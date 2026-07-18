@@ -1,25 +1,59 @@
 //! Generated Envoy v3 API protos + embedded `FileDescriptorSet` (WP-02).
 //!
-//! This crate is the ONLY place Envoy protos are generated. It pins the Envoy API
-//! version for the whole project (see IMPLEMENTATION_PLAN.md Part 0, rule 1).
+//! This crate is the ONLY place Envoy protos are generated. It pins the Envoy
+//! API version for the whole project (IMPLEMENTATION_PLAN.md ground rule #1);
+//! the vendored `.proto` sources and their dependency pins live in `vendor/`,
+//! maintained by `scripts/vendor-protos.sh`.
 //!
-//! WP-02 deliverables:
-//! - Vendored `envoyproxy/envoy` API protos at the pinned release tag.
-//! - `prost-build`/`tonic-build` generation for: bootstrap, listener, cluster, route,
-//!   endpoint, tls, HCM, router, and the ADS/SDS/ALS/ext_authz/ratelimit services.
-//! - An embedded `FileDescriptorSet` powering `descriptor_pool()`, used by
-//!   `proxy-config` for proto3-JSON parsing (YAML bootstrap) and strict-mode
-//!   unknown-field detection.
+//! Two things are exported:
+//! - The generated Rust types and tonic service stubs, under their proto
+//!   package paths (e.g. [`envoy::config::bootstrap::v3::Bootstrap`]).
+//! - [`descriptor_pool`], a reflection view of every compiled proto. This is
+//!   what lets `proxy-config` parse Envoy YAML/JSON (the proto3 JSON mapping,
+//!   including `Any` by type URL) and detect unknown fields for strict mode.
+//!
+//! Rust note: the generated code is produced by `build.rs` at compile time into
+//! `OUT_DIR`; `include!` splices that file into this crate as if written here.
+
+// The generated module tree is large and machine-written; skip doc lints on it.
+#[allow(
+    missing_docs,
+    rustdoc::invalid_html_tags,
+    rustdoc::bare_urls,
+    clippy::doc_markdown,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::large_enum_variant,
+    clippy::enum_variant_names,
+    clippy::len_without_is_empty
+)]
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+}
+
+pub use generated::*;
+
+use std::sync::OnceLock;
 
 use prost_reflect::DescriptorPool;
 
 /// The pinned Envoy API release this build targets. Bump only via a dedicated
-/// "proto upgrade" change that re-runs the WP-05 exhaustive field checklists.
+/// proto-upgrade change that re-runs the WP-05 exhaustive field checklists.
 pub const PINNED_ENVOY_API_TAG: &str = "v1.38.0";
 
-/// Descriptor pool for all vendored Envoy protos.
+/// The serialized `FileDescriptorSet` for every vendored proto we compile
+/// (roots + transitive imports). Embedded at build time.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));
+
+/// Descriptor pool over [`FILE_DESCRIPTOR_SET`]. Resolves every
+/// `type.googleapis.com/envoy.*` type URL this build supports.
 ///
-/// TODO(WP-02): embed the real `FileDescriptorSet` produced at build time.
+/// Rust note: `OnceLock` is the standard lazy-init-once primitive — the pool is
+/// decoded on first call, then every caller shares the same `'static` reference.
 pub fn descriptor_pool() -> &'static DescriptorPool {
-    unimplemented!("WP-02: generate protos and embed the FileDescriptorSet")
+    static POOL: OnceLock<DescriptorPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET)
+            .expect("embedded FileDescriptorSet must decode; regenerate with a clean build")
+    })
 }
