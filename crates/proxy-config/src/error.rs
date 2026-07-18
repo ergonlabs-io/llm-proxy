@@ -6,6 +6,9 @@
 /// xDS NACK `error_detail` messages are built from `Display` of this type.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("unknown field at `{field_path}`: not a recognized Envoy field at this position (strict mode; run with --permissive to ignore)")]
+    UnknownField { field_path: String },
+
     #[error(
         "unsupported field `{field_path}`: {reason} (strict mode; see docs/envoy-divergences.md)"
     )]
@@ -23,9 +26,21 @@ pub enum ConfigError {
         type_url: String,
     },
 
+    #[error("failed to read `{path}`: {reason}")]
+    Io { path: String, reason: String },
+
     #[error("failed to parse config: {0}")]
     Parse(String),
 
     #[error("not yet implemented ({work_package})")]
     Unimplemented { work_package: &'static str },
+}
+
+/// A non-fatal finding from permissive-mode loading, surfaced on stderr and
+/// (later) via the admin endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    /// Full dotted path of the field the warning is about.
+    pub field_path: String,
+    pub message: String,
 }
