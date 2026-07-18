@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# llm-proxy simple config — the 2-minute experience.
+# Run:       llm-proxy --config llmproxy.yaml
+# Inspect:   llm-proxy config translate llmproxy.yaml   (prints the generated
+#            Envoy bootstrap — the dialect is a front-end over Envoy config)
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+providers:
+  # `openai` and `anthropic` infer their type and base_url from the name.
+  openai:
+    api_key: ${OPENAI_API_KEY}
+  anthropic:
+    api_key: ${ANTHROPIC_API_KEY}
+  # Anything else defaults to openai-compatible (vLLM, Ollama, TGI, ...).
+  local-vllm:
+    base_url: http://vllm.internal:8000
+
+# First matching rule wins, top to bottom — specific patterns above broad ones.
+routes:
+  - model: gpt-5*
+    provider: openai
+    fallbacks: [anthropic/claude-sonnet-5]
+  - model: llama-*
+    provider: local-vllm
+  - model: "*"
+    provider: openai
+
+limits:
+  - key: header:x-api-key
+    tokens_per_minute: 100k
+    concurrent_sessions: 10
+  - key: global
+    requests_per_minute: 5000
+
+observability:
+  access_logs:
+    output: stdout
+    format: json

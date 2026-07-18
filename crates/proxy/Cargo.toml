@@ -1,0 +1,22 @@
+[package]
+name = "proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llm-proxy"
+path = "src/main.rs"
+
+[dependencies]
+proxy-admin = { workspace = true }
+proxy-cluster = { workspace = true }
+proxy-config = { workspace = true }
+proxy-core = { workspace = true }
+proxy-filters = { workspace = true }
+proxy-http = { workspace = true }
+proxy-observability = { workspace = true }
+proxy-xds = { workspace = true }
+
+[lints]
+workspace = true

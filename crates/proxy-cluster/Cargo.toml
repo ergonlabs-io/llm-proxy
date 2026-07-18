@@ -1,0 +1,15 @@
+[package]
+name = "proxy-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proxy-config = { workspace = true }
+proxy-core = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

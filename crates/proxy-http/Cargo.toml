@@ -1,0 +1,15 @@
+[package]
+name = "proxy-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proxy-config = { workspace = true }
+proxy-observability = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+prost-reflect = { workspace = true }
+
+[lints]
+workspace = true

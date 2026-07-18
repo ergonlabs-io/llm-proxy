@@ -1,0 +1,12 @@
+[package]
+name = "proxy-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proxy-config = { workspace = true }
+proxy-observability = { workspace = true }
+
+[lints]
+workspace = true

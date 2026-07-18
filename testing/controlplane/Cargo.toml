@@ -1,0 +1,16 @@
+[package]
+name = "controlplane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "xds-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://llmproxy.dev/schema/llmproxy-v0.schema.json",
+  "title": "llm-proxy configuration (v0)",
+  "description": "The simple, LLM-native configuration dialect for llm-proxy. This file is the single source of truth for the v0 schema: user-facing documentation, editor autocomplete (yaml-language-server), and the config validator are all generated from it. The dialect is a front-end: it compiles ('lowers') to standard Envoy resources and runs through the exact same validation pipeline as Envoy bootstrap config — `llm-proxy config translate` shows the generated Envoy configuration. Strings support environment-variable interpolation with `${VAR_NAME}`, applied before parsing. Parsing is strict: unknown fields are errors, never ignored. Advanced needs beyond this dialect: use Envoy bootstrap mode (`-c bootstrap.yaml`). The top-level keys `envoy`, `tracing`, and `clusters` are RESERVED for future versions and rejected in v0.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "providers", "routes"],
+  "properties": {
+    "version": {
+      "description": "Schema version. Must be 0. Future schema revisions bump this; llm-proxy refuses configs whose version it does not understand.",
+      "const": 0
+    },
+    "listen": {
+      "description": "Where the proxy accepts client traffic. Shorthand string `host:port`, or an object to enable TLS. Default: `0.0.0.0:8080` (plaintext).",
+      "default": "0.0.0.0:8080",
+      "oneOf": [
+        { "$ref": "#/$defs/HostPort" },
+        { "$ref": "#/$defs/Listener" }
+      ],
+      "examples": ["0.0.0.0:8080", { "address": "0.0.0.0:8443", "tls": { "cert_file": "/etc/llmproxy/tls.crt", "key_file": "/etc/llmproxy/tls.key" } }]
+    },
+    "admin": {
+      "description": "Admin/observability endpoint (`/ready`, `/stats/prometheus`, `/config_dump`). Disabled when omitted. Bind to loopback unless you know why not.",
+      "$ref": "#/$defs/HostPort",
+      "examples": ["127.0.0.1:9901"]
+    },
+    "providers": {
+      "description": "Named upstream LLM API providers. The key is the provider name referenced by `routes` (lowercase letters, digits, hyphens). Names `openai` and `anthropic` infer their `type` and `base_url` automatically — a working OpenAI provider is just `openai: { api_key: ${OPENAI_API_KEY} }`.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9-]*$": { "$ref": "#/$defs/Provider" }
+      }
+    },
+    "routes": {
+      "description": "Ordered routing rules, evaluated top to bottom — the FIRST rule whose `model` pattern matches the request wins (there is no specificity reordering; put specific patterns above broad ones). Requests matching no rule get a 404 with a JSON error body listing known models.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/Route" }
+    },
+    "limits": {
+      "description": "Rate limits and quotas, enforced before a request is forwarded (over-limit requests get a 429 with `x-ratelimit-*` headers). Token counts are extracted from provider responses (streaming included). NOTE: limits are enforced per proxy instance in v0; fleet-wide limits require the (future) shared budget store.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Limit" }
+    },
+    "observability": {
+      "description": "Metrics and access logging. Prometheus metrics (including token counters, TTFT/TPOT histograms, per-model dimensions) are always computed and exposed on the admin endpoint when `admin` is configured.",
+      "$ref": "#/$defs/Observability"
+    }
+  },
+  "$defs": {
+    "HostPort": {
+      "type": "string",
+      "description": "A bind address in `host:port` form. IPv6 hosts use brackets: `[::1]:8080`.",
+      "pattern": "^([0-9A-Za-z_.-]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]{1,5}$",
+      "examples": ["0.0.0.0:8080", "127.0.0.1:9901", "[::]:8080"]
+    },
+    "Duration": {
+      "type": "string",
+      "description": "A duration: integer plus unit — `ms` (milliseconds), `s` (seconds), `m` (minutes), or `h` (hours).",
+      "pattern": "^[0-9]+(ms|s|m|h)$",
+      "examples": ["500ms", "30s", "5m", "1h"]
+    },
+    "TokenAmount": {
+      "description": "A token count: a plain integer, or a string with `k` (thousands) / `m` (millions) suffix.",
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "pattern": "^[0-9]+(k|m)$" }
+      ],
+      "examples": [8000, "100k", "2m"]
+    },
+    "ModelPattern": {
+      "type": "string",
+      "description": "A glob matched against the request's `model` field (the JSON body field for chat/completions APIs; the `model` query parameter for realtime WebSocket endpoints). `*` matches any run of characters; matching is case-sensitive. `*` alone matches every request.",
+      "minLength": 1,
+      "examples": ["gpt-5", "gpt-5*", "claude-*", "llama-*", "*"]
+    },
+    "ProviderModelRef": {
+      "type": "string",
+      "description": "A provider reference: `provider-name` (keep the request's model name) or `provider-name/model-name` (rewrite the model before forwarding, e.g. fall back from `gpt-5` to `anthropic/claude-sonnet-5`).",
+      "pattern": "^[a-z0-9][a-z0-9-]*(/[^\\s]+)?$",
+      "examples": ["openai", "anthropic/claude-sonnet-5", "local-vllm/llama-3.3-70b"]
+    },
+    "Listener": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address"],
+      "properties": {
+        "address": { "$ref": "#/$defs/HostPort" },
+        "tls": {
+          "description": "Terminate TLS for client connections. Certificate files are watched and hot-reloaded on change — no restart needed for renewal.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cert_file", "key_file"],
+          "properties": {
+            "cert_file": { "type": "string", "description": "Path to the PEM certificate chain." },
+            "key_file": { "type": "string", "description": "Path to the PEM private key." }
+          }
+        }
+      }
+    },
+    "Provider": {
+      "type": "object",
+      "description": "One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit both for unauthenticated local backends).",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise.",
+          "enum": ["openai", "anthropic", "openai-compatible"]
+        },
+        "base_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "API base URL. Required unless the provider name/type implies one (`openai` -> https://api.openai.com, `anthropic` -> https://api.anthropic.com).",
+          "examples": ["http://vllm.internal:8000", "https://api.together.xyz"]
+        },
+        "api_key": {
+          "type": "string",
+          "description": "API key, sent using the provider type's native auth header (`Authorization: Bearer` for OpenAI-shaped APIs, `x-api-key` for Anthropic). Use `${ENV_VAR}` interpolation rather than inlining secrets.",
+          "examples": ["${OPENAI_API_KEY}"]
+        },
+        "api_key_file": {
+          "type": "string",
+          "description": "Read the API key from this file (trailing whitespace trimmed; watched and hot-reloaded). Preferred over `api_key` for secret managers that mount files."
+        },
+        "extra_headers": {
+          "type": "object",
+          "description": "Additional headers to send on every request to this provider (e.g. `anthropic-version`, org/project headers).",
+          "additionalProperties": { "type": "string" }
+        },
+        "ca_file": {
+          "type": "string",
+          "description": "PEM CA bundle for verifying this provider's TLS certificate. Only needed for self-hosted backends with private CAs; system roots are used otherwise."
+        },
+        "connect_timeout": {
+          "$ref": "#/$defs/Duration",
+          "description": "TCP/TLS connection establishment timeout for this provider.",
+          "default": "5s"
+        }
+      },
+      "not": {
+        "required": ["api_key", "api_key_file"]
+      }
+    },
+    "Route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "provider"],
+      "properties": {
+        "model": { "$ref": "#/$defs/ModelPattern" },
+        "provider": {
+          "$ref": "#/$defs/ProviderModelRef",
+          "description": "Where matching requests go. `provider/model` form rewrites the model name before forwarding."
+        },
+        "fallbacks": {
+          "description": "Tried in order when the primary provider fails (connection failure, 429, or 5xx — and never after the first response byte of a stream has been sent to the client). Each fallback gets a fresh attempt with the same request body, model-rewritten if the `provider/model` form is used.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/ProviderModelRef" }
+        },
+        "retries": {
+          "type": "object",
+          "description": "Retry policy against the SAME provider, applied before moving to `fallbacks`. Defaults are LLM-safe: retry only what is certainly unserved (connection failures, 429s, and 5xx received before any response byte); a request is never replayed once streaming to the client has begun.",
+          "additionalProperties": false,
+          "properties": {
+            "attempts": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5,
+              "default": 1,
+              "description": "Extra attempts against the primary provider (0 disables retries)."
+            }
+          }
+        },
+        "idle_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "90s",
+          "description": "Maximum time with NO bytes flowing (between response chunks / SSE events / WebSocket frames). There is deliberately no total-duration timeout by default — LLM generations and realtime sessions are long-lived; idle-based timeouts are the correct guard."
+        }
+      }
+    },
+    "Limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key"],
+      "minProperties": 2,
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas).",
+          "pattern": "^(global|client-ip|header:[A-Za-z0-9-]+)$",
+          "examples": ["global", "client-ip", "header:x-api-key"]
+        },
+        "tokens_per_minute": {
+          "$ref": "#/$defs/TokenAmount",
+          "description": "Total (input + output) tokens allowed per minute per bucket. Usage is extracted from provider responses, including streamed ones; enforcement is at request admission (the request that would exceed the budget is rejected — in-flight streams are never truncated)."
+        },
+        "requests_per_minute": {
+          "$ref": "#/$defs/TokenAmount",
+          "description": "Requests allowed per minute per bucket."
+        },
+        "concurrent_sessions": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session."
+        },
+        "models": {
+          "type": "array",
+          "description": "Restrict this limit to requests whose model matches one of these patterns. Omit to apply to all traffic.",
+          "items": { "$ref": "#/$defs/ModelPattern" }
+        }
+      }
+    },
+    "Observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "access_logs": {
+          "type": "object",
+          "description": "Where and how per-request/per-session access log entries are written.",
+          "additionalProperties": false,
+          "properties": {
+            "output": {
+              "type": "string",
+              "description": "`stdout`, `stderr`, or a file path. Streamed responses and realtime sessions are logged once at stream end with usage totals.",
+              "default": "stdout",
+              "examples": ["stdout", "/var/log/llmproxy/access.log"]
+            },
+            "format": {
+              "enum": ["text", "json"],
+              "default": "text",
+              "description": "`json` emits one structured object per line (recommended for log pipelines)."
+            }
+          }
+        }
+      }
+    }
+  }
+}

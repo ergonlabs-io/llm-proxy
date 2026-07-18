@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proxy-api",
+    "crates/proxy-config",
+    "crates/proxy-core",
+    "crates/proxy-http",
+    "crates/proxy-cluster",
+    "crates/proxy-xds",
+    "crates/proxy-observability",
+    "crates/proxy-admin",
+    "crates/proxy-filters",
+    "crates/proxy-simple-config",
+    "crates/proxy",
+    "testing/diffrig",
+    "testing/corpus",
+    "testing/controlplane",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.78"
+
+[workspace.dependencies]
+# Local crates
+proxy-api = { path = "crates/proxy-api" }
+proxy-config = { path = "crates/proxy-config" }
+proxy-core = { path = "crates/proxy-core" }
+proxy-http = { path = "crates/proxy-http" }
+proxy-cluster = { path = "crates/proxy-cluster" }
+proxy-xds = { path = "crates/proxy-xds" }
+proxy-observability = { path = "crates/proxy-observability" }
+proxy-admin = { path = "crates/proxy-admin" }
+proxy-filters = { path = "crates/proxy-filters" }
+
+# Async runtime & IO
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+futures = "0.3"
+bytes = "1"
+
+# HTTP
+http = "1"
+hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
+hyper-util = "0.1"
+
+# Config / protos (WP-02/WP-03)
+prost = "0.13"
+prost-reflect = { version = "0.14", features = ["serde"] }
+tonic = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# TLS (WP-08)
+rustls = "0.23"
+tokio-rustls = "0.26"
+
+# Utilities
+arc-swap = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+rand = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

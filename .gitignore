@@ -1,0 +1,7 @@
+/target
+*.pb.bin
+testing/diffrig/captures/
+
+# Planning docs stay local-only for now — track only README.md
+*.md
+!README.md
