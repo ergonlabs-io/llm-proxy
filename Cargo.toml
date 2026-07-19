@@ -34,6 +34,7 @@ proxy-xds = { path = "crates/proxy-xds" }
 proxy-observability = { path = "crates/proxy-observability" }
 proxy-admin = { path = "crates/proxy-admin" }
 proxy-filters = { path = "crates/proxy-filters" }
+proxy-simple-config = { path = "crates/proxy-simple-config" }
 
 # Async runtime & IO
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
@@ -47,11 +48,14 @@ hyper-util = "0.1"
 
 # Config / protos (WP-02/WP-03)
 prost = "0.13"
+prost-types = "0.13"
 prost-reflect = { version = "0.14", features = ["serde"] }
 tonic = "0.12"
+tonic-build = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+serde_path_to_error = "0.1"
 
 # TLS (WP-08)
 rustls = "0.23"

@@ -1,0 +1,81 @@
+# llm-proxy developer entry points.
+#
+#   make help              list all targets
+#   make build             debug build of the whole workspace
+#   make check-proxy-http  check a single crate (pattern works for any crate)
+#
+# Per-crate pattern targets accept any package name from the workspace:
+#   proxy-api proxy-config proxy-core proxy-http proxy-cluster proxy-xds
+#   proxy-observability proxy-admin proxy-filters proxy-simple-config proxy
+#   diffrig corpus controlplane
+
+CONFIG ?= examples/tcp-proxy.yaml
+
+.DEFAULT_GOAL := help
+
+# ---------------------------------------------------------------- workspace --
+
+.PHONY: help
+help: ## List available targets
+	@grep -E '^[a-zA-Z_%-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  \033[1m%-22s\033[0m %s\n", $$1, $$2}'
+
+.PHONY: build
+build: ## Debug build of every crate + the llm-proxy binary
+	cargo build --workspace
+
+.PHONY: release
+release: ## Optimized build of the llm-proxy binary (target/release/llm-proxy)
+	cargo build --release -p proxy
+
+.PHONY: check
+check: ## Fast type-check of the whole workspace (no codegen)
+	cargo check --workspace
+
+.PHONY: test
+test: ## Run all tests
+	cargo test --workspace
+
+.PHONY: fmt
+fmt: ## Format all code
+	cargo fmt --all
+
+.PHONY: lint
+lint: ## Clippy with warnings denied (what CI enforces)
+	cargo clippy --workspace --all-targets -- -D warnings
+
+.PHONY: ci
+ci: ## Everything CI runs: format check, lint, tests
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo test --workspace
+
+.PHONY: clean
+clean: ## Remove build artifacts
+	cargo clean
+
+# ----------------------------------------------------------------- per crate --
+
+check-%: ## Check one crate, e.g. make check-proxy-config
+	cargo check -p $*
+
+build-%: ## Build one crate, e.g. make build-proxy-api
+	cargo build -p $*
+
+test-%: ## Test one crate, e.g. make test-proxy-config
+	cargo test -p $*
+
+# -------------------------------------------------------------------- binary --
+
+.PHONY: run
+run: ## Run the proxy with CONFIG (default: examples/tcp-proxy.yaml)
+	cargo run -p proxy -- -c $(CONFIG)
+
+.PHONY: validate
+validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.yaml
+	cargo run -p proxy -- -c $(CONFIG) --mode validate
+
+# ------------------------------------------------------------------- protos --
+
+.PHONY: vendor-protos
+vendor-protos: ## Re-vendor the pinned Envoy protos (see scripts/vendor-protos.sh)
+	./scripts/vendor-protos.sh

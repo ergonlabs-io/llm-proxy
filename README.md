@@ -1,13 +1,18 @@
 # llm-proxy
 
-An Envoy-configuration-compatible L4/L7 proxy in Rust, purpose-built for LLM inference
-API traffic: native token metering and token-based rate limiting, SSE-first streaming,
-model-aware routing and provider fallback, and Gateway API Inference Extension support —
-without ext_proc sidecar hops. Runs identically in Kubernetes and non-Kubernetes
-environments: one static binary, one Envoy bootstrap YAML, optional xDS (gRPC or
-watched files).
+A high-performance proxy for LLM inference APIs, written in Rust: native token metering
+and token-based rate limiting, SSE-first streaming, model-aware routing and provider
+fallback, and Gateway API Inference Extension support — without ext_proc sidecar hops.
+Runs identically in Kubernetes and non-Kubernetes environments: one static binary, one
+YAML file. Speaks standard Envoy configuration and xDS, so it also drops into existing
+Envoy/Istio/Envoy Gateway estates unchanged.
 
-**Status: scaffolding.** No data-plane functionality yet.
+**Status: config plane working, data plane not yet.** Both config styles load
+end to end — strict parsing with full field-path errors (WP-03), PGV constraint
+validation (WP-04), and lowering to the internal IR (WP-05) — for Envoy
+bootstrap files (`-c`) and the simple LLM-native dialect (`--config`, WP-38).
+`--mode validate` checks a config; `--mode translate` prints the Envoy
+bootstrap generated from a dialect file. Serve mode lands with WP-06.
 
 ## Documents (local, untracked for now)
 
@@ -32,6 +37,7 @@ crates/
   proxy-observability  WP-23/24   stats (Envoy naming), access logs, response flags
   proxy-admin          WP-25   admin server (/config_dump, /stats, /ready, ...)
   proxy-filters        WP-31..36  non-core filters + the LLM lane (Lane H)
+  proxy-simple-config  WP-38   the LLM-native dialect -> Envoy resources lowering
   proxy                          the llm-proxy binary
 testing/
   diffrig              WP-26   side-by-side differential harness vs pinned Envoy
@@ -135,6 +141,22 @@ Configuration reaches the data plane out-of-band (never on the hot path):
 
 ## Building
 
+`make help` lists every developer target. The common ones:
+
 ```
-cargo check --workspace
+make build                   # debug build of everything
+make test                    # run all tests
+make ci                      # what CI enforces: fmt check, clippy -D warnings, tests
+make validate                # validate examples/tcp-proxy.yaml through the real loader
+make validate CONFIG=x.yaml  # validate your own config
+make test-proxy-config       # per-crate pattern: build-/check-/test-<crate>
 ```
+
+Dialect mode (see `examples/llmproxy.yaml` and `schema/llmproxy-v0.schema.json`):
+
+```
+llm-proxy --config llmproxy.yaml --mode validate    # check a dialect config
+llm-proxy --config llmproxy.yaml --mode translate   # print the generated Envoy bootstrap
+```
+
+Building `proxy-api` requires `protoc` (`brew install protobuf` / `apt install protobuf-compiler`).
