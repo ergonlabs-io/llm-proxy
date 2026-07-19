@@ -30,7 +30,10 @@ pub struct OpenAiConfig {
     /// The canned assistant reply. Split on whitespace to produce the
     /// per-chunk `delta.content` tokens when streaming.
     pub response_text: String,
-    /// Delay before the first streamed content chunk (time-to-first-token).
+    /// Delay before the first streamed chunk (time-to-first-token). Applied
+    /// to the leading role-delta chunk: real providers emit nothing at all
+    /// until generation starts, so a proxy measuring TTFT at first-event
+    /// arrival must observe this delay.
     pub ttft: Duration,
     /// Delay between subsequent streamed content chunks.
     pub inter_token_delay: Duration,
@@ -68,7 +71,10 @@ impl ChatRequestLog {
     /// Snapshot of every parsed chat-completion request body received so
     /// far, in arrival order.
     pub fn bodies(&self) -> Vec<serde_json::Value> {
-        self.0.lock().expect("chat request log mutex poisoned").clone()
+        self.0
+            .lock()
+            .expect("chat request log mutex poisoned")
+            .clone()
     }
 }
 
@@ -159,10 +165,9 @@ async fn handle_openai(
 
     if let Some(expected_key) = &config.require_api_key {
         let expected_header = format!("Bearer {expected_key}");
-        let authorized = recorded
-            .headers
-            .iter()
-            .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == &expected_header);
+        let authorized = recorded.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == &expected_header
+        });
         if !authorized {
             return error_response(
                 401,
@@ -229,7 +234,11 @@ fn handle_chat_completions(
     let id = format!("chatcmpl-{}", next_id.fetch_add(1, Ordering::Relaxed));
     let created = now_unix();
     let completion_tokens = whitespace_tokens(&config.response_text);
-    let prompt_tokens: usize = parsed.messages.iter().map(|m| whitespace_tokens(&m.content)).sum();
+    let prompt_tokens: usize = parsed
+        .messages
+        .iter()
+        .map(|m| whitespace_tokens(&m.content))
+        .sum();
 
     if parsed.stream {
         let include_usage = parsed
@@ -285,13 +294,16 @@ fn streaming_response(
     // just "how far through this Vec are we", which keeps the async step
     // closure trivial instead of hand-rolling a state machine per event kind.
     let mut frames: Vec<(Duration, String)> = Vec::new();
+    // TTFT gates the *first* frame: nothing (not even the role delta) is
+    // emitted before it, mirroring a real provider that stays silent until
+    // generation starts.
     frames.push((
-        Duration::ZERO,
+        config.ttft,
         chunk_json(id, created, model, json!({ "role": "assistant" }), None),
     ));
     for (i, token) in tokens.iter().enumerate() {
         let delay = if i == 0 {
-            config.ttft
+            Duration::ZERO
         } else {
             config.inter_token_delay
         };
@@ -555,21 +567,19 @@ mod tests {
             "model": "mock-gpt",
             "messages": [{"role": "user", "content": "hi there"}],
         });
-        let res = test_support::send_json(
-            upstream.addr(),
-            "POST",
-            "/v1/chat/completions",
-            &[],
-            &body,
-        )
-        .await
-        .expect("request should succeed");
+        let res =
+            test_support::send_json(upstream.addr(), "POST", "/v1/chat/completions", &[], &body)
+                .await
+                .expect("request should succeed");
 
         assert_eq!(res.status, 200);
         let parsed: serde_json::Value = serde_json::from_str(&res.body).expect("valid json body");
         assert_eq!(parsed["object"], "chat.completion");
         assert_eq!(parsed["model"], "mock-gpt");
-        assert_eq!(parsed["choices"][0]["message"]["content"], "hello there friend");
+        assert_eq!(
+            parsed["choices"][0]["message"]["content"],
+            "hello there friend"
+        );
         assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
         assert_eq!(parsed["usage"]["prompt_tokens"], 2);
         assert_eq!(parsed["usage"]["completion_tokens"], 3);
@@ -616,7 +626,12 @@ mod tests {
         assert_eq!(status, 200);
 
         // role delta, 3 content chunks, finish, usage, [DONE]
-        assert_eq!(events.len(), 7, "unexpected event count: {:?}", events.iter().map(|e| &e.data).collect::<Vec<_>>());
+        assert_eq!(
+            events.len(),
+            7,
+            "unexpected event count: {:?}",
+            events.iter().map(|e| &e.data).collect::<Vec<_>>()
+        );
         assert!(events[0].data.contains("\"role\":\"assistant\""));
         for event in &events[1..=3] {
             assert!(event.data.contains("chat.completion.chunk"));
@@ -626,6 +641,11 @@ mod tests {
         assert!(events[5].data.contains("\"usage\""));
         assert_eq!(events[6].data, "data: [DONE]");
 
+        assert!(
+            events[0].at >= ttft,
+            "no event (even the role delta) should arrive before ttft ({ttft:?}), got {:?}",
+            events[0].at
+        );
         assert!(
             events[1].at >= ttft,
             "first content chunk should arrive at/after ttft ({ttft:?}), got {:?}",
@@ -651,15 +671,10 @@ mod tests {
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
         let body = json!({"model": "mock-gpt", "messages": [{"role": "user", "content": "hi"}]});
 
-        let unauthorized = test_support::send_json(
-            upstream.addr(),
-            "POST",
-            "/v1/chat/completions",
-            &[],
-            &body,
-        )
-        .await
-        .expect("request should succeed");
+        let unauthorized =
+            test_support::send_json(upstream.addr(), "POST", "/v1/chat/completions", &[], &body)
+                .await
+                .expect("request should succeed");
         assert_eq!(unauthorized.status, 401);
         let err: serde_json::Value =
             serde_json::from_str(&unauthorized.body).expect("valid json body");
@@ -692,29 +707,18 @@ mod tests {
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
         let body = json!({"model": "mock-gpt", "messages": []});
 
-        let res = test_support::send_json(
-            upstream.addr(),
-            "POST",
-            "/v1/chat/completions",
-            &[],
-            &body,
-        )
-        .await
-        .expect("request should succeed");
+        let res =
+            test_support::send_json(upstream.addr(), "POST", "/v1/chat/completions", &[], &body)
+                .await
+                .expect("request should succeed");
         assert_eq!(res.status, 503);
         let err: serde_json::Value = serde_json::from_str(&res.body).expect("valid json body");
         assert_eq!(err["error"]["message"], "upstream overloaded");
 
         // The GET /v1/models endpoint is subject to forced_error too.
-        let models = test_support::send_json(
-            upstream.addr(),
-            "GET",
-            "/v1/models",
-            &[],
-            &json!({}),
-        )
-        .await
-        .expect("request should succeed");
+        let models = test_support::send_json(upstream.addr(), "GET", "/v1/models", &[], &json!({}))
+            .await
+            .expect("request should succeed");
         assert_eq!(models.status, 503);
 
         upstream.shutdown().await;
@@ -753,7 +757,12 @@ mod tests {
             .expect("request built");
         let response = sender.send_request(req).await.expect("send request");
         assert_eq!(response.status().as_u16(), 400);
-        let body_bytes = response.into_body().collect().await.expect("collect").to_bytes();
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes();
         let err: serde_json::Value =
             serde_json::from_slice(&body_bytes).expect("error body is json");
         assert_eq!(err["error"]["type"], "invalid_request_error");
