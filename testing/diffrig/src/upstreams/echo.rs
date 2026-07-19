@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::json;
 
-use super::{record_request, serve, RequestLog, ServerHandle};
+use super::{record_request, serve, RequestLog, ResponseBody, ServerHandle};
 
 pub struct EchoUpstream {
     pub log: RequestLog,
@@ -46,7 +46,7 @@ async fn handle_echo(
     req: Request<Incoming>,
     log: &RequestLog,
     instance_id: &str,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     let recorded = record_request(req, log).await;
     // Rust note: `BTreeMap` gives deterministic (sorted) key order in the
     // JSON body, which is nicer for assertions than a `HashMap`'s order.
@@ -62,7 +62,9 @@ async fn handle_echo(
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .header("x-upstream-instance", instance_id)
-        .body(Full::new(Bytes::from(body)))
+        // Rust note: `.boxed()` (from `BodyExt`) erases `Full<Bytes>`'s
+        // concrete type into the shared `ResponseBody` alias `serve` expects.
+        .body(Full::new(Bytes::from(body)).boxed())
         .expect("response built from static, known-valid parts")
 }
 

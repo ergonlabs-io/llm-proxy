@@ -1,0 +1,10 @@
+# Deliberately malformed YAML (unbalanced flow mapping) — exercises the
+# `ParseError` outcome class: the scorecard must never get far enough to
+# talk about field paths here, because the file never becomes structured
+# data in the first place.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901
+
+static_resources:
+  listeners: [this, is, not, closed

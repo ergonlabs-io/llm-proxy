@@ -255,7 +255,8 @@ pub trait HttpFilterFactory: Send + Sync {
         _config: &prost_reflect::DynamicMessage,
     ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
         Err(ConfigError::Unimplemented {
-            work_package: "per-route config for this filter",
+            field_path: "per-route config".to_string(),
+            reason: "this filter has no per-route config".to_string(),
         })
     }
 }

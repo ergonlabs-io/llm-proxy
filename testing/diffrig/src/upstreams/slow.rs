@@ -5,11 +5,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
-use super::{record_request, serve, RequestLog, ServerHandle};
+use super::{record_request, serve, RequestLog, ResponseBody, ServerHandle};
 
 pub struct SlowUpstream {
     pub log: RequestLog,
@@ -41,12 +41,12 @@ async fn handle_slow(
     req: Request<Incoming>,
     log: &RequestLog,
     delay: Duration,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     record_request(req, log).await;
     tokio::time::sleep(delay).await;
     Response::builder()
         .status(StatusCode::OK)
-        .body(Full::new(Bytes::from_static(b"slow-ok")))
+        .body(Full::new(Bytes::from_static(b"slow-ok")).boxed())
         .expect("response built from static, known-valid parts")
 }
 

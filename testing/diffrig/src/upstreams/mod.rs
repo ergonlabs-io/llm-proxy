@@ -7,17 +7,20 @@
 
 mod echo;
 mod flaky;
+mod openai;
 mod slow;
 
 pub use echo::EchoUpstream;
 pub use flaky::{Action, FailScript, FlakyUpstream};
+pub use openai::{ChatRequestLog, OpenAiConfig, OpenAiUpstream};
 pub use slow::SlowUpstream;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::combinators::BoxBody;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -83,6 +86,16 @@ impl ServerHandle {
     }
 }
 
+/// Response body type every upstream in this module hands back to `serve`.
+///
+/// Rust note: `BoxBody` (from `http_body_util::combinators`) type-erases the
+/// concrete `Body` implementation behind a `Box<dyn Body>`-like wrapper, so
+/// `echo`/`slow` (a single, already-buffered `Full<Bytes>`) and `openai`
+/// (a paced `StreamBody` fed from a `futures::stream::unfold`) can share one
+/// `serve` function despite having unrelated concrete body types — each just
+/// calls `.boxed()` before returning.
+pub(crate) type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
+
 /// Spawn a hyper HTTP/1.1 server bound to an ephemeral loopback port, calling
 /// `handler` for every request on every accepted connection.
 ///
@@ -93,7 +106,7 @@ impl ServerHandle {
 pub(crate) async fn serve<F, Fut>(handler: F) -> anyhow::Result<ServerHandle>
 where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<Response<Full<Bytes>>, std::convert::Infallible>>
+    Fut: std::future::Future<Output = Result<Response<ResponseBody>, std::convert::Infallible>>
         + Send
         + 'static,
 {
@@ -125,10 +138,14 @@ where
     })
 }
 
-/// Extract method/path/headers/body-length from a request and append it to
-/// `log`, returning the recorded copy so the caller (e.g. `echo`) can build a
-/// response from it without re-reading the request.
-pub(crate) async fn record_request(req: Request<Incoming>, log: &RequestLog) -> RecordedRequest {
+/// Extract method/path/headers/body from a request and append the recorded
+/// shape (not the raw bytes — see `body_len`) to `log`, returning both the
+/// recorded copy and the collected body so callers that need to look inside
+/// the body (e.g. `openai`, to parse JSON) don't have to re-read the request.
+pub(crate) async fn record_request_with_body(
+    req: Request<Incoming>,
+    log: &RequestLog,
+) -> (RecordedRequest, Bytes) {
     let method = req.method().to_string();
     let path = req
         .uri()
@@ -159,7 +176,14 @@ pub(crate) async fn record_request(req: Request<Incoming>, log: &RequestLog) -> 
         body_len: body_bytes.len(),
     };
     log.record(recorded.clone());
-    recorded
+    (recorded, body_bytes)
+}
+
+/// Extract method/path/headers/body-length from a request and append it to
+/// `log`, returning the recorded copy so the caller (e.g. `echo`) can build a
+/// response from it without re-reading the request.
+pub(crate) async fn record_request(req: Request<Incoming>, log: &RequestLog) -> RecordedRequest {
+    record_request_with_body(req, log).await.0
 }
 
 #[cfg(test)]

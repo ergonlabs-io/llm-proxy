@@ -69,8 +69,39 @@ pub struct ScriptedRequest {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UpstreamScript {
     Echo,
-    Slow { delay_ms: u64 },
-    Flaky { script: Vec<Action> },
+    Slow {
+        delay_ms: u64,
+    },
+    Flaky {
+        script: Vec<Action>,
+    },
+    // Rust note: `rename_all = "snake_case"` on the enum would turn this
+    // variant name into `open_ai` (word-boundary before the capital `A`);
+    // `openai` (matching the module/upstream name) reads better in YAML, so
+    // override it explicitly here.
+    #[serde(rename = "openai")]
+    OpenAi {
+        model: String,
+        response_text: String,
+        ttft_ms: u64,
+        inter_token_delay_ms: u64,
+        #[serde(default)]
+        require_api_key: Option<String>,
+        #[serde(default)]
+        forced_error: Option<ForcedError>,
+    },
+}
+
+/// A scripted `(status, message)` pair for `UpstreamScript::OpenAi`'s
+/// `forced_error`, matching `OpenAiConfig::forced_error` in
+/// `upstreams::openai` (kept as a plain struct here, rather than a tuple,
+/// since a YAML mapping reads better as `status:`/`message:` than a
+/// positional list).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForcedError {
+    pub status: u16,
+    pub message: String,
 }
 
 /// A scenario file failed to parse or didn't pass semantic validation; every
@@ -167,6 +198,33 @@ mod tests {
             err,
             ScenarioError::Invalid { field_path, .. } if field_path == "requests"
         ));
+    }
+
+    #[test]
+    fn parses_openai_upstream_variant() {
+        let text = "name: x\nbootstrap:\n  path: a.yaml\nrequests:\n  - method: POST\n    path: /v1/chat/completions\nupstream:\n  type: openai\n  model: mock-gpt\n  response_text: hello world\n  ttft_ms: 10\n  inter_token_delay_ms: 5\n  require_api_key: secret\n  forced_error:\n    status: 503\n    message: overloaded\n";
+        let scenario = parse_scenario(text).expect("openai upstream scenario should parse");
+
+        match scenario.upstream {
+            UpstreamScript::OpenAi {
+                model,
+                response_text,
+                ttft_ms,
+                inter_token_delay_ms,
+                require_api_key,
+                forced_error,
+            } => {
+                assert_eq!(model, "mock-gpt");
+                assert_eq!(response_text, "hello world");
+                assert_eq!(ttft_ms, 10);
+                assert_eq!(inter_token_delay_ms, 5);
+                assert_eq!(require_api_key, Some("secret".to_string()));
+                let forced_error = forced_error.expect("forced_error should parse");
+                assert_eq!(forced_error.status, 503);
+                assert_eq!(forced_error.message, "overloaded");
+            }
+            other => panic!("expected UpstreamScript::OpenAi, got {other:?}"),
+        }
     }
 
     #[test]
