@@ -44,7 +44,8 @@ bytes = "1"
 # HTTP
 http = "1"
 hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
-hyper-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # Config / protos (WP-02/WP-03)
 prost = "0.13"
@@ -70,6 +71,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 rand = "0.8"
+core_affinity = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
