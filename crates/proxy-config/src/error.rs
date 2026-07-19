@@ -3,7 +3,11 @@
 
 /// A configuration error. `field_path` is always the full dotted path into the
 /// Envoy proto, e.g. `static_resources.listeners[0].filter_chains[0].filters[0].typed_config`.
-/// xDS NACK `error_detail` messages are built from `Display` of this type.
+/// For errors scoped to a whole file rather than a proto field (e.g. an
+/// unimplemented bootstrap format), `field_path` is the file path instead —
+/// every strict-mode rejection names *where* (ground rule #2), whatever kind
+/// of "where" applies. xDS NACK `error_detail` messages are built from
+/// `Display` of this type.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("unknown field at `{field_path}`: not a recognized Envoy field at this position (strict mode; run with --permissive to ignore)")]
@@ -32,8 +36,8 @@ pub enum ConfigError {
     #[error("failed to parse config: {0}")]
     Parse(String),
 
-    #[error("not yet implemented ({work_package})")]
-    Unimplemented { work_package: &'static str },
+    #[error("not yet implemented at `{field_path}`: {reason}")]
+    Unimplemented { field_path: String, reason: String },
 }
 
 /// A non-fatal finding from permissive-mode loading, surfaced on stderr and

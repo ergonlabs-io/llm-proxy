@@ -2,7 +2,9 @@
 //! listener manager + filter-chain matching (WP-07), transport sockets (WP-08),
 //! and the L4 network filter framework (WP-09).
 
+pub mod drain;
 pub mod net_filter;
+pub mod runtime;
 pub mod transport;
 
 use std::sync::Arc;

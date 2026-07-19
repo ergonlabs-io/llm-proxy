@@ -41,7 +41,8 @@ impl ConfigFormat {
             Some("json") => Ok(Self::Json),
             Some("pb") => Ok(Self::ProtoBinary),
             Some("pb_text") => Err(ConfigError::Unimplemented {
-                work_package: "pb_text bootstrap files; use .yaml, .json or .pb",
+                field_path: path.display().to_string(),
+                reason: "pb_text bootstrap files; use .yaml, .json or .pb".to_string(),
             }),
             other => Err(ConfigError::Parse(format!(
                 "unrecognized config extension {other:?} for `{}`; expected .yaml/.yml/.json/.pb",

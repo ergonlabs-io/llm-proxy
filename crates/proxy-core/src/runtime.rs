@@ -14,9 +14,10 @@ use std::thread::JoinHandle;
 use proxy_config::ir::SnapshotVersion;
 use proxy_config::ConfigSnapshot;
 use tokio::runtime::Builder;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::LocalSet;
 
+use crate::drain::{DrainCoordinator, DrainOutcome, DrainState, DrainStrategy};
 use crate::WorkerConfigHandle;
 
 /// Identifies a worker thread/runtime.
@@ -57,6 +58,13 @@ pub struct WorkerContext {
     pub config_ping: watch::Receiver<SnapshotVersion>,
     /// Flips to `true` when `ConfigPublisher::shutdown` is called.
     pub shutdown: watch::Receiver<bool>,
+    /// Fires when the control runtime calls `ConfigPublisher::start_drain`
+    /// (WP-06 chunk B). Worker mains hand this to
+    /// [`crate::drain::drain_worker`].
+    pub drain: watch::Receiver<DrainState>,
+    /// The worker reports here (via `drain_worker`) once its connection
+    /// registry has emptied or its drain deadline has passed.
+    pub drain_done: mpsc::UnboundedSender<WorkerId>,
 }
 
 /// Owns nothing after `spawn` returns; it only exists to give `spawn` a
@@ -102,12 +110,20 @@ impl WorkerPool {
         let mut handles = Vec::with_capacity(config.concurrency);
         let mut config_txs = Vec::with_capacity(config.concurrency);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Rust note: `DrainCoordinator::new` hands back one `watch::Receiver`
+        // that every worker clones (watch receivers are `Clone`) plus the
+        // coordinator itself, which owns the `mpsc` sender side worker
+        // clones report drain completion through.
+        let (drain_coordinator, drain_rx) = DrainCoordinator::new(config.concurrency);
+        let drain_done_tx = drain_coordinator.done_sender();
 
         for i in 0..config.concurrency {
             let id = WorkerId(i);
             let handle = Arc::new(WorkerConfigHandle::new(initial_snapshot.clone()));
             let (config_tx, config_rx) = watch::channel(initial_snapshot.version);
             let shutdown_rx = shutdown_rx.clone();
+            let drain_rx = drain_rx.clone();
+            let drain_done_tx = drain_done_tx.clone();
             let worker_main = worker_main.clone();
             let handle_for_thread = handle.clone();
 
@@ -136,6 +152,8 @@ impl WorkerPool {
                         config: handle_for_thread,
                         config_ping: config_rx,
                         shutdown: shutdown_rx,
+                        drain: drain_rx,
+                        drain_done: drain_done_tx,
                     };
 
                     // Rust note: `new_current_thread` + `LocalSet` is the
@@ -163,6 +181,7 @@ impl WorkerPool {
             config_txs,
             shutdown_tx,
             threads,
+            drain: drain_coordinator,
         }
     }
 }
@@ -174,6 +193,10 @@ pub struct ConfigPublisher {
     config_txs: Vec<watch::Sender<SnapshotVersion>>,
     shutdown_tx: watch::Sender<bool>,
     threads: Vec<JoinHandle<()>>,
+    /// Drain coordination (WP-06 chunk B): kept here, not as a separate
+    /// handle callers juggle alongside this one, so "publish config",
+    /// "shut down", and "drain" all live on the one control-side type.
+    drain: DrainCoordinator,
 }
 
 impl ConfigPublisher {
@@ -200,6 +223,19 @@ impl ConfigPublisher {
     /// [`ConfigPublisher::join`] for that.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Begin a drain: broadcast the new [`DrainState`] to every worker.
+    /// Workers see this via `WorkerContext::drain` and react through
+    /// [`crate::drain::drain_worker`].
+    pub fn start_drain(&self, duration: std::time::Duration, strategy: DrainStrategy) {
+        self.drain.start_drain(duration, strategy);
+    }
+
+    /// Wait until every worker has reported drain completion, or `deadline`
+    /// passes -- whichever comes first.
+    pub async fn wait_drained(&mut self, deadline: std::time::Instant) -> DrainOutcome {
+        self.drain.wait_drained(deadline).await
     }
 
     /// Block until every worker thread has exited.

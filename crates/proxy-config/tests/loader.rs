@@ -189,7 +189,7 @@ fn file_format_detection() {
     );
     assert!(matches!(
         ConfigFormat::from_path(Path::new("a.pb_text")),
-        Err(ConfigError::Unimplemented { .. })
+        Err(ConfigError::Unimplemented { field_path, .. }) if field_path == "a.pb_text"
     ));
     assert!(ConfigFormat::from_path(Path::new("a.conf")).is_err());
 }
