@@ -10,7 +10,7 @@
 //! longest-first), compiled regexes, weighted-cluster cumulative weight arrays.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,8 +48,54 @@ pub struct ListenerConfig {
     pub address: SocketAddr,
     pub filter_chains: Vec<FilterChainSpec>,
     pub default_filter_chain: Option<FilterChainSpec>,
+    /// Ordered listener (pre-connection) filters that run against the raw
+    /// socket before filter-chain matching — currently only `tls_inspector`.
+    /// May be auto-injected: see [`ListenerFilterSpec`].
+    pub listener_filters: Vec<ListenerFilterSpec>,
     /// Envoy default: 1 MiB.
     pub per_connection_buffer_limit_bytes: u32,
+    /// `None` = platform default backlog.
+    pub tcp_backlog_size: Option<u32>,
+    /// Envoy default: true.
+    pub bind_to_port: bool,
+}
+
+/// A listener filter (`envoy.config.listener.v3.ListenerFilter`), resolved
+/// from its `typed_config` type URL. These run on the accepted connection
+/// *before* filter-chain matching, populating the properties the matcher
+/// keys on (SNI, ALPN, transport protocol).
+///
+/// Auto-injection: like Envoy, the lowering inserts a default `TlsInspector`
+/// when a filter chain matches on `server_names`, `application_protocols`, or
+/// `transport_protocol: tls` but no `tls_inspector` was configured — omitting
+/// it would silently make those criteria never match TLS traffic, a worse
+/// divergence than the injection. Recorded in `docs/envoy-divergences.md`.
+#[derive(Debug)]
+pub enum ListenerFilterSpec {
+    TlsInspector(TlsInspectorConfig),
+}
+
+/// IR for `envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector`
+/// (supported subset). Peeks the ClientHello for SNI + ALPN without consuming
+/// the bytes, so the real TLS handshake still sees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsInspectorConfig {
+    /// Upper bound on bytes buffered while waiting for a full ClientHello
+    /// before giving up. Envoy default: 64 KiB (`max_client_hello_size`,
+    /// which Envoy caps at 16 KiB — the TLS record maximum — but the field
+    /// default is 16384). A ClientHello exceeding this is treated as a parse
+    /// failure.
+    pub max_client_hello_size: u32,
+}
+
+impl Default for TlsInspectorConfig {
+    fn default() -> Self {
+        // Envoy's `max_client_hello_size` default and hard cap are both
+        // 16384 (one TLS record); a ClientHello can't exceed that on the wire.
+        Self {
+            max_client_hello_size: 16384,
+        }
+    }
 }
 
 /// One `filter_chains` entry: match criteria + transport socket + the network
@@ -64,12 +110,69 @@ pub struct FilterChainSpec {
     pub filters: Vec<NetworkFilterSpec>,
 }
 
-/// Supported subset of `FilterChainMatch` (WP-07 grows this to the 8 criteria).
-#[derive(Debug, Default)]
+/// `envoy.config.core.v3.CidrRange`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CidrRange {
+    pub addr: IpAddr,
+    pub prefix_len: u8,
+}
+
+impl CidrRange {
+    /// True if `ip` is inside this range. Address families never match each
+    /// other (an IPv4 range does not contain a v4-mapped IPv6 address, and
+    /// vice versa — Envoy keeps the families distinct).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                let prefix = self.prefix_len.min(32);
+                // Rust note: a 0-bit mask can't be built with `<< 32` (that's a
+                // shift-by-width, which panics/UB) so it's special-cased.
+                let mask: u32 = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                (u32::from(net) & mask) == (u32::from(addr) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                let prefix = self.prefix_len.min(128);
+                let mask: u128 = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                (u128::from(net) & mask) == (u128::from(addr) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `FilterChainMatch.ConnectionSourceType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceType {
+    #[default]
+    Any,
+    SameIpOrLoopback,
+    External,
+}
+
+/// Full 9-criteria `FilterChainMatch` (WP-07). Field order mirrors Envoy's
+/// matching precedence.
+#[derive(Debug, Default, PartialEq)]
 pub struct FilterChainMatch {
     pub destination_port: Option<u32>,
-    /// SNI server names: exact or `*.` suffix wildcards.
+    pub prefix_ranges: Vec<CidrRange>,
+    /// SNI: exact names or `*.`-prefixed suffix wildcards.
     pub server_names: Vec<String>,
+    /// e.g. "raw_buffer" or "tls"; `None` = any.
+    pub transport_protocol: Option<String>,
+    /// ALPN protocol list; empty = any.
+    pub application_protocols: Vec<String>,
+    pub direct_source_prefix_ranges: Vec<CidrRange>,
+    pub source_type: SourceType,
+    pub source_prefix_ranges: Vec<CidrRange>,
+    pub source_ports: Vec<u32>,
 }
 
 /// A network (L4) filter, resolved from its `typed_config` type URL.
@@ -86,6 +189,9 @@ pub struct TcpProxyConfig {
     pub cluster: ClusterName,
     /// Envoy default: 1h. `None` = disabled (explicit 0).
     pub idle_timeout: Option<Duration>,
+    /// Upstream connect attempts before giving up. Envoy default 1 (no
+    /// retry); proto floor is 1.
+    pub max_connect_attempts: u32,
 }
 
 /// IR for the HTTP connection manager (supported subset).
@@ -454,19 +560,191 @@ pub enum HeaderAppendAction {
 
 // ----------------------------------------------------------------- tls/misc --
 
-/// Downstream TLS termination config for a filter chain (WP-08 consumes).
+/// Downstream TLS termination config for a filter chain (WP-08).
+///
+/// Field-presence semantics follow Envoy v1.38's `DownstreamTlsContext`:
+/// anything the lowering can't honor errors at config load with its dotted
+/// path — this struct only holds what the rustls transport socket actually
+/// implements.
 #[derive(Debug)]
 pub struct DownstreamTlsSpec {
+    /// At least one; multiple entries = one cert per key type (RSA + ECDSA),
+    /// selected per-handshake like Envoy/BoringSSL.
+    pub certificates: Vec<TlsCertificateIR>,
+    pub params: TlsParametersIR,
+    /// Offered via ALPN in server order; empty = no ALPN extension.
+    pub alpn_protocols: Vec<String>,
+    /// Client-certificate (mTLS) verification. `None` = no client certs
+    /// requested at all.
+    pub validation: Option<ValidationContextIR>,
+    /// Envoy: reject connections without a valid client certificate.
+    /// Lowering enforces that this requires `validation` to be present.
+    pub require_client_certificate: bool,
+    /// Envoy default `false`: the server issues stateless session tickets
+    /// encrypted with an internally generated key (verified against the
+    /// v1.38 proto comment on `disable_stateless_session_resumption`).
+    pub disable_stateless_session_resumption: bool,
+}
+
+/// Upstream TLS origination config for a cluster (WP-08).
+#[derive(Debug)]
+pub struct UpstreamTlsSpec {
+    pub sni: Option<String>,
+    pub params: TlsParametersIR,
+    pub alpn_protocols: Vec<String>,
+    /// Client certificate presented to the upstream (mTLS); at most one.
+    pub client_certificate: Option<TlsCertificateIR>,
+    /// Server-certificate verification. Envoy parity: `None` means the
+    /// upstream cert is NOT verified (Envoy's documented — and dangerous —
+    /// default when no validation context is configured).
+    pub validation: Option<ValidationContextIR>,
+}
+
+/// One `TlsCertificate` (supported subset: chain + key from file/inline).
+#[derive(Debug)]
+pub struct TlsCertificateIR {
     pub cert_chain: DataSourceIR,
     pub private_key: DataSourceIR,
 }
 
-/// Upstream TLS origination config for a cluster (WP-08 consumes).
+/// `TlsParameters` subset. Defaults are direction-dependent in Envoy
+/// (`TLS_AUTO`): min TLSv1.2 both ways; max TLSv1.3 downstream but TLSv1.2
+/// upstream — the lowering resolves `TLS_AUTO` per direction so consumers
+/// never see "auto".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsParametersIR {
+    pub min_version: TlsVersion,
+    pub max_version: TlsVersion,
+    /// Empty = rustls defaults. Only TLS 1.2 suites are configurable
+    /// (TLS 1.3 suites are fixed — same as Envoy/BoringSSL); names are
+    /// translated and validated at lowering, so this is already
+    /// rustls-supported by construction.
+    pub cipher_suites: Vec<TlsCipherSuite>,
+    /// Empty = rustls defaults (X25519, P-256, P-384).
+    pub ecdh_curves: Vec<TlsEcdhCurve>,
+}
+
+/// TLS protocol versions we can actually speak (rustls has no 1.0/1.1;
+/// configs asking for them error at load, listing the unsupported version).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsVersion {
+    V1_2,
+    V1_3,
+}
+
+/// TLS 1.2 cipher suites supported by both Envoy's default set and rustls.
+/// Rust note: an enum (not a String) so "unsupported suite" is impossible
+/// to represent post-lowering — the name translation errored already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsCipherSuite {
+    EcdheEcdsaAes128GcmSha256,
+    EcdheRsaAes128GcmSha256,
+    EcdheEcdsaAes256GcmSha384,
+    EcdheRsaAes256GcmSha384,
+    EcdheEcdsaChacha20Poly1305,
+    EcdheRsaChacha20Poly1305,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsEcdhCurve {
+    X25519,
+    P256,
+    P384,
+}
+
+/// `CertificateValidationContext` subset.
 #[derive(Debug)]
-pub struct UpstreamTlsSpec {
-    pub sni: Option<String>,
-    /// CA bundle override; system roots when `None`.
-    pub trusted_ca: Option<DataSourceIR>,
+pub struct ValidationContextIR {
+    pub ca: CaSource,
+    /// `match_typed_subject_alt_names`: cert accepted if ANY matcher matches
+    /// ANY SAN of its type (Envoy semantics). Empty = chain trust only.
+    pub san_matchers: Vec<SanMatcherIR>,
+    pub allow_expired_certificate: bool,
+}
+
+/// Where trust anchors come from.
+#[derive(Debug)]
+pub enum CaSource {
+    /// `trusted_ca` PEM bundle.
+    TrustedCa(DataSourceIR),
+    /// `system_root_certs` — the platform trust store.
+    SystemRoots,
+}
+
+/// `SubjectAltNameMatcher` (supported SAN types only; EMAIL/OTHER_NAME are
+/// rejected at lowering).
+#[derive(Debug)]
+pub struct SanMatcherIR {
+    pub san_type: SanType,
+    pub matcher: StringMatcherIR,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SanType {
+    Dns,
+    Uri,
+    IpAddress,
+}
+
+/// `envoy.type.matcher.v3.StringMatcher` (supported subset), mirroring
+/// [`HeaderMatchKind`]'s shape: `ignore_case` per variant (Envoy has no
+/// `ignore_case` for regexes). Regexes are compiled at conversion time,
+/// same as [`PathMatch::Regex`].
+#[derive(Debug)]
+pub enum StringMatcherIR {
+    Exact {
+        value: String,
+        ignore_case: bool,
+    },
+    Prefix {
+        value: String,
+        ignore_case: bool,
+    },
+    Suffix {
+        value: String,
+        ignore_case: bool,
+    },
+    Contains {
+        value: String,
+        ignore_case: bool,
+    },
+    /// Full-string match, like Envoy's safe_regex.
+    SafeRegex(regex::Regex),
+}
+
+impl StringMatcherIR {
+    /// Envoy `StringMatcher` semantics. `ignore_case` is ASCII-only, like
+    /// Envoy's (which lowercases with `absl::AsciiStrToLower`).
+    pub fn matches(&self, input: &str) -> bool {
+        match self {
+            Self::Exact { value, ignore_case } if *ignore_case => input.eq_ignore_ascii_case(value),
+            Self::Exact { value, .. } => input == value,
+            Self::Prefix { value, ignore_case } if *ignore_case => {
+                starts_with_ignore_case(input, value)
+            }
+            Self::Prefix { value, .. } => input.starts_with(value.as_str()),
+            Self::Suffix { value, ignore_case } if *ignore_case => {
+                ends_with_ignore_case(input, value)
+            }
+            Self::Suffix { value, .. } => input.ends_with(value.as_str()),
+            Self::Contains { value, ignore_case } if *ignore_case => {
+                // Rust note: no case-insensitive `contains` in std; lowercase
+                // both sides. Allocates, but this only runs during TLS
+                // handshake SAN checks, not per-request.
+                input
+                    .to_ascii_lowercase()
+                    .contains(&value.to_ascii_lowercase())
+            }
+            Self::Contains { value, .. } => input.contains(value.as_str()),
+            Self::SafeRegex(re) => re.is_match(input),
+        }
+    }
+}
+
+fn ends_with_ignore_case(haystack: &str, suffix: &str) -> bool {
+    haystack.len() >= suffix.len()
+        && haystack.is_char_boundary(haystack.len() - suffix.len())
+        && haystack[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// `envoy.config.core.v3.DataSource` (supported subset).

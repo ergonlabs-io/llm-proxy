@@ -22,6 +22,7 @@ use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
 use proxy_api::envoy::config::listener::v3 as listener_v3;
 use proxy_api::envoy::config::route::v3 as route_v3;
+use proxy_api::envoy::extensions::filters::listener::tls_inspector::v3 as tls_inspector_v3;
 use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
@@ -104,14 +105,29 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "address",
             "filter_chains",
             "default_filter_chain",
+            "listener_filters",
             "per_connection_buffer_limit_bytes",
+            "tcp_backlog_size",
+            "bind_to_port",
         ],
+        "envoy.config.listener.v3.ListenerFilter" => &["name", "typed_config"],
         "envoy.config.listener.v3.FilterChain" => {
             &["name", "filter_chain_match", "filters", "transport_socket"]
         }
-        "envoy.config.listener.v3.FilterChainMatch" => &["destination_port", "server_names"],
+        "envoy.config.listener.v3.FilterChainMatch" => &[
+            "destination_port",
+            "prefix_ranges",
+            "server_names",
+            "transport_protocol",
+            "application_protocols",
+            "direct_source_prefix_ranges",
+            "source_type",
+            "source_prefix_ranges",
+            "source_ports",
+        ],
         "envoy.config.listener.v3.Filter" => &["name", "typed_config"],
         "envoy.config.core.v3.Address" => &["socket_address"],
+        "envoy.config.core.v3.CidrRange" => &["address_prefix", "prefix_len"],
         "envoy.config.core.v3.SocketAddress" => &["address", "port_value", "protocol"],
         "envoy.config.core.v3.TransportSocket" => &["name", "typed_config"],
         "envoy.config.core.v3.DataSource" => &["filename", "inline_string"],
@@ -130,9 +146,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.config.endpoint.v3.LocalityLbEndpoints" => &["lb_endpoints", "priority"],
         "envoy.config.endpoint.v3.LbEndpoint" => &["endpoint", "load_balancing_weight"],
         "envoy.config.endpoint.v3.Endpoint" => &["address"],
-        "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy" => {
-            &["stat_prefix", "cluster", "idle_timeout"]
-        }
+        "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy" => &[
+            "stat_prefix",
+            "cluster",
+            "idle_timeout",
+            "max_connect_attempts",
+        ],
         "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager" => {
             &["stat_prefix", "route_config", "http_filters"]
         }
@@ -154,9 +173,14 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             &["prefix", "path", "safe_regex", "case_sensitive", "headers"]
         }
         "envoy.config.route.v3.HeaderMatcher" => &["name", "string_match", "present_match"],
-        "envoy.type.matcher.v3.StringMatcher" => {
-            &["exact", "prefix", "suffix", "safe_regex", "ignore_case"]
-        }
+        "envoy.type.matcher.v3.StringMatcher" => &[
+            "exact",
+            "prefix",
+            "suffix",
+            "contains",
+            "safe_regex",
+            "ignore_case",
+        ],
         "envoy.type.matcher.v3.RegexMatcher" => &["regex", "google_re2"],
         "envoy.config.route.v3.RouteAction" => &[
             "cluster",
@@ -186,14 +210,38 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext" => {
             &["sni", "common_tls_context"]
         }
-        "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext" => &["common_tls_context"],
-        "envoy.extensions.transport_sockets.tls.v3.CommonTlsContext" => {
-            &["tls_certificates", "validation_context"]
-        }
+        "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext" => &[
+            "common_tls_context",
+            "require_client_certificate",
+            "disable_stateless_session_resumption",
+        ],
+        "envoy.extensions.transport_sockets.tls.v3.CommonTlsContext" => &[
+            "tls_params",
+            "tls_certificates",
+            "validation_context",
+            "alpn_protocols",
+        ],
+        "envoy.extensions.transport_sockets.tls.v3.TlsParameters" => &[
+            "tls_minimum_protocol_version",
+            "tls_maximum_protocol_version",
+            "cipher_suites",
+            "ecdh_curves",
+        ],
         "envoy.extensions.transport_sockets.tls.v3.TlsCertificate" => {
             &["certificate_chain", "private_key"]
         }
-        "envoy.extensions.transport_sockets.tls.v3.CertificateValidationContext" => &["trusted_ca"],
+        "envoy.extensions.transport_sockets.tls.v3.CertificateValidationContext" => &[
+            "trusted_ca",
+            "system_root_certs",
+            "match_typed_subject_alt_names",
+            "allow_expired_certificate",
+        ],
+        "envoy.extensions.transport_sockets.tls.v3.SubjectAltNameMatcher" => {
+            &["san_type", "matcher"]
+        }
+        "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector" => {
+            &["max_client_hello_size"]
+        }
         _ => return None,
     })
 }
@@ -384,6 +432,7 @@ const HCM_TYPE: &str =
 const ROUTER_TYPE: &str = "envoy.extensions.filters.http.router.v3.Router";
 const DOWNSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
 const UPSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
+const TLS_INSPECTOR_TYPE: &str = "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector";
 
 /// Envoy default for `per_connection_buffer_limit_bytes`: 1 MiB.
 const DEFAULT_CONN_BUFFER_LIMIT: u32 = 1024 * 1024;
@@ -413,21 +462,149 @@ fn convert_listener(l: &listener_v3::Listener, path: &str) -> Result<ListenerCon
             &format!("{path}.filter_chains[{i}]"),
         )?);
     }
+    // Envoy rejects two filter chains with byte-identical match criteria at
+    // listener creation; catching it here keeps the matcher total (WP-07).
+    for i in 0..filter_chains.len() {
+        for j in (i + 1)..filter_chains.len() {
+            if filter_chains[i].match_criteria == filter_chains[j].match_criteria {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "listener `{}` has duplicate filter_chain_match criteria between filter_chains[{i}] and filter_chains[{j}]",
+                        l.name
+                    ),
+                ));
+            }
+        }
+    }
+
     let default_filter_chain = l
         .default_filter_chain
         .as_ref()
         .map(|fc| convert_filter_chain(fc, &format!("{path}.default_filter_chain")))
         .transpose()?;
+    // Envoy silently ignores match criteria on default_filter_chain; ground
+    // rule #2 says we reject instead of dropping it quietly.
+    if let Some(dfc) = &default_filter_chain {
+        if dfc.match_criteria != FilterChainMatch::default() {
+            return Err(invalid(
+                format!("{path}.default_filter_chain.filter_chain_match"),
+                "default_filter_chain must not specify match criteria (Envoy ignores it; we reject it instead of silently dropping it)",
+            ));
+        }
+    }
+
+    let listener_filters =
+        convert_listener_filters(l, &filter_chains, default_filter_chain.as_ref(), path)?;
 
     Ok(ListenerConfig {
         name: l.name.clone(),
         address: SocketAddr::new(ip, port),
         filter_chains,
         default_filter_chain,
+        listener_filters,
         per_connection_buffer_limit_bytes: l
             .per_connection_buffer_limit_bytes
             .unwrap_or(DEFAULT_CONN_BUFFER_LIMIT),
+        tcp_backlog_size: l.tcp_backlog_size,
+        // Envoy default: true.
+        bind_to_port: l.bind_to_port.unwrap_or(true),
     })
+}
+
+/// Convert `Listener.listener_filters` (pre-connection filters run against
+/// the raw socket before filter-chain matching), plus Envoy's `tls_inspector`
+/// auto-injection: if no `tls_inspector` was configured explicitly but a
+/// filter chain matches on SNI/ALPN/`transport_protocol: tls`, Envoy inserts
+/// a default one so that matching still works — see the doc comment on
+/// [`ListenerFilterSpec`] and `docs/envoy-divergences.md`.
+fn convert_listener_filters(
+    l: &listener_v3::Listener,
+    filter_chains: &[FilterChainSpec],
+    default_chain: Option<&FilterChainSpec>,
+    path: &str,
+) -> Result<Vec<ListenerFilterSpec>, ConfigError> {
+    let mut out = Vec::new();
+    // Rust note: track the index of the first explicit tls_inspector (if any)
+    // so a second one can be reported with both indices, mirroring the
+    // duplicate-filter-chain-match check above.
+    let mut tls_inspector_at: Option<usize> = None;
+
+    for (i, lf) in l.listener_filters.iter().enumerate() {
+        let lf_path = format!("{path}.listener_filters[{i}]");
+        use listener_v3::listener_filter::ConfigType;
+        let any = match &lf.config_type {
+            Some(ConfigType::TypedConfig(any)) => any,
+            Some(_) => {
+                return Err(unsupported(
+                    format!("{lf_path}.config_discovery"),
+                    "listener filter config discovery (ECDS) is not implemented",
+                ))
+            }
+            None => return Err(invalid(&lf_path, "listener filter requires typed_config")),
+        };
+        let cfg_path = format!("{lf_path}.typed_config");
+
+        match type_name(any) {
+            TLS_INSPECTOR_TYPE => {
+                if let Some(prev) = tls_inspector_at {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "listener `{}` has duplicate tls_inspector listener filters at listener_filters[{prev}] and listener_filters[{i}]",
+                            l.name
+                        ),
+                    ));
+                }
+                tls_inspector_at = Some(i);
+                let ti: tls_inspector_v3::TlsInspector = decode_any(any, &cfg_path)?;
+                let max_client_hello_size = match ti.max_client_hello_size {
+                    Some(size) => {
+                        if !(256..=16384).contains(&size) {
+                            return Err(invalid(
+                                format!("{cfg_path}.max_client_hello_size"),
+                                "max_client_hello_size must be in [256, 16384]",
+                            ));
+                        }
+                        size
+                    }
+                    None => TlsInspectorConfig::default().max_client_hello_size,
+                };
+                out.push(ListenerFilterSpec::TlsInspector(TlsInspectorConfig {
+                    max_client_hello_size,
+                }));
+            }
+            _ => {
+                return Err(ConfigError::UnknownTypeUrl {
+                    field_path: cfg_path,
+                    type_url: any.type_url.clone(),
+                })
+            }
+        }
+    }
+
+    // Envoy parity: auto-insert a default tls_inspector when a filter chain
+    // matches on SNI/ALPN/`transport_protocol: tls` and none is configured —
+    // omitting it would silently make those criteria never match TLS traffic.
+    if tls_inspector_at.is_none() {
+        let needs_tls_inspector = filter_chains
+            .iter()
+            .chain(default_chain)
+            .any(|fc| filter_chain_match_needs_tls_inspector(&fc.match_criteria));
+        if needs_tls_inspector {
+            out.push(ListenerFilterSpec::TlsInspector(
+                TlsInspectorConfig::default(),
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+fn filter_chain_match_needs_tls_inspector(m: &FilterChainMatch) -> bool {
+    !m.server_names.is_empty()
+        || !m.application_protocols.is_empty()
+        || m.transport_protocol.as_deref() == Some("tls")
 }
 
 fn convert_filter_chain(
@@ -435,10 +612,7 @@ fn convert_filter_chain(
     path: &str,
 ) -> Result<FilterChainSpec, ConfigError> {
     let match_criteria = match &fc.filter_chain_match {
-        Some(m) => FilterChainMatch {
-            destination_port: m.destination_port,
-            server_names: m.server_names.clone(),
-        },
+        Some(m) => convert_filter_chain_match(m, &format!("{path}.filter_chain_match"))?,
         None => FilterChainMatch::default(),
     };
 
@@ -471,6 +645,140 @@ fn convert_filter_chain(
         match_criteria,
         transport_socket,
         filters,
+    })
+}
+
+/// The full 9-criteria `FilterChainMatch` (WP-07). `address_suffix`/`suffix_len`
+/// remain unimplemented (Envoy itself marks them `#not-implemented-hide`) and
+/// are rejected rather than silently dropped (ground rule #2).
+fn convert_filter_chain_match(
+    m: &listener_v3::FilterChainMatch,
+    path: &str,
+) -> Result<FilterChainMatch, ConfigError> {
+    if !m.address_suffix.is_empty() {
+        return Err(unsupported(
+            format!("{path}.address_suffix"),
+            "address_suffix matching is not implemented",
+        ));
+    }
+    if m.suffix_len.is_some() {
+        return Err(unsupported(
+            format!("{path}.suffix_len"),
+            "suffix_len matching is not implemented",
+        ));
+    }
+
+    if let Some(port) = m.destination_port {
+        if port > 65535 {
+            return Err(invalid(
+                format!("{path}.destination_port"),
+                "port must be <= 65535",
+            ));
+        }
+    }
+    for (i, port) in m.source_ports.iter().enumerate() {
+        if *port > 65535 {
+            return Err(invalid(
+                format!("{path}.source_ports[{i}]"),
+                "port must be <= 65535",
+            ));
+        }
+    }
+
+    for (i, name) in m.server_names.iter().enumerate() {
+        validate_server_name(name, &format!("{path}.server_names[{i}]"))?;
+    }
+
+    let prefix_ranges = convert_cidr_ranges(&m.prefix_ranges, &format!("{path}.prefix_ranges"))?;
+    let direct_source_prefix_ranges = convert_cidr_ranges(
+        &m.direct_source_prefix_ranges,
+        &format!("{path}.direct_source_prefix_ranges"),
+    )?;
+    let source_prefix_ranges = convert_cidr_ranges(
+        &m.source_prefix_ranges,
+        &format!("{path}.source_prefix_ranges"),
+    )?;
+
+    use listener_v3::filter_chain_match::ConnectionSourceType as ProtoSourceType;
+    let source_type = match ProtoSourceType::try_from(m.source_type) {
+        Ok(ProtoSourceType::Any) => SourceType::Any,
+        Ok(ProtoSourceType::SameIpOrLoopback) => SourceType::SameIpOrLoopback,
+        Ok(ProtoSourceType::External) => SourceType::External,
+        Err(_) => {
+            return Err(invalid(
+                format!("{path}.source_type"),
+                "unknown source_type enum value",
+            ))
+        }
+    };
+
+    Ok(FilterChainMatch {
+        destination_port: m.destination_port,
+        prefix_ranges,
+        server_names: m.server_names.clone(),
+        transport_protocol: (!m.transport_protocol.is_empty())
+            .then(|| m.transport_protocol.clone()),
+        application_protocols: m.application_protocols.clone(),
+        direct_source_prefix_ranges,
+        source_type,
+        source_prefix_ranges,
+        source_ports: m.source_ports.clone(),
+    })
+}
+
+/// `server_names` entries must be an exact name or a `*.`-prefixed suffix
+/// wildcard (e.g. `*.example.com`); Envoy rejects any other use of `*`
+/// (a bare `*`, `a.*.b`, `*example.com`).
+fn validate_server_name(name: &str, path: &str) -> Result<(), ConfigError> {
+    let valid = match name.strip_prefix("*.") {
+        Some(rest) => !rest.is_empty() && !rest.contains('*'),
+        None => !name.contains('*'),
+    };
+    if !valid {
+        return Err(invalid(
+            path,
+            format!(
+                "`{name}` is not a valid server name; only exact names or `*.`-prefixed suffix wildcards are supported"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn convert_cidr_ranges(
+    ranges: &[core_v3::CidrRange],
+    path: &str,
+) -> Result<Vec<CidrRange>, ConfigError> {
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(i, cr)| convert_cidr_range(cr, &format!("{path}[{i}]")))
+        .collect()
+}
+
+fn convert_cidr_range(cr: &core_v3::CidrRange, path: &str) -> Result<CidrRange, ConfigError> {
+    let addr: IpAddr = cr.address_prefix.parse().map_err(|_| {
+        invalid(
+            format!("{path}.address_prefix"),
+            format!("`{}` is not a valid IP address", cr.address_prefix),
+        )
+    })?;
+    let max_prefix: u32 = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let prefix_len = cr.prefix_len.unwrap_or(0);
+    if prefix_len > max_prefix {
+        return Err(invalid(
+            format!("{path}.prefix_len"),
+            format!("prefix_len must be <= {max_prefix} for this address family"),
+        ));
+    }
+    Ok(CidrRange {
+        addr,
+        // Rust note: `as` truncates, but the bounds check above already
+        // guarantees `prefix_len <= 128`, so no information is lost.
+        prefix_len: prefix_len as u8,
     })
 }
 
@@ -531,10 +839,18 @@ fn convert_tcp_proxy(
         // Envoy default: 1h.
         None => Some(StdDuration::from_secs(3600)),
     };
+    // Envoy default 1 (a single attempt, no retry); proto floor is 1, so a
+    // configured 0 is a validation error caught before lowering. Treat unset
+    // and 0 alike as the default rather than "zero attempts".
+    let max_connect_attempts = match tp.max_connect_attempts {
+        Some(n) if n >= 1 => n,
+        _ => 1,
+    };
     Ok(TcpProxyConfig {
         stat_prefix: tp.stat_prefix.clone(),
         cluster,
         idle_timeout,
+        max_connect_attempts,
     })
 }
 
@@ -621,31 +937,402 @@ fn convert_downstream_tls(
         .common_tls_context
         .as_ref()
         .ok_or_else(|| invalid(&cfg_path, "common_tls_context is required"))?;
-    if common.validation_context_type.is_some() {
-        return Err(unsupported(
-            format!("{cfg_path}.common_tls_context.validation_context"),
-            "client certificate verification (mTLS) is not implemented yet (WP-08)",
+    let common_path = format!("{cfg_path}.common_tls_context");
+
+    let params = convert_tls_params(
+        common.tls_params.as_ref(),
+        &format!("{common_path}.tls_params"),
+        true,
+    )?;
+    let certificates = convert_downstream_certificates(
+        &common.tls_certificates,
+        &format!("{common_path}.tls_certificates"),
+    )?;
+    let validation = convert_validation_context(common, &common_path)?;
+
+    let require_client_certificate = ctx.require_client_certificate.unwrap_or(false);
+    if require_client_certificate && validation.is_none() {
+        return Err(invalid(
+            format!("{cfg_path}.require_client_certificate"),
+            "require_client_certificate requires a validation_context",
         ));
     }
-    let [cert] = common.tls_certificates.as_slice() else {
-        return Err(invalid(
-            format!("{cfg_path}.common_tls_context.tls_certificates"),
-            "exactly one tls_certificates entry is required",
-        ));
+
+    // Rust note: `session_ticket_keys_type` is a proto oneof, so its Rust
+    // shape is `Option<enum>` — one variant per oneof member. Only the
+    // stateless-resumption bool is supported; the other members are secret
+    // material we don't handle yet (WP-22).
+    use tls_v3::downstream_tls_context::SessionTicketKeysType;
+    let disable_stateless_session_resumption = match &ctx.session_ticket_keys_type {
+        None => false,
+        Some(SessionTicketKeysType::DisableStatelessSessionResumption(b)) => *b,
+        Some(SessionTicketKeysType::SessionTicketKeys(_)) => {
+            return Err(unsupported(
+                format!("{cfg_path}.session_ticket_keys"),
+                "explicit session ticket keys are not implemented yet (WP-22)",
+            ))
+        }
+        Some(SessionTicketKeysType::SessionTicketKeysSdsSecretConfig(_)) => {
+            return Err(unsupported(
+                format!("{cfg_path}.session_ticket_keys_sds_secret_config"),
+                "SDS-delivered session ticket keys are not implemented yet (WP-22)",
+            ))
+        }
     };
-    let cert_path = format!("{cfg_path}.common_tls_context.tls_certificates[0]");
+
+    Ok(DownstreamTlsSpec {
+        certificates,
+        params,
+        alpn_protocols: common.alpn_protocols.clone(),
+        validation,
+        require_client_certificate,
+        disable_stateless_session_resumption,
+    })
+}
+
+/// Shared `TlsParameters` -> IR conversion. `downstream` picks Envoy's
+/// direction-dependent `TLS_AUTO` maximum-version default (v1.38: "By
+/// default, it's TLSv1_2 for clients and TLSv1_3 for servers").
+fn convert_tls_params(
+    tp: Option<&tls_v3::TlsParameters>,
+    path: &str,
+    downstream: bool,
+) -> Result<TlsParametersIR, ConfigError> {
+    // Rust note: an unset `TlsParameters` is equivalent to one with every
+    // field at its proto3 default (0 / empty), so we can normalize `None`
+    // into the same defaults instead of duplicating the "no params" case.
+    let empty = tls_v3::TlsParameters::default();
+    let tp = tp.unwrap_or(&empty);
+
+    let min_version = convert_tls_version(
+        tp.tls_minimum_protocol_version,
+        &format!("{path}.tls_minimum_protocol_version"),
+        TlsVersion::V1_2,
+    )?;
+    let max_default = if downstream {
+        TlsVersion::V1_3
+    } else {
+        TlsVersion::V1_2
+    };
+    let max_version = convert_tls_version(
+        tp.tls_maximum_protocol_version,
+        &format!("{path}.tls_maximum_protocol_version"),
+        max_default,
+    )?;
+    if min_version > max_version {
+        return Err(invalid(
+            path,
+            "tls_minimum_protocol_version must be <= tls_maximum_protocol_version",
+        ));
+    }
+
+    let cipher_suites = convert_cipher_suites(&tp.cipher_suites, &format!("{path}.cipher_suites"))?;
+    let ecdh_curves = convert_ecdh_curves(&tp.ecdh_curves, &format!("{path}.ecdh_curves"))?;
+
+    Ok(TlsParametersIR {
+        min_version,
+        max_version,
+        cipher_suites,
+        ecdh_curves,
+    })
+}
+
+fn convert_tls_version(
+    version: i32,
+    path: &str,
+    auto_default: TlsVersion,
+) -> Result<TlsVersion, ConfigError> {
+    use tls_v3::tls_parameters::TlsProtocol;
+    match TlsProtocol::try_from(version) {
+        Ok(TlsProtocol::TlsAuto) => Ok(auto_default),
+        Ok(TlsProtocol::TlSv12) => Ok(TlsVersion::V1_2),
+        Ok(TlsProtocol::TlSv13) => Ok(TlsVersion::V1_3),
+        Ok(TlsProtocol::TlSv10) => Err(unsupported(
+            path,
+            "TLSv1.0 is not supported; rustls does not implement TLS versions below 1.2",
+        )),
+        Ok(TlsProtocol::TlSv11) => Err(unsupported(
+            path,
+            "TLSv1.1 is not supported; rustls does not implement TLS versions below 1.2",
+        )),
+        Err(_) => Err(invalid(path, "unknown TLS protocol version enum value")),
+    }
+}
+
+/// The six TLS 1.2 ECDHE-GCM/CHACHA20 suites rustls implements, keyed by
+/// their BoringSSL/Envoy names. TLS 1.3 suites are fixed in both Envoy and
+/// rustls, so they are never configurable here.
+fn convert_cipher_suites(names: &[String], path: &str) -> Result<Vec<TlsCipherSuite>, ConfigError> {
+    let mut out = Vec::with_capacity(names.len());
+    let mut unknown = Vec::new();
+    for name in names {
+        if name.starts_with('[') {
+            return Err(unsupported(
+                path,
+                "BoringSSL equal-preference groups are not supported; list suites individually",
+            ));
+        }
+        match name.as_str() {
+            "ECDHE-ECDSA-AES128-GCM-SHA256" => out.push(TlsCipherSuite::EcdheEcdsaAes128GcmSha256),
+            "ECDHE-RSA-AES128-GCM-SHA256" => out.push(TlsCipherSuite::EcdheRsaAes128GcmSha256),
+            "ECDHE-ECDSA-AES256-GCM-SHA384" => out.push(TlsCipherSuite::EcdheEcdsaAes256GcmSha384),
+            "ECDHE-RSA-AES256-GCM-SHA384" => out.push(TlsCipherSuite::EcdheRsaAes256GcmSha384),
+            "ECDHE-ECDSA-CHACHA20-POLY1305" => out.push(TlsCipherSuite::EcdheEcdsaChacha20Poly1305),
+            "ECDHE-RSA-CHACHA20-POLY1305" => out.push(TlsCipherSuite::EcdheRsaChacha20Poly1305),
+            _ => unknown.push(name.clone()),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(unsupported(
+            path,
+            format!(
+                "unsupported cipher suite(s): {}; only ECDHE-ECDSA-AES128-GCM-SHA256, \
+                 ECDHE-RSA-AES128-GCM-SHA256, ECDHE-ECDSA-AES256-GCM-SHA384, \
+                 ECDHE-RSA-AES256-GCM-SHA384, ECDHE-ECDSA-CHACHA20-POLY1305, and \
+                 ECDHE-RSA-CHACHA20-POLY1305 are configurable (the only TLS 1.2 suites \
+                 rustls implements); TLS 1.3 suites are fixed, same as Envoy/BoringSSL",
+                unknown.join(", ")
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn convert_ecdh_curves(names: &[String], path: &str) -> Result<Vec<TlsEcdhCurve>, ConfigError> {
+    let mut out = Vec::with_capacity(names.len());
+    let mut unknown = Vec::new();
+    for name in names {
+        match name.as_str() {
+            "X25519" => out.push(TlsEcdhCurve::X25519),
+            "P-256" => out.push(TlsEcdhCurve::P256),
+            "P-384" => out.push(TlsEcdhCurve::P384),
+            _ => unknown.push(name.clone()),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(unsupported(
+            path,
+            format!(
+                "unsupported ECDH curve(s): {}; only X25519, P-256, P-384 are configurable",
+                unknown.join(", ")
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn convert_tls_certificate(
+    cert: &tls_v3::TlsCertificate,
+    path: &str,
+) -> Result<TlsCertificateIR, ConfigError> {
     let cert_chain = convert_data_source(
         cert.certificate_chain.as_ref(),
-        &format!("{cert_path}.certificate_chain"),
+        &format!("{path}.certificate_chain"),
     )?;
-    let private_key = convert_data_source(
-        cert.private_key.as_ref(),
-        &format!("{cert_path}.private_key"),
-    )?;
-    Ok(DownstreamTlsSpec {
+    let private_key =
+        convert_data_source(cert.private_key.as_ref(), &format!("{path}.private_key"))?;
+    Ok(TlsCertificateIR {
         cert_chain,
         private_key,
     })
+}
+
+/// Downstream: 1 or 2 certificates (one per key type — RSA and ECDSA — like
+/// Envoy/BoringSSL). Which entry is which key type is resolved when the
+/// rustls socket loads the keys (WP-08 chunk B), not here.
+fn convert_downstream_certificates(
+    certs: &[tls_v3::TlsCertificate],
+    path: &str,
+) -> Result<Vec<TlsCertificateIR>, ConfigError> {
+    if certs.is_empty() {
+        return Err(invalid(
+            path,
+            "at least one tls_certificates entry is required (SDS is not implemented yet — WP-22)",
+        ));
+    }
+    if certs.len() > 2 {
+        return Err(invalid(
+            path,
+            "Envoy allows at most one certificate per key type (RSA, ECDSA)",
+        ));
+    }
+    certs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| convert_tls_certificate(c, &format!("{path}[{i}]")))
+        .collect()
+}
+
+/// Upstream: at most one client (mTLS) certificate.
+fn convert_upstream_certificate(
+    certs: &[tls_v3::TlsCertificate],
+    path: &str,
+) -> Result<Option<TlsCertificateIR>, ConfigError> {
+    match certs {
+        [] => Ok(None),
+        [cert] => Ok(Some(convert_tls_certificate(
+            cert,
+            &format!("{path}[0]"),
+        )?)),
+        _ => Err(invalid(
+            path,
+            "at most one client certificate is supported (one per key type is a downstream-only concept)",
+        )),
+    }
+}
+
+/// Only the plain (static) `validation_context` oneof member is implemented;
+/// the SDS/combined/certificate-provider members are secret-delivery
+/// mechanisms that land with WP-22. In strict mode `check_supported_surface`
+/// already rejects those members before we get here (they're not in
+/// `CommonTlsContext`'s allowed-fields list) — the explicit arms below exist
+/// so this function never silently drops one if that surface check is ever
+/// relaxed.
+fn convert_validation_context(
+    common: &tls_v3::CommonTlsContext,
+    common_path: &str,
+) -> Result<Option<ValidationContextIR>, ConfigError> {
+    use tls_v3::common_tls_context::ValidationContextType;
+    match &common.validation_context_type {
+        None => Ok(None),
+        Some(ValidationContextType::ValidationContext(vc)) => Ok(Some(
+            convert_validation_context_inner(vc, &format!("{common_path}.validation_context"))?,
+        )),
+        Some(ValidationContextType::ValidationContextSdsSecretConfig(_)) => Err(unsupported(
+            format!("{common_path}.validation_context_sds_secret_config"),
+            "SDS-delivered validation contexts are not implemented yet (WP-22)",
+        )),
+        Some(ValidationContextType::CombinedValidationContext(_)) => Err(unsupported(
+            format!("{common_path}.combined_validation_context"),
+            "combined (static + SDS) validation contexts are not implemented yet (WP-22)",
+        )),
+        Some(ValidationContextType::ValidationContextCertificateProvider(_)) => Err(unsupported(
+            format!("{common_path}.validation_context_certificate_provider"),
+            "certificate-provider validation contexts are not implemented (WP-22)",
+        )),
+        Some(ValidationContextType::ValidationContextCertificateProviderInstance(_)) => {
+            Err(unsupported(
+                format!("{common_path}.validation_context_certificate_provider_instance"),
+                "certificate-provider validation contexts are not implemented (WP-22)",
+            ))
+        }
+    }
+}
+
+fn convert_validation_context_inner(
+    vc: &tls_v3::CertificateValidationContext,
+    path: &str,
+) -> Result<ValidationContextIR, ConfigError> {
+    let ca = match (&vc.trusted_ca, &vc.system_root_certs) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                path,
+                "trusted_ca and system_root_certs are mutually exclusive",
+            ))
+        }
+        (Some(ds), None) => CaSource::TrustedCa(convert_data_source(
+            Some(ds),
+            &format!("{path}.trusted_ca"),
+        )?),
+        (None, Some(_)) => CaSource::SystemRoots,
+        (None, None) => {
+            return Err(invalid(
+                path,
+                "a CA source (trusted_ca or system_root_certs) is required",
+            ))
+        }
+    };
+
+    let mut san_matchers = Vec::with_capacity(vc.match_typed_subject_alt_names.len());
+    for (i, m) in vc.match_typed_subject_alt_names.iter().enumerate() {
+        san_matchers.push(convert_san_matcher(
+            m,
+            &format!("{path}.match_typed_subject_alt_names[{i}]"),
+        )?);
+    }
+
+    Ok(ValidationContextIR {
+        ca,
+        san_matchers,
+        allow_expired_certificate: vc.allow_expired_certificate,
+    })
+}
+
+fn convert_san_matcher(
+    m: &tls_v3::SubjectAltNameMatcher,
+    path: &str,
+) -> Result<SanMatcherIR, ConfigError> {
+    use tls_v3::subject_alt_name_matcher::SanType as ProtoSanType;
+    let san_type = match ProtoSanType::try_from(m.san_type) {
+        Ok(ProtoSanType::Dns) => SanType::Dns,
+        Ok(ProtoSanType::Uri) => SanType::Uri,
+        Ok(ProtoSanType::IpAddress) => SanType::IpAddress,
+        Ok(ProtoSanType::Email) | Ok(ProtoSanType::OtherName) | Ok(ProtoSanType::Unspecified) => {
+            return Err(unsupported(
+                format!("{path}.san_type"),
+                "only DNS, URI, and IP_ADDRESS SAN types are implemented",
+            ))
+        }
+        Err(_) => {
+            return Err(invalid(
+                format!("{path}.san_type"),
+                "unknown san_type enum value",
+            ))
+        }
+    };
+    let matcher = m
+        .matcher
+        .as_ref()
+        .ok_or_else(|| invalid(format!("{path}.matcher"), "matcher is required"))?;
+    let matcher = convert_string_matcher(matcher, &format!("{path}.matcher"))?;
+    Ok(SanMatcherIR { san_type, matcher })
+}
+
+/// `envoy.type.matcher.v3.StringMatcher` -> IR. `ignore_case` only makes
+/// sense for exact/prefix/suffix/contains (the proto doc says as much);
+/// combining it with `safe_regex` is meaningless, so — per ground rule #2 —
+/// it's rejected rather than silently ignored.
+fn convert_string_matcher(
+    sm: &matcher_v3::StringMatcher,
+    path: &str,
+) -> Result<StringMatcherIR, ConfigError> {
+    use matcher_v3::string_matcher::MatchPattern;
+    let ignore_case = sm.ignore_case;
+    match &sm.match_pattern {
+        Some(MatchPattern::Exact(v)) => Ok(StringMatcherIR::Exact {
+            value: v.clone(),
+            ignore_case,
+        }),
+        Some(MatchPattern::Prefix(v)) => Ok(StringMatcherIR::Prefix {
+            value: v.clone(),
+            ignore_case,
+        }),
+        Some(MatchPattern::Suffix(v)) => Ok(StringMatcherIR::Suffix {
+            value: v.clone(),
+            ignore_case,
+        }),
+        Some(MatchPattern::Contains(v)) => Ok(StringMatcherIR::Contains {
+            value: v.clone(),
+            ignore_case,
+        }),
+        Some(MatchPattern::SafeRegex(re)) => {
+            if ignore_case {
+                return Err(invalid(
+                    path,
+                    "ignore_case cannot be combined with safe_regex",
+                ));
+            }
+            Ok(StringMatcherIR::SafeRegex(compile_regex(
+                &re.regex,
+                &format!("{path}.safe_regex.regex"),
+            )?))
+        }
+        Some(MatchPattern::Custom(_)) => Err(unsupported(
+            format!("{path}.custom"),
+            "custom string-matcher extensions are not implemented",
+        )),
+        None => Err(invalid(path, "a match pattern is required")),
+    }
 }
 
 fn convert_data_source(
@@ -801,40 +1488,35 @@ fn convert_upstream_tls(
         });
     }
     let ctx: tls_v3::UpstreamTlsContext = decode_any(any, &cfg_path)?;
-    let mut trusted_ca = None;
-    if let Some(common) = &ctx.common_tls_context {
-        if !common.tls_certificates.is_empty() {
-            return Err(unsupported(
-                format!("{cfg_path}.common_tls_context.tls_certificates"),
-                "upstream client certificates (mTLS) are not implemented yet (WP-08)",
-            ));
-        }
-        use tls_v3::common_tls_context::ValidationContextType;
-        match &common.validation_context_type {
-            Some(ValidationContextType::ValidationContext(vc)) => {
-                trusted_ca = vc
-                    .trusted_ca
-                    .as_ref()
-                    .map(|ds| {
-                        convert_data_source(
-                            Some(ds),
-                            &format!("{cfg_path}.common_tls_context.validation_context.trusted_ca"),
-                        )
-                    })
-                    .transpose()?;
-            }
-            Some(_) => {
-                return Err(unsupported(
-                    format!("{cfg_path}.common_tls_context.validation_context"),
-                    "only inline validation_context is implemented",
-                ))
-            }
-            None => {}
-        }
-    }
+
+    // Rust note: `Option::as_ref()...unwrap_or(&default)` lets the (common,
+    // params, certs, validation) conversions below run uniformly whether or
+    // not `common_tls_context` was set at all — Envoy treats an absent one as
+    // "everything at its default", same as an empty one.
+    let empty_common = tls_v3::CommonTlsContext::default();
+    let common = ctx.common_tls_context.as_ref().unwrap_or(&empty_common);
+    let common_path = format!("{cfg_path}.common_tls_context");
+
+    let params = convert_tls_params(
+        common.tls_params.as_ref(),
+        &format!("{common_path}.tls_params"),
+        false,
+    )?;
+    let client_certificate = convert_upstream_certificate(
+        &common.tls_certificates,
+        &format!("{common_path}.tls_certificates"),
+    )?;
+    // Envoy parity: no validation_context configured means the upstream
+    // certificate is NOT verified at all — dangerous, but that's the
+    // documented default, and the IR's doc comment says as much.
+    let validation = convert_validation_context(common, &common_path)?;
+
     Ok(UpstreamTlsSpec {
         sni: (!ctx.sni.is_empty()).then(|| ctx.sni.clone()),
-        trusted_ca,
+        params,
+        alpn_protocols: common.alpn_protocols.clone(),
+        client_certificate,
+        validation,
     })
 }
 

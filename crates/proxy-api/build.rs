@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto",
         "envoy/extensions/filters/http/router/v3/router.proto",
         "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.proto",
+        "envoy/extensions/filters/listener/tls_inspector/v3/tls_inspector.proto",
         "envoy/extensions/transport_sockets/tls/v3/tls.proto",
         "envoy/extensions/upstreams/http/v3/http_protocol_options.proto",
     ];

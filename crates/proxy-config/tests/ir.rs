@@ -271,7 +271,7 @@ fn unsupported_field_errors_with_path() {
 static_resources:
   listeners:
     - name: l1
-      tcp_backlog_size: 256
+      transparent: true
       address:
         socket_address: { address: 0.0.0.0, port_value: 10000 }
       filter_chains:
@@ -286,7 +286,7 @@ static_resources:
     let ConfigError::UnsupportedField { field_path, .. } = &err else {
         panic!("expected UnsupportedField, got: {err}");
     };
-    assert_eq!(field_path, "static_resources.listeners[0].tcp_backlog_size");
+    assert_eq!(field_path, "static_resources.listeners[0].transparent");
 }
 
 /// The surface check reaches inside `typed_config` Anys too.
@@ -364,7 +364,12 @@ static_resources:
     assert_eq!(cluster.endpoints[0].host, "api.openai.com");
     let tls = cluster.transport_socket.as_ref().expect("tls");
     assert_eq!(tls.sni.as_deref(), Some("api.openai.com"));
-    assert!(tls.trusted_ca.is_none()); // system roots
+    // No validation_context configured: Envoy parity means no server-cert
+    // verification at all (not even system roots).
+    assert!(tls.validation.is_none());
+    assert!(tls.client_certificate.is_none());
+    assert_eq!(tls.params.min_version, TlsVersion::V1_2);
+    assert_eq!(tls.params.max_version, TlsVersion::V1_2); // upstream TLS_AUTO default
 }
 
 /// Redirect and direct-response actions lower with Envoy defaults (301).
