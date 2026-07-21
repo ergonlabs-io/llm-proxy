@@ -7,9 +7,12 @@
 //! A rejected fixture is *data*, not a tool failure: this binary only exits
 //! nonzero on I/O/internal errors (bad fixtures dir, can't write the report).
 //!
-//! TODO(WP-27 next chunk): harvest external corpora (Envoy Gateway
-//! translator output, istioctl dumps, Gloo/Contour examples) into
-//! `fixtures/<source>/`; CI wiring to post the report as a PR comment.
+//! `fixtures/envoy-examples/` (WP-27 chunk B) harvests real static bootstraps
+//! from the pinned `envoyproxy/envoy` release tag — see its `SOURCES.md` for
+//! provenance. TODO(WP-27 next chunk): also harvest Envoy Gateway translator
+//! output, istioctl dumps, and Gloo/Contour examples into further
+//! `fixtures/<source>/` directories; CI wiring to post the report as a PR
+//! comment.
 
 use std::path::PathBuf;
 

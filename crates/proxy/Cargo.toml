@@ -9,6 +9,7 @@ name = "llm-proxy"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
 proxy-admin = { workspace = true }
 proxy-cluster = { workspace = true }
 proxy-config = { workspace = true }
@@ -16,7 +17,11 @@ proxy-core = { workspace = true }
 proxy-filters = { workspace = true }
 proxy-http = { workspace = true }
 proxy-observability = { workspace = true }
+proxy-simple-config = { workspace = true }
 proxy-xds = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -305,7 +305,7 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
                 stat_prefix: t
                 cluster: c
-                max_connect_attempts: 3
+                downstream_idle_timeout: 5s
 "#;
     let err = snapshot_from(yaml).expect_err("unsupported field must fail");
     let ConfigError::UnsupportedField { field_path, .. } = &err else {
@@ -313,7 +313,7 @@ static_resources:
     };
     assert_eq!(
         field_path,
-        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.max_connect_attempts"
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.downstream_idle_timeout"
     );
 }
 

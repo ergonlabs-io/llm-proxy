@@ -306,12 +306,53 @@ mod tests {
     #[test]
     fn scorecard_runs_over_seeded_fixtures() {
         let results = run_scorecard(&fixtures_dir()).unwrap();
-        assert_eq!(results.len(), 3);
-        // Sorted by (source, name): all fixtures share `local`, so this is
-        // alphabetical by file stem.
-        assert_eq!(results[0].name, "malformed");
-        assert_eq!(results[1].name, "rejected-circuit-breakers");
-        assert_eq!(results[2].name, "tcp-proxy");
+        // Results are sorted by `(source, name)`, and `envoy-examples` sorts
+        // before `local`, so the seeded `local/` fixtures are the last three
+        // — restrict to them so this test doesn't churn every time the
+        // harvested corpus grows.
+        let local: Vec<_> = results.iter().filter(|r| r.source == "local").collect();
+        assert_eq!(local.len(), 3);
+        assert_eq!(local[0].name, "malformed");
+        assert_eq!(local[1].name, "rejected-circuit-breakers");
+        assert_eq!(local[2].name, "tcp-proxy");
+    }
+
+    /// WP-27 chunk B: the scorecard must discover the harvested
+    /// `envoy-examples` source alongside `local`, and every fixture in it
+    /// must classify as `FullySupported` or `RejectedWithPath` — real Envoy
+    /// bootstraps should never hit `ParseError` (that class is reserved for
+    /// malformed bytes, not unsupported-but-well-formed fields), since a
+    /// `ParseError` there would suggest a loader bug rather than a
+    /// documented compat gap.
+    #[test]
+    fn scorecard_discovers_harvested_envoy_examples() {
+        let results = run_scorecard(&fixtures_dir()).unwrap();
+
+        let local_count = results.iter().filter(|r| r.source == "local").count();
+        assert_eq!(local_count, 3, "existing local/ fixtures must stay intact");
+
+        let envoy_examples: Vec<_> = results
+            .iter()
+            .filter(|r| r.source == "envoy-examples")
+            .collect();
+        assert!(
+            envoy_examples.len() >= 12,
+            "expected a curated set of harvested Envoy bootstraps, got {}",
+            envoy_examples.len()
+        );
+
+        for result in &envoy_examples {
+            assert!(
+                !matches!(result.outcome, Outcome::ParseError { .. }),
+                "envoy-examples/{} unexpectedly hit ParseError: {:?} \
+                 (real bootstraps should reject with a field path, not fail to parse)",
+                result.name,
+                result.outcome
+            );
+        }
+
+        // Overall total grew beyond just the local/ seed fixtures.
+        assert!(results.len() > local_count);
     }
 
     #[test]

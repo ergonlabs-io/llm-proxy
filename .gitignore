@@ -2,6 +2,10 @@
 *.pb.bin
 testing/diffrig/captures/
 
-# Planning docs stay local-only for now — track only README.md
+# Planning docs stay local-only for now — track only README.md, CLAUDE.md,
+# the agent definitions under .claude/, and corpus provenance records.
 *.md
 !README.md
+!CLAUDE.md
+!.claude/**/*.md
+!testing/corpus/fixtures/**/SOURCES.md

@@ -1,0 +1,151 @@
+//! WP-10 chunk B -- the `StreamHandler` seam: the boundary between the
+//! downstream HTTP codec ([`crate::codec`]) and whatever produces a response
+//! for a request. This is **provisional**: WP-11's filter manager will
+//! implement (and likely refine) this trait behind the S2 iteration state
+//! machine described in IMPLEMENTATION_PLAN.md. Until then, [`stub`] provides
+//! two concrete handlers ([`stub::FixedResponseHandler`],
+//! [`stub::EchoHandler`]) that exercise the seam end-to-end for the codec's
+//! own tests.
+
+use std::future::Future;
+use std::pin::Pin;
+
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+
+use crate::filter::{RequestHeaders, ResponseHeaders};
+
+/// A body read failure, downstream (reading the request) or upstream
+/// (reading/producing the response) of the seam. Boxed so it can wrap
+/// whatever the concrete body implementation (hyper's `Incoming`, a stub's
+/// channel, etc.) actually produces, without coupling this module to any of
+/// them.
+#[derive(Debug, thiserror::Error)]
+pub enum BodyError {
+    #[error("failed to read request body: {0}")]
+    Downstream(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("failed to read response body: {0}")]
+    Upstream(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// A streaming HTTP body (request or response), boxed. Carries data frames
+/// and a final optional trailers frame, per the `http_body` model. Boxing
+/// (rather than naming a concrete type) is what lets this module -- and
+/// [`StreamHandler`] implementors -- stay decoupled from hyper's `Incoming`
+/// body type (ground rule-adjacent: the codec is the only place that talks
+/// hyper).
+pub type StreamBody = BoxBody<Bytes, BodyError>;
+
+/// A fully parsed request: head (reusing [`crate::filter::RequestHeaders`])
+/// plus its streaming body.
+pub struct HttpRequestParts {
+    pub head: RequestHeaders,
+    pub body: StreamBody,
+}
+
+/// A response to write back: head (reusing [`crate::filter::ResponseHeaders`])
+/// plus its streaming body.
+pub struct HttpResponseParts {
+    pub head: ResponseHeaders,
+    pub body: StreamBody,
+}
+
+/// One per HTTP connection manager instance. The codec calls `handle` once
+/// per downstream request; the returned response (head + streaming body) is
+/// written back incrementally as it's produced (see `codec`'s early-flush
+/// handling). Trailers ride the `StreamBody`'s final frame, both ways -- there
+/// is no separate trailer field.
+///
+/// Rust note: this is worker-local / `!Send` (ADR-0003: the data plane never
+/// hops threads), so implementations may freely use `Rc`/`RefCell` internally
+/// -- do not add a `Send` bound here. `handle` returns a boxed, pinned future
+/// (`Pin<Box<dyn Future<...>>>`) instead of being declared `async fn` in the
+/// trait: `async fn` in traits desugars to an *anonymous* associated type,
+/// which makes the trait not object-safe (you can't build a vtable when the
+/// return type depends on the concrete `Self`). We need trait objects here --
+/// `Rc<dyn StreamHandler>` -- because which handler runs is decided by
+/// listener config, not known at compile time. Boxing the future by hand is
+/// the standard workaround until `async fn` in trait objects lands upstream.
+pub trait StreamHandler {
+    fn handle<'a>(
+        &'a self,
+        req: HttpRequestParts,
+    ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>>;
+}
+
+pub mod stub {
+    //! Concrete [`super::StreamHandler`]s used to smoke-test the codec
+    //! end-to-end (real routing/filtering is WP-11/12/13). These are plain
+    //! fixtures, not test-only mocks -- kept here (rather than under
+    //! `#[cfg(test)]`) so other crates can reuse them too.
+
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use bytes::Bytes;
+    use http::{HeaderMap, StatusCode};
+    use http_body_util::{BodyExt, Full};
+
+    use super::{HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
+    use crate::filter::ResponseHeaders;
+
+    /// Always returns the same fixed status/headers/body, ignoring (and
+    /// fully draining) the request body -- proves the basic request/response
+    /// path through the seam.
+    pub struct FixedResponseHandler {
+        pub status: StatusCode,
+        pub headers: HeaderMap,
+        pub body: Bytes,
+    }
+
+    impl StreamHandler for FixedResponseHandler {
+        fn handle<'a>(
+            &'a self,
+            req: HttpRequestParts,
+        ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
+            Box::pin(async move {
+                // Drain (and discard) the request body so the downstream
+                // connection isn't left with unread bytes -- mirrors what a
+                // real handler that never reads the body must still do.
+                let _ = req.body.collect().await;
+
+                let body: StreamBody = Full::new(self.body.clone())
+                    .map_err(|infallible: std::convert::Infallible| match infallible {})
+                    .boxed();
+                HttpResponseParts {
+                    head: ResponseHeaders {
+                        status: self.status,
+                        headers: self.headers.clone(),
+                    },
+                    body,
+                }
+            })
+        }
+    }
+
+    /// Streams the request body straight back as the response body (status
+    /// 200) -- proves bidirectional streaming through the seam: the response
+    /// is produced by forwarding the request body's frames as they arrive,
+    /// not by buffering it first.
+    pub struct EchoHandler;
+
+    impl StreamHandler for EchoHandler {
+        fn handle<'a>(
+            &'a self,
+            req: HttpRequestParts,
+        ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
+            Box::pin(async move {
+                // `req.body` is already a `StreamBody` (`BoxBody<Bytes,
+                // BodyError>`), i.e. exactly the type we need to hand back --
+                // no re-wrapping needed, just move it into the response.
+                HttpResponseParts {
+                    head: ResponseHeaders {
+                        status: StatusCode::OK,
+                        headers: HeaderMap::new(),
+                    },
+                    body: req.body,
+                }
+            })
+        }
+    }
+}

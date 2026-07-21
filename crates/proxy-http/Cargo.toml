@@ -10,6 +10,23 @@ proxy-observability = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 prost-reflect = { workspace = true }
+# WP-10 chunk B: the downstream h1 codec and the StreamHandler seam.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "time", "sync"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Rust note: these power the WP-10 chunk A hyper capability spike
+# (tests/hyper_spike.rs) only -- the real data-plane dependency surface above
+# is untouched.
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }
+# h2 isn't a workspace dependency; pinned here to match the version hyper 1.x
+# pulls in, purely so the spike can downcast a hyper::Error into h2::Error to
+# inspect RST_STREAM reasons (capability (c)).
+h2 = "0.4"
 
 [lints]
 workspace = true

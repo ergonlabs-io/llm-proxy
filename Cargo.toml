@@ -59,8 +59,21 @@ serde_yaml = "0.9"
 serde_path_to_error = "0.1"
 
 # TLS (WP-08)
-rustls = "0.23"
-tokio-rustls = "0.26"
+# Rust note: `ring` (not `aws-lc-rs`) is the crypto provider so builds don't
+# need a cmake/NASM toolchain; `logging` wires rustls into the `log` facade.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+rcgen = "0.13"
+# Rust note: only used to pull Subject Alternative Names out of the raw DER
+# rustls hands our verifiers -- pure Rust, no cmake, so it fits alongside the
+# `ring` crypto provider choice above.
+x509-parser = "0.16"
+# Rust note: only used by the `tls_inspector` listener filter to parse a raw
+# ClientHello (SNI + ALPN) off the wire before the real TLS handshake runs --
+# pure Rust, no cmake, matching the rest of the TLS stack's toolchain choice.
+tls-parser = "0.12"
 
 # Utilities
 arc-swap = "1"
@@ -72,6 +85,7 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 rand = "0.8"
 core_affinity = "0.8"
+socket2 = "0.5"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
