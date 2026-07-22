@@ -24,7 +24,9 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::filter::{RequestHeaders, ResponseHeaders};
-use crate::handler::{BodyError, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
+use crate::handler::{
+    local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler,
+};
 
 /// Per-connection h1 options. Room to grow (header/body size limits) as
 /// later chunks need them.
@@ -120,14 +122,12 @@ async fn serve_one(handler: &dyn StreamHandler, req: Request<Incoming>) -> Respo
         headers: parts.headers,
     };
     // Rust note: `BodyExt::map_err` adapts `Incoming`'s error type
-    // (`hyper::Error`) to our `BodyError`, then `.boxed()` erases the
+    // (`hyper::Error`) to our `BodyError`, then `local_boxed` erases the
     // concrete (now-adapted) body type into `StreamBody` -- this is the one
     // and only place downstream `Incoming` is named; everything past this
     // point (the handler, and the rest of this crate) only ever sees
     // `StreamBody`.
-    let body: StreamBody = incoming
-        .map_err(|e| BodyError::Downstream(Box::new(e)))
-        .boxed();
+    let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Downstream(Box::new(e))));
 
     let response = handler.handle(HttpRequestParts { head, body }).await;
     build_response(response)

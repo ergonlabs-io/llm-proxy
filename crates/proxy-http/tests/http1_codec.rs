@@ -19,6 +19,7 @@ use hyper_util::rt::TokioIo;
 use proxy_http::codec::{serve_http1, Http1Options};
 use proxy_http::filter::ResponseHeaders;
 use proxy_http::handler::{
+    local_boxed,
     stub::{EchoHandler, FixedResponseHandler},
     HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler,
 };
@@ -180,9 +181,9 @@ impl StreamHandler for SlowChunkedHandler {
                     .unwrap();
             });
             let stream = stream::poll_fn(move |cx| rx.poll_recv(cx));
-            let body: StreamBody = HttpStreamBody::new(stream)
-                .map_err(|infallible: Infallible| match infallible {})
-                .boxed();
+            let body: StreamBody = local_boxed(
+                HttpStreamBody::new(stream).map_err(|infallible: Infallible| match infallible {}),
+            );
             HttpResponseParts {
                 head: ResponseHeaders {
                     status: StatusCode::OK,
@@ -388,9 +389,10 @@ impl StreamHandler for SlowHandler {
     ) -> std::pin::Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
-            let body: StreamBody = Full::new(Bytes::from_static(b"done"))
-                .map_err(|infallible: Infallible| match infallible {})
-                .boxed();
+            let body: StreamBody = local_boxed(
+                Full::new(Bytes::from_static(b"done"))
+                    .map_err(|infallible: Infallible| match infallible {}),
+            );
             HttpResponseParts {
                 head: ResponseHeaders {
                     status: StatusCode::OK,

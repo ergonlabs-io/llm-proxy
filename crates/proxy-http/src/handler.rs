@@ -11,7 +11,6 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
 
 use crate::filter::{RequestHeaders, ResponseHeaders};
 
@@ -34,7 +33,35 @@ pub enum BodyError {
 /// [`StreamHandler`] implementors -- stay decoupled from hyper's `Incoming`
 /// body type (ground rule-adjacent: the codec is the only place that talks
 /// hyper).
-pub type StreamBody = BoxBody<Bytes, BodyError>;
+///
+/// Deliberately **not** `Send` (ADR-0003: the data plane never hops threads).
+/// `http_body_util::combinators::BoxBody` requires `Send + Sync`, and its
+/// `UnsyncBoxBody` variant still requires `Send` -- so neither can hold `!Send`
+/// per-stream filter state (e.g. a `Box<dyn HttpFilter>` owning `Rc`/`RefCell`)
+/// inside a streaming body, which is exactly what streaming a response through
+/// the filter chain needs (WP-11). This hand-rolled alias drops both bounds;
+/// hyper's http1 server only requires `B: Body + 'static`, not `B: Send`.
+///
+/// NOTE(WP-10 h2 chunk): this was verified against hyper's **http1** server
+/// bounds. Re-check the http2 path's bounds before wiring h2 downstream -- if
+/// it demands `B: Send`, the streaming filter pump needs a different shape
+/// (a spawn_local'd pump owning the filters, feeding a channel-backed body).
+pub type StreamBody = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = BodyError>>>;
+
+/// Box and pin a concrete body into a [`StreamBody`].
+///
+/// Rust note: this is a plain `Box::pin` rather than `BodyExt::boxed()`
+/// because `boxed()` returns `http_body_util::combinators::BoxBody`, which
+/// requires the body to be `Send + Sync` -- exactly the bound `StreamBody`
+/// exists to avoid. `Box::pin` erases the concrete type into `Pin<Box<dyn
+/// Body<..>>>` without adding any auto-trait requirements beyond what `B`
+/// already has.
+pub fn local_boxed<B>(body: B) -> StreamBody
+where
+    B: hyper::body::Body<Data = Bytes, Error = BodyError> + 'static,
+{
+    Box::pin(body)
+}
 
 /// A fully parsed request: head (reusing [`crate::filter::RequestHeaders`])
 /// plus its streaming body.
@@ -86,7 +113,7 @@ pub mod stub {
     use http::{HeaderMap, StatusCode};
     use http_body_util::{BodyExt, Full};
 
-    use super::{HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
+    use super::{local_boxed, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
     use crate::filter::ResponseHeaders;
 
     /// Always returns the same fixed status/headers/body, ignoring (and
@@ -109,9 +136,10 @@ pub mod stub {
                 // real handler that never reads the body must still do.
                 let _ = req.body.collect().await;
 
-                let body: StreamBody = Full::new(self.body.clone())
-                    .map_err(|infallible: std::convert::Infallible| match infallible {})
-                    .boxed();
+                let body: StreamBody = local_boxed(
+                    Full::new(self.body.clone())
+                        .map_err(|infallible: std::convert::Infallible| match infallible {}),
+                );
                 HttpResponseParts {
                     head: ResponseHeaders {
                         status: self.status,
@@ -147,5 +175,40 @@ pub mod stub {
                 }
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+
+    use super::{local_boxed, StreamBody};
+
+    /// The property this seam's hand-rolled [`StreamBody`] alias exists for:
+    /// a body capturing `!Send` state must be storable in it.
+    ///
+    /// Without this test, swapping `StreamBody` back to
+    /// `http_body_util::combinators::BoxBody` would still compile every other
+    /// test in the workspace, while silently making streaming a response
+    /// through the (`!Send`, ADR-0003) filter chain impossible to express.
+    /// Here `Rc` stands in for the per-stream filter state a streaming body
+    /// will own in WP-11 chunk 3.
+    #[test]
+    fn stream_body_can_hold_non_send_state() {
+        let not_send: Rc<u8> = Rc::new(7);
+        // Rust note: the `map_err` closure captures `not_send` (an `Rc`), which
+        // makes the whole body `!Send`. That `local_boxed` accepts it at all is
+        // the assertion -- a compile-time proof. Swapping `StreamBody` back to
+        // `BoxBody`/`UnsyncBoxBody` fails to compile right here.
+        let body: StreamBody = local_boxed(Full::new(Bytes::from_static(b"x")).map_err(
+            move |infallible: std::convert::Infallible| {
+                let _keep = &not_send;
+                match infallible {}
+            },
+        ));
+        assert!(!body.is_end_stream());
     }
 }

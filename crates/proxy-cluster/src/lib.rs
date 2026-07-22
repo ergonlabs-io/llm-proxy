@@ -11,6 +11,11 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
+pub mod discovery;
+pub mod host_set;
+pub mod manager;
+pub mod resolver;
+
 /// Envoy routing priority: selects the circuit-breaker bucket (S5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoutingPriority {
@@ -25,13 +30,30 @@ pub enum UpstreamProtocol {
     Http2,
 }
 
+/// A host's health, as tracked by active health checking. Every host starts
+/// (and, until WP-18 lands, stays) `Healthy` -- discovery (WP-16) never
+/// itself marks a host unhealthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealthStatus {
+    #[default]
+    Healthy,
+    // TODO(WP-18): Unhealthy (failing active health checks) and the
+    // outlier-detection ejection states (WP-19).
+    Unhealthy,
+}
+
 /// An upstream endpoint. Host sets are built on the control runtime (WP-16) and
 /// shared with workers as immutable snapshots.
 #[derive(Debug)]
 pub struct Host {
     pub address: SocketAddr,
     pub weight: u32,
-    // TODO(WP-16): locality, metadata, health status, outlier ejection state.
+    /// Failover priority this host belongs to; 0 = primary (S5/S7).
+    pub priority: u32,
+    /// TODO(WP-18): flips to `Unhealthy` on failed active health checks;
+    /// TODO(WP-19): outlier-detection ejection state.
+    pub health: HealthStatus,
+    // TODO(WP-16+): locality, metadata.
 }
 
 /// Per-request input to host selection (S7).

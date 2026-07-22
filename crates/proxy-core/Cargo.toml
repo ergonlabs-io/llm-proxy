@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 proxy-config = { workspace = true }
+proxy-http = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
 core_affinity = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }

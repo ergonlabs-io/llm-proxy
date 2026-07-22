@@ -160,7 +160,13 @@ pub trait EncoderCallbacks {
 /// implements only the callbacks it cares about — the Rust equivalent of Envoy's
 /// `PassThroughFilter` base class. Parameters in defaults are `_`-prefixed to
 /// tell the compiler "unused on purpose".
-pub trait HttpFilter: Send {
+///
+/// Rust note: intentionally NOT `Send` (ADR-0003). A filter instance is created
+/// per stream and lives entirely on one worker's `!Send` runtime, so it may hold
+/// `Rc`/`RefCell` and share worker-local state freely; it never crosses threads.
+/// Only the config-time plumbing that DOES cross threads — [`FilterInstanceFactory`],
+/// [`HttpFilterFactory`], [`PerRouteConfig`] — carries `Send + Sync`.
+pub trait HttpFilter {
     fn decode_headers(
         &mut self,
         _cb: &mut dyn DecoderCallbacks,

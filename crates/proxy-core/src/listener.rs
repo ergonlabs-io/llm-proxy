@@ -24,10 +24,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use proxy_config::ir::{
-    ListenerConfig, ListenerFilterSpec, ListenerName, NetworkFilterSpec, SnapshotVersion,
+    HttpConnectionManagerConfig, ListenerConfig, ListenerFilterSpec, ListenerName,
+    NetworkFilterSpec, SnapshotVersion,
 };
 use proxy_config::ConfigSnapshot;
+use proxy_http::codec::{serve_http1, Http1Options};
+use proxy_http::handler::stub::FixedResponseHandler;
+use proxy_http::handler::StreamHandler;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -539,8 +544,13 @@ async fn serve_connection(conn: ServeConnection) {
 /// `net_filter`'s module doc).
 enum TerminalFilter {
     TcpProxy(TcpProxyParams),
-    /// HTTP connection manager L4 entry isn't implemented yet (WP-10/11).
-    Unimplemented,
+    /// HTTP connection manager: the codec-facing `StreamHandler` is built
+    /// eagerly here (see `build_hcm_handler`), while `matched` (and the
+    /// `HttpConnectionManagerConfig` it borrows from) is still in scope --
+    /// this is what lets `TerminalFilter` be a self-contained, owned value
+    /// the caller can hold across the `stream` move, same as `TcpProxy`'s
+    /// `TcpProxyParams` above.
+    Http(Rc<dyn StreamHandler>),
 }
 
 fn terminal_filter(
@@ -554,22 +564,42 @@ fn terminal_filter(
             max_connect_attempts: tp.max_connect_attempts,
             buffer_limit,
         })),
-        NetworkFilterSpec::HttpConnectionManager(_) => Some(TerminalFilter::Unimplemented),
+        NetworkFilterSpec::HttpConnectionManager(hcm) => {
+            Some(TerminalFilter::Http(build_hcm_handler(hcm)))
+        }
     }
 }
 
-/// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy`
-/// path this registers the connection guard and runs the proxy to
-/// completion, consuming `stream` and returning `None`. On the
-/// not-yet-implemented / no-filter paths it logs and hands `stream` back so
-/// the caller can decide how to close it (a plaintext `TcpStream` can be
-/// `reset`; a `TlsStream` is just dropped -- see the call sites).
-async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin>(
+/// Build the `StreamHandler` the downstream h1 codec (`proxy_http::codec`)
+/// drives for one HTTP connection manager terminal filter.
+///
+/// TODO(WP-11/WP-13): replace the stub with the real filter manager + router
+/// built from `hcm` (route_table, http_filters).
+fn build_hcm_handler(hcm: &HttpConnectionManagerConfig) -> Rc<dyn StreamHandler> {
+    // Rust note: `hcm` is unused by the stub but kept as a parameter so the
+    // seam already has the shape the real implementation needs.
+    let _ = hcm;
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-llmproxy-stub", http::HeaderValue::from_static("hcm"));
+    Rc::new(FixedResponseHandler {
+        status: http::StatusCode::OK,
+        headers,
+        body: Bytes::from_static(b"llm-proxy: HTTP routing not yet implemented (WP-11/13)\n"),
+    })
+}
+
+/// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy` and
+/// `Http` paths this registers the connection guard and runs to completion,
+/// consuming `stream` and returning `None`. On the no-filter path it logs and
+/// hands `stream` back so the caller can decide how to close it (a plaintext
+/// `TcpStream` can be `reset`; a `TlsStream` is just dropped -- see the call
+/// sites).
+async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + 'static>(
     stream: IO,
     filter: Option<TerminalFilter>,
     snapshot: Arc<ConfigSnapshot>,
     registry: &ConnectionRegistry,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
     name: &ListenerName,
     peer: SocketAddr,
 ) -> Option<IO> {
@@ -579,9 +609,35 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin>(
             tcp_proxy::proxy_connection(stream, snapshot, params, guard, shutdown).await;
             None
         }
-        Some(TerminalFilter::Unimplemented) => {
-            tracing::warn!(listener = %name, peer = %peer, "HTTP connection manager L4 entry not implemented yet (WP-10); resetting connection");
-            Some(stream)
+        Some(TerminalFilter::Http(handler)) => {
+            // Held for the whole HTTP connection's lifetime -- same role as
+            // `tcp_proxy`'s guard above -- so drain accounting sees this
+            // connection as live until the codec returns.
+            let _guard = registry.register();
+
+            // Rust note: `serve_http1` wants an `impl Future<Output = ()>`,
+            // not a `watch::Receiver` directly (it's decoupled from
+            // proxy-core's drain machinery on purpose -- see its doc
+            // comment). `changed()` only ever resolves once in practice (the
+            // sender flips `false` -> `true` exactly once, at drain time),
+            // but the loop guards against spurious/duplicate notifications
+            // rather than assuming that.
+            let shutdown_fut = async move {
+                if *shutdown.borrow() {
+                    return;
+                }
+                while shutdown.changed().await.is_ok() {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+            };
+
+            let options = Http1Options { keep_alive: true };
+            if let Err(err) = serve_http1(stream, handler, options, shutdown_fut).await {
+                tracing::debug!(listener = %name, peer = %peer, error = %err, "http/1.1 connection ended with an error");
+            }
+            None
         }
         None => {
             tracing::debug!(listener = %name, peer = %peer, "matched chain has no terminal filter; resetting connection");
@@ -763,6 +819,20 @@ mod tests {
             cluster: cluster.to_string(),
             idle_timeout,
             max_connect_attempts: 1,
+        })
+    }
+
+    /// A minimal `http_connection_manager` filter -- an empty route table (no
+    /// virtual hosts) and no http_filters. The stub `build_hcm_handler` never
+    /// looks at either, but the shape matters for the WP-11/13 seam.
+    fn hcm_filter() -> NetworkFilterSpec {
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: Arc::new(
+                proxy_config::ir::RouteTable::new("test-routes".to_string(), vec![])
+                    .expect("empty route table can't have duplicate domains"),
+            ),
+            http_filters: vec![],
         })
     }
 
@@ -1901,6 +1971,49 @@ mod tests {
                 .expect("read should not time out")
                 .expect("read_exact should succeed");
             assert_eq!(echoed, payload);
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-10 deferred chunk: HCM terminal filter wired to the h1 codec ----
+
+    #[test]
+    fn hcm_terminal_filter_serves_http_over_the_real_socket() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = match_all_listener_with_filter("l1", addr, hcm_filter());
+            let harness = spawn_manager(snapshot_with(listener_ir, 1));
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            // `Connection: close` so the server (keep-alive is on by default)
+            // closes after this response instead of idling open -- lets this
+            // test read to EOF rather than needing to parse a Content-Length.
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {response:?}"
+            );
+            assert!(
+                response.contains("x-llmproxy-stub"),
+                "expected the stub marker header, got: {response:?}"
+            );
 
             harness.shutdown().await;
         });

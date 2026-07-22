@@ -83,6 +83,17 @@ fn spawn_line_reader(
     rx
 }
 
+/// How long to wait for a freshly spawned `llm-proxy` process to reach a
+/// startup milestone (bind its listener / log "started").
+///
+/// Deliberately generous: this is wall-clock time for an unoptimized debug
+/// binary to start on a machine that, under `make ci`, is simultaneously
+/// running every other crate's test binaries. A 5s budget here was observed to
+/// pass standalone but flake inside the full gate. The timeout is a
+/// liveness backstop, not an assertion about speed -- the test still fails if
+/// the process never binds, it just doesn't fail because the box was busy.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Waits (with a timeout) for a line matching `needle` to arrive on `rx`,
 /// returning `true` if found. Non-matching lines are discarded.
 fn wait_for_line(rx: &mpsc::Receiver<String>, needle: &str, timeout: Duration) -> bool {
@@ -122,7 +133,7 @@ fn sigterm_drains_then_exits_cleanly() {
     // open across the whole SIGTERM/drain/exit sequence, not just until the
     // startup line shows up.
     let rx = spawn_line_reader(BufReader::new(stderr));
-    let found = wait_for_line(&rx, "llm-proxy started", Duration::from_secs(5));
+    let found = wait_for_line(&rx, "llm-proxy started", STARTUP_TIMEOUT);
     assert!(found, "startup line did not appear on stderr in time");
 
     // `Child::kill` sends SIGKILL, not SIGTERM -- shell out to `kill -TERM`
@@ -209,7 +220,7 @@ static_resources:
 
     let stderr = child.stderr.take().expect("child stderr not piped");
     let rx = spawn_line_reader(BufReader::new(stderr));
-    let found = wait_for_line(&rx, "listener bound", Duration::from_secs(5));
+    let found = wait_for_line(&rx, "listener bound", STARTUP_TIMEOUT);
     assert!(
         found,
         "listener-bound line did not appear on stderr in time"

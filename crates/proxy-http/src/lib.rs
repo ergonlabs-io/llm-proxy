@@ -22,6 +22,7 @@
 
 pub mod codec;
 pub mod filter;
+pub mod filter_manager;
 pub mod handler;
 pub mod stream_info;
 
@@ -30,5 +31,6 @@ pub use filter::{
     FilterDataStatus, FilterHeadersStatus, FilterRegistry, FilterTrailersStatus, HttpFilter,
     HttpFilterFactory,
 };
+pub use filter_manager::{FilterChainHandler, DEFAULT_BUFFER_LIMIT};
 pub use handler::{BodyError, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
 pub use stream_info::StreamInfo;

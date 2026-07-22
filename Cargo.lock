@@ -1191,11 +1191,13 @@ dependencies = [
 name = "proxy-cluster"
 version = "0.0.1"
 dependencies = [
+ "arc-swap",
  "futures",
  "proxy-config",
  "proxy-core",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1224,7 +1226,9 @@ dependencies = [
  "bytes",
  "core_affinity",
  "futures",
+ "http",
  "proxy-config",
+ "proxy-http",
  "rcgen",
  "regex",
  "rustls",
@@ -1243,7 +1247,10 @@ dependencies = [
 name = "proxy-filters"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "proxy-http",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
