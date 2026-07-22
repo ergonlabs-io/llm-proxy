@@ -11,3 +11,5 @@
 //!   - WP-36: Gateway API Inference Extension endpoint-picker support.
 //!   - WP-37: realtime WebSocket sessions (session-pinned routing, frame-aware
 //!     token metering, session quotas, Close-frame drains) — Appendix S10.
+
+pub mod usage;

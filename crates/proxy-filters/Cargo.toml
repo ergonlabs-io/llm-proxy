@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 proxy-http = { workspace = true }
+# WP-34 (Lane H): usage/token extraction from provider responses.
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 # Each non-core filter lands behind a feature flag (default-on set decided in WP-31).
