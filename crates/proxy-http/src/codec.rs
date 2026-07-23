@@ -25,7 +25,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{
-    local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler,
+    local_boxed, BodyError, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody,
+    StreamHandler,
 };
 
 /// Per-connection h1 options. Room to grow (header/body size limits) as
@@ -67,6 +68,7 @@ pub async fn serve_http1<IO>(
     handler: Rc<dyn StreamHandler>,
     options: Http1Options,
     shutdown: impl Future<Output = ()>,
+    downstream: DownstreamInfo,
 ) -> Result<(), CodecError>
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -76,10 +78,11 @@ where
     // Rust note: `service_fn` requires an `Fn`, so the closure below only
     // ever *borrows* `handler` (via `.clone()` of the `Rc`, a pointer bump)
     // rather than consuming it -- it's called once per request on this
-    // connection, an unbounded number of times.
+    // connection, an unbounded number of times. `downstream` is `Copy`, so
+    // each invocation gets its own duplicate rather than a shared borrow.
     let service = service_fn(move |req: Request<Incoming>| {
         let handler = handler.clone();
-        async move { Ok::<_, std::convert::Infallible>(serve_one(&*handler, req).await) }
+        async move { Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream).await) }
     });
 
     let mut builder = hyper::server::conn::http1::Builder::new();
@@ -220,7 +223,11 @@ where
 /// Convert one `hyper::Request<Incoming>` into [`HttpRequestParts`], hand it
 /// to `handler`, and convert the resulting [`HttpResponseParts`] back into a
 /// `hyper::Response<StreamBody>`.
-async fn serve_one(handler: &dyn StreamHandler, req: Request<Incoming>) -> Response<StreamBody> {
+async fn serve_one(
+    handler: &dyn StreamHandler,
+    req: Request<Incoming>,
+    downstream: DownstreamInfo,
+) -> Response<StreamBody> {
     let (parts, incoming) = req.into_parts();
     let head = RequestHeaders {
         method: parts.method,
@@ -235,7 +242,13 @@ async fn serve_one(handler: &dyn StreamHandler, req: Request<Incoming>) -> Respo
     // `StreamBody`.
     let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Downstream(Box::new(e))));
 
-    let response = handler.handle(HttpRequestParts { head, body }).await;
+    let response = handler
+        .handle(HttpRequestParts {
+            head,
+            body,
+            downstream,
+        })
+        .await;
     build_response(response)
 }
 

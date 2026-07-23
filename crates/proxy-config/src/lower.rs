@@ -152,9 +152,14 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "idle_timeout",
             "max_connect_attempts",
         ],
-        "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager" => {
-            &["stat_prefix", "route_config", "http_filters"]
-        }
+        "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager" => &[
+            "stat_prefix",
+            "route_config",
+            "http_filters",
+            "generate_request_id",
+            "use_remote_address",
+            "xff_num_trusted_hops",
+        ],
         "envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter" => {
             &["name", "typed_config"]
         }
@@ -965,10 +970,25 @@ fn convert_hcm(
         }
     }
 
+    // Envoy default true; the proto field is a `BoolValue`, so unset means
+    // "generate" and a present value takes precedence, including an explicit
+    // `false`.
+    let generate_request_id = hcm.generate_request_id.unwrap_or(true);
+
+    // Envoy default false: `use_remote_address` is a `BoolValue`, so unset
+    // means "do not mutate XFF/x-forwarded-proto at this HCM".
+    let use_remote_address = hcm.use_remote_address.unwrap_or(false);
+    // Plain `u32` (not wrapped), so the proto zero-value is already the
+    // Envoy default of 0 trusted hops.
+    let xff_num_trusted_hops = hcm.xff_num_trusted_hops;
+
     Ok(HttpConnectionManagerConfig {
         stat_prefix: hcm.stat_prefix.clone(),
         route_table: Arc::new(route_table),
         http_filters,
+        generate_request_id,
+        use_remote_address,
+        xff_num_trusted_hops,
     })
 }
 

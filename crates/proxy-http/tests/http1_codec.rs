@@ -21,7 +21,7 @@ use proxy_http::filter::ResponseHeaders;
 use proxy_http::handler::{
     local_boxed,
     stub::{EchoHandler, FixedResponseHandler},
-    HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler,
+    DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler,
 };
 use tokio::io::duplex;
 use tokio::task::LocalSet;
@@ -67,6 +67,7 @@ fn get_returns_fixed_response() {
                 handler,
                 Http1Options { keep_alive: true },
                 never_shutdown(),
+                DownstreamInfo::loopback(),
             )
             .await
             .expect("server connection");
@@ -115,6 +116,7 @@ fn post_body_is_echoed_back() {
                 handler,
                 Http1Options { keep_alive: true },
                 never_shutdown(),
+                DownstreamInfo::loopback(),
             )
             .await
             .expect("server connection");
@@ -210,6 +212,7 @@ fn early_flush_streaming_head_and_first_chunk_arrive_before_pause_elapses() {
                 handler,
                 Http1Options { keep_alive: true },
                 never_shutdown(),
+                DownstreamInfo::loopback(),
             )
             .await
             .expect("server connection");
@@ -282,6 +285,7 @@ fn keep_alive_true_serves_two_requests_on_one_connection() {
                 handler,
                 Http1Options { keep_alive: true },
                 never_shutdown(),
+                DownstreamInfo::loopback(),
             )
             .await
             .expect("server connection");
@@ -328,6 +332,7 @@ fn keep_alive_false_closes_connection_after_one_response() {
                 handler,
                 Http1Options { keep_alive: false },
                 never_shutdown(),
+                DownstreamInfo::loopback(),
             )
             .await
         });
@@ -423,6 +428,7 @@ fn drain_completes_in_flight_request_then_closes() {
                 handler,
                 Http1Options { keep_alive: true },
                 shutdown,
+                DownstreamInfo::loopback(),
             )
             .await
         });

@@ -556,6 +556,159 @@ static_resources:
     assert!(err.to_string().contains("once"), "got: {err}");
 }
 
+/// S9: `generate_request_id` is unset by default and lowers to Envoy's
+/// default (`true`); the field must also be accepted by the surface check
+/// rather than rejected as an unsupported HCM field (ground rule #1: the
+/// allowlist and the IR must agree).
+#[test]
+fn hcm_generate_request_id_defaults_to_true() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#,
+    );
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert!(hcm.generate_request_id);
+}
+
+/// An explicit `generate_request_id: true` lowers to `true` and is accepted
+/// by the surface check.
+#[test]
+fn hcm_generate_request_id_explicit_true() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                generate_request_id: true
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#;
+    let snapshot = snapshot_from(yaml).expect("generate_request_id: true must lower");
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert!(hcm.generate_request_id);
+}
+
+/// An explicit `generate_request_id: false` lowers to `false` (and is not
+/// silently ignored, per ground rule #1).
+#[test]
+fn hcm_generate_request_id_explicit_false() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                generate_request_id: false
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#;
+    let snapshot = snapshot_from(yaml).expect("generate_request_id: false must lower");
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert!(!hcm.generate_request_id);
+}
+
+/// S9: `use_remote_address` and `xff_num_trusted_hops` lower to the values
+/// set on the HCM (not silently dropped, per ground rule #1).
+#[test]
+fn hcm_use_remote_address_and_trusted_hops_explicit() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                use_remote_address: true
+                xff_num_trusted_hops: 2
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#;
+    let snapshot = snapshot_from(yaml).expect("use_remote_address/xff_num_trusted_hops must lower");
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert!(hcm.use_remote_address);
+    assert_eq!(hcm.xff_num_trusted_hops, 2);
+}
+
+/// S9: `use_remote_address` and `xff_num_trusted_hops` default to Envoy's
+/// defaults (`false` / `0`) when omitted.
+#[test]
+fn hcm_use_remote_address_and_trusted_hops_default() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#,
+    );
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert!(!hcm.use_remote_address);
+    assert_eq!(hcm.xff_num_trusted_hops, 0);
+}
+
 /// A two-filter chain preserves config order and decodes each non-router
 /// filter's own `typed_config` (here `tls_inspector`, reused purely as a
 /// stand-in for "some non-router HTTP filter with real config" -- lowering

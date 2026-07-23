@@ -202,6 +202,17 @@ pub struct HttpConnectionManagerConfig {
     pub route_table: Arc<RouteTable>,
     /// Ordered HTTP filters; the last must be the router.
     pub http_filters: Vec<HttpFilterSpec>,
+    /// S9: generate an `x-request-id` when the request lacks one. Envoy
+    /// default true (the proto field is a `BoolValue`; absent => true).
+    pub generate_request_id: bool,
+    /// S9/HCM `use_remote_address`: when true, append the immediate downstream
+    /// peer to `x-forwarded-for` and set `x-forwarded-proto` from our
+    /// transport (edge behavior). Envoy default: false.
+    pub use_remote_address: bool,
+    /// S9/HCM `xff_num_trusted_hops`: trusted proxy hops when resolving the
+    /// real client from an inbound XFF (only meaningful with
+    /// use_remote_address=false). Envoy default: 0.
+    pub xff_num_trusted_hops: u32,
 }
 
 /// An HTTP filter, resolved from its `typed_config` type URL.

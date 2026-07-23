@@ -12,7 +12,7 @@ use http_body_util::BodyExt;
 
 use super::*;
 use crate::filter::{FilterTrailersStatus, RequestHeaders};
-use crate::handler::{HttpRequestParts, HttpResponseParts};
+use crate::handler::{DownstreamInfo, HttpRequestParts, HttpResponseParts};
 
 /// Shared call log: every filter appends `"<name>:<callback>"` so a test can
 /// assert the exact interleaving the S2 spec prescribes.
@@ -211,6 +211,7 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
             headers: HeaderMap::new(),
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
+        downstream: DownstreamInfo::loopback(),
     }
 }
 
@@ -224,6 +225,7 @@ fn request_with_trailers(body: &'static [u8], trailers: HeaderMap) -> HttpReques
             headers: HeaderMap::new(),
         },
         body: bytes_to_seam_body(Bytes::from_static(body), Some(trailers)),
+        downstream: DownstreamInfo::loopback(),
     }
 }
 
@@ -239,6 +241,8 @@ async fn run_chain_req(
     let terminal = RecordingTerminal {
         log: log.clone(),
         seen_body: seen_body.clone(),
+        seen_request_id: Rc::new(RefCell::new(None)),
+        seen_headers: None,
     };
     let mgr = FilterManager {
         filters,
@@ -258,6 +262,16 @@ async fn run_chain_req(
 struct RecordingTerminal {
     log: Log,
     seen_body: Rc<RefCell<Bytes>>,
+    /// S9 test hook: the `x-request-id` the terminal observed on the request
+    /// head (mirrors `seen_body` above), so `FilterChainHandler`-level tests
+    /// can assert what the router saw after the HCM-level id generation ran.
+    seen_request_id: Rc<RefCell<Option<String>>>,
+    /// S9 XFF test hook: the full request header map the terminal observed,
+    /// so `FilterChainHandler`-level XFF tests can assert what
+    /// `x-forwarded-for` / `x-forwarded-proto` looked like after the
+    /// HCM-level mutation ran. `None` when the test doesn't care (most
+    /// callers below).
+    seen_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
 }
 
 impl StreamHandler for RecordingTerminal {
@@ -267,6 +281,15 @@ impl StreamHandler for RecordingTerminal {
     ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
             self.log.borrow_mut().push("terminal".to_string());
+            *self.seen_request_id.borrow_mut() = req
+                .head
+                .headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            if let Some(seen_headers) = &self.seen_headers {
+                *seen_headers.borrow_mut() = Some(req.head.headers.clone());
+            }
             let collected = req.body.collect().await.expect("test body never errors");
             *self.seen_body.borrow_mut() = collected.to_bytes();
             HttpResponseParts {
@@ -292,6 +315,8 @@ async fn run_chain(
     let terminal = RecordingTerminal {
         log: log.clone(),
         seen_body: seen_body.clone(),
+        seen_request_id: Rc::new(RefCell::new(None)),
+        seen_headers: None,
     };
     let mgr = FilterManager {
         filters,
@@ -1562,5 +1587,208 @@ fn route_cache_is_not_auto_invalidated_on_header_mutation() {
         cb.route().is_some(),
         "once route resolution exists, a cached route must survive a header \
          mutation unless clear_route_cache() is called (S2.8)"
+    );
+}
+
+// --- S9: `x-request-id` generation, at the `FilterChainHandler` level ---
+//
+// Unlike the rest of this file, these tests go through `FilterChainHandler`
+// itself (not `FilterManager` directly): id generation happens in
+// `FilterChainHandler::handle`, before a `FilterManager` even exists, so
+// there is nothing to observe by constructing `FilterManager` by hand here.
+
+/// Build a `FilterChainHandler` with no configured filters (only the S9
+/// request-id behavior + the recording terminal matter for these tests) and
+/// run one request through it, returning the `x-request-id` the terminal
+/// observed (`None` if it never arrived).
+fn run_through_handler(
+    generate_request_id: bool,
+    existing_request_id: Option<&'static str>,
+) -> Option<String> {
+    block_on(async {
+        let seen_request_id = Rc::new(RefCell::new(None));
+        let terminal = Rc::new(RecordingTerminal {
+            log: log_of(),
+            seen_body: Rc::new(RefCell::new(Bytes::new())),
+            seen_request_id: seen_request_id.clone(),
+            seen_headers: None,
+        });
+        let handler = FilterChainHandler::new(Vec::new(), terminal, generate_request_id, false, 0);
+
+        let mut req = request(b"hi");
+        if let Some(id) = existing_request_id {
+            req.head.headers.insert(
+                HeaderName::from_static("x-request-id"),
+                HeaderValue::from_static(id),
+            );
+        }
+        let _ = handler.handle(req).await;
+        let seen = seen_request_id.borrow().clone();
+        seen
+    })
+}
+
+/// S9: `generate_request_id = true` and no `x-request-id` on the request ->
+/// the terminal observes a freshly generated, non-empty id.
+#[test]
+fn generate_request_id_true_adds_id_when_absent() {
+    let seen = run_through_handler(true, None);
+    assert!(
+        seen.is_some_and(|id| !id.is_empty()),
+        "expected a generated x-request-id"
+    );
+}
+
+/// S9: `generate_request_id = false` -> no `x-request-id` is added.
+#[test]
+fn generate_request_id_false_leaves_id_absent() {
+    let seen = run_through_handler(false, None);
+    assert_eq!(seen, None, "generate_request_id = false must not add an id");
+}
+
+/// S9: an existing `x-request-id` is preserved untouched, never regenerated,
+/// regardless of `generate_request_id`.
+#[test]
+fn existing_request_id_is_preserved() {
+    let seen = run_through_handler(true, Some("caller-supplied-id"));
+    assert_eq!(seen, Some("caller-supplied-id".to_string()));
+}
+
+/// S9: two independently-constructed `FilterChainHandler`s draw from
+/// independent RNG state (per-worker seeding, mirroring the equivalent test
+/// in `headers.rs` for the bare seed/generate functions) and so generate
+/// DIFFERENT ids for equivalent requests.
+#[test]
+fn separately_constructed_handlers_generate_different_ids() {
+    let a = run_through_handler(true, None).expect("handler a generated an id");
+    let b = run_through_handler(true, None).expect("handler b generated an id");
+    assert_ne!(
+        a, b,
+        "two separately-constructed handlers must not produce the same id \
+         sequence"
+    );
+}
+
+// --- S9: XFF / `use_remote_address`, at the `FilterChainHandler` level ---
+//
+// Mirrors the `x-request-id` tests above: this behavior is applied in
+// `FilterChainHandler::handle`, HCM-level, before a `FilterManager` even
+// exists.
+
+/// Build a `FilterChainHandler` with no configured filters, the given
+/// `use_remote_address`/`xff_num_trusted_hops`, and a request whose
+/// downstream peer is `remote` / TLS-ness is `is_tls` and whose inbound
+/// headers are `inbound_headers`. Returns the header map the terminal
+/// observed.
+fn run_through_handler_xff(
+    use_remote_address: bool,
+    xff_num_trusted_hops: u32,
+    remote: std::net::SocketAddr,
+    is_tls: bool,
+    inbound_headers: &[(&str, &str)],
+) -> HeaderMap {
+    block_on(async {
+        let seen_headers = Rc::new(RefCell::new(None));
+        let terminal = Rc::new(RecordingTerminal {
+            log: log_of(),
+            seen_body: Rc::new(RefCell::new(Bytes::new())),
+            seen_request_id: Rc::new(RefCell::new(None)),
+            seen_headers: Some(seen_headers.clone()),
+        });
+        let handler = FilterChainHandler::new(
+            Vec::new(),
+            terminal,
+            false,
+            use_remote_address,
+            xff_num_trusted_hops,
+        );
+
+        let mut req = request(b"hi");
+        req.downstream = DownstreamInfo { remote, is_tls };
+        for (name, value) in inbound_headers {
+            req.head.headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+                HeaderValue::from_str(value).expect("valid header value"),
+            );
+        }
+        let _ = handler.handle(req).await;
+        let result = seen_headers
+            .borrow()
+            .clone()
+            .expect("terminal must have run and recorded headers");
+        result
+    })
+}
+
+/// S9: `use_remote_address = true`, no inbound XFF -> the terminal sees a
+/// freshly-created `x-forwarded-for` naming just the downstream peer, and
+/// `x-forwarded-proto: http` (the connection wasn't TLS).
+#[test]
+fn use_remote_address_true_sets_xff_and_proto_http() {
+    let remote: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
+    let seen = run_through_handler_xff(true, 0, remote, false, &[]);
+    assert_eq!(
+        seen.get("x-forwarded-for").map(|v| v.to_str().unwrap()),
+        Some("203.0.113.7")
+    );
+    assert_eq!(
+        seen.get("x-forwarded-proto").map(|v| v.to_str().unwrap()),
+        Some("http")
+    );
+}
+
+/// S9: `use_remote_address = true` on a TLS-terminated connection -> the
+/// terminal sees `x-forwarded-proto: https`.
+#[test]
+fn use_remote_address_true_sets_proto_https_for_tls() {
+    let remote: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
+    let seen = run_through_handler_xff(true, 0, remote, true, &[]);
+    assert_eq!(
+        seen.get("x-forwarded-proto").map(|v| v.to_str().unwrap()),
+        Some("https")
+    );
+}
+
+/// S9: `use_remote_address = true` with an existing inbound `x-forwarded-for`
+/// -> the downstream peer is appended (rightmost), not substituted.
+#[test]
+fn use_remote_address_true_appends_to_existing_xff() {
+    let remote: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
+    let seen = run_through_handler_xff(
+        true,
+        0,
+        remote,
+        false,
+        &[("x-forwarded-for", "198.51.100.1")],
+    );
+    assert_eq!(
+        seen.get("x-forwarded-for").map(|v| v.to_str().unwrap()),
+        Some("198.51.100.1, 203.0.113.7")
+    );
+}
+
+/// S9: `use_remote_address = false` (the Envoy default) leaves an inbound
+/// `x-forwarded-for` / `x-forwarded-proto` completely untouched -- proves the
+/// edge gate in `FilterChainHandler::handle`.
+#[test]
+fn use_remote_address_false_leaves_xff_and_proto_untouched() {
+    let remote: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
+    let seen = run_through_handler_xff(
+        false,
+        0,
+        remote,
+        false,
+        &[
+            ("x-forwarded-for", "198.51.100.1"),
+            ("x-forwarded-proto", "https"),
+        ],
+    );
+    assert_eq!(
+        seen.get("x-forwarded-for").map(|v| v.to_str().unwrap()),
+        Some("198.51.100.1")
+    );
+    assert_eq!(
+        seen.get("x-forwarded-proto").map(|v| v.to_str().unwrap()),
+        Some("https")
     );
 }

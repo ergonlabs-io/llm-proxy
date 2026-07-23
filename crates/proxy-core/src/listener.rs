@@ -33,7 +33,7 @@ use proxy_config::ConfigSnapshot;
 use proxy_http::codec::{serve_http1, Http1Options};
 use proxy_http::filter::{FactoryContext, FilterInstanceFactory, FilterRegistry};
 use proxy_http::filter_manager::FilterChainHandler;
-use proxy_http::handler::StreamHandler;
+use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::router::RouterHandler;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
@@ -674,8 +674,12 @@ async fn serve_connection(conn: ServeConnection) {
                 // bare `TcpStream` -- `run_terminal_filter` hands the stream
                 // back on the no-op paths so the *unimplemented*/no-filter
                 // cases just drop it and let the close be a clean FIN.
+                let downstream = DownstreamInfo {
+                    remote: peer,
+                    is_tls: true,
+                };
                 let _ = run_terminal_filter(
-                    tls_stream, filter, snapshot, &registry, shutdown, &name, peer,
+                    tls_stream, filter, snapshot, &registry, shutdown, &name, downstream,
                 )
                 .await;
             }
@@ -695,9 +699,14 @@ async fn serve_connection(conn: ServeConnection) {
             // Plaintext (or TLS-passthrough, if `matched` was selected via SNI
             // but configures no `transport_socket`): dispatch straight to the
             // terminal L4 filter on `stream`.
-            if let Some(stream) =
-                run_terminal_filter(stream, filter, snapshot, &registry, shutdown, &name, peer)
-                    .await
+            let downstream = DownstreamInfo {
+                remote: peer,
+                is_tls: false,
+            };
+            if let Some(stream) = run_terminal_filter(
+                stream, filter, snapshot, &registry, shutdown, &name, downstream,
+            )
+            .await
             {
                 reset(&stream, &name);
             }
@@ -795,7 +804,13 @@ fn build_hcm_handler(
         cluster_manager.clone(),
     ));
 
-    Ok(Rc::new(FilterChainHandler::new(factories, terminal)))
+    Ok(Rc::new(FilterChainHandler::new(
+        factories,
+        terminal,
+        hcm.generate_request_id,
+        hcm.use_remote_address,
+        hcm.xff_num_trusted_hops,
+    )))
 }
 
 /// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy` and
@@ -811,8 +826,13 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + 'static>(
     registry: &ConnectionRegistry,
     mut shutdown: watch::Receiver<bool>,
     name: &ListenerName,
-    peer: SocketAddr,
+    // Rust note: bundled into one `Copy` struct (rather than a bare
+    // `SocketAddr` + `bool`) so this already-long parameter list doesn't grow
+    // by two for S9 -- also doubles as `peer` for the tracing calls below via
+    // `downstream.remote`.
+    downstream: DownstreamInfo,
 ) -> Option<IO> {
+    let peer = downstream.remote;
     match filter {
         Some(TerminalFilter::TcpProxy(params)) => {
             let guard = registry.register();
@@ -844,7 +864,8 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + 'static>(
             };
 
             let options = Http1Options { keep_alive: true };
-            if let Err(err) = serve_http1(stream, handler, options, shutdown_fut).await {
+            if let Err(err) = serve_http1(stream, handler, options, shutdown_fut, downstream).await
+            {
                 tracing::debug!(listener = %name, peer = %peer, error = %err, "http/1.1 connection ended with an error");
             }
             None
@@ -1039,6 +1060,9 @@ mod tests {
                     .expect("empty route table can't have duplicate domains"),
             ),
             http_filters: vec![],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
         })
     }
 
@@ -1104,6 +1128,9 @@ mod tests {
                     is_router: true,
                 },
             ],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
         })
     }
 
@@ -2451,6 +2478,9 @@ mod tests {
                     is_router: true,
                 },
             ],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
         })
     }
 
@@ -2481,6 +2511,7 @@ mod tests {
                         handler,
                         Http1Options { keep_alive: false },
                         std::future::pending(),
+                        DownstreamInfo::loopback(),
                     )
                     .await;
                 });

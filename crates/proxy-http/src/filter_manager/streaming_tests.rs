@@ -15,7 +15,7 @@ use http_body_util::BodyExt;
 
 use super::*;
 use crate::filter::{FilterTrailersStatus, RequestHeaders};
-use crate::handler::{HttpRequestParts, HttpResponseParts};
+use crate::handler::{DownstreamInfo, HttpRequestParts, HttpResponseParts};
 
 /// Shared call log, same convention as `tests.rs`'s `ProbeFilter`.
 type Log = Rc<RefCell<Vec<String>>>;
@@ -142,6 +142,7 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
             headers: HeaderMap::new(),
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
+        downstream: DownstreamInfo::loopback(),
     }
 }
 

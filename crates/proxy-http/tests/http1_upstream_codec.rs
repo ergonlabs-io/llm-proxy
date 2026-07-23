@@ -20,7 +20,7 @@ use proxy_http::filter::RequestHeaders;
 use proxy_http::handler::{
     local_boxed,
     stub::{EchoHandler, FixedResponseHandler},
-    HttpRequestParts, StreamBody, StreamHandler,
+    DownstreamInfo, HttpRequestParts, StreamBody, StreamHandler,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::LocalSet;
@@ -39,6 +39,7 @@ async fn spawn_upstream(handler: Rc<dyn StreamHandler>) -> std::net::SocketAddr 
             handler,
             Http1Options { keep_alive: true },
             std::future::pending(),
+            DownstreamInfo::loopback(),
         )
         .await
         .expect("upstream connection");
@@ -75,6 +76,7 @@ async fn get_returns_fixed_response() {
                     headers: HeaderMap::new(),
                 },
                 body,
+                downstream: DownstreamInfo::loopback(),
             };
 
             let response = send_upstream_http1(io, req, Http1Options { keep_alive: true })
@@ -125,6 +127,7 @@ async fn post_body_is_streamed_and_echoed_back() {
                     headers: HeaderMap::new(),
                 },
                 body,
+                downstream: DownstreamInfo::loopback(),
             };
 
             let response = send_upstream_http1(io, req, Http1Options { keep_alive: true })
@@ -171,6 +174,7 @@ async fn connect_to_nothing_yields_handshake_error() {
                         headers: HeaderMap::new(),
                     },
                     body,
+                    downstream: DownstreamInfo::loopback(),
                 };
                 let result = send_upstream_http1(io, req, Http1Options { keep_alive: true }).await;
                 assert!(matches!(

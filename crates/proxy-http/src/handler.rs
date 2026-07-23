@@ -68,6 +68,33 @@ where
 pub struct HttpRequestParts {
     pub head: RequestHeaders,
     pub body: StreamBody,
+    pub downstream: DownstreamInfo,
+}
+
+/// Downstream (client-facing) connection provenance, captured when the
+/// connection was accepted and carried alongside the request through the
+/// handler chain. The HCM reads it to apply XFF / x-forwarded-proto (S9)
+/// before filters run. `Copy` so it threads cheaply and can be duplicated
+/// onto a derived upstream request.
+#[derive(Debug, Clone, Copy)]
+pub struct DownstreamInfo {
+    /// The immediate socket peer (the other end of the accepted connection).
+    pub remote: std::net::SocketAddr,
+    /// Whether this connection was TLS-terminated (drives x-forwarded-proto).
+    pub is_tls: bool,
+}
+
+impl DownstreamInfo {
+    /// A loopback placeholder for tests and for internally-synthesized
+    /// requests (e.g. a router's upstream request) that have no real
+    /// downstream peer. Rust note: `SocketAddr` has no `Default`, so this is
+    /// an explicit, honestly-named stand-in rather than a silent zero value.
+    pub fn loopback() -> Self {
+        Self {
+            remote: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            is_tls: false,
+        }
+    }
 }
 
 /// A response to write back: head (reusing [`crate::filter::ResponseHeaders`])

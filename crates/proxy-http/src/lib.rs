@@ -37,7 +37,9 @@ pub use filter::{
     HttpFilterFactory,
 };
 pub use filter_manager::{FilterChainHandler, DEFAULT_BUFFER_LIMIT};
-pub use handler::{BodyError, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
+pub use handler::{
+    BodyError, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler,
+};
 pub use headers::{
     apply_xff, ensure_request_id, generate_request_id, is_internal_request,
     resolve_trusted_address, sanitize_hop_by_hop, set_forwarded_proto,

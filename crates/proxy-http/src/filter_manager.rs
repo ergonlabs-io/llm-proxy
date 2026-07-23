@@ -131,17 +131,43 @@ pub struct FilterChainHandler {
     /// The router stand-in: consumes the (decoded) request, produces a response.
     terminal: Rc<dyn StreamHandler>,
     buffer_limit: usize,
+    /// S9/HCM: generate `x-request-id` when the request lacks one (Envoy
+    /// default true).
+    generate_request_id: bool,
+    /// S9/HCM `use_remote_address`: when true, this HCM is at the network
+    /// edge -- append the downstream peer to `x-forwarded-for` and stamp
+    /// `x-forwarded-proto` from our transport. Envoy default false.
+    use_remote_address: bool,
+    /// S9/HCM `xff_num_trusted_hops`: forwarded straight through to
+    /// [`crate::headers::XffOptions`]; only meaningful when
+    /// `use_remote_address` is true.
+    xff_num_trusted_hops: u32,
+    /// Rust note: `RefCell` (not `Mutex`) because `FilterChainHandler` is
+    /// worker-local (`!Send`, ADR-0003) -- one instance per worker thread, built
+    /// once at bind time, so there's no cross-thread contention to guard
+    /// against, only the single-threaded aliasing rule a `Cell`/`RefCell` exists
+    /// for. Seeded once per handler (`headers::seed_from_entropy`) so different
+    /// workers -- and different `FilterChainHandler`s in tests -- draw
+    /// independent id sequences.
+    request_id_rng: std::cell::RefCell<u64>,
 }
 
 impl FilterChainHandler {
     pub fn new(
         factories: Vec<Arc<dyn FilterInstanceFactory>>,
         terminal: Rc<dyn StreamHandler>,
+        generate_request_id: bool,
+        use_remote_address: bool,
+        xff_num_trusted_hops: u32,
     ) -> Self {
         Self {
             factories,
             terminal,
             buffer_limit: DEFAULT_BUFFER_LIMIT,
+            generate_request_id,
+            use_remote_address,
+            xff_num_trusted_hops,
+            request_id_rng: std::cell::RefCell::new(crate::headers::seed_from_entropy()),
         }
     }
 
@@ -154,9 +180,36 @@ impl FilterChainHandler {
 impl StreamHandler for FilterChainHandler {
     fn handle<'a>(
         &'a self,
-        req: HttpRequestParts,
+        mut req: HttpRequestParts,
     ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
+            // S9: apply `x-request-id` before the decode filter chain runs, so
+            // every decode filter (and the router terminal) observes it. Runs
+            // ahead of `FilterManager` construction rather than as a filter
+            // itself -- it's an always-on HCM-level behavior, not a
+            // configurable filter.
+            if self.generate_request_id {
+                let mut state = self.request_id_rng.borrow_mut();
+                crate::headers::ensure_request_id(&mut req.head.headers, &mut || {
+                    crate::headers::generate_request_id(&mut state, false)
+                });
+                // `state` (a `RefMut`) drops here, releasing the borrow before
+                // `req` moves into `FilterManager::run` below.
+            }
+            // S9: at the edge (use_remote_address), append the downstream peer
+            // to x-forwarded-for and stamp x-forwarded-proto from our
+            // transport. Applied HCM-level, before the decode filter chain, so
+            // filters and the router observe the mutated headers. A non-edge
+            // (mesh/internal) HCM leaves both headers untouched — it trusts
+            // the inbound values.
+            if self.use_remote_address {
+                let xff = crate::headers::XffOptions {
+                    use_remote_address: true,
+                    xff_num_trusted_hops: self.xff_num_trusted_hops,
+                };
+                crate::headers::apply_xff(&mut req.head.headers, req.downstream.remote.ip(), &xff);
+                crate::headers::set_forwarded_proto(&mut req.head.headers, req.downstream.is_tls);
+            }
             // Rust note: a fresh, `!Send` instance vector per request — filters
             // may freely hold `Rc`/`RefCell` (ADR-0003).
             let filters: Vec<Box<dyn HttpFilter>> =
@@ -298,6 +351,11 @@ impl FilterManager<'_> {
             buffer_limit,
         } = self;
 
+        // Rust note: `downstream` is `Copy`, so it's read out here before
+        // `req` is consumed by `collect_request` below — the terminal request
+        // built further down needs it, and `req` itself won't survive.
+        let downstream = req.downstream;
+
         // --- collect the request body (buffered model) ---
         let (mut head, req_trailers, mut body) = match collect_request(req).await {
             Ok(parts) => parts,
@@ -354,6 +412,7 @@ impl FilterManager<'_> {
         let terminal_req = HttpRequestParts {
             head,
             body: bytes_to_seam_body(decoded_body, req_trailers.map(|t| t.0)),
+            downstream,
         };
         let resp = terminal.handle(terminal_req).await;
         let HttpResponseParts { mut head, mut body } = resp;
@@ -1485,7 +1544,13 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
 async fn collect_request(
     req: HttpRequestParts,
 ) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), ()> {
-    let HttpRequestParts { head, body } = req;
+    // `downstream` was already captured by the caller (`FilterManager::run`)
+    // before `req` moved here; this function only needs head + body.
+    let HttpRequestParts {
+        head,
+        body,
+        downstream: _,
+    } = req;
     let collected = body.collect().await.map_err(|_| ())?;
     let trailers = collected.trailers().cloned().map(RequestTrailers);
     Ok((head, trailers, collected.to_bytes()))
