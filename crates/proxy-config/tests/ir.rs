@@ -40,6 +40,31 @@ static_resources:
     snapshot_from(&yaml).expect("config must lower to IR")
 }
 
+/// Like [`hcm_snapshot`], but with a caller-supplied `http_filters` block
+/// (indented to match) instead of the fixed router-only chain.
+fn hcm_snapshot_with_filters(http_filters: &str, route_config: &str) -> ConfigSnapshot {
+    let yaml = format!(
+        r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                http_filters:
+{http_filters}
+                route_config:
+{route_config}
+"#
+    );
+    snapshot_from(&yaml).expect("config must lower to IR")
+}
+
 fn route_table(snapshot: &ConfigSnapshot) -> &RouteTable {
     let listener = snapshot.listeners.get("http").expect("listener");
     let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
@@ -289,6 +314,46 @@ static_resources:
     assert_eq!(field_path, "static_resources.listeners[0].transparent");
 }
 
+/// WP-17 deliberately ships without RING_HASH/MAGLEV (they need bit-exact
+/// parity with Envoy's hashing, or session affinity breaks across a mixed
+/// fleet). That has to fail at *config* time: `proxy-cluster` also refuses to
+/// build such a cluster, but that happens after startup and merely leaves the
+/// cluster absent — every request to it would get a bare 503 with nothing
+/// explaining why. Failing here is what makes `make validate` and startup
+/// report the real reason.
+#[test]
+fn unimplemented_lb_policy_errors_at_config_time() {
+    for policy in ["RING_HASH", "MAGLEV"] {
+        let yaml = format!(
+            r#"
+static_resources:
+  clusters:
+    - name: c1
+      type: STATIC
+      lb_policy: {policy}
+      load_assignment:
+        cluster_name: c1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 8080 }}
+"#
+        );
+        let err = snapshot_from(&yaml).expect_err("{policy} must be rejected at config time");
+        let ConfigError::UnsupportedField { field_path, reason } = &err else {
+            panic!("expected UnsupportedField for {policy}, got: {err}");
+        };
+        assert_eq!(field_path, "static_resources.clusters[0].lb_policy");
+        // The message must name the policy — an operator reading only the
+        // error should know which setting to change.
+        assert!(
+            reason.contains(policy),
+            "error for {policy} must name the policy, got: {reason}"
+        );
+    }
+}
+
 /// The surface check reaches inside `typed_config` Anys too.
 #[test]
 fn unsupported_field_inside_any_errors_with_path() {
@@ -425,4 +490,157 @@ static_resources:
 "#;
     let err = snapshot_from(yaml).expect_err("missing router must fail");
     assert!(err.to_string().contains("router"), "got: {err}");
+}
+
+/// The router must be last, not merely present.
+#[test]
+fn hcm_router_not_last_is_rejected() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                  - name: envoy.filters.listener.tls_inspector
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#;
+    let err = snapshot_from(yaml).expect_err("router not last must fail");
+    assert!(err.to_string().contains("last"), "got: {err}");
+}
+
+/// Exactly one router is allowed, even if it's last.
+#[test]
+fn hcm_duplicate_router_is_rejected() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#;
+    let err = snapshot_from(yaml).expect_err("duplicate router must fail");
+    assert!(err.to_string().contains("once"), "got: {err}");
+}
+
+/// A two-filter chain preserves config order and decodes each non-router
+/// filter's own `typed_config` (here `tls_inspector`, reused purely as a
+/// stand-in for "some non-router HTTP filter with real config" -- lowering
+/// doesn't care what an HTTP filter's proto shape means, only that it
+/// resolves against the descriptor pool).
+#[test]
+fn hcm_two_filter_chain_preserves_order_and_decodes_config() {
+    let snapshot = hcm_snapshot_with_filters(
+        r#"
+                  - name: my.filters.stand_in
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+                      max_client_hello_size: 2048
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#,
+    );
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert_eq!(hcm.http_filters.len(), 2);
+
+    let first = &hcm.http_filters[0];
+    assert_eq!(first.name, "my.filters.stand_in");
+    assert!(!first.is_router);
+    assert_eq!(
+        first.type_url,
+        "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"
+    );
+    let config = first
+        .config
+        .as_ref()
+        .expect("non-router filter must carry decoded config");
+    assert!(
+        config.has_field_by_name("max_client_hello_size"),
+        "expected the decoded config to carry the configured field"
+    );
+
+    let second = &hcm.http_filters[1];
+    assert_eq!(second.name, "envoy.filters.http.router");
+    assert!(second.is_router);
+    assert!(second.config.is_none());
+}
+
+/// An HTTP filter `typed_config` whose type URL isn't in the descriptor pool
+/// is a config error naming both the type URL and the dotted path -- never a
+/// silent skip, even though the IR can now hold arbitrary filter config.
+#[test]
+fn hcm_unknown_http_filter_type_url_is_rejected() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                http_filters:
+                  - name: mystery
+                    typed_config:
+                      "@type": type.googleapis.com/does.not.Exist
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#;
+    let err = snapshot_from(yaml).expect_err("unknown type_url must fail");
+    let msg = err.to_string();
+    assert!(msg.contains("does.not.Exist"), "got: {msg}");
+    assert!(msg.contains("http_filters[0].typed_config"), "got: {msg}");
 }

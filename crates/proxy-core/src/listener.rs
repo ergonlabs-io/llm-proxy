@@ -24,15 +24,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use proxy_cluster::manager::ClusterManager;
 use proxy_config::ir::{
     HttpConnectionManagerConfig, ListenerConfig, ListenerFilterSpec, ListenerName,
     NetworkFilterSpec, SnapshotVersion,
 };
 use proxy_config::ConfigSnapshot;
 use proxy_http::codec::{serve_http1, Http1Options};
-use proxy_http::handler::stub::FixedResponseHandler;
+use proxy_http::filter::{FactoryContext, FilterInstanceFactory, FilterRegistry};
+use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::StreamHandler;
+use proxy_http::router::RouterHandler;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -42,10 +44,31 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::drain::ConnectionRegistry;
 use crate::filter_chain::{select_filter_chain, ConnectionProperties};
+use crate::header_mutation_filter::HeaderMutationFactory;
 use crate::tcp_proxy::{self, TcpProxyParams};
 use crate::tls::{DownstreamTlsFactory, TlsBuildError};
 use crate::tls_inspector::inspect_client_hello;
 use crate::WorkerConfigHandle;
+
+/// The shared [`FilterRegistry`]: every worker's listeners look up HTTP
+/// filter factories by `type_url` against the same registered set, built
+/// exactly once (ground rule from WP-11's wiring task: "construct it once
+/// and share it, do not build a registry per connection").
+///
+/// Rust note: `std::sync::OnceLock` is the safe, `std`-only way to build a
+/// value lazily on first access and share it thereafter -- no `unsafe`, and
+/// no extra crate dependency for something this simple. Registration happens
+/// exactly once (the first caller to reach `get_or_init` blocks any
+/// concurrent caller until it's done), so [`FilterRegistry::register`]'s
+/// "called twice for the same type_url" assertion can never fire here.
+fn filter_registry() -> &'static Arc<FilterRegistry> {
+    static REGISTRY: std::sync::OnceLock<Arc<FilterRegistry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = FilterRegistry::default();
+        registry.register(Arc::new(HeaderMutationFactory));
+        Arc::new(registry)
+    })
+}
 
 /// Compiled downstream TLS factories for one listener's filter chains
 /// (WP-08 chunk C3), aligned by index with `ListenerConfig.filter_chains`,
@@ -110,6 +133,81 @@ fn build_listener_tls(listener: &ListenerConfig) -> Result<ListenerTls, TlsBuild
     })
 }
 
+/// A listener's HTTP filter chain (`http_filters`) failed to build for one
+/// HCM terminal filter -- a `type_url` with no registered
+/// [`proxy_http::filter::HttpFilterFactory`], or a filter's `typed_config`
+/// failing that factory's own validation. Same fatal-at-[`initial_bind`] /
+/// logged-and-skip-at-reconcile treatment as [`TlsBuildError`] (see
+/// [`InitialBindError`]'s doc comment): this is a startup error, never a
+/// silent skip of a configured filter (ground rule #1).
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {reason}")]
+pub struct HttpFilterChainBuildError {
+    context: String,
+    reason: String,
+}
+
+/// Compiled HTTP filter-chain handlers for one listener's filter chains
+/// (this WP-11 wiring task), aligned by index with
+/// `ListenerConfig.filter_chains`, plus the `default_filter_chain` -- the HCM
+/// counterpart to [`ListenerTls`], built and rebuilt on the same cadence
+/// (bind time, then whenever the accept loop notices the snapshot version
+/// changed). `None` in a slot means that chain's terminal filter isn't an
+/// HTTP connection manager at all (e.g. a plain `tcp_proxy`) -- or, only
+/// after a failed *runtime* rebuild, that its handler couldn't be rebuilt.
+struct ListenerHcm {
+    chain_handlers: Vec<Option<Rc<dyn StreamHandler>>>,
+    default_handler: Option<Rc<dyn StreamHandler>>,
+}
+
+impl ListenerHcm {
+    /// Same "everything resets" placeholder as [`ListenerTls::empty_for`],
+    /// used when a runtime rebuild fails.
+    fn empty_for(listener: &ListenerConfig) -> Self {
+        Self {
+            chain_handlers: vec![None; listener.filter_chains.len()],
+            default_handler: None,
+        }
+    }
+}
+
+/// Build the compiled HTTP filter-chain handler for every `filter_chains[i]`
+/// (and the `default_filter_chain`) of `listener` whose terminal network
+/// filter is an HTTP connection manager. A chain whose terminal filter isn't
+/// an HCM (or has no filters at all) gets a `None` slot -- mirrors
+/// `build_listener_tls`'s shape exactly.
+fn build_listener_hcm(
+    listener: &ListenerConfig,
+    cluster_manager: &Arc<ClusterManager>,
+) -> Result<ListenerHcm, HttpFilterChainBuildError> {
+    let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
+    for (i, chain) in listener.filter_chains.iter().enumerate() {
+        let handler = match chain.filters.last() {
+            Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
+                let context = format!("listener '{}' filter_chains[{i}]", listener.name);
+                Some(build_hcm_handler(hcm, &context, cluster_manager)?)
+            }
+            _ => None,
+        };
+        chain_handlers.push(handler);
+    }
+    let default_handler = match listener
+        .default_filter_chain
+        .as_ref()
+        .and_then(|c| c.filters.last())
+    {
+        Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
+            let context = format!("listener '{}' default_filter_chain", listener.name);
+            Some(build_hcm_handler(hcm, &context, cluster_manager)?)
+        }
+        _ => None,
+    };
+    Ok(ListenerHcm {
+        chain_handlers,
+        default_handler,
+    })
+}
+
 /// One listener this worker currently has bound: its address (so we can tell
 /// "address changed" from "just a chain update" on the next config ping) and
 /// the accept-loop task driving it.
@@ -144,6 +242,8 @@ pub enum InitialBindError {
     },
     #[error(transparent)]
     Tls(#[from] TlsBuildError),
+    #[error(transparent)]
+    Http(#[from] HttpFilterChainBuildError),
 }
 
 /// Bind a `socket2` socket for `listener` and hand it to tokio.
@@ -180,17 +280,32 @@ fn bind_listener(listener: &ListenerConfig) -> io::Result<TcpListener> {
 /// on success. The one place that actually calls `bind_listener` +
 /// `spawn_accept_loop` together; [`initial_bind`] and reconcile-time binding
 /// (`bind_and_spawn`) each decide what to do with the `Err` case differently.
+/// Bundles the per-worker state every bind/accept function below needs
+/// (config handle, connection registry, drain signal, cluster manager) --
+/// purely to keep `spawn_bound`/`bind_and_spawn`'s argument count under
+/// clippy's `too_many_arguments` threshold, the same motivation
+/// [`ListenerCaches`] documents for the per-listener build outputs.
+/// [`initial_bind`]/[`reconcile`] (the public-ish entry points) keep their
+/// four separate parameters -- this bundle is purely an internal plumbing
+/// convenience built once at their top and threaded down by reference.
+struct WorkerShared<'a> {
+    config: &'a Arc<WorkerConfigHandle>,
+    registry: &'a ConnectionRegistry,
+    shutdown: &'a watch::Receiver<bool>,
+    cluster_manager: &'a Arc<ClusterManager>,
+}
+
 fn spawn_bound(
     name: &ListenerName,
     listener_ir: &Arc<ListenerConfig>,
     version: SnapshotVersion,
-    config: &Arc<WorkerConfigHandle>,
-    registry: &ConnectionRegistry,
-    shutdown: &watch::Receiver<bool>,
+    shared: &WorkerShared<'_>,
 ) -> Result<BoundListener, InitialBindError> {
     // Built before the socket bind: no point opening a listening socket for a
-    // filter chain whose certs won't load.
+    // filter chain whose certs won't load, or whose HTTP filter chain
+    // references an unregistered filter.
     let tls = build_listener_tls(listener_ir)?;
+    let hcm = build_listener_hcm(listener_ir, shared.cluster_manager)?;
     let tcp_listener = bind_listener(listener_ir).map_err(|source| InitialBindError::Bind {
         name: name.clone(),
         addr: listener_ir.address,
@@ -201,11 +316,14 @@ fn spawn_bound(
     let task = spawn_accept_loop(
         name.clone(),
         tcp_listener,
-        config.clone(),
-        registry.clone(),
-        shutdown.clone(),
         version,
-        tls,
+        ListenerCaches { tls, hcm },
+        AcceptLoopShared {
+            config: shared.config.clone(),
+            registry: shared.registry.clone(),
+            shutdown: shared.shutdown.clone(),
+            cluster_manager: shared.cluster_manager.clone(),
+        },
     );
     Ok(BoundListener { addr, task })
 }
@@ -221,11 +339,9 @@ fn bind_and_spawn(
     listener_ir: &Arc<ListenerConfig>,
     version: SnapshotVersion,
     bound: &mut HashMap<ListenerName, BoundListener>,
-    config: &Arc<WorkerConfigHandle>,
-    registry: &ConnectionRegistry,
-    shutdown: &watch::Receiver<bool>,
+    shared: &WorkerShared<'_>,
 ) {
-    match spawn_bound(&name, listener_ir, version, config, registry, shutdown) {
+    match spawn_bound(&name, listener_ir, version, shared) {
         Ok(b) => {
             bound.insert(name, b);
         }
@@ -252,21 +368,21 @@ pub fn initial_bind(
     config: &Arc<WorkerConfigHandle>,
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
+    cluster_manager: &Arc<ClusterManager>,
 ) -> Result<HashMap<ListenerName, BoundListener>, InitialBindError> {
+    let shared = WorkerShared {
+        config,
+        registry,
+        shutdown,
+        cluster_manager,
+    };
     let mut bound: HashMap<ListenerName, BoundListener> = HashMap::new();
     for (name, listener_ir) in snapshot.listeners.iter() {
         if !listener_ir.bind_to_port {
             tracing::debug!(listener = %name, "bind_to_port=false; not binding");
             continue;
         }
-        match spawn_bound(
-            name,
-            listener_ir,
-            snapshot.version,
-            config,
-            registry,
-            shutdown,
-        ) {
+        match spawn_bound(name, listener_ir, snapshot.version, &shared) {
             Ok(b) => {
                 bound.insert(name.clone(), b);
             }
@@ -281,26 +397,56 @@ pub fn initial_bind(
     Ok(bound)
 }
 
+/// The two per-listener caches [`spawn_accept_loop`] seeds its accept loop
+/// with and keeps refreshed on every snapshot version change -- bundled into
+/// one type purely to keep `spawn_accept_loop`'s argument count down
+/// (clippy's `too_many_arguments`); see [`build_listener_tls`] and
+/// [`build_listener_hcm`] for how each half is built.
+struct ListenerCaches {
+    tls: ListenerTls,
+    hcm: ListenerHcm,
+}
+
+/// The owned counterpart to [`WorkerShared`] -- `spawn_accept_loop`'s task is
+/// `'static`, so it needs owned clones (cheap: `Arc`/`ConnectionRegistry`/
+/// `watch::Receiver` are all handle types) rather than borrows.
+struct AcceptLoopShared {
+    config: Arc<WorkerConfigHandle>,
+    registry: ConnectionRegistry,
+    shutdown: watch::Receiver<bool>,
+    cluster_manager: Arc<ClusterManager>,
+}
+
 /// One accept loop per bound listener, spawned with `spawn_local` (this
 /// module is worker-local / `!Send` per ADR-0003, same as the rest of
 /// `proxy-core`).
 fn spawn_accept_loop(
     name: ListenerName,
     tcp_listener: TcpListener,
-    config: Arc<WorkerConfigHandle>,
-    registry: ConnectionRegistry,
-    mut shutdown: watch::Receiver<bool>,
     initial_version: SnapshotVersion,
-    initial_tls: ListenerTls,
+    initial: ListenerCaches,
+    shared: AcceptLoopShared,
 ) -> JoinHandle<()> {
+    let ListenerCaches {
+        tls: initial_tls,
+        hcm: initial_hcm,
+    } = initial;
+    let AcceptLoopShared {
+        config,
+        registry,
+        mut shutdown,
+        cluster_manager,
+    } = shared;
     tokio::task::spawn_local(async move {
         // Rust note: `mut` locals, not behind a lock -- this whole task is
         // single-threaded (`spawn_local` on a `!Send` `LocalSet`, ADR-0003),
         // so nothing else can observe or race these between `.await` points.
-        // `tls_cache` is an `Rc` so each accepted connection's task gets a
-        // cheap clone of the same compiled factories (pointer bump, no rebuild).
+        // `tls_cache`/`hcm_cache` are `Rc`s so each accepted connection's task
+        // gets a cheap clone of the same compiled factories/handlers (pointer
+        // bump, no rebuild).
         let mut tls_version = initial_version;
         let mut tls_cache = Rc::new(initial_tls);
+        let mut hcm_cache = Rc::new(initial_hcm);
         loop {
             let (stream, peer) = tokio::select! {
                 accepted = tcp_listener.accept() => match accepted {
@@ -348,6 +494,16 @@ fn spawn_accept_loop(
                             tls_cache = Rc::new(ListenerTls::empty_for(l));
                         }
                     }
+                    // Same rebuild cadence and same "whole-listener fallback"
+                    // tradeoff as the TLS cache just above, for the HTTP
+                    // filter-chain handlers.
+                    match build_listener_hcm(l, &cluster_manager) {
+                        Ok(rebuilt) => hcm_cache = Rc::new(rebuilt),
+                        Err(err) => {
+                            tracing::warn!(listener = %name, error = %err, "failed to rebuild HTTP filter chain after config change; HCM chains on this listener will reset connections until fixed");
+                            hcm_cache = Rc::new(ListenerHcm::empty_for(l));
+                        }
+                    }
                 }
                 tls_version = snapshot.version;
             }
@@ -368,6 +524,7 @@ fn spawn_accept_loop(
                 listener_name: name.clone(),
                 snapshot,
                 tls: tls_cache.clone(),
+                hcm: hcm_cache.clone(),
                 registry: registry.clone(),
                 shutdown: shutdown.clone(),
             }));
@@ -393,6 +550,9 @@ struct ServeConnection {
     /// TLS factories compiled from `snapshot` -- built consistently with it in
     /// the accept loop before this task was spawned.
     tls: Rc<ListenerTls>,
+    /// HTTP filter-chain handlers compiled from `snapshot`, same cadence as
+    /// `tls` above.
+    hcm: Rc<ListenerHcm>,
     registry: ConnectionRegistry,
     shutdown: watch::Receiver<bool>,
 }
@@ -404,6 +564,7 @@ async fn serve_connection(conn: ServeConnection) {
         listener_name: name,
         snapshot,
         tls,
+        hcm,
         registry,
         shutdown,
     } = conn;
@@ -473,29 +634,38 @@ async fn serve_connection(conn: ServeConnection) {
         .map(|l| l.per_connection_buffer_limit_bytes)
         .unwrap_or(1024 * 1024);
 
-    // Extracted before the stream is moved into either branch below: the
-    // matched chain's terminal (and, today, only) network filter, turned into
-    // cheap owned params. A chain with no filters can't happen (lowering
-    // rejects empty `filters`), but `None` here is handled defensively.
-    let filter = terminal_filter(matched, buffer_limit);
-
     // Which cache slot corresponds to `matched`: its index in `filter_chains`,
     // or the `default_filter_chain` slot if it isn't found there (Rust note:
     // `ptr::eq` on references into the immutable, `Arc`'d snapshot is valid and
     // needs no `unsafe` -- see `filter_chain`'s own property test for the same
-    // technique).
-    let factory = matched.transport_socket.as_ref().and_then(|_| {
-        let l = listener_ir
-            .expect("a matched chain implies its listener is still present in this snapshot");
-        match l
-            .filter_chains
+    // technique). Looked up once and reused for both the TLS factory and the
+    // HCM handler caches below, which are aligned the same way.
+    let chain_idx = listener_ir.and_then(|l| {
+        l.filter_chains
             .iter()
             .position(|c| std::ptr::eq(c, matched))
-        {
+    });
+
+    // Extracted before the stream is moved into either branch below: the
+    // matched chain's terminal (and, today, only) network filter, turned into
+    // cheap owned params/handle. A chain with no filters can't happen
+    // (lowering rejects empty `filters`), but `None` here is handled
+    // defensively. The HCM handler itself was built once at bind time (see
+    // `build_listener_hcm`), not per connection -- this just looks up the
+    // slot `matched` corresponds to.
+    let hcm_handler = match chain_idx {
+        Some(idx) => hcm.chain_handlers.get(idx).cloned().flatten(),
+        None => hcm.default_handler.clone(),
+    };
+    let filter = terminal_filter(matched, buffer_limit, hcm_handler);
+
+    let factory = matched
+        .transport_socket
+        .as_ref()
+        .and_then(|_| match chain_idx {
             Some(idx) => tls.chain_factories.get(idx).cloned().flatten(),
             None => tls.default_factory.clone(),
-        }
-    });
+        });
 
     match (matched.transport_socket.is_some(), factory) {
         (true, Some(factory)) => match factory.wrap(stream).await {
@@ -544,18 +714,22 @@ async fn serve_connection(conn: ServeConnection) {
 /// `net_filter`'s module doc).
 enum TerminalFilter {
     TcpProxy(TcpProxyParams),
-    /// HTTP connection manager: the codec-facing `StreamHandler` is built
-    /// eagerly here (see `build_hcm_handler`), while `matched` (and the
-    /// `HttpConnectionManagerConfig` it borrows from) is still in scope --
-    /// this is what lets `TerminalFilter` be a self-contained, owned value
-    /// the caller can hold across the `stream` move, same as `TcpProxy`'s
-    /// `TcpProxyParams` above.
+    /// HTTP connection manager: the codec-facing `StreamHandler` -- built
+    /// once at bind time (see `build_listener_hcm`/`build_hcm_handler`), not
+    /// per connection; `terminal_filter` just clones the `Rc` handed to it.
     Http(Rc<dyn StreamHandler>),
 }
 
+/// `hcm_handler` is the (already-built) handler for the slot `matched`
+/// occupies in this worker's `ListenerHcm` cache -- see the call site in
+/// `serve_connection`, which looks it up the same way it looks up the TLS
+/// factory. `None` there just means `matched`'s terminal filter isn't an HCM
+/// (or, on a failed runtime rebuild, that it couldn't be rebuilt), same as a
+/// missing TLS factory.
 fn terminal_filter(
     matched: &proxy_config::ir::FilterChainSpec,
     buffer_limit: u32,
+    hcm_handler: Option<Rc<dyn StreamHandler>>,
 ) -> Option<TerminalFilter> {
     match matched.filters.last()? {
         NetworkFilterSpec::TcpProxy(tp) => Some(TerminalFilter::TcpProxy(TcpProxyParams {
@@ -564,28 +738,64 @@ fn terminal_filter(
             max_connect_attempts: tp.max_connect_attempts,
             buffer_limit,
         })),
-        NetworkFilterSpec::HttpConnectionManager(hcm) => {
-            Some(TerminalFilter::Http(build_hcm_handler(hcm)))
-        }
+        NetworkFilterSpec::HttpConnectionManager(_) => hcm_handler.map(TerminalFilter::Http),
     }
 }
 
 /// Build the `StreamHandler` the downstream h1 codec (`proxy_http::codec`)
-/// drives for one HTTP connection manager terminal filter.
-///
-/// TODO(WP-11/WP-13): replace the stub with the real filter manager + router
-/// built from `hcm` (route_table, http_filters).
-fn build_hcm_handler(hcm: &HttpConnectionManagerConfig) -> Rc<dyn StreamHandler> {
-    // Rust note: `hcm` is unused by the stub but kept as a parameter so the
-    // seam already has the shape the real implementation needs.
-    let _ = hcm;
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-llmproxy-stub", http::HeaderValue::from_static("hcm"));
-    Rc::new(FixedResponseHandler {
-        status: http::StatusCode::OK,
-        headers,
-        body: Bytes::from_static(b"llm-proxy: HTTP routing not yet implemented (WP-11/13)\n"),
-    })
+/// drives for one HTTP connection manager terminal filter: every non-router
+/// `http_filters` entry becomes one `FilterInstanceFactory` (config order),
+/// looked up in the shared [`filter_registry`] by `type_url`; a `type_url`
+/// with no registered factory is a startup error (`context` names the
+/// listener/chain), never a silent skip (ground rule #1). The router itself
+/// (`envoy.filters.http.router`, `is_router: true`) is the terminal --
+/// [`proxy_http::router::RouterHandler`] -- not one of these chain filters
+/// (WP-13).
+fn build_hcm_handler(
+    hcm: &HttpConnectionManagerConfig,
+    context: &str,
+    cluster_manager: &Arc<ClusterManager>,
+) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
+    let registry = filter_registry();
+    let factory_ctx = FactoryContext {};
+    let mut factories: Vec<Arc<dyn FilterInstanceFactory>> =
+        Vec::with_capacity(hcm.http_filters.len());
+    for f in &hcm.http_filters {
+        if f.is_router {
+            continue;
+        }
+        let factory = registry
+            .get(&f.type_url)
+            .ok_or_else(|| HttpFilterChainBuildError {
+                context: context.to_string(),
+                reason: format!(
+                    "http filter '{}' (type_url `{}`) has no registered factory",
+                    f.name, f.type_url
+                ),
+            })?;
+        // Invariant enforced by `proxy-config`'s lowering: `config` is `None`
+        // only for the router filter, which the `continue` above already
+        // skipped -- every other entry carries a decoded `typed_config`.
+        let config = f
+            .config
+            .as_ref()
+            .expect("lowering only leaves `config: None` on the router filter");
+        let instance_factory =
+            factory
+                .create(config, &factory_ctx)
+                .map_err(|e| HttpFilterChainBuildError {
+                    context: context.to_string(),
+                    reason: format!("http filter '{}': {e}", f.name),
+                })?;
+        factories.push(Arc::from(instance_factory));
+    }
+
+    let terminal: Rc<dyn StreamHandler> = Rc::new(RouterHandler::new(
+        hcm.route_table.clone(),
+        cluster_manager.clone(),
+    ));
+
+    Ok(Rc::new(FilterChainHandler::new(factories, terminal)))
 }
 
 /// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy` and
@@ -666,7 +876,14 @@ fn reconcile(
     config: &Arc<WorkerConfigHandle>,
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
+    cluster_manager: &Arc<ClusterManager>,
 ) {
+    let shared = WorkerShared {
+        config,
+        registry,
+        shutdown,
+        cluster_manager,
+    };
     // Removed: present in `bound`, absent from the new snapshot. Stop
     // accepting; established connections under the old listener keep their
     // own `Arc<ConfigSnapshot>` clone and drain independently (v1 "full
@@ -703,26 +920,10 @@ fn reconcile(
             Some(existing) => {
                 tracing::info!(listener = %name, old_addr = %existing.addr, new_addr = %listener_ir.address, "listener address changed; rebinding");
                 existing.task.abort();
-                bind_and_spawn(
-                    name.clone(),
-                    listener_ir,
-                    snapshot.version,
-                    bound,
-                    config,
-                    registry,
-                    shutdown,
-                );
+                bind_and_spawn(name.clone(), listener_ir, snapshot.version, bound, &shared);
             }
             None => {
-                bind_and_spawn(
-                    name.clone(),
-                    listener_ir,
-                    snapshot.version,
-                    bound,
-                    config,
-                    registry,
-                    shutdown,
-                );
+                bind_and_spawn(name.clone(), listener_ir, snapshot.version, bound, &shared);
             }
         }
     }
@@ -749,6 +950,7 @@ pub async fn run_listener_manager(
     mut config_ping: watch::Receiver<SnapshotVersion>,
     mut shutdown: watch::Receiver<bool>,
     registry: ConnectionRegistry,
+    cluster_manager: Arc<ClusterManager>,
 ) {
     loop {
         tokio::select! {
@@ -757,7 +959,7 @@ pub async fn run_listener_manager(
                     break;
                 }
                 let snapshot = config.load();
-                reconcile(&snapshot, &mut bound, &config, &registry, &shutdown);
+                reconcile(&snapshot, &mut bound, &config, &registry, &shutdown, &cluster_manager);
             }
             _ = shutdown.changed() => {
                 break;
@@ -823,8 +1025,12 @@ mod tests {
     }
 
     /// A minimal `http_connection_manager` filter -- an empty route table (no
-    /// virtual hosts) and no http_filters. The stub `build_hcm_handler` never
-    /// looks at either, but the shape matters for the WP-11/13 seam.
+    /// virtual hosts) and no http_filters. Since WP-13, the terminal is a
+    /// real [`proxy_http::router::RouterHandler`], so a request against this
+    /// empty table always takes the `NoVirtualHost` path (404) -- see
+    /// `hcm_terminal_filter_serves_http_over_the_real_socket`, which exists
+    /// to prove HTTP is served over the real socket at all, not any
+    /// particular route outcome.
     fn hcm_filter() -> NetworkFilterSpec {
         NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
             stat_prefix: "test".to_string(),
@@ -833,6 +1039,71 @@ mod tests {
                     .expect("empty route table can't have duplicate domains"),
             ),
             http_filters: vec![],
+        })
+    }
+
+    /// A one-vhost, one-route table matching every request (`*` domain,
+    /// empty-prefix path) with a `DirectResponse` action -- the router
+    /// terminal synthesizes this response itself, no cluster/upstream
+    /// involved. Used by `hcm_filter_chain_mutates_headers_over_the_real_socket`
+    /// to prove the header-mutation filter's mutation survives the real
+    /// router terminal (as opposed to the WP-13 acceptance test below, which
+    /// proves the `Forward` path to a real upstream).
+    fn direct_response_route_table(status: u16) -> Arc<proxy_config::ir::RouteTable> {
+        use proxy_config::ir::{
+            PathMatch, RouteActionIR, RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
+        };
+        Arc::new(
+            RouteTable::new(
+                "test-routes".to_string(),
+                vec![VirtualHostIR {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Arc::new(RouteEntry {
+                        name: None,
+                        matcher: RouteMatcher {
+                            path: PathMatch::Prefix(String::new()),
+                            case_sensitive: true,
+                            headers: vec![],
+                        },
+                        action: RouteActionIR::DirectResponse { status, body: None },
+                        request_headers_to_add: vec![],
+                    })],
+                }],
+            )
+            .expect("single vhost can't have duplicate domains"),
+        )
+    }
+
+    /// An `http_connection_manager` filter whose `http_filters` chain is the
+    /// built-in [`crate::header_mutation_filter`] followed by the terminal
+    /// router -- what actually exercises the `FilterRegistry` ->
+    /// `FilterChainHandler` wiring end to end (see
+    /// `hcm_filter_chain_mutates_headers_over_the_real_socket` below). The
+    /// route table is [`direct_response_route_table`] (200), so the real
+    /// router terminal produces a response for the header-mutation encode
+    /// filter to mutate -- WP-13 replaced the fixed-200 stub this used to
+    /// exercise.
+    fn hcm_filter_with_header_mutation(header_name: &str, header_value: &str) -> NetworkFilterSpec {
+        use crate::header_mutation_filter::{header_value_option, TYPE_URL};
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: direct_response_route_table(200),
+            http_filters: vec![
+                proxy_config::ir::HttpFilterSpec {
+                    name: "llmproxy.header_mutation".to_string(),
+                    type_url: TYPE_URL.to_string(),
+                    config: Some(header_value_option(header_name, header_value)),
+                    is_router: false,
+                },
+                proxy_config::ir::HttpFilterSpec {
+                    name: "envoy.filters.http.router".to_string(),
+                    type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                        .to_string(),
+                    config: None,
+                    is_router: true,
+                },
+            ],
         })
     }
 
@@ -1024,13 +1295,29 @@ mod tests {
         manager: tokio::task::JoinHandle<()>,
     }
 
-    fn spawn_manager(initial: Arc<ConfigSnapshot>) -> Harness {
+    /// Builds a [`ClusterManager`] populated (and force-initialized, so
+    /// `pick_host` never has to wait on real DNS) from `snapshot`'s cluster
+    /// map -- the same manager both the `tcp_proxy` fixtures' listener wiring
+    /// and (WP-13) the HTTP router's `RouterHandler` see.
+    async fn cluster_manager_for(snapshot: &ConfigSnapshot) -> Arc<ClusterManager> {
+        let manager = Arc::new(ClusterManager::new(Arc::new(
+            proxy_cluster::resolver::TokioResolver,
+        )));
+        manager.update_from_snapshot(&snapshot.clusters).await;
+        for name in snapshot.clusters.keys() {
+            manager.force_initialize(name);
+        }
+        manager
+    }
+
+    async fn spawn_manager(initial: Arc<ConfigSnapshot>) -> Harness {
         let config = Arc::new(WorkerConfigHandle::new(initial.clone()));
         let (config_tx, config_rx) = watch::channel(initial.version);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let registry = ConnectionRegistry::new();
+        let cluster_manager = cluster_manager_for(&initial).await;
 
-        let bound = initial_bind(&initial, &config, &registry, &shutdown_rx)
+        let bound = initial_bind(&initial, &config, &registry, &shutdown_rx, &cluster_manager)
             .expect("initial_bind should succeed in tests");
 
         let manager = tokio::task::spawn_local(run_listener_manager(
@@ -1039,6 +1326,7 @@ mod tests {
             config_rx,
             shutdown_rx,
             registry.clone(),
+            cluster_manager,
         ));
 
         Harness {
@@ -1073,7 +1361,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             // Give the accept loop a moment to actually bind.
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1103,7 +1392,7 @@ mod tests {
             let port = free_port().await;
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = sni_only_listener("l1", addr, "unused");
-            let harness = spawn_manager(snapshot_with(listener_ir, 1));
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1140,7 +1429,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1169,7 +1459,7 @@ mod tests {
             let port = free_port().await;
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "unused");
-            let harness = spawn_manager(snapshot_with(listener_ir, 1));
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1203,7 +1493,7 @@ mod tests {
             let port = free_port().await;
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "unused");
-            let harness = spawn_manager(snapshot_with(listener_ir, 1));
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1243,7 +1533,8 @@ mod tests {
                 v1,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1307,7 +1598,8 @@ mod tests {
                 v1,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1491,7 +1783,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1527,7 +1820,7 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let (listener_ir, cert_a, cert_b) =
                 tls_dual_sni_listener("l1", addr, "host-a.example.com", "host-b.example.com");
-            let harness = spawn_manager(snapshot_with(listener_ir, 1));
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1624,8 +1917,15 @@ mod tests {
             let config = Arc::new(WorkerConfigHandle::new(snapshot.clone()));
             let registry = ConnectionRegistry::new();
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let cluster_manager = cluster_manager_for(&snapshot).await;
 
-            let result = initial_bind(&snapshot, &config, &registry, &shutdown_rx);
+            let result = initial_bind(
+                &snapshot,
+                &config,
+                &registry,
+                &shutdown_rx,
+                &cluster_manager,
+            );
             match result {
                 Err(err @ InitialBindError::Tls(_)) => {
                     // Also asserts `Display` works end to end -- this is
@@ -1634,6 +1934,9 @@ mod tests {
                 }
                 Err(InitialBindError::Bind { .. }) => {
                     panic!("expected a TLS build failure, got a bind failure instead")
+                }
+                Err(InitialBindError::Http(err)) => {
+                    panic!("expected a TLS build failure, got an HTTP filter chain build failure instead: {err}")
                 }
                 Ok(_) => panic!("a bad cert must fail initial_bind, not silently bind plaintext"),
             }
@@ -1653,7 +1956,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1688,7 +1992,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1753,7 +2058,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1805,7 +2111,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1850,7 +2157,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1886,7 +2194,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1919,7 +2228,7 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             // No cluster in the snapshot at all: `nonexistent` never resolves.
             let listener_ir = match_all_listener("l1", addr, "nonexistent");
-            let harness = spawn_manager(snapshot_with(listener_ir, 1));
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1949,7 +2258,8 @@ mod tests {
                 listener_ir,
                 static_cluster("up", upstream_addr),
                 1,
-            ));
+            ))
+            .await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1978,13 +2288,21 @@ mod tests {
 
     // --- WP-10 deferred chunk: HCM terminal filter wired to the h1 codec ----
 
+    /// Since WP-13, `build_hcm_handler`'s terminal is a real
+    /// `proxy_http::router::RouterHandler`, not a fixed-200 stub -- an empty
+    /// route table (`hcm_filter`) means every request takes the
+    /// `NoVirtualHost` path, a 404. This test now proves HTTP is served over
+    /// the real socket *at all* (request parsed, response written back) --
+    /// see `hcm_filter_chain_mutates_headers_over_the_real_socket` for a
+    /// route that actually matches, and the WP-13 acceptance test below for
+    /// a route that forwards to a real upstream.
     #[test]
     fn hcm_terminal_filter_serves_http_over_the_real_socket() {
         run_local(async {
             let port = free_port().await;
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = match_all_listener_with_filter("l1", addr, hcm_filter());
-            let harness = spawn_manager(snapshot_with(listener_ir, 1));
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2007,12 +2325,229 @@ mod tests {
 
             let response = String::from_utf8(response).expect("response should be valid utf8");
             assert!(
+                response.starts_with("HTTP/1.1 404"),
+                "expected a 404 status line (empty route table -> NoVirtualHost), got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    /// A listener whose HCM `http_filters` chain runs the built-in
+    /// header-mutation filter (in config order, ahead of the terminal
+    /// router) must show that filter's mutation in the actual response
+    /// bytes over a real socket -- proof that `build_hcm_handler` builds a
+    /// real `FilterChainHandler` against the shared `FilterRegistry`, with
+    /// the real `RouterHandler` (not a stub) as its terminal.
+    #[test]
+    fn hcm_filter_chain_mutates_headers_over_the_real_socket() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                hcm_filter_with_header_mutation("x-mutated-by-filter", "yes"),
+            );
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
                 response.starts_with("HTTP/1.1 200"),
                 "expected a 200 status line, got: {response:?}"
             );
             assert!(
-                response.contains("x-llmproxy-stub"),
-                "expected the stub marker header, got: {response:?}"
+                response
+                    .to_ascii_lowercase()
+                    .contains("x-mutated-by-filter: yes"),
+                "expected the header-mutation filter's header in the response, got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-13: router terminal + cluster-manager wiring -------------------
+
+    /// A one-vhost, one-route table matching every request (`*` domain,
+    /// empty-prefix path) with a `Forward` action targeting `cluster` --
+    /// the counterpart to [`direct_response_route_table`] that actually
+    /// exercises `RouterHandler::apply_forward`'s cluster-manager/pool path.
+    fn forward_route_table(cluster: &str) -> Arc<proxy_config::ir::RouteTable> {
+        use proxy_config::ir::{
+            ForwardAction, ForwardTarget, PathMatch, RouteActionIR, RouteEntry, RouteMatcher,
+            RouteTable, VirtualHostIR,
+        };
+        Arc::new(
+            RouteTable::new(
+                "test-routes".to_string(),
+                vec![VirtualHostIR {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Arc::new(RouteEntry {
+                        name: None,
+                        matcher: RouteMatcher {
+                            path: PathMatch::Prefix(String::new()),
+                            case_sensitive: true,
+                            headers: vec![],
+                        },
+                        action: RouteActionIR::Forward(ForwardAction {
+                            target: ForwardTarget::Cluster(cluster.to_string()),
+                            timeout: None,
+                            idle_timeout: None,
+                            retry_policy: None,
+                            host_rewrite_literal: None,
+                            prefix_rewrite: None,
+                        }),
+                        request_headers_to_add: vec![],
+                    })],
+                }],
+            )
+            .expect("single vhost can't have duplicate domains"),
+        )
+    }
+
+    /// Same shape as [`hcm_filter_with_header_mutation`], but its route table
+    /// forwards to a real cluster instead of synthesizing a `DirectResponse`
+    /// -- proving the router terminal actually dials an upstream, not just
+    /// that the encode filter chain runs.
+    fn hcm_filter_forward_with_header_mutation(
+        header_name: &str,
+        header_value: &str,
+        cluster: &str,
+    ) -> NetworkFilterSpec {
+        use crate::header_mutation_filter::{header_value_option, TYPE_URL};
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: forward_route_table(cluster),
+            http_filters: vec![
+                proxy_config::ir::HttpFilterSpec {
+                    name: "llmproxy.header_mutation".to_string(),
+                    type_url: TYPE_URL.to_string(),
+                    config: Some(header_value_option(header_name, header_value)),
+                    is_router: false,
+                },
+                proxy_config::ir::HttpFilterSpec {
+                    name: "envoy.filters.http.router".to_string(),
+                    type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                        .to_string(),
+                    config: None,
+                    is_router: true,
+                },
+            ],
+        })
+    }
+
+    /// Serve a fixed 200 response (a known body, no extra headers) over real
+    /// HTTP/1.1 on a fresh ephemeral-port `TcpListener`, forever -- the "real
+    /// upstream" fixture for the WP-13 acceptance test below. Reuses
+    /// `proxy_http`'s own downstream codec + `FixedResponseHandler` stub
+    /// (exactly what `proxy-http`'s own tests use to fake an origin), so this
+    /// isn't hand-rolled wire parsing.
+    async fn spawn_http_upstream(body: &'static [u8]) -> SocketAddr {
+        use proxy_http::handler::stub::FixedResponseHandler;
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::task::spawn_local(async move {
+                    let handler: Rc<dyn StreamHandler> = Rc::new(FixedResponseHandler {
+                        status: http::StatusCode::OK,
+                        headers: http::HeaderMap::new(),
+                        body: bytes::Bytes::from_static(body),
+                    });
+                    let _ = serve_http1(
+                        stream,
+                        handler,
+                        Http1Options { keep_alive: false },
+                        std::future::pending(),
+                    )
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// The WP-13 acceptance test: a real HTTP request is routed (via the
+    /// router terminal + `ClusterManager`) to a real upstream over HTTP/1.1,
+    /// and the response still flows back through the encode filter chain --
+    /// proving all three pieces (route match -> cluster/host pick -> upstream
+    /// codec -> encode filters) work together over real sockets.
+    ///
+    /// Mutation-tested: reverting `build_hcm_handler`'s terminal to
+    /// `FixedResponseHandler` (the pre-WP-13 stub) makes this fail, since the
+    /// stub never contacts `upstream_addr` and never emits its body.
+    #[test]
+    fn router_forwards_a_real_request_to_a_real_upstream_over_http1() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_body: &'static [u8] = b"hello from upstream";
+            let upstream_addr = spawn_http_upstream(upstream_body).await;
+
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                hcm_filter_forward_with_header_mutation("x-mutated-by-filter", "yes", "up"),
+            );
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {response:?}"
+            );
+            assert!(
+                response.contains("hello from upstream"),
+                "expected the real upstream's body in the response, got: {response:?}"
+            );
+            assert!(
+                response
+                    .to_ascii_lowercase()
+                    .contains("x-mutated-by-filter: yes"),
+                "expected the header-mutation filter's header in the response, got: {response:?}"
             );
 
             harness.shutdown().await;

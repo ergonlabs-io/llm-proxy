@@ -15,6 +15,8 @@
 //!   through the filter chain as data (S10.2).
 //! - WP-12: route table + matching engine (Appendix S1).
 //! - WP-13: router filter + upstream request lifecycle (Appendices S4, S9).
+//!   [`headers`] implements the S9 header-sanitization functions this WP
+//!   will call.
 //! - WP-14: retry & hedging engine (Appendix S3).
 //!
 //! The [`filter`] module is the frozen shared surface consumed by WP-31/32
@@ -24,6 +26,9 @@ pub mod codec;
 pub mod filter;
 pub mod filter_manager;
 pub mod handler;
+pub mod headers;
+pub mod route;
+pub mod router;
 pub mod stream_info;
 
 pub use codec::{serve_http1, CodecError, Http1Options};
@@ -33,4 +38,13 @@ pub use filter::{
 };
 pub use filter_manager::{FilterChainHandler, DEFAULT_BUFFER_LIMIT};
 pub use handler::{BodyError, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
+pub use headers::{
+    apply_xff, ensure_request_id, generate_request_id, is_internal_request,
+    resolve_trusted_address, sanitize_hop_by_hop, set_forwarded_proto,
+    strip_envoy_headers_from_external, XffOptions,
+};
+pub use route::{
+    apply_prefix_rewrite, match_route, select_cluster, strip_port, strip_query, RouteMatch,
+    RouteRequest,
+};
 pub use stream_info::StreamInfo;

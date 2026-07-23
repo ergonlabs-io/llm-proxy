@@ -12,18 +12,19 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use proxy_config::ir::{ClusterConfig, ClusterName, EndpointIR};
+use proxy_config::ir::{ClusterConfig, ClusterName, EndpointIR, LbPolicy};
 
 use crate::discovery;
 use crate::host_set::{diff_host_sets, HostSet, HostSetDiff};
+use crate::load_balancer::{self, HostPicker, LbError};
 use crate::resolver::HostResolver;
 use crate::{
-    CircuitBreakerState, ClusterEntry, HealthStatus, Host, HttpConnPool, LoadBalancerContext,
-    RoutingPriority, UpstreamProtocol,
+    CircuitBreakerState, ClusterEntry, Host, HttpConnPool, LoadBalancerContext, RoutingPriority,
+    UpstreamProtocol,
 };
 
 /// Where a managed cluster's membership comes from.
@@ -54,10 +55,14 @@ struct ManagedCluster {
     /// Flips to `true` once the cluster's first resolution (or, for EDS, its
     /// first externally-supplied set) has landed.
     initialized: AtomicBool,
-    /// Round-robin cursor for `pick_host`. TODO(WP-17): replace with the
-    /// configured `lb_policy` (round-robin/least-request/ring-hash/random/
-    /// Maglev); v1 always round-robins priority 0's healthy hosts.
-    rr_cursor: AtomicUsize,
+    /// S7 host selection: the configured `lb_policy`'s [`LoadBalancer`],
+    /// plus the priority-spillover / healthy-panic-threshold logic shared by
+    /// every policy (WP-17). Built once at cluster construction -- see
+    /// [`load_balancer::build`] for why `RING_HASH`/`MAGLEV` fail here
+    /// instead of falling back to something else.
+    ///
+    /// [`LoadBalancer`]: crate::load_balancer::LoadBalancer
+    host_picker: HostPicker,
     /// TODO(WP-15): real circuit-breaker accounting/stats; these are just
     /// the buckets `ClusterEntry::circuit_breaker` hands back.
     default_cb: CircuitBreakerState,
@@ -65,23 +70,33 @@ struct ManagedCluster {
 }
 
 impl ManagedCluster {
-    fn from_config(config: Arc<ClusterConfig>) -> Self {
-        Self {
+    /// Builds a config-sourced cluster's state, including its load balancer
+    /// -- fails with [`LbError`] if `config.lb_policy` isn't implemented yet
+    /// (`RING_HASH`/`MAGLEV`, see [`load_balancer::build`]); ground rule #1
+    /// forbids silently substituting another policy.
+    fn from_config(config: Arc<ClusterConfig>) -> Result<Self, LbError> {
+        let policy = load_balancer::build(config.lb_policy)?;
+        Ok(Self {
             source: ClusterSource::Config(config),
             host_set: ArcSwap::from_pointee(HostSet::default()),
             initialized: AtomicBool::new(false),
-            rr_cursor: AtomicUsize::new(0),
+            host_picker: HostPicker::new(policy),
             default_cb: CircuitBreakerState::default(),
             high_cb: CircuitBreakerState::default(),
-        }
+        })
     }
 
+    /// EDS clusters have no `ClusterConfig`/`lb_policy` of their own (see
+    /// [`ClusterSource::Eds`]); default to `ROUND_ROBIN`, matching Envoy's
+    /// own cluster-wide default.
     fn eds() -> Self {
         Self {
             source: ClusterSource::Eds,
             host_set: ArcSwap::from_pointee(HostSet::default()),
             initialized: AtomicBool::new(false),
-            rr_cursor: AtomicUsize::new(0),
+            host_picker: HostPicker::new(
+                load_balancer::build(LbPolicy::RoundRobin).expect("round robin always builds"),
+            ),
             default_cb: CircuitBreakerState::default(),
             high_cb: CircuitBreakerState::default(),
         }
@@ -119,15 +134,31 @@ impl ClusterManager {
     /// `PartialEq`, and Envoy's own cluster-update semantics are a larger
     /// piece of work than this WP. EDS-registered clusters (which never
     /// appear in a config snapshot) are carried over untouched.
-    pub async fn update_from_snapshot(&self, clusters: &HashMap<ClusterName, Arc<ClusterConfig>>) {
+    ///
+    /// A cluster whose `lb_policy` isn't implemented (`RING_HASH`/`MAGLEV`,
+    /// WP-17) is rejected rather than silently substituted with another
+    /// policy (ground rule #1): it's left out of the resulting cluster set
+    /// entirely and its name+error is returned here so the caller can
+    /// surface it (e.g. as a config error) instead of it disappearing
+    /// silently.
+    pub async fn update_from_snapshot(
+        &self,
+        clusters: &HashMap<ClusterName, Arc<ClusterConfig>>,
+    ) -> Vec<(ClusterName, LbError)> {
         let previous = self.clusters.load_full();
         let mut next: HashMap<ClusterName, Arc<ManagedCluster>> =
             HashMap::with_capacity(clusters.len());
+        let mut rejected = Vec::new();
         for (name, config) in clusters {
-            next.insert(
-                name.clone(),
-                Arc::new(ManagedCluster::from_config(Arc::clone(config))),
-            );
+            match ManagedCluster::from_config(Arc::clone(config)) {
+                Ok(managed) => {
+                    next.insert(name.clone(), Arc::new(managed));
+                }
+                Err(err) => {
+                    tracing::error!(cluster = %name, error = %err, "cluster rejected");
+                    rejected.push((name.clone(), err));
+                }
+            }
         }
         for (name, managed) in previous.iter() {
             if matches!(managed.source, ClusterSource::Eds) {
@@ -138,6 +169,12 @@ impl ClusterManager {
         self.clusters.store(Arc::new(next));
 
         for name in clusters.keys() {
+            if rejected
+                .iter()
+                .any(|(rejected_name, _)| rejected_name == name)
+            {
+                continue;
+            }
             if let Err(err) = self.refresh_cluster(name).await {
                 // Rust note: a discovery failure doesn't take the cluster
                 // manager down -- Envoy keeps serving the last-known-good
@@ -147,6 +184,7 @@ impl ClusterManager {
                 tracing::warn!(cluster = %name, error = %err, "initial cluster discovery failed");
             }
         }
+        rejected
     }
 
     /// Register a cluster whose membership will arrive via
@@ -249,27 +287,23 @@ impl ClusterManager {
 struct ClusterHandle(Arc<ManagedCluster>);
 
 impl ClusterEntry for ClusterHandle {
-    fn pick_host(&self, _ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
-        // TODO(WP-17): real load balancing -- configured `lb_policy`, panic
-        // threshold, priority spillover, and honoring `ctx` (hash/host
-        // override). v1 round-robins priority 0's healthy hosts only.
+    fn pick_host(&self, ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
         let host_set = self.0.host_set.load();
-        let healthy: Vec<&Arc<Host>> = host_set
-            .hosts_for_priority(0)
-            .iter()
-            .filter(|h| h.health == HealthStatus::Healthy)
-            .collect();
-        if healthy.is_empty() {
-            return None;
-        }
-        let idx = self.0.rr_cursor.fetch_add(1, Ordering::Relaxed) % healthy.len();
-        Some(Arc::clone(healthy[idx]))
+        self.0.host_picker.pick(&host_set, ctx)
     }
 
-    fn http_pool(&self, _host: &Arc<Host>, _proto: UpstreamProtocol) -> Arc<dyn HttpConnPool> {
-        // TODO(WP-15): upstream connection pools + circuit breakers. Nothing
-        // in WP-16's scope calls this yet.
-        unimplemented!("upstream connection pools land in WP-15")
+    fn http_pool(&self, host: &Arc<Host>, proto: UpstreamProtocol) -> Arc<dyn HttpConnPool> {
+        // v1 is connect-per-stream, h1-only (`Http1ConnectPool`); h2
+        // multiplexing pools and circuit-breaker accounting are WP-15
+        // follow-up. Nothing feeds `Http2` in here yet (routing/pools only
+        // wire h1 so far), so a mismatch would mean a caller elsewhere is
+        // ahead of this pool -- assert rather than silently building an h1
+        // pool for an h2 request.
+        debug_assert!(
+            matches!(proto, UpstreamProtocol::Http1),
+            "h2 pools land in WP-15"
+        );
+        Arc::new(crate::pool::Http1ConnectPool::new(host.address))
     }
 
     fn circuit_breaker(&self, prio: RoutingPriority) -> &CircuitBreakerState {

@@ -424,6 +424,28 @@ fn type_name(any: &prost_types::Any) -> &str {
     any.type_url.rsplit('/').next().unwrap_or(&any.type_url)
 }
 
+/// Decode an HTTP filter's `typed_config` into a [`DynamicMessage`], keyed by
+/// its type URL against the compiled descriptor pool — same lookup
+/// [`check_any`] does for the generic surface walk, but returning the message
+/// rather than recursing into it (that recursion already happened during the
+/// surface check; this is the typed-conversion pass reusing the same bytes).
+/// A type URL absent from the pool is a config error naming both the type URL
+/// and the dotted path — an unrecognized HTTP filter is never silently
+/// accepted just because the IR can now hold arbitrary filter config.
+fn decode_http_filter_config(
+    any: &prost_types::Any,
+    path: &str,
+) -> Result<DynamicMessage, ConfigError> {
+    let inner_desc = proxy_api::descriptor_pool()
+        .get_message_by_name(type_name(any))
+        .ok_or_else(|| ConfigError::UnknownTypeUrl {
+            field_path: path.to_string(),
+            type_url: any.type_url.clone(),
+        })?;
+    DynamicMessage::decode(inner_desc, any.value.as_slice())
+        .map_err(|e| ConfigError::Parse(format!("cannot decode `{}`: {e}", any.type_url)))
+}
+
 // ---------------------------------------------------------------- listeners --
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
@@ -892,21 +914,55 @@ fn convert_hcm(
             }
             None => return Err(invalid(&f_path, "http filter requires typed_config")),
         };
-        match type_name(any) {
-            ROUTER_TYPE => http_filters.push(HttpFilterSpec::Router),
-            _ => {
-                return Err(ConfigError::UnknownTypeUrl {
-                    field_path: format!("{f_path}.typed_config"),
-                    type_url: any.type_url.clone(),
-                })
-            }
-        }
+        let is_router = type_name(any) == ROUTER_TYPE;
+        // Rust note: the router has no configurable fields (`allowed_fields`
+        // maps its type to `&[]`), so its `config` is always `None`; every
+        // other filter's `typed_config` is decoded reflectively here — the
+        // registry (`proxy-http::FilterRegistry`), not this lowering pass,
+        // is what actually understands the bytes (ground rule #2).
+        let config = if is_router {
+            None
+        } else {
+            Some(decode_http_filter_config(
+                any,
+                &format!("{f_path}.typed_config"),
+            )?)
+        };
+        http_filters.push(HttpFilterSpec {
+            name: f.name.clone(),
+            type_url: any.type_url.clone(),
+            config,
+            is_router,
+        });
     }
-    if http_filters.last() != Some(&HttpFilterSpec::Router) {
-        return Err(invalid(
-            format!("{path}.http_filters"),
-            "the last HTTP filter must be the router (envoy.filters.http.router)",
-        ));
+
+    // Envoy requires exactly one terminal router filter, and it must be last.
+    let router_positions: Vec<usize> = http_filters
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.is_router)
+        .map(|(i, _)| i)
+        .collect();
+    match router_positions.as_slice() {
+        [] => {
+            return Err(invalid(
+                format!("{path}.http_filters"),
+                "the last HTTP filter must be the router (envoy.filters.http.router)",
+            ))
+        }
+        [pos] if *pos == http_filters.len() - 1 => {}
+        [pos] => {
+            return Err(invalid(
+                format!("{path}.http_filters[{pos}]"),
+                "the router filter (envoy.filters.http.router) must be the last HTTP filter",
+            ))
+        }
+        _ => {
+            return Err(invalid(
+                format!("{path}.http_filters"),
+                "the router filter (envoy.filters.http.router) may appear at most once",
+            ))
+        }
     }
 
     Ok(HttpConnectionManagerConfig {
@@ -1389,9 +1445,28 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     let lb_policy = match ProtoLb::try_from(c.lb_policy) {
         Ok(ProtoLb::RoundRobin) => LbPolicy::RoundRobin,
         Ok(ProtoLb::LeastRequest) => LbPolicy::LeastRequest,
-        Ok(ProtoLb::RingHash) => LbPolicy::RingHash,
         Ok(ProtoLb::Random) => LbPolicy::Random,
-        Ok(ProtoLb::Maglev) => LbPolicy::Maglev,
+        // RING_HASH / MAGLEV: the `LbPolicy` variants exist so the IR can
+        // model them, but WP-17 deliberately does not implement them yet --
+        // a consistent-hash that isn't bit-identical to Envoy's silently
+        // breaks session affinity across a mixed fleet, so it needs an Envoy
+        // differential harness first. Reject at *config* time rather than at
+        // cluster-build time: `proxy-cluster` also refuses to build such a
+        // cluster, but that error surfaces after startup, leaving the cluster
+        // simply absent and every request to it answered 503 with no
+        // explanation. Failing here means `make validate` and startup say
+        // exactly what is wrong, with the full dotted path (ground rule #1).
+        Ok(policy @ (ProtoLb::RingHash | ProtoLb::Maglev)) => {
+            return Err(unsupported(
+                format!("{path}.lb_policy"),
+                format!(
+                    "{} load balancing is not implemented yet (WP-17 follow-up: it requires \
+                     bit-exact parity with Envoy's hashing, verified by a differential test, \
+                     or session affinity breaks across a mixed fleet)",
+                    policy.as_str_name()
+                ),
+            ))
+        }
         _ => {
             return Err(unsupported(
                 format!("{path}.lb_policy"),
@@ -1531,7 +1606,14 @@ fn convert_route_table(
         let vh_path = format!("{path}.virtual_hosts[{i}]");
         let mut routes = Vec::new();
         for (j, r) in vh.routes.iter().enumerate() {
-            routes.push(convert_route(r, &format!("{vh_path}.routes[{j}]"))?);
+            // Rust note: `Arc`'d here (not a bare `RouteEntry`) so the S2.8
+            // route cache in `proxy-http`'s frozen filter API can hand out
+            // `Arc<RouteEntry>` clones (see the field doc on
+            // `VirtualHostIR::routes`).
+            routes.push(Arc::new(convert_route(
+                r,
+                &format!("{vh_path}.routes[{j}]"),
+            )?));
         }
         vhosts.push(VirtualHostIR {
             name: vh.name.clone(),

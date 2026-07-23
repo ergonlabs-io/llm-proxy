@@ -47,6 +47,15 @@ impl HostSet {
             .unwrap_or(&[])
     }
 
+    /// Priorities present in this snapshot, ascending -- failover order
+    /// (S5/S7). Used by [`crate::load_balancer`]'s priority-spillover pass.
+    ///
+    /// Rust note: `BTreeMap::keys()` already yields ascending order, so this
+    /// is just naming that guarantee for callers rather than doing any work.
+    pub fn priorities(&self) -> impl Iterator<Item = u32> + '_ {
+        self.by_priority.keys().copied()
+    }
+
     /// All hosts across every priority whose health is `Healthy`.
     pub fn all_healthy_hosts(&self) -> Vec<Arc<Host>> {
         self.by_priority
@@ -115,6 +124,7 @@ mod tests {
             weight: 1,
             priority,
             health: HealthStatus::Healthy,
+            active_requests: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

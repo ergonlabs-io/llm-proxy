@@ -1194,7 +1194,7 @@ dependencies = [
  "arc-swap",
  "futures",
  "proxy-config",
- "proxy-core",
+ "rand",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1227,6 +1227,9 @@ dependencies = [
  "core_affinity",
  "futures",
  "http",
+ "prost-reflect",
+ "proxy-api",
+ "proxy-cluster",
  "proxy-config",
  "proxy-http",
  "rcgen",
@@ -1265,10 +1268,13 @@ dependencies = [
  "hyper",
  "hyper-util",
  "prost-reflect",
+ "proxy-cluster",
  "proxy-config",
  "proxy-observability",
+ "rand",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

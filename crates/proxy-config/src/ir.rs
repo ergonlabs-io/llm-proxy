@@ -205,10 +205,25 @@ pub struct HttpConnectionManagerConfig {
 }
 
 /// An HTTP filter, resolved from its `typed_config` type URL.
-#[derive(Debug, PartialEq, Eq)]
-pub enum HttpFilterSpec {
-    /// `envoy.filters.http.router` — the terminal filter (WP-13).
-    Router,
+///
+/// Rust note: `config` is left as a [`prost_reflect::DynamicMessage`] (a
+/// reflectively-typed proto value, not a generated Rust struct) rather than
+/// decoded into a filter-specific IR type here — `proxy-config` doesn't know
+/// what any given filter's config shape means; that's `HttpFilterFactory`'s
+/// job (`proxy-http`), which is why `create` takes a `&DynamicMessage`
+/// directly (ground rule #2: the registry, not the IR, owns per-filter
+/// parsing).
+#[derive(Debug)]
+pub struct HttpFilterSpec {
+    /// Envoy filter name, e.g. `envoy.filters.http.router`.
+    pub name: String,
+    /// `typed_config` type URL, the registry key.
+    pub type_url: String,
+    /// The filter's own decoded `typed_config`; `None` for filters with no
+    /// config.
+    pub config: Option<prost_reflect::DynamicMessage>,
+    /// True for `envoy.filters.http.router` — the terminal filter.
+    pub is_router: bool,
 }
 
 // ----------------------------------------------------------------- clusters --
@@ -361,7 +376,12 @@ pub struct VirtualHostIR {
     /// Original domain strings, as configured (for `/config_dump`).
     pub domains: Vec<String>,
     /// Ordered routes; first match wins (S1) — evaluated by WP-12.
-    pub routes: Vec<RouteEntry>,
+    ///
+    /// Rust note: `Arc<RouteEntry>`, not a bare `RouteEntry` — the S2.8 route
+    /// cache (`DecoderCallbacks::route`, in `proxy-http`'s frozen filter API)
+    /// hands callers an `Arc<RouteEntry>` clone rather than a borrow tied to
+    /// the request's lifetime, so there has to be an `Arc` here to clone from.
+    pub routes: Vec<Arc<RouteEntry>>,
 }
 
 /// One route: pre-compiled matcher + resolved action.

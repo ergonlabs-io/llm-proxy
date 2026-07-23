@@ -7,13 +7,16 @@
 //! (ground rule #4).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
 pub mod discovery;
 pub mod host_set;
+pub mod load_balancer;
 pub mod manager;
+pub mod pool;
 pub mod resolver;
 
 /// Envoy routing priority: selects the circuit-breaker bucket (S5).
@@ -53,7 +56,32 @@ pub struct Host {
     /// TODO(WP-18): flips to `Unhealthy` on failed active health checks;
     /// TODO(WP-19): outlier-detection ejection state.
     pub health: HealthStatus,
+    /// In-flight request count, read by `LEAST_REQUEST`'s power-of-two-choices
+    /// pick (WP-17, S7). TODO(WP-15/WP-13): the connection pool and router
+    /// are what actually `fetch_add`/`fetch_sub` this as requests start and
+    /// finish; until those land it stays 0 for every host, which just makes
+    /// `LEAST_REQUEST` degrade to uniform random.
+    pub active_requests: AtomicU64,
     // TODO(WP-16+): locality, metadata.
+}
+
+impl Host {
+    /// Current in-flight request count (see [`Host::active_requests`]).
+    ///
+    /// Rust note: `Relaxed` is enough here -- this counter has no other
+    /// memory it needs to be ordered with (we're not using it to publish or
+    /// guard access to anything else), it's just a number LB picks read.
+    pub fn active_request_count(&self) -> u64 {
+        self.active_requests.load(Ordering::Relaxed)
+    }
+
+    /// Test seam for [`crate::load_balancer`]'s `LEAST_REQUEST` tests: set
+    /// the counter directly instead of going through fetch_add/fetch_sub
+    /// (which is what real callers, once WP-15/WP-13 land, will use).
+    #[cfg(test)]
+    pub(crate) fn set_active_requests_for_test(&self, n: u64) {
+        self.active_requests.store(n, Ordering::Relaxed);
+    }
 }
 
 /// Per-request input to host selection (S7).
@@ -70,9 +98,18 @@ pub struct LoadBalancerContext {
 #[derive(Debug, Default)]
 pub struct CircuitBreakerState {}
 
-/// A stream slot on a pooled upstream connection. TODO(WP-15): wraps the codec
-/// send-request handle plus pool bookkeeping (release-on-drop).
-pub struct UpstreamStream {}
+/// A stream slot on a pooled upstream connection. v1 ([`pool::Http1ConnectPool`])
+/// is connect-per-stream: this just carries a freshly-dialed transport, no
+/// pooling/reuse yet.
+pub struct UpstreamStream {
+    /// The connected upstream transport. v1 (no reuse): a freshly-dialed
+    /// plaintext TCP connection, one per stream. The router runs the
+    /// upstream h1 codec over it.
+    pub io: tokio::net::TcpStream,
+    // TODO(WP-15): release-on-drop pool guard + `active_requests` dec, and
+    // (for keep-alive reuse) hold the codec `SendRequest` handle rather than
+    // a raw transport -- at which point this seam changes shape.
+}
 
 /// Pool failures are distinct variants because the retry engine (S3 trigger
 /// mapping), response flags, and stats all depend on which one occurred.

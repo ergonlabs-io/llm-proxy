@@ -7,11 +7,15 @@ license.workspace = true
 [dependencies]
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
+# WP-13: threads the shared ClusterManager through the listener manager into
+# the HTTP router terminal.
+proxy-cluster = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
 core_affinity = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+prost-reflect = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
@@ -24,6 +28,7 @@ tracing = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+proxy-api = { workspace = true }
 rcgen = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "io-util"] }

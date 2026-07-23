@@ -6,9 +6,9 @@ license.workspace = true
 
 [dependencies]
 proxy-config = { workspace = true }
-proxy-core = { workspace = true }
 arc-swap = { workspace = true }
 futures = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

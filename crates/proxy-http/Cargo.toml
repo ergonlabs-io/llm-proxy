@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 proxy-config = { workspace = true }
 proxy-observability = { workspace = true }
+# WP-13: the router (router.rs) picks a host/pool through the cluster
+# manager; pools live in proxy-cluster, their interface is consumed here.
+proxy-cluster = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 prost-reflect = { workspace = true }
@@ -17,6 +20,9 @@ http-body-util = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "time", "sync"] }
 thiserror = { workspace = true }
+# S9: per-worker seeding for `x-request-id` generation (headers.rs).
+rand = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Rust note: these power the WP-10 chunk A hyper capability spike

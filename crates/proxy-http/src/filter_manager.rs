@@ -2,29 +2,80 @@
 //! the frozen [`crate::filter`] API and bridges it to the codec's
 //! [`StreamHandler`] seam.
 //!
-//! # Scope of this chunk (chunk 1)
+//! # Scope so far (chunks 1-3)
 //!
-//! This is the **buffered-model** core: for one downstream request it collects
-//! the whole request body, runs the decoder chain (config order), hands the
-//! result to an inner terminal [`StreamHandler`] (the router stand-in until
-//! WP-13), then runs the encoder chain (**reverse** config order, S2.1) over the
-//! response. It implements the parts of S2 whose mechanics are exercised without
-//! streaming:
+//! The **decode** (request) direction stays fully buffered: it collects the
+//! whole request body, then runs the decoder chain (config order). LLM request
+//! bodies are small JSON, so there's no time-to-first-byte pressure there.
 //!
-//! - S2.1 ordering (decode forward, encode reverse);
-//! - S2.2/S2.3 `Continue`, `StopIteration` header-hold + resume (via
+//! The **encode** (response) direction is now **streaming** (chunk 3): the
+//! manager no longer collects the upstream response before encoding it. It
+//! runs the encode *header* phase (async — a header hold may need to consume
+//! upstream frames to resolve, S2.2), then returns a response whose body is a
+//! [`StreamingEncoder`] — a hand-rolled [`hyper::body::Body`] that pulls
+//! frames from the upstream body on demand, running the encoder chain
+//! (**reverse** config order, S2.1) over each one as it arrives. This is what
+//! makes time-to-first-token (WP-33) possible: bytes flow to the downstream
+//! connection as soon as a filter lets them through, without waiting for the
+//! upstream response to finish.
+//!
+//! S2 mechanics covered:
+//!
+//! - S2.1 ordering (decode forward, encode reverse) and per-stream teardown
+//!   (`on_destroy`, reverse creation order) — now driven by [`Drop`], since a
+//!   streaming response means filters live until the stream actually ends, not
+//!   until `run()` returns;
+//! - S2.2/S2.3 `Continue`, `StopIteration`/stop-all header-hold + resume (via
 //!   `continue_*()` or a `Continue` from the same filter's data callback), and
-//!   the buffering statuses (which, in a fully-buffered model, all collapse to
-//!   "hold until this filter continues");
+//!   the buffering statuses, now genuinely incremental on the encode side (a
+//!   held filter keeps seeing new frames, not a single fully-buffered chunk);
+//! - S2.4 trailers, including "queue behind buffered data" on encode;
 //! - `add_*_data` / `*coding_buffer` / `modify_*_buffer` buffer APIs (S2.7);
-//! - buffer-limit overflow → **413** (decode) / **500** (encode) (S2.2/S2.3).
+//! - buffer-limit overflow → **413** (decode) / **500** (encode, only while
+//!   headers are still held) / mid-stream truncation with an error (encode,
+//!   once headers have already been forwarded — a 500 can no longer be sent).
 //!
-//! Deferred to later chunks (each callback that isn't fully wired says so):
-//! streaming / early-flush and watermark backpressure; `send_local_reply`
-//! routed through the encoder chain (S2.5); 1xx (S2.6);
+//! `send_local_reply` (S2.5) now lands too: before response headers have been
+//! forwarded downstream, it synthesizes a response and drives it through the
+//! encoder chain via the exact same [`encode_headers_phase`] +
+//! [`StreamingEncoder`] machinery a normal response uses — an encoder filter
+//! (token metering, access logging, ...) can't tell a local reply from an
+//! ordinary one. The manager's own failure paths (decode buffer overflow →
+//! 413, a request body read error → 400, an encode-header-phase buffer
+//! overflow → 500) are routed through the same [`respond_with_local_reply`]
+//! helper, for the same reason: no response should bypass the chain filters
+//! were installed to observe.
+//!
+//! Deferred to later chunks:
+//! watermark backpressure (treated as plain buffering for now); 1xx (S2.6);
 //! `inject_*_to_filter_chain` and `ContinueAndDontEndStream` (S2.7); lazy route
-//! resolution + cache (S2.8, needs the WP-12 route table). The ~60-case S2
-//! conformance suite (chunk 2) is what will pin every corner.
+//! resolution + cache (S2.8, needs the WP-12 route table); resetting the
+//! downstream stream when a filter stalls forever past end-of-stream, or when
+//! an encode header-hold is never resolved before the upstream response ends
+//! (both noted at their call sites); an out-of-callback `continue_encoding()`
+//! that could wake a *pending* `poll_frame` (today it only matters if observed
+//! synchronously inside a callback — there's no waker registered for a filter
+//! that decides to continue later, e.g. after async work); a genuine stream
+//! **reset** for `send_local_reply` called after response headers have
+//! already been forwarded — we have no reset primitive through the body seam
+//! yet, so that case terminates the body with a [`BodyError`] instead (noted
+//! at [`DecoderCallbacksAdapter::send_local_reply`]). The ~60-case S2
+//! conformance suite (chunk 2, already landed for decode) is what will keep
+//! pinning every corner as the remaining items land.
+//!
+//! # The encode per-position state machine
+//!
+//! Every frame — real or the synthetic end-of-stream flush — walks the encode
+//! chain starting at position **0**, always (never resuming mid-chain from
+//! wherever some other position happens to be stopped: that was a real bug,
+//! see the `PositionState` doc comment). A frame flows forward until it hits a
+//! position that is currently stopped; that's where it accumulates. Because
+//! frames now genuinely walk from the front every time, more than one
+//! position can be stopped simultaneously (an early filter buffering while a
+//! later one is also buffering), so each position gets its **own** buffer
+//! (`ctx.encode.positions: Vec<PositionState>`, indexed by position, not by
+//! filter index — see [`StreamingEncoder`]'s doc comment for what "position"
+//! means) instead of one buffer shared by the whole direction.
 //!
 //! # The borrow problem (and why this compiles without `unsafe`)
 //!
@@ -39,14 +90,17 @@
 //! `ctx` (continue flags, appended buffer bytes) that the driver acts on **after
 //! the callback returns**; a callback never re-enters another filter.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use http_body_util::{BodyExt, StreamBody};
+use hyper::body::{Body, Frame};
 
 use proxy_config::ir::RouteEntry;
 
@@ -119,7 +173,8 @@ impl StreamHandler for FilterChainHandler {
 }
 
 /// Per-direction iteration bookkeeping the callbacks record into and the driver
-/// reads back after each callback returns.
+/// reads back after each callback returns. Decode stays fully buffered (module
+/// doc), so one shared buffer per direction is still correct here.
 #[derive(Default)]
 struct DirectionState {
     /// Filter-manager buffer for this direction (S2.7).
@@ -129,27 +184,101 @@ struct DirectionState {
     continue_requested: bool,
 }
 
+/// Encode-side counterpart to [`DirectionState`]. Unlike decode, encode is
+/// streaming and — once a frame can reach a stopped position no matter what
+/// stopped earlier (the fix for the position-skipping bug) — more than one
+/// position can be stopped at once, so it needs one buffer **per position**
+/// rather than one shared buffer for the whole direction. See
+/// [`PositionState`]'s doc comment for the invariant this relies on.
+#[derive(Default)]
+struct EncodeState {
+    /// Set by `continue_encoding()`; the driver clears it once observed. Not
+    /// per-position: only one filter call is ever in flight at a time, so
+    /// there's nothing to disambiguate.
+    continue_requested: bool,
+    /// Indexed by *position* (`p`), not filter index — see
+    /// [`StreamingEncoder`]'s doc comment. Sized once the per-stream filter
+    /// instances exist (in [`encode_headers_phase`]; `ChainCtx::new` doesn't
+    /// know `n` yet).
+    positions: Vec<PositionState>,
+}
+
 /// Split-storage counterpart to the filter `Vec`: everything a callback may
 /// touch. Kept separate from the filters so a callback adapter can borrow this
 /// while the driver still holds `&mut filters[i]` (see the module doc).
 struct ChainCtx {
     decode: DirectionState,
-    encode: DirectionState,
+    encode: EncodeState,
     stream_info: StreamInfo,
-    /// Cached route (S2.8). TODO(WP-11 chunk 3 / WP-12): lazy resolution against
+    /// Cached route (S2.8). TODO(WP-11 chunk 4 / WP-12): lazy resolution against
     /// the route table; always `None` here.
     route: Option<Arc<RouteEntry>>,
+    /// S2.5: a pending `send_local_reply()`, recorded here by
+    /// [`DecoderCallbacksAdapter::send_local_reply`] and consumed by `run()`.
+    /// First one wins — see that method's doc.
+    local_reply: Option<LocalReply>,
+    /// Set once `run()` hands response headers back across the seam (i.e.
+    /// once [`encode_headers_phase`] has resolved). `send_local_reply` checks
+    /// this to decide "synthesize a new response" vs. "too late, reset".
+    response_headers_forwarded: bool,
+    /// S2.5: `send_local_reply` was called after `response_headers_forwarded`
+    /// was already set. We can't express a real stream reset through the body
+    /// seam yet (TODO WP-11 chunk 4) — [`StreamingEncoder::poll_frame`]
+    /// checks this and terminates the body with a [`crate::handler::BodyError`]
+    /// instead of silently ignoring the call.
+    reset_after_headers: bool,
 }
 
 impl ChainCtx {
     fn new() -> Self {
         Self {
             decode: DirectionState::default(),
-            encode: DirectionState::default(),
+            encode: EncodeState::default(),
             stream_info: StreamInfo::default(),
             route: None,
+            local_reply: None,
+            response_headers_forwarded: false,
+            reset_after_headers: false,
         }
     }
+}
+
+/// S2.5: a synthesized response requested via `send_local_reply`, recorded
+/// into [`ChainCtx`] until `run()` (or [`respond_with_local_reply`]) can
+/// substitute it for whatever response was otherwise going to be built.
+struct LocalReply {
+    code: http::StatusCode,
+    body: String,
+    /// Rust note: [`HeaderMutationFn`] is `FnOnce` (callable exactly once,
+    /// consuming it) — a field can't be *called* through `&mut self`, only
+    /// moved out of. That's why every use site below takes it out of the
+    /// `Option` (`Option::take`, or an `if let Some(f) = reply.modify_headers`
+    /// pattern, which also moves it out) before calling it, rather than
+    /// calling it in place.
+    modify_headers: Option<HeaderMutationFn>,
+    details: String,
+}
+
+impl LocalReply {
+    /// Build a local reply carrying no header mutation — used by the
+    /// manager's own synthesized failure responses (decode overflow, body
+    /// read errors, encode-header-phase overflow), as opposed to one a filter
+    /// requested via `send_local_reply` (which may supply `modify_headers`).
+    fn new(code: http::StatusCode, body: &str, details: &str) -> Self {
+        Self {
+            code,
+            body: body.to_string(),
+            modify_headers: None,
+            details: details.to_string(),
+        }
+    }
+}
+
+/// Sum of every position's buffered bytes for the encode direction — the
+/// buffer limit is per-stream, not per-position, so overflow is checked
+/// against this total (S2.7).
+fn total_encode_buffered(ctx: &ChainCtx) -> usize {
+    ctx.encode.positions.iter().map(|p| p.buf.0.len()).sum()
 }
 
 /// One request's worth of filter-chain execution. Consumed by [`Self::run`].
@@ -174,8 +303,16 @@ impl FilterManager<'_> {
             Ok(parts) => parts,
             // A downstream body read error is a client problem: 400. (Streaming
             // will surface this mid-flight instead; chunk 1 sees it up front.)
+            // S2.5: routed through the encoder chain like any other response —
+            // no filters have run yet, but the still-fresh `filters`/`ctx` are
+            // exactly what `respond_with_local_reply` needs.
             Err(()) => {
-                return synth_response(http::StatusCode::BAD_REQUEST, "invalid request body")
+                let reply = LocalReply::new(
+                    http::StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                    "request_body_read_error",
+                );
+                return respond_with_local_reply(filters, ctx, buffer_limit, reply).await;
             }
         };
 
@@ -188,7 +325,25 @@ impl FilterManager<'_> {
             &mut body,
             req_trailers.as_ref(),
         ) {
-            return synth_response(status, "request rejected by filter chain");
+            let reply = LocalReply::new(
+                status,
+                "request rejected by filter chain",
+                "decode_buffer_overflow",
+            );
+            return respond_with_local_reply(filters, ctx, buffer_limit, reply).await;
+        }
+
+        // S2.5: a decoder filter may have called `send_local_reply` while the
+        // chain above was running. If so, the request must not reach the
+        // terminal handler (the router stand-in) at all — a local reply
+        // *replaces* the response, it doesn't run alongside it.
+        //
+        // Rust note: `ctx.local_reply.take()` both reads the value out and
+        // leaves `None` in its place — needed because `ctx` itself is about
+        // to move into `respond_with_local_reply` below; we can't hold a
+        // borrow of it across that move.
+        if let Some(reply) = ctx.local_reply.take() {
+            return respond_with_local_reply(filters, ctx, buffer_limit, reply).await;
         }
 
         // Anything filters appended via `add_decoded_data` rides along to the
@@ -201,40 +356,842 @@ impl FilterManager<'_> {
             body: bytes_to_seam_body(decoded_body, req_trailers.map(|t| t.0)),
         };
         let resp = terminal.handle(terminal_req).await;
+        let HttpResponseParts { mut head, mut body } = resp;
 
-        // --- collect + encode the response (reverse config order, S2.1) ---
-        let (mut resp_head, resp_trailers, resp_body) = match collect_response(resp).await {
-            Ok(parts) => parts,
-            Err(()) => {
-                return synth_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "upstream body error",
-                )
-            }
-        };
-        let mut resp_body = resp_body;
+        // --- encode header phase (async: a header hold may need to consume
+        // upstream frames to resolve it, S2.2) ---
+        let hold =
+            match encode_headers_phase(&mut filters, &mut ctx, buffer_limit, &mut head, &mut body)
+                .await
+            {
+                Ok(hold) => hold,
+                Err(status) => {
+                    // The encoder chain has ALREADY begun traversing this
+                    // response — at least one filter has seen `encode_headers`.
+                    // Substituting a local reply and restarting the chain from
+                    // position 0 would call `encode_headers` on those filters a
+                    // *second* time within one stream. That re-entrancy is
+                    // precisely the bug class that hurts most here: a metering
+                    // or access-logging filter would count the same response
+                    // twice. Envoy draws the same line — a local reply raised
+                    // once encoding is under way is sent directly rather than
+                    // back through the filters.
+                    //
+                    // The trade-off, stated plainly: filters do NOT observe
+                    // this particular 500. That is the lesser evil against
+                    // double-invocation, and this path only fires when the
+                    // filter chain itself blew the encode buffer limit.
+                    ctx.stream_info.is_local_reply = true;
+                    ctx.stream_info.response_code_details =
+                        Some("encode_header_phase_overflow".to_string());
+                    destroy_filters(&mut filters);
+                    return synth_response(status, "response rejected by filter chain");
+                }
+            };
 
-        if let Err(status) = drive_encode(
-            &mut filters,
-            &mut ctx,
+        // Response headers are about to be handed back across the seam —
+        // from this point on, `send_local_reply` can no longer synthesize a
+        // new response (S2.5); see `ctx.reset_after_headers`.
+        ctx.response_headers_forwarded = true;
+
+        // --- the rest of the response streams through the encoder chain on
+        // demand (chunk 3): filters/ctx move into the body so callbacks keep
+        // working exactly as before, just driven by `poll_frame` instead of a
+        // single synchronous pass. `on_destroy` now runs in `Drop` (below),
+        // since the stream — and therefore the filters' lifetime — doesn't
+        // end when `run()` returns.
+        let encoder = StreamingEncoder {
+            filters,
+            ctx,
+            upstream: body,
             buffer_limit,
-            &mut resp_head,
-            &mut resp_body,
-            resp_trailers.as_ref(),
-        ) {
-            return synth_response(status, "response rejected by filter chain");
-        }
-
-        let encoded_body = join_buffer(&ctx.encode.buffer, &resp_body);
-
-        // Per-stream teardown, reverse creation order (S2.1).
-        for filter in filters.iter_mut().rev() {
-            filter.on_destroy();
-        }
+            pending: hold.pending,
+            pending_trailers: hold.pending_trailers,
+            upstream_done: hold.upstream_done,
+            end_flush_done: false,
+            flush_pos: 0,
+            destroyed: false,
+        };
 
         HttpResponseParts {
-            head: resp_head,
-            body: bytes_to_seam_body(encoded_body, resp_trailers.map(|t| t.0)),
+            head,
+            body: local_boxed(encoder),
+        }
+    }
+}
+
+/// S2.5: substitute a synthesized response for whatever was otherwise going
+/// to be sent, and drive it through the SAME encoder-chain machinery a normal
+/// response uses ([`encode_headers_phase`] + [`StreamingEncoder`]) — so
+/// encoder filters (token metering, access logging, ...) observe a local
+/// reply exactly like any other response. Used both for an explicit
+/// `send_local_reply()` call and for the failure paths `run()` itself raises.
+/// Per-stream teardown (S2.1: reverse creation order).
+///
+/// Normally this rides on [`StreamingEncoder`]'s `Drop`, since a streaming
+/// response means the filters outlive `run()`. Any path that returns a bare
+/// [`synth_response`] never constructs a `StreamingEncoder`, so it must call
+/// this explicitly — otherwise the filter instances are simply dropped and
+/// `on_destroy` never fires. Filters that emit their stats/usage record on
+/// teardown (exactly what an LLM token-metering filter does) would silently
+/// report nothing for those requests.
+fn destroy_filters(filters: &mut [Box<dyn HttpFilter>]) {
+    for filter in filters.iter_mut().rev() {
+        filter.on_destroy();
+    }
+}
+
+async fn respond_with_local_reply(
+    mut filters: Vec<Box<dyn HttpFilter>>,
+    mut ctx: ChainCtx,
+    buffer_limit: usize,
+    reply: LocalReply,
+) -> HttpResponseParts {
+    // A local reply always starts the encoder chain fresh, as if this were a
+    // brand-new response substituted at the very top of the chain — discard
+    // any encode-side state a prior, now-abandoned attempt left behind (e.g.
+    // the real response's `encode_headers_phase` partially ran before
+    // overflowing and calling this function).
+    ctx.encode = EncodeState::default();
+    // Record onto `StreamInfo` even when this local reply came from one of
+    // `run()`'s own failure paths, not a filter's `send_local_reply()` call
+    // (which already records it) — every local reply must be observable this
+    // way, regardless of source.
+    ctx.stream_info.is_local_reply = true;
+    ctx.stream_info.response_code_details = Some(reply.details.clone());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    // Rust note: `if let Some(f) = reply.modify_headers` moves the `FnOnce`
+    // out of `reply` (a plain field access can't call it in place — see
+    // `LocalReply`'s doc), so it can be invoked exactly once here.
+    if let Some(f) = reply.modify_headers {
+        f(&mut headers);
+    }
+    let mut head = ResponseHeaders {
+        status: reply.code,
+        headers,
+    };
+    let mut body = bytes_to_seam_body(Bytes::from(format!("{}\n", reply.body)), None);
+
+    match encode_headers_phase(&mut filters, &mut ctx, buffer_limit, &mut head, &mut body).await {
+        Ok(hold) => {
+            ctx.response_headers_forwarded = true;
+            let encoder = StreamingEncoder {
+                filters,
+                ctx,
+                upstream: body,
+                buffer_limit,
+                pending: hold.pending,
+                pending_trailers: hold.pending_trailers,
+                upstream_done: hold.upstream_done,
+                end_flush_done: false,
+                flush_pos: 0,
+                destroyed: false,
+            };
+            HttpResponseParts {
+                head,
+                body: local_boxed(encoder),
+            }
+        }
+        Err(status) => {
+            // The local reply itself overflowed the encode buffer — there's
+            // nowhere left to route it, so fall back to a bare synthesized
+            // response (bypassing the chain), same as the pre-S2.5 behavior.
+            // Teardown still has to happen: `on_destroy` normally rides on
+            // `StreamingEncoder`'s `Drop`, and this path never builds one.
+            destroy_filters(&mut filters);
+            synth_response(status, "response rejected by filter chain")
+        }
+    }
+}
+
+/// What a position in the encode chain is currently doing with data it can't
+/// yet forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopKind {
+    /// `StopIterationAndBuffer` / `StopIterationAndWatermark`: bytes
+    /// accumulate in this position's buffer, and — this is the part the
+    /// module doc calls out as easy to miss — the filter is **re-invoked with
+    /// the whole accumulated buffer on every subsequent frame**, not just
+    /// once at end-of-stream. That's genuine Envoy behavior (it's why the
+    /// real `Buffer` filter is written as `if (end_stream) return Continue;
+    /// return StopIterationAndBuffer;` — it only ever sees "continue or stay
+    /// stopped" on each call, and needs to be asked again to notice
+    /// end-of-stream). Without re-invoking, a buffering filter could never
+    /// unstall before the stream ends.
+    ///
+    /// Watermark backpressure itself (applying downstream flow control
+    /// instead of just accumulating) is chunk 4; here it collapses to the
+    /// same "buffer and wait" behavior as the plain buffering statuses.
+    Buffering,
+    /// `StopIterationNoBuffer`: bytes are discarded, not replayed. The filter
+    /// is NOT re-invoked (unlike `Buffering`) — only an explicit
+    /// `continue_encoding()` releases it, and we have no out-of-callback
+    /// waker for that yet (module doc).
+    NoBuffer,
+    /// `StopAllIterationAndBuffer` / `StopAllIterationAndWatermark`, from the
+    /// header phase: "nothing (headers/data/trailers) proceeds past this
+    /// filter" — unlike plain `StopIteration`'s S2.2 gotcha, this filter's own
+    /// data callbacks do NOT fire either. Bytes just accumulate silently;
+    /// nothing here re-invokes the filter (TODO WP-11 chunk 4: needs an
+    /// out-of-band `continue_encoding()` to ever release, which isn't modeled
+    /// yet — this position simply absorbs the rest of the stream).
+    StopAll,
+}
+
+/// Per-position encode state, indexed by *position* (see
+/// [`StreamingEncoder`]'s doc comment: position `p` = filter index
+/// `n - 1 - p`).
+///
+/// # Why per-position, not one shared buffer
+///
+/// The chunk-3 encoder used a single `ctx.encode.buffer` plus a single
+/// `stopped_at: Option<usize>` for the whole direction. That's wrong the
+/// moment two positions are stopped at once (an early filter buffering while
+/// a later one also buffers): the flat buffer can't tell whose bytes are
+/// whose, and releasing one position would re-deliver bytes the other
+/// position already saw. Fixing the "a frame must always walk from position
+/// 0" bug (see the module doc) makes that double-stop reachable in practice,
+/// so it has to be fixed in the same change.
+///
+/// # Invariant
+///
+/// `buf` is non-empty only where `stop.is_some()` — a *flowing* position
+/// never holds bytes between calls to [`StreamingEncoder::encode_frame`].
+/// That's what makes "whose bytes are these, and in what order" unambiguous:
+/// anything sitting in a position's buffer is strictly earlier, in stream
+/// order, than anything still arriving from upstream or from an earlier
+/// position. (The invariant can be transiently violated *during* a single
+/// `encode_frame` call — e.g. while a filter is being re-invoked and might
+/// call `add_encoded_data` — but always holds again once the call returns.)
+#[derive(Default)]
+struct PositionState {
+    stop: Option<StopKind>,
+    /// Rust note: reusing [`BufferedBody`] (rather than a bare `BytesMut`)
+    /// here — not because it needs the newtype for meaning, but because
+    /// `EncoderCallbacks::encoding_buffer()` returns `Option<&BufferedBody>`
+    /// and we can't manufacture that reference from a `&BytesMut`.
+    buf: BufferedBody,
+    /// An `end_stream = true` frame arrived while this position was stopped.
+    /// Remembered so a `Buffering` re-invoke passes the real `end_stream`
+    /// flag to the filter instead of always claiming `false`.
+    end_pending: bool,
+}
+
+impl PositionState {
+    /// Debug-only check for the invariant above; called at the start/end of
+    /// [`StreamingEncoder::encode_frame`] (steady state), never mid-call.
+    #[cfg(debug_assertions)]
+    fn check_invariant(&self, p: usize) {
+        debug_assert!(
+            self.stop.is_some() || self.buf.0.is_empty(),
+            "position {p} is flowing but still holds {} buffered byte(s)",
+            self.buf.0.len()
+        );
+    }
+}
+
+/// A single upstream frame that was consumed (during a header hold, or
+/// because an earlier `encode_frame` call fully buffered it) but hasn't yet
+/// been delivered past `start_pos`.
+struct PendingFrame {
+    data: Bytes,
+    end_stream: bool,
+    /// Rust note: a *position* (see [`StreamingEncoder`]'s doc comment), not a
+    /// filter index — this frame must resume at the filter *after* whichever
+    /// one already consumed it, and positions make "next filter" a plain `+1`
+    /// regardless of config order.
+    start_pos: usize,
+}
+
+/// The outcome of [`encode_headers_phase`]: whatever couldn't be resolved
+/// synchronously, to seed a [`StreamingEncoder`]. A stopped position (if any)
+/// is recorded directly into `ctx.encode.positions` as the phase runs, rather
+/// than returned separately — at most one position can come out of the header
+/// phase stopped (the loop gives up at the first one it can't resolve), but
+/// once real frames start flowing (chunk 3+), more than one can become
+/// stopped, which is exactly why `PositionState` lives in `ctx`, not here.
+struct HeaderHoldOutcome {
+    pending: VecDeque<PendingFrame>,
+    pending_trailers: Option<HeaderMap>,
+    upstream_done: bool,
+}
+
+/// Encode header phase (S2.2 applied to the response path): walk positions
+/// `0..n` (position `p` = filter index `n - 1 - p`, i.e. reverse config
+/// order, S2.1) delivering `encode_headers`. Plain `StopIteration` means the
+/// headers can't proceed past this filter yet — but per the S2.2 gotcha,
+/// *this filter's own* data callbacks still fire while it's stopped. So we
+/// pull frames off `upstream` one at a time and hand them to the held
+/// filter's `encode_data` until it continues (headers then resume at `p + 1`)
+/// or `upstream` ends (headers are forwarded as-is; see the TODO below).
+/// `StopAllIterationAndBuffer`/`Watermark` is different: "nothing proceeds
+/// past this filter" means not even this filter's own data callbacks fire —
+/// there is no S2.2 gotcha for stop-all, so we don't try to resolve it here at
+/// all; the position is marked `StopAll` and absorbs the rest of the stream
+/// (TODO WP-11 chunk 4: only an out-of-band `continue_encoding()` should be
+/// able to release it, which isn't modeled yet).
+///
+/// Frames consumed while resolving a `StopIteration` hold must not be lost,
+/// and must not be re-delivered to filters at positions `<= p` once streaming
+/// starts — they're queued into the returned `pending`, tagged with
+/// `start_pos = p + 1`.
+///
+/// Buffer overflow here can still synthesize a 500 (`Err`), since the headers
+/// have not been handed back to the caller yet.
+async fn encode_headers_phase(
+    filters: &mut [Box<dyn HttpFilter>],
+    ctx: &mut ChainCtx,
+    buffer_limit: usize,
+    head: &mut ResponseHeaders,
+    upstream: &mut SeamBody,
+) -> Result<HeaderHoldOutcome, http::StatusCode> {
+    let n = filters.len();
+    // Rust note: sized here, not in `ChainCtx::new` — `n` (how many filters
+    // this stream has) isn't known until the per-stream instances exist.
+    ctx.encode.positions = (0..n).map(|_| PositionState::default()).collect();
+    let mut pending = VecDeque::new();
+    let mut upstream_done = false;
+    let mut pending_trailers = None;
+
+    let mut p = 0;
+    'headers: while p < n {
+        let idx = n - 1 - p;
+        let status = {
+            let mut cb = EncoderCallbacksAdapter { ctx, pos: p };
+            // We can't know ahead of time whether the (streaming) body is
+            // empty, so we never claim end_stream from the header phase; the
+            // real end-of-stream flush happens once `upstream` actually ends
+            // (see `StreamingEncoder::poll_frame`).
+            filters[idx].encode_headers(&mut cb, head, false)
+        };
+        if total_encode_buffered(ctx) > buffer_limit {
+            return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        match status {
+            FilterHeadersStatus::Continue | FilterHeadersStatus::ContinueAndDontEndStream => {
+                // ContinueAndDontEndStream: TODO(WP-11 chunk 4) requires
+                // inject_*_to_filter_chain to let the filter later end the
+                // stream itself; treated as Continue here.
+                p += 1;
+            }
+            FilterHeadersStatus::StopAllIterationAndBuffer
+            | FilterHeadersStatus::StopAllIterationAndWatermark => {
+                ctx.encode.positions[p].stop = Some(StopKind::StopAll);
+                break 'headers;
+            }
+            FilterHeadersStatus::StopIteration => {
+                // Resolve the hold: feed upstream frames to *this* filter
+                // until it continues or upstream ends.
+                loop {
+                    let frame = std::future::poll_fn(|cx| upstream.as_mut().poll_frame(cx)).await;
+                    match frame {
+                        Some(Ok(frame)) => match frame.into_data() {
+                            Ok(mut data) => {
+                                ctx.encode.continue_requested = false;
+                                let dstatus = {
+                                    let mut cb = EncoderCallbacksAdapter { ctx, pos: p };
+                                    filters[idx].encode_data(&mut cb, &mut data, false)
+                                };
+                                if total_encode_buffered(ctx) > buffer_limit {
+                                    return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
+                                }
+                                let continued = matches!(dstatus, FilterDataStatus::Continue)
+                                    || ctx.encode.continue_requested;
+                                ctx.encode.continue_requested = false;
+                                if continued {
+                                    // Resumes at p + 1; this frame already
+                                    // passed through `idx`, so it must start
+                                    // downstream of it.
+                                    pending.push_back(PendingFrame {
+                                        data,
+                                        end_stream: false,
+                                        start_pos: p + 1,
+                                    });
+                                    p += 1;
+                                    continue 'headers;
+                                }
+                                // Still held: the filter didn't ask us to
+                                // remember this chunk (it would call
+                                // `add_encoded_data` itself if it wanted
+                                // that) — poll for the next frame.
+                            }
+                            Err(frame) => {
+                                let trailers = frame
+                                    .into_trailers()
+                                    .expect("hyper::body::Frame is data or trailers");
+                                // Trailers arrived before the hold resolved.
+                                // TODO(WP-11 chunk 4): Envoy would stall/reset
+                                // here rather than giving up on the hold; we
+                                // forward the headers as-is and let the
+                                // streaming body deliver the final
+                                // end-of-stream flush to the still-held
+                                // filter, same as the "upstream ends" case
+                                // below.
+                                pending_trailers = Some(trailers);
+                                ctx.encode.positions[p].stop = Some(StopKind::Buffering);
+                                upstream_done = true;
+                                break 'headers;
+                            }
+                        },
+                        Some(Err(e)) => {
+                            let _ = e; // surfaced to the caller as a synth 500
+                            return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
+                        }
+                        None => {
+                            // TODO(WP-11 chunk 4): Envoy would stall/reset the
+                            // stream rather than force headers out with an
+                            // unresolved hold; we forward as-is.
+                            ctx.encode.positions[p].stop = Some(StopKind::Buffering);
+                            upstream_done = true;
+                            break 'headers;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(HeaderHoldOutcome {
+        pending,
+        pending_trailers,
+        upstream_done,
+    })
+}
+
+/// The response body once headers have gone out: pulls frames from
+/// `upstream` on demand and runs them through the encoder chain (reverse
+/// config order, S2.1) as they arrive, instead of buffering the whole
+/// response first (chunk 3 — this is what makes time-to-first-token
+/// possible).
+///
+/// # Position vs. filter index
+///
+/// Encode order is REVERSE config order (S2.1). Rather than tracking a
+/// config index and computing "next filter" as `idx - 1` (awkward — it hits
+/// zero and needs a wraparound check), everything here works in *positions*
+/// `p` over `0..n`, where `filters[order(p)]` is the filter encode visits
+/// p-th; `order(p) = n - 1 - p`. "Resume at the next filter" is then always
+/// plain `p + 1`, regardless of which end of `filters` that corresponds to.
+struct StreamingEncoder {
+    filters: Vec<Box<dyn HttpFilter>>,
+    ctx: ChainCtx,
+    upstream: SeamBody,
+    buffer_limit: usize,
+    /// Frames already pulled off `upstream` (during a header hold, or
+    /// because an earlier `poll_frame` call fully buffered one) but not yet
+    /// delivered past their `start_pos`. Drained before touching `upstream`
+    /// again, so frame order is preserved.
+    pending: VecDeque<PendingFrame>,
+    /// Trailers that arrived while data was still held (S2.4: trailers queue
+    /// behind buffered data) — delivered once the hold clears.
+    pending_trailers: Option<HeaderMap>,
+    /// `upstream` has yielded its terminal `None`.
+    upstream_done: bool,
+    /// Whether the end-of-stream flush (an empty, `end_stream = true` frame
+    /// through the chain) has already run.
+    end_flush_done: bool,
+    /// After the end-of-stream flush, the next position (in `0..n`) whose
+    /// leftover buffer still needs flushing to the caller (TODO WP-11 chunk 4:
+    /// a filter stalled forever past end-of-stream should reset the stream
+    /// instead; we can't express that through the body seam yet, so we flush
+    /// the bytes rather than drop them). One `poll_frame` call flushes at most
+    /// one position's worth, advancing this cursor, so multiple stopped
+    /// positions each get their own frame in position order.
+    flush_pos: usize,
+    /// Guards [`Drop::drop`] so `on_destroy` fires exactly once.
+    destroyed: bool,
+}
+
+impl StreamingEncoder {
+    /// Assert the [`PositionState`] invariant for position `p` right after
+    /// this call has finished deciding its fate for the current frame.
+    ///
+    /// Rust note: NOT a whole-vector scan. A position the filter chain
+    /// hasn't reached yet this call may legitimately hold bytes with
+    /// `stop == None` — a filter can call `add_encoded_data` from
+    /// `encode_headers` (S2.7), before that position has ever seen a data
+    /// frame, and those bytes wait right there (flowing, unstopped) until the
+    /// position's first real frame arrives and merges them in (see the `None`
+    /// arm below). So the invariant only has to hold *for a position, once
+    /// its own turn this frame is over* — not globally at every instant.
+    #[cfg(debug_assertions)]
+    fn assert_position_ok(&self, p: usize) {
+        self.ctx.encode.positions[p].check_invariant(p);
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn assert_position_ok(&self, _p: usize) {}
+
+    fn over_limit(&self) -> bool {
+        total_encode_buffered(&self.ctx) > self.buffer_limit
+    }
+
+    fn overflow_err(&self) -> BodyError {
+        BodyError::Upstream(
+            format!(
+                "encode filter chain buffered more than the {}-byte limit \
+                 after response headers were already forwarded; truncating the stream",
+                self.buffer_limit
+            )
+            .into(),
+        )
+    }
+
+    /// Whether any position in the encode chain is currently stopped — used
+    /// to decide whether trailers must queue behind buffered data (S2.4).
+    fn any_stopped(&self) -> bool {
+        self.ctx.encode.positions.iter().any(|p| p.stop.is_some())
+    }
+
+    /// Run one frame of data through positions `start_pos..n`. Every REAL
+    /// frame (from `upstream`, or the synthetic end-of-stream flush) must
+    /// call this with `start_pos = 0` — walking forward from position 0,
+    /// always, is what makes every filter observe every frame regardless of
+    /// what's stopped further down the chain (the defect this fixed: frames
+    /// used to resume at whatever position was *last* reported stopped,
+    /// silently skipping every filter before it). The only legitimate
+    /// non-zero `start_pos` is [`PendingFrame::start_pos`]: a frame that was
+    /// already handed to a specific filter during the header-hold's S2.2
+    /// resolution loop, and must not be redelivered to that same filter.
+    ///
+    /// Returns the bytes that survived to the end of the chain (`None` if
+    /// they were fully buffered or discarded along the way).
+    ///
+    /// Buffer overflow here is `Err` (not a status code): headers have
+    /// already gone out, so the only thing left to do is truncate the
+    /// stream with an error — there is no 500 to send anymore.
+    fn encode_frame(
+        &mut self,
+        mut data: Bytes,
+        end_stream: bool,
+        start_pos: usize,
+    ) -> Result<Option<Bytes>, BodyError> {
+        let n = self.filters.len();
+        let mut p = start_pos;
+        while p < n {
+            let idx = n - 1 - p;
+            match self.ctx.encode.positions[p].stop {
+                Some(StopKind::StopAll) => {
+                    // The filter is not called at all while stop-all is in
+                    // effect (unlike `Buffering` — see `StopKind`'s doc).
+                    let pos = &mut self.ctx.encode.positions[p];
+                    pos.buf.0.extend_from_slice(&data);
+                    pos.end_pending |= end_stream;
+                    if self.over_limit() {
+                        return Err(self.overflow_err());
+                    }
+                    self.assert_position_ok(p);
+                    return Ok(None);
+                }
+                Some(StopKind::NoBuffer) => {
+                    // Bytes are discarded, not replayed (matches
+                    // `StopIterationNoBuffer`'s contract); the filter is only
+                    // released by an explicit `continue_encoding()`, which we
+                    // have no out-of-callback waker for yet.
+                    self.assert_position_ok(p);
+                    return Ok(None);
+                }
+                Some(StopKind::Buffering) => {
+                    let pos = &mut self.ctx.encode.positions[p];
+                    pos.buf.0.extend_from_slice(&data);
+                    pos.end_pending |= end_stream;
+                    let call_end_stream = pos.end_pending;
+                    // Take the whole accumulated buffer to hand to the filter
+                    // as `&mut Bytes` — Envoy's actual semantics for a
+                    // buffering filter: it is re-invoked with everything
+                    // accumulated so far on every subsequent frame, not just
+                    // once at end-of-stream (see `StopKind::Buffering`'s doc);
+                    // otherwise it could never notice end-of-stream and
+                    // release.
+                    let mut whole = std::mem::take(&mut pos.buf).0.freeze();
+                    self.ctx.encode.continue_requested = false;
+                    let status = {
+                        let mut cb = EncoderCallbacksAdapter {
+                            ctx: &mut self.ctx,
+                            pos: p,
+                        };
+                        self.filters[idx].encode_data(&mut cb, &mut whole, call_end_stream)
+                    };
+                    let continued = matches!(status, FilterDataStatus::Continue)
+                        || self.ctx.encode.continue_requested;
+                    self.ctx.encode.continue_requested = false;
+                    // Anything appended via `add_encoded_data` during the call
+                    // above landed in this position's buffer (freshly emptied
+                    // by the `take` above) — fold it in after the (possibly
+                    // rewritten) accumulated bytes, whichever way this call
+                    // resolves.
+                    let trailing = std::mem::take(&mut self.ctx.encode.positions[p].buf).0;
+                    if continued {
+                        let pos = &mut self.ctx.encode.positions[p];
+                        pos.stop = None;
+                        pos.end_pending = false;
+                        data = if trailing.is_empty() {
+                            whole
+                        } else {
+                            let mut out = BytesMut::with_capacity(whole.len() + trailing.len());
+                            out.extend_from_slice(&whole);
+                            out.extend_from_slice(&trailing);
+                            out.freeze()
+                        };
+                        self.assert_position_ok(p);
+                        p += 1;
+                        continue;
+                    }
+                    // Still held: leave the (possibly rewritten) accumulated
+                    // bytes, plus anything newly added, in place.
+                    let pos = &mut self.ctx.encode.positions[p];
+                    pos.buf.0 = BytesMut::with_capacity(whole.len() + trailing.len());
+                    pos.buf.0.extend_from_slice(&whole);
+                    pos.buf.0.extend_from_slice(&trailing);
+                    if self.over_limit() {
+                        return Err(self.overflow_err());
+                    }
+                    self.assert_position_ok(p);
+                    return Ok(None);
+                }
+                None => {
+                    // A position with `stop == None` is "flowing," but it may
+                    // still hold bytes here: a filter can call
+                    // `add_encoded_data` from `encode_headers` (S2.7) before
+                    // this position has ever seen a data frame. `buf_before`
+                    // captures that so it can replay AHEAD of the current
+                    // frame — mirroring what "buffered from before this call"
+                    // meant when there was one shared per-direction buffer.
+                    let buf_before = self.ctx.encode.positions[p].buf.0.len();
+                    self.ctx.encode.continue_requested = false;
+                    let status = {
+                        let mut cb = EncoderCallbacksAdapter {
+                            ctx: &mut self.ctx,
+                            pos: p,
+                        };
+                        self.filters[idx].encode_data(&mut cb, &mut data, end_stream)
+                    };
+                    let continued = matches!(status, FilterDataStatus::Continue)
+                        || self.ctx.encode.continue_requested;
+                    self.ctx.encode.continue_requested = false;
+
+                    if continued {
+                        // S2.7: bytes from BEFORE this call (added via headers
+                        // or an earlier resume) replay ahead of the current
+                        // frame; bytes added DURING this call ride along
+                        // after it.
+                        if !self.ctx.encode.positions[p].buf.0.is_empty() || buf_before > 0 {
+                            let mut whole = std::mem::take(&mut self.ctx.encode.positions[p].buf).0;
+                            let held_before = whole.split_to(buf_before.min(whole.len()));
+                            let mut out = BytesMut::with_capacity(
+                                held_before.len() + data.len() + whole.len(),
+                            );
+                            out.extend_from_slice(&held_before);
+                            out.extend_from_slice(&data);
+                            out.extend_from_slice(&whole);
+                            data = out.freeze();
+                        }
+                        self.assert_position_ok(p);
+                        p += 1;
+                        continue;
+                    }
+
+                    match status {
+                        FilterDataStatus::StopIterationAndBuffer
+                        | FilterDataStatus::StopIterationAndWatermark => {
+                            let pos = &mut self.ctx.encode.positions[p];
+                            pos.buf.0.extend_from_slice(&data);
+                            pos.end_pending |= end_stream;
+                            pos.stop = Some(StopKind::Buffering);
+                        }
+                        FilterDataStatus::StopIterationNoBuffer => {
+                            let pos = &mut self.ctx.encode.positions[p];
+                            // `NoBuffer` discards, full stop: even bytes that
+                            // arrived earlier (e.g. via `add_encoded_data`
+                            // from `encode_headers`) are given up here, not
+                            // just the current frame's `data`.
+                            pos.buf.0.clear();
+                            pos.stop = Some(StopKind::NoBuffer);
+                        }
+                        FilterDataStatus::Continue => unreachable!("handled by `continued` above"),
+                    }
+                    if self.over_limit() {
+                        return Err(self.overflow_err());
+                    }
+                    self.assert_position_ok(p);
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(if data.is_empty() { None } else { Some(data) })
+    }
+
+    /// S2.4: run trailers through positions `0..n` (only reachable once
+    /// nothing is held — held trailers wait in `pending_trailers` instead).
+    fn encode_trailers(&mut self, trailers: HeaderMap) -> HeaderMap {
+        let n = self.filters.len();
+        let mut owned = ResponseTrailers(trailers);
+        for p in 0..n {
+            let idx = n - 1 - p;
+            let mut cb = EncoderCallbacksAdapter {
+                ctx: &mut self.ctx,
+                pos: p,
+            };
+            // Chunk-1-era simplification carried forward: `FilterTrailersStatus`
+            // (Continue/StopIteration) isn't yet honored for encode trailers.
+            let _ = self.filters[idx].encode_trailers(&mut cb, &mut owned);
+        }
+        owned.0
+    }
+}
+
+impl Body for StreamingEncoder {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        // Rust note: every field here is `Unpin` — `Vec`, `VecDeque`,
+        // `Option`, `bool`, and `upstream: Pin<Box<dyn Body>>` is
+        // unconditionally `Unpin` regardless of what it points to (pinning a
+        // boxed value only pins the *pointee*, and moving the `Box` itself
+        // never moves that pointee). So `StreamingEncoder` as a whole is
+        // `Unpin`, and `get_mut()` is sound here without any manual
+        // pin-projection.
+        let this = self.get_mut();
+
+        // S2.5: `send_local_reply` was called after response headers were
+        // already forwarded. TODO(WP-11 chunk 4): the correct Envoy behavior
+        // is a stream RESET, which we have no primitive for through the body
+        // seam yet — terminate the body with an error instead of silently
+        // pretending nothing happened.
+        if this.ctx.reset_after_headers {
+            return Poll::Ready(Some(Err(BodyError::Upstream(
+                "send_local_reply() was called after response headers were already forwarded; \
+                 this should reset the stream (TODO WP-11 chunk 4), but no reset primitive \
+                 exists yet, so the response is being terminated with an error instead"
+                    .into(),
+            ))));
+        }
+
+        loop {
+            // 1. Drain anything already pulled off `upstream` first, so frame
+            // order survives header holds / prior full-buffering.
+            if let Some(frame) = this.pending.pop_front() {
+                match this.encode_frame(frame.data, frame.end_stream, frame.start_pos) {
+                    Ok(Some(bytes)) => return Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                    // Fully buffered — produced nothing observable; try the
+                    // next queued frame (or fall through) without returning
+                    // an empty data frame to the caller.
+                    Ok(None) => continue,
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                }
+            }
+
+            if !this.upstream_done {
+                match this.upstream.as_mut().poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(data) => {
+                            // Defect fix: every real frame walks the chain
+                            // from position 0, always — never resuming from
+                            // wherever some *other* position last stopped,
+                            // which used to skip every filter before it.
+                            match this.encode_frame(data, false, 0) {
+                                Ok(Some(bytes)) => {
+                                    return Poll::Ready(Some(Ok(Frame::data(bytes))))
+                                }
+                                Ok(None) => continue,
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                            }
+                        }
+                        Err(frame) => {
+                            let trailers = frame
+                                .into_trailers()
+                                .expect("hyper::body::Frame is data or trailers");
+                            // S2.4: trailers queue behind any data still held.
+                            if this.any_stopped() {
+                                this.pending_trailers = Some(trailers);
+                                continue;
+                            }
+                            let trailers = this.encode_trailers(trailers);
+                            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                        }
+                    },
+                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                    Poll::Ready(None) => {
+                        this.upstream_done = true;
+                        continue;
+                    }
+                    // Do NOT buffer-and-wait: returning Pending here with
+                    // nothing emitted is exactly what lets bytes already
+                    // produced above flush through without waiting on the
+                    // rest of the upstream response.
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            // --- upstream has ended: end-of-stream sequence ---
+            if !this.end_flush_done {
+                this.end_flush_done = true;
+                // Deliver a final end_stream=true empty frame, from position
+                // 0 (same defect-fix reasoning as above), so a filter that
+                // gated on end-of-stream can release its buffer -- and so can
+                // every position after it, in the same pass.
+                match this.encode_frame(Bytes::new(), true, 0) {
+                    Ok(Some(bytes)) => return Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                    Ok(None) => {} // fall through to the checks below
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                }
+            }
+
+            // A filter that is still stopped never continued, even on the
+            // end-of-stream flush above.
+            // TODO(WP-11 chunk 4): a filter that stalls past end-of-stream
+            // should reset the downstream stream; we cannot express a reset
+            // through the body seam yet. For now, flush whatever the manager
+            // buffered so the bytes aren't silently dropped -- one position
+            // per `poll_frame` call, in position order, so two positions that
+            // are both still holding bytes each get their own frame rather
+            // than being concatenated out of order.
+            let n = this.filters.len();
+            while this.flush_pos < n {
+                let p = this.flush_pos;
+                this.flush_pos += 1;
+                if !this.ctx.encode.positions[p].buf.0.is_empty() {
+                    let bytes = std::mem::take(&mut this.ctx.encode.positions[p].buf)
+                        .0
+                        .freeze();
+                    return Poll::Ready(Some(Ok(Frame::data(bytes))));
+                }
+            }
+
+            if let Some(trailers) = this.pending_trailers.take() {
+                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+            }
+
+            return Poll::Ready(None);
+        }
+    }
+}
+
+impl Drop for StreamingEncoder {
+    fn drop(&mut self) {
+        // Rust note: `on_destroy` used to run at the end of `run()`'s
+        // synchronous pass (chunk 1). Now that the response streams, the
+        // filters' per-stream lifetime is the *body's* lifetime, not a single
+        // function call — `Drop` is where "the stream is over" actually
+        // happens, whether it ended cleanly or was dropped early (client
+        // disconnect, error, etc). `destroyed` guards against firing twice if
+        // something ever calls `drop` explicitly.
+        if !self.destroyed {
+            self.destroyed = true;
+            // Reverse creation order (S2.1), same as decode's teardown.
+            for filter in self.filters.iter_mut().rev() {
+                filter.on_destroy();
+            }
         }
     }
 }
@@ -285,9 +1242,19 @@ fn drive_decode(
             return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
         }
 
+        // S2.5: once a filter has requested a local reply, decode iteration
+        // stops immediately — no filter after the sender sees the request, and
+        // the sender's own data callbacks don't fire either. `run()` picks up
+        // the pending `ctx.local_reply` and synthesizes the response through the
+        // *encoder* chain. Without this, a later filter (e.g. a metering filter
+        // downstream of an auth filter that just returned 401) would still run.
+        if ctx.local_reply.is_some() {
+            return Ok(());
+        }
+
         match status {
             FilterHeadersStatus::Continue | FilterHeadersStatus::ContinueAndDontEndStream => {
-                // ContinueAndDontEndStream: TODO(WP-11 chunk 3) forward with
+                // ContinueAndDontEndStream: TODO(WP-11 chunk 4) forward with
                 // end_stream=false + require inject_*; treated as Continue here.
                 idx += 1;
                 header_reach = idx;
@@ -306,6 +1273,11 @@ fn drive_decode(
                     trailers,
                     &mut data_consumed,
                 )?;
+                // S2.5: a `send_local_reply` from this filter's data/trailers
+                // callback stops decode just as a header-phase one does.
+                if ctx.local_reply.is_some() {
+                    return Ok(());
+                }
                 if continued {
                     idx += 1;
                     header_reach = idx;
@@ -331,6 +1303,10 @@ fn drive_decode(
             trailers,
             &mut data_consumed,
         )?;
+        // S2.5: stop the trailing-data phase too if a local reply was requested.
+        if ctx.local_reply.is_some() {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -366,49 +1342,6 @@ fn deliver_decode_data(
     Ok(continued)
 }
 
-/// Encoder pass over the response, walking filters in **reverse** config order
-/// (S2.1). Overflow of a buffering filter here → 500.
-///
-/// Chunk-1 simplification: this delivers headers to every filter, then data +
-/// trailers to every filter, honoring `add_encoded_data`/buffer-limit but not
-/// yet the encode-side header-hold-then-resume-via-data mechanics that
-/// [`drive_decode`] implements. Encode holds and `send_local_reply`-during-encode
-/// (S2.5) land with the chunk-2 conformance suite.
-fn drive_encode(
-    filters: &mut [Box<dyn HttpFilter>],
-    ctx: &mut ChainCtx,
-    buffer_limit: usize,
-    head: &mut ResponseHeaders,
-    body: &mut Bytes,
-    trailers: Option<&ResponseTrailers>,
-) -> Result<(), http::StatusCode> {
-    let end_stream_on_headers = body.is_empty() && trailers.is_none();
-    // Reverse config order.
-    let order: Vec<usize> = (0..filters.len()).rev().collect();
-    for &idx in &order {
-        let mut cb = EncoderCallbacksAdapter { ctx };
-        let _ = filters[idx].encode_headers(&mut cb, head, end_stream_on_headers);
-        if ctx.encode.buffer.0.len() > buffer_limit {
-            return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    }
-    if !(body.is_empty() && trailers.is_none()) {
-        for &idx in &order {
-            let mut cb = EncoderCallbacksAdapter { ctx };
-            let _ = filters[idx].encode_data(&mut cb, body, trailers.is_none());
-            if ctx.encode.buffer.0.len() > buffer_limit {
-                return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
-            }
-            if let Some(t) = trailers {
-                let mut cb = EncoderCallbacksAdapter { ctx };
-                let mut owned = ResponseTrailers(t.0.clone());
-                let _ = filters[idx].encode_trailers(&mut cb, &mut owned);
-            }
-        }
-    }
-    Ok(())
-}
-
 // --- callback adapters -----------------------------------------------------
 
 /// Borrows only [`ChainCtx`]; never the filter list (module doc).
@@ -419,15 +1352,40 @@ struct DecoderCallbacksAdapter<'c> {
 impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
     fn send_local_reply(
         &mut self,
-        _code: http::StatusCode,
-        _body: &str,
-        _modify_headers: Option<HeaderMutationFn>,
+        code: http::StatusCode,
+        body: &str,
+        modify_headers: Option<HeaderMutationFn>,
         details: &str,
     ) {
-        // TODO(WP-11 chunk 3, S2.5): synthesize + run through the encoder chain,
-        // or reset if headers already sent. For now just record intent.
         self.ctx.stream_info.is_local_reply = true;
         self.ctx.stream_info.response_code_details = Some(details.to_string());
+
+        if self.ctx.response_headers_forwarded {
+            // S2.5: once response headers have already gone out, a NEW
+            // response can't be sent — Envoy resets the stream instead. We
+            // have no reset primitive through the body seam yet
+            // (TODO(WP-11 chunk 4): plumb a real stream reset), so the best
+            // we can do without silently ignoring the call is terminate the
+            // response body with an error; `StreamingEncoder::poll_frame`
+            // checks this flag and surfaces it.
+            self.ctx.reset_after_headers = true;
+            return;
+        }
+
+        if self.ctx.local_reply.is_some() {
+            // First one wins — matches Envoy, which also ignores a second
+            // `sendLocalReply()` while one is already pending. A filter that
+            // calls this twice is a filter bug, not something we can recover
+            // from more gracefully here.
+            return;
+        }
+
+        self.ctx.local_reply = Some(LocalReply {
+            code,
+            body: body.to_string(),
+            modify_headers,
+            details: details.to_string(),
+        });
     }
 
     fn continue_decoding(&mut self) {
@@ -439,9 +1397,10 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
     }
 
     fn inject_decoded_data_to_filter_chain(&mut self, _data: Bytes, _end_stream: bool) {
-        // TODO(WP-11 chunk 3, S2.7): out-of-callback injection to subsequent
-        // filters. Needs the streaming driver.
-        unimplemented!("inject_decoded_data_to_filter_chain lands in WP-11 chunk 3")
+        // TODO(WP-11 chunk 4, S2.7): out-of-callback injection to subsequent
+        // filters. The decode direction stays fully buffered (chunk 3 only
+        // streams encode), so this still has no streaming driver to hook into.
+        unimplemented!("inject_decoded_data_to_filter_chain lands in a later WP-11 chunk")
     }
 
     fn decoding_buffer(&self) -> Option<&BufferedBody> {
@@ -457,7 +1416,7 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
     }
 
     fn route(&self) -> Option<Arc<RouteEntry>> {
-        // TODO(WP-11 chunk 3 / WP-12): lazy resolution against the route table.
+        // TODO(WP-11 chunk 4 / WP-12): lazy resolution against the route table.
         self.ctx.route.clone()
     }
 
@@ -470,9 +1429,18 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
     }
 }
 
-/// Encoder mirror of [`DecoderCallbacksAdapter`].
+/// Encoder mirror of [`DecoderCallbacksAdapter`]. Unlike decode, encode
+/// buffers per-*position*, not per-direction (module doc), so this also
+/// carries which position is calling back right now — `encoding_buffer()` /
+/// `modify_encoding_buffer()` / `add_encoded_data()` all operate on THIS
+/// position's slot in `ctx.encode.positions`.
+///
+/// Rust note: `BufferedBody` (in `filter.rs`) and the `EncoderCallbacks` trait
+/// signatures are frozen; the position is threaded through here, in the
+/// adapter, rather than by changing either of those.
 struct EncoderCallbacksAdapter<'c> {
     ctx: &'c mut ChainCtx,
+    pos: usize,
 }
 
 impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
@@ -481,23 +1449,29 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
     }
 
     fn add_encoded_data(&mut self, data: Bytes, _streaming: bool) {
-        self.ctx.encode.buffer.0.extend_from_slice(&data);
+        self.ctx.encode.positions[self.pos]
+            .buf
+            .0
+            .extend_from_slice(&data);
     }
 
     fn inject_encoded_data_to_filter_chain(&mut self, _data: Bytes, _end_stream: bool) {
-        unimplemented!("inject_encoded_data_to_filter_chain lands in WP-11 chunk 3")
+        // TODO(WP-11 chunk 4, S2.7): out-of-callback injection to subsequent
+        // filters, mid-stream. Pairs with `ContinueAndDontEndStream`.
+        unimplemented!("inject_encoded_data_to_filter_chain lands in a later WP-11 chunk")
     }
 
     fn encoding_buffer(&self) -> Option<&BufferedBody> {
-        if self.ctx.encode.buffer.0.is_empty() {
+        let buf = &self.ctx.encode.positions[self.pos].buf;
+        if buf.0.is_empty() {
             None
         } else {
-            Some(&self.ctx.encode.buffer)
+            Some(buf)
         }
     }
 
     fn modify_encoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut)) {
-        f(&mut self.ctx.encode.buffer.0);
+        f(&mut self.ctx.encode.positions[self.pos].buf.0);
     }
 
     fn stream_info(&mut self) -> &mut StreamInfo {
@@ -514,15 +1488,6 @@ async fn collect_request(
     let HttpRequestParts { head, body } = req;
     let collected = body.collect().await.map_err(|_| ())?;
     let trailers = collected.trailers().cloned().map(RequestTrailers);
-    Ok((head, trailers, collected.to_bytes()))
-}
-
-async fn collect_response(
-    resp: HttpResponseParts,
-) -> Result<(ResponseHeaders, Option<ResponseTrailers>, Bytes), ()> {
-    let HttpResponseParts { head, body } = resp;
-    let collected = body.collect().await.map_err(|_| ())?;
-    let trailers = collected.trailers().cloned().map(ResponseTrailers);
     Ok((head, trailers, collected.to_bytes()))
 }
 
@@ -554,8 +1519,11 @@ fn bytes_to_seam_body(bytes: Bytes, trailers: Option<HeaderMap>) -> SeamBody {
     local_boxed(StreamBody::new(futures::stream::iter(frames)))
 }
 
-/// A minimal synthesized response for the failure paths this chunk raises
-/// (buffer overflow, body read errors). Real local replies (S2.5) are chunk 3.
+/// A minimal synthesized response that bypasses the encoder chain entirely.
+/// Only used as the last-resort fallback when a local reply (S2.5) itself
+/// can't be routed through the chain — e.g. it overflows the encode buffer
+/// limit in [`respond_with_local_reply`]. Every other failure path now goes
+/// through the chain via [`LocalReply`] / [`respond_with_local_reply`].
 fn synth_response(status: http::StatusCode, message: &str) -> HttpResponseParts {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -569,5 +1537,7 @@ fn synth_response(status: http::StatusCode, message: &str) -> HttpResponseParts 
     }
 }
 
+#[cfg(test)]
+mod streaming_tests;
 #[cfg(test)]
 mod tests;

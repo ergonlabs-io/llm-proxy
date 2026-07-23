@@ -111,6 +111,112 @@ where
     conn.await.map_err(CodecError::Connection)
 }
 
+/// Upstream (proxy-to-origin) connection-level codec failures. Distinct from
+/// [`CodecError`] (which is downstream-only): the router (later WP) maps
+/// these to pool errors / response flags, but this module has no notion of
+/// either -- it only ever returns its own typed error.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamCodecError {
+    #[error("http/1.1 client handshake failed: {0}")]
+    Handshake(#[source] hyper::Error),
+    #[error("http/1.1 upstream connection error: {0}")]
+    Connection(#[source] hyper::Error),
+    #[error("http/1.1 send_request failed: {0}")]
+    Send(#[source] hyper::Error),
+}
+
+/// Send one request upstream over `io` as HTTP/1.1 and return the response,
+/// head-first with a streaming body -- the client-side mirror of
+/// `serve_http1`/`serve_one`.
+///
+/// Generic over `IO` for the same reason `serve_http1` is: this same function
+/// drives both plaintext `TcpStream`s and (once upstream TLS origination
+/// exists) TLS-wrapped streams.
+pub async fn send_upstream_http1<IO>(
+    io: IO,
+    req: HttpRequestParts,
+    options: Http1Options,
+) -> Result<HttpResponseParts, UpstreamCodecError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let io = TokioIo::new(io);
+
+    // Rust note: unlike the downstream server `Builder` (which has a
+    // `keep_alive` knob controlling whether *it* offers a next request slot),
+    // hyper's client `Builder` has no such method -- client-side keep-alive
+    // is negotiated per-request via the `Connection` header, not a
+    // connection-wide setting. So `options.keep_alive` is threaded through by
+    // setting `Connection: close` on the outgoing request below when it's
+    // `false`, rather than on this builder.
+    let builder = hyper::client::conn::http1::Builder::new();
+    let (mut sender, conn) = builder
+        .handshake::<_, StreamBody>(io)
+        .await
+        .map_err(UpstreamCodecError::Handshake)?;
+
+    // Rust note: like the downstream `Connection`, the client `Connection`
+    // future must be polled for the handshake/request/response machinery to
+    // make progress at all -- hyper's low-level client API doesn't spawn it
+    // for you. It's `!Send` here because the `StreamBody` it drives (via
+    // `sender.send_request`) is deliberately `!Send` (ADR-0003), so we can't
+    // hand it to `tokio::spawn` (which requires `Send + 'static` futures);
+    // `tokio::task::spawn_local` is the `!Send`-friendly equivalent, but it
+    // requires a `LocalSet` to be running on this task -- the worker runtime
+    // already provides one (as `serve_http1`'s call sites do), and tests
+    // calling this function must supply one too (see
+    // `tests/http1_upstream_codec.rs`). We keep the `JoinHandle` only to
+    // surface a `Connection` error if the caller wants it; for v1 a detached
+    // connection task (dropped `JoinHandle`) is an acceptable simplification
+    // -- the connection is torn down when `sender`/the response body are
+    // dropped either way.
+    let conn_task = tokio::task::spawn_local(conn);
+
+    let RequestHeaders {
+        method,
+        uri,
+        headers,
+    } = req.head;
+    let mut headers = headers;
+    if !options.keep_alive {
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+    }
+    let mut builder = Request::builder().method(method).uri(uri);
+    // Rust note: mirrors `build_response`'s wholesale `HeaderMap` swap --
+    // `Request::builder()` starts with an empty map, so replace it rather
+    // than re-inserting each header individually.
+    *builder.headers_mut().expect("builder not yet finalized") = headers;
+    let request = builder
+        .body(req.body)
+        .expect("method/uri were already valid; building can't fail here");
+
+    let response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(send_err) => {
+            // The request failed to go out (or the response head failed to
+            // arrive); prefer surfacing that specific error over whatever the
+            // detached connection task did or didn't do.
+            conn_task.abort();
+            return Err(UpstreamCodecError::Send(send_err));
+        }
+    };
+
+    let (parts, incoming) = response.into_parts();
+    let head = ResponseHeaders {
+        status: parts.status,
+        headers: parts.headers,
+    };
+    // Rust note: same adaptation `serve_one` does for the downstream request
+    // body, but tagged `BodyError::Upstream` since this body is read on the
+    // proxy-to-origin side of the seam.
+    let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
+
+    Ok(HttpResponseParts { head, body })
+}
+
 /// Convert one `hyper::Request<Incoming>` into [`HttpRequestParts`], hand it
 /// to `handler`, and convert the resulting [`HttpResponseParts`] back into a
 /// `hyper::Response<StreamBody>`.

@@ -325,6 +325,24 @@ async fn run_serve(
         .map(|l| format!("{}@{}", l.name, l.address))
         .collect();
 
+    // WP-13: one `ClusterManager` shared across every worker -- control
+    // computes (discovery, EDS updates land here), workers only ever read
+    // through `ClusterEntry`/`HttpConnPool`, exactly like Envoy's own
+    // cluster manager. Built and populated here, before `WorkerPool::spawn`,
+    // so every worker's first `initial_bind` sees a manager that already
+    // knows about the snapshot's clusters.
+    let cluster_manager = Arc::new(proxy_cluster::manager::ClusterManager::new(Arc::new(
+        proxy_cluster::resolver::TokioResolver,
+    )));
+    let rejected = cluster_manager
+        .update_from_snapshot(&snapshot.clusters)
+        .await;
+    if !rejected.is_empty() {
+        for (name, err) in &rejected {
+            tracing::warn!(cluster = %name, error = %err, "cluster rejected at startup");
+        }
+    }
+
     // Rust note: `WorkerPool::spawn` takes `worker_main` by value and clones
     // it once per worker thread (see its doc comment), so `bind_tx` -- an
     // `mpsc::UnboundedSender`, itself `Clone` -- gets captured once here and
@@ -342,7 +360,7 @@ async fn run_serve(
         snapshot,
         move |ctx: WorkerContext| {
             let bind_tx = bind_tx.clone();
-            worker_main(ctx, bind_tx)
+            worker_main(ctx, bind_tx, cluster_manager.clone())
         },
     );
 
@@ -423,10 +441,17 @@ async fn wait_for_initial_binds(
 async fn worker_main(
     ctx: WorkerContext,
     bind_tx: mpsc::UnboundedSender<(WorkerId, Result<(), String>)>,
+    cluster_manager: Arc<proxy_cluster::manager::ClusterManager>,
 ) {
     let registry = ConnectionRegistry::new();
 
-    let bound = match initial_bind(&ctx.config.load(), &ctx.config, &registry, &ctx.shutdown) {
+    let bound = match initial_bind(
+        &ctx.config.load(),
+        &ctx.config,
+        &registry,
+        &ctx.shutdown,
+        &cluster_manager,
+    ) {
         Ok(bound) => {
             let _ = bind_tx.send((ctx.id, Ok(())));
             bound
@@ -449,6 +474,7 @@ async fn worker_main(
         ctx.config_ping,
         ctx.shutdown.clone(),
         registry.clone(),
+        cluster_manager.clone(),
     ));
 
     drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
