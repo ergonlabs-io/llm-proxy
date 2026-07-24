@@ -1174,6 +1174,7 @@ mod tests {
             }],
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1024 * 1024,
+            circuit_breakers: Default::default(),
         }
     }
 

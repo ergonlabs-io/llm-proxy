@@ -1,7 +1,9 @@
-# Real Envoy field (`Cluster.circuit_breakers`) that our lowering pass does not
-# map yet. Ground rule #2 says this must be rejected with its full dotted
-# field path rather than silently dropped — this fixture is the
-# `RejectedWithPath` outcome-class exemplar for the WP-27 scorecard.
+# Real Envoy field (`CircuitBreakers.per_host_thresholds`) that our lowering
+# pass does not map — `circuit_breakers.thresholds` itself IS now supported (S5),
+# so this fixture exercises a nested-but-unsupported CB field instead. Ground
+# rule #1 says an unhandled field must be rejected with its full dotted path
+# rather than silently dropped — this fixture is the `RejectedWithPath`
+# outcome-class exemplar for the WP-27 scorecard.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
@@ -25,7 +27,7 @@ static_resources:
       connect_timeout: 5s
       lb_policy: ROUND_ROBIN
       circuit_breakers:
-        thresholds:
+        per_host_thresholds:
           - priority: DEFAULT
             max_connections: 1024
       load_assignment:

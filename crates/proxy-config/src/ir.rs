@@ -252,6 +252,65 @@ pub struct ClusterConfig {
     pub transport_socket: Option<UpstreamTlsSpec>,
     /// Envoy default: 1 MiB.
     pub per_connection_buffer_limit_bytes: u32,
+    /// S5 circuit-breaker budgets, per routing priority. Always present:
+    /// Envoy applies the default thresholds when the config omits them.
+    pub circuit_breakers: CircuitBreakers,
+}
+
+/// S5 circuit breakers for a cluster: one [`CircuitBreakerThresholds`] bucket
+/// per routing priority (`DEFAULT` / `HIGH`). Envoy's proto carries a repeated
+/// `thresholds` list tagged by priority; the IR flattens it to the two buckets
+/// and fills missing ones with the Envoy defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitBreakers {
+    /// Budgets for priority 0 (`RoutingPriority::Default`).
+    pub default: CircuitBreakerThresholds,
+    /// Budgets for priority 1 (`RoutingPriority::High`).
+    pub high: CircuitBreakerThresholds,
+}
+
+/// One priority's S5 budgets. Each field caps a live gauge; exceeding it makes
+/// the cluster shed load (503 + `UO` + `x-envoy-overloaded`) rather than pile
+/// work onto a struggling upstream. Envoy defaults are baked into
+/// [`CircuitBreakerThresholds::ENVOY_DEFAULT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitBreakerThresholds {
+    /// Max open upstream connections (Envoy default 1024).
+    pub max_connections: u32,
+    /// Max requests queued waiting for a connection (Envoy default 1024).
+    pub max_pending_requests: u32,
+    /// Max concurrent active requests (Envoy default 1024).
+    pub max_requests: u32,
+    /// Max concurrent retries in flight (Envoy default 3).
+    pub max_retries: u32,
+}
+
+impl CircuitBreakerThresholds {
+    /// Envoy's documented per-priority defaults (S5), applied when a priority
+    /// has no `thresholds` entry or a field is left at the proto zero-value's
+    /// "unset" meaning (Envoy treats an absent `UInt32Value` as the default,
+    /// not as 0 — lowering is responsible for that distinction).
+    pub const ENVOY_DEFAULT: Self = Self {
+        max_connections: 1024,
+        max_pending_requests: 1024,
+        max_requests: 1024,
+        max_retries: 3,
+    };
+}
+
+impl Default for CircuitBreakerThresholds {
+    fn default() -> Self {
+        Self::ENVOY_DEFAULT
+    }
+}
+
+impl Default for CircuitBreakers {
+    fn default() -> Self {
+        Self {
+            default: CircuitBreakerThresholds::ENVOY_DEFAULT,
+            high: CircuitBreakerThresholds::ENVOY_DEFAULT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

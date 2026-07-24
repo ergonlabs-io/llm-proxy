@@ -22,6 +22,15 @@
 //! LLM-relevant direction for a stalled token stream. See `apply_forward`
 //! below for how the two timeouts compose.
 //!
+//! Also in scope: the S5 `max_requests` circuit breaker
+//! (`ClusterEntry::circuit_breaker(RoutingPriority::Default)`), acquired
+//! before dialing and held for the whole response stream via
+//! `router::guarded::GuardedBody` -- exceeding it sheds load as `UO` + 503 +
+//! `x-envoy-overloaded` rather than piling onto a struggling upstream. The
+//! other three S5 budgets (`max_connections`, `max_pending_requests`,
+//! `max_retries`) have real counters in `proxy_cluster::CircuitBreakerState`
+//! but no call site yet -- see the `TODO`s there.
+//!
 //! Deferred (known feature gaps, not silent drops -- ground rule #1):
 //! - S9 request-header transforms: XFF, `x-request-id`, `:authority`
 //!   rewrite. `crate::headers` already implements the functions; this
@@ -30,8 +39,6 @@
 //!   body) and HCM-level `stream_idle_timeout` inheritance -- the IR has no
 //!   HCM `stream_idle_timeout` field yet, so a `None` route `idle_timeout`
 //!   means "no idle timeout" for now, not "inherit the listener's".
-//! - Circuit-breaker checks (`ClusterEntry::circuit_breaker`) before
-//!   dialing.
 //! - The retry & hedging engine (S3, WP-14).
 //! - HTTP/2 upstream (`UpstreamProtocol::Http2`).
 //! - Connection reuse / real pooling (WP-15 follow-up;
@@ -47,15 +54,17 @@ use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
-use proxy_cluster::{LoadBalancerContext, PoolError, UpstreamProtocol};
+use proxy_cluster::{LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol};
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable};
 
 use crate::codec::{send_upstream_http1, Http1Options, UpstreamCodecError};
 use crate::filter::ResponseHeaders;
 use crate::handler::{local_boxed, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
 use crate::route::{apply_prefix_rewrite, match_route, select_cluster, RouteMatch, RouteRequest};
+use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 
+mod guarded;
 mod idle;
 
 /// The router terminal: matches a route, then forwards to the picked
@@ -181,6 +190,22 @@ impl RouterHandler {
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
 
+        // S5: acquire a `max_requests` permit for this cluster before doing
+        // any more work for it. Requests are priority `Default` for now --
+        // per-priority route selection (routing a request to the `HIGH`
+        // bucket) is a later WP; every request lands in the same bucket
+        // until then.
+        let cb = entry.circuit_breaker(RoutingPriority::Default);
+        let Some(rq_guard) = cb.try_acquire_request() else {
+            tracing::debug!(response_flag = "UO", cluster = %cluster_name, "circuit breaker: max_requests exceeded");
+            drain_request_body(req).await;
+            let mut resp = local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
+            resp.head
+                .headers
+                .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
+            return resp;
+        };
+
         let ctx = LoadBalancerContext::default();
         let Some(host) = entry.pick_host(&ctx) else {
             tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
@@ -271,6 +296,11 @@ impl RouterHandler {
                 if let Some(idle) = fwd.idle_timeout {
                     resp.body = local_boxed(IdleTimeoutBody::new(resp.body, idle));
                 }
+                // S5: wrap outermost (after any idle_timeout wrap) so the
+                // `max_requests` permit is held until the very last response
+                // frame is produced or the body is dropped, whichever comes
+                // first -- not just until headers arrive.
+                resp.body = local_boxed(GuardedBody::new(resp.body, rq_guard));
                 resp
             }
             Err(UpstreamCodecError::Handshake(_))
@@ -391,8 +421,9 @@ mod tests {
     use proxy_cluster::manager::ClusterManager;
     use proxy_cluster::resolver::FakeResolver;
     use proxy_config::ir::{
-        ClusterConfig, ClusterName, DiscoveryType, EndpointIR, ForwardAction, ForwardTarget,
-        LbPolicy, PathMatch, RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
+        CircuitBreakerThresholds, CircuitBreakers, ClusterConfig, ClusterName, DiscoveryType,
+        EndpointIR, ForwardAction, ForwardTarget, LbPolicy, PathMatch, RouteEntry, RouteMatcher,
+        RouteTable, VirtualHostIR,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -504,12 +535,49 @@ mod tests {
         addr
     }
 
+    /// An upstream that accepts connections in a loop, answering each with a
+    /// quick `200 OK` -- used by the S5 tests, which need a *second* request
+    /// to actually reach the upstream once a `max_requests` guard has been
+    /// released (unlike the one-shot helpers above, whose listener task ends
+    /// after a single `accept`).
+    async fn spawn_upstream_answers_ok_repeatedly() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
     /// Build a one-cluster, one-route `RouterHandler` forwarding to `addr`
     /// under cluster name `"up"`.
     async fn build_router(
         addr: SocketAddr,
         matcher: RouteMatcher,
         fwd: ForwardAction,
+    ) -> RouterHandler {
+        build_router_with_circuit_breakers(addr, matcher, fwd, CircuitBreakers::default()).await
+    }
+
+    /// Like [`build_router`], but threading a custom [`CircuitBreakers`]
+    /// through the cluster config -- lets S5 tests set a tight `max_requests`
+    /// without hand-building a `ClusterEntry`.
+    async fn build_router_with_circuit_breakers(
+        addr: SocketAddr,
+        matcher: RouteMatcher,
+        fwd: ForwardAction,
+        circuit_breakers: CircuitBreakers,
     ) -> RouterHandler {
         let manager = ClusterManager::new(Arc::new(FakeResolver::new()));
         let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
@@ -528,6 +596,7 @@ mod tests {
                 }],
                 transport_socket: None,
                 per_connection_buffer_limit_bytes: 1 << 20,
+                circuit_breakers,
             }),
         );
         manager.update_from_snapshot(&snapshot).await;
@@ -826,6 +895,93 @@ mod tests {
                         .expect("no idle_timeout configured means no wrapping, no spurious error")
                         .to_bytes();
                     assert_eq!(collected.as_ref(), b"hellohello");
+                })
+                .await;
+        })
+        .await
+        .expect("should complete well within the test's own guard timeout");
+    }
+
+    fn circuit_breakers_with_max_requests(max_requests: u32) -> CircuitBreakers {
+        CircuitBreakers {
+            default: CircuitBreakerThresholds {
+                max_requests,
+                ..CircuitBreakerThresholds::ENVOY_DEFAULT
+            },
+            high: CircuitBreakerThresholds::ENVOY_DEFAULT,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_requests_sheds_a_second_request_while_the_first_streams() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            LocalSet::new()
+                .run_until(async {
+                    // Headers arrive, then the upstream stalls mid-body --
+                    // the first response's `GuardedBody` (wrapping the S5
+                    // permit) is therefore still held open when the second
+                    // request is fired.
+                    let addr = spawn_upstream_that_stalls_mid_body().await;
+                    let router = build_router_with_circuit_breakers(
+                        addr,
+                        prefix_matcher("/v1/"),
+                        forward_to_up(None, None, None),
+                        circuit_breakers_with_max_requests(1),
+                    )
+                    .await;
+
+                    let first = router.handle(request("/v1/chat/completions")).await;
+                    assert_eq!(first.head.status, StatusCode::OK);
+
+                    let second = router.handle(request("/v1/chat/completions")).await;
+                    assert_eq!(second.head.status, StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(
+                        second.head.headers.get("x-envoy-overloaded").unwrap(),
+                        "true"
+                    );
+
+                    // Keep the first response body alive for the whole test
+                    // -- dropping it earlier would release the guard and
+                    // undermine the premise that the second request is shed
+                    // while the first is still active.
+                    drop(first.body);
+                })
+                .await;
+        })
+        .await
+        .expect("should complete well within the test's own guard timeout");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_requests_permit_is_released_when_the_response_body_completes() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            LocalSet::new()
+                .run_until(async {
+                    let addr = spawn_upstream_answers_ok_repeatedly().await;
+                    let router = build_router_with_circuit_breakers(
+                        addr,
+                        prefix_matcher("/v1/"),
+                        forward_to_up(None, None, None),
+                        circuit_breakers_with_max_requests(1),
+                    )
+                    .await;
+
+                    let first = router.handle(request("/v1/chat/completions")).await;
+                    assert_eq!(first.head.status, StatusCode::OK);
+                    // Fully consuming the body drops the `GuardedBody`,
+                    // which drops the S5 guard and frees the one slot.
+                    first
+                        .body
+                        .collect()
+                        .await
+                        .expect("the one-shot upstream's empty body completes cleanly");
+
+                    let second = router.handle(request("/v1/chat/completions")).await;
+                    assert_eq!(
+                        second.head.status,
+                        StatusCode::OK,
+                        "the freed permit should let a new request through"
+                    );
                 })
                 .await;
         })

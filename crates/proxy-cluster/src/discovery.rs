@@ -130,6 +130,7 @@ mod tests {
             endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
         }
     }
 

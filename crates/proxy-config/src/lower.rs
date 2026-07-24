@@ -141,6 +141,23 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "load_assignment",
             "transport_socket",
             "per_connection_buffer_limit_bytes",
+            "circuit_breakers",
+        ],
+        // S5 circuit breakers. `per_host_thresholds` is deliberately excluded
+        // (we don't model per-host limits); a config setting it is rejected
+        // by the surface walk with its dotted path (ground rule #1) rather
+        // than silently ignored.
+        "envoy.config.cluster.v3.CircuitBreakers" => &["thresholds"],
+        // `retry_budget`, `track_remaining`, and `max_connection_pools` are
+        // not implemented (no retry-budget engine, no stats publishing, no
+        // per-cluster pool cap yet) and stay out of this list on purpose --
+        // setting them must fail loudly, not vanish.
+        "envoy.config.cluster.v3.CircuitBreakers.Thresholds" => &[
+            "priority",
+            "max_connections",
+            "max_pending_requests",
+            "max_requests",
+            "max_retries",
         ],
         "envoy.config.endpoint.v3.ClusterLoadAssignment" => &["cluster_name", "endpoints"],
         "envoy.config.endpoint.v3.LocalityLbEndpoints" => &["lb_endpoints", "priority"],
@@ -1517,6 +1534,8 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         .map(|ts| convert_upstream_tls(ts, &format!("{path}.transport_socket")))
         .transpose()?;
 
+    let circuit_breakers = convert_circuit_breakers(&c.circuit_breakers, path)?;
+
     Ok(ClusterConfig {
         name: c.name.clone(),
         discovery,
@@ -1527,6 +1546,76 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         per_connection_buffer_limit_bytes: c
             .per_connection_buffer_limit_bytes
             .unwrap_or(DEFAULT_CONN_BUFFER_LIMIT),
+        circuit_breakers,
+    })
+}
+
+/// S5: lower Envoy's repeated, priority-tagged `thresholds` list to the IR's
+/// flat two-bucket shape. A priority absent from the list keeps Envoy's
+/// documented defaults; a bucket with an explicit entry defaults only the
+/// *fields* the entry left unset (Envoy's `UInt32Value` semantics: absent
+/// means "use the default", not zero).
+fn convert_circuit_breakers(
+    cb: &Option<cluster_v3::CircuitBreakers>,
+    path: &str,
+) -> Result<CircuitBreakers, ConfigError> {
+    let Some(cb) = cb else {
+        return Ok(CircuitBreakers::default());
+    };
+
+    // Rust note: `Option<CircuitBreakerThresholds>` per bucket lets us detect
+    // a *second* thresholds entry for the same priority (Envoy takes the
+    // first; we reject the config outright rather than silently pick one).
+    let mut default_bucket: Option<CircuitBreakerThresholds> = None;
+    let mut high_bucket: Option<CircuitBreakerThresholds> = None;
+
+    for (i, t) in cb.thresholds.iter().enumerate() {
+        let t_path = format!("{path}.circuit_breakers.thresholds[{i}]");
+        let thresholds = CircuitBreakerThresholds {
+            max_connections: t
+                .max_connections
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_connections),
+            max_pending_requests: t
+                .max_pending_requests
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_pending_requests),
+            max_requests: t
+                .max_requests
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_requests),
+            max_retries: t
+                .max_retries
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_retries),
+        };
+
+        use core_v3::RoutingPriority;
+        match RoutingPriority::try_from(t.priority) {
+            Ok(RoutingPriority::Default) => {
+                if default_bucket.replace(thresholds).is_some() {
+                    return Err(invalid(
+                        format!("{t_path}.priority"),
+                        "duplicate `DEFAULT` priority circuit breaker thresholds",
+                    ));
+                }
+            }
+            Ok(RoutingPriority::High) => {
+                if high_bucket.replace(thresholds).is_some() {
+                    return Err(invalid(
+                        format!("{t_path}.priority"),
+                        "duplicate `HIGH` priority circuit breaker thresholds",
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(invalid(
+                    format!("{t_path}.priority"),
+                    format!("unknown routing priority `{}`", t.priority),
+                ))
+            }
+        }
+    }
+
+    Ok(CircuitBreakers {
+        default: default_bucket.unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT),
+        high: high_bucket.unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT),
     })
 }
 

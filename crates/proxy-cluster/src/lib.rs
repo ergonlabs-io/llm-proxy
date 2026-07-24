@@ -93,10 +93,129 @@ pub struct LoadBalancerContext {
     pub host_override: Option<SocketAddr>,
 }
 
-/// Circuit-breaker accounting for one (cluster, priority) — S5 semantics/defaults.
-/// TODO(WP-15): counters/gauges with Envoy stat names, `track_remaining`.
-#[derive(Debug, Default)]
-pub struct CircuitBreakerState {}
+/// Circuit-breaker accounting for one (cluster, priority) — S5's four
+/// per-priority budgets. Only `max_requests` is checked at a call site today
+/// (the router, WP-13/WP-15 thin slice); the other three keep real
+/// counters/guards so wiring them up later is additive, not a redesign.
+///
+/// Rust note: the gauges live behind `Arc<AtomicU32>` rather than borrowed --
+/// [`CbGuard`] rides inside a streaming response body that must outlive the
+/// handler stack frame that acquired it, so it can't hold a borrow of
+/// `self`.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerState {
+    connections: BudgetHandle,
+    pending: BudgetHandle,
+    requests: BudgetHandle,
+    retries: BudgetHandle,
+}
+
+/// A budget's live gauge plus its limit, with the gauge pre-wrapped in `Arc`
+/// so a guard can clone just the atomic out without holding the whole
+/// `CircuitBreakerState` alive.
+#[derive(Debug, Clone)]
+struct BudgetHandle {
+    active: Arc<std::sync::atomic::AtomicU32>,
+    limit: u32,
+}
+
+impl BudgetHandle {
+    fn new(limit: u32) -> Self {
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            limit,
+        }
+    }
+
+    /// Optimistic increment-then-check-then-rollback: claim a slot first,
+    /// and only give it back if that claim turned out to overflow the
+    /// limit. This avoids a check-then-act race between two threads racing
+    /// the same budget (both could pass a `load` check before either
+    /// increments) at the cost of a harmless bounce off the limit under
+    /// contention.
+    ///
+    /// Rust note: the claiming `fetch_add` uses `Acquire` so a prior
+    /// release (another guard's `Drop`, below) is visible before we decide
+    /// whether we're over budget; the rollback `fetch_sub` uses `Release`
+    /// so a losing thread's "give the slot back" is visible to whoever
+    /// reads `active` next. A successful acquire doesn't need to *release*
+    /// anything itself -- the guard's `Drop` is the operation other threads
+    /// need to observe, and that already uses `Release`.
+    fn try_acquire(&self) -> Option<CbGuard> {
+        let prev = self
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        if prev >= self.limit {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            return None;
+        }
+        Some(CbGuard {
+            active: Arc::clone(&self.active),
+        })
+    }
+}
+
+/// An acquired S5 budget slot. Owns a clone of the budget's gauge (not a
+/// borrow), so it's `'static` and can be moved into a response body that
+/// outlives the request handler; dropping it releases the slot.
+#[derive(Debug)]
+pub struct CbGuard {
+    active: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for CbGuard {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl CircuitBreakerState {
+    /// Builds all four budgets from a cluster's lowered [`CircuitBreakerThresholds`].
+    pub fn from_thresholds(t: proxy_config::ir::CircuitBreakerThresholds) -> Self {
+        Self {
+            connections: BudgetHandle::new(t.max_connections),
+            pending: BudgetHandle::new(t.max_pending_requests),
+            requests: BudgetHandle::new(t.max_requests),
+            retries: BudgetHandle::new(t.max_retries),
+        }
+    }
+
+    /// The one budget wired to a real call site today: the router acquires
+    /// this before dialing/forwarding and holds it for the full response
+    /// stream (LLM streaming keeps a request "active" far longer than
+    /// time-to-headers).
+    pub fn try_acquire_request(&self) -> Option<CbGuard> {
+        self.requests.try_acquire()
+    }
+
+    // TODO(WP-15 pooling): check max_connections in the pool on dial.
+    #[allow(dead_code)]
+    pub fn try_acquire_connection(&self) -> Option<CbGuard> {
+        self.connections.try_acquire()
+    }
+
+    // TODO: max_pending_requests engages once there's a real pending queue (WP-15).
+    #[allow(dead_code)]
+    pub fn try_acquire_pending(&self) -> Option<CbGuard> {
+        self.pending.try_acquire()
+    }
+
+    // TODO(WP-14 retries): check max_retries in the retry engine.
+    #[allow(dead_code)]
+    pub fn try_acquire_retry(&self) -> Option<CbGuard> {
+        self.retries.try_acquire()
+    }
+}
+
+impl Default for CircuitBreakerState {
+    /// Used where no cluster config is available yet (e.g. `manager::eds()`,
+    /// which has no `ClusterConfig` to read thresholds from).
+    fn default() -> Self {
+        Self::from_thresholds(proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT)
+    }
+}
 
 /// A stream slot on a pooled upstream connection. v1 ([`pool::Http1ConnectPool`])
 /// is connect-per-stream: this just carries a freshly-dialed transport, no
@@ -146,4 +265,63 @@ pub trait ClusterEntry: Send + Sync {
 
     /// Circuit-breaker bucket for the request's priority (S5).
     fn circuit_breaker(&self, prio: RoutingPriority) -> &CircuitBreakerState;
+}
+
+#[cfg(test)]
+mod cb_tests {
+    use super::*;
+
+    fn thresholds(max_requests: u32) -> proxy_config::ir::CircuitBreakerThresholds {
+        proxy_config::ir::CircuitBreakerThresholds {
+            max_requests,
+            ..proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT
+        }
+    }
+
+    #[test]
+    fn max_requests_sheds_load_past_the_limit() {
+        let cb = CircuitBreakerState::from_thresholds(thresholds(2));
+        let g1 = cb.try_acquire_request().expect("1st acquire under budget");
+        let g2 = cb.try_acquire_request().expect("2nd acquire under budget");
+        assert!(
+            cb.try_acquire_request().is_none(),
+            "3rd acquire must be shed (limit is 2)"
+        );
+        drop(g1);
+        drop(g2);
+    }
+
+    #[test]
+    fn dropping_a_guard_frees_a_slot() {
+        let cb = CircuitBreakerState::from_thresholds(thresholds(1));
+        let g1 = cb.try_acquire_request().expect("1st acquire under budget");
+        assert!(cb.try_acquire_request().is_none(), "budget is exhausted");
+        drop(g1);
+        let g2 = cb
+            .try_acquire_request()
+            .expect("acquire must succeed again after the guard freed a slot");
+        drop(g2);
+    }
+
+    #[test]
+    fn guards_decrement_active_on_drop() {
+        let cb = CircuitBreakerState::from_thresholds(thresholds(2));
+        let g1 = cb.try_acquire_request().expect("acquire 1");
+        let g2 = cb.try_acquire_request().expect("acquire 2");
+        drop(g1);
+        drop(g2);
+        // Rust note: `requests.active` is private, so we prove "back to
+        // zero" behaviorally -- re-acquiring up to the full limit must
+        // succeed again, which is only possible if both prior guards
+        // actually released their slots.
+        let g3 = cb
+            .try_acquire_request()
+            .expect("full budget available again");
+        let g4 = cb
+            .try_acquire_request()
+            .expect("full budget available again");
+        assert!(cb.try_acquire_request().is_none());
+        drop(g3);
+        drop(g4);
+    }
 }

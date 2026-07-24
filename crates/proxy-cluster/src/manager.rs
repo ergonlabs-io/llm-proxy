@@ -63,8 +63,9 @@ struct ManagedCluster {
     ///
     /// [`LoadBalancer`]: crate::load_balancer::LoadBalancer
     host_picker: HostPicker,
-    /// TODO(WP-15): real circuit-breaker accounting/stats; these are just
-    /// the buckets `ClusterEntry::circuit_breaker` hands back.
+    /// S5 circuit-breaker budgets for this cluster, one bucket per routing
+    /// priority; these are the buckets `ClusterEntry::circuit_breaker` hands
+    /// back.
     default_cb: CircuitBreakerState,
     high_cb: CircuitBreakerState,
 }
@@ -76,13 +77,15 @@ impl ManagedCluster {
     /// forbids silently substituting another policy.
     fn from_config(config: Arc<ClusterConfig>) -> Result<Self, LbError> {
         let policy = load_balancer::build(config.lb_policy)?;
+        let default_cb = CircuitBreakerState::from_thresholds(config.circuit_breakers.default);
+        let high_cb = CircuitBreakerState::from_thresholds(config.circuit_breakers.high);
         Ok(Self {
             source: ClusterSource::Config(config),
             host_set: ArcSwap::from_pointee(HostSet::default()),
             initialized: AtomicBool::new(false),
             host_picker: HostPicker::new(policy),
-            default_cb: CircuitBreakerState::default(),
-            high_cb: CircuitBreakerState::default(),
+            default_cb,
+            high_cb,
         })
     }
 
@@ -335,6 +338,7 @@ mod tests {
             endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
         })
     }
 

@@ -288,7 +288,10 @@ mod tests {
         let bytes = fs::read(fixtures_dir().join("local/rejected-circuit-breakers.yaml")).unwrap();
         match Outcome::classify(&bytes) {
             Outcome::RejectedWithPath { path, .. } => {
-                assert_eq!(path, "static_resources.clusters[0].circuit_breakers");
+                assert_eq!(
+                    path,
+                    "static_resources.clusters[0].circuit_breakers.per_host_thresholds"
+                );
             }
             other => panic!("expected RejectedWithPath, got {other:?}"),
         }
@@ -365,7 +368,7 @@ mod tests {
         assert!(a.contains("local/tcp-proxy` — fully-supported"));
         assert!(a.contains(
             "local/rejected-circuit-breakers` — rejected-with-path at \
-             `static_resources.clusters[0].circuit_breakers`"
+             `static_resources.clusters[0].circuit_breakers.per_host_thresholds`"
         ));
         assert!(a.contains("local/malformed` — parse-error"));
     }
