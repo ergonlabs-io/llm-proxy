@@ -126,6 +126,11 @@ pub enum UpstreamCodecError {
     Connection(#[source] hyper::Error),
     #[error("http/1.1 send_request failed: {0}")]
     Send(#[source] hyper::Error),
+    /// h2-only failure: the request had neither an absolute-form URI nor a
+    /// `Host` header to derive `:authority` from. Not reachable by
+    /// `send_upstream_http1` (h1 has no `:authority` pseudo-header).
+    #[error("request has no authority: URI is origin-form and no Host header was present")]
+    MissingAuthority,
 }
 
 /// Send one request upstream over `io` as HTTP/1.1 and return the response,
@@ -215,6 +220,118 @@ where
     // Rust note: same adaptation `serve_one` does for the downstream request
     // body, but tagged `BodyError::Upstream` since this body is read on the
     // proxy-to-origin side of the seam.
+    let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
+
+    Ok(HttpResponseParts { head, body })
+}
+
+/// Rust note: h2's hyper client needs an `Executor` to drive the internal
+/// future that pumps frames out of the *request body* onto the h2 connection
+/// (hyper's `H2ClientFuture`). That future is `!Send` whenever the request
+/// body `B` is `!Send` -- which ours (`StreamBody`) deliberately is
+/// (ADR-0003) -- but `hyper_util::rt::TokioExecutor` spawns via
+/// `tokio::spawn`, which requires `Send + 'static` futures, so it can't be
+/// used here. `LocalExec` is the minimal fix: implement `hyper::rt::Executor`
+/// by calling `tokio::task::spawn_local` instead. See
+/// `tests/h2_upstream_spike.rs` (now deleted; superseded by this codec + its
+/// test) for the traced-through justification. `Clone` is required because
+/// hyper's internal bounds on the executor type demand it.
+#[derive(Clone)]
+struct LocalExec;
+
+impl<F> hyper::rt::Executor<F> for LocalExec
+where
+    F: Future + 'static,
+{
+    fn execute(&self, fut: F) {
+        // Rust note: the future's output is discarded, matching
+        // `TokioExecutor`'s own `execute` (which also drops what
+        // `tokio::spawn` returns) -- hyper only needs the side effects (driving
+        // the h2 connection/body pump), not a result.
+        tokio::task::spawn_local(fut);
+    }
+}
+
+/// Send one request upstream over `io` as HTTP/2 and return the response,
+/// head-first with a streaming body -- the h2 mirror of
+/// `send_upstream_http1`.
+///
+/// Divergence from `send_upstream_http1`: there is no `Http2Options`/
+/// `keep_alive` parameter. HTTP/2 is multiplexed over one connection; there is
+/// no per-request `Connection: close` concept, so we never set (or need) that
+/// header. Connection lifecycle (when to tear down / reuse the underlying
+/// `SendRequest`) is the pool's concern, not this function's -- a later WP.
+///
+/// Generic over `IO` for the same reason `send_upstream_http1` is.
+pub async fn send_upstream_http2<IO>(
+    io: IO,
+    req: HttpRequestParts,
+) -> Result<HttpResponseParts, UpstreamCodecError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let io = TokioIo::new(io);
+
+    let builder = hyper::client::conn::http2::Builder::new(LocalExec);
+    let (mut sender, conn) = builder
+        .handshake::<_, StreamBody>(io)
+        .await
+        .map_err(UpstreamCodecError::Handshake)?;
+
+    // Same rationale as `send_upstream_http1`: the `Connection` future is
+    // `!Send` (it drives our `!Send` `StreamBody`), so it's driven with
+    // `spawn_local` rather than `tokio::spawn`, and detached (dropped
+    // `JoinHandle`) -- an acceptable v1 simplification, since the connection
+    // tears down when `sender`/the response body are dropped either way.
+    let conn_task = tokio::task::spawn_local(conn);
+
+    let RequestHeaders {
+        method,
+        uri,
+        headers,
+    } = req.head;
+
+    // h2 gotcha: every h2 request needs `:scheme` and `:authority`
+    // pseudo-headers. hyper's h2 client derives them from the request URI --
+    // our router builds origin-form (path-only) URIs after h1-style
+    // processing, which carry neither. Reconstruct an absolute URI from the
+    // `Host` header (scheme `http`, since this codec only ever runs over a
+    // plaintext `IO`) so hyper can populate them. Verified empirically
+    // (`tests/http2_upstream_codec.rs`): passing the origin-form URI as-is
+    // makes the h2 client reject the request before it's ever sent -- the
+    // absolute-URI reconstruction below is what makes the round trip work.
+    let uri = if uri.authority().is_some() {
+        uri
+    } else {
+        let host = headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(UpstreamCodecError::MissingAuthority)?;
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        format!("http://{host}{path_and_query}")
+            .parse::<http::Uri>()
+            .map_err(|_| UpstreamCodecError::MissingAuthority)?
+    };
+
+    let mut builder = Request::builder().method(method).uri(uri);
+    *builder.headers_mut().expect("builder not yet finalized") = headers;
+    let request = builder
+        .body(req.body)
+        .expect("method/uri were already valid; building can't fail here");
+
+    let response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(send_err) => {
+            conn_task.abort();
+            return Err(UpstreamCodecError::Send(send_err));
+        }
+    };
+
+    let (parts, incoming) = response.into_parts();
+    let head = ResponseHeaders {
+        status: parts.status,
+        headers: parts.headers,
+    };
     let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
 
     Ok(HttpResponseParts { head, body })

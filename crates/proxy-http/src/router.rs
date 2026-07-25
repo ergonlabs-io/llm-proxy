@@ -305,7 +305,11 @@ impl RouterHandler {
             }
             Err(UpstreamCodecError::Handshake(_))
             | Err(UpstreamCodecError::Connection(_))
-            | Err(UpstreamCodecError::Send(_)) => {
+            | Err(UpstreamCodecError::Send(_))
+            // `MissingAuthority` is h2-only (unreachable via `send_upstream_http1`,
+            // which this router chunk exclusively drives) but must be handled here
+            // since the match is over the shared `UpstreamCodecError` enum.
+            | Err(UpstreamCodecError::MissingAuthority) => {
                 tracing::debug!(response_flag = "UC", cluster = %cluster_name, "upstream codec error");
                 local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure")
             }
