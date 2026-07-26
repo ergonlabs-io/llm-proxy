@@ -13,6 +13,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 pub mod discovery;
+pub mod health_check;
 pub mod host_set;
 pub mod load_balancer;
 pub mod manager;
@@ -48,14 +49,19 @@ impl From<proxy_config::ir::UpstreamProtocol> for UpstreamProtocol {
 }
 
 /// A host's health, as tracked by active health checking. Every host starts
-/// (and, until WP-18 lands, stays) `Healthy` -- discovery (WP-16) never
-/// itself marks a host unhealthy.
+/// `Healthy` -- discovery (WP-16) never itself marks a host unhealthy, only
+/// [`health_check::HealthCheckEngine`] flips it. That engine exists and is
+/// unit-tested (WP-18), but nothing yet drives it from a real cluster's
+/// config: `proxy_config::ir::ClusterConfig` has no health-check field, so
+/// `ClusterManager`-built clusters never spawn one, and a discovered host
+/// stays `Healthy` until the IR grows that field and a caller wires it up
+/// (see `health_check`'s module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthStatus {
     #[default]
     Healthy,
-    // TODO(WP-18): Unhealthy (failing active health checks) and the
-    // outlier-detection ejection states (WP-19).
+    /// Failing active health checks. TODO(WP-19): outlier-detection ejection
+    /// states are a separate, not-yet-modeled axis from this.
     Unhealthy,
 }
 
