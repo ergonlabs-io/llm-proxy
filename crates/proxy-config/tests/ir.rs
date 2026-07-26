@@ -40,6 +40,34 @@ static_resources:
     snapshot_from(&yaml).expect("config must lower to IR")
 }
 
+/// Like [`hcm_snapshot`], but for configs that are expected to be REJECTED —
+/// returns the error instead of panicking, so a test can assert on its field
+/// path and reason.
+fn hcm_snapshot_err(route_config: &str) -> ConfigError {
+    let yaml = format!(
+        r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+{route_config}
+"#
+    );
+    snapshot_from(&yaml).expect_err("config must be rejected")
+}
+
 /// Like [`hcm_snapshot`], but with a caller-supplied `http_filters` block
 /// (indented to match) instead of the fixed router-only chain.
 fn hcm_snapshot_with_filters(http_filters: &str, route_config: &str) -> ConfigSnapshot {
@@ -273,8 +301,7 @@ fn retry_policy_defaults_and_parsing() {
 }
 
 /// S3.3: an explicit `retry_back_off` with only `base_interval` set derives
-/// `max_interval` as 10x the base; `host_selection_retry_max_attempts` is
-/// lowered as given.
+/// `max_interval` as 10x the base.
 #[test]
 fn retry_back_off_explicit_base_derives_default_max() {
     let snapshot = hcm_snapshot(
@@ -290,7 +317,6 @@ fn retry_back_off_explicit_base_derives_default_max() {
                               retry_on: "5xx"
                               retry_back_off:
                                 base_interval: 0.100s
-                              host_selection_retry_max_attempts: 5
 "#,
     );
     let table = route_table(&snapshot);
@@ -300,7 +326,93 @@ fn retry_back_off_explicit_base_derives_default_max() {
     let rp = f.retry_policy.as_ref().expect("retry policy");
     assert_eq!(rp.retry_back_off.base_interval, Duration::from_millis(100));
     assert_eq!(rp.retry_back_off.max_interval, Duration::from_millis(1000));
-    assert_eq!(rp.host_selection_retry_max_attempts, 5);
+}
+
+/// Ground rule #1, guarding a gap that actually bit us: route-level
+/// `request_headers_to_add` IS lowered (and, as of WP-13, applied by the
+/// router), but Envoy also allows the same field on `VirtualHost` and
+/// `RouteConfiguration`, where we model nothing. Those levels must be
+/// REJECTED with their field path rather than parsed and dropped — the
+/// route-level version spent months lowering into an IR field no runtime code
+/// read, which is exactly the failure mode this asserts against.
+#[test]
+fn virtual_host_level_request_headers_to_add_is_rejected() {
+    let err = hcm_snapshot_err(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      request_headers_to_add:
+                        - header: { key: x-from-vhost, value: "1" }
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c }
+"#,
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("request_headers_to_add"),
+        "error must name the unsupported field, got: {msg}"
+    );
+}
+
+/// Ground rule #1: the router re-runs host selection once per retry (Envoy's
+/// default of 1) but cannot exclude an already-tried host, so a higher value
+/// is refused rather than accepted-and-dropped.
+#[test]
+fn host_selection_retry_max_attempts_above_one_is_rejected() {
+    let err = hcm_snapshot_err(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx"
+                              host_selection_retry_max_attempts: 5
+"#,
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("host_selection_retry_max_attempts"),
+        "error must name the field path, got: {msg}"
+    );
+    assert!(
+        msg.contains("exclude"),
+        "error must explain why it can't be honored, got: {msg}"
+    );
+}
+
+/// Ground rule #1: `envoy-ratelimited` fires on the `x-envoy-ratelimited`
+/// response header, which no filter sets yet — so accepting the token would
+/// silently never retry anything.
+#[test]
+fn retry_on_envoy_ratelimited_is_rejected() {
+    let err = hcm_snapshot_err(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx,envoy-ratelimited"
+"#,
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("retry_on"),
+        "error must name the field path, got: {msg}"
+    );
+    assert!(
+        msg.contains("envoy-ratelimited"),
+        "error must name the offending token, got: {msg}"
+    );
 }
 
 /// S3.3: both `base_interval` and `max_interval` set are lowered verbatim.

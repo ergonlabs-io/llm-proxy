@@ -2371,8 +2371,38 @@ fn convert_retry_policy(
         host_selection_retry_max_attempts
     };
 
+    // Ground rule #1. The router re-runs host selection once per retry, which
+    // *is* the Envoy default (1) -- but it has no notion of "avoid a host this
+    // request already tried", so any explicit value above 1 would parse,
+    // validate, and then do nothing. Refuse it instead of accepting a knob we
+    // silently drop.
+    if host_selection_retry_max_attempts > 1 {
+        return Err(unsupported(
+            format!("{path}.host_selection_retry_max_attempts"),
+            "values above 1 are not implemented yet (WP-14 follow-up: the router re-runs host \
+             selection per retry but cannot yet exclude already-tried hosts, so a higher \
+             attempt count would have no effect)",
+        ));
+    }
+
+    let retry_on = RetryOn::parse(&rp.retry_on);
+
+    // Ground rule #1. `envoy-ratelimited` retries when the response carries
+    // `x-envoy-ratelimited`, a header only a rate-limit filter sets -- and no
+    // such filter exists yet (WP-31/WP-32), so nothing can ever produce the
+    // condition. Accepting the token would mean a config that reads as "retry
+    // rate-limited responses" and never retries anything.
+    if retry_on.envoy_ratelimited {
+        return Err(unsupported(
+            format!("{path}.retry_on"),
+            "the `envoy-ratelimited` retry trigger is not implemented yet (it fires on the \
+             `x-envoy-ratelimited` response header, which no filter sets until WP-31/WP-32 \
+             land the rate-limit filters)",
+        ));
+    }
+
     Ok(RetryPolicyIR {
-        retry_on: RetryOn::parse(&rp.retry_on),
+        retry_on,
         // S3: Envoy default is 1 retry.
         num_retries: rp.num_retries.unwrap_or(1),
         per_try_timeout: rp
