@@ -27,9 +27,13 @@
 //!
 //! # Status
 //!
-//! Function bodies are `todo!()` placeholders. The tests below encode the
-//! required behavior and are `#[ignore]`d so the CI gate stays green; remove
-//! the `#[ignore]` from a test as you make it pass.
+//! Extraction is complete for all three dialects (OpenAI chat completions,
+//! OpenAI Responses, and Anthropic Messages), streaming and non-streaming, and
+//! the full acceptance suite below runs in the CI gate.
+//!
+//! Not yet done: this module is a pure extractor with no `HttpFilter` wrapper,
+//! so nothing calls it on real traffic. Wiring it into the encode chain is
+//! WP-33.
 
 /// Tokens consumed by one request/response exchange, split into the buckets
 /// that are **priced differently** so downstream cost accounting can apply a
@@ -471,12 +475,9 @@ fn merge_line(target: &mut Option<TokenUsage>, dialect: Dialect, line: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    //! The WP-34 acceptance suite. Every test is `#[ignore]`d so the CI gate
-    //! stays green while the implementation is still `todo!()`.
-    //!
-    //! **Workflow:** pick a test, delete its `#[ignore]` line, run
-    //! `cargo test -p proxy-filters` (it will fail), implement until it
-    //! passes. Work top to bottom — they're ordered easiest to hardest.
+    //! The WP-34 acceptance suite. Every test runs in the CI gate; they are
+    //! ordered easiest to hardest, which is also the order they were made to
+    //! pass. Add a failing test here first when extending a dialect.
 
     use super::*;
 
