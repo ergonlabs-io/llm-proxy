@@ -9,6 +9,8 @@ thiserror = { workspace = true }
 http = { workspace = true }
 # WP-24: `%START_TIME(fmt)%` strftime rendering.
 chrono = { workspace = true }
+# WP-24 chunk 2: rate-limited warnings when an access-log sink fails to write.
+tracing = { workspace = true }
 
 [lints]
 workspace = true

@@ -240,14 +240,17 @@ pub struct AccessLogIR {
     pub filter: Option<AccessLogFilterIR>,
 }
 
-/// Where a rendered access-log line is written. `File` is a path only here —
-/// opening/buffering/reopen-on-SIGUSR1 is chunk 2 (runtime sink) territory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccessLogSink {
-    Stdout,
-    Stderr,
-    File { path: String },
-}
+/// Where a rendered access-log line is written.
+///
+/// This is `proxy_observability`'s type, re-exported so the IR reads as one
+/// surface — the same arrangement already used for [`FormatString`] and
+/// [`ResponseFlag`] above. It deliberately lives in `proxy-observability`
+/// rather than here because that crate owns the runtime sink that opens and
+/// writes the destination, and `proxy-config` depends on it (never the
+/// reverse). Defining a same-shaped twin here instead would mean a new sink
+/// variant could be added on one side and silently not exist on the other,
+/// which is exactly the class of drift ground rule #1 exists to prevent.
+pub use proxy_observability::sink::AccessLogSink;
 
 /// A logger's `log_format`, pre-parsed at config time (never re-parsed per
 /// request). Mirrors `envoy.config.core.v3.SubstitutionFormatString`'s

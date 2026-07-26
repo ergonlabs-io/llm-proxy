@@ -4,5 +4,6 @@
 
 pub mod access_log;
 pub mod flags;
+pub mod sink;
 
 pub use flags::ResponseFlag;
