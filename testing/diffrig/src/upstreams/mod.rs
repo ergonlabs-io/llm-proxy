@@ -10,12 +10,14 @@ mod echo;
 mod flaky;
 mod openai;
 mod slow;
+mod tls_support;
 
 pub use anthropic::{AnthropicConfig, AnthropicUpstream, MessagesRequestLog};
 pub use echo::EchoUpstream;
 pub use flaky::{Action, FailScript, FlakyUpstream};
 pub use openai::{ChatRequestLog, OpenAiConfig, OpenAiUpstream};
 pub use slow::SlowUpstream;
+pub use tls_support::MockTls;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

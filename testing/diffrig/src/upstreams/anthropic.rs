@@ -28,6 +28,7 @@ use hyper::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::tls_support::{serve_tls, MockTls, TlsServerHandle};
 use super::{record_request_with_body, serve, RequestLog, ResponseBody, ServerHandle};
 
 /// How the mock upstream should behave for every request it serves.
@@ -91,15 +92,36 @@ impl MessagesRequestLog {
     }
 }
 
+/// Either a plaintext accept loop (`spawn`) or a TLS-terminating one
+/// (`spawn_tls`) — see `openai::Handle` for the same shape and rationale.
+enum Handle {
+    Plain(ServerHandle),
+    Tls(TlsServerHandle),
+}
+
 pub struct AnthropicUpstream {
     pub log: RequestLog,
     pub bodies: MessagesRequestLog,
-    handle: ServerHandle,
+    handle: Handle,
 }
 
 impl AnthropicUpstream {
+    /// Only valid for a plaintext (`spawn`) upstream — see
+    /// `openai::OpenAiUpstream::addr`.
     pub fn addr(&self) -> SocketAddr {
-        self.handle.addr
+        match &self.handle {
+            Handle::Plain(h) => h.addr,
+            Handle::Tls(_) => {
+                panic!("AnthropicUpstream::addr() is not meaningful for a TLS upstream; use port()")
+            }
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match &self.handle {
+            Handle::Plain(h) => h.addr.port(),
+            Handle::Tls(h) => h.port,
+        }
     }
 
     pub async fn spawn(config: AnthropicConfig) -> anyhow::Result<Self> {
@@ -113,14 +135,45 @@ impl AnthropicUpstream {
         // since we only need uniqueness, not synchronization with anything
         // else — same reasoning as `openai::OpenAiUpstream::spawn`.
         let next_id = Arc::new(AtomicU64::new(1));
-        let handle = serve(move |req: Request<Incoming>| {
-            let log = log_for_handler.clone();
-            let bodies = bodies_for_handler.clone();
-            let config = Arc::clone(&config);
-            let next_id = Arc::clone(&next_id);
-            async move { Ok(handle_anthropic(req, &log, &bodies, &config, &next_id).await) }
+        let handle = Handle::Plain(
+            serve(move |req: Request<Incoming>| {
+                let log = log_for_handler.clone();
+                let bodies = bodies_for_handler.clone();
+                let config = Arc::clone(&config);
+                let next_id = Arc::clone(&next_id);
+                async move { Ok(handle_anthropic(req, &log, &bodies, &config, &next_id).await) }
+            })
+            .await?,
+        );
+        Ok(Self {
+            log,
+            bodies,
+            handle,
         })
-        .await?;
+    }
+
+    /// The TLS-capable twin of `spawn` — see
+    /// `openai::OpenAiUpstream::spawn_tls`.
+    pub async fn spawn_tls(config: AnthropicConfig, tls: &MockTls) -> anyhow::Result<Self> {
+        let log = RequestLog::new();
+        let bodies = MessagesRequestLog::new();
+        let log_for_handler = log.clone();
+        let bodies_for_handler = bodies.clone();
+        let config = Arc::new(config);
+        let next_id = Arc::new(AtomicU64::new(1));
+        let handle = Handle::Tls(
+            serve_tls(
+                move |req: Request<Incoming>| {
+                    let log = log_for_handler.clone();
+                    let bodies = bodies_for_handler.clone();
+                    let config = Arc::clone(&config);
+                    let next_id = Arc::clone(&next_id);
+                    async move { Ok(handle_anthropic(req, &log, &bodies, &config, &next_id).await) }
+                },
+                tls,
+            )
+            .await?,
+        );
         Ok(Self {
             log,
             bodies,
@@ -129,7 +182,10 @@ impl AnthropicUpstream {
     }
 
     pub async fn shutdown(self) {
-        self.handle.shutdown().await;
+        match self.handle {
+            Handle::Plain(h) => h.shutdown().await,
+            Handle::Tls(h) => h.shutdown().await,
+        }
     }
 }
 

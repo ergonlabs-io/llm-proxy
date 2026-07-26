@@ -18,6 +18,7 @@ use hyper::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::tls_support::{serve_tls, MockTls, TlsServerHandle};
 use super::{record_request_with_body, serve, RequestLog, ResponseBody, ServerHandle};
 
 /// How the mock upstream should behave for every request it serves.
@@ -86,15 +87,39 @@ impl ChatRequestLog {
     }
 }
 
+/// Either a plaintext accept loop (`spawn`) or a TLS-terminating one
+/// (`spawn_tls`) -- see `spawn_tls`'s doc comment for why the TLS variant
+/// carries a bare port rather than a single `SocketAddr` (it listens on both
+/// loopback address families).
+enum Handle {
+    Plain(ServerHandle),
+    Tls(TlsServerHandle),
+}
+
 pub struct OpenAiUpstream {
     pub log: RequestLog,
     pub bodies: ChatRequestLog,
-    handle: ServerHandle,
+    handle: Handle,
 }
 
 impl OpenAiUpstream {
+    /// Only valid for a plaintext (`spawn`) upstream -- a TLS upstream
+    /// listens on two address families at the same port, so callers should
+    /// use [`Self::port`] and dial it by hostname instead.
     pub fn addr(&self) -> SocketAddr {
-        self.handle.addr
+        match &self.handle {
+            Handle::Plain(h) => h.addr,
+            Handle::Tls(_) => {
+                panic!("OpenAiUpstream::addr() is not meaningful for a TLS upstream; use port()")
+            }
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match &self.handle {
+            Handle::Plain(h) => h.addr.port(),
+            Handle::Tls(h) => h.port,
+        }
     }
 
     pub async fn spawn(config: OpenAiConfig) -> anyhow::Result<Self> {
@@ -108,14 +133,48 @@ impl OpenAiUpstream {
         // since we only need uniqueness, not synchronization with anything
         // else.
         let next_id = Arc::new(AtomicU64::new(1));
-        let handle = serve(move |req: Request<Incoming>| {
-            let log = log_for_handler.clone();
-            let bodies = bodies_for_handler.clone();
-            let config = Arc::clone(&config);
-            let next_id = Arc::clone(&next_id);
-            async move { Ok(handle_openai(req, &log, &bodies, &config, &next_id).await) }
+        let handle = Handle::Plain(
+            serve(move |req: Request<Incoming>| {
+                let log = log_for_handler.clone();
+                let bodies = bodies_for_handler.clone();
+                let config = Arc::clone(&config);
+                let next_id = Arc::clone(&next_id);
+                async move { Ok(handle_openai(req, &log, &bodies, &config, &next_id).await) }
+            })
+            .await?,
+        );
+        Ok(Self {
+            log,
+            bodies,
+            handle,
         })
-        .await?;
+    }
+
+    /// The TLS-capable twin of `spawn`: serves the same
+    /// chat-completions/responses handler behind `tls`'s minted certificate,
+    /// for the hermetic upstream-TLS end-to-end test (WP-26). Bound on both
+    /// loopback address families at one port -- see [`TlsServerHandle`]'s
+    /// doc comment for why.
+    pub async fn spawn_tls(config: OpenAiConfig, tls: &MockTls) -> anyhow::Result<Self> {
+        let log = RequestLog::new();
+        let bodies = ChatRequestLog::new();
+        let log_for_handler = log.clone();
+        let bodies_for_handler = bodies.clone();
+        let config = Arc::new(config);
+        let next_id = Arc::new(AtomicU64::new(1));
+        let handle = Handle::Tls(
+            serve_tls(
+                move |req: Request<Incoming>| {
+                    let log = log_for_handler.clone();
+                    let bodies = bodies_for_handler.clone();
+                    let config = Arc::clone(&config);
+                    let next_id = Arc::clone(&next_id);
+                    async move { Ok(handle_openai(req, &log, &bodies, &config, &next_id).await) }
+                },
+                tls,
+            )
+            .await?,
+        );
         Ok(Self {
             log,
             bodies,
@@ -124,7 +183,10 @@ impl OpenAiUpstream {
     }
 
     pub async fn shutdown(self) {
-        self.handle.shutdown().await;
+        match self.handle {
+            Handle::Plain(h) => h.shutdown().await,
+            Handle::Tls(h) => h.shutdown().await,
+        }
     }
 }
 
