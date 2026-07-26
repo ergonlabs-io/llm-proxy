@@ -15,6 +15,7 @@ members = [
     "testing/diffrig",
     "testing/corpus",
     "testing/controlplane",
+    "testing/loadgen",
 ]
 
 [workspace.package]
@@ -86,8 +87,16 @@ regex = "1"
 rand = "0.8"
 core_affinity = "0.8"
 socket2 = "0.5"
+# Load-generator benchmarking (testing/loadgen): percentile histograms with
+# proper multi-thread-friendly recording (`Recorder`/`SyncHistogram`) instead
+# of a hand-rolled percentile calculation.
+hdrhistogram = "7"
 # Access-log `%START_TIME(fmt)%` strftime rendering (WP-24).
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# Load-generator benchmarking (testing/loadgen): safe `getrlimit` wrapper so
+# the driver can log its own fd budget without an `unsafe` FFI call in our
+# code -- see `rig.rs`.
+rlimit = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
