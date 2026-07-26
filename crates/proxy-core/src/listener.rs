@@ -799,10 +799,24 @@ fn build_hcm_handler(
         factories.push(Arc::from(instance_factory));
     }
 
-    let terminal: Rc<dyn StreamHandler> = Rc::new(RouterHandler::new(
+    // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
+    // bind/rebuild cadence as everything else in this function (a fresh
+    // `RouterHandler` -- and so a fresh set of loggers/sinks -- is built
+    // every time `build_listener_hcm` rebuilds this chain, mirroring
+    // `build_listener_tls`'s cadence for certs). A sink that can't be opened
+    // (e.g. an unwritable file path) is a startup/config error, same
+    // fatal-at-`initial_bind`/logged-and-skip-at-reconcile treatment as an
+    // unregistered filter or a bad cert.
+    let router = RouterHandler::new_with_access_logs(
         hcm.route_table.clone(),
         cluster_manager.clone(),
-    ));
+        &hcm.access_logs,
+    )
+    .map_err(|e| HttpFilterChainBuildError {
+        context: context.to_string(),
+        reason: format!("failed to open access_logs sink: {e}"),
+    })?;
+    let terminal: Rc<dyn StreamHandler> = Rc::new(router);
 
     Ok(Rc::new(FilterChainHandler::new(
         factories,

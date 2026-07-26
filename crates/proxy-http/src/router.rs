@@ -45,28 +45,41 @@
 //!   `ConnectPool` is connect-per-stream today).
 //! - `RouteActionIR::Redirect` (returns 501 below).
 //!
-//! There is no access-log sink yet (WP-24): response flags are only ever
-//! `tracing::debug!`/`tracing::warn!`'d here, never recorded as stats.
+//! WP-24 chunk 3: response flags are recorded onto a per-request
+//! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below, and --
+//! when the route's HCM has `access_logs` configured -- a rendered line is
+//! written per logger once the response stream ends (`logging::LoggingBody`,
+//! wrapped outermost in [`RouterHandler::handle`]). See `logging`'s module
+//! doc for why that has to be at stream end, not at header-flush time.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::{LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol};
-use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable};
+use proxy_config::ir::{
+    AccessLogIR, DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable,
+};
+use proxy_observability::ResponseFlag;
 
 use crate::codec::{send_upstream_http1, send_upstream_http2, Http1Options, UpstreamCodecError};
 use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{local_boxed, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, match_route, select_cluster, RouteMatch, RouteRequest};
+use crate::stream_info::StreamInfo;
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
+use logging::{AccessLogContext, AccessLoggerRuntime, CountingRequestBody, LoggingBody};
 
 mod guarded;
 mod idle;
+mod logging;
 
 /// S3.4 (Envoy's `no_retry_body_too_large`): the largest request body this
 /// router will hold in memory for retry replay. Matches
@@ -83,6 +96,12 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 pub struct RouterHandler {
     route_table: Arc<RouteTable>,
     clusters: Arc<ClusterManager>,
+    /// WP-24 chunk 3: this HCM's configured access loggers, already resolved
+    /// to open sinks -- empty when the HCM has no `access_logs`, in which
+    /// case [`RouterHandler::handle`] skips the logging wrap entirely.
+    /// `Rc` (not `Arc`): shared cheaply across every request this
+    /// (`!Send`, per-worker) handler serves, never across workers.
+    access_loggers: Rc<Vec<AccessLoggerRuntime>>,
 }
 
 impl RouterHandler {
@@ -90,7 +109,29 @@ impl RouterHandler {
         Self {
             route_table,
             clusters,
+            access_loggers: Rc::new(Vec::new()),
         }
+    }
+
+    /// Like [`Self::new`], but resolving `access_logs` into live sinks
+    /// (opening/sharing files via a fresh [`logging::AccessLoggerRuntime`]
+    /// registry scoped to this one build) -- what `proxy-core`'s
+    /// `build_hcm_handler` calls, since every HCM in real config carries its
+    /// own `access_logs`. Kept as a separate constructor (rather than adding
+    /// a parameter to `new`) so every existing caller that has no sinks to
+    /// build -- and so no `io::Error` to handle -- is unaffected.
+    pub fn new_with_access_logs(
+        route_table: Arc<RouteTable>,
+        clusters: Arc<ClusterManager>,
+        access_logs: &[AccessLogIR],
+    ) -> std::io::Result<Self> {
+        let registry = proxy_observability::sink::SinkRegistry::new();
+        let access_loggers = AccessLoggerRuntime::build_all(access_logs, &registry)?;
+        Ok(Self {
+            route_table,
+            clusters,
+            access_loggers: Rc::new(access_loggers),
+        })
     }
 }
 
@@ -102,12 +143,71 @@ impl StreamHandler for RouterHandler {
         &'a self,
         req: HttpRequestParts,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>> {
-        Box::pin(async move { self.route_and_forward(req).await })
+        Box::pin(async move { self.handle_and_log(req).await })
     }
 }
 
 impl RouterHandler {
-    async fn route_and_forward(&self, req: HttpRequestParts) -> HttpResponseParts {
+    /// The `StreamHandler::handle` entry point: builds the per-request
+    /// [`StreamInfo`] and access-log context, routes/forwards
+    /// ([`Self::route_and_forward`]), then -- only if this HCM has
+    /// `access_logs` configured -- wraps the response body in
+    /// [`LoggingBody`] so a line is written once the stream actually ends.
+    async fn handle_and_log(&self, req: HttpRequestParts) -> HttpResponseParts {
+        let start_time = SystemTime::now();
+        let start_instant = Instant::now();
+        let downstream_remote_address = req.downstream.remote.to_string();
+
+        // Rust note: snapshot the *pre-router* request headers for logging.
+        // This already reflects any S9 mutations the filter chain made
+        // upstream of the router (x-request-id, XFF, ...), but deliberately
+        // not this route's own `request_headers_to_add` (provider
+        // credentials injected later, in `apply_request_transforms`) -- an
+        // access log must never become a place a dialect-injected
+        // `Authorization`/`x-api-key` header leaks to.
+        let mut request_headers = req.head.headers.clone();
+        // `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%` (the default access-log
+        // format's own path field) falls back to a `:PATH` pseudo-header
+        // `header_lookup` can never resolve (see its doc in
+        // `proxy_observability::access_log`) -- populating the *primary*
+        // here, the same normal header name real Envoy sets on a
+        // `prefix_rewrite`, is what makes that default format usable at all
+        // for the path, without touching the (frozen) formatter itself.
+        let original_path = req.head.uri.path().to_string();
+        if !request_headers.contains_key("x-envoy-original-path") {
+            if let Ok(v) = HeaderValue::from_str(&original_path) {
+                request_headers.insert("x-envoy-original-path", v);
+            }
+        }
+
+        let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
+        let resp = self.route_and_forward(req, stream_info.clone()).await;
+
+        if self.access_loggers.is_empty() {
+            return resp;
+        }
+
+        let ctx = AccessLogContext {
+            loggers: self.access_loggers.clone(),
+            stream_info,
+            start_time,
+            start_instant,
+            request_headers,
+            response_headers: resp.head.headers.clone(),
+            response_code: resp.head.status.as_u16(),
+            downstream_remote_address,
+        };
+        HttpResponseParts {
+            head: resp.head,
+            body: local_boxed(LoggingBody::new(resp.body, ctx)),
+        }
+    }
+
+    async fn route_and_forward(
+        &self,
+        req: HttpRequestParts,
+        stream_info: Rc<RefCell<StreamInfo>>,
+    ) -> HttpResponseParts {
         // Rust note: `req.head.uri.authority()` borrows from `req.head`, so
         // this has to be resolved before `req` is destructured/moved below;
         // the `Host` header fallback borrows from the same `req.head`.
@@ -143,13 +243,22 @@ impl RouterHandler {
         match match_route(&self.route_table, &route_req) {
             RouteMatch::NoVirtualHost | RouteMatch::NoRoute { .. } => {
                 tracing::debug!(response_flag = "NR", authority, path, "no route matched");
+                stream_info
+                    .borrow_mut()
+                    .set_response_flag(ResponseFlag::NoRouteFound);
                 drain_request_body(req).await;
                 local_reply(StatusCode::NOT_FOUND, "no route matched")
             }
             RouteMatch::Found { route, .. } => match &route.action {
                 RouteActionIR::Forward(fwd) => {
-                    self.apply_forward(fwd, &route.matcher, &route.request_headers_to_add, req)
-                        .await
+                    self.apply_forward(
+                        fwd,
+                        &route.matcher,
+                        &route.request_headers_to_add,
+                        req,
+                        stream_info,
+                    )
+                    .await
                 }
                 RouteActionIR::DirectResponse { status, body } => {
                     drain_request_body(req).await;
@@ -175,6 +284,7 @@ impl RouterHandler {
         matcher: &RouteMatcher,
         request_headers_to_add: &[proxy_config::ir::HeaderMutation],
         req: HttpRequestParts,
+        stream_info: Rc<RefCell<StreamInfo>>,
     ) -> HttpResponseParts {
         let draw = match &fwd.target {
             ForwardTarget::Weighted(w) if w.total_weight > 0 => {
@@ -188,6 +298,9 @@ impl RouterHandler {
                 response_flag = "NC",
                 "forward target resolved to no cluster"
             );
+            stream_info
+                .borrow_mut()
+                .set_response_flag(ResponseFlag::NoClusterFound);
             drain_request_body(req).await;
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no cluster");
         };
@@ -200,6 +313,9 @@ impl RouterHandler {
 
         let Some(entry) = self.clusters.cluster(&cluster_name) else {
             tracing::debug!(response_flag = "NC", cluster = %cluster_name, "unknown cluster");
+            stream_info
+                .borrow_mut()
+                .set_response_flag(ResponseFlag::NoClusterFound);
             drain_request_body(req).await;
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
@@ -234,6 +350,11 @@ impl RouterHandler {
                         // request still proceeds -- it just can't be retried.
                         state.mark_body_not_retriable();
                     }
+                    // WP-24: the retry/replay path already has the whole
+                    // body in hand, so `%BYTES_RECEIVED%` is exact and free
+                    // -- no need for the streaming path's frame-by-frame
+                    // counter below.
+                    stream_info.borrow_mut().bytes_received = bytes.len() as u64;
                     Some(bytes)
                 }
                 Err(_) => {
@@ -241,7 +362,13 @@ impl RouterHandler {
                 }
             },
             None => {
-                streaming_body = Some(req.body);
+                // WP-24: wrapped so `%BYTES_RECEIVED%` reflects what's
+                // actually forwarded upstream, one frame at a time, instead
+                // of staying 0 for every non-retry (i.e. most) request.
+                streaming_body = Some(local_boxed(CountingRequestBody::new(
+                    req.body,
+                    stream_info.clone(),
+                )));
                 None
             }
         };
@@ -264,6 +391,9 @@ impl RouterHandler {
                 let cb = entry.circuit_breaker(RoutingPriority::Default);
                 let Some(rq_guard) = cb.try_acquire_request() else {
                     tracing::debug!(response_flag = "UO", cluster = %cluster_name, "circuit breaker: max_requests exceeded");
+                    stream_info
+                        .borrow_mut()
+                        .set_response_flag(ResponseFlag::UpstreamOverflow);
                     drain_leftover_body(&mut streaming_body).await;
                     let mut resp =
                         local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
@@ -276,11 +406,34 @@ impl RouterHandler {
                 let ctx = LoadBalancerContext::default();
                 let Some(host) = entry.pick_host(&ctx) else {
                     tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
+                    stream_info
+                        .borrow_mut()
+                        .set_response_flag(ResponseFlag::NoHealthyUpstream);
                     drain_leftover_body(&mut streaming_body).await;
                     return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
                 };
 
                 let proto = entry.upstream_protocol();
+                // WP-24: both known right here, at the dial site -- recorded
+                // onto `StreamInfo` for `%UPSTREAM_HOST%`/`%UPSTREAM_CLUSTER%`/
+                // `%PROTOCOL%` before the connect is even attempted, so a
+                // failed attempt still logs which host/cluster/protocol it
+                // was aimed at (matching Envoy's own access-log behavior on
+                // an upstream failure). A later retry attempt overwrites
+                // these with its own host, which is what makes the *last*
+                // attempt's target the one that ends up logged.
+                {
+                    let mut info = stream_info.borrow_mut();
+                    info.upstream_cluster = Some(cluster_name.clone());
+                    info.upstream_host = Some(host.address.to_string());
+                    info.protocol = Some(
+                        match proto {
+                            UpstreamProtocol::Http1 => "HTTP/1.1",
+                            UpstreamProtocol::Http2 => "HTTP/2",
+                        }
+                        .to_string(),
+                    );
+                }
                 let pool = entry.http_pool(&host, proto);
                 let upstream = match pool.new_stream().await {
                     Ok(upstream) => upstream,
@@ -296,6 +449,9 @@ impl RouterHandler {
                         return match err {
                             PoolError::Overflow => {
                                 tracing::debug!(response_flag = "UO", cluster = %cluster_name, "pool overflow");
+                                stream_info
+                                    .borrow_mut()
+                                    .set_response_flag(ResponseFlag::UpstreamOverflow);
                                 let mut resp = local_reply(
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     "upstream overloaded",
@@ -307,6 +463,9 @@ impl RouterHandler {
                             }
                             PoolError::ConnectFailure(_) | PoolError::ConnectTimeout => {
                                 tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream connect failure");
+                                stream_info
+                                    .borrow_mut()
+                                    .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
                                 local_reply(
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     "upstream connect failure",
@@ -321,6 +480,9 @@ impl RouterHandler {
                             // half actually broke.
                             PoolError::TlsHandshake(_) => {
                                 tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream TLS handshake failure");
+                                stream_info
+                                    .borrow_mut()
+                                    .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
                                 local_reply(
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     "upstream connect failure",
@@ -328,6 +490,9 @@ impl RouterHandler {
                             }
                             PoolError::ResetBeforeHeaders => {
                                 tracing::debug!(response_flag = "UR", cluster = %cluster_name, "upstream reset before headers");
+                                stream_info
+                                    .borrow_mut()
+                                    .set_response_flag(ResponseFlag::UpstreamRemoteReset);
                                 local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream reset")
                             }
                         };
@@ -428,6 +593,9 @@ impl RouterHandler {
                                 timeout_ms = d.as_millis(),
                                 "upstream per-try timeout waiting for response headers"
                             );
+                            stream_info
+                                .borrow_mut()
+                                .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
                             return local_reply(
                                 StatusCode::GATEWAY_TIMEOUT,
                                 "upstream request timeout",
@@ -479,6 +647,9 @@ impl RouterHandler {
                             }
                         }
                         tracing::debug!(response_flag = "UC", cluster = %cluster_name, "upstream codec error");
+                        stream_info
+                            .borrow_mut()
+                            .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
                         return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
                     }
                 }
@@ -503,6 +674,9 @@ impl RouterHandler {
                             timeout_ms = d.as_millis(),
                             "upstream request timed out waiting for response headers"
                         );
+                        stream_info
+                            .borrow_mut()
+                            .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
                         local_reply(StatusCode::GATEWAY_TIMEOUT, "upstream request timeout")
                     }
                 }
