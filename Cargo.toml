@@ -86,6 +86,8 @@ regex = "1"
 rand = "0.8"
 core_affinity = "0.8"
 socket2 = "0.5"
+# Access-log `%START_TIME(fmt)%` strftime rendering (WP-24).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

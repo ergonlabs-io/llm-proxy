@@ -28,6 +28,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/extensions/filters/listener/tls_inspector/v3/tls_inspector.proto",
         "envoy/extensions/transport_sockets/tls/v3/tls.proto",
         "envoy/extensions/upstreams/http/v3/http_protocol_options.proto",
+        // Access logging (WP-24): common AccessLog/AccessLogFilter types plus
+        // the two logger extensions we implement (file, stdout/stderr).
+        "envoy/config/accesslog/v3/accesslog.proto",
+        "envoy/extensions/access_loggers/file/v3/file.proto",
+        "envoy/extensions/access_loggers/stream/v3/stream.proto",
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);

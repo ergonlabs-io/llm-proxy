@@ -42,7 +42,7 @@
 //! - The retry & hedging engine (S3, WP-14).
 //! - HTTP/2 upstream (`UpstreamProtocol::Http2`).
 //! - Connection reuse / real pooling (WP-15 follow-up;
-//!   `Http1ConnectPool` is connect-per-stream today).
+//!   `ConnectPool` is connect-per-stream today).
 //! - `RouteActionIR::Redirect` (returns 501 below).
 //!
 //! There is no access-log sink yet (WP-24): response flags are only ever
@@ -57,7 +57,7 @@ use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::{LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol};
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable};
 
-use crate::codec::{send_upstream_http1, Http1Options, UpstreamCodecError};
+use crate::codec::{send_upstream_http1, send_upstream_http2, Http1Options, UpstreamCodecError};
 use crate::filter::ResponseHeaders;
 use crate::handler::{local_boxed, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
 use crate::route::{apply_prefix_rewrite, match_route, select_cluster, RouteMatch, RouteRequest};
@@ -213,7 +213,8 @@ impl RouterHandler {
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
         };
 
-        let pool = entry.http_pool(&host, UpstreamProtocol::Http1);
+        let proto = entry.upstream_protocol();
+        let pool = entry.http_pool(&host, proto);
         let upstream = match pool.new_stream().await {
             Ok(upstream) => upstream,
             Err(PoolError::Overflow) => {
@@ -227,6 +228,16 @@ impl RouterHandler {
             }
             Err(PoolError::ConnectFailure(_)) | Err(PoolError::ConnectTimeout) => {
                 tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream connect failure");
+                drain_request_body(req).await;
+                return local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream connect failure");
+            }
+            // The TCP connect succeeded but the transport socket's handshake
+            // (TLS: bad certificate, no shared ALPN, version mismatch...)
+            // didn't -- Envoy folds this into the same `UF`/connect-failure
+            // bucket as a TCP failure, but it gets its own arm so the log
+            // line says which half actually broke.
+            Err(PoolError::TlsHandshake(_)) => {
+                tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream TLS handshake failure");
                 drain_request_body(req).await;
                 return local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream connect failure");
             }
@@ -249,11 +260,22 @@ impl RouterHandler {
         };
         apply_request_transforms(fwd, matcher, &mut upstream_req.head);
 
-        let send = send_upstream_http1(
-            upstream.io,
-            upstream_req,
-            Http1Options { keep_alive: false },
-        );
+        // Dispatch on the cluster's configured upstream protocol. Both codecs
+        // yield the same `Result<HttpResponseParts, UpstreamCodecError>`; box
+        // the future so the two arms share one type for the timeout race below.
+        // h2 here is prior-knowledge cleartext (h2c) over the pool's raw TCP
+        // stream -- no per-request `Connection: close`, so it takes no
+        // `Http1Options`.
+        let send: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<HttpResponseParts, UpstreamCodecError>>>,
+        > = match proto {
+            UpstreamProtocol::Http1 => Box::pin(send_upstream_http1(
+                upstream.io,
+                upstream_req,
+                Http1Options { keep_alive: false },
+            )),
+            UpstreamProtocol::Http2 => Box::pin(send_upstream_http2(upstream.io, upstream_req)),
+        };
 
         let result = match fwd.timeout {
             Some(d) => {
@@ -583,7 +605,7 @@ mod tests {
         fwd: ForwardAction,
         circuit_breakers: CircuitBreakers,
     ) -> RouterHandler {
-        let manager = ClusterManager::new(Arc::new(FakeResolver::new()));
+        let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
         let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
         snapshot.insert(
             "up".to_string(),
@@ -601,6 +623,7 @@ mod tests {
                 transport_socket: None,
                 per_connection_buffer_limit_bytes: 1 << 20,
                 circuit_breakers,
+                upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             }),
         );
         manager.update_from_snapshot(&snapshot).await;

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 proxy-api = { workspace = true }
+proxy-observability = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 prost = { workspace = true }

@@ -331,16 +331,24 @@ async fn run_serve(
     // cluster manager. Built and populated here, before `WorkerPool::spawn`,
     // so every worker's first `initial_bind` sees a manager that already
     // knows about the snapshot's clusters.
-    let cluster_manager = Arc::new(proxy_cluster::manager::ClusterManager::new(Arc::new(
-        proxy_cluster::resolver::TokioResolver,
-    )));
+    let cluster_manager = Arc::new(proxy_cluster::manager::ClusterManager::new(
+        Arc::new(proxy_cluster::resolver::TokioResolver),
+        proxy_core::tls::transport_socket_builder(),
+    ));
     let rejected = cluster_manager
         .update_from_snapshot(&snapshot.clusters)
         .await;
     if !rejected.is_empty() {
+        // A rejected cluster (unimplemented `lb_policy`, or a
+        // `transport_socket` that fails to build -- e.g. bad TLS config) is
+        // fatal at startup, same as a bad listener certificate
+        // (`InitialBindError` below): ground rule #1 forbids leaving the
+        // proxy up serving 503s for a misconfigured cluster with no
+        // diagnostic.
         for (name, err) in &rejected {
-            tracing::warn!(cluster = %name, error = %err, "cluster rejected at startup");
+            tracing::error!(cluster = %name, error = %err, "cluster rejected at startup");
         }
+        return ExitCode::FAILURE;
     }
 
     // Rust note: `WorkerPool::spawn` takes `worker_main` by value and clones

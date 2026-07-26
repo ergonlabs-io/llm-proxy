@@ -15,6 +15,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Rust note: `FormatString` and `ResponseFlag` are re-exported from
+// `proxy-observability` rather than redefined here — WP-24's format engine
+// (parser + renderer) lives there (see that crate's `access_log` module),
+// and the IR only needs to *hold* the already-parsed result, not know how to
+// build or render it (ground rule #2's spirit: keep the parsing/rendering
+// logic in the crate that owns it).
+use proxy_observability::access_log::FormatString;
+use proxy_observability::ResponseFlag;
+
 pub type ListenerName = String;
 pub type ClusterName = String;
 pub type RouteConfigName = String;
@@ -213,6 +222,87 @@ pub struct HttpConnectionManagerConfig {
     /// real client from an inbound XFF (only meaningful with
     /// use_remote_address=false). Envoy default: 0.
     pub xff_num_trusted_hops: u32,
+    /// WP-24 chunk 1: parsed access-log sinks, in configured order. Chunk 2
+    /// wires the actual per-request render + write; this crate only builds
+    /// the IR.
+    pub access_logs: Vec<AccessLogIR>,
+}
+
+// -------------------------------------------------------------- access log --
+
+/// IR for one `envoy.config.accesslog.v3.AccessLog` entry: where a rendered
+/// line goes, how it's formatted, and (optionally) whether it's emitted at
+/// all for a given request.
+#[derive(Debug, Clone)]
+pub struct AccessLogIR {
+    pub sink: AccessLogSink,
+    pub format: AccessLogFormat,
+    pub filter: Option<AccessLogFilterIR>,
+}
+
+/// Where a rendered access-log line is written. `File` is a path only here —
+/// opening/buffering/reopen-on-SIGUSR1 is chunk 2 (runtime sink) territory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessLogSink {
+    Stdout,
+    Stderr,
+    File { path: String },
+}
+
+/// A logger's `log_format`, pre-parsed at config time (never re-parsed per
+/// request). Mirrors `envoy.config.core.v3.SubstitutionFormatString`'s
+/// `text_format`/`json_format` oneof.
+#[derive(Debug, Clone)]
+pub enum AccessLogFormat {
+    Text(FormatString),
+    /// Ordered `(key, value-format)` pairs — `Struct` field order isn't
+    /// significant in JSON, but keeping the configured order makes output
+    /// deterministic and diff-friendly.
+    Json(Vec<(String, FormatString)>),
+}
+
+/// Envoy's real default access-log line (no `log_format` configured), from
+/// the Envoy access-log documentation's "Default format string" section
+/// (`SubstitutionFormatUtils::DEFAULT_FORMAT` in Envoy's source,
+/// `source/common/formatter/substitution_formatter.cc`):
+///
+/// ```text
+/// [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%"
+/// %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION%
+/// %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% "%REQ(X-FORWARDED-FOR)%"
+/// "%REQ(USER-AGENT)%" "%REQ(X-REQUEST-ID)%" "%REQ(:AUTHORITY)%" "%UPSTREAM_HOST%"
+/// ```
+pub const DEFAULT_ACCESS_LOG_FORMAT: &str = concat!(
+    "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" ",
+    "%RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% ",
+    "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% \"%REQ(X-FORWARDED-FOR)%\" ",
+    "\"%REQ(USER-AGENT)%\" \"%REQ(X-REQUEST-ID)%\" \"%REQ(:AUTHORITY)%\" \"%UPSTREAM_HOST%\"\n",
+);
+
+/// S9-style gate on whether a request's line is emitted at all. Envoy's
+/// `AccessLogFilter` has a much larger oneof (duration, runtime sampling,
+/// header match, and/and, gRPC status, metadata, ...); only the two
+/// operators reachable with what the proxy records today are implemented —
+/// anything else is a strict-mode config error naming its dotted path
+/// (ground rule #1), not a silent no-op filter.
+#[derive(Debug, Clone)]
+pub enum AccessLogFilterIR {
+    StatusCode {
+        op: ComparisonOp,
+        value: u32,
+    },
+    /// Log only if the response carries at least one of these flags. An
+    /// empty list matches Envoy's "unspecified = any flag passes" behavior.
+    ResponseFlag(Vec<ResponseFlag>),
+}
+
+/// `envoy.config.accesslog.v3.ComparisonFilter.Op`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonOp {
+    Eq,
+    Ge,
+    Le,
+    Ne,
 }
 
 /// An HTTP filter, resolved from its `typed_config` type URL.
@@ -255,6 +345,25 @@ pub struct ClusterConfig {
     /// S5 circuit-breaker budgets, per routing priority. Always present:
     /// Envoy applies the default thresholds when the config omits them.
     pub circuit_breakers: CircuitBreakers,
+    /// Which HTTP protocol the proxy speaks to this cluster's upstreams.
+    /// Envoy's default when unconfigured is HTTP/1.1.
+    pub upstream_protocol: UpstreamProtocol,
+}
+
+/// Which HTTP protocol version the proxy speaks to a cluster's upstreams.
+///
+/// Envoy configures this through the cluster's `typed_extension_protocol_options`
+/// map keyed by `envoy.extensions.upstreams.http.v3.HttpProtocolOptions`; the IR
+/// flattens that surface to the single dimension the data plane acts on. Envoy's
+/// default when the option is absent is HTTP/1.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpstreamProtocol {
+    /// HTTP/1.1 (Envoy default).
+    #[default]
+    Http1,
+    /// HTTP/2 — prior-knowledge cleartext (h2c) in the current data plane;
+    /// ALPN-negotiated h2 over upstream TLS is a follow-up.
+    Http2,
 }
 
 /// S5 circuit breakers for a cluster: one [`CircuitBreakerThresholds`] bucket
@@ -584,6 +693,41 @@ pub struct RetryPolicyIR {
     pub num_retries: u32,
     pub per_try_timeout: Option<Duration>,
     pub retriable_status_codes: Vec<u16>,
+    /// S3.3 fully-jittered exponential backoff parameters.
+    pub retry_back_off: RetryBackOff,
+    /// S3.1: how many times a retry may re-run host selection to avoid a
+    /// previously-tried host before giving up and reusing one. Envoy default 1.
+    pub host_selection_retry_max_attempts: u32,
+}
+
+/// S3.3 backoff: attempt *n* (1-based) waits a delay drawn uniformly from
+/// `[0, min((2^n - 1) * base_interval, max_interval)]` — "fully jittered"
+/// exponential backoff. The progression with Envoy's defaults is 0–25ms,
+/// 0–75ms, 0–175ms, ... capped at `max_interval`.
+///
+/// Drawing from `[0, cap]` rather than waiting exactly `cap` is the whole
+/// point: it de-synchronizes clients that all failed at the same instant, so
+/// a struggling upstream doesn't get a retry thundering herd on a fixed beat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryBackOff {
+    /// Envoy default 25ms.
+    pub base_interval: Duration,
+    /// Envoy default: 10 × `base_interval`.
+    pub max_interval: Duration,
+}
+
+impl RetryBackOff {
+    /// Envoy's defaults, applied when `retry_back_off` is absent.
+    pub const ENVOY_DEFAULT: Self = Self {
+        base_interval: Duration::from_millis(25),
+        max_interval: Duration::from_millis(250),
+    };
+}
+
+impl Default for RetryBackOff {
+    fn default() -> Self {
+        Self::ENVOY_DEFAULT
+    }
 }
 
 /// Parsed `retry_on` policy set. Unrecognized tokens are ignored, as in Envoy.

@@ -18,6 +18,7 @@ pub mod load_balancer;
 pub mod manager;
 pub mod pool;
 pub mod resolver;
+pub mod transport;
 
 /// Envoy routing priority: selects the circuit-breaker bucket (S5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,6 +32,19 @@ pub enum RoutingPriority {
 pub enum UpstreamProtocol {
     Http1,
     Http2,
+}
+
+// Rust note: the config IR carries its own `UpstreamProtocol` (protos stay in
+// `proxy-config`; the data plane consumes the IR). This `From` is the one place
+// that bridges the two, so cluster-build code maps config → runtime once and
+// stays decoupled from the IR enum's identity.
+impl From<proxy_config::ir::UpstreamProtocol> for UpstreamProtocol {
+    fn from(proto: proxy_config::ir::UpstreamProtocol) -> Self {
+        match proto {
+            proxy_config::ir::UpstreamProtocol::Http1 => UpstreamProtocol::Http1,
+            proxy_config::ir::UpstreamProtocol::Http2 => UpstreamProtocol::Http2,
+        }
+    }
 }
 
 /// A host's health, as tracked by active health checking. Every host starts
@@ -50,6 +64,15 @@ pub enum HealthStatus {
 #[derive(Debug)]
 pub struct Host {
     pub address: SocketAddr,
+    /// The DNS name this host was resolved from (`STRICT_DNS`/`LOGICAL_DNS`),
+    /// or `None` for `STATIC` clusters whose endpoints are literal IPs.
+    ///
+    /// This is what upstream TLS uses as the SNI / certificate-verification
+    /// name when the cluster's `transport_socket` doesn't override it with an
+    /// explicit `sni`: by the time a host exists, `address` is an IP, and no
+    /// public CA issues certificates for IP addresses. Envoy keeps the same
+    /// thing on its own `Host` (`hostname()`), for the same reason.
+    pub hostname: Option<String>,
     pub weight: u32,
     /// Failover priority this host belongs to; 0 = primary (S5/S7).
     pub priority: u32,
@@ -217,18 +240,37 @@ impl Default for CircuitBreakerState {
     }
 }
 
-/// A stream slot on a pooled upstream connection. v1 ([`pool::Http1ConnectPool`])
+/// A stream slot on a pooled upstream connection. v1 ([`pool::ConnectPool`])
 /// is connect-per-stream: this just carries a freshly-dialed transport, no
 /// pooling/reuse yet.
 pub struct UpstreamStream {
-    /// The connected upstream transport. v1 (no reuse): a freshly-dialed
-    /// plaintext TCP connection, one per stream. The router runs the
-    /// upstream h1 codec over it.
-    pub io: tokio::net::TcpStream,
+    /// The connected upstream transport: a freshly-dialed TCP connection,
+    /// already wrapped by the cluster's [`transport::UpstreamTransportSocket`]
+    /// (plaintext passthrough, or a completed TLS handshake). The router runs
+    /// the upstream h1/h2 codec over it, and both codecs are generic over
+    /// `AsyncRead + AsyncWrite + Unpin`, so they don't care which it is.
+    pub io: BoxedUpstreamIo,
     // TODO(WP-15): release-on-drop pool guard + `active_requests` dec, and
     // (for keep-alive reuse) hold the codec `SendRequest` handle rather than
     // a raw transport -- at which point this seam changes shape.
 }
+
+/// The byte transport under an upstream HTTP stream, type-erased so a cluster
+/// can be plaintext or TLS without every consumer becoming generic over the
+/// transport.
+///
+/// Rust note: this is the standard "trait alias by blanket impl" idiom --
+/// `dyn AsyncRead + AsyncWrite + Unpin` is not a legal trait object (only one
+/// non-auto trait per object), so we declare a single trait with the three as
+/// supertraits and blanket-impl it for everything that qualifies.
+pub trait UpstreamIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static {}
+
+impl<T> UpstreamIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static {}
+
+/// A boxed [`UpstreamIo`]. `Box<T>` itself implements `AsyncRead`/`AsyncWrite`
+/// (tokio provides those forwarding impls for `Box<T: ?Sized>`), so the box is
+/// directly usable as codec IO -- no manual projection needed.
+pub type BoxedUpstreamIo = Box<dyn UpstreamIo>;
 
 /// Pool failures are distinct variants because the retry engine (S3 trigger
 /// mapping), response flags, and stats all depend on which one occurred.
@@ -243,6 +285,13 @@ pub enum PoolError {
     /// `connect_timeout` elapsed -> retriable under `connect-failure` (S3.2).
     #[error("upstream connect timeout")]
     ConnectTimeout,
+    /// The TCP connect succeeded but the transport socket's handshake failed
+    /// (TLS: bad certificate, no shared ALPN protocol, protocol version
+    /// mismatch...). Envoy folds this into the same `UF`/`connect-failure`
+    /// bucket as a TCP failure; it is a separate variant here so the log line
+    /// says which half actually broke.
+    #[error("upstream TLS handshake failed: {0}")]
+    TlsHandshake(std::io::Error),
     /// Connection died before response headers -> retriable under `reset` (S3.2).
     #[error("upstream reset before response headers")]
     ResetBeforeHeaders,
@@ -262,6 +311,11 @@ pub trait ClusterEntry: Send + Sync {
 
     /// The pool for a picked host.
     fn http_pool(&self, host: &Arc<Host>, proto: UpstreamProtocol) -> Arc<dyn HttpConnPool>;
+
+    /// Which HTTP protocol the router must speak to this cluster's upstreams,
+    /// from the cluster's `upstream_protocol` config (Envoy default HTTP/1.1).
+    /// The router reads this to pick both the pool and the upstream codec.
+    fn upstream_protocol(&self) -> UpstreamProtocol;
 
     /// Circuit-breaker bucket for the request's priority (S5).
     fn circuit_breaker(&self, prio: RoutingPriority) -> &CircuitBreakerState;

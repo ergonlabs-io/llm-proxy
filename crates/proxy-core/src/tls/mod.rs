@@ -20,9 +20,12 @@ mod verify;
 use std::io;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
+use proxy_cluster::transport::UpstreamTransportSocket;
+use proxy_cluster::BoxedUpstreamIo;
 use proxy_config::ir::{
-    CaSource, DownstreamTlsSpec, TlsCertificateIR, TlsCipherSuite, TlsEcdhCurve, TlsParametersIR,
-    TlsVersion, UpstreamTlsSpec,
+    CaSource, ClusterConfig, DownstreamTlsSpec, TlsCertificateIR, TlsCipherSuite, TlsEcdhCurve,
+    TlsParametersIR, TlsVersion, UpstreamProtocol, UpstreamTlsSpec,
 };
 use rustls::crypto::ring::{cipher_suite, kx_group};
 use rustls::crypto::CryptoProvider;
@@ -30,6 +33,7 @@ use rustls::pki_types::ServerName;
 use rustls::server::{ResolvesServerCert, WebPkiClientVerifier};
 use rustls::{version, ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use resolver::SwapCertResolver;
@@ -311,6 +315,21 @@ pub struct UpstreamTlsFactory {
 
 impl UpstreamTlsFactory {
     pub fn build(spec: &UpstreamTlsSpec, context: &str) -> Result<Self, TlsBuildError> {
+        Self::build_with_alpn(spec, None, context)
+    }
+
+    /// Like [`Self::build`], but `alpn_override`, when `Some`, replaces
+    /// `spec.alpn_protocols` for the `ClientConfig`'s ALPN offer. Used by
+    /// [`transport_socket_builder`] to derive ALPN from the cluster's
+    /// `upstream_protocol` when the spec doesn't configure one explicitly --
+    /// see that function's doc comment for why. Doesn't mutate `spec` itself,
+    /// so callers that only have a borrowed IR (never `proxy-cluster`'s
+    /// concern to own) don't need to clone it.
+    pub fn build_with_alpn(
+        spec: &UpstreamTlsSpec,
+        alpn_override: Option<&[String]>,
+        context: &str,
+    ) -> Result<Self, TlsBuildError> {
         let provider = Arc::new(build_crypto_provider(&spec.params));
         let versions = protocol_versions(&spec.params);
         let builder = ClientConfig::builder_with_provider(provider.clone())
@@ -353,8 +372,8 @@ impl UpstreamTlsFactory {
             None => builder.with_no_client_auth(),
         };
 
-        client_config.alpn_protocols = spec
-            .alpn_protocols
+        client_config.alpn_protocols = alpn_override
+            .unwrap_or(&spec.alpn_protocols)
             .iter()
             .map(|p| p.as_bytes().to_vec())
             .collect();
@@ -378,11 +397,82 @@ impl UpstreamTlsFactory {
         io: IO,
         endpoint_host: &str,
     ) -> io::Result<tokio_rustls::client::TlsStream<IO>> {
-        let name = self.sni.as_deref().unwrap_or(endpoint_host).to_string();
-        let server_name = ServerName::try_from(name)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let server_name = server_name_for(&self.sni, endpoint_host)?;
         TlsConnector::from(self.client_config.clone())
             .connect(server_name, io)
             .await
     }
+}
+
+/// Shared by [`UpstreamTlsFactory::wrap`] and its
+/// [`UpstreamTransportSocket`] impl below: the explicit `sni` override wins,
+/// otherwise fall back to the endpoint host.
+fn server_name_for(sni: &Option<String>, endpoint_host: &str) -> io::Result<ServerName<'static>> {
+    let name = sni.as_deref().unwrap_or(endpoint_host).to_string();
+    ServerName::try_from(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+// Rust note: `wrap`'s signature is fixed by the `UpstreamTransportSocket`
+// trait (`proxy-cluster`, see that module's doc comment on why the trait
+// lives there and the impl lives here) -- it takes a concrete `TcpStream` and
+// returns a `'static` boxed future, unlike the inherent `wrap` above which is
+// generic over `IO` and returns the concrete `TlsStream<IO>`. Cloning
+// `client_config` (an `Arc`) and `sni` out of `&self` up front is what makes
+// the future `'static`: it can't borrow `self`, because a pool may move it
+// onto a spawned task that outlives this call.
+impl UpstreamTransportSocket for UpstreamTlsFactory {
+    fn wrap(
+        &self,
+        io: TcpStream,
+        server_name: &str,
+    ) -> BoxFuture<'static, io::Result<BoxedUpstreamIo>> {
+        let client_config = Arc::clone(&self.client_config);
+        let sni = self.sni.clone();
+        let endpoint_host = server_name.to_string();
+        Box::pin(async move {
+            let name = server_name_for(&sni, &endpoint_host)?;
+            let stream = TlsConnector::from(client_config).connect(name, io).await?;
+            Ok(Box::new(stream) as BoxedUpstreamIo)
+        })
+    }
+}
+
+/// Builds the real [`proxy_cluster::transport::TransportSocketBuilder`]:
+/// plaintext for clusters with no `transport_socket`, upstream TLS
+/// (rustls, via [`UpstreamTlsFactory`]) for clusters that configure one.
+///
+/// # ALPN derivation
+///
+/// If `spec.alpn_protocols` is empty, this offers exactly one protocol
+/// derived from the cluster's `upstream_protocol`: `Http2` -> `["h2"]`,
+/// `Http1` -> `["http/1.1"]`. A non-empty `alpn_protocols` is used verbatim
+/// (explicit config wins).
+///
+/// Our upstream codec is chosen from `upstream_protocol` at config time, not
+/// negotiated -- so offering the *matching* ALPN makes a misconfigured server
+/// (one that doesn't support the protocol we're about to speak) fail loudly
+/// at the TLS handshake instead of us silently speaking the wrong protocol
+/// over an already-established connection. Envoy derives its ALPN offer from
+/// the cluster's protocol options the same way.
+pub fn transport_socket_builder() -> proxy_cluster::transport::TransportSocketBuilder {
+    Arc::new(|config: &ClusterConfig| {
+        let Some(spec) = &config.transport_socket else {
+            return Ok(Arc::new(proxy_cluster::transport::RawTransportSocket)
+                as Arc<dyn UpstreamTransportSocket>);
+        };
+        let context = format!("cluster `{}` transport_socket", config.name);
+        let derived_alpn;
+        let alpn_override: Option<&[String]> = if spec.alpn_protocols.is_empty() {
+            derived_alpn = match config.upstream_protocol {
+                UpstreamProtocol::Http2 => vec!["h2".to_string()],
+                UpstreamProtocol::Http1 => vec!["http/1.1".to_string()],
+            };
+            Some(derived_alpn.as_slice())
+        } else {
+            None
+        };
+        let factory = UpstreamTlsFactory::build_with_alpn(spec, alpn_override, &context)
+            .map_err(|e| proxy_cluster::transport::TransportSocketError(e.to_string()))?;
+        Ok(Arc::new(factory) as Arc<dyn UpstreamTransportSocket>)
+    })
 }

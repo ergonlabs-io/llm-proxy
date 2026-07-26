@@ -437,6 +437,7 @@ mod tests {
     fn host(last: u8, weight: u32, priority: u32, health: HealthStatus) -> Arc<Host> {
         Arc::new(Host {
             address: addr(last),
+            hostname: None,
             weight,
             priority,
             health,

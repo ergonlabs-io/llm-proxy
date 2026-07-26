@@ -266,6 +266,114 @@ fn retry_policy_defaults_and_parsing() {
     assert!(rp.retry_on.five_xx);
     assert!(!rp.retry_on.reset);
     assert_eq!(rp.retriable_status_codes, vec![429, 503]);
+    // Absent `retry_back_off` / `host_selection_retry_max_attempts` fall
+    // back to Envoy's defaults (S3.3 / S3.1).
+    assert_eq!(rp.retry_back_off, RetryBackOff::ENVOY_DEFAULT);
+    assert_eq!(rp.host_selection_retry_max_attempts, 1);
+}
+
+/// S3.3: an explicit `retry_back_off` with only `base_interval` set derives
+/// `max_interval` as 10x the base; `host_selection_retry_max_attempts` is
+/// lowered as given.
+#[test]
+fn retry_back_off_explicit_base_derives_default_max() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx"
+                              retry_back_off:
+                                base_interval: 0.100s
+                              host_selection_retry_max_attempts: 5
+"#,
+    );
+    let table = route_table(&snapshot);
+    let RouteActionIR::Forward(f) = &table.virtual_hosts[0].routes[0].action else {
+        panic!("expected forward");
+    };
+    let rp = f.retry_policy.as_ref().expect("retry policy");
+    assert_eq!(rp.retry_back_off.base_interval, Duration::from_millis(100));
+    assert_eq!(rp.retry_back_off.max_interval, Duration::from_millis(1000));
+    assert_eq!(rp.host_selection_retry_max_attempts, 5);
+}
+
+/// S3.3: both `base_interval` and `max_interval` set are lowered verbatim.
+#[test]
+fn retry_back_off_explicit_base_and_max() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx"
+                              retry_back_off:
+                                base_interval: 0.050s
+                                max_interval: 0.500s
+"#,
+    );
+    let table = route_table(&snapshot);
+    let RouteActionIR::Forward(f) = &table.virtual_hosts[0].routes[0].action else {
+        panic!("expected forward");
+    };
+    let rp = f.retry_policy.as_ref().expect("retry policy");
+    assert_eq!(rp.retry_back_off.base_interval, Duration::from_millis(50));
+    assert_eq!(rp.retry_back_off.max_interval, Duration::from_millis(500));
+}
+
+/// Ground rule #2: an unsupported `retry_policy` sub-field (e.g.
+/// `retry_priority`) must error with its full dotted path, not be silently
+/// dropped.
+#[test]
+fn retry_policy_unsupported_subfield_errors_with_path() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx"
+                              host_selection_retry_max_attempts: 2
+                              retry_priority:
+                                name: envoy.retry_priorities.previous_priorities
+"#;
+    let err = snapshot_from(yaml).expect_err("unsupported retry_policy field must error");
+    let ConfigError::UnsupportedField { field_path, .. } = &err else {
+        panic!("expected UnsupportedField, got: {err}");
+    };
+    assert!(
+        field_path.ends_with("retry_policy.retry_priority"),
+        "path was: {field_path}"
+    );
 }
 
 /// Regex route matches compile at build time and are full-string (safe_regex).

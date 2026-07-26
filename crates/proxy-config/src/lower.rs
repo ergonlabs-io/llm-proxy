@@ -16,17 +16,23 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use prost_reflect::{DynamicMessage, ReflectMessage, Value};
+use proxy_api::envoy::config::accesslog::v3 as accesslog_v3;
 use proxy_api::envoy::config::bootstrap::v3::Bootstrap;
 use proxy_api::envoy::config::cluster::v3 as cluster_v3;
 use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
 use proxy_api::envoy::config::listener::v3 as listener_v3;
 use proxy_api::envoy::config::route::v3 as route_v3;
+use proxy_api::envoy::extensions::access_loggers::file::v3 as access_log_file_v3;
+use proxy_api::envoy::extensions::access_loggers::stream::v3 as access_log_stream_v3;
 use proxy_api::envoy::extensions::filters::listener::tls_inspector::v3 as tls_inspector_v3;
 use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
+use proxy_api::envoy::extensions::upstreams::http::v3 as upstream_http_v3;
 use proxy_api::envoy::r#type::matcher::v3 as matcher_v3;
+use proxy_observability::access_log::{parse_format, FormatString};
+use proxy_observability::ResponseFlag;
 
 use crate::error::ConfigError;
 use crate::ir::*;
@@ -142,6 +148,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "transport_socket",
             "per_connection_buffer_limit_bytes",
             "circuit_breakers",
+            "typed_extension_protocol_options",
         ],
         // S5 circuit breakers. `per_host_thresholds` is deliberately excluded
         // (we don't model per-host limits); a config setting it is rejected
@@ -176,11 +183,31 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "generate_request_id",
             "use_remote_address",
             "xff_num_trusted_hops",
+            "access_log",
         ],
         "envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter" => {
             &["name", "typed_config"]
         }
         "envoy.extensions.filters.http.router.v3.Router" => &[],
+        // WP-24: access logging.
+        "envoy.config.accesslog.v3.AccessLog" => &["name", "filter", "typed_config"],
+        "envoy.config.accesslog.v3.AccessLogFilter" => {
+            &["status_code_filter", "response_flag_filter"]
+        }
+        "envoy.config.accesslog.v3.StatusCodeFilter" => &["comparison"],
+        "envoy.config.accesslog.v3.ComparisonFilter" => &["op", "value"],
+        "envoy.config.core.v3.RuntimeUInt32" => &["default_value", "runtime_key"],
+        "envoy.config.accesslog.v3.ResponseFlagFilter" => &["flags"],
+        "envoy.extensions.access_loggers.file.v3.FileAccessLog" => &["path", "log_format"],
+        "envoy.extensions.access_loggers.stream.v3.StdoutAccessLog" => &["log_format"],
+        "envoy.extensions.access_loggers.stream.v3.StderrAccessLog" => &["log_format"],
+        // `formatters`, `json_format_options`, `content_type`, and
+        // `omit_empty_values` are not implemented (no custom formatter
+        // plugins, no JSON-key-omission knob, no content-type override, and
+        // absent values always render `-` regardless of this flag); leaving
+        // them out of this list means setting any of them is a strict-mode
+        // error rather than a silent behavior change.
+        "envoy.config.core.v3.SubstitutionFormatString" => &["text_format", "json_format"],
         "envoy.config.route.v3.RouteConfiguration" => &["name", "virtual_hosts"],
         "envoy.config.route.v3.VirtualHost" => &["name", "domains", "routes"],
         "envoy.config.route.v3.Route" => &[
@@ -221,7 +248,10 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "num_retries",
             "per_try_timeout",
             "retriable_status_codes",
+            "retry_back_off",
+            "host_selection_retry_max_attempts",
         ],
+        "envoy.config.route.v3.RetryPolicy.RetryBackOff" => &["base_interval", "max_interval"],
         "envoy.config.route.v3.RedirectAction" => &[
             "host_redirect",
             "path_redirect",
@@ -264,6 +294,18 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector" => {
             &["max_client_hello_size"]
         }
+        // Upstream HTTP protocol selection (S? / WP-13 h2). Only the explicit
+        // HTTP/1-vs-HTTP/2 selector is implemented; ALPN auto-negotiation and
+        // downstream-protocol passthrough are follow-ups.
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions" => &["explicit_http_config"],
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions.ExplicitHttpConfig" => {
+            &["http_protocol_options", "http2_protocol_options"]
+        }
+        // Bare `{}` selects the protocol; any tuning sub-field must fail
+        // loudly rather than be silently ignored (same rationale as the
+        // Router `&[]` entry above).
+        "envoy.config.core.v3.Http1ProtocolOptions" => &[],
+        "envoy.config.core.v3.Http2ProtocolOptions" => &[],
         _ => return None,
     })
 }
@@ -477,6 +519,10 @@ const ROUTER_TYPE: &str = "envoy.extensions.filters.http.router.v3.Router";
 const DOWNSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
 const UPSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const TLS_INSPECTOR_TYPE: &str = "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector";
+// WP-24: access logging sinks we implement.
+const FILE_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.file.v3.FileAccessLog";
+const STDOUT_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.stream.v3.StdoutAccessLog";
+const STDERR_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.stream.v3.StderrAccessLog";
 
 /// Envoy default for `per_connection_buffer_limit_bytes`: 1 MiB.
 const DEFAULT_CONN_BUFFER_LIMIT: u32 = 1024 * 1024;
@@ -999,14 +1045,239 @@ fn convert_hcm(
     // Envoy default of 0 trusted hops.
     let xff_num_trusted_hops = hcm.xff_num_trusted_hops;
 
+    let access_logs = convert_access_logs(&hcm.access_log, &format!("{path}.access_log"))?;
+
     Ok(HttpConnectionManagerConfig {
         stat_prefix: hcm.stat_prefix.clone(),
         route_table: Arc::new(route_table),
         http_filters,
         generate_request_id,
         use_remote_address,
+        access_logs,
         xff_num_trusted_hops,
     })
+}
+
+// ------------------------------------------------------------ access log --
+
+fn convert_access_logs(
+    entries: &[accesslog_v3::AccessLog],
+    path: &str,
+) -> Result<Vec<AccessLogIR>, ConfigError> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| convert_access_log(e, &format!("{path}[{i}]")))
+        .collect()
+}
+
+fn convert_access_log(e: &accesslog_v3::AccessLog, path: &str) -> Result<AccessLogIR, ConfigError> {
+    use accesslog_v3::access_log::ConfigType;
+    let any = match &e.config_type {
+        Some(ConfigType::TypedConfig(any)) => any,
+        None => return Err(invalid(path, "access log requires typed_config")),
+    };
+    let filter = e
+        .filter
+        .as_ref()
+        .map(|f| convert_access_log_filter(f, &format!("{path}.filter")))
+        .transpose()?;
+
+    let cfg_path = format!("{path}.typed_config");
+    let (sink, sfs) = match type_name(any) {
+        FILE_ACCESS_LOG_TYPE => {
+            let file: access_log_file_v3::FileAccessLog = decode_any(any, &cfg_path)?;
+            if file.path.is_empty() {
+                return Err(invalid(format!("{cfg_path}.path"), "path is required"));
+            }
+            use access_log_file_v3::file_access_log::AccessLogFormat as F;
+            let sfs = match file.access_log_format {
+                Some(F::LogFormat(sfs)) => Some(sfs),
+                // Ground rule #1: the deprecated `format`/`json_format`/
+                // `typed_json_format` oneof members aren't in this message's
+                // `allowed_fields` entry, so the surface check already
+                // rejects them before typed conversion runs; this arm is
+                // unreachable in practice but kept explicit rather than
+                // `unreachable!()` so a future allowlist change fails loudly
+                // here too, not with a panic.
+                Some(_) => {
+                    return Err(unsupported(
+                        format!("{cfg_path}.access_log_format"),
+                        "only `log_format` is implemented for the file access logger",
+                    ))
+                }
+                None => None,
+            };
+            (
+                AccessLogSink::File {
+                    path: file.path.clone(),
+                },
+                sfs,
+            )
+        }
+        STDOUT_ACCESS_LOG_TYPE => {
+            let stdout: access_log_stream_v3::StdoutAccessLog = decode_any(any, &cfg_path)?;
+            use access_log_stream_v3::stdout_access_log::AccessLogFormat as F;
+            let sfs = stdout.access_log_format.map(|F::LogFormat(sfs)| sfs);
+            (AccessLogSink::Stdout, sfs)
+        }
+        STDERR_ACCESS_LOG_TYPE => {
+            let stderr: access_log_stream_v3::StderrAccessLog = decode_any(any, &cfg_path)?;
+            use access_log_stream_v3::stderr_access_log::AccessLogFormat as F;
+            let sfs = stderr.access_log_format.map(|F::LogFormat(sfs)| sfs);
+            (AccessLogSink::Stderr, sfs)
+        }
+        _ => {
+            return Err(ConfigError::UnknownTypeUrl {
+                field_path: cfg_path,
+                type_url: any.type_url.clone(),
+            })
+        }
+    };
+
+    let format = match sfs {
+        Some(sfs) => convert_substitution_format(&sfs, &cfg_path)?,
+        // Envoy default when a sink omits `log_format`.
+        None => AccessLogFormat::Text(parse_fmt(DEFAULT_ACCESS_LOG_FORMAT, &cfg_path)?),
+    };
+
+    Ok(AccessLogIR {
+        sink,
+        format,
+        filter,
+    })
+}
+
+fn convert_substitution_format(
+    sfs: &core_v3::SubstitutionFormatString,
+    path: &str,
+) -> Result<AccessLogFormat, ConfigError> {
+    use core_v3::substitution_format_string::Format;
+    match &sfs.format {
+        Some(Format::TextFormat(s)) => {
+            Ok(AccessLogFormat::Text(parse_fmt(s, &format!("{path}.text_format"))?))
+        }
+        Some(Format::JsonFormat(strct)) => {
+            let fields_path = format!("{path}.json_format");
+            let mut fields = Vec::with_capacity(strct.fields.len());
+            for (key, value) in &strct.fields {
+                let value_path = format!("{fields_path}.{key}");
+                let s = match &value.kind {
+                    Some(prost_types::value::Kind::StringValue(s)) => s,
+                    _ => {
+                        return Err(unsupported(
+                            value_path,
+                            "json_format values must be strings (command-operator format \
+                             strings); non-string JSON literals are not implemented",
+                        ))
+                    }
+                };
+                fields.push((key.clone(), parse_fmt(s, &value_path)?));
+            }
+            Ok(AccessLogFormat::Json(fields))
+        }
+        // `text_format_source` (field 5) isn't in `SubstitutionFormatString`'s
+        // `allowed_fields` entry, so this is unreachable via the surface
+        // check for the same reason as the file-logger arm above.
+        Some(Format::TextFormatSource(_)) => Err(unsupported(
+            format!("{path}.text_format_source"),
+            "text_format_source (DataSource-based format strings) is not implemented; use text_format",
+        )),
+        None => Err(invalid(
+            path,
+            "SubstitutionFormatString requires text_format or json_format",
+        )),
+    }
+}
+
+/// Parse a format string, wrapping the formatter's own parse error (which
+/// knows nothing about proto field paths — ground rule #2 keeps that
+/// knowledge in `proxy-config`) into a [`ConfigError`] naming the field.
+fn parse_fmt(s: &str, path: &str) -> Result<FormatString, ConfigError> {
+    parse_format(s).map_err(|e| unsupported(path, e.to_string()))
+}
+
+fn convert_access_log_filter(
+    f: &accesslog_v3::AccessLogFilter,
+    path: &str,
+) -> Result<AccessLogFilterIR, ConfigError> {
+    use accesslog_v3::access_log_filter::FilterSpecifier;
+    match &f.filter_specifier {
+        Some(FilterSpecifier::StatusCodeFilter(scf)) => {
+            let comparison = scf.comparison.as_ref().ok_or_else(|| {
+                invalid(
+                    format!("{path}.status_code_filter.comparison"),
+                    "comparison is required",
+                )
+            })?;
+            let op = convert_comparison_op(
+                comparison.op,
+                &format!("{path}.status_code_filter.comparison.op"),
+            )?;
+            let value_path = format!("{path}.status_code_filter.comparison.value");
+            let value = comparison
+                .value
+                .as_ref()
+                .ok_or_else(|| invalid(&value_path, "value is required"))?
+                .default_value;
+            Ok(AccessLogFilterIR::StatusCode { op, value })
+        }
+        Some(FilterSpecifier::ResponseFlagFilter(rff)) => {
+            let flags_path = format!("{path}.response_flag_filter.flags");
+            let flags = rff
+                .flags
+                .iter()
+                .map(|code| {
+                    ResponseFlag::from_code(code).ok_or_else(|| {
+                        unsupported(
+                            &flags_path,
+                            format!("response flag `{code}` is not implemented"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(AccessLogFilterIR::ResponseFlag(flags))
+        }
+        Some(other) => Err(unsupported(
+            path,
+            format!(
+                "access log filter `{}` is not implemented; only status_code_filter and \
+                 response_flag_filter are supported",
+                access_log_filter_kind(other)
+            ),
+        )),
+        None => Err(invalid(path, "filter requires a filter_specifier")),
+    }
+}
+
+fn access_log_filter_kind(f: &accesslog_v3::access_log_filter::FilterSpecifier) -> &'static str {
+    use accesslog_v3::access_log_filter::FilterSpecifier;
+    match f {
+        FilterSpecifier::StatusCodeFilter(_) => "status_code_filter",
+        FilterSpecifier::DurationFilter(_) => "duration_filter",
+        FilterSpecifier::NotHealthCheckFilter(_) => "not_health_check_filter",
+        FilterSpecifier::TraceableFilter(_) => "traceable_filter",
+        FilterSpecifier::RuntimeFilter(_) => "runtime_filter",
+        FilterSpecifier::AndFilter(_) => "and_filter",
+        FilterSpecifier::OrFilter(_) => "or_filter",
+        FilterSpecifier::HeaderFilter(_) => "header_filter",
+        FilterSpecifier::ResponseFlagFilter(_) => "response_flag_filter",
+        FilterSpecifier::GrpcStatusFilter(_) => "grpc_status_filter",
+        FilterSpecifier::ExtensionFilter(_) => "extension_filter",
+        FilterSpecifier::MetadataFilter(_) => "metadata_filter",
+        FilterSpecifier::LogTypeFilter(_) => "log_type_filter",
+    }
+}
+
+fn convert_comparison_op(op: i32, path: &str) -> Result<ComparisonOp, ConfigError> {
+    use accesslog_v3::comparison_filter::Op;
+    match Op::try_from(op) {
+        Ok(Op::Eq) => Ok(ComparisonOp::Eq),
+        Ok(Op::Ge) => Ok(ComparisonOp::Ge),
+        Ok(Op::Le) => Ok(ComparisonOp::Le),
+        Ok(Op::Ne) => Ok(ComparisonOp::Ne),
+        Err(_) => Err(invalid(path, format!("unknown comparison op `{op}`"))),
+    }
 }
 
 fn convert_downstream_tls(
@@ -1535,6 +1806,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         .transpose()?;
 
     let circuit_breakers = convert_circuit_breakers(&c.circuit_breakers, path)?;
+    let upstream_protocol = convert_upstream_protocol(&c.typed_extension_protocol_options, path)?;
 
     Ok(ClusterConfig {
         name: c.name.clone(),
@@ -1547,7 +1819,93 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
             .per_connection_buffer_limit_bytes
             .unwrap_or(DEFAULT_CONN_BUFFER_LIMIT),
         circuit_breakers,
+        upstream_protocol,
     })
+}
+
+/// Type URL key Envoy expects for the one `typed_extension_protocol_options`
+/// entry we implement: HTTP/1-vs-HTTP/2 selection via `explicit_http_config`.
+const HTTP_PROTOCOL_OPTIONS_TYPE: &str = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+
+/// Lower a cluster's `typed_extension_protocol_options` map into the IR's
+/// single-dimension [`UpstreamProtocol`]. Envoy keys this map by extension
+/// name; we only implement the one entry that selects HTTP/1 vs HTTP/2
+/// (`envoy.extensions.upstreams.http.v3.HttpProtocolOptions`), so any other
+/// key -- or any of that message's fields we don't model -- is rejected with
+/// its full dotted path (ground rule #1) rather than silently ignored.
+fn convert_upstream_protocol(
+    opts: &std::collections::HashMap<String, prost_types::Any>,
+    path: &str,
+) -> Result<UpstreamProtocol, ConfigError> {
+    if opts.is_empty() {
+        return Ok(UpstreamProtocol::Http1); // Envoy default: HTTP/1.1.
+    }
+
+    let map_path = format!("{path}.typed_extension_protocol_options");
+
+    // Rust note: `opts` is a `HashMap`, whose iteration order is unspecified;
+    // sort the keys first so which key we complain about (and the resulting
+    // error) is deterministic across runs rather than depending on hashing.
+    let mut keys: Vec<&String> = opts.keys().collect();
+    keys.sort();
+    for key in keys {
+        if key != HTTP_PROTOCOL_OPTIONS_TYPE {
+            return Err(unsupported(
+                format!("{map_path}[\"{key}\"]"),
+                format!("only `{HTTP_PROTOCOL_OPTIONS_TYPE}` is implemented"),
+            ));
+        }
+    }
+
+    let any = &opts[HTTP_PROTOCOL_OPTIONS_TYPE];
+    let entry_path = format!("{map_path}[\"{HTTP_PROTOCOL_OPTIONS_TYPE}\"]");
+    if type_name(any) != HTTP_PROTOCOL_OPTIONS_TYPE {
+        return Err(ConfigError::UnknownTypeUrl {
+            field_path: entry_path,
+            type_url: any.type_url.clone(),
+        });
+    }
+    let options: upstream_http_v3::HttpProtocolOptions = decode_any(any, &entry_path)?;
+    convert_explicit_http_config(&options, &entry_path)
+}
+
+/// Read the `explicit_http_config` oneof out of a decoded `HttpProtocolOptions`
+/// and map its `protocol_config` oneof to [`UpstreamProtocol`]. The other two
+/// top-level oneof branches (`use_downstream_protocol_config`, `auto_config`)
+/// and HTTP/3 are already rejected by the surface walk's allowlist for this
+/// message (see `allowed_fields`); this function only has to handle the one
+/// branch that's on the supported surface.
+fn convert_explicit_http_config(
+    options: &upstream_http_v3::HttpProtocolOptions,
+    path: &str,
+) -> Result<UpstreamProtocol, ConfigError> {
+    use upstream_http_v3::http_protocol_options::explicit_http_config::ProtocolConfig;
+    use upstream_http_v3::http_protocol_options::UpstreamProtocolOptions;
+
+    let explicit = match &options.upstream_protocol_options {
+        Some(UpstreamProtocolOptions::ExplicitHttpConfig(explicit)) => explicit,
+        _ => {
+            return Err(unsupported(
+                format!("{path}.explicit_http_config"),
+                "only `explicit_http_config` is implemented (not \
+                 `use_downstream_protocol_config` or `auto_config`)",
+            ))
+        }
+    };
+
+    match &explicit.protocol_config {
+        Some(ProtocolConfig::HttpProtocolOptions(_)) => Ok(UpstreamProtocol::Http1),
+        Some(ProtocolConfig::Http2ProtocolOptions(_)) => Ok(UpstreamProtocol::Http2),
+        Some(ProtocolConfig::Http3ProtocolOptions(_)) => Err(unsupported(
+            format!("{path}.explicit_http_config.http3_protocol_options"),
+            "HTTP/3 upstreams are not implemented",
+        )),
+        None => Err(invalid(
+            format!("{path}.explicit_http_config"),
+            "explicit_http_config requires one of http_protocol_options or \
+             http2_protocol_options",
+        )),
+    }
 }
 
 /// S5: lower Envoy's repeated, priority-tagged `thresholds` list to the IR's
@@ -1972,6 +2330,47 @@ fn convert_retry_policy(
             )
         })?);
     }
+    // S3.3: absent message => Envoy's defaults (25ms / 250ms). When present,
+    // `base_interval` is required by the proto and `max_interval` defaults to
+    // 10x the base when unset.
+    let retry_back_off = match &rp.retry_back_off {
+        None => RetryBackOff::ENVOY_DEFAULT,
+        Some(rb) => {
+            let base_path = format!("{path}.retry_back_off.base_interval");
+            let base_interval = rb
+                .base_interval
+                .as_ref()
+                .ok_or_else(|| invalid(&base_path, "base_interval is required"))
+                .and_then(|d| to_std_duration(d, &base_path))?;
+            let max_interval = rb
+                .max_interval
+                .as_ref()
+                .map(|d| to_std_duration(d, &format!("{path}.retry_back_off.max_interval")))
+                .transpose()?
+                .unwrap_or(base_interval * 10);
+            RetryBackOff {
+                base_interval,
+                max_interval,
+            }
+        }
+    };
+
+    // S3.4: proto type is int64 (`host_selection_retry_max_attempts`); Envoy
+    // default is 1. Reject negative/overflowing values loudly rather than
+    // silently truncating.
+    let host_selection_retry_max_attempts = u32::try_from(rp.host_selection_retry_max_attempts)
+        .map_err(|_| {
+            invalid(
+                format!("{path}.host_selection_retry_max_attempts"),
+                "must be a non-negative value that fits in u32",
+            )
+        })?;
+    let host_selection_retry_max_attempts = if host_selection_retry_max_attempts == 0 {
+        1
+    } else {
+        host_selection_retry_max_attempts
+    };
+
     Ok(RetryPolicyIR {
         retry_on: RetryOn::parse(&rp.retry_on),
         // S3: Envoy default is 1 retry.
@@ -1982,6 +2381,8 @@ fn convert_retry_policy(
             .map(|d| to_std_duration(d, &format!("{path}.per_try_timeout")))
             .transpose()?,
         retriable_status_codes: codes,
+        retry_back_off,
+        host_selection_retry_max_attempts,
     })
 }
 

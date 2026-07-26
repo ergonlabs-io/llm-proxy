@@ -60,6 +60,7 @@ pub(crate) fn static_hosts(endpoints: &[EndpointIR]) -> io::Result<Vec<Arc<Host>
             })?;
             Ok(Arc::new(Host {
                 address: SocketAddr::new(ip, e.port),
+                hostname: None,
                 weight: e.weight,
                 priority: e.priority,
                 health: HealthStatus::Healthy,
@@ -81,6 +82,7 @@ async fn strict_dns_hosts(
         hosts.extend(ips.into_iter().map(|ip| {
             Arc::new(Host {
                 address: SocketAddr::new(ip, e.port),
+                hostname: Some(e.host.clone()),
                 weight: e.weight,
                 priority: e.priority,
                 health: HealthStatus::Healthy,
@@ -104,6 +106,7 @@ async fn logical_dns_hosts(
         if let Some(ip) = ips.into_iter().next() {
             hosts.push(Arc::new(Host {
                 address: SocketAddr::new(ip, e.port),
+                hostname: Some(e.host.clone()),
                 weight: e.weight,
                 priority: e.priority,
                 health: HealthStatus::Healthy,
@@ -131,6 +134,7 @@ mod tests {
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
         }
     }
 

@@ -22,10 +22,26 @@ use crate::discovery;
 use crate::host_set::{diff_host_sets, HostSet, HostSetDiff};
 use crate::load_balancer::{self, HostPicker, LbError};
 use crate::resolver::HostResolver;
+use crate::transport::{
+    self, TransportSocketBuilder, TransportSocketError, UpstreamTransportSocket,
+};
 use crate::{
     CircuitBreakerState, ClusterEntry, Host, HttpConnPool, LoadBalancerContext, RoutingPriority,
     UpstreamProtocol,
 };
+
+/// Failure to build a cluster: either its `lb_policy` isn't implemented
+/// ([`LbError`]) or its `transport_socket` couldn't be built
+/// ([`TransportSocketError`]). Kept as one enum (rather than two separate
+/// `Vec`s of rejections) because both are "this cluster didn't make it into
+/// the cluster set" outcomes the same callers need to report the same way.
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterBuildError {
+    #[error(transparent)]
+    Lb(#[from] LbError),
+    #[error(transparent)]
+    TransportSocket(#[from] TransportSocketError),
+}
 
 /// Where a managed cluster's membership comes from.
 enum ClusterSource {
@@ -68,17 +84,36 @@ struct ManagedCluster {
     /// back.
     default_cb: CircuitBreakerState,
     high_cb: CircuitBreakerState,
+    /// Which HTTP protocol the router speaks to this cluster's upstreams.
+    /// Captured from the config at build time (Envoy default HTTP/1.1); EDS
+    /// clusters, which have no `ClusterConfig`, default to HTTP/1.1.
+    upstream_protocol: UpstreamProtocol,
+    /// What [`crate::pool::ConnectPool`] wraps a freshly-dialed TCP
+    /// connection in: plaintext, or a TLS originator built from
+    /// `config.transport_socket`. Built once at cluster construction via the
+    /// manager's [`TransportSocketBuilder`]; EDS clusters, which have no
+    /// `ClusterConfig`, always get plaintext.
+    transport: Arc<dyn UpstreamTransportSocket>,
 }
 
 impl ManagedCluster {
     /// Builds a config-sourced cluster's state, including its load balancer
-    /// -- fails with [`LbError`] if `config.lb_policy` isn't implemented yet
-    /// (`RING_HASH`/`MAGLEV`, see [`load_balancer::build`]); ground rule #1
-    /// forbids silently substituting another policy.
-    fn from_config(config: Arc<ClusterConfig>) -> Result<Self, LbError> {
+    /// and transport socket -- fails if `config.lb_policy` isn't implemented
+    /// yet (`RING_HASH`/`MAGLEV`, see [`load_balancer::build`]) or if
+    /// `config.transport_socket` doesn't build (bad TLS config); ground rule
+    /// #1 forbids silently substituting another policy or downgrading to
+    /// plaintext.
+    fn from_config(
+        config: Arc<ClusterConfig>,
+        transport_builder: &TransportSocketBuilder,
+    ) -> Result<Self, ClusterBuildError> {
         let policy = load_balancer::build(config.lb_policy)?;
+        let transport = transport_builder(&config)?;
         let default_cb = CircuitBreakerState::from_thresholds(config.circuit_breakers.default);
         let high_cb = CircuitBreakerState::from_thresholds(config.circuit_breakers.high);
+        // Read + map (IR → runtime enum) before `config` is moved into
+        // `source` below.
+        let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
         Ok(Self {
             source: ClusterSource::Config(config),
             host_set: ArcSwap::from_pointee(HostSet::default()),
@@ -86,12 +121,15 @@ impl ManagedCluster {
             host_picker: HostPicker::new(policy),
             default_cb,
             high_cb,
+            upstream_protocol,
+            transport,
         })
     }
 
     /// EDS clusters have no `ClusterConfig`/`lb_policy` of their own (see
     /// [`ClusterSource::Eds`]); default to `ROUND_ROBIN`, matching Envoy's
-    /// own cluster-wide default.
+    /// own cluster-wide default, and to plaintext (there's no
+    /// `transport_socket` field to read).
     fn eds() -> Self {
         Self {
             source: ClusterSource::Eds,
@@ -102,6 +140,8 @@ impl ManagedCluster {
             ),
             default_cb: CircuitBreakerState::default(),
             high_cb: CircuitBreakerState::default(),
+            upstream_protocol: UpstreamProtocol::Http1,
+            transport: Arc::new(transport::RawTransportSocket),
         }
     }
 }
@@ -117,14 +157,25 @@ fn not_found(name: &str) -> io::Error {
 pub struct ClusterManager {
     clusters: ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>,
     resolver: Arc<dyn HostResolver>,
+    transport_builder: TransportSocketBuilder,
 }
 
 impl ClusterManager {
-    pub fn new(resolver: Arc<dyn HostResolver>) -> Self {
+    pub fn new(resolver: Arc<dyn HostResolver>, transport_builder: TransportSocketBuilder) -> Self {
         Self {
             clusters: ArcSwap::from_pointee(HashMap::new()),
             resolver,
+            transport_builder,
         }
+    }
+
+    /// Convenience constructor for callers that don't (yet) wire real
+    /// upstream TLS: installs [`transport::reject_tls_builder`], so
+    /// plaintext clusters work and a `transport_socket`-configured one fails
+    /// loudly instead of silently downgrading. Used throughout this crate's
+    /// own tests.
+    pub fn with_default_transport(resolver: Arc<dyn HostResolver>) -> Self {
+        Self::new(resolver, transport::reject_tls_builder())
     }
 
     /// Reconcile against a config snapshot's cluster map and kick off each
@@ -147,13 +198,13 @@ impl ClusterManager {
     pub async fn update_from_snapshot(
         &self,
         clusters: &HashMap<ClusterName, Arc<ClusterConfig>>,
-    ) -> Vec<(ClusterName, LbError)> {
+    ) -> Vec<(ClusterName, ClusterBuildError)> {
         let previous = self.clusters.load_full();
         let mut next: HashMap<ClusterName, Arc<ManagedCluster>> =
             HashMap::with_capacity(clusters.len());
         let mut rejected = Vec::new();
         for (name, config) in clusters {
-            match ManagedCluster::from_config(Arc::clone(config)) {
+            match ManagedCluster::from_config(Arc::clone(config), &self.transport_builder) {
                 Ok(managed) => {
                     next.insert(name.clone(), Arc::new(managed));
                 }
@@ -295,18 +346,26 @@ impl ClusterEntry for ClusterHandle {
         self.0.host_picker.pick(&host_set, ctx)
     }
 
-    fn http_pool(&self, host: &Arc<Host>, proto: UpstreamProtocol) -> Arc<dyn HttpConnPool> {
-        // v1 is connect-per-stream, h1-only (`Http1ConnectPool`); h2
-        // multiplexing pools and circuit-breaker accounting are WP-15
-        // follow-up. Nothing feeds `Http2` in here yet (routing/pools only
-        // wire h1 so far), so a mismatch would mean a caller elsewhere is
-        // ahead of this pool -- assert rather than silently building an h1
-        // pool for an h2 request.
-        debug_assert!(
-            matches!(proto, UpstreamProtocol::Http1),
-            "h2 pools land in WP-15"
-        );
-        Arc::new(crate::pool::Http1ConnectPool::new(host.address))
+    fn http_pool(&self, host: &Arc<Host>, _proto: UpstreamProtocol) -> Arc<dyn HttpConnPool> {
+        // v1 is connect-per-stream: `ConnectPool` just opens a fresh TCP
+        // connection per request and hands it to the cluster's transport
+        // socket (plaintext passthrough, or a TLS handshake). The resulting
+        // byte stream is protocol-agnostic -- the router applies h1 or h2c on
+        // top by picking the upstream codec -- so `_proto` doesn't change the
+        // pool today. Real h2 multiplexing pools are a WP-15 follow-up.
+        let server_name = host
+            .hostname
+            .clone()
+            .unwrap_or_else(|| host.address.ip().to_string());
+        Arc::new(crate::pool::ConnectPool::new(
+            host.address,
+            Arc::clone(&self.0.transport),
+            server_name,
+        ))
+    }
+
+    fn upstream_protocol(&self) -> UpstreamProtocol {
+        self.0.upstream_protocol
     }
 
     fn circuit_breaker(&self, prio: RoutingPriority) -> &CircuitBreakerState {
@@ -339,6 +398,7 @@ mod tests {
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
         })
     }
 
@@ -354,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn static_cluster_becomes_available_and_initialized() {
         let resolver = Arc::new(FakeResolver::new());
-        let manager = ClusterManager::new(resolver);
+        let manager = ClusterManager::with_default_transport(resolver);
         let mut snapshot = HashMap::new();
         snapshot.insert(
             "static-svc".to_string(),
@@ -375,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn removing_a_cluster_from_the_snapshot_drops_it() {
         let resolver = Arc::new(FakeResolver::new());
-        let manager = ClusterManager::new(resolver);
+        let manager = ClusterManager::with_default_transport(resolver);
         let mut snapshot = HashMap::new();
         snapshot.insert(
             "svc".to_string(),
@@ -396,7 +456,7 @@ mod tests {
             "svc.internal",
             vec![IpAddr::from([10, 0, 0, 1]), IpAddr::from([10, 0, 0, 2])],
         );
-        let manager = ClusterManager::new(resolver.clone());
+        let manager = ClusterManager::with_default_transport(resolver.clone());
         let mut snapshot = HashMap::new();
         snapshot.insert(
             "dns-svc".to_string(),
@@ -432,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn eds_cluster_starts_uninitialized_then_accepts_an_update() {
         let resolver = Arc::new(FakeResolver::new());
-        let manager = ClusterManager::new(resolver);
+        let manager = ClusterManager::with_default_transport(resolver);
         manager.add_eds_cluster("eds-svc".to_string());
 
         assert!(manager.cluster("eds-svc").is_some());
@@ -451,7 +511,7 @@ mod tests {
     #[tokio::test]
     async fn force_initialize_marks_an_unresolved_cluster_ready() {
         let resolver = Arc::new(FakeResolver::new());
-        let manager = ClusterManager::new(resolver);
+        let manager = ClusterManager::with_default_transport(resolver);
         manager.add_eds_cluster("never-fed".to_string());
         assert!(!manager.is_initialized("never-fed"));
         manager.force_initialize("never-fed");
@@ -461,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn pick_host_round_robins_priority_zero() {
         let resolver = Arc::new(FakeResolver::new());
-        let manager = ClusterManager::new(resolver);
+        let manager = ClusterManager::with_default_transport(resolver);
         let mut snapshot = HashMap::new();
         snapshot.insert(
             "rr-svc".to_string(),

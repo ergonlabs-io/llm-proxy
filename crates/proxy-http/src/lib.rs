@@ -27,6 +27,7 @@ pub mod filter;
 pub mod filter_manager;
 pub mod handler;
 pub mod headers;
+pub mod retry;
 pub mod route;
 pub mod router;
 pub mod stream_info;
@@ -45,6 +46,7 @@ pub use headers::{
     resolve_trusted_address, sanitize_hop_by_hop, set_forwarded_proto,
     strip_envoy_headers_from_external, XffOptions,
 };
+pub use retry::{backoff_delay, should_retry, AttemptOutcome, RetryState};
 pub use route::{
     apply_prefix_rewrite, match_route, select_cluster, strip_port, strip_query, RouteMatch,
     RouteRequest,

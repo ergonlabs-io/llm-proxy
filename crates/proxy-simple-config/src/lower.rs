@@ -35,6 +35,17 @@ const UPSTREAM_TLS_TYPE_URL: &str =
 const DOWNSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
 
+/// The header Anthropic requires on every Messages API request.
+const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
+
+/// The API version the dialect pins when the user doesn't choose one.
+/// Anthropic versions its API by date and treats this header as mandatory;
+/// `2023-06-01` is the long-standing stable version. Bumping it is a
+/// deliberate compatibility decision, not a routine dependency update —
+/// a newer version can change response shapes that `proxy-filters`' usage
+/// extraction depends on.
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+
 /// A lowered config: the Envoy bootstrap as JSON plus lowering warnings.
 #[derive(Debug)]
 pub struct Lowered {
@@ -210,15 +221,44 @@ fn lower_provider(
     });
 
     if up.tls {
-        let mut tls_config = json!({
+        // Rust note: `trusted_ca` and `system_root_certs` are mutually
+        // exclusive in `CertificateValidationContext` (proxy-config's
+        // lowering rejects both being set), so this `if`/`else` can only
+        // ever populate one of them.
+        //
+        // An `UpstreamTlsContext` with no validation context at all is
+        // Envoy's documented (and dangerous) default: it disables server
+        // certificate verification entirely. That parity is intentional
+        // for the raw Envoy-mode surface, but this dialect is our own
+        // opinionated one, so a provider with no explicit `ca_file` still
+        // gets verified against the platform trust store instead of
+        // silently accepting any certificate.
+        //
+        // Neither `trusted_ca` nor `system_root_certs` alone checks the
+        // upstream's *identity* -- Envoy's `CertificateValidationContext`
+        // validates chain trust only; a `match_typed_subject_alt_names`
+        // entry is the actual hostname check (see
+        // `proxy-core/tests/upstream_tls.rs` for the runtime proof). Chain
+        // trust without identity is not authentication: without this, any
+        // cert signed by any public CA for any domain would be accepted
+        // for `up.host`, which is exactly the MITM TLS is meant to
+        // prevent. Envoy-mode must stay permissive by default (that's
+        // genuine upstream parity for users porting real Envoy configs),
+        // but the dialect is our own opinionated surface, so it can afford
+        // to be strict here.
+        let mut validation_context = if let Some(ca_file) = &provider.ca_file {
+            json!({ "trusted_ca": { "filename": ca_file } })
+        } else {
+            json!({ "system_root_certs": {} })
+        };
+        validation_context["match_typed_subject_alt_names"] = json!([
+            { "san_type": "DNS", "matcher": { "exact": up.host } }
+        ]);
+        let tls_config = json!({
             "@type": UPSTREAM_TLS_TYPE_URL,
             "sni": up.host,
+            "common_tls_context": { "validation_context": validation_context },
         });
-        if let Some(ca_file) = &provider.ca_file {
-            tls_config["common_tls_context"] = json!({
-                "validation_context": { "trusted_ca": { "filename": ca_file } }
-            });
-        }
         cluster["transport_socket"] = json!({
             "name": "envoy.transport_sockets.tls",
             "typed_config": tls_config,
@@ -343,6 +383,29 @@ fn lower_route(
     if let Some((key, value)) = auth_header(provider_name, provider, warnings)? {
         headers_to_add.push(json!({
             "header": { "key": key, "value": value },
+            "append_action": "OVERWRITE_IF_EXISTS_OR_ADD",
+        }));
+    }
+    // Anthropic rejects any request without `anthropic-version`, so the
+    // dialect supplies it rather than letting an otherwise-complete provider
+    // block fail on every call. This is the opinionated-surface move (ground
+    // rule #5): Envoy mode stays permissive, the dialect gets a
+    // required-by-the-API header right by default. A user-supplied value in
+    // `extra_headers` wins, so pinning a different version stays possible.
+    //
+    // Rust note: HTTP header names are case-insensitive, so the override
+    // check compares lowercased -- `Anthropic-Version` must count as the
+    // user having set it, otherwise we would emit the header twice.
+    if matches!(
+        provider.effective_type(provider_name),
+        ProviderType::Anthropic
+    ) && !provider
+        .extra_headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case(ANTHROPIC_VERSION_HEADER))
+    {
+        headers_to_add.push(json!({
+            "header": { "key": ANTHROPIC_VERSION_HEADER, "value": DEFAULT_ANTHROPIC_VERSION },
             "append_action": "OVERWRITE_IF_EXISTS_OR_ADD",
         }));
     }

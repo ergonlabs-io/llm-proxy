@@ -1063,6 +1063,7 @@ mod tests {
             generate_request_id: true,
             use_remote_address: false,
             xff_num_trusted_hops: 0,
+            access_logs: vec![],
         })
     }
 
@@ -1131,6 +1132,7 @@ mod tests {
             generate_request_id: true,
             use_remote_address: false,
             xff_num_trusted_hops: 0,
+            access_logs: vec![],
         })
     }
 
@@ -1175,6 +1177,7 @@ mod tests {
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1024 * 1024,
             circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
         }
     }
 
@@ -1328,9 +1331,10 @@ mod tests {
     /// map -- the same manager both the `tcp_proxy` fixtures' listener wiring
     /// and (WP-13) the HTTP router's `RouterHandler` see.
     async fn cluster_manager_for(snapshot: &ConfigSnapshot) -> Arc<ClusterManager> {
-        let manager = Arc::new(ClusterManager::new(Arc::new(
-            proxy_cluster::resolver::TokioResolver,
-        )));
+        let manager = Arc::new(ClusterManager::new(
+            Arc::new(proxy_cluster::resolver::TokioResolver),
+            crate::tls::transport_socket_builder(),
+        ));
         manager.update_from_snapshot(&snapshot.clusters).await;
         for name in snapshot.clusters.keys() {
             manager.force_initialize(name);
@@ -2482,6 +2486,7 @@ mod tests {
             generate_request_id: true,
             use_remote_address: false,
             xff_num_trusted_hops: 0,
+            access_logs: vec![],
         })
     }
 

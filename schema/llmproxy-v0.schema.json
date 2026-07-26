@@ -127,7 +127,7 @@
         },
         "extra_headers": {
           "type": "object",
-          "description": "Additional headers to send on every request to this provider (e.g. `anthropic-version`, org/project headers).",
+          "description": "Additional headers to send on every request to this provider (e.g. org/project headers). Anthropic providers are sent a default `anthropic-version` automatically; setting it here overrides that default (header names are matched case-insensitively).",
           "additionalProperties": { "type": "string" }
         },
         "ca_file": {

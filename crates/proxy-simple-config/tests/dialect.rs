@@ -47,10 +47,15 @@ fn example_config_lowers_end_to_end() {
     let openai = &snapshot.clusters["provider:openai"];
     assert_eq!(openai.endpoints[0].host, "api.openai.com");
     assert_eq!(openai.endpoints[0].port, 443);
-    assert_eq!(
-        openai.transport_socket.as_ref().unwrap().sni.as_deref(),
-        Some("api.openai.com")
-    );
+    let openai_ts = openai.transport_socket.as_ref().unwrap();
+    assert_eq!(openai_ts.sni.as_deref(), Some("api.openai.com"));
+    // No `ca_file` configured: the dialect must not fall back to Envoy's
+    // "no validation context" default (unverified TLS). It verifies against
+    // the platform trust store instead.
+    assert!(matches!(
+        openai_ts.validation.as_ref().map(|v| &v.ca),
+        Some(proxy_config::ir::CaSource::SystemRoots)
+    ));
     let vllm = &snapshot.clusters["provider:local-vllm"];
     assert_eq!(vllm.endpoints[0].port, 8000);
     assert!(vllm.transport_socket.is_none());
@@ -67,6 +72,92 @@ fn example_config_lowers_end_to_end() {
         .join(",");
     assert!(all.contains("fallbacks"), "warnings: {all}");
     assert!(all.contains("limits"), "warnings: {all}");
+}
+
+/// An `https://` provider with no `ca_file` must still get a validation
+/// context — Envoy's raw "no validation context" default means "trust any
+/// certificate", which would let a MITM read API keys in flight. The
+/// dialect falls back to the platform trust store instead.
+#[test]
+fn https_provider_without_ca_file_validates_against_system_roots() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    let openai = &snapshot.clusters["provider:openai"];
+    let ts = openai
+        .transport_socket
+        .as_ref()
+        .expect("https provider must have a transport_socket");
+    let validation = ts
+        .validation
+        .as_ref()
+        .expect("no ca_file must still validate against something");
+    assert!(matches!(
+        validation.ca,
+        proxy_config::ir::CaSource::SystemRoots
+    ));
+    // Chain trust alone is not identity checking (see
+    // `proxy-core/tests/upstream_tls.rs`): the dialect must also emit a SAN
+    // matcher for the provider's host so a cert for any other domain, even
+    // one signed by a trusted public CA, is rejected.
+    assert_eq!(validation.san_matchers.len(), 1);
+    let m = &validation.san_matchers[0];
+    assert!(matches!(m.san_type, proxy_config::ir::SanType::Dns));
+    match &m.matcher {
+        proxy_config::ir::StringMatcherIR::Exact { value, .. } => {
+            assert_eq!(value, "api.openai.com");
+        }
+        other => panic!("expected an exact DNS matcher, got {other:?}"),
+    }
+}
+
+/// An `https://` provider with an explicit `ca_file` uses it verbatim
+/// (`trusted_ca`), not the system trust store.
+#[test]
+fn https_provider_with_ca_file_uses_trusted_ca() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY}, ca_file: /etc/ssl/custom-ca.pem }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    let openai = &snapshot.clusters["provider:openai"];
+    let ts = openai.transport_socket.as_ref().unwrap();
+    let validation = ts.validation.as_ref().unwrap();
+    match &validation.ca {
+        proxy_config::ir::CaSource::TrustedCa(proxy_config::ir::DataSourceIR::File(path)) => {
+            assert_eq!(path, std::path::Path::new("/etc/ssl/custom-ca.pem"));
+        }
+        other => panic!("expected TrustedCa(File(..)), got {other:?}"),
+    }
+    // A custom `ca_file` establishes chain trust but still says nothing
+    // about identity: the SAN matcher must be present here too.
+    assert_eq!(validation.san_matchers.len(), 1);
+    let m = &validation.san_matchers[0];
+    assert!(matches!(m.san_type, proxy_config::ir::SanType::Dns));
+    match &m.matcher {
+        proxy_config::ir::StringMatcherIR::Exact { value, .. } => {
+            assert_eq!(value, "api.openai.com");
+        }
+        other => panic!("expected an exact DNS matcher, got {other:?}"),
+    }
 }
 
 /// Model globs lower to the right header matchers on the model header.
@@ -148,6 +239,89 @@ routes:
     assert_eq!(hdr(0)["append_action"], "OVERWRITE_IF_EXISTS_OR_ADD");
     assert_eq!(hdr(1)["header"]["key"], "x-api-key");
     assert_eq!(hdr(1)["header"]["value"], "sk-test-anthropic");
+}
+
+/// Anthropic rejects every request that lacks `anthropic-version`, so the
+/// dialect supplies it automatically. OpenAI providers must NOT get it.
+#[test]
+fn anthropic_provider_gets_the_required_version_header() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "gpt*", provider: openai }
+  - { model: "claude*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = &lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"];
+
+    let keys = |i: usize| -> Vec<String> {
+        routes[i]["request_headers_to_add"]
+            .as_array()
+            .expect("headers must be an array")
+            .iter()
+            .map(|h| h["header"]["key"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let anthropic = keys(1);
+    assert!(
+        anthropic.iter().any(|k| k == "anthropic-version"),
+        "anthropic provider must get the version header, got {anthropic:?}"
+    );
+    let openai = keys(0);
+    assert!(
+        !openai.iter().any(|k| k == "anthropic-version"),
+        "openai provider must NOT get an anthropic header, got {openai:?}"
+    );
+}
+
+/// A user-supplied version wins, and must not be emitted twice. HTTP header
+/// names are case-insensitive, so a differently-cased key still counts as an
+/// override -- the case that a naive exact-match check would get wrong.
+#[test]
+fn user_supplied_anthropic_version_overrides_the_default_case_insensitively() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  anthropic:
+    api_key: ${ANTHROPIC_API_KEY}
+    extra_headers: { Anthropic-Version: "2099-01-01" }
+routes:
+  - { model: "claude*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let headers = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"][0]
+        ["request_headers_to_add"]
+        .as_array()
+        .expect("headers must be an array")
+        .clone();
+
+    let version_headers: Vec<_> = headers
+        .iter()
+        .filter(|h| {
+            h["header"]["key"]
+                .as_str()
+                .unwrap()
+                .eq_ignore_ascii_case("anthropic-version")
+        })
+        .collect();
+    assert_eq!(
+        version_headers.len(),
+        1,
+        "exactly one version header expected, got {version_headers:?}"
+    );
+    assert_eq!(version_headers[0]["header"]["value"], "2099-01-01");
 }
 
 /// LLM-safe defaults: total timeout disabled, 90s idle, retries only on

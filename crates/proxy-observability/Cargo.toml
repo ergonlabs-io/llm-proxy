@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+http = { workspace = true }
+# WP-24: `%START_TIME(fmt)%` strftime rendering.
+chrono = { workspace = true }
 
 [lints]
 workspace = true

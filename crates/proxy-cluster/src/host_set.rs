@@ -121,6 +121,7 @@ mod tests {
     fn host(ip: [u8; 4], port: u16, priority: u32) -> Arc<Host> {
         Arc::new(Host {
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port),
+            hostname: None,
             weight: 1,
             priority,
             health: HealthStatus::Healthy,
