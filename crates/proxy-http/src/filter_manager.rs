@@ -235,6 +235,20 @@ struct DirectionState {
     /// Set by `continue_decoding()` / `continue_encoding()`; the driver clears
     /// it once observed.
     continue_requested: bool,
+    /// S2.7: the filter index the driver is *currently* invoking a decode
+    /// callback on, so `inject_decoded_data_to_filter_chain` knows which
+    /// position to deliver "after" — the callback adapter only borrows `ctx`
+    /// (module doc), not the filter index, so the driver stashes it here right
+    /// before every call. Only meaningful during a callback; stale otherwise.
+    current_idx: usize,
+    /// S2.7: out-of-band injections recorded by
+    /// `inject_decoded_data_to_filter_chain`, each `(originating filter
+    /// index, data, end_stream)`. Drained by the decode driver
+    /// (`drain_decode_injections`) immediately after the injecting callback
+    /// returns — delivered to filters strictly AFTER the originator (never
+    /// re-entering it), and without touching `continue_requested`, so
+    /// injecting never itself resumes the originator's own held iteration.
+    injected: VecDeque<(usize, Bytes, bool)>,
 }
 
 /// Encode-side counterpart to [`DirectionState`]. Unlike decode, encode is
@@ -254,6 +268,17 @@ struct EncodeState {
     /// instances exist (in [`encode_headers_phase`]; `ChainCtx::new` doesn't
     /// know `n` yet).
     positions: Vec<PositionState>,
+    /// S2.7: out-of-band injections queued by
+    /// `inject_encoded_data_to_filter_chain`, reusing [`PendingFrame`]'s
+    /// `(data, end_stream, start_pos)` shape — injection and a header-hold's
+    /// leftover frame have identical delivery semantics: resume at a specific
+    /// position, honoring that position's (and everything after it's)
+    /// existing `StopKind`/buffer state, never touching earlier positions.
+    /// Drained into whichever `pending` queue is currently in scope
+    /// ([`encode_headers_phase`]'s local one, or
+    /// [`StreamingEncoder::pending`]) immediately after the injecting
+    /// callback returns.
+    injected: VecDeque<PendingFrame>,
 }
 
 /// Split-storage counterpart to the filter `Vec`: everything a callback may
@@ -731,6 +756,11 @@ async fn encode_headers_phase(
         if total_encode_buffered(ctx) > buffer_limit {
             return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
         }
+        // S2.7: `idx` may have injected data out-of-band from `encode_headers`
+        // — fold it into `pending` (entering at `p + 1`, toward the client;
+        // see `StreamingEncoder`'s doc comment on position order) so it's
+        // delivered once streaming starts, without re-entering `idx` itself.
+        pending.extend(ctx.encode.injected.drain(..));
 
         match status {
             FilterHeadersStatus::Continue | FilterHeadersStatus::ContinueAndDontEndStream => {
@@ -760,6 +790,9 @@ async fn encode_headers_phase(
                                 if total_encode_buffered(ctx) > buffer_limit {
                                     return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
                                 }
+                                // S2.7: same fold-in for an injection from this
+                                // held filter's own `encode_data`.
+                                pending.extend(ctx.encode.injected.drain(..));
                                 let continued = matches!(dstatus, FilterDataStatus::Continue)
                                     || ctx.encode.continue_requested;
                                 ctx.encode.continue_requested = false;
@@ -977,6 +1010,12 @@ impl StreamingEncoder {
                         };
                         self.filters[idx].encode_data(&mut cb, &mut whole, call_end_stream)
                     };
+                    // S2.7: fold in anything `idx` injected out-of-band from
+                    // this call — entering at `p + 1` (toward the client),
+                    // never re-entering `idx`. Delivered by the next
+                    // `poll_frame` iteration, which drains `self.pending`
+                    // before touching `upstream` again.
+                    self.pending.extend(self.ctx.encode.injected.drain(..));
                     let continued = matches!(status, FilterDataStatus::Continue)
                         || self.ctx.encode.continue_requested;
                     self.ctx.encode.continue_requested = false;
@@ -1031,6 +1070,8 @@ impl StreamingEncoder {
                         };
                         self.filters[idx].encode_data(&mut cb, &mut data, end_stream)
                     };
+                    // S2.7: same fold-in as the `Buffering` branch above.
+                    self.pending.extend(self.ctx.encode.injected.drain(..));
                     let continued = matches!(status, FilterDataStatus::Continue)
                         || self.ctx.encode.continue_requested;
                     self.ctx.encode.continue_requested = false;
@@ -1294,12 +1335,18 @@ fn drive_decode(
     while idx < filters.len() {
         // Split borrow: `&mut filters[idx]`, `&mut *head`, and an adapter over
         // `&mut *ctx` are three disjoint borrows (module doc).
+        ctx.decode.current_idx = idx;
         let mut cb = DecoderCallbacksAdapter { ctx };
         let status = filters[idx].decode_headers(&mut cb, head, end_stream_on_headers);
         // A filter that buffered via add_decoded_data must not exceed the limit.
         if ctx.decode.buffer.0.len() > buffer_limit {
             return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
         }
+        // S2.7: deliver anything `idx` injected out-of-band before doing
+        // anything else with its status — injected data reaches subsequent
+        // filters immediately, not whenever the normal pointer machine
+        // happens to get there.
+        drain_decode_injections(filters, ctx, buffer_limit)?;
 
         // S2.5: once a filter has requested a local reply, decode iteration
         // stops immediately — no filter after the sender sees the request, and
@@ -1383,22 +1430,78 @@ fn deliver_decode_data(
 ) -> Result<bool, http::StatusCode> {
     data_consumed[idx] = true;
     ctx.decode.continue_requested = false;
+    ctx.decode.current_idx = idx;
     let end_stream = trailers.is_none();
     let mut cb = DecoderCallbacksAdapter { ctx };
     let status = filters[idx].decode_data(&mut cb, body, end_stream);
     if ctx.decode.buffer.0.len() > buffer_limit {
         return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
     }
+    // S2.7: `idx` may have injected data out-of-band from `decode_data` —
+    // deliver it to filters after `idx` before deciding anything else.
+    drain_decode_injections(filters, ctx, buffer_limit)?;
     let continued = matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested;
 
     if continued {
         if let Some(t) = trailers {
+            ctx.decode.current_idx = idx;
             let mut cb = DecoderCallbacksAdapter { ctx };
             let mut owned = RequestTrailers(t.0.clone());
             let _ = filters[idx].decode_trailers(&mut cb, &mut owned);
+            // S2.7: same for an injection from `decode_trailers`.
+            drain_decode_injections(filters, ctx, buffer_limit)?;
         }
     }
     Ok(continued)
+}
+
+/// S2.7: deliver every out-of-band injection queued in `ctx.decode.injected`
+/// (via `inject_decoded_data_to_filter_chain`) to the filters strictly AFTER
+/// its originator, in order — never re-entering the originator, and never
+/// touching `continue_requested` (so injecting never itself resumes the
+/// originator's own held iteration).
+///
+/// Decode has no streaming driver (module doc: decode stays fully buffered),
+/// so a downstream filter that itself stops on an injected chunk has no later
+/// point to resume it at — same documented limitation the header-hold
+/// resolution loop above already accepts for a hold that never resolves
+/// synchronously. Anything that makes it past every subsequent filter rides
+/// along to the terminal exactly like `add_decoded_data` (appended to the
+/// shared decode buffer that `join_buffer` prepends to the body).
+///
+/// Rust note: `while let Some(..) = ctx.decode.injected.pop_front()` (not a
+/// single drain-into-a-`Vec` pass) — delivering one injected chunk can itself
+/// call `inject_decoded_data_to_filter_chain` again, pushing more work onto
+/// the very queue we're draining; popping one at a time picks that up.
+fn drain_decode_injections(
+    filters: &mut [Box<dyn HttpFilter>],
+    ctx: &mut ChainCtx,
+    buffer_limit: usize,
+) -> Result<(), http::StatusCode> {
+    while let Some((from_idx, mut data, end_stream)) = ctx.decode.injected.pop_front() {
+        let n = filters.len();
+        let mut idx = from_idx + 1;
+        while idx < n {
+            ctx.decode.current_idx = idx;
+            ctx.decode.continue_requested = false;
+            let mut cb = DecoderCallbacksAdapter { ctx };
+            let status = filters[idx].decode_data(&mut cb, &mut data, end_stream);
+            if ctx.decode.buffer.0.len() > buffer_limit {
+                return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            let continued =
+                matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested;
+            ctx.decode.continue_requested = false;
+            if !continued {
+                break;
+            }
+            idx += 1;
+        }
+        if idx == n {
+            ctx.decode.buffer.0.extend_from_slice(&data);
+        }
+    }
+    Ok(())
 }
 
 // --- callback adapters -----------------------------------------------------
@@ -1455,11 +1558,16 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
         self.ctx.decode.buffer.0.extend_from_slice(&data);
     }
 
-    fn inject_decoded_data_to_filter_chain(&mut self, _data: Bytes, _end_stream: bool) {
-        // TODO(WP-11 chunk 4, S2.7): out-of-callback injection to subsequent
-        // filters. The decode direction stays fully buffered (chunk 3 only
-        // streams encode), so this still has no streaming driver to hook into.
-        unimplemented!("inject_decoded_data_to_filter_chain lands in a later WP-11 chunk")
+    fn inject_decoded_data_to_filter_chain(&mut self, data: Bytes, end_stream: bool) {
+        // S2.7: out-of-band — delivered to the filters strictly AFTER the one
+        // currently running (`ctx.decode.current_idx`, stashed by the driver
+        // right before this callback's owning call), never re-entering it.
+        // Recorded here; the driver (`drain_decode_injections`) delivers it
+        // immediately after this callback returns.
+        self.ctx
+            .decode
+            .injected
+            .push_back((self.ctx.decode.current_idx, data, end_stream));
     }
 
     fn decoding_buffer(&self) -> Option<&BufferedBody> {
@@ -1514,10 +1622,21 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
             .extend_from_slice(&data);
     }
 
-    fn inject_encoded_data_to_filter_chain(&mut self, _data: Bytes, _end_stream: bool) {
-        // TODO(WP-11 chunk 4, S2.7): out-of-callback injection to subsequent
-        // filters, mid-stream. Pairs with `ContinueAndDontEndStream`.
-        unimplemented!("inject_encoded_data_to_filter_chain lands in a later WP-11 chunk")
+    fn inject_encoded_data_to_filter_chain(&mut self, data: Bytes, end_stream: bool) {
+        // S2.7: out-of-band — delivered to the filter AFTER this position
+        // (`pos + 1`, i.e. toward the client; see `StreamingEncoder`'s doc
+        // comment on position order), never re-entering this one. Reuses
+        // `PendingFrame`'s shape: the driver (`encode_headers_phase` /
+        // `StreamingEncoder::encode_frame`) folds this into whichever
+        // `pending` queue is in scope right after this callback returns,
+        // which honors `pos + 1`'s (and everything after it's) existing
+        // `StopKind`/buffer state exactly like a header-hold's leftover frame
+        // does.
+        self.ctx.encode.injected.push_back(PendingFrame {
+            data,
+            end_stream,
+            start_pos: self.pos + 1,
+        });
     }
 
     fn encoding_buffer(&self) -> Option<&BufferedBody> {

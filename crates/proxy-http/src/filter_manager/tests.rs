@@ -24,6 +24,11 @@ type Log = Rc<RefCell<Vec<String>>>;
 /// under clippy's `type_complexity` bar.
 type SeenResponseHead = Rc<RefCell<Option<(StatusCode, HeaderMap)>>>;
 
+/// S2.7 test hook: every `(data, end_stream)` pair a probe filter's
+/// `decode_data` observed. Aliased for the same reason as
+/// [`SeenResponseHead`] above.
+type SeenDecodeData = Rc<RefCell<Vec<(Bytes, bool)>>>;
+
 fn log_of() -> Log {
     Rc::new(RefCell::new(Vec::new()))
 }
@@ -61,6 +66,18 @@ struct ProbeFilter {
     /// S2.5 (G16): if set, `decode_data` calls `send_local_reply` (mirrors
     /// `send_local_reply`, which only fires from `decode_headers`).
     send_local_reply_from_data: Option<(StatusCode, &'static str, &'static str)>,
+    /// S2.7: if set, `decode_data` calls
+    /// `inject_decoded_data_to_filter_chain(data, end_stream)` before
+    /// returning `decode_data_status`.
+    inject_decoded: Option<(Bytes, bool)>,
+    /// S2.7: every `(data, end_stream)` pair this filter's `decode_data`
+    /// observed — records BOTH the main body flow and anything delivered to
+    /// it via injection, so a test can tell the two apart by content.
+    seen_decode_data: Option<SeenDecodeData>,
+    /// S2.7: if set, `encode_data` calls
+    /// `inject_encoded_data_to_filter_chain(data, end_stream)` before
+    /// returning `encode_data_status`.
+    inject_encoded: Option<(Bytes, bool)>,
 }
 
 impl ProbeFilter {
@@ -83,6 +100,9 @@ impl ProbeFilter {
             seen_response_head: None,
             seen_encode_data: None,
             send_local_reply_from_data: None,
+            inject_decoded: None,
+            seen_decode_data: None,
+            inject_encoded: None,
         }
     }
 
@@ -126,12 +146,18 @@ impl HttpFilter for ProbeFilter {
     fn decode_data(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
-        _data: &mut Bytes,
-        _end_stream: bool,
+        data: &mut Bytes,
+        end_stream: bool,
     ) -> FilterDataStatus {
         self.record("decode_data");
+        if let Some(seen) = &self.seen_decode_data {
+            seen.borrow_mut().push((data.clone(), end_stream));
+        }
         if let Some((code, body, details)) = self.send_local_reply_from_data {
             cb.send_local_reply(code, body, None, details);
+        }
+        if let Some((data, end_stream)) = &self.inject_decoded {
+            cb.inject_decoded_data_to_filter_chain(data.clone(), *end_stream);
         }
         if self.call_continue_decoding {
             cb.continue_decoding();
@@ -173,6 +199,9 @@ impl HttpFilter for ProbeFilter {
         self.record("encode_data");
         if let Some(seen) = &self.seen_encode_data {
             seen.borrow_mut().push(data.clone());
+        }
+        if let Some((inj_data, end_stream)) = &self.inject_encoded {
+            cb.inject_encoded_data_to_filter_chain(inj_data.clone(), *end_stream);
         }
         if self.call_continue_encoding {
             cb.continue_encoding();
@@ -1542,31 +1571,197 @@ fn informational_1xx_response_runs_a_separate_encode_callback() {
     unimplemented!("no 1xx seam exists yet to drive this scenario (S2.6)")
 }
 
-/// S2.7 (I6): `inject_decoded_data_to_filter_chain` should deliver data
-/// directly to SUBSEQUENT filters, out-of-callback, incl. `end_stream`
-/// signaling. Today it's `unimplemented!()` (filter_manager.rs L1384).
+/// S2.7 (I6): `inject_decoded_data_to_filter_chain` should record the
+/// injection against the ORIGINATING filter's index (`ctx.decode.current_idx`,
+/// stashed by the driver before the owning callback runs) so the driver can
+/// deliver it to filters strictly after that one — never re-entering it. This
+/// is a unit-level check of the callback adapter itself (no driver involved);
+/// [`inject_decoded_data_reaches_subsequent_filters_not_the_injector`] below
+/// exercises the full driver-level delivery.
 #[test]
-#[ignore = "WP-11 chunk 4: inject_decoded_data_to_filter_chain"]
 fn inject_decoded_data_to_filter_chain_delivers_to_subsequent_filters() {
     let mut ctx = ChainCtx::new();
+    ctx.decode.current_idx = 2;
     let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
-    // Panics today — that's the point (see the doc comment).
     cb.inject_decoded_data_to_filter_chain(Bytes::from_static(b"x"), true);
+    assert_eq!(
+        ctx.decode.injected.len(),
+        1,
+        "the injection must be queued, not dropped or delivered synchronously here"
+    );
+    let (from_idx, data, end_stream) = ctx.decode.injected.front().expect("queued above");
+    assert_eq!(
+        *from_idx, 2,
+        "must record the ORIGINATING filter's index so the driver knows where \"after\" is"
+    );
+    assert_eq!(data, &Bytes::from_static(b"x"));
+    assert!(*end_stream);
 }
 
-/// S2.7 (I7): `inject_encoded_data_to_filter_chain` mirror. Today
-/// `unimplemented!()` (filter_manager.rs L1442).
+/// S2.7 (I7): `inject_encoded_data_to_filter_chain` mirror — the encode side
+/// resumes at `pos + 1` (toward the client; see `StreamingEncoder`'s doc
+/// comment on position order), reusing `PendingFrame`'s shape directly.
 #[test]
-#[ignore = "WP-11 chunk 4: inject_encoded_data_to_filter_chain"]
 fn inject_encoded_data_to_filter_chain_delivers_to_subsequent_filters() {
     let mut ctx = ChainCtx::new();
-    ctx.encode.positions = vec![PositionState::default()];
+    ctx.encode.positions = vec![PositionState::default(), PositionState::default()];
     let mut cb = EncoderCallbacksAdapter {
         ctx: &mut ctx,
         pos: 0,
     };
-    // Panics today — that's the point (see the doc comment).
     cb.inject_encoded_data_to_filter_chain(Bytes::from_static(b"x"), true);
+    assert_eq!(ctx.encode.injected.len(), 1);
+    let frame = ctx.encode.injected.front().expect("queued above");
+    assert_eq!(
+        frame.start_pos, 1,
+        "must resume at pos + 1 (toward the client), never pos itself"
+    );
+    assert_eq!(frame.data, Bytes::from_static(b"x"));
+    assert!(frame.end_stream);
+}
+
+// --- WP-11 chunk 4: full driver-level injection semantics (S2.7) ----------
+
+/// S2.7: injected data must reach filters strictly AFTER the injecting one,
+/// and must NOT be delivered back to the injector itself — the core semantic
+/// that distinguishes injection from `add_decoded_data` (which only appends
+/// to the buffer the injecting filter is already working with).
+#[test]
+fn inject_decoded_data_reaches_subsequent_filters_not_the_injector() {
+    block_on(async {
+        let log = log_of();
+        let a_seen = Rc::new(RefCell::new(Vec::new()));
+        let b_seen = Rc::new(RefCell::new(Vec::new()));
+        let mut a = ProbeFilter::new("a", log.clone());
+        a.inject_decoded = Some((Bytes::from_static(b"INJ"), false));
+        a.seen_decode_data = Some(a_seen.clone());
+        let mut b = ProbeFilter::new("b", log.clone());
+        b.seen_decode_data = Some(b_seen.clone());
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a), Box::new(b)];
+        let (status, seen, _) = run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let a_seen = a_seen.borrow();
+        assert!(
+            !a_seen.iter().any(|(d, _)| d == &Bytes::from_static(b"INJ")),
+            "an injecting filter must never see its own injected data; saw: {a_seen:?}"
+        );
+        let b_seen = b_seen.borrow();
+        assert!(
+            b_seen.iter().any(|(d, _)| d == &Bytes::from_static(b"INJ")),
+            "a subsequent filter must receive the injected data; saw: {b_seen:?}"
+        );
+        // Sanity: injected data that survives every subsequent filter (both
+        // `Continue`d here) rides along to the terminal exactly like
+        // `add_decoded_data` would (S2.7) — prepended ahead of the real body.
+        assert_eq!(seen, Bytes::from_static(b"INJhi"));
+    });
+}
+
+/// S2.7: injection is out-of-band — a filter calling it while it is holding
+/// iteration (`StopIteration`, never resuming) must not thereby resume
+/// iteration itself. `b` must receive the injected chunk directly (injection
+/// bypasses the normal header/data pointer entirely) even though `b` never
+/// gets as far as its own `decode_headers` in the normal iteration.
+#[test]
+fn inject_decoded_data_does_not_resume_the_injectors_own_held_iteration() {
+    block_on(async {
+        let log = log_of();
+        let b_seen = Rc::new(RefCell::new(Vec::new()));
+        let mut a = ProbeFilter::new("a", log.clone());
+        a.decode_headers_status = FilterHeadersStatus::StopIteration;
+        a.decode_data_status = FilterDataStatus::StopIterationAndBuffer; // never continues
+        a.inject_decoded = Some((Bytes::from_static(b"INJ"), false));
+        let mut b = ProbeFilter::new("b", log.clone());
+        b.seen_decode_data = Some(b_seen.clone());
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a), Box::new(b)];
+        run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        let entries = log.borrow().clone();
+        assert!(
+            !entries.iter().any(|e| e == "b:decode_headers"),
+            "the injecting filter never continued, so normal iteration must \
+             stay stopped at it (S2.2); log: {entries:?}"
+        );
+        let b_seen = b_seen.borrow();
+        assert!(
+            b_seen.iter().any(|(d, _)| d == &Bytes::from_static(b"INJ")),
+            "injection is out-of-band: it must still reach a subsequent \
+             filter's decode_data directly, even though normal iteration \
+             never got there; saw: {b_seen:?}"
+        );
+    });
+}
+
+/// S2.7: `end_stream: true` on an injection must terminate the downstream
+/// portion of the chain correctly — the subsequent filter observes
+/// `end_stream = true` on the injected chunk, not `false`.
+#[test]
+fn inject_decoded_data_end_stream_true_terminates_downstream_portion() {
+    block_on(async {
+        let log = log_of();
+        let b_seen = Rc::new(RefCell::new(Vec::new()));
+        let mut a = ProbeFilter::new("a", log.clone());
+        a.inject_decoded = Some((Bytes::from_static(b"INJ"), true));
+        let mut b = ProbeFilter::new("b", log.clone());
+        b.seen_decode_data = Some(b_seen.clone());
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a), Box::new(b)];
+        run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        let b_seen = b_seen.borrow();
+        let injected = b_seen
+            .iter()
+            .find(|(d, _)| d == &Bytes::from_static(b"INJ"))
+            .expect("b must observe the injected chunk");
+        assert!(
+            injected.1,
+            "end_stream: true on the injection must reach the subsequent \
+             filter as end_stream = true, terminating the downstream portion \
+             of the chain (S2.7); saw: {b_seen:?}"
+        );
+    });
+}
+
+/// S2.7 (encode mirror): an injection from position `p` must be seen by
+/// positions AFTER `p` (toward the client — `p + 1`, `p + 2`, ...) and NOT by
+/// positions at or before `p`. Config order [a, b, c] means encode order is
+/// c (position 0), b (position 1), a (position 2) — reverse config order
+/// (S2.1) — so an injection from `b` (position 1) must reach `a` (position 2)
+/// but not `b` itself nor `c` (position 0, which already ran).
+#[test]
+fn encode_injection_from_position_p_seen_only_after_p() {
+    block_on(async {
+        let log = log_of();
+        let a_seen = Rc::new(RefCell::new(Vec::new()));
+        let b_seen = Rc::new(RefCell::new(Vec::new()));
+        let c_seen = Rc::new(RefCell::new(Vec::new()));
+        let mut a = ProbeFilter::new("a", log.clone());
+        a.seen_encode_data = Some(a_seen.clone());
+        let mut b = ProbeFilter::new("b", log.clone());
+        b.inject_encoded = Some((Bytes::from_static(b"INJ"), false));
+        b.seen_encode_data = Some(b_seen.clone());
+        let mut c = ProbeFilter::new("c", log.clone());
+        c.seen_encode_data = Some(c_seen.clone());
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a), Box::new(b), Box::new(c)];
+        run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        let injected = Bytes::from_static(b"INJ");
+        assert!(
+            a_seen.borrow().iter().any(|d| d == &injected),
+            "position after the injector (toward the client) must see it; saw: {:?}",
+            a_seen.borrow()
+        );
+        assert!(
+            !b_seen.borrow().iter().any(|d| d == &injected),
+            "the injector itself must never see its own injected data; saw: {:?}",
+            b_seen.borrow()
+        );
+        assert!(
+            !c_seen.borrow().iter().any(|d| d == &injected),
+            "a position before the injector (already ran) must never see it; saw: {:?}",
+            c_seen.borrow()
+        );
+    });
 }
 
 /// S2.8 (I9): a filter mutating a routing-relevant header must call
