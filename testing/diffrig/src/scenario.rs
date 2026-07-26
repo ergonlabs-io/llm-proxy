@@ -89,6 +89,29 @@ pub enum UpstreamScript {
         require_api_key: Option<String>,
         #[serde(default)]
         forced_error: Option<ForcedError>,
+        /// Cache-read tokens to fold into `usage.prompt_tokens`/report under
+        /// `usage.prompt_tokens_details.cached_tokens` — see
+        /// `upstreams::openai::OpenAiConfig::cached_tokens`.
+        #[serde(default)]
+        cached_tokens: u64,
+    },
+    /// The Anthropic-Messages-compatible mock (`upstreams::anthropic`),
+    /// backing `POST /v1/messages`.
+    Anthropic {
+        model: String,
+        response_text: String,
+        ttft_ms: u64,
+        inter_token_delay_ms: u64,
+        #[serde(default)]
+        require_api_key: Option<String>,
+        #[serde(default)]
+        forced_error: Option<ForcedError>,
+        /// See `upstreams::anthropic::AnthropicConfig::cache_read_tokens`.
+        #[serde(default)]
+        cache_read_tokens: u64,
+        /// See `upstreams::anthropic::AnthropicConfig::cache_creation_tokens`.
+        #[serde(default)]
+        cache_creation_tokens: u64,
     },
 }
 
@@ -213,6 +236,7 @@ mod tests {
                 inter_token_delay_ms,
                 require_api_key,
                 forced_error,
+                cached_tokens,
             } => {
                 assert_eq!(model, "mock-gpt");
                 assert_eq!(response_text, "hello world");
@@ -222,8 +246,40 @@ mod tests {
                 let forced_error = forced_error.expect("forced_error should parse");
                 assert_eq!(forced_error.status, 503);
                 assert_eq!(forced_error.message, "overloaded");
+                assert_eq!(cached_tokens, 0, "defaults to 0 when omitted");
             }
             other => panic!("expected UpstreamScript::OpenAi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_anthropic_upstream_variant() {
+        let text = "name: x\nbootstrap:\n  path: a.yaml\nrequests:\n  - method: POST\n    path: /v1/messages\nupstream:\n  type: anthropic\n  model: mock-claude\n  response_text: hello world\n  ttft_ms: 10\n  inter_token_delay_ms: 5\n  require_api_key: secret\n  cache_read_tokens: 40\n  cache_creation_tokens: 15\n  forced_error:\n    status: 503\n    message: overloaded\n";
+        let scenario = parse_scenario(text).expect("anthropic upstream scenario should parse");
+
+        match scenario.upstream {
+            UpstreamScript::Anthropic {
+                model,
+                response_text,
+                ttft_ms,
+                inter_token_delay_ms,
+                require_api_key,
+                forced_error,
+                cache_read_tokens,
+                cache_creation_tokens,
+            } => {
+                assert_eq!(model, "mock-claude");
+                assert_eq!(response_text, "hello world");
+                assert_eq!(ttft_ms, 10);
+                assert_eq!(inter_token_delay_ms, 5);
+                assert_eq!(require_api_key, Some("secret".to_string()));
+                let forced_error = forced_error.expect("forced_error should parse");
+                assert_eq!(forced_error.status, 503);
+                assert_eq!(forced_error.message, "overloaded");
+                assert_eq!(cache_read_tokens, 40);
+                assert_eq!(cache_creation_tokens, 15);
+            }
+            other => panic!("expected UpstreamScript::Anthropic, got {other:?}"),
         }
     }
 
