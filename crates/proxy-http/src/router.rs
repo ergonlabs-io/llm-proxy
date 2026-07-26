@@ -58,14 +58,24 @@ use proxy_cluster::{LoadBalancerContext, PoolError, RoutingPriority, UpstreamPro
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable};
 
 use crate::codec::{send_upstream_http1, send_upstream_http2, Http1Options, UpstreamCodecError};
-use crate::filter::ResponseHeaders;
+use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{local_boxed, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
+use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, match_route, select_cluster, RouteMatch, RouteRequest};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 
 mod guarded;
 mod idle;
+
+/// S3.4 (Envoy's `no_retry_body_too_large`): the largest request body this
+/// router will hold in memory for retry replay. Matches
+/// `filter_manager::DEFAULT_BUFFER_LIMIT` -- both exist for the same reason
+/// (the decode chain is already fully buffered by the time a request reaches
+/// the router terminal, so this doesn't add a *new* buffering cost, just caps
+/// how much of what's already buffered upstream we're willing to hold a
+/// second (replayable) copy of).
+const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 
 /// The router terminal: matches a route, then forwards to the picked
 /// cluster/host over a real upstream connection. See the module doc for v1
@@ -137,7 +147,10 @@ impl RouterHandler {
                 local_reply(StatusCode::NOT_FOUND, "no route matched")
             }
             RouteMatch::Found { route, .. } => match &route.action {
-                RouteActionIR::Forward(fwd) => self.apply_forward(fwd, &route.matcher, req).await,
+                RouteActionIR::Forward(fwd) => {
+                    self.apply_forward(fwd, &route.matcher, &route.request_headers_to_add, req)
+                        .await
+                }
                 RouteActionIR::DirectResponse { status, body } => {
                     drain_request_body(req).await;
                     direct_response(*status, body.as_ref())
@@ -160,6 +173,7 @@ impl RouterHandler {
         &self,
         fwd: &proxy_config::ir::ForwardAction,
         matcher: &RouteMatcher,
+        request_headers_to_add: &[proxy_config::ir::HeaderMutation],
         req: HttpRequestParts,
     ) -> HttpResponseParts {
         let draw = match &fwd.target {
@@ -190,106 +204,298 @@ impl RouterHandler {
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
 
-        // S5: acquire a `max_requests` permit for this cluster before doing
-        // any more work for it. Requests are priority `Default` for now --
-        // per-priority route selection (routing a request to the `HIGH`
-        // bucket) is a later WP; every request lands in the same bucket
-        // until then.
-        let cb = entry.circuit_breaker(RoutingPriority::Default);
-        let Some(rq_guard) = cb.try_acquire_request() else {
-            tracing::debug!(response_flag = "UO", cluster = %cluster_name, "circuit breaker: max_requests exceeded");
-            drain_request_body(req).await;
-            let mut resp = local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
-            resp.head
-                .headers
-                .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
-            return resp;
-        };
-
-        let ctx = LoadBalancerContext::default();
-        let Some(host) = entry.pick_host(&ctx) else {
-            tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
-            drain_request_body(req).await;
-            return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
-        };
-
-        let proto = entry.upstream_protocol();
-        let pool = entry.http_pool(&host, proto);
-        let upstream = match pool.new_stream().await {
-            Ok(upstream) => upstream,
-            Err(PoolError::Overflow) => {
-                tracing::debug!(response_flag = "UO", cluster = %cluster_name, "pool overflow");
-                drain_request_body(req).await;
-                let mut resp = local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
-                resp.head
-                    .headers
-                    .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
-                return resp;
-            }
-            Err(PoolError::ConnectFailure(_)) | Err(PoolError::ConnectTimeout) => {
-                tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream connect failure");
-                drain_request_body(req).await;
-                return local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream connect failure");
-            }
-            // The TCP connect succeeded but the transport socket's handshake
-            // (TLS: bad certificate, no shared ALPN, version mismatch...)
-            // didn't -- Envoy folds this into the same `UF`/connect-failure
-            // bucket as a TCP failure, but it gets its own arm so the log
-            // line says which half actually broke.
-            Err(PoolError::TlsHandshake(_)) => {
-                tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream TLS handshake failure");
-                drain_request_body(req).await;
-                return local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream connect failure");
-            }
-            Err(PoolError::ResetBeforeHeaders) => {
-                tracing::debug!(response_flag = "UR", cluster = %cluster_name, "upstream reset before headers");
-                drain_request_body(req).await;
-                return local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream reset");
-            }
-        };
-
         // Rust note: `downstream` is `Copy`, so this reads it out before
         // `req.head`/`req.body` are moved below (a partial move of `req`) --
-        // provenance flows from the accepted downstream connection onto the
-        // upstream request the router builds.
+        // provenance flows from the accepted downstream connection onto every
+        // upstream request the router builds, retried or not.
         let downstream = req.downstream;
-        let mut upstream_req = HttpRequestParts {
-            head: req.head,
-            body: req.body,
-            downstream,
-        };
-        apply_request_transforms(fwd, matcher, &mut upstream_req.head);
+        let mut head = req.head;
+        apply_request_transforms(fwd, matcher, request_headers_to_add, &mut head);
 
-        // Dispatch on the cluster's configured upstream protocol. Both codecs
-        // yield the same `Result<HttpResponseParts, UpstreamCodecError>`; box
-        // the future so the two arms share one type for the timeout race below.
-        // h2 here is prior-knowledge cleartext (h2c) over the pool's raw TCP
-        // stream -- no per-request `Connection: close`, so it takes no
-        // `Http1Options`.
-        let send: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<HttpResponseParts, UpstreamCodecError>>>,
-        > = match proto {
-            UpstreamProtocol::Http1 => Box::pin(send_upstream_http1(
-                upstream.io,
-                upstream_req,
-                Http1Options { keep_alive: false },
-            )),
-            UpstreamProtocol::Http2 => Box::pin(send_upstream_http2(upstream.io, upstream_req)),
+        // WP-14 (S3): a route with a retry policy has to be able to replay
+        // its request body on every attempt, so it's collected into `Bytes`
+        // once, up front, instead of streamed straight through. A route with
+        // no policy keeps the original zero-copy streaming path -- exactly
+        // one attempt is ever made, so there's nothing to replay and no
+        // buffering cost to pay. Rust note: exactly one of
+        // `streaming_body`/`buffered_body` is ever populated below; a plain
+        // two-variant enum would say that more strongly, but would still need
+        // an unreachable third arm for "neither" -- these two `Option`s do
+        // the same job with less ceremony.
+        let mut retry_state = fwd.retry_policy.as_ref().map(RetryState::new);
+        let mut streaming_body: Option<StreamBody> = None;
+        let buffered_body: Option<Bytes> = match &mut retry_state {
+            Some(state) => match req.body.collect().await {
+                Ok(collected) => {
+                    let bytes = collected.to_bytes();
+                    if bytes.len() > RETRY_REQUEST_BUFFER_LIMIT {
+                        // S3.4 (Envoy's `no_retry_body_too_large`): too big to
+                        // safely hold a second copy of for replay. The
+                        // request still proceeds -- it just can't be retried.
+                        state.mark_body_not_retriable();
+                    }
+                    Some(bytes)
+                }
+                Err(_) => {
+                    return local_reply(StatusCode::BAD_REQUEST, "failed to read request body");
+                }
+            },
+            None => {
+                streaming_body = Some(req.body);
+                None
+            }
         };
 
-        let result = match fwd.timeout {
-            Some(d) => {
+        // S4: `fwd.timeout`, when set, is an *overall* budget across every
+        // attempt (Envoy's route `timeout` is not a per-try timeout -- the IR
+        // has no per-try timeout field, see `RetryPolicyIR::per_try_timeout`'s
+        // doc), so it wraps the whole attempt loop below rather than a single
+        // `send`. With no retry policy the loop runs exactly once, so this is
+        // unobservable from a no-retry route's point of view.
+        let attempt_loop = async {
+            loop {
+                // S5: acquire a `max_requests` permit for this attempt before
+                // doing any more work for it. Requests are priority `Default`
+                // for now -- per-priority route selection is a later WP.
+                // Rust note: scoped to one loop iteration, so `continue`
+                // (a retry) drops it and the next attempt acquires fresh --
+                // exactly what "an attempt is free to land on a different
+                // host" implies for its circuit-breaker accounting too.
+                let cb = entry.circuit_breaker(RoutingPriority::Default);
+                let Some(rq_guard) = cb.try_acquire_request() else {
+                    tracing::debug!(response_flag = "UO", cluster = %cluster_name, "circuit breaker: max_requests exceeded");
+                    drain_leftover_body(&mut streaming_body).await;
+                    let mut resp =
+                        local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
+                    resp.head
+                        .headers
+                        .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
+                    return resp;
+                };
+
+                let ctx = LoadBalancerContext::default();
+                let Some(host) = entry.pick_host(&ctx) else {
+                    tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
+                    drain_leftover_body(&mut streaming_body).await;
+                    return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
+                };
+
+                let proto = entry.upstream_protocol();
+                let pool = entry.http_pool(&host, proto);
+                let upstream = match pool.new_stream().await {
+                    Ok(upstream) => upstream,
+                    Err(err) => {
+                        let outcome = AttemptOutcome::from_pool_error(&err);
+                        if let Some(state) = &mut retry_state {
+                            if state.should_retry(&outcome) {
+                                sleep_backoff_and_record(state).await;
+                                continue;
+                            }
+                        }
+                        drain_leftover_body(&mut streaming_body).await;
+                        return match err {
+                            PoolError::Overflow => {
+                                tracing::debug!(response_flag = "UO", cluster = %cluster_name, "pool overflow");
+                                let mut resp = local_reply(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "upstream overloaded",
+                                );
+                                resp.head
+                                    .headers
+                                    .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
+                                resp
+                            }
+                            PoolError::ConnectFailure(_) | PoolError::ConnectTimeout => {
+                                tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream connect failure");
+                                local_reply(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "upstream connect failure",
+                                )
+                            }
+                            // The TCP connect succeeded but the transport
+                            // socket's handshake (TLS: bad certificate, no
+                            // shared ALPN, version mismatch...) didn't --
+                            // Envoy folds this into the same `UF`/
+                            // connect-failure bucket as a TCP failure, but it
+                            // gets its own arm so the log line says which
+                            // half actually broke.
+                            PoolError::TlsHandshake(_) => {
+                                tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream TLS handshake failure");
+                                local_reply(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "upstream connect failure",
+                                )
+                            }
+                            PoolError::ResetBeforeHeaders => {
+                                tracing::debug!(response_flag = "UR", cluster = %cluster_name, "upstream reset before headers");
+                                local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream reset")
+                            }
+                        };
+                    }
+                };
+
+                // Rust note: a fresh `RequestHeaders` for this attempt --
+                // `head` itself stays owned by the outer scope for the *next*
+                // attempt, so this clones the (small) method/uri/header-map
+                // trio rather than moving `head` away after one use.
+                let attempt_head = RequestHeaders {
+                    method: head.method.clone(),
+                    uri: head.uri.clone(),
+                    headers: head.headers.clone(),
+                };
+                // Rust note: the streaming body can only be taken once (it's
+                // not `Clone` -- it's a boxed, single-consumption stream), so
+                // `.take()` empties it after the first (only, since no retry
+                // policy implies no second iteration) use; the buffered
+                // variant is plain `Bytes`, cheap (refcounted) to `.clone()`
+                // fresh for every attempt.
+                let attempt_body: StreamBody = match streaming_body.take() {
+                    Some(body) => body,
+                    None => body_from_bytes(
+                        buffered_body
+                            .clone()
+                            .expect("retry policy implies buffered_body is populated"),
+                    ),
+                };
+
+                let upstream_req = HttpRequestParts {
+                    head: attempt_head,
+                    body: attempt_body,
+                    downstream,
+                };
+
+                // Dispatch on the cluster's configured upstream protocol.
+                // Both codecs yield the same
+                // `Result<HttpResponseParts, UpstreamCodecError>`; box the
+                // future so the two arms share one type. h2 here is
+                // prior-knowledge cleartext (h2c) over the pool's raw TCP
+                // stream -- no per-request `Connection: close`, so it takes
+                // no `Http1Options`.
+                let send: std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                            Output = Result<HttpResponseParts, UpstreamCodecError>,
+                        >,
+                    >,
+                > = match proto {
+                    UpstreamProtocol::Http1 => Box::pin(send_upstream_http1(
+                        upstream.io,
+                        upstream_req,
+                        Http1Options { keep_alive: false },
+                    )),
+                    UpstreamProtocol::Http2 => {
+                        Box::pin(send_upstream_http2(upstream.io, upstream_req))
+                    }
+                };
+
+                // S4.2: a route with a retry policy may additionally set
+                // `per_try_timeout`, a *single attempt's* budget -- distinct
+                // from `fwd.timeout`'s whole-loop budget wrapped around
+                // `attempt_loop` below. It's armed fresh every time this
+                // point in the loop is reached (a fresh `tokio::time::timeout`
+                // call per iteration, not one timer reused across attempts),
+                // which is what makes attempt N+1 get its own full
+                // `per_try_timeout` rather than inheriting however much of it
+                // attempt N already burned.
+                //
                 // Rust note: `tokio::time::timeout` races `send` against a
-                // timer; on `Err(Elapsed)` the `send` future (and the
-                // `upstream.io` it owns) is dropped, which closes/resets the
-                // upstream connection -- exactly Envoy's `UT` behavior of
-                // abandoning a request that didn't get response headers in
-                // time. Once headers arrive (`Ok(Ok(_))`), the timeout is
-                // fully out of the picture: the *body* stream returned below
-                // has no further deadline (S4 -- this is what makes
-                // LLM-streaming routes safe to bound this way).
-                match tokio::time::timeout(d, send).await {
-                    Ok(inner) => inner,
+                // timer and returns `Err(Elapsed)` on expiry -- exactly like
+                // the outer `fwd.timeout` wrap below, but scoped to just this
+                // attempt. On expiry the `send` future here is dropped
+                // (never polled again), which drops the upstream `TcpStream`
+                // it owns and so resets/closes that one attempt's connection
+                // -- the *next* attempt (if a retry follows) dials a fresh
+                // one via `pool.new_stream()` at the top of the loop, it
+                // never reuses a timed-out connection.
+                let per_try_timeout = fwd
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|policy| policy.per_try_timeout);
+                let attempt_result = match per_try_timeout {
+                    Some(d) => match tokio::time::timeout(d, send).await {
+                        Ok(result) => result,
+                        Err(_elapsed) => {
+                            let outcome = AttemptOutcome::PerTryTimeout;
+                            if let Some(state) = &mut retry_state {
+                                if state.should_retry(&outcome) {
+                                    sleep_backoff_and_record(state).await;
+                                    continue;
+                                }
+                            }
+                            tracing::debug!(
+                                response_flag = "UT",
+                                cluster = %cluster_name,
+                                timeout_ms = d.as_millis(),
+                                "upstream per-try timeout waiting for response headers"
+                            );
+                            return local_reply(
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "upstream request timeout",
+                            );
+                        }
+                    },
+                    None => send.await,
+                };
+
+                match attempt_result {
+                    Ok(mut resp) => {
+                        let outcome = AttemptOutcome::Response(resp.head.status.as_u16());
+                        let retriable = retry_state
+                            .as_ref()
+                            .is_some_and(|state| state.should_retry(&outcome));
+                        if retriable {
+                            // Drain the failed attempt's response body before
+                            // retrying so its connection isn't left dangling
+                            // mid-read.
+                            let _ = resp.body.collect().await;
+                            let state = retry_state.as_mut().expect("checked Some above");
+                            sleep_backoff_and_record(state).await;
+                            continue;
+                        }
+                        // Rust note: the route `timeout` bounds the whole
+                        // attempt loop, not just this last attempt's
+                        // `send` -- once headers arrive here the timeout is
+                        // fully out of the picture: the *body* stream
+                        // returned below has no further deadline (S4 -- this
+                        // is what makes LLM-streaming routes safe to bound
+                        // this way).
+                        if let Some(idle) = fwd.idle_timeout {
+                            resp.body = local_boxed(IdleTimeoutBody::new(resp.body, idle));
+                        }
+                        // S5: wrap outermost (after any idle_timeout wrap) so
+                        // the `max_requests` permit is held until the very
+                        // last response frame is produced or the body is
+                        // dropped, whichever comes first -- not just until
+                        // headers arrive.
+                        resp.body = local_boxed(GuardedBody::new(resp.body, rq_guard));
+                        return resp;
+                    }
+                    Err(err) => {
+                        let outcome = AttemptOutcome::from_codec_error(&err);
+                        if let Some(state) = &mut retry_state {
+                            if state.should_retry(&outcome) {
+                                sleep_backoff_and_record(state).await;
+                                continue;
+                            }
+                        }
+                        tracing::debug!(response_flag = "UC", cluster = %cluster_name, "upstream codec error");
+                        return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
+                    }
+                }
+            }
+        };
+
+        match fwd.timeout {
+            Some(d) => {
+                // Rust note: `tokio::time::timeout` races the whole attempt
+                // loop against a timer; on `Err(Elapsed)` the loop future
+                // (and whatever upstream connection/attempt it's mid-flight
+                // on) is dropped, which closes/resets that connection --
+                // exactly Envoy's `UT` behavior of abandoning a request that
+                // didn't get response headers, across every attempt, in
+                // time.
+                match tokio::time::timeout(d, attempt_loop).await {
+                    Ok(resp) => resp,
                     Err(_elapsed) => {
                         tracing::debug!(
                             response_flag = "UT",
@@ -297,57 +503,70 @@ impl RouterHandler {
                             timeout_ms = d.as_millis(),
                             "upstream request timed out waiting for response headers"
                         );
-                        return local_reply(
-                            StatusCode::GATEWAY_TIMEOUT,
-                            "upstream request timeout",
-                        );
+                        local_reply(StatusCode::GATEWAY_TIMEOUT, "upstream request timeout")
                     }
                 }
             }
-            None => send.await,
-        };
-
-        match result {
-            Ok(mut resp) => {
-                // Rust note: the route `timeout` above is fully spent once
-                // headers arrive -- this is the independent, response-body-
-                // only deadline that picks up from there. Wrapping only on
-                // the success path (not the error/local-reply arms) is
-                // deliberate: `idle_timeout` bounds inter-frame gaps in a
-                // response we actually got, not the absence of one.
-                if let Some(idle) = fwd.idle_timeout {
-                    resp.body = local_boxed(IdleTimeoutBody::new(resp.body, idle));
-                }
-                // S5: wrap outermost (after any idle_timeout wrap) so the
-                // `max_requests` permit is held until the very last response
-                // frame is produced or the body is dropped, whichever comes
-                // first -- not just until headers arrive.
-                resp.body = local_boxed(GuardedBody::new(resp.body, rq_guard));
-                resp
-            }
-            Err(UpstreamCodecError::Handshake(_))
-            | Err(UpstreamCodecError::Connection(_))
-            | Err(UpstreamCodecError::Send(_))
-            // `MissingAuthority` is h2-only (unreachable via `send_upstream_http1`,
-            // which this router chunk exclusively drives) but must be handled here
-            // since the match is over the shared `UpstreamCodecError` enum.
-            | Err(UpstreamCodecError::MissingAuthority) => {
-                tracing::debug!(response_flag = "UC", cluster = %cluster_name, "upstream codec error");
-                local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure")
-            }
+            None => attempt_loop.await,
         }
     }
+}
+
+/// Sleep this attempt's S3.3 backoff delay, then record it against the
+/// retry budget -- in that order, matching `RetryState::backoff_delay`'s doc
+/// (the 1-based attempt number it computes is the same whether read right
+/// before or right after `record_attempt`).
+///
+/// Rust note: `rand::random` is reached for directly here (rather than
+/// threading a `rand::Rng` through) since this is the one real (not
+/// deterministically-tested) call site -- `retry.rs`'s own tests inject a
+/// fixed closure instead.
+async fn sleep_backoff_and_record(state: &mut RetryState<'_>) {
+    let delay = state.backoff_delay(&mut rand::random::<f64>);
+    tokio::time::sleep(delay).await;
+    state.record_attempt();
+}
+
+/// Drain (and discard) a request body that was never handed to an upstream
+/// attempt -- e.g. a circuit-breaker/pick-host/connect failure before the
+/// streaming body was ever taken. Only the (at most once) streaming path
+/// ever has anything left to drain here: the buffered/replay path collects
+/// the whole body up front, so by the time an attempt can fail there's
+/// nothing left on the wire to read. Mirrors `drain_request_body`'s
+/// rationale: a local reply that never reads the body must still consume it
+/// so the downstream connection isn't left with unread bytes.
+async fn drain_leftover_body(streaming_body: &mut Option<StreamBody>) {
+    if let Some(body) = streaming_body.take() {
+        let _ = body.collect().await;
+    }
+}
+
+/// Build a fresh, single-use [`StreamBody`] from already-buffered bytes --
+/// used to replay a retried request's body on each attempt.
+fn body_from_bytes(bytes: Bytes) -> StreamBody {
+    local_boxed(
+        Full::new(bytes).map_err(|infallible: std::convert::Infallible| match infallible {}),
+    )
 }
 
 /// Apply the S13/S4 upstream request transforms to the outgoing request
 /// head, in place, before it's handed to `send_upstream_http1`:
 /// `prefix_rewrite` (rewrites `head.uri`), `host_rewrite_literal` (rewrites
-/// the `Host` header, which is what carries `:authority` over h1), and the
+/// the `Host` header, which is what carries `:authority` over h1), the
 /// `x-envoy-expected-rq-timeout-ms` header Envoy sets from the route's S4
-/// timeout so the upstream knows its deadline.
+/// timeout so the upstream knows its deadline, and finally the route's
+/// `request_headers_to_add` mutations (e.g. provider credentials injected by
+/// the simple dialect).
+///
+/// Ordering: `request_headers_to_add` is applied *last*, after the rewrites
+/// above -- this mirrors Envoy's router `finalizeRequestHeaders`, which
+/// performs host/path rewrite first and then runs the route's header
+/// mutations, so a mutation that happens to target `host` (or any other
+/// rewrite-adjacent header) is the final word, not the rewrite.
 fn apply_request_transforms(
     fwd: &proxy_config::ir::ForwardAction,
     matcher: &RouteMatcher,
+    request_headers_to_add: &[proxy_config::ir::HeaderMutation],
     head: &mut crate::filter::RequestHeaders,
 ) {
     if let Some(rewrite) = &fwd.prefix_rewrite {
@@ -381,6 +600,68 @@ fn apply_request_transforms(
     if let Some(d) = fwd.timeout {
         if let Ok(value) = HeaderValue::from_str(&d.as_millis().to_string()) {
             head.headers.insert("x-envoy-expected-rq-timeout-ms", value);
+        }
+    }
+
+    apply_header_mutations(request_headers_to_add, &mut head.headers);
+}
+
+/// Apply a route's `request_headers_to_add` mutations, in config order, to
+/// the outgoing request headers -- this is what actually gets a
+/// dialect-injected provider credential (`Authorization`/`x-api-key`/
+/// `anthropic-version`/...) onto the wire; see the P0 this fixes in
+/// `router.rs`'s module doc history.
+///
+/// Rust note: `http::HeaderName` always lower-cases on construction (it's
+/// case-insensitive by spec), so parsing `mutation.key` into one and then
+/// using `HeaderMap`'s `contains_key`/`get`/`insert`/`append` (all of which
+/// key off the canonical `HeaderName`) gives case-insensitive matching for
+/// free -- no `.to_ascii_lowercase()` needed anywhere here.
+fn apply_header_mutations(
+    mutations: &[proxy_config::ir::HeaderMutation],
+    headers: &mut http::HeaderMap,
+) {
+    use proxy_config::ir::HeaderAppendAction;
+
+    for mutation in mutations {
+        let Ok(name) = http::HeaderName::from_bytes(mutation.key.as_bytes()) else {
+            tracing::warn!(key = %mutation.key, "request_headers_to_add: invalid header name, skipping");
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(&mutation.value) else {
+            tracing::warn!(key = %mutation.key, "request_headers_to_add: invalid header value, skipping");
+            continue;
+        };
+
+        match mutation.action {
+            // Keep any existing value(s) and add this as an additional
+            // instance -- `HeaderMap::append` (unlike `insert`) never
+            // displaces what's already there.
+            HeaderAppendAction::AppendIfExistsOrAdd => {
+                headers.append(name, value);
+            }
+            // Only insert when nothing with this name is present yet; a
+            // client-supplied value (e.g. a client-forged `Authorization`)
+            // must not be able to displace it, but this action also must not
+            // clobber an existing one -- this is the security-relevant case
+            // from the task: it is NOT the same as `OverwriteIfExistsOrAdd`.
+            HeaderAppendAction::AddIfAbsent => {
+                if !headers.contains_key(&name) {
+                    headers.insert(name, value);
+                }
+            }
+            // Replace any existing value(s), or insert if absent.
+            // `HeaderMap::insert` already drops every prior value for this
+            // name and installs exactly one.
+            HeaderAppendAction::OverwriteIfExistsOrAdd => {
+                headers.insert(name, value);
+            }
+            // Replace only if already present; never insert.
+            HeaderAppendAction::OverwriteIfExists => {
+                if headers.contains_key(&name) {
+                    headers.insert(name, value);
+                }
+            }
         }
     }
 }
