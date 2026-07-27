@@ -21,6 +21,8 @@
 //! - `metadata_match` merge between route- and weighted-cluster-level
 //!   overrides (S1.5): `WeightedClusters`/`ForwardTarget` carry no metadata.
 
+use std::sync::Arc;
+
 use proxy_config::ir::{
     ForwardTarget, HeaderMatch, HeaderMatchKind, PathMatch, RouteEntry, RouteMatcher, RouteTable,
     VirtualHostIR,
@@ -64,7 +66,18 @@ pub struct RouteRequest<'a> {
 pub enum RouteMatch<'t> {
     Found {
         vhost: &'t VirtualHostIR,
-        route: &'t RouteEntry,
+        // Rust note: `&'t Arc<RouteEntry>`, not `&'t RouteEntry` -- the extra
+        // layer matters. `VirtualHostIR.routes` is `Vec<Arc<RouteEntry>>`
+        // (WP-12), and the filter manager's route cache (S2.8) needs to hold
+        // an OWNED, cheaply-cloned handle to the matched route across the
+        // rest of the stream (past this call's borrow of the route table),
+        // not just read its fields. Borrowing the `Arc` itself (rather than
+        // deref'ing straight to `&RouteEntry`, which would throw the `Arc`
+        // away) lets a caller do `route.clone()` -- an `Arc` refcount bump,
+        // not a deep copy -- to get that owned handle. Every existing caller
+        // that only reads fields off `route` (`route.action`, `route.matcher`,
+        // ...) keeps compiling unchanged: `Arc<T>` derefs to `&T` automatically.
+        route: &'t Arc<RouteEntry>,
     },
     /// A virtual host matched but no route did -> 404, response flag `NR`.
     NoRoute { vhost: &'t VirtualHostIR },

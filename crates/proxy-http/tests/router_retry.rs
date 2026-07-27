@@ -131,6 +131,7 @@ fn request_with_body(path: &'static str, body: &'static [u8]) -> HttpRequestPart
         ),
         downstream: DownstreamInfo::loopback(),
         stream_info: None,
+        route: None,
     }
 }
 

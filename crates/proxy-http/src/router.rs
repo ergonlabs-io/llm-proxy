@@ -134,9 +134,22 @@ impl RouterHandler {
         req: HttpRequestParts,
         stream_info: Rc<RefCell<StreamInfo>>,
     ) -> HttpResponseParts {
+        // S2.8 (ADR-0004 step 1): the filter manager already resolved (and
+        // cached) the route before handing us this request -- reuse that
+        // `Arc` rather than matching a second time. `None` means no chain sat
+        // in front of this handler (a standalone/test invocation, or a
+        // hand-built `RouterHandler` in a unit test), so we fall back to
+        // resolving privately, exactly as this router did before ADR-0004.
+        //
+        // Rust note: `.clone()` on `Option<Arc<RouteEntry>>` bumps the
+        // `Arc`'s refcount; it never deep-copies `RouteEntry`.
+        let route_from_chain = req.route.clone();
+
         // Rust note: `req.head.uri.authority()` borrows from `req.head`, so
         // this has to be resolved before `req` is destructured/moved below;
-        // the `Host` header fallback borrows from the same `req.head`.
+        // the `Host` header fallback borrows from the same `req.head`. Used
+        // both by the private-resolution fallback and by the "no route"
+        // trace below, regardless of which path produced `None`.
         let host_header = req
             .head
             .headers
@@ -156,18 +169,34 @@ impl RouterHandler {
             .map(|p| p.as_str())
             .unwrap_or("/");
 
-        let route_req = RouteRequest {
-            authority,
-            path,
-            headers: &req.head.headers,
+        let route = match route_from_chain {
+            Some(route) => Some(route),
+            None => {
+                let route_req = RouteRequest {
+                    authority,
+                    path,
+                    headers: &req.head.headers,
+                };
+                // Rust note: `match_route` borrows from `self.route_table`
+                // (its `'t` lifetime) and from `route_req` (which itself
+                // borrows `req.head`), so the match has to be turned into an
+                // owned `Arc` (`.clone()`) here, before `req` is
+                // destructured/moved below.
+                //
+                // `RouteMatch::NoVirtualHost` and `RouteMatch::NoRoute` both
+                // collapse to `None` here -- this router has always treated
+                // the two identically (same trace, same response flag, same
+                // 404), so no behavior is lost by no longer naming which one
+                // it was.
+                match match_route(&self.route_table, &route_req) {
+                    RouteMatch::Found { route, .. } => Some(route.clone()),
+                    RouteMatch::NoRoute { .. } | RouteMatch::NoVirtualHost => None,
+                }
+            }
         };
 
-        // Rust note: `match_route` borrows from `self.route_table` (its `'t`
-        // lifetime) and from `route_req` (which itself borrows `req.head`),
-        // so the match has to be fully handled -- and `req`'s body drained or
-        // moved on -- before this function returns.
-        match match_route(&self.route_table, &route_req) {
-            RouteMatch::NoVirtualHost | RouteMatch::NoRoute { .. } => {
+        match route {
+            None => {
                 tracing::debug!(response_flag = "NR", authority, path, "no route matched");
                 stream_info
                     .borrow_mut()
@@ -175,7 +204,7 @@ impl RouterHandler {
                 drain_request_body(req).await;
                 local_reply(StatusCode::NOT_FOUND, "no route matched")
             }
-            RouteMatch::Found { route, .. } => match &route.action {
+            Some(route) => match &route.action {
                 RouteActionIR::Forward(fwd) => {
                     self.apply_forward(
                         fwd,
@@ -457,6 +486,10 @@ impl RouterHandler {
                     // this stream's own `StreamInfo` -- the codec functions
                     // don't consume it, so there's nothing to share here.
                     stream_info: None,
+                    // Likewise not meaningful for an outgoing upstream
+                    // request -- `route` (S2.8) is a downstream-request
+                    // concept.
+                    route: None,
                 };
 
                 // Dispatch on the cluster's configured upstream protocol.
@@ -1080,6 +1113,7 @@ mod tests {
             ),
             downstream: DownstreamInfo::loopback(),
             stream_info: None,
+            route: None,
         }
     }
 
@@ -1205,6 +1239,82 @@ mod tests {
                 .expect("should complete well within the test's own guard timeout");
 
                 assert_eq!(resp.head.status, StatusCode::OK);
+            })
+            .await;
+    }
+
+    /// ADR-0004 step 1: a request matching no route still yields the
+    /// existing 404 + `NoRouteFound` response flag, end to end -- proves
+    /// collapsing `RouteMatch::NoVirtualHost`/`RouteMatch::NoRoute` into a
+    /// single `None` (in `route_and_forward`'s private-resolution fallback)
+    /// didn't change observable behavior.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_route_match_yields_404_and_no_route_found_flag() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, _rx) = spawn_reflecting_upstream().await;
+                let router = build_router(
+                    addr,
+                    prefix_matcher("/configured-only"),
+                    forward_to_up(None, None, None),
+                )
+                .await;
+
+                let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
+                let mut req = request("/does-not-match");
+                req.stream_info = Some(stream_info.clone());
+
+                let resp = router.handle(req).await;
+                assert_eq!(resp.head.status, StatusCode::NOT_FOUND);
+                let _ = resp.body.collect().await;
+
+                assert!(
+                    stream_info
+                        .borrow()
+                        .response_flags()
+                        .contains(&ResponseFlag::NoRouteFound),
+                    "expected the NR response flag on a no-route request"
+                );
+            })
+            .await;
+    }
+
+    /// S2.8 (ADR-0004 step 1): when the request already carries a
+    /// chain-resolved route (`req.route`), the router uses THAT instead of
+    /// re-matching against its own table. Here the router's own table would
+    /// 404 the request path (it only matches `/configured-only`), but the
+    /// chain hands it a route that forwards to a real cluster anyway --
+    /// proving the private resolution in `route_and_forward` is only a
+    /// fallback, not always consulted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn req_route_from_chain_is_used_instead_of_private_resolution() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, rx) = spawn_reflecting_upstream().await;
+                let router = build_router(
+                    addr,
+                    prefix_matcher("/configured-only"),
+                    forward_to_up(None, None, None),
+                )
+                .await;
+
+                let mut req = request("/mismatch");
+                req.route = Some(Arc::new(RouteEntry {
+                    name: None,
+                    matcher: prefix_matcher("/mismatch"),
+                    action: RouteActionIR::Forward(forward_to_up(None, None, None)),
+                    request_headers_to_add: Vec::new(),
+                }));
+
+                let resp = router.handle(req).await;
+                assert_eq!(
+                    resp.head.status,
+                    StatusCode::OK,
+                    "the chain-resolved route (S2.8) must be used, not a private \
+                     re-match against a path that wouldn't have matched the \
+                     router's own table"
+                );
+                let _ = rx.await;
             })
             .await;
     }

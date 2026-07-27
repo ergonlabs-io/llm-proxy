@@ -10,7 +10,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use http_body_util::BodyExt;
-use proxy_config::ir::{AccessLogFormat, AccessLogSink};
+use proxy_config::ir::{
+    AccessLogFormat, AccessLogSink, ForwardAction, ForwardTarget, PathMatch, RouteActionIR,
+    RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
+};
 use proxy_observability::access_log::parse_format;
 
 use super::*;
@@ -34,6 +37,15 @@ type SeenDecodeData = Rc<RefCell<Vec<(Bytes, bool)>>>;
 
 fn log_of() -> Log {
     Rc::new(RefCell::new(Vec::new()))
+}
+
+/// A route table with no virtual hosts, for tests that need to hand
+/// `FilterChainHandler` SOME table (it's a required field, S2.8) but don't
+/// exercise routing themselves -- `route()` then always returns `None`,
+/// matching this suite's pre-S2.8 behavior everywhere except the tests below
+/// that build their own real table.
+fn empty_route_table() -> Arc<RouteTable> {
+    Arc::new(RouteTable::new("test-routes".to_string(), Vec::new()).expect("empty table is valid"))
 }
 
 /// A configurable probe filter. Each field controls one callback's return.
@@ -245,6 +257,7 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
         stream_info: None,
+        route: None,
     }
 }
 
@@ -260,6 +273,7 @@ fn request_with_trailers(body: &'static [u8], trailers: HeaderMap) -> HttpReques
         body: bytes_to_seam_body(Bytes::from_static(body), Some(trailers)),
         downstream: DownstreamInfo::loopback(),
         stream_info: None,
+        route: None,
     }
 }
 
@@ -289,6 +303,35 @@ async fn run_chain_req(
     let resp_body = resp.body.collect().await.expect("resp body").to_bytes();
     let seen = seen_body.borrow().clone();
     (status, seen, resp_body)
+}
+
+/// Like [`run_chain_req`], but with a real route table attached to `ctx`
+/// (S2.8) -- for the route-resolution tests below, which need `route()` to
+/// resolve against something rather than always returning `None`.
+async fn run_chain_req_with_route_table(
+    filters: Vec<Box<dyn HttpFilter>>,
+    log: Log,
+    req: HttpRequestParts,
+    route_table: Arc<RouteTable>,
+) -> StatusCode {
+    let seen_body = Rc::new(RefCell::new(Bytes::new()));
+    let terminal = RecordingTerminal {
+        log,
+        seen_body,
+        seen_request_id: Rc::new(RefCell::new(None)),
+        seen_headers: None,
+    };
+    let mgr = FilterManager {
+        filters,
+        ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())))
+            .with_route_table(route_table),
+        terminal: &terminal,
+        buffer_limit: DEFAULT_BUFFER_LIMIT,
+    };
+    let resp = mgr.run(req).await;
+    let status = resp.head.status;
+    let _ = resp.body.collect().await;
+    status
 }
 
 /// A terminal handler that records that it ran and echoes a fixed 200 with the
@@ -1769,25 +1812,218 @@ fn encode_injection_from_position_p_seen_only_after_p() {
     });
 }
 
-/// S2.8 (I9): a filter mutating a routing-relevant header must call
-/// `clear_route_cache()`; the cache is NOT auto-invalidated. Needs the
-/// WP-12 route table to have anything to differentially resolve against — no
-/// route is ever cached yet (`ctx.route` is always `None`, filter_manager.rs).
+// --- S2.8 (ADR-0004 step 1): the filter manager resolves and caches the
+// route, and `DecoderCallbacks::route()`/`clear_route_cache()` are real. ---
+
+/// Build a request identical to [`request`] except for `:path` -- the S2.8
+/// tests below need to control which route matches.
+fn request_with_path(path: &'static str, body: &'static [u8]) -> HttpRequestParts {
+    HttpRequestParts {
+        head: RequestHeaders {
+            method: Method::POST,
+            uri: Uri::from_static(path),
+            headers: HeaderMap::new(),
+        },
+        body: bytes_to_seam_body(Bytes::from_static(body), None),
+        downstream: DownstreamInfo::loopback(),
+        stream_info: None,
+        route: None,
+    }
+}
+
+/// A route table fixture for the tests below: domain `*` with two routes,
+/// distinguished by path prefix, so a filter that rewrites `:path` can be
+/// proven to land on a genuinely DIFFERENT route, not just re-match the same
+/// one.
+fn route_table_two_routes() -> Arc<RouteTable> {
+    fn route(name: &str, prefix: &str, cluster: &str) -> Arc<RouteEntry> {
+        Arc::new(RouteEntry {
+            name: Some(name.to_string()),
+            matcher: RouteMatcher {
+                path: PathMatch::Prefix(prefix.to_string()),
+                case_sensitive: true,
+                headers: Vec::new(),
+            },
+            action: RouteActionIR::Forward(ForwardAction {
+                target: ForwardTarget::Cluster(cluster.to_string()),
+                timeout: None,
+                idle_timeout: None,
+                retry_policy: None,
+                host_rewrite_literal: None,
+                prefix_rewrite: None,
+            }),
+            request_headers_to_add: Vec::new(),
+        })
+    }
+    Arc::new(
+        RouteTable::new(
+            "test-routes".to_string(),
+            vec![VirtualHostIR {
+                name: "vh".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![
+                    route("route-a", "/a", "cluster-a"),
+                    route("route-b", "/b", "cluster-b"),
+                ],
+            }],
+        )
+        .expect("two non-overlapping prefixes on one domain is a valid table"),
+    )
+}
+
+/// S2.8 test filter: calls `cb.route()` some number of times from
+/// `decode_headers` (recording each result), optionally rewrites `:path` and
+/// calls `clear_route_cache()` at the end of `decode_headers`, and -- if
+/// asked -- calls `route()` once more from `decode_data`. The split across
+/// two callbacks matters: the manager only re-reads `:authority`/`:path`
+/// from the live head immediately before EACH filter callback (see
+/// `sync_route_head`'s doc in the parent module), so a mutation this same
+/// filter makes to its `headers` parameter only becomes visible to `route()`
+/// on the NEXT callback the driver hands it -- `decode_data`, here.
+struct RouteProbeFilter {
+    seen: Rc<RefCell<Vec<Option<Arc<RouteEntry>>>>>,
+    calls_in_headers: usize,
+    rewrite_path: Option<&'static str>,
+    call_route_in_data: bool,
+}
+
+impl HttpFilter for RouteProbeFilter {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        for _ in 0..self.calls_in_headers {
+            self.seen.borrow_mut().push(cb.route());
+        }
+        if let Some(path) = self.rewrite_path {
+            headers.uri = Uri::from_static(path);
+            cb.clear_route_cache();
+        }
+        FilterHeadersStatus::Continue
+    }
+
+    fn decode_data(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _data: &mut Bytes,
+        _end_stream: bool,
+    ) -> FilterDataStatus {
+        if self.call_route_in_data {
+            self.seen.borrow_mut().push(cb.route());
+        }
+        FilterDataStatus::Continue
+    }
+}
+
+/// The headline fix: a decode filter calling `cb.route()` gets the matching
+/// `RouteEntry`, not `None`.
 #[test]
-#[ignore = "WP-11 chunk 4 / WP-12: route cache (S2.8)"]
-fn route_cache_is_not_auto_invalidated_on_header_mutation() {
-    let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
-    let cb = DecoderCallbacksAdapter { ctx: &mut ctx };
-    // There is no route table to resolve against yet (WP-12) — `route()`
-    // always returns `None`. The differential fixture this needs: resolve a
-    // route, mutate a routing header without calling `clear_route_cache()`,
-    // and assert `route()` still returns the STALE cached route rather than
-    // re-resolving.
-    assert!(
-        cb.route().is_some(),
-        "once route resolution exists, a cached route must survive a header \
-         mutation unless clear_route_cache() is called (S2.8)"
-    );
+fn route_resolves_to_the_matching_route_entry() {
+    block_on(async {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let filter = RouteProbeFilter {
+            seen: seen.clone(),
+            calls_in_headers: 1,
+            rewrite_path: None,
+            call_route_in_data: false,
+        };
+        let status = run_chain_req_with_route_table(
+            vec![Box::new(filter)],
+            log_of(),
+            request_with_path("/a/chat", b""),
+            route_table_two_routes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        let route = seen[0].as_ref().expect("route() must resolve, not None");
+        assert_eq!(route.name.as_deref(), Some("route-a"));
+    });
+}
+
+/// Resolution happens ONCE across multiple `route()` calls: every call
+/// (absent a `clear_route_cache()`) returns the SAME `Arc` allocation.
+#[test]
+fn route_resolves_only_once_across_repeated_calls() {
+    block_on(async {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let filter = RouteProbeFilter {
+            seen: seen.clone(),
+            calls_in_headers: 3,
+            rewrite_path: None,
+            call_route_in_data: false,
+        };
+        let status = run_chain_req_with_route_table(
+            vec![Box::new(filter)],
+            log_of(),
+            request_with_path("/a/chat", b""),
+            route_table_two_routes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 3);
+        let first = seen[0].as_ref().expect("must resolve");
+        for (i, route) in seen.iter().enumerate() {
+            let route = route.as_ref().expect("must resolve");
+            assert!(
+                Arc::ptr_eq(first, route),
+                "call #{i} returned a different allocation than call #0 -- \
+                 route() re-resolved instead of returning the cached Arc"
+            );
+        }
+    });
+}
+
+/// The S2.8 contract that matters most: a filter rewrites `:path` to
+/// something matching a DIFFERENT route and calls `clear_route_cache()`; the
+/// next `route()` call (on the next callback the driver hands this filter,
+/// per `RouteProbeFilter`'s doc) returns that different route, not the
+/// stale cached one.
+#[test]
+fn clear_route_cache_forces_re_resolution_after_a_path_rewrite() {
+    block_on(async {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let filter = RouteProbeFilter {
+            seen: seen.clone(),
+            calls_in_headers: 1,
+            rewrite_path: Some("http://example.test/b/chat"),
+            call_route_in_data: true,
+        };
+        let status = run_chain_req_with_route_table(
+            vec![Box::new(filter)],
+            log_of(),
+            request_with_path("/a/chat", b"body"),
+            route_table_two_routes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.len(),
+            2,
+            "one call from decode_headers, one from decode_data"
+        );
+        let before = seen[0].as_ref().expect("must resolve before the rewrite");
+        let after = seen[1]
+            .as_ref()
+            .expect("must re-resolve after clear_route_cache(), not stay None");
+        assert_eq!(before.name.as_deref(), Some("route-a"));
+        assert_eq!(
+            after.name.as_deref(),
+            Some("route-b"),
+            "clear_route_cache() must force re-resolution against the REWRITTEN \
+             :path, not replay the stale cached route (S2.8)"
+        );
+        assert!(
+            !Arc::ptr_eq(before, after),
+            "before/after must be genuinely different allocations, not the same \
+             route re-matched"
+        );
+    });
 }
 
 // --- S9: `x-request-id` generation, at the `FilterChainHandler` level ---
@@ -1813,7 +2049,14 @@ fn run_through_handler(
             seen_request_id: seen_request_id.clone(),
             seen_headers: None,
         });
-        let handler = FilterChainHandler::new(Vec::new(), terminal, generate_request_id, false, 0);
+        let handler = FilterChainHandler::new(
+            Vec::new(),
+            terminal,
+            empty_route_table(),
+            generate_request_id,
+            false,
+            0,
+        );
 
         let mut req = request(b"hi");
         if let Some(id) = existing_request_id {
@@ -1898,6 +2141,7 @@ fn run_through_handler_xff(
         let handler = FilterChainHandler::new(
             Vec::new(),
             terminal,
+            empty_route_table(),
             false,
             use_remote_address,
             xff_num_trusted_hops,
@@ -2124,6 +2368,7 @@ fn encode_filters_end_of_stream_write_reaches_the_access_log_line() {
         let handler = FilterChainHandler::new_with_access_logs(
             vec![Arc::new(StampsUsageOnEndStreamFilterFactory)],
             terminal,
+            empty_route_table(),
             false,
             false,
             0,
@@ -2166,6 +2411,7 @@ fn a_filter_chain_local_reply_still_produces_an_access_log_line() {
         let handler = FilterChainHandler::new_with_access_logs(
             vec![Arc::new(LocalReplyFilterFactory)],
             terminal,
+            empty_route_table(),
             false,
             false,
             0,

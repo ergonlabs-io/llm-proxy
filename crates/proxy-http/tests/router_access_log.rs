@@ -152,10 +152,19 @@ async fn build_router(
     )
     .unwrap();
 
+    let route_table = Arc::new(route_table);
     let terminal: Rc<dyn StreamHandler> =
-        Rc::new(RouterHandler::new(Arc::new(route_table), Arc::new(manager)));
-    FilterChainHandler::new_with_access_logs(Vec::new(), terminal, false, false, 0, &access_logs)
-        .expect("test access-log sinks (temp files/stdout) always open cleanly")
+        Rc::new(RouterHandler::new(route_table.clone(), Arc::new(manager)));
+    FilterChainHandler::new_with_access_logs(
+        Vec::new(),
+        terminal,
+        route_table,
+        false,
+        false,
+        0,
+        &access_logs,
+    )
+    .expect("test access-log sinks (temp files/stdout) always open cleanly")
 }
 
 fn request(path: &'static str) -> HttpRequestParts {
@@ -173,6 +182,7 @@ fn request(path: &'static str) -> HttpRequestParts {
         ),
         downstream: DownstreamInfo::loopback(),
         stream_info: None,
+        route: None,
     }
 }
 

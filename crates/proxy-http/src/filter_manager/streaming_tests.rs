@@ -144,6 +144,7 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
         stream_info: None,
+        route: None,
     }
 }
 

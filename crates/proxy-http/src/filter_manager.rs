@@ -104,7 +104,7 @@ use http::HeaderMap;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Frame};
 
-use proxy_config::ir::{AccessLogIR, RouteEntry};
+use proxy_config::ir::{AccessLogIR, RouteEntry, RouteTable};
 
 use crate::access_logging::{
     snapshot_request_headers, AccessLogContext, AccessLoggerRuntime, LoggingBody,
@@ -118,6 +118,7 @@ use crate::handler::{
     local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody as SeamBody,
     StreamHandler,
 };
+use crate::route::{match_route, RouteMatch, RouteRequest};
 use crate::stream_info::StreamInfo;
 
 /// Default per-direction buffer limit (Envoy's
@@ -135,6 +136,11 @@ pub struct FilterChainHandler {
     factories: Vec<Arc<dyn FilterInstanceFactory>>,
     /// The router stand-in: consumes the (decoded) request, produces a response.
     terminal: Rc<dyn StreamHandler>,
+    /// S2.8 (ADR-0004 step 1): this HCM's route table -- the manager, not the
+    /// router, now owns route resolution. Handed to each stream's `ChainCtx`
+    /// so `DecoderCallbacks::route()` (and the terminal-request resolution in
+    /// `FilterManager::run`) can match against it.
+    route_table: Arc<RouteTable>,
     buffer_limit: usize,
     /// S9/HCM: generate `x-request-id` when the request lacks one (Envoy
     /// default true).
@@ -169,6 +175,7 @@ impl FilterChainHandler {
     pub fn new(
         factories: Vec<Arc<dyn FilterInstanceFactory>>,
         terminal: Rc<dyn StreamHandler>,
+        route_table: Arc<RouteTable>,
         generate_request_id: bool,
         use_remote_address: bool,
         xff_num_trusted_hops: u32,
@@ -176,6 +183,7 @@ impl FilterChainHandler {
         Self {
             factories,
             terminal,
+            route_table,
             buffer_limit: DEFAULT_BUFFER_LIMIT,
             generate_request_id,
             use_remote_address,
@@ -197,6 +205,7 @@ impl FilterChainHandler {
     pub fn new_with_access_logs(
         factories: Vec<Arc<dyn FilterInstanceFactory>>,
         terminal: Rc<dyn StreamHandler>,
+        route_table: Arc<RouteTable>,
         generate_request_id: bool,
         use_remote_address: bool,
         xff_num_trusted_hops: u32,
@@ -209,6 +218,7 @@ impl FilterChainHandler {
             ..Self::new(
                 factories,
                 terminal,
+                route_table,
                 generate_request_id,
                 use_remote_address,
                 xff_num_trusted_hops,
@@ -295,7 +305,7 @@ impl StreamHandler for FilterChainHandler {
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
             let mgr = FilterManager {
                 filters,
-                ctx: ChainCtx::new(stream_info.clone()),
+                ctx: ChainCtx::new(stream_info.clone()).with_route_table(self.route_table.clone()),
                 terminal: self.terminal.as_ref(),
                 buffer_limit: self.buffer_limit,
             };
@@ -413,8 +423,33 @@ struct ChainCtx {
     /// `!Send` runtime (ADR-0003), so there's no cross-thread contention to
     /// pay atomic-refcount cost for.
     stream_info: Rc<RefCell<StreamInfo>>,
-    /// Cached route (S2.8). TODO(WP-11 chunk 4 / WP-12): lazy resolution against
-    /// the route table; always `None` here.
+    /// S2.8 (ADR-0004 step 1): the route table this stream resolves against.
+    /// `None` for a standalone/test invocation with no HCM route table
+    /// configured (e.g. `FilterManager` driven directly in a unit test) --
+    /// `route()` then always returns `None`, the same behavior this field
+    /// had before route resolution existed.
+    route_table: Option<Arc<RouteTable>>,
+    /// S2.8: the `:authority`/`:path`/headers the NEXT unresolved `route()`
+    /// call matches against. Refreshed by the decode driver from the LIVE
+    /// request head immediately before every filter callback (see
+    /// `sync_route_head` and its call sites in `drive_decode` /
+    /// `deliver_decode_data` / `drain_decode_injections`) -- deliberately
+    /// NOT computed once at the start of the whole decode chain and left
+    /// alone. A decode filter may rewrite `:authority`/`:path` and then call
+    /// `clear_route_cache()`; the next filter's `route()` call must resolve
+    /// against what THAT filter changed it to, not the request as it arrived
+    /// on the wire. That re-read is the entire point of S2.8.
+    route_authority: String,
+    route_path: String,
+    route_headers: HeaderMap,
+    /// Cached route (S2.8), populated lazily by [`resolve_and_cache_route`]
+    /// (used by both [`DecoderCallbacksAdapter::route`] and, once the decode
+    /// chain finishes, [`FilterManager::run`] itself before building the
+    /// terminal request). `None` means either "not yet resolved" or
+    /// "resolved to no match" -- both correctly retry resolution on the next
+    /// call, which matters when an earlier filter's rewrite makes a route
+    /// newly reachable. [`DecoderCallbacksAdapter::clear_route_cache`] resets
+    /// this to `None` to force a re-resolution.
     route: Option<Arc<RouteEntry>>,
     /// S2.5: a pending `send_local_reply()`, recorded here by
     /// [`DecoderCallbacksAdapter::send_local_reply`] and consumed by `run()`.
@@ -459,12 +494,86 @@ impl ChainCtx {
             decode: DirectionState::default(),
             encode: EncodeState::default(),
             stream_info,
+            route_table: None,
+            route_authority: String::new(),
+            route_path: String::new(),
+            route_headers: HeaderMap::new(),
             route: None,
             local_reply: None,
             response_headers_forwarded: false,
             reset_after_headers: false,
             request_headers_snapshot: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Attach the route table this stream resolves against (S2.8). A separate
+    /// builder method rather than a `new` parameter, so every existing
+    /// call site that doesn't exercise routing (most direct `FilterManager`
+    /// tests) is unaffected -- `route()` simply keeps returning `None` for
+    /// them, matching pre-S2.8 behavior.
+    fn with_route_table(mut self, route_table: Arc<RouteTable>) -> Self {
+        self.route_table = Some(route_table);
+        self
+    }
+}
+
+/// S2.8: refresh `ctx`'s route-resolution snapshot (`:authority`, `:path`,
+/// headers) from the LIVE request head. Called immediately before every
+/// decode filter callback (see the call sites in `drive_decode` /
+/// `deliver_decode_data` / `drain_decode_injections`), never once at the
+/// start of the whole decode chain -- see `ChainCtx::route_authority`'s doc
+/// for why that distinction is the entire point of S2.8.
+fn sync_route_head(ctx: &mut ChainCtx, head: &RequestHeaders) {
+    let host_header = head
+        .headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    ctx.route_authority = head
+        .uri
+        .authority()
+        .map(|a| a.as_str())
+        .or(host_header)
+        .unwrap_or("")
+        .to_string();
+    ctx.route_path = head
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+    // Rust note: `HeaderMap::clone()` is a full copy, not a refcount bump --
+    // acceptable here because request header maps are small (LLM proxy
+    // traffic, not bulk data) and this only runs once per filter callback,
+    // never per-byte.
+    ctx.route_headers = head.headers.clone();
+}
+
+/// S2.8: resolve (and cache) the route against `ctx`'s current snapshot,
+/// shared by [`DecoderCallbacksAdapter::route`] and by [`FilterManager::run`]
+/// (so the terminal gets a result consistent with whatever a decode filter
+/// already observed via `route()`/`clear_route_cache()`). Returns the cached
+/// `Arc` without touching the route table when one is already cached.
+fn resolve_and_cache_route(ctx: &mut ChainCtx) -> Option<Arc<RouteEntry>> {
+    if let Some(route) = &ctx.route {
+        return Some(route.clone());
+    }
+    let table = ctx.route_table.as_ref()?;
+    let route_req = RouteRequest {
+        authority: &ctx.route_authority,
+        path: &ctx.route_path,
+        headers: &ctx.route_headers,
+    };
+    match match_route(table, &route_req) {
+        RouteMatch::Found { route, .. } => {
+            let route = route.clone();
+            ctx.route = Some(route.clone());
+            Some(route)
+        }
+        // No match: cache nothing, so the very next call retries -- exactly
+        // what lets a filter's rewrite (e.g. a path rewrite that makes a
+        // different route reachable) be observed without an explicit
+        // `clear_route_cache()` when nothing was cached in the first place.
+        RouteMatch::NoRoute { .. } | RouteMatch::NoVirtualHost => None,
     }
 }
 
@@ -608,6 +717,16 @@ impl FilterManager<'_> {
         // terminal handler ahead of the original body.
         let decoded_body = join_buffer(&ctx.decode.buffer, &body);
 
+        // S2.8: resolve (and cache) the route through the exact same path
+        // `DecoderCallbacksAdapter::route()` uses, so the terminal (the
+        // router stand-in) sees a result consistent with whatever a decode
+        // filter already observed via `route()`/`clear_route_cache()` --
+        // rather than the router resolving privately a second time
+        // (ADR-0004 step 1). Synced from `head` one last time here since this
+        // is the last point before `head` moves into `terminal_req` below.
+        sync_route_head(&mut ctx, &head);
+        let route = resolve_and_cache_route(&mut ctx);
+
         // --- terminal handler (router stand-in) ---
         // Hand the terminal (the router) the SAME `StreamInfo` the decode
         // filters above just wrote into -- an `Rc::clone` (cheap refcount
@@ -618,6 +737,7 @@ impl FilterManager<'_> {
             body: bytes_to_seam_body(decoded_body, req_trailers.map(|t| t.0)),
             downstream,
             stream_info: Some(ctx.stream_info.clone()),
+            route,
         };
         let resp = terminal.handle(terminal_req).await;
         let HttpResponseParts { mut head, mut body } = resp;
@@ -1608,6 +1728,10 @@ fn drive_decode(
         // Split borrow: `&mut filters[idx]`, `&mut *head`, and an adapter over
         // `&mut *ctx` are three disjoint borrows (module doc).
         ctx.decode.current_idx = idx;
+        // S2.8: refresh the route-resolution snapshot from the LIVE head
+        // immediately before this filter runs -- see `sync_route_head`'s doc
+        // for why this can't be done once, up front, for the whole chain.
+        sync_route_head(ctx, head);
         let mut cb = DecoderCallbacksAdapter { ctx };
         let status = filters[idx].decode_headers(&mut cb, head, end_stream_on_headers);
         // A filter that buffered via add_decoded_data must not exceed the limit.
@@ -1618,7 +1742,7 @@ fn drive_decode(
         // anything else with its status — injected data reaches subsequent
         // filters immediately, not whenever the normal pointer machine
         // happens to get there.
-        drain_decode_injections(filters, ctx, buffer_limit)?;
+        drain_decode_injections(filters, ctx, buffer_limit, head)?;
 
         // S2.5: once a filter has requested a local reply, decode iteration
         // stops immediately — no filter after the sender sees the request, and
@@ -1650,6 +1774,7 @@ fn drive_decode(
                     body,
                     trailers,
                     &mut data_consumed,
+                    head,
                 )?;
                 // S2.5: a `send_local_reply` from this filter's data/trailers
                 // callback stops decode just as a header-phase one does.
@@ -1680,6 +1805,7 @@ fn drive_decode(
             body,
             trailers,
             &mut data_consumed,
+            head,
         )?;
         // S2.5: stop the trailing-data phase too if a local reply was requested.
         if ctx.local_reply.is_some() {
@@ -1691,6 +1817,13 @@ fn drive_decode(
 
 /// Deliver the buffered body (and, if the filter continues, trailers) to filter
 /// `idx` exactly once. Returns whether it continued. Marks `data_consumed[idx]`.
+///
+/// `head` (S2.8, ADR-0004 step 1) is the one addition over the pre-S2.8
+/// signature -- bundling it with the other split-storage borrows into a
+/// struct isn't a clean win here (the borrows are all short-lived reborrows
+/// scoped to individual calls within `drive_decode`, not one value that
+/// outlives the whole function), so this just accepts the extra parameter.
+#[allow(clippy::too_many_arguments)]
 fn deliver_decode_data(
     filters: &mut [Box<dyn HttpFilter>],
     ctx: &mut ChainCtx,
@@ -1699,10 +1832,15 @@ fn deliver_decode_data(
     body: &mut Bytes,
     trailers: Option<&RequestTrailers>,
     data_consumed: &mut [bool],
+    head: &RequestHeaders,
 ) -> Result<bool, http::StatusCode> {
     data_consumed[idx] = true;
     ctx.decode.continue_requested = false;
     ctx.decode.current_idx = idx;
+    // S2.8: same refresh as `drive_decode`'s header-phase call site -- `head`
+    // may have been mutated by this same filter's own (already-returned)
+    // `decode_headers` call.
+    sync_route_head(ctx, head);
     let end_stream = trailers.is_none();
     let mut cb = DecoderCallbacksAdapter { ctx };
     let status = filters[idx].decode_data(&mut cb, body, end_stream);
@@ -1711,17 +1849,18 @@ fn deliver_decode_data(
     }
     // S2.7: `idx` may have injected data out-of-band from `decode_data` —
     // deliver it to filters after `idx` before deciding anything else.
-    drain_decode_injections(filters, ctx, buffer_limit)?;
+    drain_decode_injections(filters, ctx, buffer_limit, head)?;
     let continued = matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested;
 
     if continued {
         if let Some(t) = trailers {
             ctx.decode.current_idx = idx;
+            sync_route_head(ctx, head);
             let mut cb = DecoderCallbacksAdapter { ctx };
             let mut owned = RequestTrailers(t.0.clone());
             let _ = filters[idx].decode_trailers(&mut cb, &mut owned);
             // S2.7: same for an injection from `decode_trailers`.
-            drain_decode_injections(filters, ctx, buffer_limit)?;
+            drain_decode_injections(filters, ctx, buffer_limit, head)?;
         }
     }
     Ok(continued)
@@ -1749,6 +1888,7 @@ fn drain_decode_injections(
     filters: &mut [Box<dyn HttpFilter>],
     ctx: &mut ChainCtx,
     buffer_limit: usize,
+    head: &RequestHeaders,
 ) -> Result<(), http::StatusCode> {
     while let Some((from_idx, mut data, end_stream)) = ctx.decode.injected.pop_front() {
         let n = filters.len();
@@ -1756,6 +1896,9 @@ fn drain_decode_injections(
         while idx < n {
             ctx.decode.current_idx = idx;
             ctx.decode.continue_requested = false;
+            // S2.8: same refresh as elsewhere -- an injected chunk's
+            // recipient can call `route()` too.
+            sync_route_head(ctx, head);
             let mut cb = DecoderCallbacksAdapter { ctx };
             let status = filters[idx].decode_data(&mut cb, &mut data, end_stream);
             if ctx.decode.buffer.0.len() > buffer_limit {
@@ -1857,9 +2000,12 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
         f(&mut self.ctx.decode.buffer.0);
     }
 
-    fn route(&self) -> Option<Arc<RouteEntry>> {
-        // TODO(WP-11 chunk 4 / WP-12): lazy resolution against the route table.
-        self.ctx.route.clone()
+    fn route(&mut self) -> Option<Arc<RouteEntry>> {
+        // S2.8: resolve lazily, against whatever `sync_route_head` most
+        // recently refreshed `self.ctx` with (i.e. the request as of THIS
+        // callback), and cache it -- shared with `FilterManager::run`'s own
+        // pre-terminal resolution so both see the same answer.
+        resolve_and_cache_route(self.ctx)
     }
 
     fn clear_route_cache(&mut self) {
@@ -1948,6 +2094,10 @@ async fn collect_request(
         // that's only set on the *terminal* request built further down in
         // `run()`, once `ctx.stream_info` exists (module doc).
         stream_info: _,
+        // Likewise: nothing has resolved a route for the inbound request yet
+        // (S2.8) -- that's set on the terminal request too, once the decode
+        // chain has run.
+        route: _,
     } = req;
     let collected = body.collect().await.map_err(|_| ())?;
     let trailers = collected.trailers().cloned().map(RequestTrailers);

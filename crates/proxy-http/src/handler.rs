@@ -80,6 +80,16 @@ pub struct HttpRequestParts {
     /// with interior mutability, but `!Send` (ADR-0003: no atomics needed,
     /// since a stream never leaves its worker's single thread).
     pub stream_info: Option<std::rc::Rc<std::cell::RefCell<StreamInfo>>>,
+    /// The route the filter chain resolved and cached (S2.8), handed to the
+    /// terminal so it does not resolve a second time. `None` means no chain
+    /// is present (a standalone or test invocation) and the handler should
+    /// resolve its own.
+    ///
+    /// TEMPORARY: this field disappears in step 3 of ADR-0004, when the
+    /// router becomes a terminal `HttpFilter` and reads `cb.route()` directly
+    /// like every other filter. It exists only because the router is still a
+    /// `StreamHandler` behind the filter-manager seam.
+    pub route: Option<std::sync::Arc<proxy_config::ir::RouteEntry>>,
 }
 
 /// Downstream (client-facing) connection provenance, captured when the

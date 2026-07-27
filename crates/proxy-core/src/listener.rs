@@ -824,6 +824,7 @@ fn build_hcm_handler(
         FilterChainHandler::new_with_access_logs(
             factories,
             terminal,
+            hcm.route_table.clone(),
             hcm.generate_request_id,
             hcm.use_remote_address,
             hcm.xff_num_trusted_hops,

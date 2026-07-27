@@ -130,6 +130,7 @@ fn request_with_headers(path: &'static str, headers: HeaderMap) -> HttpRequestPa
         ),
         downstream: DownstreamInfo::loopback(),
         stream_info: None,
+        route: None,
     }
 }
 

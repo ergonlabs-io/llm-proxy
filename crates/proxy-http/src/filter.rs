@@ -132,8 +132,13 @@ pub trait DecoderCallbacks {
     /// Only legal before any data has been continued past this filter (S2.7).
     fn modify_decoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut));
 
-    /// The cached route (S2.8). Resolved lazily on first access.
-    fn route(&self) -> Option<Arc<RouteEntry>>;
+    /// The cached route (S2.8). Resolved lazily on first access: the manager
+    /// matches against the LIVE `:authority`/`:path` (as of whichever filter
+    /// callback is running) the first time this is called, caches the result,
+    /// and returns the cached `Arc` on every subsequent call until
+    /// `clear_route_cache()` drops it. `&mut self` (not `&self`): resolving is
+    /// the whole point, and that has to write the cache.
+    fn route(&mut self) -> Option<Arc<RouteEntry>>;
 
     /// S2.8: the route cache is NOT auto-invalidated — any filter mutating
     /// routing-relevant headers must call this (differential fixture required).
