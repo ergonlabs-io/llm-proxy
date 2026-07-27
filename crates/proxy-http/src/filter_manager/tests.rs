@@ -93,6 +93,10 @@ struct ProbeFilter {
     /// `inject_encoded_data_to_filter_chain(data, end_stream)` before
     /// returning `encode_data_status`.
     inject_encoded: Option<(Bytes, bool)>,
+    /// ADR-0004 step 2 test hook: the request headers this filter observed in
+    /// `decode_headers`, so a test can assert a mutation made by an EARLIER
+    /// async filter (during its resumption) is visible here.
+    seen_decode_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
 }
 
 impl ProbeFilter {
@@ -118,6 +122,7 @@ impl ProbeFilter {
             inject_decoded: None,
             seen_decode_data: None,
             inject_encoded: None,
+            seen_decode_headers: None,
         }
     }
 
@@ -130,10 +135,13 @@ impl HttpFilter for ProbeFilter {
     fn decode_headers(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
-        _headers: &mut RequestHeaders,
+        headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
         self.record("decode_headers");
+        if let Some(seen) = &self.seen_decode_headers {
+            *seen.borrow_mut() = Some(headers.headers.clone());
+        }
         if let Some(data) = &self.add_decoded {
             cb.add_decoded_data(data.clone(), false);
         }
@@ -2436,5 +2444,239 @@ fn a_filter_chain_local_reply_still_produces_an_access_log_line() {
         );
 
         std::fs::remove_file(&path).ok();
+    });
+}
+
+// --- ADR-0004 step 2: async decode filters (`poll_pending`) ----------------
+
+/// A decode filter that returns `StopIteration` from `decode_headers` on its
+/// first invocation and offers a `poll_pending` future (one `yield_now`) that
+/// the driver must await before re-invoking `decode_headers` on this same
+/// filter — at which point it sets `ran` and returns `Continue`. `calls`
+/// tracks how many times `decode_headers` actually fired, so a test can
+/// assert the resumption really re-invoked the callback rather than the
+/// driver inventing progress on its own.
+struct AsyncPauseFilter {
+    log: Log,
+    name: &'static str,
+    calls: Rc<RefCell<u32>>,
+    ran: Rc<RefCell<bool>>,
+    /// If set, applied to the request headers on the SECOND `decode_headers`
+    /// call (i.e. "mutation the filter makes once its async work is done" —
+    /// per `HttpFilter::poll_pending`'s contract, the future itself can't
+    /// touch callbacks/headers, only the next synchronous callback can).
+    mutate_on_resume: Option<(&'static str, &'static str)>,
+}
+
+impl HttpFilter for AsyncPauseFilter {
+    fn decode_headers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        let mut calls = self.calls.borrow_mut();
+        *calls += 1;
+        self.log
+            .borrow_mut()
+            .push(format!("{}:decode_headers#{calls}", self.name));
+        if *calls == 1 {
+            FilterHeadersStatus::StopIteration
+        } else {
+            if let Some((name, value)) = self.mutate_on_resume {
+                headers.headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+                    HeaderValue::from_str(value).expect("valid header value"),
+                );
+            }
+            FilterHeadersStatus::Continue
+        }
+    }
+
+    fn poll_pending<'a>(&'a mut self) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+        // Only the first `decode_headers` call (the one that returned
+        // `StopIteration`) has async work; the second returns `Continue`, so
+        // the driver never asks again.
+        if *self.calls.borrow() == 1 {
+            let ran = self.ran.clone();
+            Some(Box::pin(async move {
+                tokio::task::yield_now().await;
+                *ran.borrow_mut() = true;
+            }))
+        } else {
+            None
+        }
+    }
+}
+
+/// Test 1 (headline capability): a decode filter pauses on `decode_headers`,
+/// does async work via `poll_pending`, sets a flag, and on resumption returns
+/// `Continue` — the request reaches the terminal, and the async work
+/// demonstrably ran.
+#[test]
+fn async_decode_filter_pauses_does_async_work_and_resumes_the_chain() {
+    block_on(async {
+        let log = log_of();
+        let calls = Rc::new(RefCell::new(0));
+        let ran = Rc::new(RefCell::new(false));
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(AsyncPauseFilter {
+            log: log.clone(),
+            name: "a",
+            calls: calls.clone(),
+            ran: ran.clone(),
+            mutate_on_resume: None,
+        })];
+        let (status, seen_body, _) =
+            run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the request must reach the terminal"
+        );
+        assert_eq!(seen_body, Bytes::from_static(b"hi"));
+        assert!(
+            *ran.borrow(),
+            "poll_pending's future must have been awaited by the driver"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            2,
+            "decode_headers must be re-invoked on the same filter after the \
+             async resumption, not skipped over"
+        );
+        assert!(
+            log.borrow().contains(&"terminal".to_string()),
+            "log: {:?}",
+            log.borrow()
+        );
+    });
+}
+
+/// Test 2: an async decode filter's header mutation (applied when it's
+/// re-invoked after its async phase) is visible to the NEXT filter in the
+/// chain.
+#[test]
+fn async_decode_filter_header_mutation_is_visible_to_the_next_filter() {
+    block_on(async {
+        let log = log_of();
+        let calls = Rc::new(RefCell::new(0));
+        let ran = Rc::new(RefCell::new(false));
+        let seen_by_b = Rc::new(RefCell::new(None));
+        let mut b = ProbeFilter::new("b", log.clone());
+        b.seen_decode_headers = Some(seen_by_b.clone());
+        let filters: Vec<Box<dyn HttpFilter>> = vec![
+            Box::new(AsyncPauseFilter {
+                log: log.clone(),
+                name: "a",
+                calls: calls.clone(),
+                ran: ran.clone(),
+                mutate_on_resume: Some(("x-async-set", "yes")),
+            }),
+            Box::new(b),
+        ];
+        let (status, _, _) = run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(*ran.borrow());
+        let seen = seen_by_b.borrow().clone().expect("b must have run");
+        assert_eq!(
+            seen.get("x-async-set").map(|v| v.to_str().unwrap()),
+            Some("yes"),
+            "the header `a` set on resumption must be visible to `b`, the next \
+             filter in the chain"
+        );
+    });
+}
+
+/// Test 3 (no regression): a filter returning `StopIteration` with the
+/// default `poll_pending` (`None`) behaves exactly as before this change —
+/// `decode_headers` fires exactly once, the buffered data still resolves the
+/// hold, and the request still reaches the terminal.
+#[test]
+fn stop_iteration_with_default_poll_pending_is_unchanged() {
+    block_on(async {
+        let log = log_of();
+        let mut a = ProbeFilter::new("a", log.clone());
+        a.decode_headers_status = FilterHeadersStatus::StopIteration;
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a)];
+        let (status, seen_body, _) =
+            run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen_body, Bytes::from_static(b"hi"));
+        let entries = log.borrow().clone();
+        let decode_headers_calls = entries
+            .iter()
+            .filter(|e| e.as_str() == "a:decode_headers")
+            .count();
+        assert_eq!(
+            decode_headers_calls, 1,
+            "the default (no async work) `poll_pending` must not cause an \
+             extra `decode_headers` invocation; log: {entries:?}"
+        );
+    });
+}
+
+/// A decode filter that ALWAYS reports async work pending, and always stops
+/// again once resumed — the runaway case ADR-0004 step 2 must guard against.
+struct AlwaysPendingFilter {
+    resumptions: Rc<RefCell<u32>>,
+}
+
+impl HttpFilter for AlwaysPendingFilter {
+    fn decode_headers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        _headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        FilterHeadersStatus::StopIteration
+    }
+
+    fn poll_pending<'a>(&'a mut self) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+        let resumptions = self.resumptions.clone();
+        Some(Box::pin(async move {
+            tokio::task::yield_now().await;
+            *resumptions.borrow_mut() += 1;
+        }))
+    }
+}
+
+/// Test 4: a filter whose `poll_pending` always returns `Some` must not spin
+/// the chain forever — the driver's resumption budget must fail closed with a
+/// local reply instead. Bounded by an outer `tokio::time::timeout` so a
+/// regression that DOES hang fails this test instead of wedging CI.
+#[test]
+fn a_filter_that_always_reports_pending_work_fails_closed_instead_of_hanging() {
+    block_on(async {
+        let resumptions = Rc::new(RefCell::new(0u32));
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(AlwaysPendingFilter {
+            resumptions: resumptions.clone(),
+        })];
+        let log = log_of();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT),
+        )
+        .await
+        .expect("must not hang: the resumption budget must terminate the chain");
+
+        let (status, _, _) = result;
+        assert!(
+            status.is_server_error(),
+            "a runaway async filter must fail closed with a local reply, not \
+             hang or silently succeed; got {status}"
+        );
+        assert!(
+            *resumptions.borrow() > 0,
+            "the filter must actually have been given async resumptions \
+             before the budget cut it off"
+        );
+        assert!(
+            !log.borrow().contains(&"terminal".to_string()),
+            "a runaway filter must never let the request reach the terminal"
+        );
     });
 }

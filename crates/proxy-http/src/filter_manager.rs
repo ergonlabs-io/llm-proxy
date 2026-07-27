@@ -679,7 +679,9 @@ impl FilterManager<'_> {
             &mut head,
             &mut body,
             req_trailers.as_ref(),
-        ) {
+        )
+        .await
+        {
             let reply = LocalReply::new(
                 status,
                 "request rejected by filter chain",
@@ -1710,7 +1712,12 @@ impl Drop for StreamingEncoder {
 /// per-filter effect — each `decode_data` called once, in config order — is
 /// preserved. A hold that never resolves synchronously (async buffering /
 /// local reply) is chunk 3; here it simply stops progression past that filter.
-fn drive_decode(
+///
+/// ADR-0004 step 2: `async fn`, so a `StopIteration*` from `decode_headers` or
+/// `decode_data` can now also mean "ask the filter if it has async work"
+/// (`HttpFilter::poll_pending`) instead of only "wait for `continue_decoding()`".
+/// See [`poll_async_resumption`] for the shared retry policy both call sites use.
+async fn drive_decode(
     filters: &mut [Box<dyn HttpFilter>],
     ctx: &mut ChainCtx,
     buffer_limit: usize,
@@ -1720,6 +1727,10 @@ fn drive_decode(
 ) -> Result<(), http::StatusCode> {
     let end_stream_on_headers = body.is_empty() && trailers.is_none();
     let mut data_consumed = vec![false; filters.len()];
+    // ADR-0004 step 2: how many times each filter has been given an async
+    // resumption so far, this direction — see `poll_async_resumption`'s doc
+    // for the bound this enforces.
+    let mut resumptions = vec![0u32; filters.len()];
     // `header_reach`: one past the last filter that received (and continued on)
     // headers. Filters `[0, header_reach)` get data in the trailing phase.
     let mut header_reach = 0;
@@ -1764,6 +1775,27 @@ fn drive_decode(
             FilterHeadersStatus::StopIteration
             | FilterHeadersStatus::StopAllIterationAndBuffer
             | FilterHeadersStatus::StopAllIterationAndWatermark => {
+                // ADR-0004 step 2: before falling back to today's "deliver the
+                // buffered data to this same filter now" behavior, give the
+                // filter a chance to do async work. `poll_async_resumption`
+                // re-drives `decode_headers` on this SAME filter once its
+                // future resolves — there is no other place in this pointer
+                // machine to "resume from headers", so re-invoking the
+                // callback that stopped IS the resumption (exactly as
+                // `continue_decoding()` resuming it synchronously would have
+                // led straight back here).
+                if poll_async_resumption(filters, ctx, idx, &mut resumptions).await {
+                    if ctx.local_reply.is_some() {
+                        return Ok(());
+                    }
+                    continue; // retry decode_headers at the same idx
+                }
+                // Either there was no pending future (today's behavior), or
+                // the resumption budget was just exhausted and `ctx.local_reply`
+                // is now set — either way, fall through to the ordinary path.
+                if ctx.local_reply.is_some() {
+                    return Ok(());
+                }
                 // Headers held at `idx`. Deliver the (buffered) data to this same
                 // filter; if it continues, resume header delivery at the next.
                 let continued = deliver_decode_data(
@@ -1775,7 +1807,9 @@ fn drive_decode(
                     trailers,
                     &mut data_consumed,
                     head,
-                )?;
+                    &mut resumptions,
+                )
+                .await?;
                 // S2.5: a `send_local_reply` from this filter's data/trailers
                 // callback stops decode just as a header-phase one does.
                 if ctx.local_reply.is_some() {
@@ -1806,13 +1840,62 @@ fn drive_decode(
             trailers,
             &mut data_consumed,
             head,
-        )?;
+            &mut resumptions,
+        )
+        .await?;
         // S2.5: stop the trailing-data phase too if a local reply was requested.
         if ctx.local_reply.is_some() {
             return Ok(());
         }
     }
     Ok(())
+}
+
+/// ADR-0004 step 2: how many times a single filter may be given an async
+/// resumption (a `Some` from `poll_pending`) for one direction of one stream.
+/// A filter whose async work never lands — a bug, or a misbehaving extension
+/// that always reports more pending work — must not spin the decode chain
+/// forever; once a filter exceeds this many resumptions we fail closed
+/// (a local reply) instead of hanging. Chosen generously: legitimate async
+/// filters (e.g. `ext_authz`, WP-32) resolve in one resumption per callback
+/// invocation, not a loop of their own.
+const MAX_ASYNC_RESUMPTIONS_PER_FILTER: u32 = 16;
+
+/// Ask `filters[idx]` whether it has async work pending (`HttpFilter::poll_pending`)
+/// and, if so, await it. Returns `true` when the caller should retry the
+/// callback that just stopped (the future resolved and the budget wasn't
+/// exceeded); `false` when there was nothing pending (today's behavior:
+/// fall through to the synchronous hold) OR the per-filter resumption budget
+/// ([`MAX_ASYNC_RESUMPTIONS_PER_FILTER`]) was just exhausted — in the latter
+/// case `ctx.local_reply` is set, and callers must check
+/// `ctx.local_reply.is_some()` themselves (mirroring every other local-reply
+/// check in this file) rather than relying on the `bool` alone.
+///
+/// Rust note: `poll_pending`'s returned future borrows only `filters[idx]`
+/// (`&'a mut self` in `filter.rs`) — never `ctx` — so holding it across the
+/// `.await` below only keeps `filters` mutably borrowed, not `ctx`. That's
+/// exactly the split-storage discipline the module doc describes, just
+/// stretched across an await point instead of a single synchronous call.
+async fn poll_async_resumption(
+    filters: &mut [Box<dyn HttpFilter>],
+    ctx: &mut ChainCtx,
+    idx: usize,
+    resumptions: &mut [u32],
+) -> bool {
+    let Some(fut) = filters[idx].poll_pending() else {
+        return false;
+    };
+    resumptions[idx] += 1;
+    if resumptions[idx] > MAX_ASYNC_RESUMPTIONS_PER_FILTER {
+        ctx.local_reply = Some(LocalReply::new(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "filter chain did not complete",
+            "async_filter_resumption_limit_exceeded",
+        ));
+        return false;
+    }
+    fut.await;
+    true
 }
 
 /// Deliver the buffered body (and, if the filter continues, trailers) to filter
@@ -1823,8 +1906,13 @@ fn drive_decode(
 /// struct isn't a clean win here (the borrows are all short-lived reborrows
 /// scoped to individual calls within `drive_decode`, not one value that
 /// outlives the whole function), so this just accepts the extra parameter.
+///
+/// ADR-0004 step 2: `async fn`, and `resumptions` (the same per-filter budget
+/// `drive_decode`'s header phase uses) lets a filter that stopped on
+/// `decode_data` also be offered an async resumption before this falls back
+/// to "stopped, wait for `continue_decoding()`" — see [`poll_async_resumption`].
 #[allow(clippy::too_many_arguments)]
-fn deliver_decode_data(
+async fn deliver_decode_data(
     filters: &mut [Box<dyn HttpFilter>],
     ctx: &mut ChainCtx,
     buffer_limit: usize,
@@ -1833,6 +1921,7 @@ fn deliver_decode_data(
     trailers: Option<&RequestTrailers>,
     data_consumed: &mut [bool],
     head: &RequestHeaders,
+    resumptions: &mut [u32],
 ) -> Result<bool, http::StatusCode> {
     data_consumed[idx] = true;
     ctx.decode.continue_requested = false;
@@ -1842,28 +1931,51 @@ fn deliver_decode_data(
     // `decode_headers` call.
     sync_route_head(ctx, head);
     let end_stream = trailers.is_none();
-    let mut cb = DecoderCallbacksAdapter { ctx };
-    let status = filters[idx].decode_data(&mut cb, body, end_stream);
-    if ctx.decode.buffer.0.len() > buffer_limit {
-        return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    // S2.7: `idx` may have injected data out-of-band from `decode_data` —
-    // deliver it to filters after `idx` before deciding anything else.
-    drain_decode_injections(filters, ctx, buffer_limit, head)?;
-    let continued = matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested;
-
-    if continued {
-        if let Some(t) = trailers {
-            ctx.decode.current_idx = idx;
-            sync_route_head(ctx, head);
-            let mut cb = DecoderCallbacksAdapter { ctx };
-            let mut owned = RequestTrailers(t.0.clone());
-            let _ = filters[idx].decode_trailers(&mut cb, &mut owned);
-            // S2.7: same for an injection from `decode_trailers`.
-            drain_decode_injections(filters, ctx, buffer_limit, head)?;
+    // ADR-0004 step 2: a `loop` because a filter may ask for (bounded) async
+    // resumptions before it finally continues or gives up; every other
+    // iteration is the same synchronous `decode_data` call chunk 1 always made.
+    loop {
+        let mut cb = DecoderCallbacksAdapter { ctx };
+        let status = filters[idx].decode_data(&mut cb, body, end_stream);
+        if ctx.decode.buffer.0.len() > buffer_limit {
+            return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
         }
+        // S2.7: `idx` may have injected data out-of-band from `decode_data` —
+        // deliver it to filters after `idx` before deciding anything else.
+        drain_decode_injections(filters, ctx, buffer_limit, head)?;
+        let continued =
+            matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested;
+
+        if continued {
+            if let Some(t) = trailers {
+                ctx.decode.current_idx = idx;
+                sync_route_head(ctx, head);
+                let mut cb = DecoderCallbacksAdapter { ctx };
+                let mut owned = RequestTrailers(t.0.clone());
+                let _ = filters[idx].decode_trailers(&mut cb, &mut owned);
+                // S2.7: same for an injection from `decode_trailers`.
+                drain_decode_injections(filters, ctx, buffer_limit, head)?;
+            }
+            return Ok(true);
+        }
+
+        // Not continued: offer this filter an async resumption before
+        // falling back to "stopped" (today's behavior).
+        if poll_async_resumption(filters, ctx, idx, resumptions).await {
+            if ctx.local_reply.is_some() {
+                return Ok(false);
+            }
+            // Retry `decode_data` at the same `idx` — same policy as the
+            // header phase: re-invoking the callback that stopped is the
+            // resumption.
+            ctx.decode.continue_requested = false;
+            continue;
+        }
+        // `poll_async_resumption` may have set `ctx.local_reply` itself
+        // (resumption budget exhausted); either way the caller's own
+        // `ctx.local_reply.is_some()` check right after this call handles it.
+        return Ok(false);
     }
-    Ok(continued)
 }
 
 /// S2.7: deliver every out-of-band injection queued in `ctx.decode.injected`

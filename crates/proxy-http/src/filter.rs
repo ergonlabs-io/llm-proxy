@@ -250,6 +250,34 @@ pub trait HttpFilter {
 
     /// Called once when the stream ends or resets; release resources here.
     fn on_destroy(&mut self) {}
+
+    /// Asynchronous continuation, polled by the filter manager after this
+    /// filter has returned a `StopIteration*` status from a decode callback.
+    ///
+    /// `Some(fut)` means "I have work in flight: await it, then re-drive the
+    /// chain from me". `None` — the default — keeps the existing meaning:
+    /// stopped until something calls `continue_decoding()`.
+    ///
+    /// Anything the filter needs from its callbacks must be captured BEFORE
+    /// returning the future: the future borrows only `self`, not the
+    /// callbacks. Results are applied on the next synchronous callback, when
+    /// callbacks are available again. See ADR-0004 for why.
+    ///
+    /// Rust note: a boxed, pinned, `!Send` future — the same shape
+    /// `StreamHandler` already uses (`crate::handler`), and for the same
+    /// reason: an `async fn` in a trait isn't object-safe (its `Future` type
+    /// would have to be part of the trait's vtable, which Rust doesn't
+    /// support), so we return the desugared form by hand. `!Send` is correct
+    /// per ADR-0003 — the whole stream, filters included, lives on one
+    /// worker's `!Send` `LocalSet`, so nothing here ever needs to cross a
+    /// thread. The `'a` lifetime ties the future to the `&mut self` borrow
+    /// that produced it: the borrow checker then guarantees the future can't
+    /// outlive (or be polled after) the filter instance it reads from.
+    fn poll_pending<'a>(
+        &'a mut self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>> {
+        None
+    }
 }
 
 /// Marker trait for parsed per-route filter config (`typed_per_filter_config`).
