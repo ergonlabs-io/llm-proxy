@@ -46,27 +46,27 @@
 //! - `RouteActionIR::Redirect` (returns 501 below).
 //!
 //! WP-24 chunk 3: response flags are recorded onto a per-request
-//! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below, and --
-//! when the route's HCM has `access_logs` configured -- a rendered line is
-//! written per logger once the response stream ends (`logging::LoggingBody`,
-//! wrapped outermost in [`RouterHandler::handle`]). See `logging`'s module
-//! doc for why that has to be at stream end, not at header-flush time.
+//! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below --
+//! `%BYTES_RECEIVED%`, upstream host/cluster/protocol, response flags. This
+//! router no longer renders access-log lines itself: that moved up to
+//! [`crate::filter_manager::FilterChainHandler`] (see its module doc and
+//! [`crate::access_logging`]'s doc for why -- in short, this router sits
+//! INSIDE the encode filter chain, so logging from here can never observe
+//! what an encode filter does at end-of-stream).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::{LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol};
-use proxy_config::ir::{
-    AccessLogIR, DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable,
-};
+use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable};
 use proxy_observability::ResponseFlag;
 
+use crate::access_logging::CountingRequestBody;
 use crate::codec::{send_upstream_http1, send_upstream_http2, Http1Options, UpstreamCodecError};
 use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{local_boxed, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
@@ -75,11 +75,9 @@ use crate::route::{apply_prefix_rewrite, match_route, select_cluster, RouteMatch
 use crate::stream_info::StreamInfo;
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
-use logging::{AccessLogContext, AccessLoggerRuntime, CountingRequestBody, LoggingBody};
 
 mod guarded;
 mod idle;
-mod logging;
 
 /// S3.4 (Envoy's `no_retry_body_too_large`): the largest request body this
 /// router will hold in memory for retry replay. Matches
@@ -96,12 +94,6 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 pub struct RouterHandler {
     route_table: Arc<RouteTable>,
     clusters: Arc<ClusterManager>,
-    /// WP-24 chunk 3: this HCM's configured access loggers, already resolved
-    /// to open sinks -- empty when the HCM has no `access_logs`, in which
-    /// case [`RouterHandler::handle`] skips the logging wrap entirely.
-    /// `Rc` (not `Arc`): shared cheaply across every request this
-    /// (`!Send`, per-worker) handler serves, never across workers.
-    access_loggers: Rc<Vec<AccessLoggerRuntime>>,
 }
 
 impl RouterHandler {
@@ -109,29 +101,7 @@ impl RouterHandler {
         Self {
             route_table,
             clusters,
-            access_loggers: Rc::new(Vec::new()),
         }
-    }
-
-    /// Like [`Self::new`], but resolving `access_logs` into live sinks
-    /// (opening/sharing files via a fresh [`logging::AccessLoggerRuntime`]
-    /// registry scoped to this one build) -- what `proxy-core`'s
-    /// `build_hcm_handler` calls, since every HCM in real config carries its
-    /// own `access_logs`. Kept as a separate constructor (rather than adding
-    /// a parameter to `new`) so every existing caller that has no sinks to
-    /// build -- and so no `io::Error` to handle -- is unaffected.
-    pub fn new_with_access_logs(
-        route_table: Arc<RouteTable>,
-        clusters: Arc<ClusterManager>,
-        access_logs: &[AccessLogIR],
-    ) -> std::io::Result<Self> {
-        let registry = proxy_observability::sink::SinkRegistry::new();
-        let access_loggers = AccessLoggerRuntime::build_all(access_logs, &registry)?;
-        Ok(Self {
-            route_table,
-            clusters,
-            access_loggers: Rc::new(access_loggers),
-        })
     }
 }
 
@@ -143,66 +113,22 @@ impl StreamHandler for RouterHandler {
         &'a self,
         req: HttpRequestParts,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>> {
-        Box::pin(async move { self.handle_and_log(req).await })
+        Box::pin(async move {
+            // Envoy's model (see `filter_manager`'s module doc): one
+            // `StreamInfo` per stream, shared with the filter chain wrapping
+            // this router. Take the handle the chain already built when
+            // present; only mint a fresh one for a standalone/test
+            // invocation with no chain in front of it.
+            let stream_info = req
+                .stream_info
+                .clone()
+                .unwrap_or_else(|| Rc::new(RefCell::new(StreamInfo::default())));
+            self.route_and_forward(req, stream_info).await
+        })
     }
 }
 
 impl RouterHandler {
-    /// The `StreamHandler::handle` entry point: builds the per-request
-    /// [`StreamInfo`] and access-log context, routes/forwards
-    /// ([`Self::route_and_forward`]), then -- only if this HCM has
-    /// `access_logs` configured -- wraps the response body in
-    /// [`LoggingBody`] so a line is written once the stream actually ends.
-    async fn handle_and_log(&self, req: HttpRequestParts) -> HttpResponseParts {
-        let start_time = SystemTime::now();
-        let start_instant = Instant::now();
-        let downstream_remote_address = req.downstream.remote.to_string();
-
-        // Rust note: snapshot the *pre-router* request headers for logging.
-        // This already reflects any S9 mutations the filter chain made
-        // upstream of the router (x-request-id, XFF, ...), but deliberately
-        // not this route's own `request_headers_to_add` (provider
-        // credentials injected later, in `apply_request_transforms`) -- an
-        // access log must never become a place a dialect-injected
-        // `Authorization`/`x-api-key` header leaks to.
-        let mut request_headers = req.head.headers.clone();
-        // `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%` (the default access-log
-        // format's own path field) falls back to a `:PATH` pseudo-header
-        // `header_lookup` can never resolve (see its doc in
-        // `proxy_observability::access_log`) -- populating the *primary*
-        // here, the same normal header name real Envoy sets on a
-        // `prefix_rewrite`, is what makes that default format usable at all
-        // for the path, without touching the (frozen) formatter itself.
-        let original_path = req.head.uri.path().to_string();
-        if !request_headers.contains_key("x-envoy-original-path") {
-            if let Ok(v) = HeaderValue::from_str(&original_path) {
-                request_headers.insert("x-envoy-original-path", v);
-            }
-        }
-
-        let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
-        let resp = self.route_and_forward(req, stream_info.clone()).await;
-
-        if self.access_loggers.is_empty() {
-            return resp;
-        }
-
-        let ctx = AccessLogContext {
-            loggers: self.access_loggers.clone(),
-            stream_info,
-            start_time,
-            start_instant,
-            request_headers,
-            response_headers: resp.head.headers.clone(),
-            response_code: resp.head.status.as_u16(),
-            downstream_remote_address,
-        };
-        HttpResponseParts {
-            head: resp.head,
-            body: local_boxed(LoggingBody::new(resp.body, ctx)),
-        }
-    }
-
     async fn route_and_forward(
         &self,
         req: HttpRequestParts,
@@ -527,6 +453,10 @@ impl RouterHandler {
                     head: attempt_head,
                     body: attempt_body,
                     downstream,
+                    // This is the OUTGOING request to the upstream codec, not
+                    // this stream's own `StreamInfo` -- the codec functions
+                    // don't consume it, so there's nothing to share here.
+                    stream_info: None,
                 };
 
                 // Dispatch on the cluster's configured upstream protocol.
@@ -1149,6 +1079,7 @@ mod tests {
                     .map_err(|infallible: std::convert::Infallible| match infallible {}),
             ),
             downstream: DownstreamInfo::loopback(),
+            stream_info: None,
         }
     }
 

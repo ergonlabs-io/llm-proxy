@@ -6,6 +6,8 @@
 //! - WP-32: ext_authz, ratelimit (gRPC RLS), ext_proc (client side).
 //! - Lane H (LLM layer):
 //!   - WP-33: streaming-first guarantees + GenAI observability (TTFT/TPOT).
+//!     [`usage_filter`] wires the WP-34 extractor below into the real encode
+//!     path.
 //!   - WP-34: token metering & token-based rate limiting (budget-store seam).
 //!   - WP-35: model routing (body peek -> cluster_header) & provider fallback.
 //!   - WP-36: Gateway API Inference Extension endpoint-picker support.
@@ -13,3 +15,4 @@
 //!     token metering, session quotas, Close-frame drains) — Appendix S10.
 
 pub mod usage;
+pub mod usage_filter;

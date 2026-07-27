@@ -194,7 +194,7 @@ mod tests {
             .expect("valid config builds a factory");
         let mut filter = instance_factory.create_filter();
 
-        struct NoopEncoderCallbacks(proxy_http::stream_info::StreamInfo);
+        struct NoopEncoderCallbacks(std::cell::RefCell<proxy_http::stream_info::StreamInfo>);
         impl EncoderCallbacks for NoopEncoderCallbacks {
             fn continue_encoding(&mut self) {}
             fn add_encoded_data(&mut self, _data: bytes::Bytes, _streaming: bool) {}
@@ -208,11 +208,15 @@ mod tests {
                 None
             }
             fn modify_encoding_buffer(&mut self, _f: &mut dyn FnMut(&mut bytes::BytesMut)) {}
-            fn stream_info(&mut self) -> &mut proxy_http::stream_info::StreamInfo {
-                &mut self.0
+            fn stream_info(
+                &mut self,
+            ) -> std::cell::RefMut<'_, proxy_http::stream_info::StreamInfo> {
+                self.0.borrow_mut()
             }
         }
-        let mut cb = NoopEncoderCallbacks(proxy_http::stream_info::StreamInfo::default());
+        let mut cb = NoopEncoderCallbacks(std::cell::RefCell::new(
+            proxy_http::stream_info::StreamInfo::default(),
+        ));
         let mut headers = ResponseHeaders {
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),

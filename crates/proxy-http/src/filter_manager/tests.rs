@@ -5,10 +5,13 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use http_body_util::BodyExt;
+use proxy_config::ir::{AccessLogFormat, AccessLogSink};
+use proxy_observability::access_log::parse_format;
 
 use super::*;
 use crate::filter::{FilterTrailersStatus, RequestHeaders};
@@ -241,6 +244,7 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
+        stream_info: None,
     }
 }
 
@@ -255,6 +259,7 @@ fn request_with_trailers(body: &'static [u8], trailers: HeaderMap) -> HttpReques
         },
         body: bytes_to_seam_body(Bytes::from_static(body), Some(trailers)),
         downstream: DownstreamInfo::loopback(),
+        stream_info: None,
     }
 }
 
@@ -275,7 +280,7 @@ async fn run_chain_req(
     };
     let mgr = FilterManager {
         filters,
-        ctx: ChainCtx::new(),
+        ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: &terminal,
         buffer_limit,
     };
@@ -349,7 +354,7 @@ async fn run_chain(
     };
     let mgr = FilterManager {
         filters,
-        ctx: ChainCtx::new(),
+        ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: &terminal,
         buffer_limit,
     };
@@ -755,14 +760,14 @@ fn local_reply_modify_headers_callback_is_applied() {
 /// `StreamInfo` regardless of whether the response can be sent (S2.5).
 #[test]
 fn local_reply_records_response_code_details_and_is_local_reply() {
-    let mut ctx = ChainCtx::new();
+    let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     {
         let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
         cb.send_local_reply(StatusCode::FORBIDDEN, "nope", None, "custom_reason");
     }
-    assert!(ctx.stream_info.is_local_reply);
+    assert!(ctx.stream_info.borrow().is_local_reply);
     assert_eq!(
-        ctx.stream_info.response_code_details.as_deref(),
+        ctx.stream_info.borrow().response_code_details.as_deref(),
         Some("custom_reason")
     );
     assert!(ctx.local_reply.is_some());
@@ -772,7 +777,7 @@ fn local_reply_records_response_code_details_and_is_local_reply() {
 /// first one wins (matches Envoy).
 #[test]
 fn a_second_local_reply_is_ignored() {
-    let mut ctx = ChainCtx::new();
+    let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     {
         let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
         cb.send_local_reply(StatusCode::FORBIDDEN, "first", None, "first_reason");
@@ -790,7 +795,7 @@ fn a_second_local_reply_is_ignored() {
     // record, not "first wins"), unlike `ctx.local_reply` itself — only the
     // latter decides what response actually gets built.
     assert_eq!(
-        ctx.stream_info.response_code_details.as_deref(),
+        ctx.stream_info.borrow().response_code_details.as_deref(),
         Some("second_reason")
     );
 }
@@ -1580,7 +1585,7 @@ fn informational_1xx_response_runs_a_separate_encode_callback() {
 /// exercises the full driver-level delivery.
 #[test]
 fn inject_decoded_data_to_filter_chain_delivers_to_subsequent_filters() {
-    let mut ctx = ChainCtx::new();
+    let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     ctx.decode.current_idx = 2;
     let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
     cb.inject_decoded_data_to_filter_chain(Bytes::from_static(b"x"), true);
@@ -1603,7 +1608,7 @@ fn inject_decoded_data_to_filter_chain_delivers_to_subsequent_filters() {
 /// comment on position order), reusing `PendingFrame`'s shape directly.
 #[test]
 fn inject_encoded_data_to_filter_chain_delivers_to_subsequent_filters() {
-    let mut ctx = ChainCtx::new();
+    let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     ctx.encode.positions = vec![PositionState::default(), PositionState::default()];
     let mut cb = EncoderCallbacksAdapter {
         ctx: &mut ctx,
@@ -1771,7 +1776,7 @@ fn encode_injection_from_position_p_seen_only_after_p() {
 #[test]
 #[ignore = "WP-11 chunk 4 / WP-12: route cache (S2.8)"]
 fn route_cache_is_not_auto_invalidated_on_header_mutation() {
-    let mut ctx = ChainCtx::new();
+    let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     let cb = DecoderCallbacksAdapter { ctx: &mut ctx };
     // There is no route table to resolve against yet (WP-12) — `route()`
     // always returns `None`. The differential fixture this needs: resolve a
@@ -1986,4 +1991,204 @@ fn use_remote_address_false_leaves_xff_and_proto_untouched() {
         seen.get("x-forwarded-proto").map(|v| v.to_str().unwrap()),
         Some("https")
     );
+}
+
+// --- Access logging relocation (moved from `RouterHandler` to
+// `FilterChainHandler`) -----------------------------------------------------
+//
+// These two tests ARE the acceptance criteria for that move (see the task
+// this shipped under): first, that the reordering fix is real -- an encode
+// filter's own end-of-stream write reaches the rendered log line, which it
+// cannot if `LoggingBody` is nested INSIDE the encode chain the way the
+// pre-relocation design had it. Second, that a filter-chain local reply --
+// which never reaches the router terminal at all -- is now logged, which it
+// never was before (there was nothing above the router to log it with).
+//
+// Both drive real requests through `FilterChainHandler::handle` (not
+// `FilterManager` directly, like the rest of this file) with a real file
+// sink, mirroring `proxy-http/tests/router_access_log.rs`'s style, since the
+// whole point is to observe the wrap `FilterChainHandler::handle` itself
+// does after `FilterManager::run` returns.
+
+/// An encode filter that stamps `StreamInfo::llm.usage` only on the
+/// end-of-stream `encode_data` callback -- mirrors what the real WP-33/34
+/// usage filter does once it has observed the whole streamed response. If
+/// `LoggingBody` were still nested INSIDE the encode chain (the bug this
+/// relocation fixes), it would already have rendered its line before this
+/// callback ever ran, and the log would show `-`, not a real value.
+struct StampsUsageOnEndStreamFilter;
+
+impl HttpFilter for StampsUsageOnEndStreamFilter {
+    fn encode_data(
+        &mut self,
+        cb: &mut dyn EncoderCallbacks,
+        _data: &mut Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        if end_stream {
+            cb.stream_info().llm.usage = Some(crate::stream_info::LlmTokenUsage {
+                input_tokens: 42,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 0,
+            });
+        }
+        FilterDataStatus::Continue
+    }
+}
+
+struct StampsUsageOnEndStreamFilterFactory;
+
+impl FilterInstanceFactory for StampsUsageOnEndStreamFilterFactory {
+    fn create_filter(&self) -> Box<dyn HttpFilter> {
+        Box::new(StampsUsageOnEndStreamFilter)
+    }
+}
+
+/// A decode filter that unconditionally rejects the request via
+/// `send_local_reply` -- standing in for e.g. an auth filter -- so its
+/// response never reaches the router terminal at all.
+struct LocalReplyFilter;
+
+impl HttpFilter for LocalReplyFilter {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        cb.send_local_reply(
+            StatusCode::FORBIDDEN,
+            "denied by filter",
+            None,
+            "test_local_reply",
+        );
+        FilterHeadersStatus::StopIteration
+    }
+}
+
+struct LocalReplyFilterFactory;
+
+impl FilterInstanceFactory for LocalReplyFilterFactory {
+    fn create_filter(&self) -> Box<dyn HttpFilter> {
+        Box::new(LocalReplyFilter)
+    }
+}
+
+/// A unique temp-file path, same technique as
+/// `proxy-http/tests/router_access_log.rs`'s `temp_path`.
+fn temp_log_path(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "proxy-http-filter-manager-access-log-test-{}-{name}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    p
+}
+
+fn read_log(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn text_access_log(path: &std::path::Path, format: &str) -> AccessLogIR {
+    AccessLogIR {
+        sink: AccessLogSink::File {
+            path: path.to_string_lossy().into_owned(),
+        },
+        format: AccessLogFormat::Text(parse_format(format).unwrap()),
+        filter: None,
+    }
+}
+
+/// The ordering-fix test: without the `FilterChainHandler`-level relocation,
+/// `LoggingBody` would be nested inside the encode chain (wrapping the
+/// router's own response, the pre-relocation design), so it would render
+/// before `StampsUsageOnEndStreamFilter`'s `encode_data` end-of-stream
+/// callback ever ran, and `%LLM_INPUT_TOKENS%` would log `-`. This must fail
+/// if `LoggingBody` moves back inside the encode chain.
+#[test]
+fn encode_filters_end_of_stream_write_reaches_the_access_log_line() {
+    block_on(async {
+        let log = log_of();
+        let terminal = Rc::new(RecordingTerminal {
+            log,
+            seen_body: Rc::new(RefCell::new(Bytes::new())),
+            seen_request_id: Rc::new(RefCell::new(None)),
+            seen_headers: None,
+        });
+        let path = temp_log_path("ordering");
+        let handler = FilterChainHandler::new_with_access_logs(
+            vec![Arc::new(StampsUsageOnEndStreamFilterFactory)],
+            terminal,
+            false,
+            false,
+            0,
+            &[text_access_log(&path, "%LLM_INPUT_TOKENS%\n")],
+        )
+        .expect("temp file sink always opens cleanly");
+
+        let resp = handler.handle(request(b"hi")).await;
+        assert_eq!(resp.head.status, StatusCode::OK);
+        resp.body.collect().await.expect("resp body must collect");
+
+        assert_eq!(
+            read_log(&path).trim(),
+            "42",
+            "the usage the encode filter wrote at end-of-stream must reach the \
+             rendered access-log line -- proves `LoggingBody` wraps OUTSIDE the \
+             encode chain, not nested inside the router's own response"
+        );
+
+        std::fs::remove_file(&path).ok();
+    });
+}
+
+/// The local-reply test: a decode filter's `send_local_reply` response never
+/// reaches `RouterHandler` (the terminal), so before this relocation there
+/// was nothing to render a line for it at all. This must fail if the
+/// `LoggingBody` wrap moves back to wherever it can only see responses that
+/// reached the router terminal.
+#[test]
+fn a_filter_chain_local_reply_still_produces_an_access_log_line() {
+    block_on(async {
+        let log = log_of();
+        let terminal = Rc::new(RecordingTerminal {
+            log: log.clone(),
+            seen_body: Rc::new(RefCell::new(Bytes::new())),
+            seen_request_id: Rc::new(RefCell::new(None)),
+            seen_headers: None,
+        });
+        let path = temp_log_path("local-reply");
+        let handler = FilterChainHandler::new_with_access_logs(
+            vec![Arc::new(LocalReplyFilterFactory)],
+            terminal,
+            false,
+            false,
+            0,
+            &[text_access_log(&path, "%RESPONSE_CODE%\n")],
+        )
+        .expect("temp file sink always opens cleanly");
+
+        let resp = handler.handle(request(b"hi")).await;
+        assert_eq!(resp.head.status, StatusCode::FORBIDDEN);
+        resp.body.collect().await.expect("resp body must collect");
+
+        assert!(
+            log.borrow().iter().all(|entry| entry != "terminal"),
+            "a filter-chain local reply must never reach the router terminal"
+        );
+        assert_eq!(
+            read_log(&path).trim(),
+            "403",
+            "a local reply synthesized by the filter chain itself -- which never \
+             reaches the router terminal -- must still produce an access-log \
+             line; it never did before this relocation"
+        );
+
+        std::fs::remove_file(&path).ok();
+    });
 }

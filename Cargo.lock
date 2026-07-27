@@ -1395,6 +1395,7 @@ dependencies = [
  "proxy-api",
  "proxy-cluster",
  "proxy-config",
+ "proxy-filters",
  "proxy-http",
  "rcgen",
  "regex",
@@ -1415,6 +1416,10 @@ name = "proxy-filters"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "http",
+ "prost-reflect",
+ "proxy-api",
+ "proxy-config",
  "proxy-http",
  "serde",
  "serde_json",

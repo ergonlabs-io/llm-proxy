@@ -10,6 +10,9 @@ proxy-http = { workspace = true }
 # WP-13: threads the shared ClusterManager through the listener manager into
 # the HTTP router terminal.
 proxy-cluster = { workspace = true }
+# WP-33a (Lane H): the usage/token filter, registered into the shared
+# FilterRegistry below so a `typed_config` can reach it.
+proxy-filters = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
 core_affinity = { workspace = true }

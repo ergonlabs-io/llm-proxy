@@ -143,6 +143,7 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
+        stream_info: None,
     }
 }
 
@@ -165,6 +166,20 @@ fn multi_frame_body(chunks: &[&'static [u8]], trailers: Option<HeaderMap>) -> Se
 struct FixedBodyTerminal {
     log: Log,
     body: RefCell<Option<SeamBody>>,
+    /// Response headers to hand back alongside `body` — defaults to empty via
+    /// [`FixedBodyTerminal::new`]; the content-length tests below set this to
+    /// exercise `StreamingEncoder`'s content-length-based end-of-stream flush.
+    headers: HeaderMap,
+}
+
+impl FixedBodyTerminal {
+    fn new(log: Log, body: SeamBody) -> Self {
+        Self {
+            log,
+            body: RefCell::new(Some(body)),
+            headers: HeaderMap::new(),
+        }
+    }
 }
 
 impl StreamHandler for FixedBodyTerminal {
@@ -183,7 +198,7 @@ impl StreamHandler for FixedBodyTerminal {
             HttpResponseParts {
                 head: ResponseHeaders {
                     status: StatusCode::OK,
-                    headers: HeaderMap::new(),
+                    headers: self.headers.clone(),
                 },
                 body,
             }
@@ -199,17 +214,43 @@ async fn run_streaming(
     body: SeamBody,
     buffer_limit: usize,
 ) -> HttpResponseParts {
-    let terminal = FixedBodyTerminal {
-        log: log_of(),
-        body: RefCell::new(Some(body)),
-    };
+    let terminal = FixedBodyTerminal::new(log_of(), body);
     let mgr = FilterManager {
         filters,
-        ctx: ChainCtx::new(),
+        ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: &terminal,
         buffer_limit,
     };
     mgr.run(request(b"req")).await
+}
+
+/// Like [`run_streaming`], but lets the caller set response headers on the
+/// terminal's reply — used by the content-length end-of-stream-flush tests
+/// below, which need a real `content-length` header on the upstream response.
+async fn run_streaming_with_headers(
+    filters: Vec<Box<dyn HttpFilter>>,
+    body: SeamBody,
+    headers: HeaderMap,
+    buffer_limit: usize,
+) -> HttpResponseParts {
+    let mut terminal = FixedBodyTerminal::new(log_of(), body);
+    terminal.headers = headers;
+    let mgr = FilterManager {
+        filters,
+        ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
+        terminal: &terminal,
+        buffer_limit,
+    };
+    mgr.run(request(b"req")).await
+}
+
+fn content_length_header(len: usize) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&len.to_string()).unwrap(),
+    );
+    headers
 }
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -888,7 +929,7 @@ impl HttpFilter for ResumeWithExtra {
 #[test]
 fn local_reply_after_response_headers_forwarded_terminates_the_stream() {
     block_on(async {
-        let mut ctx = ChainCtx::new();
+        let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
         ctx.response_headers_forwarded = true;
         {
             let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
@@ -914,6 +955,7 @@ fn local_reply_after_response_headers_forwarded_terminates_the_stream() {
             end_flush_done: false,
             flush_pos: 0,
             destroyed: false,
+            remaining_content_length: None,
         };
         let mut body = local_boxed(encoder);
         let err = body
@@ -1017,5 +1059,230 @@ fn encode_buffer_overflow_is_checked_as_the_sum_across_positions() {
             }
             other => panic!("expected BodyError::Upstream, got {other:?}"),
         }
+    });
+}
+
+// --- content-length end-of-stream-flush fix --------------------------------
+//
+// hyper's HTTP/1 write dispatcher stops polling the response body once it has
+// written exactly `content-length` bytes, so `upstream`'s terminal `None`
+// (what the end-of-stream flush used to wait for exclusively) never arrives
+// for the common non-streaming case. These tests pin
+// `StreamingEncoder::note_frame_len`'s fix: count the header's declared
+// length down as real frames arrive, and treat the frame that exhausts it as
+// carrying `end_stream = true` itself.
+
+/// How many `encode_data` calls for filter `name` carried `end=true` — the
+/// end-of-stream flush must reach a filter EXACTLY once, whichever path
+/// (content-length countdown, or the ordinary post-`None` flush) triggers it.
+fn end_stream_call_count(entries: &[String], name: &str) -> usize {
+    let prefix = format!("{name}:encode_data:");
+    entries
+        .iter()
+        .filter(|e| e.starts_with(&prefix) && e.ends_with("end=true"))
+        .count()
+}
+
+/// `end=true`/`end=false` for filter `name`'s `encode_data` calls, in log
+/// order — used to check WHICH frame among several carried the flag.
+fn end_stream_flags(entries: &[String], name: &str) -> Vec<bool> {
+    let prefix = format!("{name}:encode_data:");
+    entries
+        .iter()
+        .filter(|e| e.starts_with(&prefix))
+        .map(|e| e.ends_with("end=true"))
+        .collect()
+}
+
+/// An upstream body that yields exactly the given data frames and then --
+/// forever after -- `Pending`, never a terminal `None`. Stands in for the
+/// real condition this whole fix is about: hyper's HTTP/1 write dispatcher
+/// simply stops polling the response body once it has written
+/// `content-length` bytes, so there is no later poll for a `None` to arrive
+/// on. Reusing `multi_frame_body` (which DOES eventually yield `None`) here
+/// would let the pre-existing post-`None` fallback quietly cover for a
+/// content-length fix that does nothing at all -- this body rules that out.
+struct FramesThenPending {
+    frames: VecDeque<Bytes>,
+}
+
+impl Body for FramesThenPending {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        // Rust note: same `Unpin` reasoning as `OneFrameThenPending` above.
+        let this = self.get_mut();
+        match this.frames.pop_front() {
+            Some(b) => Poll::Ready(Some(Ok(Frame::data(b)))),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// A response with a `content-length` header matching its single data frame
+/// must still deliver `end_stream = true` to the encode chain exactly once --
+/// even though (via [`FramesThenPending`]) `upstream` never yields a terminal
+/// `None` for the driver to hang the old post-`None` flush off of. Polls a
+/// few times past the exhausting frame (each of which the fake upstream can
+/// only answer with `Pending`) to prove the flush isn't hiding behind some
+/// later call either.
+#[test]
+fn content_length_response_delivers_end_stream_exactly_once() {
+    block_on(async {
+        let log = log_of();
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(ProbeFilter::new("f", log.clone()))];
+        let upstream = local_boxed(FramesThenPending {
+            frames: VecDeque::from(vec![Bytes::from_static(b"hello")]),
+        });
+        let resp = run_streaming_with_headers(
+            filters,
+            upstream,
+            content_length_header(5),
+            DEFAULT_BUFFER_LIMIT,
+        )
+        .await;
+
+        let mut body = resp.body;
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(
+                    frame.into_data().expect("data frame"),
+                    Bytes::from_static(b"hello")
+                );
+            }
+            other => panic!("expected the content-length-exhausting frame, got {other:?}"),
+        }
+        // The fake upstream can only ever answer `Pending` from here on --
+        // there's no later `None` for a post-`None` fallback to trigger on.
+        for _ in 0..3 {
+            let _ = body.as_mut().poll_frame(&mut cx);
+        }
+
+        let entries = log.borrow().clone();
+        assert_eq!(
+            end_stream_call_count(&entries, "f"),
+            1,
+            "end_stream=true must reach the filter exactly once, even though this \
+             fake upstream never yields a terminal None (mirrors real hyper's \
+             HTTP/1 behavior once content-length bytes are written); log: {entries:?}"
+        );
+    });
+}
+
+/// No `content-length` header (the chunked case): the fallback — the
+/// ordinary post-`None` flush — must still deliver `end_stream = true`
+/// exactly once. Pins that the content-length fix doesn't regress the
+/// pre-existing chunked path.
+#[test]
+fn chunked_response_without_content_length_still_delivers_end_stream_exactly_once() {
+    block_on(async {
+        let log = log_of();
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(ProbeFilter::new("f", log.clone()))];
+        let body = multi_frame_body(&[b"hello"], None);
+        let resp = run_streaming(filters, body, DEFAULT_BUFFER_LIMIT).await;
+        let out = resp.body.collect().await.expect("body").to_bytes();
+        assert_eq!(out, Bytes::from_static(b"hello"));
+
+        let entries = log.borrow().clone();
+        assert_eq!(
+            end_stream_call_count(&entries, "f"),
+            1,
+            "end_stream=true must reach the filter exactly once even with no \
+             content-length header; log: {entries:?}"
+        );
+    });
+}
+
+/// A `content-length` satisfied across MULTIPLE data frames: only the frame
+/// that brings the counter to exactly zero may carry `end_stream = true` —
+/// earlier frames must not. Uses [`FramesThenPending`] for the same reason as
+/// the single-frame test above: a body that eventually yields `None` would
+/// let the pre-existing fallback quietly stand in for the fix.
+#[test]
+fn content_length_satisfied_across_multiple_frames_flags_only_the_final_one() {
+    block_on(async {
+        let log = log_of();
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(ProbeFilter::new("f", log.clone()))];
+        let upstream = local_boxed(FramesThenPending {
+            frames: VecDeque::from(vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")]),
+        });
+        let resp = run_streaming_with_headers(
+            filters,
+            upstream,
+            content_length_header(4), // 2 + 2 = 4 bytes total
+            DEFAULT_BUFFER_LIMIT,
+        )
+        .await;
+
+        let mut body = resp.body;
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        for expected in [&b"ab"[..], &b"cd"[..]] {
+            match body.as_mut().poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    assert_eq!(
+                        frame.into_data().expect("data frame"),
+                        Bytes::from_static(expected)
+                    );
+                }
+                other => panic!("expected frame {expected:?}, got {other:?}"),
+            }
+        }
+        for _ in 0..3 {
+            let _ = body.as_mut().poll_frame(&mut cx);
+        }
+
+        let entries = log.borrow().clone();
+        assert_eq!(
+            end_stream_call_count(&entries, "f"),
+            1,
+            "exactly one frame may carry end_stream=true; log: {entries:?}"
+        );
+        let flags = end_stream_flags(&entries, "f");
+        assert_eq!(
+            flags,
+            vec![false, true],
+            "only the LAST frame (the one that exhausts content-length) may be \
+             flagged end=true; log: {entries:?}"
+        );
+    });
+}
+
+/// `content-length: 0` (no body frames at all) must still deliver the
+/// end-of-stream flush exactly once — the degenerate case where the counter
+/// starts (and stays) at zero without ever seeing a real data frame to
+/// trigger the content-length path in `note_frame_len`, so it has to fall
+/// back to the ordinary post-`None` flush on its own.
+#[test]
+fn content_length_zero_response_still_gets_end_of_stream_flush_exactly_once() {
+    block_on(async {
+        let log = log_of();
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(ProbeFilter::new("f", log.clone()))];
+        let body = multi_frame_body(&[], None);
+        let resp = run_streaming_with_headers(
+            filters,
+            body,
+            content_length_header(0),
+            DEFAULT_BUFFER_LIMIT,
+        )
+        .await;
+        let out = resp.body.collect().await.expect("body").to_bytes();
+        assert_eq!(out, Bytes::new());
+
+        let entries = log.borrow().clone();
+        assert_eq!(
+            end_stream_call_count(&entries, "f"),
+            1,
+            "content-length: 0 must still deliver exactly one end_stream=true \
+             flush; log: {entries:?}"
+        );
     });
 }

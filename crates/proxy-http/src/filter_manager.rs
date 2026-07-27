@@ -90,20 +90,25 @@
 //! `ctx` (continue flags, appended buffer bytes) that the driver acts on **after
 //! the callback returns**; a callback never re-enters another filter.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Frame};
 
-use proxy_config::ir::RouteEntry;
+use proxy_config::ir::{AccessLogIR, RouteEntry};
 
+use crate::access_logging::{
+    snapshot_request_headers, AccessLogContext, AccessLoggerRuntime, LoggingBody,
+};
 use crate::filter::{
     BufferedBody, DecoderCallbacks, EncoderCallbacks, FilterDataStatus, FilterHeadersStatus,
     FilterInstanceFactory, HeaderMutationFn, HttpFilter, RequestHeaders, RequestTrailers,
@@ -150,6 +155,14 @@ pub struct FilterChainHandler {
     /// workers -- and different `FilterChainHandler`s in tests -- draw
     /// independent id sequences.
     request_id_rng: std::cell::RefCell<u64>,
+    /// WP-24 chunk 3, relocated from `RouterHandler` (see the module doc's
+    /// note on why access logging moved up here): this HCM's configured
+    /// access loggers, already resolved to open sinks -- empty when the HCM
+    /// has no `access_logs`, in which case [`Self::handle`] skips the
+    /// `LoggingBody` wrap entirely. `Rc` (not `Arc`): shared cheaply across
+    /// every request this (`!Send`, per-worker) handler serves, never across
+    /// workers.
+    access_loggers: Rc<Vec<AccessLoggerRuntime>>,
 }
 
 impl FilterChainHandler {
@@ -168,7 +181,39 @@ impl FilterChainHandler {
             use_remote_address,
             xff_num_trusted_hops,
             request_id_rng: std::cell::RefCell::new(crate::headers::seed_from_entropy()),
+            access_loggers: Rc::new(Vec::new()),
         }
+    }
+
+    /// Like [`Self::new`], but resolving `access_logs` into live sinks
+    /// (opening/sharing files via a fresh [`AccessLoggerRuntime`] registry
+    /// scoped to this one build) -- what `proxy-core`'s `build_hcm_handler`
+    /// calls, since every HCM in real config carries its own `access_logs`.
+    /// Kept as a separate constructor (rather than adding a parameter to
+    /// `new`) so every existing caller that has no sinks to build -- and so
+    /// no `io::Error` to handle -- is unaffected. Mirrors
+    /// `RouterHandler::new_with_access_logs`'s old contract, before access
+    /// logging moved up here.
+    pub fn new_with_access_logs(
+        factories: Vec<Arc<dyn FilterInstanceFactory>>,
+        terminal: Rc<dyn StreamHandler>,
+        generate_request_id: bool,
+        use_remote_address: bool,
+        xff_num_trusted_hops: u32,
+        access_logs: &[AccessLogIR],
+    ) -> std::io::Result<Self> {
+        let registry = proxy_observability::sink::SinkRegistry::new();
+        let access_loggers = AccessLoggerRuntime::build_all(access_logs, &registry)?;
+        Ok(Self {
+            access_loggers: Rc::new(access_loggers),
+            ..Self::new(
+                factories,
+                terminal,
+                generate_request_id,
+                use_remote_address,
+                xff_num_trusted_hops,
+            )
+        })
     }
 
     pub fn with_buffer_limit(mut self, limit: usize) -> Self {
@@ -178,11 +223,36 @@ impl FilterChainHandler {
 }
 
 impl StreamHandler for FilterChainHandler {
+    /// The HCM entry point: applies S9 HCM-level header behavior
+    /// (`x-request-id`, XFF), builds a fresh per-stream `FilterManager`, runs
+    /// it, and -- this is the single outermost exit point every response
+    /// takes, including a filter-chain local reply -- wraps whatever
+    /// [`FilterManager::run`] hands back in [`LoggingBody`] when this HCM has
+    /// `access_logs` configured.
+    ///
+    /// This is where WP-24 chunk 3's access logging now lives (relocated
+    /// from `RouterHandler::handle_and_log`; see [`crate::access_logging`]'s
+    /// module doc for why). The nesting is `LoggingBody(StreamingEncoder(...))`
+    /// -- `LoggingBody` wraps OUTSIDE the encode filter chain's own body, not
+    /// inside the router's response the way the old design had it -- so a
+    /// line is only ever rendered once every encode filter (and the encode
+    /// chain's own end-of-stream flush) has already run, and so that a local
+    /// reply synthesized by the filter chain itself (which never reaches the
+    /// router terminal at all) still gets logged.
     fn handle<'a>(
         &'a self,
         mut req: HttpRequestParts,
     ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
+            // Access-log timing/downstream-address, captured up front --
+            // same as the pre-relocation `RouterHandler::handle_and_log` did,
+            // just one level higher (before the decode chain runs, not after
+            // it) so the duration covers the whole filter-chain-plus-upstream
+            // round trip, not just the part downstream of the router.
+            let start_time = SystemTime::now();
+            let start_instant = Instant::now();
+            let downstream_remote_address = req.downstream.remote.to_string();
+
             // S9: apply `x-request-id` before the decode filter chain runs, so
             // every decode filter (and the router terminal) observes it. Runs
             // ahead of `FilterManager` construction rather than as a filter
@@ -214,13 +284,57 @@ impl StreamHandler for FilterChainHandler {
             // may freely hold `Rc`/`RefCell` (ADR-0003).
             let filters: Vec<Box<dyn HttpFilter>> =
                 self.factories.iter().map(|f| f.create_filter()).collect();
+            // The one `StreamInfo` for this stream (Envoy's model, module
+            // doc): created once here, cloned (cheap `Rc` bump) into `ctx`
+            // for filters and into `req.stream_info` for the terminal
+            // handler (the router), which writes into the SAME instance
+            // rather than building its own. Also kept here, uncloned, for
+            // the access-log wrap below -- `LoggingBody` needs to read the
+            // SAME `StreamInfo` every filter (including an encode filter's
+            // end-of-stream callback) wrote into.
+            let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
             let mgr = FilterManager {
                 filters,
-                ctx: ChainCtx::new(),
+                ctx: ChainCtx::new(stream_info.clone()),
                 terminal: self.terminal.as_ref(),
                 buffer_limit: self.buffer_limit,
             };
-            mgr.run(req).await
+            // Rust note: `mgr` is still a plain local value here (not yet
+            // moved into `run()`), so its `ctx.request_headers_snapshot` --
+            // an `Rc<RefCell<Option<HeaderMap>>>` `ChainCtx::new` mints
+            // internally -- can be cloned out now and read back after `run()`
+            // returns, without changing `run()`'s own return type (which
+            // every direct `FilterManager` test below also relies on).
+            let request_headers_snapshot = mgr.ctx.request_headers_snapshot.clone();
+            let resp = mgr.run(req).await;
+
+            if self.access_loggers.is_empty() {
+                return resp;
+            }
+
+            // Rust note: `.take()` both reads the snapshot out and leaves
+            // `None` behind -- there's nothing else left to read it after
+            // this. `unwrap_or_default()` only matters if every path inside
+            // `run()` somehow skipped setting it, which none do (module doc
+            // on `ChainCtx::request_headers_snapshot`'s field).
+            let request_headers = request_headers_snapshot
+                .borrow_mut()
+                .take()
+                .unwrap_or_default();
+            let log_ctx = AccessLogContext {
+                loggers: self.access_loggers.clone(),
+                stream_info,
+                start_time,
+                start_instant,
+                request_headers,
+                response_headers: resp.head.headers.clone(),
+                response_code: resp.head.status.as_u16(),
+                downstream_remote_address,
+            };
+            HttpResponseParts {
+                head: resp.head,
+                body: local_boxed(LoggingBody::new(resp.body, log_ctx)),
+            }
         })
     }
 }
@@ -287,7 +401,18 @@ struct EncodeState {
 struct ChainCtx {
     decode: DirectionState,
     encode: EncodeState,
-    stream_info: StreamInfo,
+    /// Rust note: `Rc<RefCell<StreamInfo>>` — shared, interior-mutable
+    /// ownership. This is the ONE `StreamInfo` for the whole stream: the
+    /// filter manager writes into it here, every filter callback (through
+    /// [`DecoderCallbacksAdapter::stream_info`] /
+    /// [`EncoderCallbacksAdapter::stream_info`]) borrows the *same* `Rc`
+    /// clone, and it's handed to the router terminal via
+    /// [`crate::handler::HttpRequestParts::stream_info`] so access logging
+    /// reads what filters actually wrote (Envoy's model — see the module
+    /// doc). `Rc`, not `Arc`: this whole stream lives on one worker's
+    /// `!Send` runtime (ADR-0003), so there's no cross-thread contention to
+    /// pay atomic-refcount cost for.
+    stream_info: Rc<RefCell<StreamInfo>>,
     /// Cached route (S2.8). TODO(WP-11 chunk 4 / WP-12): lazy resolution against
     /// the route table; always `None` here.
     route: Option<Arc<RouteEntry>>,
@@ -305,18 +430,40 @@ struct ChainCtx {
     /// checks this and terminates the body with a [`crate::handler::BodyError`]
     /// instead of silently ignoring the call.
     reset_after_headers: bool,
+    /// Access-log request-header snapshot (relocated from
+    /// `RouterHandler::handle_and_log` — see `crate::access_logging`'s
+    /// module doc): [`FilterManager::run`] writes into this at the point the
+    /// task's design calls for — AFTER the decode filter chain has run, so
+    /// it reflects any decode-filter header mutation, but BEFORE
+    /// `apply_request_transforms`'s `request_headers_to_add` runs deep
+    /// inside the router terminal for a `Forward` route, which is what
+    /// actually carries dialect-injected provider credentials
+    /// (`Authorization`/`x-api-key`) — an access log must never become a
+    /// place those leak to. `Rc<RefCell<..>>`, not a plain field: `ChainCtx`
+    /// (and so this) moves into `FilterManager`/`StreamingEncoder`/
+    /// `respond_with_local_reply` and is gone by the time `run()` returns,
+    /// but `FilterChainHandler::handle` needs to read this back afterward to
+    /// build the `LoggingBody` it wraps the OUTERMOST response in — so it
+    /// clones this `Rc` out of `ChainCtx` before `run()` ever takes
+    /// ownership (see that call site), and reads it back through the clone.
+    request_headers_snapshot: Rc<RefCell<Option<HeaderMap>>>,
 }
 
 impl ChainCtx {
-    fn new() -> Self {
+    /// `stream_info` is the stream's single, shared `StreamInfo` (see the
+    /// field's doc) -- passed in rather than constructed here, so the caller
+    /// (`FilterChainHandler::handle`) can hand the exact same `Rc` clone to
+    /// the terminal handler via `HttpRequestParts::stream_info`.
+    fn new(stream_info: Rc<RefCell<StreamInfo>>) -> Self {
         Self {
             decode: DirectionState::default(),
             encode: EncodeState::default(),
-            stream_info: StreamInfo::default(),
+            stream_info,
             route: None,
             local_reply: None,
             response_headers_forwarded: false,
             reset_after_headers: false,
+            request_headers_snapshot: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -381,6 +528,22 @@ impl FilterManager<'_> {
         // built further down needs it, and `req` itself won't survive.
         let downstream = req.downstream;
 
+        // Access-log request-header snapshot (fallback): taken here, before
+        // `collect_request` consumes `req`, purely so the failure paths
+        // right below (a request-body read error, or a decode filter's own
+        // buffer overflow) -- which end before the decode chain finishes --
+        // still have *something* to log with, rather than nothing at all
+        // (their pre-relocation behavior: a filter-chain local reply never
+        // reached `RouterHandler`, so it was never logged). Every path that
+        // reaches the decode chain successfully overwrites this below with a
+        // fresher, post-decode-filter snapshot — see
+        // `ChainCtx::request_headers_snapshot`'s doc for why that ordering
+        // matters.
+        *ctx.request_headers_snapshot.borrow_mut() = Some(snapshot_request_headers(
+            &req.head.headers,
+            req.head.uri.path(),
+        ));
+
         // --- collect the request body (buffered model) ---
         let (mut head, req_trailers, mut body) = match collect_request(req).await {
             Ok(parts) => parts,
@@ -416,6 +579,18 @@ impl FilterManager<'_> {
             return respond_with_local_reply(filters, ctx, buffer_limit, reply).await;
         }
 
+        // Access-log request-header snapshot, refreshed: the decode chain
+        // has now run (see the fallback snapshot's doc above), so this
+        // reflects any decode-filter header mutation -- but is still taken
+        // strictly BEFORE `apply_request_transforms`'s
+        // `request_headers_to_add` (deep inside the router terminal below,
+        // for a `Forward` route), which is what actually carries
+        // dialect-injected provider credentials. That ordering is
+        // load-bearing: an access log must never become a place a
+        // `Authorization`/`x-api-key` header leaks to.
+        *ctx.request_headers_snapshot.borrow_mut() =
+            Some(snapshot_request_headers(&head.headers, head.uri.path()));
+
         // S2.5: a decoder filter may have called `send_local_reply` while the
         // chain above was running. If so, the request must not reach the
         // terminal handler (the router stand-in) at all — a local reply
@@ -434,10 +609,15 @@ impl FilterManager<'_> {
         let decoded_body = join_buffer(&ctx.decode.buffer, &body);
 
         // --- terminal handler (router stand-in) ---
+        // Hand the terminal (the router) the SAME `StreamInfo` the decode
+        // filters above just wrote into -- an `Rc::clone` (cheap refcount
+        // bump), not a copy, so writes either side makes are visible to the
+        // other (module doc: one `StreamInfo` per stream).
         let terminal_req = HttpRequestParts {
             head,
             body: bytes_to_seam_body(decoded_body, req_trailers.map(|t| t.0)),
             downstream,
+            stream_info: Some(ctx.stream_info.clone()),
         };
         let resp = terminal.handle(terminal_req).await;
         let HttpResponseParts { mut head, mut body } = resp;
@@ -465,9 +645,12 @@ impl FilterManager<'_> {
                     // this particular 500. That is the lesser evil against
                     // double-invocation, and this path only fires when the
                     // filter chain itself blew the encode buffer limit.
-                    ctx.stream_info.is_local_reply = true;
-                    ctx.stream_info.response_code_details =
-                        Some("encode_header_phase_overflow".to_string());
+                    {
+                        let mut info = ctx.stream_info.borrow_mut();
+                        info.is_local_reply = true;
+                        info.response_code_details =
+                            Some("encode_header_phase_overflow".to_string());
+                    }
                     destroy_filters(&mut filters);
                     return synth_response(status, "response rejected by filter chain");
                 }
@@ -484,6 +667,7 @@ impl FilterManager<'_> {
         // single synchronous pass. `on_destroy` now runs in `Drop` (below),
         // since the stream — and therefore the filters' lifetime — doesn't
         // end when `run()` returns.
+        let remaining_content_length = parse_content_length(&head.headers);
         let encoder = StreamingEncoder {
             filters,
             ctx,
@@ -495,6 +679,7 @@ impl FilterManager<'_> {
             end_flush_done: false,
             flush_pos: 0,
             destroyed: false,
+            remaining_content_length,
         };
 
         HttpResponseParts {
@@ -541,8 +726,11 @@ async fn respond_with_local_reply(
     // `run()`'s own failure paths, not a filter's `send_local_reply()` call
     // (which already records it) — every local reply must be observable this
     // way, regardless of source.
-    ctx.stream_info.is_local_reply = true;
-    ctx.stream_info.response_code_details = Some(reply.details.clone());
+    {
+        let mut info = ctx.stream_info.borrow_mut();
+        info.is_local_reply = true;
+        info.response_code_details = Some(reply.details.clone());
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -564,6 +752,7 @@ async fn respond_with_local_reply(
     match encode_headers_phase(&mut filters, &mut ctx, buffer_limit, &mut head, &mut body).await {
         Ok(hold) => {
             ctx.response_headers_forwarded = true;
+            let remaining_content_length = parse_content_length(&head.headers);
             let encoder = StreamingEncoder {
                 filters,
                 ctx,
@@ -575,6 +764,7 @@ async fn respond_with_local_reply(
                 end_flush_done: false,
                 flush_pos: 0,
                 destroyed: false,
+                remaining_content_length,
             };
             HttpResponseParts {
                 head,
@@ -856,6 +1046,20 @@ async fn encode_headers_phase(
     })
 }
 
+/// Parse the response's `content-length` header, if any, for
+/// [`StreamingEncoder::remaining_content_length`]. `None` covers both "no
+/// header" and "present but not a plain non-negative integer" (a malformed
+/// header some upstream sent) — either way there's nothing to count down, so
+/// the caller falls back to the ordinary post-`None` flush.
+fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// The response body once headers have gone out: pulls frames from
 /// `upstream` on demand and runs them through the encoder chain (reverse
 /// config order, S2.1) as they arrive, instead of buffering the whole
@@ -898,6 +1102,31 @@ struct StreamingEncoder {
     flush_pos: usize,
     /// Guards [`Drop::drop`] so `on_destroy` fires exactly once.
     destroyed: bool,
+    /// Bytes remaining per the response's `content-length` header, decremented
+    /// as each real upstream data frame is delivered (see
+    /// [`Self::note_frame_len`]). `None` means either there was no
+    /// `content-length` header, or the running total has already overshot it
+    /// (a stale header — not ours to fix, see `note_frame_len`); either way
+    /// that's a permanent fallback to the ordinary post-`None` end-of-stream
+    /// flush below.
+    ///
+    /// # Why this exists
+    ///
+    /// hyper's HTTP/1 write dispatcher stops polling the response body the
+    /// moment it has written exactly `content-length` bytes — the terminal
+    /// `None` poll this body relies on to trigger its end-of-stream flush
+    /// never happens. That's the common case for a non-streaming response
+    /// (including a non-streaming LLM provider reply), so an encode filter's
+    /// stream-end logic (e.g. token-usage recording) would silently never run
+    /// for it.
+    ///
+    /// Rust note: deliberately NOT one-frame lookahead (buffer the next frame
+    /// to see whether `None` follows before releasing this one) — that would
+    /// add a full chunk of latency to every SSE token on the streaming path,
+    /// which is the entire reason this body exists instead of just buffering
+    /// the whole response. Counting down an already-known `content-length`
+    /// costs nothing extra per frame and needs no buffering.
+    remaining_content_length: Option<u64>,
 }
 
 impl StreamingEncoder {
@@ -939,6 +1168,39 @@ impl StreamingEncoder {
     /// to decide whether trailers must queue behind buffered data (S2.4).
     fn any_stopped(&self) -> bool {
         self.ctx.encode.positions.iter().any(|p| p.stop.is_some())
+    }
+
+    /// Count `len` bytes of a just-arrived real upstream data frame against
+    /// [`Self::remaining_content_length`], and report whether THIS frame is
+    /// the one that exactly exhausts it — i.e. should be treated as carrying
+    /// `end_stream = true` (see this field's doc comment for why: hyper never
+    /// polls again once it's written `content-length` bytes, so there is no
+    /// later `None` poll to hang the end-of-stream flush off of).
+    ///
+    /// Falls back to `false` (and disables itself for the rest of the stream)
+    /// if `len` overshoots what's left — that means a filter mutation already
+    /// made the running total diverge from the header, so the header was
+    /// stale before we got here; fixing a stale `content-length` is out of
+    /// scope for this fix (task doc), so we just stop trying to use it.
+    fn note_frame_len(&mut self, len: usize) -> bool {
+        match self.remaining_content_length {
+            Some(remaining) => match remaining.checked_sub(len as u64) {
+                Some(0) => {
+                    self.remaining_content_length = Some(0);
+                    true
+                }
+                Some(new_remaining) => {
+                    self.remaining_content_length = Some(new_remaining);
+                    false
+                }
+                None => {
+                    // Overshoot: fall back to the post-`None` flush for good.
+                    self.remaining_content_length = None;
+                    false
+                }
+            },
+            None => false,
+        }
     }
 
     /// Run one frame of data through positions `start_pos..n`. Every REAL
@@ -1195,11 +1457,21 @@ impl Body for StreamingEncoder {
                 match this.upstream.as_mut().poll_frame(cx) {
                     Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                         Ok(data) => {
+                            // content-length flush fix: this frame may be the
+                            // one hyper will never poll past (see
+                            // `remaining_content_length`'s doc) — if so, run
+                            // it through the chain as the end-of-stream flush
+                            // itself, rather than waiting for a `None` poll
+                            // that's never coming.
+                            let is_final_by_length = this.note_frame_len(data.len());
+                            if is_final_by_length {
+                                this.end_flush_done = true;
+                            }
                             // Defect fix: every real frame walks the chain
                             // from position 0, always — never resuming from
                             // wherever some *other* position last stopped,
                             // which used to skip every filter before it.
-                            match this.encode_frame(data, false, 0) {
+                            match this.encode_frame(data, is_final_by_length, 0) {
                                 Ok(Some(bytes)) => {
                                     return Poll::Ready(Some(Ok(Frame::data(bytes))))
                                 }
@@ -1519,8 +1791,11 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
         modify_headers: Option<HeaderMutationFn>,
         details: &str,
     ) {
-        self.ctx.stream_info.is_local_reply = true;
-        self.ctx.stream_info.response_code_details = Some(details.to_string());
+        {
+            let mut info = self.ctx.stream_info.borrow_mut();
+            info.is_local_reply = true;
+            info.response_code_details = Some(details.to_string());
+        }
 
         if self.ctx.response_headers_forwarded {
             // S2.5: once response headers have already gone out, a NEW
@@ -1591,8 +1866,8 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
         self.ctx.route = None;
     }
 
-    fn stream_info(&mut self) -> &mut StreamInfo {
-        &mut self.ctx.stream_info
+    fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo> {
+        self.ctx.stream_info.borrow_mut()
     }
 }
 
@@ -1652,8 +1927,8 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
         f(&mut self.ctx.encode.positions[self.pos].buf.0);
     }
 
-    fn stream_info(&mut self) -> &mut StreamInfo {
-        &mut self.ctx.stream_info
+    fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo> {
+        self.ctx.stream_info.borrow_mut()
     }
 }
 
@@ -1669,6 +1944,10 @@ async fn collect_request(
         head,
         body,
         downstream: _,
+        // The inbound (downstream) request never carries a `stream_info` --
+        // that's only set on the *terminal* request built further down in
+        // `run()`, once `ctx.stream_info` exists (module doc).
+        stream_info: _,
     } = req;
     let collected = body.collect().await.map_err(|_| ())?;
     let trailers = collected.trailers().cloned().map(RequestTrailers);

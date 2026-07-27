@@ -22,6 +22,7 @@
 //! The [`filter`] module is the frozen shared surface consumed by WP-31/32
 //! filters and Lane H (ground rule #4).
 
+pub mod access_logging;
 pub mod codec;
 pub mod filter;
 pub mod filter_manager;
@@ -51,4 +52,4 @@ pub use route::{
     apply_prefix_rewrite, match_route, select_cluster, strip_port, strip_query, RouteMatch,
     RouteRequest,
 };
-pub use stream_info::StreamInfo;
+pub use stream_info::{LlmStats, LlmTokenUsage, StreamInfo};

@@ -66,6 +66,10 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
     REGISTRY.get_or_init(|| {
         let mut registry = FilterRegistry::default();
         registry.register(Arc::new(HeaderMutationFactory));
+        // WP-33a (Lane H): the usage/token filter. Registered unconditionally
+        // -- it only does anything on a route that configures it, and a filter
+        // that isn't in the registry is a hard config error at load time.
+        registry.register(Arc::new(proxy_filters::usage_filter::UsageFilterFactory));
         Arc::new(registry)
     })
 }
@@ -799,32 +803,37 @@ fn build_hcm_handler(
         factories.push(Arc::from(instance_factory));
     }
 
+    let router = RouterHandler::new(hcm.route_table.clone(), cluster_manager.clone());
+    let terminal: Rc<dyn StreamHandler> = Rc::new(router);
+
     // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
     // bind/rebuild cadence as everything else in this function (a fresh
-    // `RouterHandler` -- and so a fresh set of loggers/sinks -- is built
+    // `FilterChainHandler` -- and so a fresh set of loggers/sinks -- is built
     // every time `build_listener_hcm` rebuilds this chain, mirroring
     // `build_listener_tls`'s cadence for certs). A sink that can't be opened
     // (e.g. an unwritable file path) is a startup/config error, same
     // fatal-at-`initial_bind`/logged-and-skip-at-reconcile treatment as an
     // unregistered filter or a bad cert.
-    let router = RouterHandler::new_with_access_logs(
-        hcm.route_table.clone(),
-        cluster_manager.clone(),
-        &hcm.access_logs,
-    )
-    .map_err(|e| HttpFilterChainBuildError {
-        context: context.to_string(),
-        reason: format!("failed to open access_logs sink: {e}"),
-    })?;
-    let terminal: Rc<dyn StreamHandler> = Rc::new(router);
-
-    Ok(Rc::new(FilterChainHandler::new(
-        factories,
-        terminal,
-        hcm.generate_request_id,
-        hcm.use_remote_address,
-        hcm.xff_num_trusted_hops,
-    )))
+    //
+    // Access logging now lives on `FilterChainHandler`, not `RouterHandler`
+    // -- see `proxy_http::filter_manager`'s and `proxy_http::access_logging`'s
+    // module docs for why (the router sits INSIDE the encode filter chain,
+    // so logging from there can never observe what an encode filter does at
+    // end-of-stream).
+    Ok(Rc::new(
+        FilterChainHandler::new_with_access_logs(
+            factories,
+            terminal,
+            hcm.generate_request_id,
+            hcm.use_remote_address,
+            hcm.xff_num_trusted_hops,
+            &hcm.access_logs,
+        )
+        .map_err(|e| HttpFilterChainBuildError {
+            context: context.to_string(),
+            reason: format!("failed to open access_logs sink: {e}"),
+        })?,
+    ))
 }
 
 /// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy` and
@@ -2540,6 +2549,63 @@ mod tests {
         addr
     }
 
+    /// Like [`spawn_http_upstream`], but hand-writes a **chunked**
+    /// `content-type: application/json` response over the raw socket instead
+    /// of going through `serve_http1`/`FixedResponseHandler`.
+    ///
+    /// Rust note: this exists (rather than reusing `FixedResponseHandler`,
+    /// whose body is an `http_body_util::Full` -- an exact-length body) for a
+    /// load-bearing reason, not style: `Full`'s exact `size_hint()` makes
+    /// hyper stamp an explicit `content-length` on *this* fixture's own
+    /// response, which `RouterHandler` then forwards verbatim onto the
+    /// downstream response. Once that header is on the wire, hyper's h1
+    /// write-dispatcher (`Conn::can_write_body()`) stops polling our
+    /// `StreamingEncoder` the instant it has written that many bytes -- it
+    /// never issues the final empty `end_stream=true` frame the filter
+    /// manager relies on to call `finalize()`. A chunked body (no
+    /// content-length anywhere) doesn't hit that early-stop path, so the
+    /// usage filter's end-of-stream write actually happens, which is the
+    /// thing this whole test exists to observe. Writing raw chunked bytes by
+    /// hand (rather than adding a `hyper`/`http-body` dependency to build a
+    /// custom `Body` impl) keeps this fixture inside `proxy-core`'s existing
+    /// dependency set.
+    async fn spawn_http_upstream_chunked_json(body: &'static [u8]) -> SocketAddr {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::task::spawn_local(async move {
+                    // Drain the request up to the header/body separator --
+                    // we don't care about its contents, just don't want a
+                    // half-read request left sitting in the kernel buffer.
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                        body.len(),
+                        String::from_utf8_lossy(body),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
     /// The WP-13 acceptance test: a real HTTP request is routed (via the
     /// router terminal + `ClusterManager`) to a real upstream over HTTP/1.1,
     /// and the response still flows back through the encode filter chain --
@@ -2602,6 +2668,210 @@ mod tests {
             );
 
             harness.shutdown().await;
+        });
+    }
+
+    // --- WP-33a: usage filter over a real socket ---------------------------
+
+    /// Undo HTTP/1.1 chunked transfer-coding: `<hex-len>\r\n<chunk>\r\n`
+    /// repeated, terminated by a `0\r\n\r\n` end chunk (no trailers in this
+    /// fixture). Just enough of RFC 9112 section 7.1 to unwrap what
+    /// [`spawn_http_upstream_chunked_json`] -- and, transitively, the proxy's
+    /// own re-encoded response -- produce; not a general-purpose decoder.
+    fn dechunk(mut data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let line_end = data
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("chunk size line must end in CRLF");
+            let size_str =
+                std::str::from_utf8(&data[..line_end]).expect("chunk size must be ascii");
+            let size = usize::from_str_radix(size_str.trim(), 16).expect("chunk size must be hex");
+            data = &data[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(&data[..size]);
+            data = &data[size + 2..]; // skip the chunk's trailing CRLF too
+        }
+        out
+    }
+
+    /// The WP-33a acceptance test: a **YAML-shaped** bootstrap (not
+    /// hand-built IR) wires the `type.llmproxy.dev/envoy.config.core.v3.DataSource`
+    /// usage filter and a file access logger into one HCM, `build_snapshot`
+    /// lowers it exactly the way `proxy_config::load_bootstrap_file` would for
+    /// a real deployment, and the whole stack runs over real `TcpStream`s: a
+    /// real upstream emits an OpenAI-shaped JSON body, the proxy forwards it
+    /// unmodified to a real client socket, and the usage filter's extracted
+    /// token counts land in a real rendered access-log line on disk.
+    ///
+    /// Four distinct numbers (`input=20, cached=80, cache_creation=0,
+    /// output=20, total=120`) are asserted so a filter that reads the wrong
+    /// JSON field, or the extractor's cached-tokens-out-of-prompt-tokens
+    /// arithmetic regressing, cannot accidentally pass.
+    ///
+    /// Mutation-tested: see the task notes -- either dropping the
+    /// `UsageFilterFactory` registration or making `classify_body` treat
+    /// `application/json` as `Inert` makes this fail (no line is ever
+    /// written, so the bounded poll below times out).
+    #[test]
+    fn usage_filter_records_tokens_from_a_real_upstream_response() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        run_local(async {
+            let proxy_port = free_port().await;
+            let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+
+            let upstream_body: &'static [u8] = br#"{"id":"x","usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+            let upstream_addr = spawn_http_upstream_chunked_json(upstream_body).await;
+
+            let log_path = std::env::temp_dir().join(format!(
+                "llm-proxy-usage-filter-test-{}-{}.log",
+                std::process::id(),
+                proxy_port
+            ));
+            // Rust note: `Path::display()` (rather than `to_str().unwrap()`)
+            // so this doesn't panic on a hypothetical non-UTF8 temp dir --
+            // the resulting YAML string just needs *a* path, not a lossless
+            // round trip of the OS path type.
+            let log_path_str = log_path.display().to_string();
+
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {proxy_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.usage
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                      inline_string: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: up }}
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: {log_path_str}
+                      log_format:
+                        text_format: "%LLM_INPUT_TOKENS% %LLM_CACHED_TOKENS% %LLM_CACHE_CREATION_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_TOTAL_TOKENS% %LLM_TTFT%\n"
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {upstream_ip}, port_value: {upstream_port} }}
+"#,
+                proxy_port = proxy_port,
+                log_path_str = log_path_str,
+                upstream_ip = upstream_addr.ip(),
+                upstream_port = upstream_addr.port(),
+            );
+
+            let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+                .expect("bootstrap YAML must parse");
+            let snapshot = Arc::new(build_snapshot(&loaded).expect("bootstrap YAML must lower"));
+
+            let harness = spawn_manager(snapshot).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(proxy_addr)
+                .await
+                .expect("connect should succeed");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let header_end = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response must have a header/body separator");
+            let status_line = String::from_utf8(response[..header_end].to_vec())
+                .expect("headers should be valid utf8");
+            assert!(
+                status_line.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {status_line:?}"
+            );
+            let raw_body = &response[header_end + 4..];
+            // The proxy's own response is chunked too (nothing downstream of
+            // the filter chain re-adds a `content-length`, for the same
+            // reason `spawn_http_upstream_chunked_json` sends one upstream),
+            // so unwrap the chunk framing before comparing against the
+            // upstream's raw body.
+            let response_body = dechunk(raw_body);
+            assert_eq!(
+                response_body, upstream_body,
+                "the usage filter observes the body -- it must never alter or truncate it"
+            );
+
+            harness.shutdown().await;
+
+            // FileSink flushes per line, but the write races the harness
+            // shutdown returning, so poll briefly instead of asserting on
+            // the first read.
+            let mut logged = String::new();
+            for attempt in 0..20 {
+                logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if !logged.trim().is_empty() {
+                    break;
+                }
+                assert!(
+                    attempt < 19,
+                    "access-log file at {log_path_str} was never written"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let line = logged.trim();
+            let fields: Vec<&str> = line.split(' ').collect();
+            assert_eq!(
+                fields.len(),
+                6,
+                "expected 6 space-separated fields, got: {line:?}"
+            );
+            // input=20, cached=80, cache_creation=0, output=20, total=120 --
+            // four distinct values, so a wrong-field extraction bug can't
+            // accidentally pass.
+            assert_eq!(&fields[0..5], &["20", "80", "0", "20", "120"]);
+            assert_ne!(
+                fields[5], "-",
+                "time-to-first-byte must be populated for a real streamed response"
+            );
+
+            let _ = std::fs::remove_file(&log_path);
         });
     }
 }

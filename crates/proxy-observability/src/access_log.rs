@@ -53,6 +53,18 @@ pub enum FormatOp {
     UpstreamHost,
     UpstreamCluster,
     DownstreamRemoteAddress,
+    /// WP-33: `%LLM_INPUT_TOKENS%`.
+    LlmInputTokens,
+    /// WP-33: `%LLM_CACHED_TOKENS%`.
+    LlmCachedTokens,
+    /// WP-33: `%LLM_CACHE_CREATION_TOKENS%`.
+    LlmCacheCreationTokens,
+    /// WP-33: `%LLM_OUTPUT_TOKENS%`.
+    LlmOutputTokens,
+    /// WP-33: `%LLM_TOTAL_TOKENS%` -- the sum of all four buckets above.
+    LlmTotalTokens,
+    /// WP-33: `%LLM_TTFT%` -- time-to-first-token, in milliseconds.
+    LlmTtft,
 }
 
 /// The argument to `%REQ%`/`%RESP%`/`%TRAILER%`: a primary header name, an
@@ -274,6 +286,30 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::DownstreamRemoteAddress
         }
+        "LLM_INPUT_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmInputTokens
+        }
+        "LLM_CACHED_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmCachedTokens
+        }
+        "LLM_CACHE_CREATION_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmCacheCreationTokens
+        }
+        "LLM_OUTPUT_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmOutputTokens
+        }
+        "LLM_TOTAL_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmTotalTokens
+        }
+        "LLM_TTFT" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmTtft
+        }
         other => {
             return Err(err(format!(
                 "unknown access-log format operator `%{other}%` in format string `{input}`"
@@ -289,6 +325,31 @@ fn build_op(
 /// `%Y-%m-%dT%H:%M:%E3SZ`, which chrono's strftime dialect spells with
 /// `%.3f` instead of the abseil-specific `%E3S`).
 const DEFAULT_START_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
+
+/// WP-33: provider-reported token usage, in the four billing buckets --
+/// mirrors `proxy_http::LlmTokenUsage` field-for-field, but this crate can't
+/// name that type (`proxy-observability` is a *dependency* of `proxy-http`,
+/// not the other way around -- ground rule #2's direction applies to crate
+/// layering here too), so the caller (`proxy-http::router::logging`) converts
+/// at the boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlmTokens {
+    pub input: u64,
+    pub cached: u64,
+    pub cache_creation: u64,
+    pub output: u64,
+}
+
+impl LlmTokens {
+    /// Total across all four buckets. Saturating: a billing count overflowing
+    /// `u64` is not a case worth panicking the request over.
+    pub fn total(&self) -> u64 {
+        self.input
+            .saturating_add(self.cached)
+            .saturating_add(self.cache_creation)
+            .saturating_add(self.output)
+    }
+}
 
 /// Everything a request/stream lifecycle knows by the time it's logged.
 /// Built by the caller (chunk 2: the router / filter manager) and handed to
@@ -313,6 +374,11 @@ pub struct LogContext<'a> {
     pub upstream_host: Option<&'a str>,
     pub upstream_cluster: Option<&'a str>,
     pub downstream_remote_address: Option<&'a str>,
+    /// WP-33: provider-reported token usage. `None` when the response
+    /// carried none -- a non-LLM route, or a provider that reported nothing.
+    pub llm_tokens: Option<LlmTokens>,
+    /// WP-33: time-to-first-token -- response headers to first body byte.
+    pub llm_ttft: Option<std::time::Duration>,
 }
 
 /// Render a parsed format string against a request's context. Allocation is
@@ -369,6 +435,45 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::DownstreamRemoteAddress => {
             out.push_str(ctx.downstream_remote_address.unwrap_or("-"))
         }
+        // WP-33: these six feed billing, so absent usage must render `-`,
+        // never a confident-looking `0` -- `None` means "the provider told
+        // us nothing", not "zero tokens were used".
+        FormatOp::LlmInputTokens => match ctx.llm_tokens {
+            Some(t) => {
+                let _ = write!(out, "{}", t.input);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmCachedTokens => match ctx.llm_tokens {
+            Some(t) => {
+                let _ = write!(out, "{}", t.cached);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmCacheCreationTokens => match ctx.llm_tokens {
+            Some(t) => {
+                let _ = write!(out, "{}", t.cache_creation);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmOutputTokens => match ctx.llm_tokens {
+            Some(t) => {
+                let _ = write!(out, "{}", t.output);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmTotalTokens => match ctx.llm_tokens {
+            Some(t) => {
+                let _ = write!(out, "{}", t.total());
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmTtft => match ctx.llm_ttft {
+            Some(d) => {
+                let _ = write!(out, "{}", d.as_millis());
+            }
+            None => out.push('-'),
+        },
     }
 }
 
@@ -492,6 +597,15 @@ mod tests {
                 "%DOWNSTREAM_REMOTE_ADDRESS%",
                 FormatOp::DownstreamRemoteAddress,
             ),
+            ("%LLM_INPUT_TOKENS%", FormatOp::LlmInputTokens),
+            ("%LLM_CACHED_TOKENS%", FormatOp::LlmCachedTokens),
+            (
+                "%LLM_CACHE_CREATION_TOKENS%",
+                FormatOp::LlmCacheCreationTokens,
+            ),
+            ("%LLM_OUTPUT_TOKENS%", FormatOp::LlmOutputTokens),
+            ("%LLM_TOTAL_TOKENS%", FormatOp::LlmTotalTokens),
+            ("%LLM_TTFT%", FormatOp::LlmTtft),
         ] {
             assert_eq!(parse(src).0, vec![expect], "operator {src}");
         }
@@ -562,6 +676,8 @@ mod tests {
             upstream_host: Some("10.0.0.1:8080"),
             upstream_cluster: Some("my_cluster"),
             downstream_remote_address: Some("127.0.0.1:1234"),
+            llm_tokens: None,
+            llm_ttft: None,
         }
     }
 
@@ -640,5 +756,44 @@ mod tests {
         let c = ctx(&empty, &empty, &trailers, &[]);
         let fs = parse("%TRAILER(grpc-status)%");
         assert_eq!(render(&fs, &c), "0");
+    }
+
+    const LLM_FMT: &str = "%LLM_INPUT_TOKENS% %LLM_CACHED_TOKENS% %LLM_CACHE_CREATION_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_TOTAL_TOKENS% %LLM_TTFT%";
+
+    #[test]
+    fn llm_operators_render_populated_usage() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        // Four distinct, non-zero values so a wrong-field bug in the total
+        // (or in an individual operator) can't slip through by coincidence.
+        c.llm_tokens = Some(LlmTokens {
+            input: 11,
+            cached: 22,
+            cache_creation: 33,
+            output: 44,
+        });
+        c.llm_ttft = Some(std::time::Duration::from_millis(250));
+        let fs = parse(LLM_FMT);
+        assert_eq!(render(&fs, &c), "11 22 33 44 110 250");
+    }
+
+    #[test]
+    fn llm_operators_render_dash_when_absent() {
+        // WP-33: absent usage/ttft must render `-`, never a confident `0` --
+        // these numbers feed billing, and `0` would falsely claim the
+        // provider reported zero tokens.
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        assert_eq!(c.llm_tokens, None);
+        assert_eq!(c.llm_ttft, None);
+        let fs = parse(LLM_FMT);
+        assert_eq!(render(&fs, &c), "- - - - - -");
+    }
+
+    #[test]
+    fn llm_bogus_operator_is_rejected() {
+        let e = parse_format("%LLM_BOGUS%").unwrap_err();
+        assert!(e.0.contains("unknown access-log format operator"), "{e}");
+        assert!(e.0.contains("LLM_BOGUS"), "{e}");
     }
 }

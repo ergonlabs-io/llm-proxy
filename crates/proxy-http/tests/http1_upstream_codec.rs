@@ -77,6 +77,7 @@ async fn get_returns_fixed_response() {
                 },
                 body,
                 downstream: DownstreamInfo::loopback(),
+                stream_info: None,
             };
 
             let response = send_upstream_http1(io, req, Http1Options { keep_alive: true })
@@ -128,6 +129,7 @@ async fn post_body_is_streamed_and_echoed_back() {
                 },
                 body,
                 downstream: DownstreamInfo::loopback(),
+                stream_info: None,
             };
 
             let response = send_upstream_http1(io, req, Http1Options { keep_alive: true })
@@ -175,6 +177,7 @@ async fn connect_to_nothing_yields_handshake_error() {
                     },
                     body,
                     downstream: DownstreamInfo::loopback(),
+                    stream_info: None,
                 };
                 let result = send_upstream_http1(io, req, Http1Options { keep_alive: true }).await;
                 assert!(matches!(

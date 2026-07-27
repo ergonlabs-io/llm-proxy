@@ -139,7 +139,19 @@ pub trait DecoderCallbacks {
     /// routing-relevant headers must call this (differential fixture required).
     fn clear_route_cache(&mut self);
 
-    fn stream_info(&mut self) -> &mut StreamInfo;
+    /// The stream's single [`StreamInfo`] (Envoy's model: one per stream,
+    /// owned at the filter-manager level, written by every filter AND by the
+    /// router terminal — see `filter_manager::FilterChainHandler::handle`).
+    ///
+    /// Rust note: `RefMut<'_, T>` implements `DerefMut`, so both
+    /// `cb.stream_info().field = x` and
+    /// `let mut si = cb.stream_info(); si.a = 1; si.b = 2;` still compile
+    /// unchanged — this is a much smaller change at call sites than the
+    /// signature suggests. The guard MUST NOT be held across another call on
+    /// this same callbacks object (e.g. `cb.route()`, `cb.continue_decoding()`)
+    /// or the underlying `RefCell` panics at runtime — drop it (end the
+    /// statement/block) before making another call.
+    fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo>;
 }
 
 /// Callbacks available to encoder (response-path) filters.
@@ -149,7 +161,11 @@ pub trait EncoderCallbacks {
     fn inject_encoded_data_to_filter_chain(&mut self, data: Bytes, end_stream: bool);
     fn encoding_buffer(&self) -> Option<&BufferedBody>;
     fn modify_encoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut));
-    fn stream_info(&mut self) -> &mut StreamInfo;
+
+    /// The stream's single [`StreamInfo`] — see [`DecoderCallbacks::stream_info`]
+    /// for the shared-ownership model and the same "don't hold the guard
+    /// across another call" rule.
+    fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo>;
 }
 
 /// A per-stream HTTP filter instance. Decoder callbacks run in config order,

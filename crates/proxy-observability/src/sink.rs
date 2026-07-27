@@ -478,6 +478,8 @@ mod tests {
             upstream_host: None,
             upstream_cluster: None,
             downstream_remote_address: None,
+            llm_tokens: None,
+            llm_ttft: None,
         };
         let line = render(&fmt, &ctx);
         assert_eq!(line, "HTTP/1.1 200\n");

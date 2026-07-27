@@ -129,6 +129,7 @@ fn request_with_headers(path: &'static str, headers: HeaderMap) -> HttpRequestPa
                 .map_err(|infallible: std::convert::Infallible| match infallible {}),
         ),
         downstream: DownstreamInfo::loopback(),
+        stream_info: None,
     }
 }
 

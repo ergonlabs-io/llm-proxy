@@ -13,6 +13,7 @@ use std::pin::Pin;
 use bytes::Bytes;
 
 use crate::filter::{RequestHeaders, ResponseHeaders};
+use crate::stream_info::StreamInfo;
 
 /// A body read failure, downstream (reading the request) or upstream
 /// (reading/producing the response) of the seam. Boxed so it can wrap
@@ -69,6 +70,16 @@ pub struct HttpRequestParts {
     pub head: RequestHeaders,
     pub body: StreamBody,
     pub downstream: DownstreamInfo,
+    /// The stream's single `StreamInfo`, owned by the filter chain wrapping
+    /// this handler (Envoy's model: one per stream, at the filter-manager
+    /// level, written by every filter and by the router). `None` means no
+    /// chain is present — a standalone or test invocation — and the handler
+    /// should create its own.
+    ///
+    /// Rust note: `Rc<RefCell<T>>` (not `Arc<Mutex<T>>`) — shared ownership
+    /// with interior mutability, but `!Send` (ADR-0003: no atomics needed,
+    /// since a stream never leaves its worker's single thread).
+    pub stream_info: Option<std::rc::Rc<std::cell::RefCell<StreamInfo>>>,
 }
 
 /// Downstream (client-facing) connection provenance, captured when the

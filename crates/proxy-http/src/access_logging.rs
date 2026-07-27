@@ -1,7 +1,25 @@
-//! WP-24 chunk 3: turns the parsed `AccessLogIR`/`FormatString` (chunks 1-2,
-//! `proxy_observability::access_log`/`sink`) into real per-request log
-//! lines. Two pieces:
+//! WP-24 chunk 3 (relocated): turns the parsed `AccessLogIR`/`FormatString`
+//! (`proxy_observability::access_log`/`sink`) into real per-request log
+//! lines. Originally lived under `router::logging` and was invoked from
+//! `RouterHandler::handle_and_log` -- moved up to be a peer of
+//! [`crate::filter_manager`] because the router sits INSIDE the encode
+//! filter chain (`filter_manager::StreamingEncoder` wraps the router's
+//! response body, not the other way around). Wrapping the response here,
+//! from *inside* the router, meant [`LoggingBody`] rendered its line the
+//! moment the router's own body hit end-of-stream -- which is BEFORE the
+//! encode filter chain has had a chance to run its own end-of-stream
+//! callback. An encode filter that records something at stream end (the
+//! WP-33/34 usage filter, notably) was therefore invisible to access logs.
 //!
+//! `FilterChainHandler::handle` now wraps the OUTERMOST response body --
+//! i.e. `LoggingBody(StreamingEncoder(router's response))`, not
+//! `StreamingEncoder(LoggingBody(router's response))` -- so a line is only
+//! ever rendered once every encode filter (and the encode chain's own
+//! end-of-stream flush) has already run. See `FilterChainHandler::handle`'s
+//! own doc for exactly where that wrap happens and why it's the single
+//! outermost exit point.
+//!
+//! Two pieces, unchanged from the original module:
 //! - [`AccessLoggerRuntime`]: the resolved, per-HCM-bind runtime form of one
 //!   `AccessLogIR` entry -- its sink already opened (or shared, via
 //!   `SinkRegistry`, with any other logger in the same HCM pointed at the
@@ -23,7 +41,7 @@ use http::HeaderMap;
 use hyper::body::{Body, Frame};
 
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
-use proxy_observability::access_log::{render, FormatString, LogContext};
+use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
 
 use crate::handler::{BodyError, StreamBody};
@@ -32,8 +50,9 @@ use crate::stream_info::StreamInfo;
 /// One configured logger, resolved at HCM-bind time (mirrors
 /// `proxy-core::listener::build_listener_hcm`'s own "compiled once, rebuilt
 /// only when the snapshot version changes" cadence -- a fresh
-/// `RouterHandler`, and so a fresh set of these, is built on every rebuild).
-pub(super) struct AccessLoggerRuntime {
+/// `FilterChainHandler`, and so a fresh set of these, is built on every
+/// rebuild).
+pub(crate) struct AccessLoggerRuntime {
     sink: std::sync::Arc<dyn AccessLogWriter>,
     format: AccessLogFormat,
     filter: Option<AccessLogFilterIR>,
@@ -45,7 +64,7 @@ impl AccessLoggerRuntime {
     /// `SinkRegistry`'s own doc for why that matters (two loggers naming the
     /// same file must not each open their own `BufWriter`, or their lines
     /// can interleave mid-write).
-    pub(super) fn build_all(
+    pub(crate) fn build_all(
         access_logs: &[AccessLogIR],
         registry: &SinkRegistry,
     ) -> io::Result<Vec<AccessLoggerRuntime>> {
@@ -153,19 +172,40 @@ fn json_escape_into(s: &str, out: &mut String) {
     }
 }
 
+/// `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%` (the default access-log format's own
+/// path field) falls back to a `:PATH` pseudo-header `header_lookup` can
+/// never resolve (see its doc in `proxy_observability::access_log`) --
+/// populating the *primary* header here, the same normal header name real
+/// Envoy sets on a `prefix_rewrite`, is what makes that default format
+/// usable at all for the path, without touching the (frozen) formatter
+/// itself.
+///
+/// Rust note: takes `&HeaderMap` and clones rather than mutating in place --
+/// every call site needs an independent snapshot (the caller's own headers
+/// keep flowing through the rest of the pipeline unmodified).
+pub(crate) fn snapshot_request_headers(headers: &HeaderMap, path: &str) -> HeaderMap {
+    let mut snapshot = headers.clone();
+    if !snapshot.contains_key("x-envoy-original-path") {
+        if let Ok(v) = http::HeaderValue::from_str(path) {
+            snapshot.insert("x-envoy-original-path", v);
+        }
+    }
+    snapshot
+}
+
 /// Everything [`LoggingBody`] needs to render + write a line once the
 /// response stream ends (or is dropped mid-stream) -- assembled once, in
-/// `RouterHandler::handle`, before the body starts streaming to the
+/// `FilterChainHandler::handle`, before the body starts streaming to the
 /// downstream client.
-pub(super) struct AccessLogContext {
-    pub(super) loggers: Rc<Vec<AccessLoggerRuntime>>,
-    pub(super) stream_info: Rc<RefCell<StreamInfo>>,
-    pub(super) start_time: SystemTime,
-    pub(super) start_instant: Instant,
-    pub(super) request_headers: HeaderMap,
-    pub(super) response_headers: HeaderMap,
-    pub(super) response_code: u16,
-    pub(super) downstream_remote_address: String,
+pub(crate) struct AccessLogContext {
+    pub(crate) loggers: Rc<Vec<AccessLoggerRuntime>>,
+    pub(crate) stream_info: Rc<RefCell<StreamInfo>>,
+    pub(crate) start_time: SystemTime,
+    pub(crate) start_instant: Instant,
+    pub(crate) request_headers: HeaderMap,
+    pub(crate) response_headers: HeaderMap,
+    pub(crate) response_code: u16,
+    pub(crate) downstream_remote_address: String,
 }
 
 /// Wraps a response [`StreamBody`] so that -- regardless of whether the
@@ -181,15 +221,27 @@ pub(super) struct AccessLogContext {
 /// time and carries the bytes; headers arrive almost immediately. Wrapping
 /// the body itself, the same way `GuardedBody`/`IdleTimeoutBody` already do
 /// for the S5/S4 concerns, is what lets this observe the real end of the
-/// stream. `LoggingBody` wraps *outermost* (see `RouterHandler::handle`), so
-/// it sees the stream end after those two have already run, not before.
+/// stream.
+///
+/// `LoggingBody` wraps the OUTERMOST response body -- see
+/// `FilterChainHandler::handle`'s doc -- specifically OUTSIDE
+/// `filter_manager::StreamingEncoder`, not nested inside the router's own
+/// response like the pre-relocation design had it. That ordering is the
+/// entire point of this module living here rather than under `router`: a
+/// `StreamingEncoder(LoggingBody(...))` nesting renders the log line the
+/// moment the router's body ends, before the encode filter chain's own
+/// end-of-stream callback has run, which makes anything an encode filter
+/// records at stream end (e.g. the WP-33/34 usage filter's token counts)
+/// invisible to the log. `LoggingBody(StreamingEncoder(...))` fixes that by
+/// only ever observing end-of-stream *after* the whole encode chain -- and
+/// its own end-of-stream flush -- has already run.
 ///
 /// Rust note: `ctx` is `Option<AccessLogContext>` purely so `finish` can be
 /// called from either `poll_frame` (the common case: the stream ends or
 /// errors while still being polled) or `Drop` (the stream is abandoned
 /// without ever being polled to completion) and only actually log once,
 /// without a separate "have I already logged" bool.
-pub(super) struct LoggingBody {
+pub(crate) struct LoggingBody {
     inner: StreamBody,
     bytes_sent: u64,
     trailers: HeaderMap,
@@ -197,7 +249,7 @@ pub(super) struct LoggingBody {
 }
 
 impl LoggingBody {
-    pub(super) fn new(inner: StreamBody, ctx: AccessLogContext) -> Self {
+    pub(crate) fn new(inner: StreamBody, ctx: AccessLogContext) -> Self {
         Self {
             inner,
             bytes_sent: 0,
@@ -217,15 +269,37 @@ impl LoggingBody {
         // `LogContext` only borrows the pieces it's handed, and holding the
         // `Ref` across that would just add a lifetime knot for no benefit
         // (nothing else touches `stream_info` concurrently by this point).
-        let (response_flags, upstream_host, upstream_cluster, protocol, bytes_received) = {
+        let (
+            response_flags,
+            upstream_host,
+            upstream_cluster,
+            protocol,
+            bytes_received,
+            llm_tokens,
+            llm_ttft,
+        ) = {
             let mut info = ctx.stream_info.borrow_mut();
             info.bytes_sent = self.bytes_sent;
+            // WP-33: `LlmTokenUsage` -> `LlmTokens` field-for-field --
+            // `proxy-observability` can't name `proxy_http::LlmTokenUsage`
+            // (crate layering runs the other way), so this is the boundary
+            // conversion; note this is a `Option<LlmTokenUsage>`, not a
+            // struct with zeroed fields, so "no usage reported" stays `None`
+            // all the way through to `render` (`-`, never `0`).
+            let llm_tokens = info.llm.usage.map(|u| LlmTokens {
+                input: u.input_tokens,
+                cached: u.cached_tokens,
+                cache_creation: u.cache_creation_tokens,
+                output: u.output_tokens,
+            });
             (
                 info.response_flags().to_vec(),
                 info.upstream_host.clone(),
                 info.upstream_cluster.clone(),
                 info.protocol.clone(),
                 info.bytes_received,
+                llm_tokens,
+                info.llm.time_to_first_byte,
             )
         };
 
@@ -243,6 +317,8 @@ impl LoggingBody {
             upstream_host: upstream_host.as_deref(),
             upstream_cluster: upstream_cluster.as_deref(),
             downstream_remote_address: Some(&ctx.downstream_remote_address),
+            llm_tokens,
+            llm_ttft,
         };
         for logger in ctx.loggers.iter() {
             logger.log(&log_ctx);
@@ -303,14 +379,16 @@ impl Drop for LoggingBody {
 /// Wraps the *request* body being forwarded upstream, incrementing
 /// `stream_info`'s `bytes_received` running total as frames stream through
 /// -- the streaming-body counterpart of the buffered/retry path, which
-/// already knows its exact length up front from `.collect()`.
-pub(super) struct CountingRequestBody {
+/// already knows its exact length up front from `.collect()`. Still used
+/// (and still lives here, not in `router.rs`) by `router::RouterHandler`,
+/// which is where it's constructed.
+pub(crate) struct CountingRequestBody {
     inner: StreamBody,
     stream_info: Rc<RefCell<StreamInfo>>,
 }
 
 impl CountingRequestBody {
-    pub(super) fn new(inner: StreamBody, stream_info: Rc<RefCell<StreamInfo>>) -> Self {
+    pub(crate) fn new(inner: StreamBody, stream_info: Rc<RefCell<StreamInfo>>) -> Self {
         Self { inner, stream_info }
     }
 }
@@ -339,5 +417,110 @@ impl Body for CountingRequestBody {
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use http::{HeaderMap, StatusCode};
+    use http_body_util::{BodyExt, Full};
+    use proxy_observability::access_log::parse_format;
+    use proxy_observability::sink::AccessLogWriter;
+
+    use super::*;
+    use crate::handler::local_boxed;
+    use crate::stream_info::LlmTokenUsage;
+
+    /// An in-memory sink for asserting on rendered lines, standing in for
+    /// `FileSink`/`StdoutSink` -- same trait, no I/O.
+    ///
+    /// Rust note: `Mutex<Vec<String>>` behind an `Arc` so the test can hold
+    /// its own clone to inspect after the sink has been moved into an
+    /// `AccessLoggerRuntime` as `Arc<dyn AccessLogWriter>`.
+    #[derive(Default)]
+    struct CaptureSink(Mutex<Vec<String>>);
+
+    impl AccessLogWriter for CaptureSink {
+        fn write_line(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+        fn flush(&self) {}
+        fn reopen(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drives one `LoggingBody` (a response body plus its populated
+    /// `StreamInfo::llm`) to completion and returns the single rendered
+    /// line, proving the WP-33 token/TTFT operators reach the real access
+    /// log through the same path as `bytes_sent` -- not just through
+    /// `access_log::render` in isolation.
+    async fn render_one(llm: crate::stream_info::LlmStats) -> String {
+        let capture = Arc::new(CaptureSink::default());
+        let fmt = parse_format(
+            "%LLM_INPUT_TOKENS% %LLM_CACHED_TOKENS% %LLM_CACHE_CREATION_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_TOTAL_TOKENS% %LLM_TTFT%",
+        )
+        .unwrap();
+        let logger = AccessLoggerRuntime {
+            sink: capture.clone() as Arc<dyn AccessLogWriter>,
+            format: AccessLogFormat::Text(fmt),
+            filter: None,
+        };
+
+        let mut stream_info = StreamInfo::default();
+        stream_info.llm = llm;
+
+        let ctx = AccessLogContext {
+            loggers: Rc::new(vec![logger]),
+            stream_info: Rc::new(RefCell::new(stream_info)),
+            start_time: SystemTime::now(),
+            start_instant: Instant::now(),
+            request_headers: HeaderMap::new(),
+            response_headers: HeaderMap::new(),
+            response_code: StatusCode::OK.as_u16(),
+            downstream_remote_address: "127.0.0.1:0".to_string(),
+        };
+
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        let logging_body = LoggingBody::new(body, ctx);
+        // Drain to end-of-stream, which is what triggers `finish()`.
+        let _ = logging_body.collect().await.unwrap();
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1, "expected exactly one rendered line");
+        lines.remove(0)
+    }
+
+    #[tokio::test]
+    async fn llm_stats_reach_the_rendered_access_log_line() {
+        let llm = crate::stream_info::LlmStats {
+            usage: Some(LlmTokenUsage {
+                input_tokens: 11,
+                cached_tokens: 22,
+                cache_creation_tokens: 33,
+                output_tokens: 44,
+            }),
+            time_to_first_byte: Some(std::time::Duration::from_millis(250)),
+            max_inter_chunk: None,
+            response_chunks: 1,
+        };
+        assert_eq!(render_one(llm).await, "11 22 33 44 110 250");
+    }
+
+    #[tokio::test]
+    async fn absent_llm_stats_render_dash_not_zero() {
+        // WP-33: a stream that never populated `StreamInfo::llm` (a non-LLM
+        // route, or a provider response with no usage) must log `-`, not a
+        // confident-looking `0` -- these numbers feed billing.
+        assert_eq!(
+            render_one(crate::stream_info::LlmStats::default()).await,
+            "- - - - - -"
+        );
     }
 }

@@ -364,6 +364,10 @@ async fn serve_one(
             head,
             body,
             downstream,
+            // Freshly accepted from the wire -- no filter chain has run yet
+            // to own a `StreamInfo` for this stream (`FilterChainHandler`
+            // creates one, if this listener has one wrapping the terminal).
+            stream_info: None,
         })
         .await;
     build_response(response)

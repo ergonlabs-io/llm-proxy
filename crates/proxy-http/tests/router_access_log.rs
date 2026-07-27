@@ -1,8 +1,18 @@
-//! WP-24 chunk 3: proves access logs actually emit through the real
-//! `RouterHandler` -- rendered lines land in the configured sink, honoring
-//! `AccessLogIR.filter`, and (the mistake this chunk exists to catch) a
-//! streamed response's line carries the *final* byte count and a duration
-//! covering the whole stream, not just the time to response headers.
+//! WP-24 chunk 3: proves access logs actually emit -- rendered lines land in
+//! the configured sink, honoring `AccessLogIR.filter`, and (the mistake this
+//! chunk exists to catch) a streamed response's line carries the *final*
+//! byte count and a duration covering the whole stream, not just the time to
+//! response headers.
+//!
+//! Relocated (see `proxy_http::access_logging`'s and
+//! `proxy_http::filter_manager`'s module docs): access logging now lives on
+//! `FilterChainHandler`, one level above the router, not on `RouterHandler`
+//! itself -- the router sits INSIDE the encode filter chain, so logging from
+//! there could never observe what an encode filter does at end-of-stream.
+//! These tests build a `FilterChainHandler` with no configured HTTP filters
+//! (nothing here exercises the filter chain itself) wrapping a real
+//! `RouterHandler` terminal, and drive requests through the *handler*, not
+//! the bare router.
 //!
 //! Standalone (not `router.rs`'s own `#[cfg(test)]` module), same reasoning
 //! as `router_retry.rs`/`router_header_mutations.rs`: a fresh, focused set
@@ -17,6 +27,7 @@ use std::fs::File;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +42,7 @@ use proxy_config::ir::{
     RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
 };
 use proxy_http::filter::RequestHeaders;
+use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
 use proxy_http::router::RouterHandler;
 use proxy_observability::access_log::parse_format;
@@ -89,13 +101,17 @@ fn forward_to(cluster: &str) -> ForwardAction {
     }
 }
 
-/// Build a one-route `RouterHandler` forwarding `/v1/` to a cluster named
-/// `"up"` at `addr` (when `addr` is `Some`; `None` leaves `"up"` entirely
+/// Build a one-route `FilterChainHandler` (no configured HTTP filters, a
+/// real `RouterHandler` terminal) forwarding `/v1/` to a cluster named `"up"`
+/// at `addr` (when `addr` is `Some`; `None` leaves `"up"` entirely
 /// unregistered, for the unknown-cluster/`NC` test), with `access_logs`
-/// wired through `RouterHandler::new_with_access_logs` -- mirrors
+/// wired through `FilterChainHandler::new_with_access_logs` -- mirrors
 /// `router_retry.rs`'s own `build_router` helper plus the field this file
 /// exists to exercise.
-async fn build_router(addr: Option<SocketAddr>, access_logs: Vec<AccessLogIR>) -> RouterHandler {
+async fn build_router(
+    addr: Option<SocketAddr>,
+    access_logs: Vec<AccessLogIR>,
+) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     if let Some(addr) = addr {
         let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
@@ -136,7 +152,9 @@ async fn build_router(addr: Option<SocketAddr>, access_logs: Vec<AccessLogIR>) -
     )
     .unwrap();
 
-    RouterHandler::new_with_access_logs(Arc::new(route_table), Arc::new(manager), &access_logs)
+    let terminal: Rc<dyn StreamHandler> =
+        Rc::new(RouterHandler::new(Arc::new(route_table), Arc::new(manager)));
+    FilterChainHandler::new_with_access_logs(Vec::new(), terminal, false, false, 0, &access_logs)
         .expect("test access-log sinks (temp files/stdout) always open cleanly")
 }
 
@@ -154,6 +172,7 @@ fn request(path: &'static str) -> HttpRequestParts {
                 .map_err(|infallible: std::convert::Infallible| match infallible {}),
         ),
         downstream: DownstreamInfo::loopback(),
+        stream_info: None,
     }
 }
 
@@ -206,7 +225,7 @@ async fn successful_proxied_request_writes_one_line_with_status_and_path() {
         .run_until(async {
             let addr = spawn_upstream_ok(b"hi").await;
             let path = temp_path("success");
-            let router = build_router(
+            let handler = build_router(
                 Some(addr),
                 vec![text_logger(
                     &path,
@@ -216,7 +235,7 @@ async fn successful_proxied_request_writes_one_line_with_status_and_path() {
             )
             .await;
 
-            let resp = router.handle(request("/v1/chat/completions")).await;
+            let resp = handler.handle(request("/v1/chat/completions")).await;
             assert_eq!(resp.head.status, StatusCode::OK);
             resp.body.collect().await.unwrap();
 
@@ -237,7 +256,7 @@ async fn streamed_response_logs_full_bytes_sent_and_a_duration_covering_the_whol
                 let frame_count = 4;
                 let addr = spawn_upstream_streaming_slowly(frame_count, gap).await;
                 let path = temp_path("streamed");
-                let router = build_router(
+                let handler = build_router(
                     Some(addr),
                     vec![text_logger(
                         &path,
@@ -247,7 +266,7 @@ async fn streamed_response_logs_full_bytes_sent_and_a_duration_covering_the_whol
                 )
                 .await;
 
-                let resp = router.handle(request("/v1/chat/completions")).await;
+                let resp = handler.handle(request("/v1/chat/completions")).await;
                 assert_eq!(resp.head.status, StatusCode::OK);
                 let collected = resp.body.collect().await.unwrap().to_bytes();
                 // Every frame ("hello", 5 bytes) made it through.
@@ -287,7 +306,7 @@ async fn unknown_cluster_records_and_renders_the_nc_flag() {
         .run_until(async {
             let path = temp_path("nc-flag");
             // No upstream address registered for cluster "up" at all.
-            let router = build_router(
+            let handler = build_router(
                 None,
                 vec![text_logger(
                     &path,
@@ -297,7 +316,7 @@ async fn unknown_cluster_records_and_renders_the_nc_flag() {
             )
             .await;
 
-            let resp = router.handle(request("/v1/chat/completions")).await;
+            let resp = handler.handle(request("/v1/chat/completions")).await;
             assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
             resp.body.collect().await.unwrap();
 
@@ -318,7 +337,7 @@ async fn a_request_excluded_by_the_access_log_filter_produces_no_line() {
             // An empty `ResponseFlag` filter list means "log only if *some*
             // flag fired" (Envoy semantics) -- a plain successful request
             // fires none, so this logger must produce nothing for it.
-            let router = build_router(
+            let handler = build_router(
                 Some(addr),
                 vec![text_logger(
                     &path,
@@ -328,7 +347,7 @@ async fn a_request_excluded_by_the_access_log_filter_produces_no_line() {
             )
             .await;
 
-            let resp = router.handle(request("/v1/chat/completions")).await;
+            let resp = handler.handle(request("/v1/chat/completions")).await;
             assert_eq!(resp.head.status, StatusCode::OK);
             resp.body.collect().await.unwrap();
 
@@ -351,7 +370,7 @@ async fn two_loggers_on_the_same_file_path_share_one_sink_and_interleave_whole_l
             // each with a distinct format -- proves they share one
             // `FileSink` (one `BufWriter`/`Mutex`) rather than each opening
             // their own handle and corrupting each other's writes.
-            let router = build_router(
+            let handler = build_router(
                 Some(addr),
                 vec![
                     text_logger(&path, "first %RESPONSE_CODE%\n", None),
@@ -360,7 +379,7 @@ async fn two_loggers_on_the_same_file_path_share_one_sink_and_interleave_whole_l
             )
             .await;
 
-            let resp = router.handle(request("/v1/chat/completions")).await;
+            let resp = handler.handle(request("/v1/chat/completions")).await;
             assert_eq!(resp.head.status, StatusCode::OK);
             resp.body.collect().await.unwrap();
 
@@ -382,9 +401,9 @@ async fn no_access_logs_configured_writes_nothing_and_behaves_like_before() {
     LocalSet::new()
         .run_until(async {
             let addr = spawn_upstream_ok(b"hi").await;
-            let router = build_router(Some(addr), Vec::new()).await;
+            let handler = build_router(Some(addr), Vec::new()).await;
 
-            let resp = router.handle(request("/v1/chat/completions")).await;
+            let resp = handler.handle(request("/v1/chat/completions")).await;
             assert_eq!(resp.head.status, StatusCode::OK);
             let collected = resp.body.collect().await.unwrap().to_bytes();
             assert_eq!(collected.as_ref(), b"hi");
