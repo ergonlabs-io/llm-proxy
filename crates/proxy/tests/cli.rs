@@ -111,6 +111,37 @@ fn wait_for_line(rx: &mpsc::Receiver<String>, needle: &str, timeout: Duration) -
     }
 }
 
+/// Polls `addr` until a TCP connection succeeds or `timeout` elapses,
+/// returning whether it connected.
+///
+/// Rust note: unlike `wait_for_line`, this doesn't depend on the child's
+/// stderr at all -- it asks the OS directly whether the listener is actually
+/// accepting connections, which is the real readiness condition we need (see
+/// the doc comment at its call site in `sigterm_drains_then_exits_cleanly`).
+fn wait_for_connectable(addr: (&str, u16), timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if TcpStream::connect(addr).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Drains whatever lines are already sitting in `rx` without blocking, for
+/// use in failure messages (e.g. "here's what the child printed before we
+/// gave up").
+fn drain_available_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        lines.push(line);
+    }
+    lines
+}
+
 #[test]
 fn sigterm_drains_then_exits_cleanly() {
     let config = repo_root().join("examples/tcp-proxy.yaml");
@@ -133,8 +164,28 @@ fn sigterm_drains_then_exits_cleanly() {
     // open across the whole SIGTERM/drain/exit sequence, not just until the
     // startup line shows up.
     let rx = spawn_line_reader(BufReader::new(stderr));
-    let found = wait_for_line(&rx, "llm-proxy started", STARTUP_TIMEOUT);
-    assert!(found, "startup line did not appear on stderr in time");
+
+    // Deliberately *not* `wait_for_line(&rx, "llm-proxy started", ..)` here:
+    // `run_serve` (crates/proxy/src/main.rs) logs that line before it has
+    // confirmed every worker's initial listener bind, and -- more importantly
+    // -- before `wait_for_shutdown_signal` makes its (synchronous)
+    // `tokio::signal::unix::signal(SIGTERM)` call that actually installs our
+    // handler. A SIGTERM delivered in that window hits the default
+    // disposition (process-terminate-by-signal) instead of the drain path,
+    // which is exactly the kind of failure this test saw once on 2026-07-29:
+    // a non-`success()` exit, not a timeout. Polling for the example config's
+    // listener (127.0.0.1:10000, examples/tcp-proxy.yaml) to actually accept
+    // a connection instead ties readiness to `initial_bind` having completed
+    // in every worker, which happens-before `run_serve`'s `wait_for_shutdown_signal`
+    // call (see `wait_for_initial_binds` gating it) -- a real readiness fence
+    // instead of a log line that can precede it.
+    let ready = wait_for_connectable(("127.0.0.1", 10000), STARTUP_TIMEOUT);
+    assert!(
+        ready,
+        "listener at 127.0.0.1:10000 did not become connectable in time \
+         (stderr so far: {:?})",
+        drain_available_lines(&rx)
+    );
 
     // `Child::kill` sends SIGKILL, not SIGTERM -- shell out to `kill -TERM`
     // to exercise the actual signal our graceful-shutdown path listens for.

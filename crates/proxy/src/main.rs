@@ -358,6 +358,20 @@ async fn run_serve(
     // status gets back to the control runtime without changing
     // `WorkerPool`'s public API: it's plumbed entirely through the closure's
     // capture, not through `WorkerContext`.
+    // Install the shutdown handlers BEFORE spawning any worker. Workers begin
+    // binding listeners as soon as they start, so installing after the spawn
+    // would leave a window in which the proxy is already accepting connections
+    // while a SIGTERM would still kill it outright with no drain -- see
+    // `ShutdownSignals`'s doc comment. Nothing is listening yet at this point,
+    // so there is nothing to tear down if installation fails.
+    let mut shutdown_signals = match ShutdownSignals::install() {
+        Ok(signals) => signals,
+        Err(err) => {
+            eprintln!("failed to install shutdown signal handlers: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let (bind_tx, mut bind_rx) = mpsc::unbounded_channel::<(WorkerId, Result<(), String>)>();
 
     let publisher = WorkerPool::spawn(
@@ -394,7 +408,7 @@ async fn run_serve(
         return ExitCode::FAILURE;
     }
 
-    wait_for_shutdown_signal().await;
+    shutdown_signals.recv().await;
 
     let outcome = graceful_shutdown(publisher, drain_time, strategy).await;
     tracing::info!(?outcome, "drain sequence finished, exiting");
@@ -496,16 +510,45 @@ async fn worker_main(
     let _ = listener_manager.await;
 }
 
-/// Waits for either SIGTERM or SIGINT (Ctrl-C). Rust note:
-/// `tokio::signal::unix::signal` returns a `Signal` stream we can `.recv()`
-/// repeatedly; we only care about the first one, so `select!` racing it
-/// against `ctrl_c()` is enough.
-async fn wait_for_shutdown_signal() {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
+/// SIGTERM and SIGINT, with their handlers already **installed**.
+///
+/// The distinction that matters: `tokio::signal::unix::signal()` registers the
+/// handler with the OS when it is *called*, not when the returned stream is
+/// first polled. Installing both up front — before we announce readiness and
+/// before the initial-bind gate — is what makes the announcement true. If the
+/// handler were installed only at the point we start awaiting it (as this used
+/// to do), any signal arriving between "started" and that await would be
+/// handled by the **default disposition**: immediate termination by signal, no
+/// drain, live connections dropped. That window is small but entirely real —
+/// an orchestrator terminating a pod during a fast rollout or a scale-down
+/// race lands squarely in it.
+///
+/// Rust note: SIGINT is taken as a `Signal` stream rather than via
+/// `tokio::signal::ctrl_c()` for exactly the same reason — `ctrl_c()` is a
+/// future that installs its handler on first poll, which would reintroduce the
+/// gap for SIGINT alone.
+struct ShutdownSignals {
+    sigterm: tokio::signal::unix::Signal,
+    sigint: tokio::signal::unix::Signal,
+}
 
-    tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
+impl ShutdownSignals {
+    /// Installs both handlers. Failing to install one is a startup failure,
+    /// not something to discover at shutdown time.
+    fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            sigterm: signal(SignalKind::terminate())?,
+            sigint: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Resolves on the first of either signal. We only care about the first,
+    /// so racing the two streams in a `select!` is enough.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.sigterm.recv() => {}
+            _ = self.sigint.recv() => {}
+        }
     }
 }
