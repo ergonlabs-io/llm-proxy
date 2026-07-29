@@ -9,7 +9,7 @@
 //! path: S1 domain lookup structures (exact map + wildcard lists sorted
 //! longest-first), compiled regexes, weighted-cluster cumulative weight arrays.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -308,6 +308,24 @@ pub enum ComparisonOp {
     Ne,
 }
 
+/// One entry of Envoy's `typed_per_filter_config` map: a per-route override
+/// for a single HTTP filter, left undecoded for the same reason
+/// [`HttpFilterSpec::config`] is (ground rule #2 -- the `proxy-http` registry
+/// owns per-filter parsing, not the IR).
+#[derive(Debug)]
+pub struct PerFilterConfig {
+    /// Type URL of the *inner* config (after any `FilterConfig` unwrapping).
+    pub type_url: String,
+    /// `None` when `disabled` is set (Envoy allows a bare disable with no config).
+    pub config: Option<prost_reflect::DynamicMessage>,
+    /// `envoy.config.route.v3.FilterConfig.is_optional`: tolerate a filter
+    /// name that isn't in the chain, instead of rejecting the config.
+    pub is_optional: bool,
+    /// `envoy.config.route.v3.FilterConfig.disabled`: disable this filter for
+    /// this route.
+    pub disabled: bool,
+}
+
 /// An HTTP filter, resolved from its `typed_config` type URL.
 ///
 /// Rust note: `config` is left as a [`prost_reflect::DynamicMessage`] (a
@@ -464,6 +482,8 @@ pub struct RouteTable {
     pub name: RouteConfigName,
     pub virtual_hosts: Vec<Arc<VirtualHostIR>>,
     index: DomainIndex,
+    /// `RouteConfiguration.typed_per_filter_config`.
+    pub typed_per_filter_config: BTreeMap<String, PerFilterConfig>,
 }
 
 /// S1 domain-precedence lookup structure, built once at conversion time.
@@ -484,7 +504,8 @@ impl RouteTable {
     /// across virtual hosts are a config error (as in Envoy).
     pub fn new(
         name: RouteConfigName,
-        virtual_hosts: Vec<VirtualHostIR>,
+        mut virtual_hosts: Vec<VirtualHostIR>,
+        typed_per_filter_config: BTreeMap<String, PerFilterConfig>,
     ) -> Result<Self, DuplicateDomain> {
         let mut index = DomainIndex::default();
         let mut seen: HashMap<String, ()> = HashMap::new();
@@ -514,11 +535,35 @@ impl RouteTable {
         index
             .prefix_wildcards
             .sort_by_key(|(p, _)| Reverse(p.len()));
+
+        // Rust note: assign a dense `route_index` across the whole table
+        // before wrapping the virtual hosts in `Arc` and sharing them.
+        // `Arc::get_mut` only succeeds while the `Arc`'s strong count is 1,
+        // which it still is here -- `convert_route` set each `RouteEntry`'s
+        // `Arc` up as a unique owner, and `virtual_hosts` arrived by value,
+        // so nothing else has cloned any of these `Arc`s yet.
+        let mut next_index = 0usize;
+        for vhost in virtual_hosts.iter_mut() {
+            for route in vhost.routes.iter_mut() {
+                let entry =
+                    Arc::get_mut(route).expect("route Arc is still uniquely owned in new()");
+                entry.route_index = next_index;
+                next_index += 1;
+            }
+        }
+
         Ok(Self {
             name,
             virtual_hosts: virtual_hosts.into_iter().map(Arc::new).collect(),
             index,
+            typed_per_filter_config,
         })
+    }
+
+    /// Number of routes in this table; every `RouteEntry::route_index` is
+    /// `< route_count()`. Sized for the `proxy-http` side table.
+    pub fn route_count(&self) -> usize {
+        self.virtual_hosts.iter().map(|v| v.routes.len()).sum()
     }
 
     /// S1 virtual-host selection for a request `:authority`/`Host`.
@@ -564,6 +609,8 @@ pub struct VirtualHostIR {
     /// hands callers an `Arc<RouteEntry>` clone rather than a borrow tied to
     /// the request's lifetime, so there has to be an `Arc` here to clone from.
     pub routes: Vec<Arc<RouteEntry>>,
+    /// `VirtualHost.typed_per_filter_config`.
+    pub typed_per_filter_config: BTreeMap<String, PerFilterConfig>,
 }
 
 /// One route: pre-compiled matcher + resolved action.
@@ -574,6 +621,13 @@ pub struct RouteEntry {
     pub action: RouteActionIR,
     /// Request header mutations applied on match.
     pub request_headers_to_add: Vec<HeaderMutation>,
+    /// `Route.typed_per_filter_config`.
+    pub typed_per_filter_config: BTreeMap<String, PerFilterConfig>,
+    /// Dense index, unique within the owning [`RouteTable`], assigned by
+    /// `RouteTable::new`. Lets `proxy-http` keep a side table of parsed
+    /// per-route filter configs (which are `proxy-http` types and so cannot
+    /// live in the IR) indexed by route, without hashing pointers.
+    pub route_index: usize,
 }
 
 #[derive(Debug)]

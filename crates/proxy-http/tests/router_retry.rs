@@ -8,7 +8,7 @@
 //! driver tasks via `tokio::task::spawn_local`, so every test needs a
 //! `LocalSet` on a `current_thread` runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -109,8 +109,12 @@ async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandle
                 matcher: prefix_matcher("/v1/"),
                 action: RouteActionIR::Forward(fwd),
                 request_headers_to_add: Vec::new(),
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
             })],
+            typed_per_filter_config: BTreeMap::new(),
         }],
+        BTreeMap::new(),
     )
     .unwrap();
 
@@ -322,8 +326,12 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                             3,
                         )))),
                         request_headers_to_add: Vec::new(),
+                        typed_per_filter_config: BTreeMap::new(),
+                        route_index: 0,
                     })],
+                    typed_per_filter_config: BTreeMap::new(),
                 }],
+                BTreeMap::new(),
             )
             .unwrap();
             let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =

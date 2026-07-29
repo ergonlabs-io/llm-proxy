@@ -10,7 +10,7 @@
 //! `tokio::task::spawn_local`, so every test needs a `LocalSet` on a
 //! `current_thread` runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,8 +104,12 @@ async fn build_router(
                 matcher: prefix_matcher("/v1/"),
                 action: RouteActionIR::Forward(fwd),
                 request_headers_to_add: mutations,
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
             })],
+            typed_per_filter_config: BTreeMap::new(),
         }],
+        BTreeMap::new(),
     )
     .unwrap();
 

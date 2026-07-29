@@ -208,8 +208,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // them out of this list means setting any of them is a strict-mode
         // error rather than a silent behavior change.
         "envoy.config.core.v3.SubstitutionFormatString" => &["text_format", "json_format"],
-        "envoy.config.route.v3.RouteConfiguration" => &["name", "virtual_hosts"],
-        "envoy.config.route.v3.VirtualHost" => &["name", "domains", "routes"],
+        "envoy.config.route.v3.RouteConfiguration" => {
+            &["name", "virtual_hosts", "typed_per_filter_config"]
+        }
+        "envoy.config.route.v3.VirtualHost" => {
+            &["name", "domains", "routes", "typed_per_filter_config"]
+        }
         "envoy.config.route.v3.Route" => &[
             "name",
             "match",
@@ -217,7 +221,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "redirect",
             "direct_response",
             "request_headers_to_add",
+            "typed_per_filter_config",
         ],
+        // ADR-0004 step 4: the `Any` wrapper Envoy allows around a per-route
+        // filter override, carrying `is_optional`/`disabled` alongside the
+        // inner config. See `convert_typed_per_filter_config`.
+        "envoy.config.route.v3.FilterConfig" => &["config", "is_optional", "disabled"],
         "envoy.config.route.v3.RouteMatch" => {
             &["prefix", "path", "safe_regex", "case_sensitive", "headers"]
         }
@@ -508,6 +517,82 @@ fn decode_http_filter_config(
         })?;
     DynamicMessage::decode(inner_desc, any.value.as_slice())
         .map_err(|e| ConfigError::Parse(format!("cannot decode `{}`: {e}", any.type_url)))
+}
+
+/// `envoy.config.route.v3.FilterConfig`'s type name -- the optional wrapper
+/// around a `typed_per_filter_config` entry (see
+/// [`convert_typed_per_filter_config`]).
+const FILTER_CONFIG_TYPE: &str = "envoy.config.route.v3.FilterConfig";
+
+/// Lower one level of Envoy's `typed_per_filter_config` map (present on
+/// `Route`, `VirtualHost`, and `RouteConfiguration`) into IR
+/// [`PerFilterConfig`] entries, keyed by filter name. `path` is the dotted
+/// path of the owning `typed_per_filter_config` field itself; each entry's
+/// error path is `{path}[{name}]`, matching ground rule #1.
+///
+/// Rust note: the return type is a [`std::collections::BTreeMap`], not a
+/// `HashMap` -- `m`'s iteration order is unspecified (it's a `HashMap`,
+/// mirroring the proto's `map<string, Any>`), but the IR needs deterministic
+/// `Debug`/iteration order for `/config_dump` and test assertions, so the
+/// entries are collected into a map that sorts itself by key.
+fn convert_typed_per_filter_config(
+    m: &std::collections::HashMap<String, prost_types::Any>,
+    path: &str,
+) -> Result<std::collections::BTreeMap<String, PerFilterConfig>, ConfigError> {
+    let mut out = std::collections::BTreeMap::new();
+    for (name, any) in m {
+        let entry_path = format!("{path}[{name}]");
+        let per = if type_name(any) == FILTER_CONFIG_TYPE {
+            let wrapper: route_v3::FilterConfig = decode_any(any, &entry_path)?;
+            let has_config = wrapper
+                .config
+                .as_ref()
+                .is_some_and(|a| !a.type_url.is_empty());
+            match (has_config, wrapper.disabled) {
+                (true, true) => {
+                    return Err(invalid(
+                        &entry_path,
+                        "cannot set both `config` and `disabled`",
+                    ))
+                }
+                (false, false) => {
+                    return Err(invalid(
+                        &entry_path,
+                        "a FilterConfig must set either `config` or `disabled`",
+                    ))
+                }
+                (true, false) => {
+                    let inner = wrapper.config.as_ref().expect("has_config checked above");
+                    let config = decode_http_filter_config(
+                        inner,
+                        &format!("{entry_path}.config.typed_config"),
+                    )?;
+                    PerFilterConfig {
+                        type_url: inner.type_url.clone(),
+                        config: Some(config),
+                        is_optional: wrapper.is_optional,
+                        disabled: false,
+                    }
+                }
+                (false, true) => PerFilterConfig {
+                    type_url: String::new(),
+                    config: None,
+                    is_optional: wrapper.is_optional,
+                    disabled: true,
+                },
+            }
+        } else {
+            let config = decode_http_filter_config(any, &entry_path)?;
+            PerFilterConfig {
+                type_url: any.type_url.clone(),
+                config: Some(config),
+                is_optional: false,
+                disabled: false,
+            }
+        };
+        out.insert(name.clone(), per);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- listeners --
@@ -2082,13 +2167,22 @@ fn convert_route_table(
                 &format!("{vh_path}.routes[{j}]"),
             )?));
         }
+        let vh_typed_per_filter_config = convert_typed_per_filter_config(
+            &vh.typed_per_filter_config,
+            &format!("{vh_path}.typed_per_filter_config"),
+        )?;
         vhosts.push(VirtualHostIR {
             name: vh.name.clone(),
             domains: vh.domains.clone(),
             routes,
+            typed_per_filter_config: vh_typed_per_filter_config,
         });
     }
-    RouteTable::new(rc.name.clone(), vhosts).map_err(|dup| {
+    let rc_typed_per_filter_config = convert_typed_per_filter_config(
+        &rc.typed_per_filter_config,
+        &format!("{path}.typed_per_filter_config"),
+    )?;
+    RouteTable::new(rc.name.clone(), vhosts, rc_typed_per_filter_config).map_err(|dup| {
         invalid(
             format!("{path}.virtual_hosts"),
             format!("duplicate domain `{}`", dup.0),
@@ -2139,11 +2233,21 @@ fn convert_route(r: &route_v3::Route, path: &str) -> Result<RouteEntry, ConfigEr
         )?);
     }
 
+    let typed_per_filter_config = convert_typed_per_filter_config(
+        &r.typed_per_filter_config,
+        &format!("{path}.typed_per_filter_config"),
+    )?;
+
     Ok(RouteEntry {
         name: (!r.name.is_empty()).then(|| r.name.clone()),
         matcher,
         action,
         request_headers_to_add,
+        typed_per_filter_config,
+        // Rust note: real value assigned in bulk by `RouteTable::new` (via
+        // `Arc::get_mut`) once every route in the table has been built --
+        // this constructor doesn't know the table-wide ordering yet.
+        route_index: 0,
     })
 }
 

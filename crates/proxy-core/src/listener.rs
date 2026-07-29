@@ -1026,6 +1026,7 @@ mod tests {
     use proxy_config::ir::{
         FilterChainMatch, FilterChainSpec, ListenerConfig as IrListenerConfig, SourceType,
     };
+    use std::collections::BTreeMap;
     use std::io::ErrorKind;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener as TokioTcpListener;
@@ -1082,8 +1083,12 @@ mod tests {
         NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
             stat_prefix: "test".to_string(),
             route_table: Arc::new(
-                proxy_config::ir::RouteTable::new("test-routes".to_string(), vec![])
-                    .expect("empty route table can't have duplicate domains"),
+                proxy_config::ir::RouteTable::new(
+                    "test-routes".to_string(),
+                    vec![],
+                    BTreeMap::new(),
+                )
+                .expect("empty route table can't have duplicate domains"),
             ),
             http_filters: vec![],
             generate_request_id: true,
@@ -1119,8 +1124,12 @@ mod tests {
                         },
                         action: RouteActionIR::DirectResponse { status, body: None },
                         request_headers_to_add: vec![],
+                        typed_per_filter_config: BTreeMap::new(),
+                        route_index: 0,
                     })],
+                    typed_per_filter_config: BTreeMap::new(),
                 }],
+                BTreeMap::new(),
             )
             .expect("single vhost can't have duplicate domains"),
         )
@@ -2474,8 +2483,12 @@ mod tests {
                             prefix_rewrite: None,
                         }),
                         request_headers_to_add: vec![],
+                        typed_per_filter_config: BTreeMap::new(),
+                        route_index: 0,
                     })],
+                    typed_per_filter_config: BTreeMap::new(),
                 }],
+                BTreeMap::new(),
             )
             .expect("single vhost can't have duplicate domains"),
         )

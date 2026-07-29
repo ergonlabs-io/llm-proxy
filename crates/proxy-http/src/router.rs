@@ -830,7 +830,7 @@ fn local_reply_with_status(status: StatusCode, body: Bytes) -> HttpResponseParts
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -1037,8 +1037,12 @@ mod tests {
                     matcher,
                     action: RouteActionIR::Forward(fwd),
                     request_headers_to_add: Vec::new(),
+                    typed_per_filter_config: BTreeMap::new(),
+                    route_index: 0,
                 })],
+                typed_per_filter_config: BTreeMap::new(),
             }],
+            BTreeMap::new(),
         )
         .unwrap();
 
@@ -1522,6 +1526,8 @@ mod tests {
                 matcher: prefix_matcher(prefix),
                 action: RouteActionIR::DirectResponse { status, body: None },
                 request_headers_to_add: Vec::new(),
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
             })
         }
         RouteTable::new(
@@ -1530,7 +1536,9 @@ mod tests {
                 name: "vh".to_string(),
                 domains: vec!["*".to_string()],
                 routes: vec![route("/a", 201), route("/b", 202)],
+                typed_per_filter_config: BTreeMap::new(),
             }],
+            BTreeMap::new(),
         )
         .expect("two non-overlapping prefixes on one domain is a valid table")
     }

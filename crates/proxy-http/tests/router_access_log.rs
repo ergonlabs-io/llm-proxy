@@ -22,7 +22,7 @@
 //! spawns a non-`Send` connection driver task via `tokio::task::spawn_local`,
 //! so every test needs a `LocalSet` on a `current_thread` runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read as _;
 use std::net::SocketAddr;
@@ -146,8 +146,12 @@ async fn build_router(
                 matcher: prefix_matcher("/v1/"),
                 action: RouteActionIR::Forward(forward_to("up")),
                 request_headers_to_add: Vec::new(),
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
             })],
+            typed_per_filter_config: BTreeMap::new(),
         }],
+        BTreeMap::new(),
     )
     .unwrap();
 

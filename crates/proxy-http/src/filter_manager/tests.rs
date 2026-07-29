@@ -4,6 +4,7 @@
 //! trailers (S2.4), the buffer APIs (S2.7), and overflow → 413/500.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -45,7 +46,10 @@ fn log_of() -> Log {
 /// matching this suite's pre-S2.8 behavior everywhere except the tests below
 /// that build their own real table.
 fn empty_route_table() -> Arc<RouteTable> {
-    Arc::new(RouteTable::new("test-routes".to_string(), Vec::new()).expect("empty table is valid"))
+    Arc::new(
+        RouteTable::new("test-routes".to_string(), Vec::new(), BTreeMap::new())
+            .expect("empty table is valid"),
+    )
 }
 
 /// A configurable probe filter. Each field controls one callback's return.
@@ -2009,6 +2013,8 @@ fn route_table_two_routes() -> Arc<RouteTable> {
                 prefix_rewrite: None,
             }),
             request_headers_to_add: Vec::new(),
+            typed_per_filter_config: BTreeMap::new(),
+            route_index: 0,
         })
     }
     Arc::new(
@@ -2021,7 +2027,9 @@ fn route_table_two_routes() -> Arc<RouteTable> {
                     route("route-a", "/a", "cluster-a"),
                     route("route-b", "/b", "cluster-b"),
                 ],
+                typed_per_filter_config: BTreeMap::new(),
             }],
+            BTreeMap::new(),
         )
         .expect("two non-overlapping prefixes on one domain is a valid table"),
     )
