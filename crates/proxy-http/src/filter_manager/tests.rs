@@ -264,8 +264,6 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
-        stream_info: None,
-        route: None,
     }
 }
 
@@ -280,8 +278,6 @@ fn request_with_trailers(body: &'static [u8], trailers: HeaderMap) -> HttpReques
         },
         body: bytes_to_seam_body(Bytes::from_static(body), Some(trailers)),
         downstream: DownstreamInfo::loopback(),
-        stream_info: None,
-        route: None,
     }
 }
 
@@ -299,11 +295,12 @@ async fn run_chain_req(
         seen_body: seen_body.clone(),
         seen_request_id: Rc::new(RefCell::new(None)),
         seen_headers: None,
+        captured_body: Bytes::new(),
     };
     let mgr = FilterManager {
         filters,
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
-        terminal: &terminal,
+        terminal: Box::new(terminal),
         buffer_limit,
     };
     let resp = mgr.run(req).await;
@@ -328,12 +325,13 @@ async fn run_chain_req_with_route_table(
         seen_body,
         seen_request_id: Rc::new(RefCell::new(None)),
         seen_headers: None,
+        captured_body: Bytes::new(),
     };
     let mgr = FilterManager {
         filters,
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())))
             .with_route_table(route_table),
-        terminal: &terminal,
+        terminal: Box::new(terminal),
         buffer_limit: DEFAULT_BUFFER_LIMIT,
     };
     let resp = mgr.run(req).await;
@@ -342,8 +340,13 @@ async fn run_chain_req_with_route_table(
     status
 }
 
-/// A terminal handler that records that it ran and echoes a fixed 200 with the
+/// A terminal filter that records that it ran and echoes a fixed 200 with the
 /// request body it received (so tests can assert what reached the router).
+///
+/// ADR-0004 step 3: this is now an ordinary [`HttpFilter`] (capturing what it
+/// needs from `decode_headers`/`decode_data` -- exactly like `RouterHandler`
+/// does) plus [`TerminalHttpFilter::respond`], rather than a bespoke
+/// `StreamHandler` handed a whole `HttpRequestParts` across a seam.
 struct RecordingTerminal {
     log: Log,
     seen_body: Rc<RefCell<Bytes>>,
@@ -357,26 +360,60 @@ struct RecordingTerminal {
     /// HCM-level mutation ran. `None` when the test doesn't care (most
     /// callers below).
     seen_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
+    /// Captured in `decode_data`, consumed by `respond`.
+    captured_body: Bytes,
 }
 
-impl StreamHandler for RecordingTerminal {
-    fn handle<'a>(
-        &'a self,
-        req: HttpRequestParts,
+impl HttpFilter for RecordingTerminal {
+    fn decode_headers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        *self.seen_request_id.borrow_mut() = headers
+            .headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let Some(seen_headers) = &self.seen_headers {
+            *seen_headers.borrow_mut() = Some(headers.headers.clone());
+        }
+        FilterHeadersStatus::Continue
+    }
+
+    fn decode_data(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        data: &mut Bytes,
+        _end_stream: bool,
+    ) -> FilterDataStatus {
+        self.captured_body = data.clone();
+        FilterDataStatus::Continue
+    }
+
+    /// ADR-0004 step 3: the terminal is now an ordinary filter instance
+    /// (`filter_manager::destroy_filters` calls `terminal.on_destroy()`
+    /// before walking the rest of the chain in reverse creation order) --
+    /// before this step the router lived behind a `StreamHandler` seam and
+    /// never received `on_destroy` at all. Recorded onto the same shared
+    /// `Log` every `ProbeFilter` writes to, so a test can assert both that
+    /// it fires and where it falls in the overall teardown order.
+    fn on_destroy(&mut self) {
+        self.log
+            .borrow_mut()
+            .push("terminal:on_destroy".to_string());
+    }
+}
+
+impl TerminalHttpFilter for RecordingTerminal {
+    fn respond<'a>(
+        &'a mut self,
+        _cb: &'a mut dyn DecoderCallbacks,
     ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
             self.log.borrow_mut().push("terminal".to_string());
-            *self.seen_request_id.borrow_mut() = req
-                .head
-                .headers
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            if let Some(seen_headers) = &self.seen_headers {
-                *seen_headers.borrow_mut() = Some(req.head.headers.clone());
-            }
-            let collected = req.body.collect().await.expect("test body never errors");
-            *self.seen_body.borrow_mut() = collected.to_bytes();
+            *self.seen_body.borrow_mut() = self.captured_body.clone();
             HttpResponseParts {
                 head: ResponseHeaders {
                     status: StatusCode::OK,
@@ -384,6 +421,32 @@ impl StreamHandler for RecordingTerminal {
                 },
                 body: bytes_to_seam_body(Bytes::from_static(b"resp"), None),
             }
+        })
+    }
+}
+
+/// ADR-0004 step 3: [`RecordingTerminal`]'s own factory, for the
+/// `FilterChainHandler`-level tests below -- mints a fresh instance per
+/// request, sharing the same observation `Rc`s so the test can still read
+/// what the (fresh) instance saw. Deliberately not `Send + Sync`
+/// (`TerminalFilterInstanceFactory` doesn't require it, see its doc) since
+/// `Log`/the other fields are plain `Rc`s, same reasoning as `ProbeFilter`
+/// bypassing `FilterInstanceFactory` above.
+struct RecordingTerminalFactory {
+    log: Log,
+    seen_body: Rc<RefCell<Bytes>>,
+    seen_request_id: Rc<RefCell<Option<String>>>,
+    seen_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
+}
+
+impl TerminalFilterInstanceFactory for RecordingTerminalFactory {
+    fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter> {
+        Box::new(RecordingTerminal {
+            log: self.log.clone(),
+            seen_body: self.seen_body.clone(),
+            seen_request_id: self.seen_request_id.clone(),
+            seen_headers: self.seen_headers.clone(),
+            captured_body: Bytes::new(),
         })
     }
 }
@@ -402,11 +465,12 @@ async fn run_chain(
         seen_body: seen_body.clone(),
         seen_request_id: Rc::new(RefCell::new(None)),
         seen_headers: None,
+        captured_body: Bytes::new(),
     };
     let mgr = FilterManager {
         filters,
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
-        terminal: &terminal,
+        terminal: Box::new(terminal),
         buffer_limit,
     };
     let resp = mgr.run(request(body)).await;
@@ -464,8 +528,52 @@ fn decode_runs_in_order_and_encode_in_reverse() {
             .collect();
         assert_eq!(
             destroys,
-            vec!["b:on_destroy", "a:on_destroy"],
-            "instances destroyed in reverse creation order (S2.1); log: {entries:?}"
+            vec!["terminal:on_destroy", "b:on_destroy", "a:on_destroy"],
+            "instances destroyed in reverse creation order (S2.1), the \
+             terminal being created LAST and so destroyed FIRST; \
+             log: {entries:?}"
+        );
+    });
+}
+
+/// ADR-0004 step 3: the terminal is now an ordinary [`HttpFilter`] instance
+/// living in the chain (created LAST, after every configured filter), so per
+/// the `HttpFilter` contract -- instances destroyed in reverse creation order
+/// (S2.1) -- it must receive `on_destroy` exactly like any other filter. It
+/// never could before this step: the router sat behind a bespoke
+/// `StreamHandler` seam that had no teardown hook at all. Two `ProbeFilter`s
+/// bracket the terminal so the full reverse-creation-order sequence is
+/// observable, not just "it fires at all".
+#[test]
+fn terminal_receives_on_destroy_in_reverse_creation_order() {
+    block_on(async {
+        let log = log_of();
+        let filters: Vec<Box<dyn HttpFilter>> = vec![
+            Box::new(ProbeFilter::new("a", log.clone())),
+            Box::new(ProbeFilter::new("b", log.clone())),
+        ];
+        let (status, _, _) = run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let entries = log.borrow().clone();
+        let destroys: Vec<&String> = entries
+            .iter()
+            .filter(|e| e.ends_with(":on_destroy"))
+            .collect();
+        assert_eq!(
+            destroys,
+            vec!["terminal:on_destroy", "b:on_destroy", "a:on_destroy"],
+            "the terminal is created LAST (position n, after `a` and `b`), so \
+             it must be destroyed FIRST -- reverse creation order (S2.1); \
+             log: {entries:?}"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| *e == "terminal:on_destroy")
+                .count(),
+            1,
+            "on_destroy must fire exactly once per stream; log: {entries:?}"
         );
     });
 }
@@ -894,8 +1002,14 @@ fn three_filters_decode_forward_encode_reverse_destroy_reverse() {
             .collect();
         assert_eq!(
             destroys,
-            vec!["c:on_destroy", "b:on_destroy", "a:on_destroy"],
-            "S2.1 reverse creation-order teardown; log: {entries:?}"
+            vec![
+                "terminal:on_destroy",
+                "c:on_destroy",
+                "b:on_destroy",
+                "a:on_destroy"
+            ],
+            "S2.1 reverse creation-order teardown, terminal (created last) first; \
+             log: {entries:?}"
         );
     });
 }
@@ -923,9 +1037,15 @@ fn on_destroy_reverse_order_holds_on_local_reply_path() {
             .collect();
         assert_eq!(
             destroys,
-            vec!["c:on_destroy", "b:on_destroy", "a:on_destroy"],
+            vec![
+                "terminal:on_destroy",
+                "c:on_destroy",
+                "b:on_destroy",
+                "a:on_destroy"
+            ],
             "S2.1: teardown must be reverse creation order even on the \
-             local-reply short-circuit path; log: {entries:?}"
+             local-reply short-circuit path, terminal (created last) first; \
+             log: {entries:?}"
         );
     });
 }
@@ -954,9 +1074,15 @@ fn on_destroy_reverse_order_holds_on_decode_overflow_path() {
             .collect();
         assert_eq!(
             destroys,
-            vec!["c:on_destroy", "b:on_destroy", "a:on_destroy"],
+            vec![
+                "terminal:on_destroy",
+                "c:on_destroy",
+                "b:on_destroy",
+                "a:on_destroy"
+            ],
             "S2.1: teardown must be reverse creation order even on the \
-             decode-overflow (413) path; log: {entries:?}"
+             decode-overflow (413) path, terminal (created last) first; \
+             log: {entries:?}"
         );
     });
 }
@@ -1834,8 +1960,6 @@ fn request_with_path(path: &'static str, body: &'static [u8]) -> HttpRequestPart
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
-        stream_info: None,
-        route: None,
     }
 }
 
@@ -2051,15 +2175,16 @@ fn run_through_handler(
 ) -> Option<String> {
     block_on(async {
         let seen_request_id = Rc::new(RefCell::new(None));
-        let terminal = Rc::new(RecordingTerminal {
-            log: log_of(),
-            seen_body: Rc::new(RefCell::new(Bytes::new())),
-            seen_request_id: seen_request_id.clone(),
-            seen_headers: None,
-        });
+        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+            Rc::new(RecordingTerminalFactory {
+                log: log_of(),
+                seen_body: Rc::new(RefCell::new(Bytes::new())),
+                seen_request_id: seen_request_id.clone(),
+                seen_headers: None,
+            });
         let handler = FilterChainHandler::new(
             Vec::new(),
-            terminal,
+            terminal_factory,
             empty_route_table(),
             generate_request_id,
             false,
@@ -2140,15 +2265,16 @@ fn run_through_handler_xff(
 ) -> HeaderMap {
     block_on(async {
         let seen_headers = Rc::new(RefCell::new(None));
-        let terminal = Rc::new(RecordingTerminal {
-            log: log_of(),
-            seen_body: Rc::new(RefCell::new(Bytes::new())),
-            seen_request_id: Rc::new(RefCell::new(None)),
-            seen_headers: Some(seen_headers.clone()),
-        });
+        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+            Rc::new(RecordingTerminalFactory {
+                log: log_of(),
+                seen_body: Rc::new(RefCell::new(Bytes::new())),
+                seen_request_id: Rc::new(RefCell::new(None)),
+                seen_headers: Some(seen_headers.clone()),
+            });
         let handler = FilterChainHandler::new(
             Vec::new(),
-            terminal,
+            terminal_factory,
             empty_route_table(),
             false,
             use_remote_address,
@@ -2366,16 +2492,17 @@ fn text_access_log(path: &std::path::Path, format: &str) -> AccessLogIR {
 fn encode_filters_end_of_stream_write_reaches_the_access_log_line() {
     block_on(async {
         let log = log_of();
-        let terminal = Rc::new(RecordingTerminal {
-            log,
-            seen_body: Rc::new(RefCell::new(Bytes::new())),
-            seen_request_id: Rc::new(RefCell::new(None)),
-            seen_headers: None,
-        });
+        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+            Rc::new(RecordingTerminalFactory {
+                log,
+                seen_body: Rc::new(RefCell::new(Bytes::new())),
+                seen_request_id: Rc::new(RefCell::new(None)),
+                seen_headers: None,
+            });
         let path = temp_log_path("ordering");
         let handler = FilterChainHandler::new_with_access_logs(
             vec![Arc::new(StampsUsageOnEndStreamFilterFactory)],
-            terminal,
+            terminal_factory,
             empty_route_table(),
             false,
             false,
@@ -2409,16 +2536,17 @@ fn encode_filters_end_of_stream_write_reaches_the_access_log_line() {
 fn a_filter_chain_local_reply_still_produces_an_access_log_line() {
     block_on(async {
         let log = log_of();
-        let terminal = Rc::new(RecordingTerminal {
-            log: log.clone(),
-            seen_body: Rc::new(RefCell::new(Bytes::new())),
-            seen_request_id: Rc::new(RefCell::new(None)),
-            seen_headers: None,
-        });
+        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+            Rc::new(RecordingTerminalFactory {
+                log: log.clone(),
+                seen_body: Rc::new(RefCell::new(Bytes::new())),
+                seen_request_id: Rc::new(RefCell::new(None)),
+                seen_headers: None,
+            });
         let path = temp_log_path("local-reply");
         let handler = FilterChainHandler::new_with_access_logs(
             vec![Arc::new(LocalReplyFilterFactory)],
-            terminal,
+            terminal_factory,
             empty_route_table(),
             false,
             false,

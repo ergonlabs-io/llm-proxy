@@ -1,8 +1,9 @@
-//! WP-13 v1 (thin slice): the router terminal filter. This is what
-//! `proxy-core`'s HTTP connection manager wiring plugs in as the
-//! [`crate::handler::StreamHandler`] at the *end* of the non-router
-//! `http_filters` chain (mirroring Envoy's `envoy.filters.http.router`) --
-//! matches a route (`crate::route`), picks a cluster + host through
+//! WP-13 v1 (thin slice): the router terminal filter. Since ADR-0004 step 3
+//! this is an ordinary [`crate::filter::HttpFilter`] that also implements
+//! [`crate::filter::TerminalHttpFilter`] -- `proxy-core`'s HTTP connection
+//! manager wiring plugs a [`RouterFilterFactory`] in as the LAST entry of the
+//! filter chain (mirroring Envoy's `envoy.filters.http.router`, which is
+//! simply the terminal `StreamDecoderFilter`) -- matches a route (`crate::route`), picks a cluster + host through
 //! `proxy_cluster::manager::ClusterManager`, dials/reuses an upstream
 //! connection, and proxies the request over it with
 //! [`crate::codec::send_upstream_http1`].
@@ -54,25 +55,27 @@
 //! INSIDE the encode filter chain, so logging from here can never observe
 //! what an encode filter does at end-of-stream).
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::{LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol};
-use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher, RouteTable};
+use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher};
 use proxy_observability::ResponseFlag;
 
-use crate::access_logging::CountingRequestBody;
 use crate::codec::{send_upstream_http1, send_upstream_http2, Http1Options, UpstreamCodecError};
-use crate::filter::{RequestHeaders, ResponseHeaders};
-use crate::handler::{local_boxed, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler};
+use crate::filter::{
+    DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
+    RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
+    TerminalHttpFilter,
+};
+use crate::handler::{
+    local_boxed, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody,
+};
 use crate::retry::{AttemptOutcome, RetryState};
-use crate::route::{apply_prefix_rewrite, match_route, select_cluster, RouteMatch, RouteRequest};
-use crate::stream_info::StreamInfo;
+use crate::route::{apply_prefix_rewrite, select_cluster};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 
@@ -88,120 +91,138 @@ mod idle;
 /// second (replayable) copy of).
 const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 
-/// The router terminal: matches a route, then forwards to the picked
-/// cluster/host over a real upstream connection. See the module doc for v1
-/// scope.
-pub struct RouterHandler {
-    route_table: Arc<RouteTable>,
+/// ADR-0004 step 3: the router's own [`TerminalFilterInstanceFactory`] --
+/// mints a fresh [`RouterHandler`] per stream, exactly like every other
+/// filter's factory. `Send + Sync` because it only holds an `Arc<ClusterManager>`
+/// (thread-safe config-time state); `TerminalFilterInstanceFactory` itself
+/// doesn't require that (see its doc), but nothing stops a real factory from
+/// providing it anyway.
+pub struct RouterFilterFactory {
     clusters: Arc<ClusterManager>,
 }
 
+impl RouterFilterFactory {
+    pub fn new(clusters: Arc<ClusterManager>) -> Self {
+        Self { clusters }
+    }
+}
+
+impl TerminalFilterInstanceFactory for RouterFilterFactory {
+    fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter> {
+        Box::new(RouterHandler::new(self.clusters.clone()))
+    }
+}
+
+/// The router terminal: matches a route, then forwards to the picked
+/// cluster/host over a real upstream connection. See the module doc for v1
+/// scope.
+///
+/// ADR-0004 step 3: this is now an ordinary [`HttpFilter`] instance, created
+/// fresh per stream (S2.1) -- it no longer resolves routes privately or holds
+/// a `route_table` of its own; it reads the filter manager's cached route via
+/// `DecoderCallbacks::route()` (S2.8), exactly like any other filter would.
+/// `decode_headers`/`decode_data`/`decode_trailers` below capture the fully
+/// -mutated request the same way any filter captures state from its own
+/// callbacks -- there is no more bespoke `HttpRequestParts` field carrying it
+/// across a seam.
+pub struct RouterHandler {
+    clusters: Arc<ClusterManager>,
+    /// Captured in `decode_headers` (cloned, since `RequestHeaders` isn't
+    /// `Clone` and the callback only lends us `&mut`); consumed by
+    /// `respond()`.
+    captured_head: Option<RequestHeaders>,
+    /// Captured in `decode_data`. Decode is fully buffered before any filter
+    /// runs (`filter_manager`'s module doc), so this one call always carries
+    /// the whole request body -- there's nothing incremental to accumulate.
+    captured_body: Bytes,
+    /// Captured in `decode_trailers`, when present.
+    captured_trailers: Option<RequestTrailers>,
+}
+
 impl RouterHandler {
-    pub fn new(route_table: Arc<RouteTable>, clusters: Arc<ClusterManager>) -> Self {
+    pub fn new(clusters: Arc<ClusterManager>) -> Self {
         Self {
-            route_table,
             clusters,
+            captured_head: None,
+            captured_body: Bytes::new(),
+            captured_trailers: None,
         }
     }
 }
 
-impl StreamHandler for RouterHandler {
-    // Rust note: boxed/pinned future, same shape as `stub::FixedResponseHandler`
-    // -- see `StreamHandler`'s own doc comment for why `async fn` in a trait
-    // isn't an option here (object safety).
-    fn handle<'a>(
-        &'a self,
-        req: HttpRequestParts,
+impl HttpFilter for RouterHandler {
+    fn decode_headers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        self.captured_head = Some(RequestHeaders {
+            method: headers.method.clone(),
+            uri: headers.uri.clone(),
+            headers: headers.headers.clone(),
+        });
+        FilterHeadersStatus::Continue
+    }
+
+    fn decode_data(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        data: &mut Bytes,
+        _end_stream: bool,
+    ) -> FilterDataStatus {
+        self.captured_body = data.clone();
+        FilterDataStatus::Continue
+    }
+
+    fn decode_trailers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        trailers: &mut RequestTrailers,
+    ) -> FilterTrailersStatus {
+        self.captured_trailers = Some(RequestTrailers(trailers.0.clone()));
+        FilterTrailersStatus::Continue
+    }
+}
+
+impl TerminalHttpFilter for RouterHandler {
+    // Rust note: boxed/pinned future, same shape every other `HttpFilter`/
+    // `TerminalHttpFilter` method that needs to be async uses (object safety
+    // -- `async fn` in a trait isn't callable through a trait object).
+    fn respond<'a>(
+        &'a mut self,
+        cb: &'a mut dyn DecoderCallbacks,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>> {
-        Box::pin(async move {
-            // Envoy's model (see `filter_manager`'s module doc): one
-            // `StreamInfo` per stream, shared with the filter chain wrapping
-            // this router. Take the handle the chain already built when
-            // present; only mint a fresh one for a standalone/test
-            // invocation with no chain in front of it.
-            let stream_info = req
-                .stream_info
-                .clone()
-                .unwrap_or_else(|| Rc::new(RefCell::new(StreamInfo::default())));
-            self.route_and_forward(req, stream_info).await
-        })
+        Box::pin(async move { self.route_and_forward(cb).await })
     }
 }
 
 impl RouterHandler {
-    async fn route_and_forward(
-        &self,
-        req: HttpRequestParts,
-        stream_info: Rc<RefCell<StreamInfo>>,
-    ) -> HttpResponseParts {
-        // S2.8 (ADR-0004 step 1): the filter manager already resolved (and
-        // cached) the route before handing us this request -- reuse that
-        // `Arc` rather than matching a second time. `None` means no chain sat
-        // in front of this handler (a standalone/test invocation, or a
-        // hand-built `RouterHandler` in a unit test), so we fall back to
-        // resolving privately, exactly as this router did before ADR-0004.
-        //
-        // Rust note: `.clone()` on `Option<Arc<RouteEntry>>` bumps the
-        // `Arc`'s refcount; it never deep-copies `RouteEntry`.
-        let route_from_chain = req.route.clone();
+    async fn route_and_forward(&mut self, dcb: &mut dyn DecoderCallbacks) -> HttpResponseParts {
+        // S2.8: the filter manager already resolved (and cached) the route
+        // by the time the decode chain reaches the terminal -- read it
+        // through the same callback every other filter would use. There is
+        // no more private fallback resolution (ADR-0004 step 3): the router
+        // always runs inside a filter chain that owns a route table.
+        let route = dcb.route();
 
-        // Rust note: `req.head.uri.authority()` borrows from `req.head`, so
-        // this has to be resolved before `req` is destructured/moved below;
-        // the `Host` header fallback borrows from the same `req.head`. Used
-        // both by the private-resolution fallback and by the "no route"
-        // trace below, regardless of which path produced `None`.
-        let host_header = req
-            .head
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok());
-        let authority = req
-            .head
-            .uri
-            .authority()
-            .map(|a| a.as_str())
-            .or(host_header)
-            .unwrap_or("");
-        let path = req
-            .head
-            .uri
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
-
-        let route = match route_from_chain {
-            Some(route) => Some(route),
-            None => {
-                let route_req = RouteRequest {
-                    authority,
-                    path,
-                    headers: &req.head.headers,
-                };
-                // Rust note: `match_route` borrows from `self.route_table`
-                // (its `'t` lifetime) and from `route_req` (which itself
-                // borrows `req.head`), so the match has to be turned into an
-                // owned `Arc` (`.clone()`) here, before `req` is
-                // destructured/moved below.
-                //
-                // `RouteMatch::NoVirtualHost` and `RouteMatch::NoRoute` both
-                // collapse to `None` here -- this router has always treated
-                // the two identically (same trace, same response flag, same
-                // 404), so no behavior is lost by no longer naming which one
-                // it was.
-                match match_route(&self.route_table, &route_req) {
-                    RouteMatch::Found { route, .. } => Some(route.clone()),
-                    RouteMatch::NoRoute { .. } | RouteMatch::NoVirtualHost => None,
-                }
+        let head = self.captured_head.take().unwrap_or_else(|| {
+            tracing::error!(
+                "RouterHandler::respond called with no captured request head -- \
+                 decode_headers never ran; this indicates a filter-manager bug"
+            );
+            RequestHeaders {
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
             }
-        };
+        });
 
         match route {
             None => {
-                tracing::debug!(response_flag = "NR", authority, path, "no route matched");
-                stream_info
-                    .borrow_mut()
+                tracing::debug!(response_flag = "NR", "no route matched");
+                dcb.stream_info()
                     .set_response_flag(ResponseFlag::NoRouteFound);
-                drain_request_body(req).await;
                 local_reply(StatusCode::NOT_FOUND, "no route matched")
             }
             Some(route) => match &route.action {
@@ -210,20 +231,18 @@ impl RouterHandler {
                         fwd,
                         &route.matcher,
                         &route.request_headers_to_add,
-                        req,
-                        stream_info,
+                        head,
+                        dcb,
                     )
                     .await
                 }
                 RouteActionIR::DirectResponse { status, body } => {
-                    drain_request_body(req).await;
                     direct_response(*status, body.as_ref())
                 }
                 RouteActionIR::Redirect(_) => {
                     tracing::debug!(
                         "TODO(WP-13 follow-up: redirects) -- redirect action not yet implemented"
                     );
-                    drain_request_body(req).await;
                     local_reply(
                         StatusCode::NOT_IMPLEMENTED,
                         "redirect actions are not yet implemented",
@@ -238,8 +257,8 @@ impl RouterHandler {
         fwd: &proxy_config::ir::ForwardAction,
         matcher: &RouteMatcher,
         request_headers_to_add: &[proxy_config::ir::HeaderMutation],
-        req: HttpRequestParts,
-        stream_info: Rc<RefCell<StreamInfo>>,
+        head: RequestHeaders,
+        dcb: &mut dyn DecoderCallbacks,
     ) -> HttpResponseParts {
         let draw = match &fwd.target {
             ForwardTarget::Weighted(w) if w.total_weight > 0 => {
@@ -248,85 +267,54 @@ impl RouterHandler {
             _ => 0,
         };
 
-        let Some(cluster_name) = select_cluster(&fwd.target, &req.head.headers, draw) else {
+        let Some(cluster_name) = select_cluster(&fwd.target, &head.headers, draw) else {
             tracing::debug!(
                 response_flag = "NC",
                 "forward target resolved to no cluster"
             );
-            stream_info
-                .borrow_mut()
+            dcb.stream_info()
                 .set_response_flag(ResponseFlag::NoClusterFound);
-            drain_request_body(req).await;
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no cluster");
         };
         // Rust note: `select_cluster` borrows `cluster_name` from
-        // `req.head.headers` (the `ClusterHeader` case) or from `fwd.target`
+        // `head.headers` (the `ClusterHeader` case) or from `fwd.target`
         // (a `'static`-ish `String` living in the route table) -- either way
-        // it's tied to `req`/`self`'s lifetime, so it has to be copied out
-        // (`to_string`) before `req` is consumed below.
+        // it's tied to `head`/`self`'s lifetime, so it has to be copied out
+        // (`to_string`) before `head` is mutated below.
         let cluster_name = cluster_name.to_string();
 
         let Some(entry) = self.clusters.cluster(&cluster_name) else {
             tracing::debug!(response_flag = "NC", cluster = %cluster_name, "unknown cluster");
-            stream_info
-                .borrow_mut()
+            dcb.stream_info()
                 .set_response_flag(ResponseFlag::NoClusterFound);
-            drain_request_body(req).await;
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
 
-        // Rust note: `downstream` is `Copy`, so this reads it out before
-        // `req.head`/`req.body` are moved below (a partial move of `req`) --
-        // provenance flows from the accepted downstream connection onto every
-        // upstream request the router builds, retried or not.
-        let downstream = req.downstream;
-        let mut head = req.head;
+        let mut head = head;
         apply_request_transforms(fwd, matcher, request_headers_to_add, &mut head);
 
-        // WP-14 (S3): a route with a retry policy has to be able to replay
-        // its request body on every attempt, so it's collected into `Bytes`
-        // once, up front, instead of streamed straight through. A route with
-        // no policy keeps the original zero-copy streaming path -- exactly
-        // one attempt is ever made, so there's nothing to replay and no
-        // buffering cost to pay. Rust note: exactly one of
-        // `streaming_body`/`buffered_body` is ever populated below; a plain
-        // two-variant enum would say that more strongly, but would still need
-        // an unreachable third arm for "neither" -- these two `Option`s do
-        // the same job with less ceremony.
+        // ADR-0004 step 3: the whole request body is already captured
+        // (`self.captured_body`) by the time `respond()` runs -- decode is
+        // fully buffered before any filter (including the terminal) sees the
+        // request (`filter_manager`'s module doc), so there is no more
+        // "streamed straight through vs. collected up front" distinction to
+        // make here: every attempt (retried or not) just clones the same,
+        // already-in-memory `Bytes` (a refcount bump, never a deep copy).
+        // WP-24: `%BYTES_RECEIVED%` is exact and known up front for the same
+        // reason.
+        let body_bytes = self.captured_body.clone();
+        dcb.stream_info().bytes_received = body_bytes.len() as u64;
+        let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
+
         let mut retry_state = fwd.retry_policy.as_ref().map(RetryState::new);
-        let mut streaming_body: Option<StreamBody> = None;
-        let buffered_body: Option<Bytes> = match &mut retry_state {
-            Some(state) => match req.body.collect().await {
-                Ok(collected) => {
-                    let bytes = collected.to_bytes();
-                    if bytes.len() > RETRY_REQUEST_BUFFER_LIMIT {
-                        // S3.4 (Envoy's `no_retry_body_too_large`): too big to
-                        // safely hold a second copy of for replay. The
-                        // request still proceeds -- it just can't be retried.
-                        state.mark_body_not_retriable();
-                    }
-                    // WP-24: the retry/replay path already has the whole
-                    // body in hand, so `%BYTES_RECEIVED%` is exact and free
-                    // -- no need for the streaming path's frame-by-frame
-                    // counter below.
-                    stream_info.borrow_mut().bytes_received = bytes.len() as u64;
-                    Some(bytes)
-                }
-                Err(_) => {
-                    return local_reply(StatusCode::BAD_REQUEST, "failed to read request body");
-                }
-            },
-            None => {
-                // WP-24: wrapped so `%BYTES_RECEIVED%` reflects what's
-                // actually forwarded upstream, one frame at a time, instead
-                // of staying 0 for every non-retry (i.e. most) request.
-                streaming_body = Some(local_boxed(CountingRequestBody::new(
-                    req.body,
-                    stream_info.clone(),
-                )));
-                None
+        if let Some(state) = &mut retry_state {
+            if body_bytes.len() > RETRY_REQUEST_BUFFER_LIMIT {
+                // S3.4 (Envoy's `no_retry_body_too_large`): too big to
+                // safely hold a second copy of for replay. The request still
+                // proceeds -- it just can't be retried.
+                state.mark_body_not_retriable();
             }
-        };
+        }
 
         // S4: `fwd.timeout`, when set, is an *overall* budget across every
         // attempt (Envoy's route `timeout` is not a per-try timeout -- the IR
@@ -334,6 +322,12 @@ impl RouterHandler {
         // doc), so it wraps the whole attempt loop below rather than a single
         // `send`. With no retry policy the loop runs exactly once, so this is
         // unobservable from a no-retry route's point of view.
+        //
+        // Rust note: this `async` block (no `move`) captures `dcb` (a `&mut
+        // dyn DecoderCallbacks`) by unique reborrow, not by value -- so once
+        // this future is dropped (whether by completing or by the outer
+        // `fwd.timeout` racing it against a timer), the reborrow ends and
+        // `dcb` is usable again in the code below.
         let attempt_loop = async {
             loop {
                 // S5: acquire a `max_requests` permit for this attempt before
@@ -346,10 +340,8 @@ impl RouterHandler {
                 let cb = entry.circuit_breaker(RoutingPriority::Default);
                 let Some(rq_guard) = cb.try_acquire_request() else {
                     tracing::debug!(response_flag = "UO", cluster = %cluster_name, "circuit breaker: max_requests exceeded");
-                    stream_info
-                        .borrow_mut()
+                    dcb.stream_info()
                         .set_response_flag(ResponseFlag::UpstreamOverflow);
-                    drain_leftover_body(&mut streaming_body).await;
                     let mut resp =
                         local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
                     resp.head
@@ -361,10 +353,8 @@ impl RouterHandler {
                 let ctx = LoadBalancerContext::default();
                 let Some(host) = entry.pick_host(&ctx) else {
                     tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
-                    stream_info
-                        .borrow_mut()
+                    dcb.stream_info()
                         .set_response_flag(ResponseFlag::NoHealthyUpstream);
-                    drain_leftover_body(&mut streaming_body).await;
                     return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
                 };
 
@@ -378,7 +368,7 @@ impl RouterHandler {
                 // these with its own host, which is what makes the *last*
                 // attempt's target the one that ends up logged.
                 {
-                    let mut info = stream_info.borrow_mut();
+                    let mut info = dcb.stream_info();
                     info.upstream_cluster = Some(cluster_name.clone());
                     info.upstream_host = Some(host.address.to_string());
                     info.protocol = Some(
@@ -400,12 +390,10 @@ impl RouterHandler {
                                 continue;
                             }
                         }
-                        drain_leftover_body(&mut streaming_body).await;
                         return match err {
                             PoolError::Overflow => {
                                 tracing::debug!(response_flag = "UO", cluster = %cluster_name, "pool overflow");
-                                stream_info
-                                    .borrow_mut()
+                                dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamOverflow);
                                 let mut resp = local_reply(
                                     StatusCode::SERVICE_UNAVAILABLE,
@@ -418,8 +406,7 @@ impl RouterHandler {
                             }
                             PoolError::ConnectFailure(_) | PoolError::ConnectTimeout => {
                                 tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream connect failure");
-                                stream_info
-                                    .borrow_mut()
+                                dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
                                 local_reply(
                                     StatusCode::SERVICE_UNAVAILABLE,
@@ -435,8 +422,7 @@ impl RouterHandler {
                             // half actually broke.
                             PoolError::TlsHandshake(_) => {
                                 tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream TLS handshake failure");
-                                stream_info
-                                    .borrow_mut()
+                                dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
                                 local_reply(
                                     StatusCode::SERVICE_UNAVAILABLE,
@@ -445,8 +431,7 @@ impl RouterHandler {
                             }
                             PoolError::ResetBeforeHeaders => {
                                 tracing::debug!(response_flag = "UR", cluster = %cluster_name, "upstream reset before headers");
-                                stream_info
-                                    .borrow_mut()
+                                dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamRemoteReset);
                                 local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream reset")
                             }
@@ -463,33 +448,17 @@ impl RouterHandler {
                     uri: head.uri.clone(),
                     headers: head.headers.clone(),
                 };
-                // Rust note: the streaming body can only be taken once (it's
-                // not `Clone` -- it's a boxed, single-consumption stream), so
-                // `.take()` empties it after the first (only, since no retry
-                // policy implies no second iteration) use; the buffered
-                // variant is plain `Bytes`, cheap (refcounted) to `.clone()`
-                // fresh for every attempt.
-                let attempt_body: StreamBody = match streaming_body.take() {
-                    Some(body) => body,
-                    None => body_from_bytes(
-                        buffered_body
-                            .clone()
-                            .expect("retry policy implies buffered_body is populated"),
-                    ),
-                };
+                // Rust note: `body_bytes` is plain `Bytes`, cheap
+                // (refcounted) to `.clone()` fresh for every attempt --
+                // there's no separate "streaming" body anymore (see this
+                // function's body-handling doc above).
+                let attempt_body: StreamBody =
+                    body_with_trailers(body_bytes.clone(), trailers.clone());
 
                 let upstream_req = HttpRequestParts {
                     head: attempt_head,
                     body: attempt_body,
-                    downstream,
-                    // This is the OUTGOING request to the upstream codec, not
-                    // this stream's own `StreamInfo` -- the codec functions
-                    // don't consume it, so there's nothing to share here.
-                    stream_info: None,
-                    // Likewise not meaningful for an outgoing upstream
-                    // request -- `route` (S2.8) is a downstream-request
-                    // concept.
-                    route: None,
+                    downstream: DownstreamInfo::loopback(),
                 };
 
                 // Dispatch on the cluster's configured upstream protocol.
@@ -556,8 +525,7 @@ impl RouterHandler {
                                 timeout_ms = d.as_millis(),
                                 "upstream per-try timeout waiting for response headers"
                             );
-                            stream_info
-                                .borrow_mut()
+                            dcb.stream_info()
                                 .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
                             return local_reply(
                                 StatusCode::GATEWAY_TIMEOUT,
@@ -610,8 +578,7 @@ impl RouterHandler {
                             }
                         }
                         tracing::debug!(response_flag = "UC", cluster = %cluster_name, "upstream codec error");
-                        stream_info
-                            .borrow_mut()
+                        dcb.stream_info()
                             .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
                         return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
                     }
@@ -619,32 +586,31 @@ impl RouterHandler {
             }
         };
 
-        match fwd.timeout {
-            Some(d) => {
-                // Rust note: `tokio::time::timeout` races the whole attempt
-                // loop against a timer; on `Err(Elapsed)` the loop future
-                // (and whatever upstream connection/attempt it's mid-flight
-                // on) is dropped, which closes/resets that connection --
-                // exactly Envoy's `UT` behavior of abandoning a request that
-                // didn't get response headers, across every attempt, in
-                // time.
-                match tokio::time::timeout(d, attempt_loop).await {
-                    Ok(resp) => resp,
-                    Err(_elapsed) => {
-                        tracing::debug!(
-                            response_flag = "UT",
-                            cluster = %cluster_name,
-                            timeout_ms = d.as_millis(),
-                            "upstream request timed out waiting for response headers"
-                        );
-                        stream_info
-                            .borrow_mut()
-                            .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
-                        local_reply(StatusCode::GATEWAY_TIMEOUT, "upstream request timeout")
-                    }
-                }
+        // Rust note: the `let outcome = ...;` binding here (rather than
+        // matching directly on `tokio::time::timeout(..).await`/
+        // `attempt_loop.await` and using `dcb` again inside an arm of that
+        // same `match`) matters: a temporary produced in a `match`'s
+        // scrutinee lives until the end of the WHOLE match statement, and
+        // that temporary is still holding `attempt_loop`'s reborrow of `dcb`.
+        // Ending the statement here (the temporary's scope ends at this
+        // `;`) releases that reborrow before `dcb` is used again below.
+        let outcome = match fwd.timeout {
+            Some(d) => tokio::time::timeout(d, attempt_loop).await,
+            None => Ok(attempt_loop.await),
+        };
+        match outcome {
+            Ok(resp) => resp,
+            Err(_elapsed) => {
+                tracing::debug!(
+                    response_flag = "UT",
+                    cluster = %cluster_name,
+                    timeout_ms = fwd.timeout.map(|d| d.as_millis()),
+                    "upstream request timed out waiting for response headers"
+                );
+                dcb.stream_info()
+                    .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
+                local_reply(StatusCode::GATEWAY_TIMEOUT, "upstream request timeout")
             }
-            None => attempt_loop.await,
         }
     }
 }
@@ -664,26 +630,42 @@ async fn sleep_backoff_and_record(state: &mut RetryState<'_>) {
     state.record_attempt();
 }
 
-/// Drain (and discard) a request body that was never handed to an upstream
-/// attempt -- e.g. a circuit-breaker/pick-host/connect failure before the
-/// streaming body was ever taken. Only the (at most once) streaming path
-/// ever has anything left to drain here: the buffered/replay path collects
-/// the whole body up front, so by the time an attempt can fail there's
-/// nothing left on the wire to read. Mirrors `drain_request_body`'s
-/// rationale: a local reply that never reads the body must still consume it
-/// so the downstream connection isn't left with unread bytes.
-async fn drain_leftover_body(streaming_body: &mut Option<StreamBody>) {
-    if let Some(body) = streaming_body.take() {
-        let _ = body.collect().await;
+/// Build a fresh, single-use [`StreamBody`] from already-buffered bytes (and,
+/// if the captured request carried any, trailers) -- used both to build each
+/// attempt's upstream request body (retried or not, ADR-0004 step 3: the
+/// whole body is always already in memory by the time the terminal runs) and
+/// by [`local_reply_with_status`] for a synthesized reply.
+///
+/// Bug found (and fixed here) while wiring ADR-0004 step 3, not caused by it:
+/// the no-trailers case must use `Full`, not `http_body_util::StreamBody`
+/// wrapping a `futures::stream::iter` -- `StreamBody` never overrides
+/// `Body::size_hint()`, so hyper's client can't see an exact length and falls
+/// back to `Transfer-Encoding: chunked` even though the whole (buffered)
+/// payload is already known up front. `Full` DOES report an exact
+/// `size_hint()`, which is what lets hyper send a plain `Content-Length`
+/// request instead -- exactly what this function's two HEAD-era predecessors
+/// (`body_from_bytes` using `Full`, a separate trailers-only path) did before
+/// being merged into one function here. `router_retry.rs`'s
+/// `the_replayed_request_carries_the_same_body_as_the_original` is what
+/// caught the regression: its upstream test double parses the wire bytes
+/// against a `Content-Length` header and got the raw chunked framing instead.
+fn body_with_trailers(bytes: Bytes, trailers: Option<HeaderMap>) -> StreamBody {
+    use hyper::body::Frame;
+    match trailers {
+        None => local_boxed(
+            Full::new(bytes).map_err(|infallible: std::convert::Infallible| match infallible {}),
+        ),
+        Some(t) => {
+            let mut frames: Vec<Result<Frame<Bytes>, crate::handler::BodyError>> = Vec::new();
+            if !bytes.is_empty() {
+                frames.push(Ok(Frame::data(bytes)));
+            }
+            frames.push(Ok(Frame::trailers(t)));
+            local_boxed(http_body_util::StreamBody::new(futures::stream::iter(
+                frames,
+            )))
+        }
     }
-}
-
-/// Build a fresh, single-use [`StreamBody`] from already-buffered bytes --
-/// used to replay a retried request's body on each attempt.
-fn body_from_bytes(bytes: Bytes) -> StreamBody {
-    local_boxed(
-        Full::new(bytes).map_err(|infallible: std::convert::Infallible| match infallible {}),
-    )
 }
 
 /// Apply the S13/S4 upstream request transforms to the outgoing request
@@ -803,14 +785,6 @@ fn apply_header_mutations(
     }
 }
 
-/// Drain (and discard) the request body -- mirrors
-/// `stub::FixedResponseHandler`'s handling: a local reply that never reads
-/// the body must still consume it so the downstream connection isn't left
-/// with unread bytes.
-async fn drain_request_body(req: HttpRequestParts) {
-    let _ = req.body.collect().await;
-}
-
 /// Synthesize a `DirectResponse` action's reply. `DataSourceIR::Inline` is
 /// the only body variant handled for v1; a `File` body is non-trivial
 /// (loading + caching file contents isn't wired anywhere in this WP) so it
@@ -859,6 +833,7 @@ fn local_reply_with_status(status: StatusCode, body: Bytes) -> HttpResponseParts
 mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use http::{HeaderMap, Method, StatusCode, Uri};
@@ -875,7 +850,8 @@ mod tests {
     use tokio::task::LocalSet;
 
     use super::*;
-    use crate::filter::RequestHeaders;
+    use crate::filter::{FilterInstanceFactory, RequestHeaders};
+    use crate::filter_manager::FilterChainHandler;
     use crate::handler::{DownstreamInfo, StreamHandler};
 
     /// A one-shot "reflecting" upstream: accepts a single connection, reads
@@ -1006,11 +982,18 @@ mod tests {
 
     /// Build a one-cluster, one-route `RouterHandler` forwarding to `addr`
     /// under cluster name `"up"`.
+    /// ADR-0004 step 3: `RouterHandler` is no longer a `StreamHandler` on its
+    /// own -- it's the terminal of a filter chain. These tests exercise it
+    /// exactly the way production code does: a `FilterChainHandler` with no
+    /// other filters, wrapping the router via [`RouterFilterFactory`], whose
+    /// `.handle()` (still a `StreamHandler`) drives the whole thing,
+    /// including S2.8 route resolution against `route_table` (there is no
+    /// more private-resolution fallback for these tests to bypass).
     async fn build_router(
         addr: SocketAddr,
         matcher: RouteMatcher,
         fwd: ForwardAction,
-    ) -> RouterHandler {
+    ) -> FilterChainHandler {
         build_router_with_circuit_breakers(addr, matcher, fwd, CircuitBreakers::default()).await
     }
 
@@ -1022,7 +1005,7 @@ mod tests {
         matcher: RouteMatcher,
         fwd: ForwardAction,
         circuit_breakers: CircuitBreakers,
-    ) -> RouterHandler {
+    ) -> FilterChainHandler {
         let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
         let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
         snapshot.insert(
@@ -1061,7 +1044,16 @@ mod tests {
         )
         .unwrap();
 
-        RouterHandler::new(Arc::new(route_table), Arc::new(manager))
+        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+            Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+        FilterChainHandler::new(
+            Vec::new(),
+            terminal_factory,
+            Arc::new(route_table),
+            false,
+            false,
+            0,
+        )
     }
 
     fn prefix_matcher(prefix: &str) -> RouteMatcher {
@@ -1112,8 +1104,6 @@ mod tests {
                     .map_err(|infallible: std::convert::Infallible| match infallible {}),
             ),
             downstream: DownstreamInfo::loopback(),
-            stream_info: None,
-            route: None,
         }
     }
 
@@ -1243,13 +1233,19 @@ mod tests {
             .await;
     }
 
-    /// ADR-0004 step 1: a request matching no route still yields the
-    /// existing 404 + `NoRouteFound` response flag, end to end -- proves
-    /// collapsing `RouteMatch::NoVirtualHost`/`RouteMatch::NoRoute` into a
-    /// single `None` (in `route_and_forward`'s private-resolution fallback)
-    /// didn't change observable behavior.
+    /// A request matching no route still yields a 404. Pre-ADR-0004-step-3
+    /// this also asserted the `NoRouteFound` response flag by injecting a
+    /// `Rc<RefCell<StreamInfo>>` directly via `req.stream_info` -- that seam
+    /// is exactly what step 3 deletes (the router no longer receives a
+    /// bespoke `StreamInfo` handle; it reads/writes the ONE the filter chain
+    /// owns internally through `cb.stream_info()`, which isn't reachable
+    /// from outside a request without wiring an access logger). The flag
+    /// itself is still set (see `route_and_forward`'s `None` arm) and is
+    /// covered from the access-log side by `tests/router_access_log.rs`;
+    /// this test keeps the one assertion that's still observable through the
+    /// public `StreamHandler` seam.
     #[tokio::test(flavor = "current_thread")]
-    async fn no_route_match_yields_404_and_no_route_found_flag() {
+    async fn no_route_match_yields_404() {
         LocalSet::new()
             .run_until(async {
                 let (addr, _rx) = spawn_reflecting_upstream().await;
@@ -1260,64 +1256,28 @@ mod tests {
                 )
                 .await;
 
-                let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
-                let mut req = request("/does-not-match");
-                req.stream_info = Some(stream_info.clone());
-
-                let resp = router.handle(req).await;
+                let resp = router.handle(request("/does-not-match")).await;
                 assert_eq!(resp.head.status, StatusCode::NOT_FOUND);
                 let _ = resp.body.collect().await;
-
-                assert!(
-                    stream_info
-                        .borrow()
-                        .response_flags()
-                        .contains(&ResponseFlag::NoRouteFound),
-                    "expected the NR response flag on a no-route request"
-                );
             })
             .await;
     }
 
-    /// S2.8 (ADR-0004 step 1): when the request already carries a
-    /// chain-resolved route (`req.route`), the router uses THAT instead of
-    /// re-matching against its own table. Here the router's own table would
-    /// 404 the request path (it only matches `/configured-only`), but the
-    /// chain hands it a route that forwards to a real cluster anyway --
-    /// proving the private resolution in `route_and_forward` is only a
-    /// fallback, not always consulted.
-    #[tokio::test(flavor = "current_thread")]
-    async fn req_route_from_chain_is_used_instead_of_private_resolution() {
-        LocalSet::new()
-            .run_until(async {
-                let (addr, rx) = spawn_reflecting_upstream().await;
-                let router = build_router(
-                    addr,
-                    prefix_matcher("/configured-only"),
-                    forward_to_up(None, None, None),
-                )
-                .await;
-
-                let mut req = request("/mismatch");
-                req.route = Some(Arc::new(RouteEntry {
-                    name: None,
-                    matcher: prefix_matcher("/mismatch"),
-                    action: RouteActionIR::Forward(forward_to_up(None, None, None)),
-                    request_headers_to_add: Vec::new(),
-                }));
-
-                let resp = router.handle(req).await;
-                assert_eq!(
-                    resp.head.status,
-                    StatusCode::OK,
-                    "the chain-resolved route (S2.8) must be used, not a private \
-                     re-match against a path that wouldn't have matched the \
-                     router's own table"
-                );
-                let _ = rx.await;
-            })
-            .await;
-    }
+    // NOTE (ADR-0004 step 3): the test that used to live here,
+    // `req_route_from_chain_is_used_instead_of_private_resolution`, pinned a
+    // behavior this step deliberately removes: `RouterHandler` used to fall
+    // back to matching its OWN `route_table` privately whenever a request
+    // didn't arrive with a chain-resolved `req.route` already attached, and
+    // the test proved the chain-resolved route always won over that private
+    // fallback. Step 3 deletes the private fallback entirely -- the router
+    // now has no `route_table` of its own at all and always reads the
+    // filter-manager-cached route via `cb.route()` (S2.8) -- so there is no
+    // longer a second code path for a chain-resolved route to "win against".
+    // Every other test in this module already exercises the router
+    // forwarding via the ONLY route-resolution path that still exists (the
+    // `FilterChainHandler`'s route table, through `build_router`), so no
+    // coverage is lost; this test's specific premise is gone, not just its
+    // plumbing.
 
     #[tokio::test(flavor = "current_thread")]
     async fn response_idle_timeout_fires_mid_stream() {
@@ -1510,5 +1470,116 @@ mod tests {
         })
         .await
         .expect("should complete well within the test's own guard timeout");
+    }
+
+    // --- ADR-0004 step 3 payoff: the terminal reads the CHAIN-resolved route ---
+
+    /// A decode filter that rewrites `:path` to `to` and calls
+    /// `clear_route_cache()` -- the S2.8/ADR-0004-step-1 half of the test
+    /// below. Unlike `filter_manager::tests::RouteProbeFilter` (which can't
+    /// be `Send + Sync` because it shares an `Rc` call log with other
+    /// probes), this filter carries no shared/interior-mutable state, so it
+    /// really can be minted by a genuine [`FilterInstanceFactory`] and ride
+    /// through the production `FilterChainHandler`/`RouterHandler` path
+    /// rather than `FilterManager` driven directly.
+    struct RewriteToFilter {
+        to: &'static str,
+    }
+
+    impl HttpFilter for RewriteToFilter {
+        fn decode_headers(
+            &mut self,
+            cb: &mut dyn DecoderCallbacks,
+            headers: &mut RequestHeaders,
+            _end_stream: bool,
+        ) -> FilterHeadersStatus {
+            // Force the ORIGINAL path to actually be resolved and cached
+            // first -- otherwise `clear_route_cache()` would have nothing
+            // stale to invalidate, and this test wouldn't distinguish "the
+            // cache was genuinely cleared" from "nothing was ever cached".
+            let _ = cb.route();
+            headers.uri = Uri::from_static(self.to);
+            cb.clear_route_cache();
+            FilterHeadersStatus::Continue
+        }
+    }
+
+    struct RewriteToFilterFactory {
+        to: &'static str,
+    }
+
+    impl FilterInstanceFactory for RewriteToFilterFactory {
+        fn create_filter(&self) -> Box<dyn HttpFilter> {
+            Box::new(RewriteToFilter { to: self.to })
+        }
+    }
+
+    /// Two `DirectResponse` routes, distinguished only by status code -- the
+    /// simplest observable difference, so which one the terminal actually
+    /// acted on is visible in the response without a live upstream.
+    fn direct_response_route_table() -> RouteTable {
+        fn route(prefix: &str, status: u16) -> Arc<RouteEntry> {
+            Arc::new(RouteEntry {
+                name: None,
+                matcher: prefix_matcher(prefix),
+                action: RouteActionIR::DirectResponse { status, body: None },
+                request_headers_to_add: Vec::new(),
+            })
+        }
+        RouteTable::new(
+            "test-routes".to_string(),
+            vec![VirtualHostIR {
+                name: "vh".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![route("/a", 201), route("/b", 202)],
+            }],
+        )
+        .expect("two non-overlapping prefixes on one domain is a valid table")
+    }
+
+    /// The payoff of ADR-0004 steps 1 and 3 together, and inexpressible
+    /// before either landed: a decode filter rewrites `:path` from `/a/...`
+    /// to `/b/...` and calls `clear_route_cache()`; the terminal -- the real
+    /// [`RouterHandler`], not a test stand-in -- must act on route `/b`, not
+    /// the route that matched the ORIGINAL request.
+    ///
+    /// Before step 3, `RouterHandler` was a `StreamHandler` that resolved
+    /// its own route privately, off the request as it was handed across the
+    /// seam -- there was no `DecoderCallbacks::route()` for it to read at
+    /// all, so a decode filter's rewrite + `clear_route_cache()` had nothing
+    /// to reach. Before step 1, `route()`/`clear_route_cache()` existed as
+    /// callback signatures but did nothing (`ChainCtx.route` was never
+    /// populated). Only with both in place does "the chain resolved a
+    /// different route" and "the terminal reads that resolution" hold at
+    /// the same time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_forwards_to_the_route_the_chain_resolved_after_a_rewrite() {
+        LocalSet::new()
+            .run_until(async {
+                let route_table = direct_response_route_table();
+                let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+                let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+                    Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+                let rewrite_factory: Arc<dyn FilterInstanceFactory> =
+                    Arc::new(RewriteToFilterFactory { to: "/b/x" });
+                let handler = FilterChainHandler::new(
+                    vec![rewrite_factory],
+                    terminal_factory,
+                    Arc::new(route_table),
+                    false,
+                    false,
+                    0,
+                );
+
+                let resp = handler.handle(request("/a/x")).await;
+                assert_eq!(
+                    resp.head.status.as_u16(),
+                    202,
+                    "the rewrite + clear_route_cache() must steer the terminal \
+                     onto route /b (status 202), not the originally-matched \
+                     route /a (status 201)"
+                );
+            })
+            .await;
     }
 }

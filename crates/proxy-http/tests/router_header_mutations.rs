@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,9 +26,10 @@ use proxy_config::ir::{
     HeaderAppendAction, HeaderMutation, LbPolicy, PathMatch, RouteActionIR, RouteEntry,
     RouteMatcher, RouteTable, VirtualHostIR,
 };
-use proxy_http::filter::RequestHeaders;
+use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
+use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
-use proxy_http::router::RouterHandler;
+use proxy_http::router::RouterFilterFactory;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -60,15 +62,16 @@ fn mutation(key: &str, value: &str, action: HeaderAppendAction) -> HeaderMutatio
     }
 }
 
-/// Build a one-cluster, one-route `RouterHandler` forwarding to `addr` under
-/// cluster name `"up"`, with `mutations` as the route's
-/// `request_headers_to_add` -- mirrors `router.rs`'s own `build_router` test
-/// helper, plus the field this file exists to exercise.
+/// Build a one-cluster, one-route [`FilterChainHandler`] (no configured
+/// filters, just the router terminal) forwarding to `addr` under cluster name
+/// `"up"`, with `mutations` as the route's `request_headers_to_add` --
+/// mirrors `router.rs`'s own `build_router` test helper, plus the field this
+/// file exists to exercise.
 async fn build_router(
     addr: SocketAddr,
     fwd: ForwardAction,
     mutations: Vec<HeaderMutation>,
-) -> RouterHandler {
+) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
     snapshot.insert(
@@ -107,7 +110,16 @@ async fn build_router(
     )
     .unwrap();
 
-    RouterHandler::new(Arc::new(route_table), Arc::new(manager))
+    let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+        Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+    FilterChainHandler::new(
+        Vec::new(),
+        terminal_factory,
+        Arc::new(route_table),
+        false,
+        false,
+        0,
+    )
 }
 
 /// A request with no headers beyond the mandatory `Host`.
@@ -129,8 +141,6 @@ fn request_with_headers(path: &'static str, headers: HeaderMap) -> HttpRequestPa
                 .map_err(|infallible: std::convert::Infallible| match infallible {}),
         ),
         downstream: DownstreamInfo::loopback(),
-        stream_info: None,
-        route: None,
     }
 }
 

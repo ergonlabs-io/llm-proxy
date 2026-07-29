@@ -143,8 +143,6 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
-        stream_info: None,
-        route: None,
     }
 }
 
@@ -162,8 +160,11 @@ fn multi_frame_body(chunks: &[&'static [u8]], trailers: Option<HeaderMap>) -> Se
     local_boxed(StreamBody::new(futures::stream::iter(frames)))
 }
 
-/// A terminal handler that returns a fixed, pre-built response body exactly
-/// once (moved out of the `RefCell` on first — and only — call).
+/// A terminal filter that returns a fixed, pre-built response body exactly
+/// once (moved out of the `RefCell` on first — and only — call). Decode
+/// callbacks are all pass-through defaults (untested here; chunk 1's
+/// `tests.rs` covers decode-side terminal behavior) — this fixture only
+/// exercises the encode side.
 struct FixedBodyTerminal {
     log: Log,
     body: RefCell<Option<SeamBody>>,
@@ -183,14 +184,15 @@ impl FixedBodyTerminal {
     }
 }
 
-impl StreamHandler for FixedBodyTerminal {
-    fn handle<'a>(
-        &'a self,
-        req: HttpRequestParts,
+impl HttpFilter for FixedBodyTerminal {}
+
+impl TerminalHttpFilter for FixedBodyTerminal {
+    fn respond<'a>(
+        &'a mut self,
+        _cb: &'a mut dyn DecoderCallbacks,
     ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
             self.log.borrow_mut().push("terminal".to_string());
-            let _ = req.body.collect().await;
             let body = self
                 .body
                 .borrow_mut()
@@ -219,7 +221,7 @@ async fn run_streaming(
     let mgr = FilterManager {
         filters,
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
-        terminal: &terminal,
+        terminal: Box::new(terminal),
         buffer_limit,
     };
     mgr.run(request(b"req")).await
@@ -239,7 +241,7 @@ async fn run_streaming_with_headers(
     let mgr = FilterManager {
         filters,
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
-        terminal: &terminal,
+        terminal: Box::new(terminal),
         buffer_limit,
     };
     mgr.run(request(b"req")).await
@@ -946,6 +948,13 @@ fn local_reply_after_response_headers_forwarded_terminates_the_stream() {
         );
 
         let encoder = StreamingEncoder {
+            // Never called here -- this test drives `StreamingEncoder`
+            // directly, well past the point `respond()` would have already
+            // run; `terminal` only needs to exist for `Drop`'s teardown.
+            terminal: Box::new(FixedBodyTerminal::new(
+                log_of(),
+                bytes_to_seam_body(Bytes::new(), None),
+            )),
             filters: vec![],
             ctx,
             upstream: bytes_to_seam_body(Bytes::new(), None),

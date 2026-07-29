@@ -31,10 +31,12 @@ use proxy_config::ir::{
 };
 use proxy_config::ConfigSnapshot;
 use proxy_http::codec::{serve_http1, Http1Options};
-use proxy_http::filter::{FactoryContext, FilterInstanceFactory, FilterRegistry};
+use proxy_http::filter::{
+    FactoryContext, FilterInstanceFactory, FilterRegistry, TerminalFilterInstanceFactory,
+};
 use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
-use proxy_http::router::RouterHandler;
+use proxy_http::router::RouterFilterFactory;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -803,8 +805,8 @@ fn build_hcm_handler(
         factories.push(Arc::from(instance_factory));
     }
 
-    let router = RouterHandler::new(hcm.route_table.clone(), cluster_manager.clone());
-    let terminal: Rc<dyn StreamHandler> = Rc::new(router);
+    let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+        Rc::new(RouterFilterFactory::new(cluster_manager.clone()));
 
     // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
     // bind/rebuild cadence as everything else in this function (a fresh
@@ -823,7 +825,7 @@ fn build_hcm_handler(
     Ok(Rc::new(
         FilterChainHandler::new_with_access_logs(
             factories,
-            terminal,
+            terminal_factory,
             hcm.route_table.clone(),
             hcm.generate_request_id,
             hcm.use_remote_address,

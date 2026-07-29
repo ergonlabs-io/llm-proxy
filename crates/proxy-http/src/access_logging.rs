@@ -376,49 +376,16 @@ impl Drop for LoggingBody {
     }
 }
 
-/// Wraps the *request* body being forwarded upstream, incrementing
-/// `stream_info`'s `bytes_received` running total as frames stream through
-/// -- the streaming-body counterpart of the buffered/retry path, which
-/// already knows its exact length up front from `.collect()`. Still used
-/// (and still lives here, not in `router.rs`) by `router::RouterHandler`,
-/// which is where it's constructed.
-pub(crate) struct CountingRequestBody {
-    inner: StreamBody,
-    stream_info: Rc<RefCell<StreamInfo>>,
-}
-
-impl CountingRequestBody {
-    pub(crate) fn new(inner: StreamBody, stream_info: Rc<RefCell<StreamInfo>>) -> Self {
-        Self { inner, stream_info }
-    }
-}
-
-impl Body for CountingRequestBody {
-    type Data = Bytes;
-    type Error = BodyError;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        let poll = Pin::new(&mut this.inner).poll_frame(cx);
-        if let Poll::Ready(Some(Ok(frame))) = &poll {
-            if let Some(data) = frame.data_ref() {
-                this.stream_info.borrow_mut().bytes_received += data.len() as u64;
-            }
-        }
-        poll
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
-    }
-}
+// `CountingRequestBody` (a streaming-body wrapper that incremented
+// `stream_info.bytes_received` frame-by-frame as the downstream request body
+// was forwarded upstream) lived here until ADR-0004 step 3. It's gone now,
+// not orphaned: `router::RouterHandler` no longer streams the request body at
+// all -- decode is always fully buffered before the terminal runs (see
+// `filter_manager`'s module doc), so `router::apply_forward` sets
+// `bytes_received` directly from the already-known buffer length instead
+// (`dcb.stream_info().bytes_received = body_bytes.len() as u64`). Removed
+// (rather than left `#[allow(dead_code)]`) because clippy's `-D warnings`
+// gate is right that nothing constructs it anymore.
 
 #[cfg(test)]
 mod tests {

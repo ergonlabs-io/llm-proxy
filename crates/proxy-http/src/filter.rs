@@ -19,6 +19,7 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 use proxy_config::ir::RouteEntry;
 use proxy_config::ConfigError;
 
+use crate::handler::HttpResponseParts;
 use crate::stream_info::StreamInfo;
 
 /// Request head. Pseudo-header data (`:method`, `:path`, `:authority`) is carried
@@ -278,6 +279,44 @@ pub trait HttpFilter {
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>> {
         None
     }
+}
+
+/// ADR-0004 step 3: the terminal filter — Envoy's `Router::Filter`. An
+/// ordinary [`HttpFilter`] for the decode direction (it lives at the LAST
+/// position of the decode chain, created and destroyed exactly like any other
+/// filter instance); once the decode chain reaches it with the complete
+/// request, `respond` produces the response, which the filter manager then
+/// drives into the ENCODE chain — exactly the position Envoy's `Router::Filter`
+/// occupies.
+///
+/// Rust note: same boxed/pinned/`!Send` future shape as
+/// [`HttpFilter::poll_pending`], and for the same reason (object safety —
+/// `async fn` in a trait can't be called through a trait object). The `'a`
+/// lifetime ties the future to both the `&mut self` and `&mut dyn
+/// DecoderCallbacks` borrows that produced it.
+pub trait TerminalHttpFilter: HttpFilter {
+    fn respond<'a>(
+        &'a mut self,
+        cb: &'a mut dyn DecoderCallbacks,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>>;
+}
+
+/// Created once per (filter config, listener); creates the per-stream
+/// terminal instance — the [`TerminalHttpFilter`] counterpart to
+/// [`FilterInstanceFactory`].
+///
+/// Deliberately does **not** require `Send + Sync` (unlike
+/// `FilterInstanceFactory`) — a known wart, not a design decision. TODO:
+/// ADR-0003 says config-time plumbing carries `Send + Sync`, and this should
+/// match `FilterInstanceFactory` once the test fixtures' shared `Log` (an
+/// `Rc<RefCell<_>>`) is converted to `Arc<Mutex<_>>`; until then a `Send +
+/// Sync` bound here would make those fixtures uncompileable, since they share
+/// observation hooks between a factory and the instances it mints. Holders of
+/// a `dyn TerminalFilterInstanceFactory` must therefore use `Rc`, not `Arc` —
+/// clippy's `arc_with_non_send_sync` lint enforces this (an `Arc` around a
+/// `!Send + !Sync` trait object is always a bug).
+pub trait TerminalFilterInstanceFactory {
+    fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter>;
 }
 
 /// Marker trait for parsed per-route filter config (`typed_per_filter_config`).

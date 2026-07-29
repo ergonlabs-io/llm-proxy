@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,9 +25,10 @@ use proxy_config::ir::{
     PathMatch, RetryBackOff, RetryOn, RetryPolicyIR, RouteActionIR, RouteEntry, RouteMatcher,
     RouteTable, VirtualHostIR,
 };
-use proxy_http::filter::RequestHeaders;
+use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
+use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
-use proxy_http::router::RouterHandler;
+use proxy_http::router::RouterFilterFactory;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::LocalSet;
@@ -71,10 +73,10 @@ fn prefix_matcher(prefix: &str) -> RouteMatcher {
     }
 }
 
-/// Build a one-cluster, one-route `RouterHandler` forwarding to `addr` under
-/// cluster name `"up"` -- mirrors `router.rs`'s own `build_router` test
-/// helper.
-async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> RouterHandler {
+/// Build a one-cluster, one-route [`FilterChainHandler`] (no configured
+/// filters, just the router terminal) forwarding to `addr` under cluster name
+/// `"up"` -- mirrors `router.rs`'s own `build_router` test helper.
+async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
     snapshot.insert(
@@ -113,7 +115,16 @@ async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> RouterHandler {
     )
     .unwrap();
 
-    RouterHandler::new(Arc::new(route_table), Arc::new(manager))
+    let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+        Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+    FilterChainHandler::new(
+        Vec::new(),
+        terminal_factory,
+        Arc::new(route_table),
+        false,
+        false,
+        0,
+    )
 }
 
 fn request_with_body(path: &'static str, body: &'static [u8]) -> HttpRequestParts {
@@ -130,8 +141,6 @@ fn request_with_body(path: &'static str, body: &'static [u8]) -> HttpRequestPart
                 .map_err(|infallible: std::convert::Infallible| match infallible {}),
         ),
         downstream: DownstreamInfo::loopback(),
-        stream_info: None,
-        route: None,
     }
 }
 
@@ -318,7 +327,16 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                 }],
             )
             .unwrap();
-            let router = RouterHandler::new(Arc::new(route_table), Arc::new(manager));
+            let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+                Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+            let router = FilterChainHandler::new(
+                Vec::new(),
+                terminal_factory,
+                Arc::new(route_table),
+                false,
+                false,
+                0,
+            );
 
             // Round-robin over the two endpoints means the closed port isn't
             // guaranteed to be tried first on every LB implementation change,

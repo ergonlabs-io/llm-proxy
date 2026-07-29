@@ -41,10 +41,10 @@ use proxy_config::ir::{
     DiscoveryType, EndpointIR, ForwardAction, ForwardTarget, LbPolicy, PathMatch, RouteActionIR,
     RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
 };
-use proxy_http::filter::RequestHeaders;
+use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
-use proxy_http::router::RouterHandler;
+use proxy_http::router::RouterFilterFactory;
 use proxy_observability::access_log::parse_format;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -153,11 +153,11 @@ async fn build_router(
     .unwrap();
 
     let route_table = Arc::new(route_table);
-    let terminal: Rc<dyn StreamHandler> =
-        Rc::new(RouterHandler::new(route_table.clone(), Arc::new(manager)));
+    let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
+        Rc::new(RouterFilterFactory::new(Arc::new(manager)));
     FilterChainHandler::new_with_access_logs(
         Vec::new(),
-        terminal,
+        terminal_factory,
         route_table,
         false,
         false,
@@ -181,8 +181,6 @@ fn request(path: &'static str) -> HttpRequestParts {
                 .map_err(|infallible: std::convert::Infallible| match infallible {}),
         ),
         downstream: DownstreamInfo::loopback(),
-        stream_info: None,
-        route: None,
     }
 }
 

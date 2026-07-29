@@ -112,7 +112,7 @@ use crate::access_logging::{
 use crate::filter::{
     BufferedBody, DecoderCallbacks, EncoderCallbacks, FilterDataStatus, FilterHeadersStatus,
     FilterInstanceFactory, HeaderMutationFn, HttpFilter, RequestHeaders, RequestTrailers,
-    ResponseHeaders, ResponseTrailers,
+    ResponseHeaders, ResponseTrailers, TerminalFilterInstanceFactory, TerminalHttpFilter,
 };
 use crate::handler::{
     local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody as SeamBody,
@@ -134,8 +134,11 @@ pub const DEFAULT_BUFFER_LIMIT: usize = 1 << 20;
 pub struct FilterChainHandler {
     /// Config-order factories; `create_filter()` mints one instance per stream.
     factories: Vec<Arc<dyn FilterInstanceFactory>>,
-    /// The router stand-in: consumes the (decoded) request, produces a response.
-    terminal: Rc<dyn StreamHandler>,
+    /// ADR-0004 step 3: the terminal's own factory -- mints a fresh
+    /// [`TerminalHttpFilter`] instance per stream, exactly like every other
+    /// filter. `Rc`, not `Arc`: see [`TerminalFilterInstanceFactory`]'s doc
+    /// for why it doesn't require `Send + Sync`.
+    terminal_factory: Rc<dyn TerminalFilterInstanceFactory>,
     /// S2.8 (ADR-0004 step 1): this HCM's route table -- the manager, not the
     /// router, now owns route resolution. Handed to each stream's `ChainCtx`
     /// so `DecoderCallbacks::route()` (and the terminal-request resolution in
@@ -174,7 +177,7 @@ pub struct FilterChainHandler {
 impl FilterChainHandler {
     pub fn new(
         factories: Vec<Arc<dyn FilterInstanceFactory>>,
-        terminal: Rc<dyn StreamHandler>,
+        terminal_factory: Rc<dyn TerminalFilterInstanceFactory>,
         route_table: Arc<RouteTable>,
         generate_request_id: bool,
         use_remote_address: bool,
@@ -182,7 +185,7 @@ impl FilterChainHandler {
     ) -> Self {
         Self {
             factories,
-            terminal,
+            terminal_factory,
             route_table,
             buffer_limit: DEFAULT_BUFFER_LIMIT,
             generate_request_id,
@@ -204,7 +207,7 @@ impl FilterChainHandler {
     /// logging moved up here.
     pub fn new_with_access_logs(
         factories: Vec<Arc<dyn FilterInstanceFactory>>,
-        terminal: Rc<dyn StreamHandler>,
+        terminal_factory: Rc<dyn TerminalFilterInstanceFactory>,
         route_table: Arc<RouteTable>,
         generate_request_id: bool,
         use_remote_address: bool,
@@ -217,7 +220,7 @@ impl FilterChainHandler {
             access_loggers: Rc::new(access_loggers),
             ..Self::new(
                 factories,
-                terminal,
+                terminal_factory,
                 route_table,
                 generate_request_id,
                 use_remote_address,
@@ -294,19 +297,25 @@ impl StreamHandler for FilterChainHandler {
             // may freely hold `Rc`/`RefCell` (ADR-0003).
             let filters: Vec<Box<dyn HttpFilter>> =
                 self.factories.iter().map(|f| f.create_filter()).collect();
+            // ADR-0004 step 3: the terminal instance is minted LAST, after
+            // every configured filter -- it's created and destroyed exactly
+            // like any other filter instance (S2.1: reverse creation order),
+            // just via its own factory type since `TerminalHttpFilter` isn't
+            // `HttpFilter`-uniform (it also exposes `respond`).
+            let terminal = self.terminal_factory.create_terminal_filter();
             // The one `StreamInfo` for this stream (Envoy's model, module
             // doc): created once here, cloned (cheap `Rc` bump) into `ctx`
-            // for filters and into `req.stream_info` for the terminal
-            // handler (the router), which writes into the SAME instance
-            // rather than building its own. Also kept here, uncloned, for
-            // the access-log wrap below -- `LoggingBody` needs to read the
-            // SAME `StreamInfo` every filter (including an encode filter's
-            // end-of-stream callback) wrote into.
+            // for every filter (including the terminal, which reads it
+            // through `DecoderCallbacks::stream_info()` like any other
+            // filter). Also kept here, uncloned, for the access-log wrap
+            // below -- `LoggingBody` needs to read the SAME `StreamInfo`
+            // every filter (including an encode filter's end-of-stream
+            // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
             let mgr = FilterManager {
                 filters,
                 ctx: ChainCtx::new(stream_info.clone()).with_route_table(self.route_table.clone()),
-                terminal: self.terminal.as_ref(),
+                terminal,
                 buffer_limit: self.buffer_limit,
             };
             // Rust note: `mgr` is still a plain local value here (not yet
@@ -616,26 +625,27 @@ fn total_encode_buffered(ctx: &ChainCtx) -> usize {
 }
 
 /// One request's worth of filter-chain execution. Consumed by [`Self::run`].
-struct FilterManager<'t> {
+///
+/// ADR-0004 step 3: `terminal` is owned (`Box<dyn TerminalHttpFilter>`), not
+/// borrowed -- it's a per-stream instance minted by
+/// [`crate::filter::TerminalFilterInstanceFactory`] exactly like every other
+/// filter in `filters`, not a shared handler reused across requests. There is
+/// no more `'t` lifetime: nothing here borrows from the caller anymore.
+struct FilterManager {
     filters: Vec<Box<dyn HttpFilter>>,
     ctx: ChainCtx,
-    terminal: &'t dyn StreamHandler,
+    terminal: Box<dyn TerminalHttpFilter>,
     buffer_limit: usize,
 }
 
-impl FilterManager<'_> {
+impl FilterManager {
     async fn run(self, req: HttpRequestParts) -> HttpResponseParts {
         let FilterManager {
             mut filters,
             mut ctx,
-            terminal,
+            mut terminal,
             buffer_limit,
         } = self;
-
-        // Rust note: `downstream` is `Copy`, so it's read out here before
-        // `req` is consumed by `collect_request` below — the terminal request
-        // built further down needs it, and `req` itself won't survive.
-        let downstream = req.downstream;
 
         // Access-log request-header snapshot (fallback): taken here, before
         // `collect_request` consumes `req`, purely so the failure paths
@@ -667,7 +677,7 @@ impl FilterManager<'_> {
                     "invalid request body",
                     "request_body_read_error",
                 );
-                return respond_with_local_reply(filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
             }
         };
 
@@ -687,7 +697,7 @@ impl FilterManager<'_> {
                 "request rejected by filter chain",
                 "decode_buffer_overflow",
             );
-            return respond_with_local_reply(filters, ctx, buffer_limit, reply).await;
+            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
         }
 
         // Access-log request-header snapshot, refreshed: the decode chain
@@ -712,36 +722,54 @@ impl FilterManager<'_> {
         // to move into `respond_with_local_reply` below; we can't hold a
         // borrow of it across that move.
         if let Some(reply) = ctx.local_reply.take() {
-            return respond_with_local_reply(filters, ctx, buffer_limit, reply).await;
+            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
         }
 
-        // Anything filters appended via `add_decoded_data` rides along to the
-        // terminal handler ahead of the original body.
-        let decoded_body = join_buffer(&ctx.decode.buffer, &body);
-
-        // S2.8: resolve (and cache) the route through the exact same path
-        // `DecoderCallbacksAdapter::route()` uses, so the terminal (the
-        // router stand-in) sees a result consistent with whatever a decode
-        // filter already observed via `route()`/`clear_route_cache()` --
-        // rather than the router resolving privately a second time
-        // (ADR-0004 step 1). Synced from `head` one last time here since this
-        // is the last point before `head` moves into `terminal_req` below.
+        // --- terminal (ADR-0004 step 3): an ordinary filter for decode
+        // purposes, minted LAST (`FilterChainHandler::handle`) and so living
+        // at the very end of the decode chain -- deliver the fully-mutated
+        // head/body/trailers to it exactly like `drive_decode` delivers to
+        // any configured filter, then call `respond()` to produce the
+        // response. Anything filters appended via `add_decoded_data` rides
+        // along ahead of the original body, same as it always reached the
+        // terminal.
+        let mut decoded_body = join_buffer(&ctx.decode.buffer, &body);
+        let end_stream_on_headers = decoded_body.is_empty() && req_trailers.is_none();
+        ctx.decode.current_idx = filters.len();
         sync_route_head(&mut ctx, &head);
-        let route = resolve_and_cache_route(&mut ctx);
+        {
+            let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+            let _ = terminal.decode_headers(&mut cb, &mut head, end_stream_on_headers);
+        }
+        if let Some(reply) = ctx.local_reply.take() {
+            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+        }
 
-        // --- terminal handler (router stand-in) ---
-        // Hand the terminal (the router) the SAME `StreamInfo` the decode
-        // filters above just wrote into -- an `Rc::clone` (cheap refcount
-        // bump), not a copy, so writes either side makes are visible to the
-        // other (module doc: one `StreamInfo` per stream).
-        let terminal_req = HttpRequestParts {
-            head,
-            body: bytes_to_seam_body(decoded_body, req_trailers.map(|t| t.0)),
-            downstream,
-            stream_info: Some(ctx.stream_info.clone()),
-            route,
+        let end_stream = req_trailers.is_none();
+        {
+            let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+            let _ = terminal.decode_data(&mut cb, &mut decoded_body, end_stream);
+        }
+        if let Some(reply) = ctx.local_reply.take() {
+            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+        }
+
+        if let Some(t) = &req_trailers {
+            let mut owned = RequestTrailers(t.0.clone());
+            {
+                let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+                let _ = terminal.decode_trailers(&mut cb, &mut owned);
+            }
+            if let Some(reply) = ctx.local_reply.take() {
+                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            }
+        }
+
+        // --- terminal handler (router) produces the response ---
+        let resp = {
+            let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+            terminal.respond(&mut cb).await
         };
-        let resp = terminal.handle(terminal_req).await;
         let HttpResponseParts { mut head, mut body } = resp;
 
         // --- encode header phase (async: a header hold may need to consume
@@ -773,7 +801,7 @@ impl FilterManager<'_> {
                         info.response_code_details =
                             Some("encode_header_phase_overflow".to_string());
                     }
-                    destroy_filters(&mut filters);
+                    destroy_filters(terminal.as_mut(), &mut filters);
                     return synth_response(status, "response rejected by filter chain");
                 }
             };
@@ -788,9 +816,11 @@ impl FilterManager<'_> {
         // working exactly as before, just driven by `poll_frame` instead of a
         // single synchronous pass. `on_destroy` now runs in `Drop` (below),
         // since the stream — and therefore the filters' lifetime — doesn't
-        // end when `run()` returns.
+        // end when `run()` returns. `terminal` rides along too (S2.1: created
+        // last, so destroyed first).
         let remaining_content_length = parse_content_length(&head.headers);
         let encoder = StreamingEncoder {
+            terminal,
             filters,
             ctx,
             upstream: body,
@@ -825,14 +855,20 @@ impl FilterManager<'_> {
 /// this explicitly — otherwise the filter instances are simply dropped and
 /// `on_destroy` never fires. Filters that emit their stats/usage record on
 /// teardown (exactly what an LLM token-metering filter does) would silently
-/// report nothing for those requests.
-fn destroy_filters(filters: &mut [Box<dyn HttpFilter>]) {
+/// report nothing for those requests. `terminal` is destroyed FIRST -- it's
+/// created last (S2.1: reverse creation order), just like every other filter,
+/// whether or not it ever actually ran (a local reply short-circuits before
+/// the terminal's own callbacks fire, but the instance still exists and still
+/// needs tearing down).
+fn destroy_filters(terminal: &mut dyn TerminalHttpFilter, filters: &mut [Box<dyn HttpFilter>]) {
+    terminal.on_destroy();
     for filter in filters.iter_mut().rev() {
         filter.on_destroy();
     }
 }
 
 async fn respond_with_local_reply(
+    mut terminal: Box<dyn TerminalHttpFilter>,
     mut filters: Vec<Box<dyn HttpFilter>>,
     mut ctx: ChainCtx,
     buffer_limit: usize,
@@ -876,6 +912,7 @@ async fn respond_with_local_reply(
             ctx.response_headers_forwarded = true;
             let remaining_content_length = parse_content_length(&head.headers);
             let encoder = StreamingEncoder {
+                terminal,
                 filters,
                 ctx,
                 upstream: body,
@@ -899,7 +936,7 @@ async fn respond_with_local_reply(
             // response (bypassing the chain), same as the pre-S2.5 behavior.
             // Teardown still has to happen: `on_destroy` normally rides on
             // `StreamingEncoder`'s `Drop`, and this path never builds one.
-            destroy_filters(&mut filters);
+            destroy_filters(terminal.as_mut(), &mut filters);
             synth_response(status, "response rejected by filter chain")
         }
     }
@@ -1197,6 +1234,11 @@ fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
 /// p-th; `order(p) = n - 1 - p`. "Resume at the next filter" is then always
 /// plain `p + 1`, regardless of which end of `filters` that corresponds to.
 struct StreamingEncoder {
+    /// ADR-0004 step 3: carried along purely for teardown -- `respond()` has
+    /// already run by the time a `StreamingEncoder` exists, so nothing here
+    /// calls into `terminal` again; `Drop` below just needs to reach it to
+    /// fire `on_destroy` (S2.1: created last, destroyed first).
+    terminal: Box<dyn TerminalHttpFilter>,
     filters: Vec<Box<dyn HttpFilter>>,
     ctx: ChainCtx,
     upstream: SeamBody,
@@ -1682,7 +1724,9 @@ impl Drop for StreamingEncoder {
         // something ever calls `drop` explicitly.
         if !self.destroyed {
             self.destroyed = true;
-            // Reverse creation order (S2.1), same as decode's teardown.
+            // Reverse creation order (S2.1), same as decode's teardown --
+            // `terminal` first (created last), then the configured filters.
+            self.terminal.on_destroy();
             for filter in self.filters.iter_mut().rev() {
                 filter.on_destroy();
             }
@@ -2196,20 +2240,13 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
 async fn collect_request(
     req: HttpRequestParts,
 ) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), ()> {
-    // `downstream` was already captured by the caller (`FilterManager::run`)
-    // before `req` moved here; this function only needs head + body.
+    // `downstream` is only used by `FilterChainHandler::handle` (XFF/S9,
+    // access-log peer address), all of which runs before `FilterManager::run`
+    // is even called -- this function only needs head + body.
     let HttpRequestParts {
         head,
         body,
         downstream: _,
-        // The inbound (downstream) request never carries a `stream_info` --
-        // that's only set on the *terminal* request built further down in
-        // `run()`, once `ctx.stream_info` exists (module doc).
-        stream_info: _,
-        // Likewise: nothing has resolved a route for the inbound request yet
-        // (S2.8) -- that's set on the terminal request too, once the decode
-        // chain has run.
-        route: _,
     } = req;
     let collected = body.collect().await.map_err(|_| ())?;
     let trailers = collected.trailers().cloned().map(RequestTrailers);

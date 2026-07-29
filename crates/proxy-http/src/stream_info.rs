@@ -92,10 +92,10 @@ pub struct StreamInfo {
     /// WP-24: the HTTP version spoken to the upstream -- `%PROTOCOL%`.
     /// `None` for a local reply, which never dials one.
     pub protocol: Option<String>,
-    /// WP-24: running byte count for `%BYTES_RECEIVED%`. Set once the
-    /// request body's length is known -- either up front (the buffered
-    /// retry-replay path) or incrementally as it streams through to the
-    /// upstream (`router::logging::CountingRequestBody`).
+    /// WP-24: running byte count for `%BYTES_RECEIVED%`. Set from the
+    /// already-buffered request body's length (ADR-0004 step 3: decode is
+    /// always fully buffered before the terminal runs, so this is a plain
+    /// assignment in `router::apply_forward`, never incremental).
     pub bytes_received: u64,
     /// WP-24: final byte count for `%BYTES_SENT%`, written by
     /// `access_logging::LoggingBody` once the response body ends (or is
