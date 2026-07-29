@@ -21,19 +21,30 @@
 //!
 //! # Design notes worth reading before touching this file
 //!
-//! **Consecutive-5xx and consecutive-gateway-failure are independent
-//! counters**, not one counter feeding two detectors. Real Envoy has
-//! `ConsecutiveGatewayFailure` results *also* bump the plain 5xx counter
-//! (a gateway error is a kind of 5xx). We deliberately do not: with both
-//! thresholds defaulting to 5 and `enforcing_consecutive_5xx` defaulting to
-//! 100%, double-counting would mean five consecutive gateway failures
-//! *always* eject via the 5xx detector even though
-//! `enforcing_consecutive_gateway_failure` is 0% -- which contradicts this
-//! WP's own acceptance criterion that a correct implementation counts
-//! gateway failures without ejecting on them by default. [`RequestResult`]
-//! therefore reports exactly one axis per call, and each axis's counter is
-//! only ever touched by its own result variant (a [`RequestResult::Success`]
-//! clears both).
+//! **A gateway failure bumps *both* the consecutive-5xx and
+//! consecutive-gateway-failure counters.** This matches real Envoy, where a
+//! gateway error is a *subset* of 5xx, not a separate axis --
+//! `DetectorImpl::putHttpResponseCode` does:
+//!
+//! ```cpp
+//! if (Http::CodeUtility::is5xx(response_code)) {
+//!   if (Http::CodeUtility::isGatewayError(response_code)) {
+//!     // ... bump consecutive gateway failure
+//!   }
+//!   // ... and ALSO bump consecutive 5xx
+//! }
+//! ```
+//!
+//! The consequence, which is correct Envoy behaviour and not a bug: **five
+//! consecutive gateway failures do cause an ejection**, even though
+//! `enforcing_consecutive_gateway_failure` defaults to 0%. They eject
+//! through the consecutive-5xx detector (`enforcing_consecutive_5xx`
+//! defaults to 100%), which fires on the very same request that trips the
+//! gateway-failure counter. `enforcing_consecutive_gateway_failure = 0` only
+//! disables *that detector's own* ejections -- it cannot stop the 5xx
+//! detector from seeing (and enforcing on) the same failures. A
+//! [`RequestResult::Success`] (or any non-5xx result) resets both counters,
+//! as it does in Envoy.
 //!
 //! **A threshold crossing always resets its counter**, whether or not the
 //! resulting ejection was actually enforced (blocked by the enforcement-
@@ -58,9 +69,10 @@ use tokio::task::JoinHandle;
 use crate::host_set::HostSet;
 use crate::{HealthFlags, Host};
 
-/// What one completed request told us about the host that served it. Exactly
-/// one axis per call -- see the module doc's note on why consecutive-5xx and
-/// consecutive-gateway-failure are independent counters.
+/// What one completed request told us about the host that served it.
+/// [`RequestResult::GatewayFailure`] bumps *both* the consecutive-5xx and
+/// consecutive-gateway-failure counters -- see the module doc's note on why
+/// a gateway error is a subset of 5xx, not an independent axis.
 ///
 /// [`RequestResult::LocalOriginFailure`] (connect failure, timeout, reset --
 /// anything that never got as far as an upstream HTTP status) is folded into
@@ -426,6 +438,12 @@ impl OutlierDetector {
                     state.interval_failure += 1;
                 }
                 RequestResult::GatewayFailure => {
+                    // Envoy's `DetectorImpl::putHttpResponseCode`: a gateway
+                    // error (502/503/504) is a *subset* of 5xx, so it bumps
+                    // both counters -- see the module doc for the full
+                    // reasoning and the consequence (five consecutive
+                    // gateway failures do eject, via the 5xx detector).
+                    state.consecutive_5xx += 1;
                     state.consecutive_gateway_failure += 1;
                     state.interval_failure += 1;
                 }
@@ -1007,8 +1025,15 @@ mod tests {
 
     // --------------------------------- gateway failure, 0% enforcement --
 
-    #[test]
-    fn five_consecutive_gateway_failures_are_counted_but_not_ejected_by_default() {
+    /// Envoy behaviour (`DetectorImpl::putHttpResponseCode`): a gateway
+    /// failure bumps *both* the consecutive-5xx and
+    /// consecutive-gateway-failure counters, so with S6 defaults (both
+    /// thresholds 5, `enforcing_consecutive_5xx` 100%,
+    /// `enforcing_consecutive_gateway_failure` 0%) five consecutive gateway
+    /// failures DO eject -- via the 5xx detector, not the gateway detector.
+    /// See the module doc for the full reasoning.
+    #[tokio::test]
+    async fn five_consecutive_gateway_failures_eject_via_the_5xx_detector() {
         let a = addr(1);
         let (engine, host_set, sink) =
             detector(vec![host(1), host(2)], config_without_ejection_cap());
@@ -1016,10 +1041,50 @@ mod tests {
             engine.report_result(a, RequestResult::GatewayFailure);
         }
         assert!(
+            is_ejected(&host_set, a),
+            "a gateway failure also bumps the consecutive-5xx counter, which \
+             is enforced 100% by default -- five in a row must eject"
+        );
+
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e.action, EjectAction::Eject)
+                && e.enforced
+                && e.detector_type == "5XX"),
+            "the enforced ejection must be attributed to the 5xx detector, \
+             which is the one that actually enforced it"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e.action, EjectAction::Eject)
+                && e.enforced
+                && e.detector_type == "GATEWAY_FAILURE"),
+            "the gateway-failure detector must not be credited with an \
+             enforced ejection at its default 0% enforcement"
+        );
+    }
+
+    /// Isolates the gateway detector by making `consecutive_5xx`
+    /// unreachable (100, but only 5 requests are fed): only the gateway
+    /// detector can fire, and at its default 0% enforcement it must not
+    /// eject. This is what `enforcing_consecutive_gateway_failure = 0`
+    /// actually guarantees -- not that gateway failures never eject at all
+    /// (they do, via the 5xx detector; see the sibling test).
+    #[test]
+    fn gateway_failure_detector_alone_does_not_eject_at_zero_enforcement() {
+        let a = addr(1);
+        let config = OutlierDetectionConfig {
+            consecutive_5xx: 100,
+            ..config_without_ejection_cap()
+        };
+        let (engine, host_set, sink) = detector(vec![host(1), host(2)], config);
+        for _ in 0..5 {
+            engine.report_result(a, RequestResult::GatewayFailure);
+        }
+        assert!(
             !is_ejected(&host_set, a),
             "enforcing_consecutive_gateway_failure defaults to 0% -- must count without ejecting"
         );
-        // The detector still fired (and logged), just wasn't enforced.
+        // The gateway detector still fired (and logged), just wasn't enforced.
         let events = sink.events.lock().unwrap();
         assert!(events
             .iter()
