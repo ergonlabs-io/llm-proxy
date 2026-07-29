@@ -20,7 +20,7 @@ use rand::{Rng, SeedableRng};
 use proxy_config::ir::LbPolicy;
 
 use crate::host_set::HostSet;
-use crate::{HealthStatus, Host, LoadBalancerContext};
+use crate::{Host, LoadBalancerContext};
 
 /// Envoy's overprovisioning factor (S7), expressed as a percent multiplier
 /// (140 == 1.4x) so priority-load math stays integer. See
@@ -338,10 +338,7 @@ impl HostPicker {
             return None;
         }
 
-        let healthy_count = members
-            .iter()
-            .filter(|h| h.health == HealthStatus::Healthy)
-            .count() as u64;
+        let healthy_count = members.iter().filter(|h| h.is_healthy()).count() as u64;
         let total_count = members.len() as u64;
         // Panic check: `< 50`, not `<= 50` -- exactly 50% healthy stays on
         // the healthy-only path.
@@ -351,11 +348,7 @@ impl HostPicker {
             // TODO(WP-23 stats): count this as `lb_healthy_panic`.
             members.to_vec()
         } else {
-            members
-                .iter()
-                .filter(|h| h.health == HealthStatus::Healthy)
-                .cloned()
-                .collect()
+            members.iter().filter(|h| h.is_healthy()).cloned().collect()
         };
         if candidates.is_empty() {
             return None;
@@ -393,10 +386,7 @@ impl HostPicker {
             } else {
                 let members = host_set.hosts_for_priority(priority);
                 let total = members.len() as u64;
-                let healthy = members
-                    .iter()
-                    .filter(|h| h.health == HealthStatus::Healthy)
-                    .count() as u64;
+                let healthy = members.iter().filter(|h| h.is_healthy()).count() as u64;
                 let ratio_percent = (healthy * 100).checked_div(total).unwrap_or(0);
                 let available =
                     std::cmp::min(100, ratio_percent * OVERPROVISIONING_FACTOR_PERCENT / 100);
@@ -425,7 +415,7 @@ impl HostPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::HealthStatus;
+    use crate::{HealthFlags, HealthStatus};
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::AtomicU64;
@@ -434,13 +424,23 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), 80)
     }
 
+    // Rust note: these tests predate `HealthFlags` (WP-19) and were written
+    // against the old two-state `HealthStatus` enum; rather than touch every
+    // one of the dozens of call sites below, `host()` keeps the old
+    // `HealthStatus` parameter and maps it onto the new `failed_active_hc`
+    // bit -- `Unhealthy` here means "failing active HC", which is exactly
+    // what these tests are exercising (S7 panic threshold / spillover), not
+    // outlier ejection.
     fn host(last: u8, weight: u32, priority: u32, health: HealthStatus) -> Arc<Host> {
         Arc::new(Host {
             address: addr(last),
             hostname: None,
             weight,
             priority,
-            health,
+            health_flags: HealthFlags {
+                failed_active_hc: health == HealthStatus::Unhealthy,
+                failed_outlier_check: false,
+            },
             active_requests: AtomicU64::new(0),
         })
     }

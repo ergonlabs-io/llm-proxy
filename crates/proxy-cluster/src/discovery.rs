@@ -20,7 +20,7 @@ use proxy_config::ir::{ClusterConfig, DiscoveryType, EndpointIR};
 
 use crate::host_set::HostSet;
 use crate::resolver::HostResolver;
-use crate::{HealthStatus, Host};
+use crate::{HealthFlags, Host};
 
 /// Envoy's default `dns_refresh_rate` for `STRICT_DNS`/`LOGICAL_DNS`
 /// clusters. TODO(WP-16+): wire `ClusterConfig.dns_refresh_rate` once the IR
@@ -63,7 +63,7 @@ pub(crate) fn static_hosts(endpoints: &[EndpointIR]) -> io::Result<Vec<Arc<Host>
                 hostname: None,
                 weight: e.weight,
                 priority: e.priority,
-                health: HealthStatus::Healthy,
+                health_flags: HealthFlags::default(),
                 active_requests: AtomicU64::new(0),
             }))
         })
@@ -85,7 +85,7 @@ async fn strict_dns_hosts(
                 hostname: Some(e.host.clone()),
                 weight: e.weight,
                 priority: e.priority,
-                health: HealthStatus::Healthy,
+                health_flags: HealthFlags::default(),
                 active_requests: AtomicU64::new(0),
             })
         }));
@@ -109,7 +109,7 @@ async fn logical_dns_hosts(
                 hostname: Some(e.host.clone()),
                 weight: e.weight,
                 priority: e.priority,
-                health: HealthStatus::Healthy,
+                health_flags: HealthFlags::default(),
                 active_requests: AtomicU64::new(0),
             }));
         }

@@ -34,7 +34,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use crate::host_set::HostSet;
-use crate::{HealthStatus, Host};
+use crate::{HealthFlags, HealthStatus, Host};
 
 /// Envoy's documented default expected HTTP status for an HTTP health check
 /// with no explicit `expected_statuses` (S-something's health-check
@@ -258,12 +258,16 @@ impl HealthCheckEngine {
     }
 }
 
-/// Replace one host's `HealthStatus` in `host_set` and publish the result,
-/// but only if the address is still present and its health actually differs
-/// -- a no-op store would just be needless churn for every reader watching
-/// this `ArcSwap`.
+/// Replace one host's `failed_active_hc` flag in `host_set` and publish the
+/// result, but only if the address is still present and that flag actually
+/// differs -- a no-op store would just be needless churn for every reader
+/// watching this `ArcSwap`. The outlier-detection flag
+/// (`failed_outlier_check`, WP-19) is carried over untouched: active HC and
+/// outlier detection are independent axes (see [`crate::HealthFlags`]), so a
+/// health-check transition must never clobber an outlier ejection that's
+/// concurrently in effect.
 ///
-/// Rust note: `Host` has no interior mutability for `health` (unlike
+/// Rust note: `Host` has no interior mutability for `health_flags` (unlike
 /// `active_requests`'s `AtomicU64`) precisely so this can't race with a
 /// reader mid-read -- a whole new `Arc<Host>` is built and the whole
 /// `HostSet` swapped, the same "control computes, workers swap" discipline
@@ -285,18 +289,22 @@ fn apply_health_transition(host_set: &ArcSwap<HostSet>, addr: SocketAddr, status
     // the compare-and-swap, so concurrent transitions compose instead of
     // clobbering. The closure must therefore be pure and cheap; rebuilding a
     // `HostSet` is both.
+    let failed_active_hc = status == HealthStatus::Unhealthy;
     host_set.rcu(|current| {
         let updated: Vec<Arc<Host>> = current
             .all_hosts()
             .into_iter()
             .map(|h| {
-                if h.address == addr && h.health != status {
+                if h.address == addr && h.health_flags.failed_active_hc != failed_active_hc {
                     Arc::new(Host {
                         address: h.address,
                         hostname: h.hostname.clone(),
                         weight: h.weight,
                         priority: h.priority,
-                        health: status,
+                        health_flags: HealthFlags {
+                            failed_active_hc,
+                            failed_outlier_check: h.health_flags.failed_outlier_check,
+                        },
                         // Carried over, not reset -- a health flip must not
                         // erase in-flight accounting that `LeastRequestLb`
                         // reads. (A concurrent increment landing between this
@@ -388,7 +396,7 @@ mod tests {
             hostname: None,
             weight: 1,
             priority,
-            health: HealthStatus::Healthy,
+            health_flags: HealthFlags::default(),
             active_requests: AtomicU64::new(0),
         })
     }
@@ -665,7 +673,7 @@ mod tests {
         let still_healthy: Vec<SocketAddr> = final_set
             .all_hosts()
             .into_iter()
-            .filter(|h| h.health == HealthStatus::Healthy)
+            .filter(|h| h.is_healthy())
             .map(|h| h.address)
             .collect();
         assert!(

@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::{HealthStatus, Host};
+use crate::Host;
 
 /// Immutable per-cluster membership snapshot, indexed by numeric priority
 /// (0 = primary, matching [`crate::RoutingPriority`]/S5/S7 failover order).
@@ -56,12 +56,13 @@ impl HostSet {
         self.by_priority.keys().copied()
     }
 
-    /// All hosts across every priority whose health is `Healthy`.
+    /// All hosts across every priority with no health flag set (see
+    /// [`crate::HealthFlags::is_healthy`]).
     pub fn all_healthy_hosts(&self) -> Vec<Arc<Host>> {
         self.by_priority
             .values()
             .flatten()
-            .filter(|h| h.health == HealthStatus::Healthy)
+            .filter(|h| h.is_healthy())
             .cloned()
             .collect()
     }
@@ -124,7 +125,7 @@ mod tests {
             hostname: None,
             weight: 1,
             priority,
-            health: HealthStatus::Healthy,
+            health_flags: crate::HealthFlags::default(),
             active_requests: std::sync::atomic::AtomicU64::new(0),
         })
     }

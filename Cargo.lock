@@ -1355,9 +1355,12 @@ name = "proxy-cluster"
 version = "0.0.1"
 dependencies = [
  "arc-swap",
+ "chrono",
  "futures",
  "proxy-config",
  "rand",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

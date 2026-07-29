@@ -17,6 +17,7 @@ pub mod health_check;
 pub mod host_set;
 pub mod load_balancer;
 pub mod manager;
+pub mod outlier;
 pub mod pool;
 pub mod resolver;
 pub mod transport;
@@ -48,21 +49,78 @@ impl From<proxy_config::ir::UpstreamProtocol> for UpstreamProtocol {
     }
 }
 
-/// A host's health, as tracked by active health checking. Every host starts
-/// `Healthy` -- discovery (WP-16) never itself marks a host unhealthy, only
-/// [`health_check::HealthCheckEngine`] flips it. That engine exists and is
-/// unit-tested (WP-18), but nothing yet drives it from a real cluster's
-/// config: `proxy_config::ir::ClusterConfig` has no health-check field, so
-/// `ClusterManager`-built clusters never spawn one, and a discovered host
-/// stays `Healthy` until the IR grows that field and a caller wires it up
-/// (see `health_check`'s module doc).
+/// A host's *derived* health, as a simple two-state view. This is what
+/// [`health_check::HealthCheckEngine`]'s internal consecutive-count tracker
+/// uses (it only ever cares "did active HC just flip me") and what callers
+/// get back from [`HealthFlags::status`]. It is deliberately not the type
+/// stored on [`Host`] any more -- see [`HealthFlags`] for why a host needs
+/// two independent axes, not one enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthStatus {
     #[default]
     Healthy,
-    /// Failing active health checks. TODO(WP-19): outlier-detection ejection
-    /// states are a separate, not-yet-modeled axis from this.
     Unhealthy,
+}
+
+/// A host's health as two independent axes, matching Envoy's own
+/// `Host::HealthFlag` bitset model: active health checking (WP-18) and
+/// outlier detection (WP-19) each fail/clear a host *independently* --  a
+/// host can be ejected by the outlier detector while still passing its
+/// active health check (or vice versa), and either one alone is enough to
+/// make the host unusable for new traffic.
+///
+/// Rust note: this used to be the single two-state `HealthStatus` enum
+/// directly on `Host`. A `struct` of two `bool`s (rather than a 4-variant
+/// enum) is the right shape here because the two axes are genuinely
+/// independent and owned by two different subsystems -- `health_check.rs`
+/// only ever touches `failed_active_hc`, `outlier.rs` only ever touches
+/// `failed_outlier_check`, and neither has to know the other's bit exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HealthFlags {
+    /// Set by [`health_check::HealthCheckEngine`] on a failed consecutive-
+    /// threshold run of active health checks; cleared on a passing run.
+    pub failed_active_hc: bool,
+    /// Set by [`outlier::OutlierDetector`] when a host is ejected; cleared
+    /// when its ejection expires, an active health check passes (if
+    /// configured to do so), or it's manually un-ejected.
+    pub failed_outlier_check: bool,
+}
+
+impl HealthFlags {
+    /// A host is usable for new traffic only when *no* flag is set --
+    /// matching Envoy's `Host::healthy()`, which is `!healthFlagsGet(...)`
+    /// across every flag it tracks.
+    pub fn is_healthy(&self) -> bool {
+        !self.failed_active_hc && !self.failed_outlier_check
+    }
+
+    /// The derived two-state view some older call sites still want (e.g.
+    /// [`health_check::ConsecutiveTracker`]'s own bookkeeping, which only
+    /// ever sees its own axis and has no use for the finer-grained struct).
+    pub fn status(&self) -> HealthStatus {
+        if self.is_healthy() {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Unhealthy
+        }
+    }
+}
+
+impl std::fmt::Display for HealthFlags {
+    /// Envoy-compatible rendering for the admin endpoint (WP-25) and the
+    /// diff rig: `""` when healthy, else each failing flag's
+    /// `/failed_active_hc`/`/failed_outlier_check` token concatenated in
+    /// that fixed order (Envoy always lists `FAILED_ACTIVE_HC` before
+    /// `FAILED_OUTLIER_CHECK` in its own health-flag enum ordering).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.failed_active_hc {
+            write!(f, "/failed_active_hc")?;
+        }
+        if self.failed_outlier_check {
+            write!(f, "/failed_outlier_check")?;
+        }
+        Ok(())
+    }
 }
 
 /// An upstream endpoint. Host sets are built on the control runtime (WP-16) and
@@ -82,9 +140,9 @@ pub struct Host {
     pub weight: u32,
     /// Failover priority this host belongs to; 0 = primary (S5/S7).
     pub priority: u32,
-    /// TODO(WP-18): flips to `Unhealthy` on failed active health checks;
-    /// TODO(WP-19): outlier-detection ejection state.
-    pub health: HealthStatus,
+    /// Active-health-check state (WP-18) and outlier-ejection state
+    /// (WP-19), tracked independently -- see [`HealthFlags`].
+    pub health_flags: HealthFlags,
     /// In-flight request count, read by `LEAST_REQUEST`'s power-of-two-choices
     /// pick (WP-17, S7). TODO(WP-15/WP-13): the connection pool and router
     /// are what actually `fetch_add`/`fetch_sub` this as requests start and
@@ -95,6 +153,14 @@ pub struct Host {
 }
 
 impl Host {
+    /// Usable for new traffic -- no health flag set. Load balancers (S7)
+    /// and priority spillover both read this rather than comparing
+    /// `health_flags` to a specific variant, so a third flag (should one
+    /// ever get added) doesn't require touching every call site.
+    pub fn is_healthy(&self) -> bool {
+        self.health_flags.is_healthy()
+    }
+
     /// Current in-flight request count (see [`Host::active_requests`]).
     ///
     /// Rust note: `Relaxed` is enough here -- this counter has no other
