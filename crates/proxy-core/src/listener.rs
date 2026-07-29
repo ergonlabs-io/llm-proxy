@@ -805,8 +805,8 @@ fn build_hcm_handler(
         factories.push(Arc::from(instance_factory));
     }
 
-    let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-        Rc::new(RouterFilterFactory::new(cluster_manager.clone()));
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+        Arc::new(RouterFilterFactory::new(cluster_manager.clone()));
 
     // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
     // bind/rebuild cadence as everything else in this function (a fresh

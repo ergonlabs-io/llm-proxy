@@ -305,17 +305,13 @@ pub trait TerminalHttpFilter: HttpFilter {
 /// terminal instance — the [`TerminalHttpFilter`] counterpart to
 /// [`FilterInstanceFactory`].
 ///
-/// Deliberately does **not** require `Send + Sync` (unlike
-/// `FilterInstanceFactory`) — a known wart, not a design decision. TODO:
-/// ADR-0003 says config-time plumbing carries `Send + Sync`, and this should
-/// match `FilterInstanceFactory` once the test fixtures' shared `Log` (an
-/// `Rc<RefCell<_>>`) is converted to `Arc<Mutex<_>>`; until then a `Send +
-/// Sync` bound here would make those fixtures uncompileable, since they share
-/// observation hooks between a factory and the instances it mints. Holders of
-/// a `dyn TerminalFilterInstanceFactory` must therefore use `Rc`, not `Arc` —
-/// clippy's `arc_with_non_send_sync` lint enforces this (an `Arc` around a
-/// `!Send + !Sync` trait object is always a bug).
-pub trait TerminalFilterInstanceFactory {
+/// `Send + Sync`, exactly like `FilterInstanceFactory` — per ADR-0003,
+/// config-time plumbing (built once from config and shared by every worker)
+/// crosses threads and carries `Send + Sync`; only the per-stream instances
+/// it mints ([`TerminalHttpFilter`]) are deliberately `!Send` (see
+/// [`HttpFilter`]'s doc). Holders of a `dyn TerminalFilterInstanceFactory`
+/// use `Arc`, same as `FilterInstanceFactory`.
+pub trait TerminalFilterInstanceFactory: Send + Sync {
     fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter>;
 }
 

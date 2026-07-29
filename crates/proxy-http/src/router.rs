@@ -93,10 +93,9 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 
 /// ADR-0004 step 3: the router's own [`TerminalFilterInstanceFactory`] --
 /// mints a fresh [`RouterHandler`] per stream, exactly like every other
-/// filter's factory. `Send + Sync` because it only holds an `Arc<ClusterManager>`
-/// (thread-safe config-time state); `TerminalFilterInstanceFactory` itself
-/// doesn't require that (see its doc), but nothing stops a real factory from
-/// providing it anyway.
+/// filter's factory. `Send + Sync` (required by `TerminalFilterInstanceFactory`,
+/// see its doc) because it only holds an `Arc<ClusterManager>` -- thread-safe
+/// config-time state, same shape as `FilterInstanceFactory` implementors.
 pub struct RouterFilterFactory {
     clusters: Arc<ClusterManager>,
 }
@@ -833,7 +832,6 @@ fn local_reply_with_status(status: StatusCode, body: Bytes) -> HttpResponseParts
 mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
-    use std::rc::Rc;
     use std::time::Duration;
 
     use http::{HeaderMap, Method, StatusCode, Uri};
@@ -1044,8 +1042,8 @@ mod tests {
         )
         .unwrap();
 
-        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-            Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RouterFilterFactory::new(Arc::new(manager)));
         FilterChainHandler::new(
             Vec::new(),
             terminal_factory,
@@ -1558,8 +1556,8 @@ mod tests {
             .run_until(async {
                 let route_table = direct_response_route_table();
                 let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
-                let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-                    Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+                let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+                    Arc::new(RouterFilterFactory::new(Arc::new(manager)));
                 let rewrite_factory: Arc<dyn FilterInstanceFactory> =
                     Arc::new(RewriteToFilterFactory { to: "/b/x" });
                 let handler = FilterChainHandler::new(

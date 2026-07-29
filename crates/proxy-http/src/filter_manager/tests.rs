@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
@@ -289,11 +289,12 @@ async fn run_chain_req(
     req: HttpRequestParts,
     buffer_limit: usize,
 ) -> (StatusCode, Bytes, Bytes) {
-    let seen_body = Rc::new(RefCell::new(Bytes::new()));
+    let seen_body = Arc::new(Mutex::new(Bytes::new()));
     let terminal = RecordingTerminal {
         log: log.clone(),
+        term_log: None,
         seen_body: seen_body.clone(),
-        seen_request_id: Rc::new(RefCell::new(None)),
+        seen_request_id: Arc::new(Mutex::new(None)),
         seen_headers: None,
         captured_body: Bytes::new(),
     };
@@ -306,7 +307,7 @@ async fn run_chain_req(
     let resp = mgr.run(req).await;
     let status = resp.head.status;
     let resp_body = resp.body.collect().await.expect("resp body").to_bytes();
-    let seen = seen_body.borrow().clone();
+    let seen = seen_body.lock().unwrap().clone();
     (status, seen, resp_body)
 }
 
@@ -319,11 +320,12 @@ async fn run_chain_req_with_route_table(
     req: HttpRequestParts,
     route_table: Arc<RouteTable>,
 ) -> StatusCode {
-    let seen_body = Rc::new(RefCell::new(Bytes::new()));
+    let seen_body = Arc::new(Mutex::new(Bytes::new()));
     let terminal = RecordingTerminal {
         log,
+        term_log: None,
         seen_body,
-        seen_request_id: Rc::new(RefCell::new(None)),
+        seen_request_id: Arc::new(Mutex::new(None)),
         seen_headers: None,
         captured_body: Bytes::new(),
     };
@@ -349,17 +351,25 @@ async fn run_chain_req_with_route_table(
 /// `StreamHandler` handed a whole `HttpRequestParts` across a seam.
 struct RecordingTerminal {
     log: Log,
-    seen_body: Rc<RefCell<Bytes>>,
+    /// Mirrors [`Self::respond`]'s `"terminal"` push into a `Send + Sync`
+    /// sink too, when this instance was minted by [`RecordingTerminalFactory`]
+    /// (which -- unlike `log`'s `Rc`, deliberately shared with `ProbeFilter`
+    /// so their entries interleave in one ordered call log -- must itself be
+    /// `Send + Sync` per ADR-0003/[`TerminalFilterInstanceFactory`]'s doc).
+    /// `None` for the `run_chain*` helpers below, which construct this
+    /// instance directly and read `log` itself instead.
+    term_log: Option<Arc<Mutex<Vec<String>>>>,
+    seen_body: Arc<Mutex<Bytes>>,
     /// S9 test hook: the `x-request-id` the terminal observed on the request
     /// head (mirrors `seen_body` above), so `FilterChainHandler`-level tests
     /// can assert what the router saw after the HCM-level id generation ran.
-    seen_request_id: Rc<RefCell<Option<String>>>,
+    seen_request_id: Arc<Mutex<Option<String>>>,
     /// S9 XFF test hook: the full request header map the terminal observed,
     /// so `FilterChainHandler`-level XFF tests can assert what
     /// `x-forwarded-for` / `x-forwarded-proto` looked like after the
     /// HCM-level mutation ran. `None` when the test doesn't care (most
     /// callers below).
-    seen_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
+    seen_headers: Option<Arc<Mutex<Option<HeaderMap>>>>,
     /// Captured in `decode_data`, consumed by `respond`.
     captured_body: Bytes,
 }
@@ -371,13 +381,13 @@ impl HttpFilter for RecordingTerminal {
         headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
-        *self.seen_request_id.borrow_mut() = headers
+        *self.seen_request_id.lock().unwrap() = headers
             .headers
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         if let Some(seen_headers) = &self.seen_headers {
-            *seen_headers.borrow_mut() = Some(headers.headers.clone());
+            *seen_headers.lock().unwrap() = Some(headers.headers.clone());
         }
         FilterHeadersStatus::Continue
     }
@@ -413,7 +423,10 @@ impl TerminalHttpFilter for RecordingTerminal {
     ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
             self.log.borrow_mut().push("terminal".to_string());
-            *self.seen_body.borrow_mut() = self.captured_body.clone();
+            if let Some(term_log) = &self.term_log {
+                term_log.lock().unwrap().push("terminal".to_string());
+            }
+            *self.seen_body.lock().unwrap() = self.captured_body.clone();
             HttpResponseParts {
                 head: ResponseHeaders {
                     status: StatusCode::OK,
@@ -427,22 +440,32 @@ impl TerminalHttpFilter for RecordingTerminal {
 
 /// ADR-0004 step 3: [`RecordingTerminal`]'s own factory, for the
 /// `FilterChainHandler`-level tests below -- mints a fresh instance per
-/// request, sharing the same observation `Rc`s so the test can still read
-/// what the (fresh) instance saw. Deliberately not `Send + Sync`
-/// (`TerminalFilterInstanceFactory` doesn't require it, see its doc) since
-/// `Log`/the other fields are plain `Rc`s, same reasoning as `ProbeFilter`
-/// bypassing `FilterInstanceFactory` above.
+/// request, sharing the same observation handles so the test can still read
+/// what the (fresh) instance saw. `Send + Sync`, per
+/// `TerminalFilterInstanceFactory`'s doc (ADR-0003: config-time plumbing
+/// crosses threads), so every field is an `Arc<Mutex<_>>`, unlike
+/// `RecordingTerminal`'s own `log`, which stays a plain `Rc` -- shared with
+/// `ProbeFilter`, which has no such requirement (see `Log`'s doc) -- so
+/// factory-minted instances get a private, throwaway `log` of their own
+/// (`create_terminal_filter` below) and mirror what matters into `term_log`
+/// instead.
 struct RecordingTerminalFactory {
-    log: Log,
-    seen_body: Rc<RefCell<Bytes>>,
-    seen_request_id: Rc<RefCell<Option<String>>>,
-    seen_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
+    seen_body: Arc<Mutex<Bytes>>,
+    seen_request_id: Arc<Mutex<Option<String>>>,
+    seen_headers: Option<Arc<Mutex<Option<HeaderMap>>>>,
+    /// See [`RecordingTerminal::term_log`]. `None` when a test doesn't care
+    /// whether the terminal ran.
+    term_log: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl TerminalFilterInstanceFactory for RecordingTerminalFactory {
     fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter> {
         Box::new(RecordingTerminal {
-            log: self.log.clone(),
+            // Fresh and private: factory-minted instances are never run
+            // alongside a `ProbeFilter`, so there's nothing to interleave
+            // with -- see the struct doc above.
+            log: log_of(),
+            term_log: self.term_log.clone(),
             seen_body: self.seen_body.clone(),
             seen_request_id: self.seen_request_id.clone(),
             seen_headers: self.seen_headers.clone(),
@@ -459,11 +482,12 @@ async fn run_chain(
     body: &'static [u8],
     buffer_limit: usize,
 ) -> (StatusCode, Bytes, Bytes) {
-    let seen_body = Rc::new(RefCell::new(Bytes::new()));
+    let seen_body = Arc::new(Mutex::new(Bytes::new()));
     let terminal = RecordingTerminal {
         log: log.clone(),
+        term_log: None,
         seen_body: seen_body.clone(),
-        seen_request_id: Rc::new(RefCell::new(None)),
+        seen_request_id: Arc::new(Mutex::new(None)),
         seen_headers: None,
         captured_body: Bytes::new(),
     };
@@ -476,7 +500,7 @@ async fn run_chain(
     let resp = mgr.run(request(body)).await;
     let status = resp.head.status;
     let resp_body = resp.body.collect().await.expect("resp body").to_bytes();
-    let seen = seen_body.borrow().clone();
+    let seen = seen_body.lock().unwrap().clone();
     (status, seen, resp_body)
 }
 
@@ -2174,13 +2198,13 @@ fn run_through_handler(
     existing_request_id: Option<&'static str>,
 ) -> Option<String> {
     block_on(async {
-        let seen_request_id = Rc::new(RefCell::new(None));
-        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-            Rc::new(RecordingTerminalFactory {
-                log: log_of(),
-                seen_body: Rc::new(RefCell::new(Bytes::new())),
+        let seen_request_id = Arc::new(Mutex::new(None));
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RecordingTerminalFactory {
+                seen_body: Arc::new(Mutex::new(Bytes::new())),
                 seen_request_id: seen_request_id.clone(),
                 seen_headers: None,
+                term_log: None,
             });
         let handler = FilterChainHandler::new(
             Vec::new(),
@@ -2199,7 +2223,7 @@ fn run_through_handler(
             );
         }
         let _ = handler.handle(req).await;
-        let seen = seen_request_id.borrow().clone();
+        let seen = seen_request_id.lock().unwrap().clone();
         seen
     })
 }
@@ -2264,13 +2288,13 @@ fn run_through_handler_xff(
     inbound_headers: &[(&str, &str)],
 ) -> HeaderMap {
     block_on(async {
-        let seen_headers = Rc::new(RefCell::new(None));
-        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-            Rc::new(RecordingTerminalFactory {
-                log: log_of(),
-                seen_body: Rc::new(RefCell::new(Bytes::new())),
-                seen_request_id: Rc::new(RefCell::new(None)),
+        let seen_headers = Arc::new(Mutex::new(None));
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RecordingTerminalFactory {
+                seen_body: Arc::new(Mutex::new(Bytes::new())),
+                seen_request_id: Arc::new(Mutex::new(None)),
                 seen_headers: Some(seen_headers.clone()),
+                term_log: None,
             });
         let handler = FilterChainHandler::new(
             Vec::new(),
@@ -2291,7 +2315,8 @@ fn run_through_handler_xff(
         }
         let _ = handler.handle(req).await;
         let result = seen_headers
-            .borrow()
+            .lock()
+            .unwrap()
             .clone()
             .expect("terminal must have run and recorded headers");
         result
@@ -2491,13 +2516,12 @@ fn text_access_log(path: &std::path::Path, format: &str) -> AccessLogIR {
 #[test]
 fn encode_filters_end_of_stream_write_reaches_the_access_log_line() {
     block_on(async {
-        let log = log_of();
-        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-            Rc::new(RecordingTerminalFactory {
-                log,
-                seen_body: Rc::new(RefCell::new(Bytes::new())),
-                seen_request_id: Rc::new(RefCell::new(None)),
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RecordingTerminalFactory {
+                seen_body: Arc::new(Mutex::new(Bytes::new())),
+                seen_request_id: Arc::new(Mutex::new(None)),
                 seen_headers: None,
+                term_log: None,
             });
         let path = temp_log_path("ordering");
         let handler = FilterChainHandler::new_with_access_logs(
@@ -2535,13 +2559,13 @@ fn encode_filters_end_of_stream_write_reaches_the_access_log_line() {
 #[test]
 fn a_filter_chain_local_reply_still_produces_an_access_log_line() {
     block_on(async {
-        let log = log_of();
-        let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-            Rc::new(RecordingTerminalFactory {
-                log: log.clone(),
-                seen_body: Rc::new(RefCell::new(Bytes::new())),
-                seen_request_id: Rc::new(RefCell::new(None)),
+        let term_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RecordingTerminalFactory {
+                seen_body: Arc::new(Mutex::new(Bytes::new())),
+                seen_request_id: Arc::new(Mutex::new(None)),
                 seen_headers: None,
+                term_log: Some(term_log.clone()),
             });
         let path = temp_log_path("local-reply");
         let handler = FilterChainHandler::new_with_access_logs(
@@ -2560,7 +2584,11 @@ fn a_filter_chain_local_reply_still_produces_an_access_log_line() {
         resp.body.collect().await.expect("resp body must collect");
 
         assert!(
-            log.borrow().iter().all(|entry| entry != "terminal"),
+            term_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|entry| entry != "terminal"),
             "a filter-chain local reply must never reach the router terminal"
         );
         assert_eq!(

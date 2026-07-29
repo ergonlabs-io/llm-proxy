@@ -136,9 +136,10 @@ pub struct FilterChainHandler {
     factories: Vec<Arc<dyn FilterInstanceFactory>>,
     /// ADR-0004 step 3: the terminal's own factory -- mints a fresh
     /// [`TerminalHttpFilter`] instance per stream, exactly like every other
-    /// filter. `Rc`, not `Arc`: see [`TerminalFilterInstanceFactory`]'s doc
-    /// for why it doesn't require `Send + Sync`.
-    terminal_factory: Rc<dyn TerminalFilterInstanceFactory>,
+    /// filter. `Arc`, same as `factories` above: see
+    /// [`TerminalFilterInstanceFactory`]'s doc -- it's config-time plumbing
+    /// and carries `Send + Sync` per ADR-0003, just like `FilterInstanceFactory`.
+    terminal_factory: Arc<dyn TerminalFilterInstanceFactory>,
     /// S2.8 (ADR-0004 step 1): this HCM's route table -- the manager, not the
     /// router, now owns route resolution. Handed to each stream's `ChainCtx`
     /// so `DecoderCallbacks::route()` (and the terminal-request resolution in
@@ -177,7 +178,7 @@ pub struct FilterChainHandler {
 impl FilterChainHandler {
     pub fn new(
         factories: Vec<Arc<dyn FilterInstanceFactory>>,
-        terminal_factory: Rc<dyn TerminalFilterInstanceFactory>,
+        terminal_factory: Arc<dyn TerminalFilterInstanceFactory>,
         route_table: Arc<RouteTable>,
         generate_request_id: bool,
         use_remote_address: bool,
@@ -207,7 +208,7 @@ impl FilterChainHandler {
     /// logging moved up here.
     pub fn new_with_access_logs(
         factories: Vec<Arc<dyn FilterInstanceFactory>>,
-        terminal_factory: Rc<dyn TerminalFilterInstanceFactory>,
+        terminal_factory: Arc<dyn TerminalFilterInstanceFactory>,
         route_table: Arc<RouteTable>,
         generate_request_id: bool,
         use_remote_address: bool,

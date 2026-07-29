@@ -27,7 +27,6 @@ use std::fs::File;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -153,8 +152,8 @@ async fn build_router(
     .unwrap();
 
     let route_table = Arc::new(route_table);
-    let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-        Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+        Arc::new(RouterFilterFactory::new(Arc::new(manager)));
     FilterChainHandler::new_with_access_logs(
         Vec::new(),
         terminal_factory,

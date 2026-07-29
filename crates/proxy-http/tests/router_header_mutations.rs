@@ -12,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,8 +109,8 @@ async fn build_router(
     )
     .unwrap();
 
-    let terminal_factory: Rc<dyn TerminalFilterInstanceFactory> =
-        Rc::new(RouterFilterFactory::new(Arc::new(manager)));
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+        Arc::new(RouterFilterFactory::new(Arc::new(manager)));
     FilterChainHandler::new(
         Vec::new(),
         terminal_factory,
