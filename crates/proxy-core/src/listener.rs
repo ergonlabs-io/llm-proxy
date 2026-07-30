@@ -31,10 +31,8 @@ use proxy_config::ir::{
 };
 use proxy_config::ConfigSnapshot;
 use proxy_http::codec::{serve_http1, Http1Options};
-use proxy_http::filter::{
-    FactoryContext, FilterInstanceFactory, FilterRegistry, TerminalFilterInstanceFactory,
-};
-use proxy_http::filter_manager::FilterChainHandler;
+use proxy_http::filter::{FactoryContext, FilterRegistry, TerminalFilterInstanceFactory};
+use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
@@ -773,8 +771,7 @@ fn build_hcm_handler(
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
     let factory_ctx = FactoryContext {};
-    let mut factories: Vec<Arc<dyn FilterInstanceFactory>> =
-        Vec::with_capacity(hcm.http_filters.len());
+    let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
     for f in &hcm.http_filters {
         if f.is_router {
             continue;
@@ -802,7 +799,17 @@ fn build_hcm_handler(
                     context: context.to_string(),
                     reason: format!("http filter '{}': {e}", f.name),
                 })?;
-        factories.push(Arc::from(instance_factory));
+        filters.push(ConfiguredHttpFilter {
+            name: f.name.clone(),
+            instance_factory: Arc::from(instance_factory),
+            // ADR-0004 step 4 increment 2: kept alongside the instance
+            // factory -- `FilterChainHandler::new_with_filters` needs the
+            // registered `HttpFilterFactory` (not just the per-stream
+            // instance factory) once, at construction, to resolve any
+            // `typed_per_filter_config` entry naming this filter through
+            // `HttpFilterFactory::parse_per_route`.
+            factory: factory.clone(),
+        });
     }
 
     let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
@@ -822,9 +829,14 @@ fn build_hcm_handler(
     // module docs for why (the router sits INSIDE the encode filter chain,
     // so logging from there can never observe what an encode filter does at
     // end-of-stream).
+    //
+    // ADR-0004 step 4 increment 2: `new_with_filters_and_access_logs` (not
+    // plain `new_with_access_logs`) -- `filters` carries each entry's Envoy
+    // name and registered factory, needed to resolve `typed_per_filter_config`
+    // against the real chain once, here, rather than never (ground rule #1).
     Ok(Rc::new(
-        FilterChainHandler::new_with_access_logs(
-            factories,
+        FilterChainHandler::new_with_filters_and_access_logs(
+            filters,
             terminal_factory,
             hcm.route_table.clone(),
             hcm.generate_request_id,
@@ -834,7 +846,7 @@ fn build_hcm_handler(
         )
         .map_err(|e| HttpFilterChainBuildError {
             context: context.to_string(),
-            reason: format!("failed to open access_logs sink: {e}"),
+            reason: format!("failed to build filter chain: {e}"),
         })?,
     ))
 }

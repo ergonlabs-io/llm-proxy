@@ -191,68 +191,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   proxy-config); TlsSecret's own doc comment already names \
                   these WPs.",
     },
-    // ADR-0004 step 4, increment 1 landed the IR and lowering for
-    // `typed_per_filter_config`; increment 2 (`proxy-http`: resolve each
-    // entry through the filter registry at HCM build time, expose the
-    // result via `DecoderCallbacks`) is what gives these fields readers.
-    // All six entries below are expected to be deleted by that increment —
-    // the staleness recheck will insist on it.
-    AllowlistEntry {
-        struct_name: "RouteEntry",
-        field_name: "typed_per_filter_config",
-        kind: EntryKind::KnownInert,
-        reason: "ADR-0004 step 4 increment 2: the per-route override is \
-                  lowered but nothing resolves it yet — `proxy-http` has to \
-                  hand each entry to the owning HttpFilterFactory's \
-                  `parse_per_route` at HCM build time before any of this is \
-                  read. Lowering it now is what stops it being silently \
-                  dropped (ground rule #1).",
-    },
-    AllowlistEntry {
-        struct_name: "VirtualHostIR",
-        field_name: "typed_per_filter_config",
-        kind: EntryKind::KnownInert,
-        reason: "Same increment-2 gap as RouteEntry.typed_per_filter_config \
-                  above; this is the virtual-host level of Envoy's \
-                  route < virtual-host < route-config override merge order.",
-    },
-    AllowlistEntry {
-        struct_name: "RouteTable",
-        field_name: "typed_per_filter_config",
-        kind: EntryKind::KnownInert,
-        reason: "Same increment-2 gap as RouteEntry.typed_per_filter_config \
-                  above; this is the route-configuration (least specific) \
-                  level of the override merge order.",
-    },
-    AllowlistEntry {
-        struct_name: "PerFilterConfig",
-        field_name: "is_optional",
-        kind: EntryKind::KnownInert,
-        reason: "ADR-0004 step 4 increment 2: `is_optional` only takes effect \
-                  where a per-route entry is matched against the actual filter \
-                  chain — an entry naming a filter that isn't in the chain is \
-                  an error unless this is set. That check lives in \
-                  `proxy-http` at HCM build time and doesn't exist yet.",
-    },
-    AllowlistEntry {
-        struct_name: "PerFilterConfig",
-        field_name: "disabled",
-        kind: EntryKind::KnownInert,
-        reason: "Same increment-2 gap as PerFilterConfig.is_optional above: \
-                  disabling a filter for a route is enforced by the filter \
-                  manager when it builds the chain, which doesn't consult \
-                  per-route config yet.",
-    },
-    AllowlistEntry {
-        struct_name: "RouteEntry",
-        field_name: "route_index",
-        kind: EntryKind::KnownInert,
-        reason: "ADR-0004 step 4 increment 2: the dense index exists so \
-                  `proxy-http` can keep a side table of *parsed* per-route \
-                  configs (which are proxy-http types and so cannot live in \
-                  the IR) indexed by route rather than by hashing Arc \
-                  pointers. Nothing builds that side table yet.",
-    },
 ];
 
 /// A `pub struct` block parsed out of `ir.rs`, with its `pub` field names.

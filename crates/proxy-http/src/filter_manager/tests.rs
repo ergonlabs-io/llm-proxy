@@ -18,7 +18,7 @@ use proxy_config::ir::{
 use proxy_observability::access_log::parse_format;
 
 use super::*;
-use crate::filter::{FilterTrailersStatus, RequestHeaders};
+use crate::filter::{FactoryContext, FilterTrailersStatus, RequestHeaders};
 use crate::handler::{DownstreamInfo, HttpRequestParts, HttpResponseParts};
 
 /// Shared call log: every filter appends `"<name>:<callback>"` so a test can
@@ -2186,6 +2186,619 @@ fn clear_route_cache_forces_re_resolution_after_a_path_rewrite() {
             !Arc::ptr_eq(before, after),
             "before/after must be genuinely different allocations, not the same \
              route re-matched"
+        );
+    });
+}
+
+// --- ADR-0004 step 4 increment 2: resolved `typed_per_filter_config` -------
+//
+// These tests exercise `build_per_route_table` (the HCM-build-time
+// resolution + validation) and `DecoderCallbacks::per_route_config` (the
+// runtime read) directly, following this file's existing convention of
+// driving `FilterManager`/`ChainCtx` by hand rather than through
+// `FilterChainHandler`.
+
+/// A `google.protobuf.StringValue`-shaped `DynamicMessage` carrying `tag` in
+/// its `value` field. `google.protobuf.StringValue` is a well-known type
+/// already bundled in `prost_reflect`'s global descriptor pool (see
+/// `DescriptorPool::global`'s doc), so this needs no `proxy-api` Envoy
+/// descriptors -- any real message shape would do, since only `TagFactory`
+/// below ever reads it, and only to recover `tag`.
+fn string_value(tag: &str) -> prost_reflect::DynamicMessage {
+    let desc = prost_reflect::DescriptorPool::global()
+        .get_message_by_name("google.protobuf.StringValue")
+        .expect("google.protobuf.StringValue is a well-known type");
+    let mut msg = prost_reflect::DynamicMessage::new(desc);
+    msg.set_field_by_name("value", prost_reflect::Value::String(tag.to_string()));
+    msg
+}
+
+/// A `typed_per_filter_config` entry carrying `tag` (see [`string_value`]).
+fn tag_override(tag: &str) -> PerFilterConfig {
+    PerFilterConfig {
+        type_url: "type.googleapis.com/google.protobuf.StringValue".to_string(),
+        config: Some(string_value(tag)),
+        is_optional: false,
+        disabled: false,
+    }
+}
+
+/// A resolved per-route override that just carries an identifying tag --
+/// [`tag_of`] downcasts an `Arc<dyn PerRouteConfig>` back to this so a test
+/// can tell WHICH override resolved.
+#[derive(Debug, PartialEq, Eq)]
+struct TagConfig(String);
+
+impl PerRouteConfig for TagConfig {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Downcast whatever `per_route_config()` returned back to its tag, if any.
+fn tag_of(cfg: Option<Arc<dyn PerRouteConfig>>) -> Option<String> {
+    cfg.and_then(|c| c.as_any().downcast_ref::<TagConfig>().map(|t| t.0.clone()))
+}
+
+/// An `HttpFilterFactory` fixture whose `parse_per_route` reads the
+/// `google.protobuf.StringValue.value` field [`tag_override`] wrote and
+/// hands back a [`TagConfig`] carrying it. `create()` is never exercised by
+/// these tests (none of them build a real per-stream instance from this
+/// factory), so it just fails loudly if that ever changes.
+struct TagFactory;
+
+impl HttpFilterFactory for TagFactory {
+    fn type_url(&self) -> &'static str {
+        "type.llmproxy.dev/test.TagFilter"
+    }
+
+    fn create(
+        &self,
+        _config: &prost_reflect::DynamicMessage,
+        _ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        panic!("TagFactory::create is not exercised by the per-route-config tests")
+    }
+
+    fn parse_per_route(
+        &self,
+        config: &prost_reflect::DynamicMessage,
+    ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
+        let tag = config
+            .get_field_by_name("value")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        Ok(Arc::new(TagConfig(tag)))
+    }
+}
+
+/// An `HttpFilterFactory` fixture that DOES support per-route config but
+/// rejects every config it is handed. This is the other side of
+/// [`NoPerRouteFactory`]: "I don't do per-route config" (the trait default,
+/// an `Unimplemented`) versus "I do, and yours is wrong" (a validation
+/// error). `is_optional` must tolerate only the first.
+struct RejectingPerRouteFactory;
+
+impl HttpFilterFactory for RejectingPerRouteFactory {
+    fn type_url(&self) -> &'static str {
+        "type.llmproxy.dev/test.RejectingFilter"
+    }
+
+    fn create(
+        &self,
+        _config: &prost_reflect::DynamicMessage,
+        _ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        panic!("RejectingPerRouteFactory::create is not exercised by the per-route-config tests")
+    }
+
+    fn parse_per_route(
+        &self,
+        _config: &prost_reflect::DynamicMessage,
+    ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
+        Err(ConfigError::InvalidValue {
+            field_path: "test.RejectingFilter".to_string(),
+            reason: "this per-route config is malformed".to_string(),
+        })
+    }
+}
+
+/// An `HttpFilterFactory` fixture that never overrides `parse_per_route` --
+/// exercises the trait's own default ("this filter has no per-route
+/// config").
+struct NoPerRouteFactory;
+
+impl HttpFilterFactory for NoPerRouteFactory {
+    fn type_url(&self) -> &'static str {
+        "type.llmproxy.dev/test.NoPerRouteFilter"
+    }
+
+    fn create(
+        &self,
+        _config: &prost_reflect::DynamicMessage,
+        _ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        panic!("NoPerRouteFactory::create is not exercised by the per-route-config tests")
+    }
+}
+
+/// A route table with a single route matching everything, carrying
+/// `route_config_overrides`/`vhost_overrides`/`route_overrides` at their
+/// respective levels -- for the build-time validation tests and the
+/// "most specific wins" test, which need all three levels configurable
+/// independently.
+fn route_table_with_all_levels(
+    route_config_overrides: BTreeMap<String, PerFilterConfig>,
+    vhost_overrides: BTreeMap<String, PerFilterConfig>,
+    route_overrides: BTreeMap<String, PerFilterConfig>,
+) -> Arc<RouteTable> {
+    let route = Arc::new(RouteEntry {
+        name: Some("only-route".to_string()),
+        matcher: RouteMatcher {
+            path: PathMatch::Prefix("/".to_string()),
+            case_sensitive: true,
+            headers: Vec::new(),
+        },
+        action: RouteActionIR::Forward(ForwardAction {
+            target: ForwardTarget::Cluster("cluster-a".to_string()),
+            timeout: None,
+            idle_timeout: None,
+            retry_policy: None,
+            host_rewrite_literal: None,
+            prefix_rewrite: None,
+        }),
+        request_headers_to_add: Vec::new(),
+        typed_per_filter_config: route_overrides,
+        route_index: 0,
+    });
+    Arc::new(
+        RouteTable::new(
+            "test-routes".to_string(),
+            vec![VirtualHostIR {
+                name: "vh".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![route],
+                typed_per_filter_config: vhost_overrides,
+            }],
+            route_config_overrides,
+        )
+        .expect("single catch-all route is valid"),
+    )
+}
+
+/// Like [`run_chain_req_with_route_table`], but also attaches a resolved
+/// [`PerRouteTable`] (built by [`build_per_route_table`]) to `ctx`, for the
+/// `per_route_config()` tests below.
+async fn run_chain_req_with_route_and_per_route(
+    filters: Vec<Box<dyn HttpFilter>>,
+    log: Log,
+    req: HttpRequestParts,
+    route_table: Arc<RouteTable>,
+    per_route: PerRouteTable,
+) -> StatusCode {
+    let seen_body = Arc::new(Mutex::new(Bytes::new()));
+    let terminal = RecordingTerminal {
+        log,
+        term_log: None,
+        seen_body,
+        seen_request_id: Arc::new(Mutex::new(None)),
+        seen_headers: None,
+        captured_body: Bytes::new(),
+    };
+    let mgr = FilterManager {
+        filters,
+        ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())))
+            .with_route_table(route_table)
+            .with_per_route(Arc::new(per_route)),
+        terminal: Box::new(terminal),
+        buffer_limit: DEFAULT_BUFFER_LIMIT,
+    };
+    let resp = mgr.run(req).await;
+    let status = resp.head.status;
+    let _ = resp.body.collect().await;
+    status
+}
+
+/// A probe filter that records what `per_route_config()` returned (as its
+/// tag, or `None`) from `decode_headers` -- and, if `check_on_encode` is
+/// set, again from `encode_headers` (proving `EncoderCallbacksAdapter`'s
+/// position -> filter-index mapping is correct too).
+struct PerRouteProbeFilter {
+    seen: Rc<RefCell<Vec<Option<String>>>>,
+    check_on_encode: bool,
+}
+
+impl HttpFilter for PerRouteProbeFilter {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        self.seen.borrow_mut().push(tag_of(cb.per_route_config()));
+        FilterHeadersStatus::Continue
+    }
+
+    fn encode_headers(
+        &mut self,
+        cb: &mut dyn EncoderCallbacks,
+        _headers: &mut ResponseHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        if self.check_on_encode {
+            self.seen.borrow_mut().push(tag_of(cb.per_route_config()));
+        }
+        FilterHeadersStatus::Continue
+    }
+}
+
+/// Item 1: a filter reads its own route-level override.
+#[test]
+fn per_route_config_reads_the_calling_filters_own_route_level_override() {
+    block_on(async {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let filter = PerRouteProbeFilter {
+            seen: seen.clone(),
+            check_on_encode: false,
+        };
+        let mut route_overrides = BTreeMap::new();
+        route_overrides.insert("filter-a".to_string(), tag_override("route-tag"));
+        let route_table =
+            route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), route_overrides);
+        let names = vec!["filter-a".to_string()];
+        let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(TagFactory)];
+        let per_route =
+            build_per_route_table(&names, &factories, &route_table).expect("valid overrides");
+
+        let status = run_chain_req_with_route_and_per_route(
+            vec![Box::new(filter)],
+            log_of(),
+            request_with_path("/x", b""),
+            route_table,
+            per_route,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.borrow().as_slice(), [Some("route-tag".to_string())]);
+    });
+}
+
+/// Item 2: route beats virtual-host beats route-configuration, all three
+/// configured at once for the same filter.
+#[test]
+fn per_route_config_most_specific_level_wins() {
+    block_on(async {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let filter = PerRouteProbeFilter {
+            seen: seen.clone(),
+            check_on_encode: false,
+        };
+        let mut route_config_overrides = BTreeMap::new();
+        route_config_overrides.insert("filter-a".to_string(), tag_override("route-config-tag"));
+        let mut vhost_overrides = BTreeMap::new();
+        vhost_overrides.insert("filter-a".to_string(), tag_override("vhost-tag"));
+        let mut route_overrides = BTreeMap::new();
+        route_overrides.insert("filter-a".to_string(), tag_override("route-tag"));
+        let route_table =
+            route_table_with_all_levels(route_config_overrides, vhost_overrides, route_overrides);
+        let names = vec!["filter-a".to_string()];
+        let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(TagFactory)];
+        let per_route =
+            build_per_route_table(&names, &factories, &route_table).expect("valid overrides");
+
+        let status = run_chain_req_with_route_and_per_route(
+            vec![Box::new(filter)],
+            log_of(),
+            request_with_path("/x", b""),
+            route_table,
+            per_route,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [Some("route-tag".to_string())],
+            "the route-level entry must win over both the virtual-host and \
+             route-configuration entries"
+        );
+    });
+}
+
+/// Item 3: a filter with no override gets `None`, while a sibling filter on
+/// the SAME route gets `Some` -- proves indexing is per-filter, not
+/// per-route.
+#[test]
+fn per_route_config_is_isolated_per_filter() {
+    block_on(async {
+        let seen_a = Rc::new(RefCell::new(Vec::new()));
+        let seen_b = Rc::new(RefCell::new(Vec::new()));
+        let filter_a = PerRouteProbeFilter {
+            seen: seen_a.clone(),
+            check_on_encode: false,
+        };
+        let filter_b = PerRouteProbeFilter {
+            seen: seen_b.clone(),
+            check_on_encode: false,
+        };
+        let mut route_overrides = BTreeMap::new();
+        route_overrides.insert("filter-a".to_string(), tag_override("route-tag"));
+        let route_table =
+            route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), route_overrides);
+        let names = vec!["filter-a".to_string(), "filter-b".to_string()];
+        let factories: Vec<Arc<dyn HttpFilterFactory>> =
+            vec![Arc::new(TagFactory), Arc::new(TagFactory)];
+        let per_route =
+            build_per_route_table(&names, &factories, &route_table).expect("valid overrides");
+
+        let status = run_chain_req_with_route_and_per_route(
+            vec![Box::new(filter_a), Box::new(filter_b)],
+            log_of(),
+            request_with_path("/x", b""),
+            route_table,
+            per_route,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen_a.borrow().as_slice(), [Some("route-tag".to_string())]);
+        assert_eq!(
+            seen_b.borrow().as_slice(),
+            [None],
+            "filter-b has no override anywhere -- it must see None, not filter-a's"
+        );
+    });
+}
+
+/// Item 4: an entry naming a filter absent from the chain is a build error;
+/// `is_optional: true` on the same entry builds clean.
+#[test]
+fn per_route_config_absent_filter_is_a_build_error_unless_optional() {
+    let names = vec!["configured-filter".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(TagFactory)];
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "not-in-chain".to_string(),
+        PerFilterConfig {
+            type_url: String::new(),
+            config: None,
+            is_optional: false,
+            disabled: false,
+        },
+    );
+    let route_table = route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), overrides);
+    let err = build_per_route_table(&names, &factories, &route_table)
+        .expect_err("a filter name absent from the chain must fail the build");
+    assert!(
+        matches!(err, ConfigError::Validation { .. }),
+        "expected Validation, got {err:?}"
+    );
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "not-in-chain".to_string(),
+        PerFilterConfig {
+            type_url: String::new(),
+            config: None,
+            is_optional: true,
+            disabled: false,
+        },
+    );
+    let route_table = route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), overrides);
+    build_per_route_table(&names, &factories, &route_table)
+        .expect("is_optional must make an absent filter name build clean");
+}
+
+/// Item 5: an entry for a filter whose factory has no `parse_per_route`
+/// support is a build error; `is_optional: true` builds clean.
+#[test]
+fn per_route_config_unsupported_filter_is_a_build_error_unless_optional() {
+    let names = vec!["configured-filter".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(NoPerRouteFactory)];
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert("configured-filter".to_string(), tag_override("irrelevant"));
+    let route_table = route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), overrides);
+    let err = build_per_route_table(&names, &factories, &route_table)
+        .expect_err("a filter with no per-route support must fail the build");
+    assert!(
+        matches!(err, ConfigError::Unimplemented { .. }),
+        "expected Unimplemented (the trait's own default), got {err:?}"
+    );
+
+    let mut optional_overrides = BTreeMap::new();
+    optional_overrides.insert(
+        "configured-filter".to_string(),
+        PerFilterConfig {
+            is_optional: true,
+            ..tag_override("irrelevant")
+        },
+    );
+    let route_table =
+        route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), optional_overrides);
+    build_per_route_table(&names, &factories, &route_table)
+        .expect("is_optional must tolerate a filter with no per-route support");
+}
+
+/// `is_optional` means "ignore this if the filter does not SUPPORT per-route
+/// config" -- NOT "ignore any error". A filter that supports per-route config
+/// and rejects the one it was given must still fail the build, or a typo'd
+/// override on an optional entry would be silently dropped on a filter that
+/// would have honored a correct one (ground rule #1).
+#[test]
+fn is_optional_does_not_swallow_a_supported_filters_rejection() {
+    let names = vec!["configured-filter".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(RejectingPerRouteFactory)];
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "configured-filter".to_string(),
+        PerFilterConfig {
+            is_optional: true,
+            ..tag_override("malformed")
+        },
+    );
+    let route_table = route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), overrides);
+
+    let err = build_per_route_table(&names, &factories, &route_table).expect_err(
+        "is_optional must NOT swallow a rejection from a filter that does support \
+         per-route config -- only the trait default's Unimplemented",
+    );
+    assert!(
+        matches!(err, ConfigError::InvalidValue { .. }),
+        "expected the filter's own InvalidValue to propagate, got {err:?}"
+    );
+}
+
+/// Item 6: `disabled: true` is a build error mentioning that it is not yet
+/// implemented.
+#[test]
+fn per_route_config_disabled_is_a_build_error_mentioning_not_implemented() {
+    let names = vec!["configured-filter".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(TagFactory)];
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "configured-filter".to_string(),
+        PerFilterConfig {
+            type_url: String::new(),
+            config: None,
+            is_optional: false,
+            disabled: true,
+        },
+    );
+    let route_table = route_table_with_all_levels(BTreeMap::new(), BTreeMap::new(), overrides);
+    let err = build_per_route_table(&names, &factories, &route_table)
+        .expect_err("disabled must fail the build (not yet implemented)");
+    match err {
+        ConfigError::Unimplemented { reason, .. } => assert!(
+            reason.contains("not yet implemented") || reason.contains("not implemented"),
+            "reason should say disabling a filter per-route isn't implemented yet: {reason}"
+        ),
+        other => panic!("expected Unimplemented, got {other:?}"),
+    }
+}
+
+/// Like [`RouteProbeFilter`], but calls `per_route_config()` instead of
+/// `route()` -- item 7: after a path rewrite + `clear_route_cache()`, the
+/// NEXT `per_route_config()` call must reflect the rewritten route's
+/// override, not the stale cached one. Modeled directly on
+/// `clear_route_cache_forces_re_resolution_after_a_path_rewrite`.
+struct PerRouteRewriteProbeFilter {
+    seen: Rc<RefCell<Vec<Option<String>>>>,
+    rewrite_path: &'static str,
+}
+
+impl HttpFilter for PerRouteRewriteProbeFilter {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        self.seen.borrow_mut().push(tag_of(cb.per_route_config()));
+        headers.uri = Uri::from_static(self.rewrite_path);
+        cb.clear_route_cache();
+        FilterHeadersStatus::Continue
+    }
+
+    fn decode_data(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _data: &mut Bytes,
+        _end_stream: bool,
+    ) -> FilterDataStatus {
+        self.seen.borrow_mut().push(tag_of(cb.per_route_config()));
+        FilterDataStatus::Continue
+    }
+}
+
+/// A two-route table (mirrors [`route_table_two_routes`]), each route
+/// carrying its OWN route-level override for the same filter name, so a
+/// rewrite from one route to the other is observable through
+/// `per_route_config()`, not just `route()`.
+fn route_table_two_routes_with_tags() -> (
+    Arc<RouteTable>,
+    Vec<String>,
+    Vec<Arc<dyn HttpFilterFactory>>,
+) {
+    fn route(name: &str, prefix: &str, cluster: &str, tag: &str) -> Arc<RouteEntry> {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("filter-a".to_string(), tag_override(tag));
+        Arc::new(RouteEntry {
+            name: Some(name.to_string()),
+            matcher: RouteMatcher {
+                path: PathMatch::Prefix(prefix.to_string()),
+                case_sensitive: true,
+                headers: Vec::new(),
+            },
+            action: RouteActionIR::Forward(ForwardAction {
+                target: ForwardTarget::Cluster(cluster.to_string()),
+                timeout: None,
+                idle_timeout: None,
+                retry_policy: None,
+                host_rewrite_literal: None,
+                prefix_rewrite: None,
+            }),
+            request_headers_to_add: Vec::new(),
+            typed_per_filter_config: overrides,
+            route_index: 0,
+        })
+    }
+    let route_table = Arc::new(
+        RouteTable::new(
+            "test-routes".to_string(),
+            vec![VirtualHostIR {
+                name: "vh".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![
+                    route("route-a", "/a", "cluster-a", "route-a-tag"),
+                    route("route-b", "/b", "cluster-b", "route-b-tag"),
+                ],
+                typed_per_filter_config: BTreeMap::new(),
+            }],
+            BTreeMap::new(),
+        )
+        .expect("two non-overlapping prefixes on one domain is a valid table"),
+    );
+    let names = vec!["filter-a".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(TagFactory)];
+    (route_table, names, factories)
+}
+
+/// Item 7.
+#[test]
+fn per_route_config_reflects_the_new_route_after_clear_route_cache() {
+    block_on(async {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let filter = PerRouteRewriteProbeFilter {
+            seen: seen.clone(),
+            rewrite_path: "http://example.test/b/chat",
+        };
+        let (route_table, names, factories) = route_table_two_routes_with_tags();
+        let per_route =
+            build_per_route_table(&names, &factories, &route_table).expect("valid overrides");
+
+        let status = run_chain_req_with_route_and_per_route(
+            vec![Box::new(filter)],
+            log_of(),
+            request_with_path("/a/chat", b"body"),
+            route_table,
+            per_route,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.len(),
+            2,
+            "one call from decode_headers, one from decode_data"
+        );
+        assert_eq!(seen[0], Some("route-a-tag".to_string()));
+        assert_eq!(
+            seen[1],
+            Some("route-b-tag".to_string()),
+            "clear_route_cache() must force per_route_config() to resolve against \
+             the REWRITTEN route too, not replay the stale cached one"
         );
     });
 }

@@ -91,7 +91,7 @@
 //! the callback returns**; a callback never re-enters another filter.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -104,15 +104,17 @@ use http::HeaderMap;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Frame};
 
-use proxy_config::ir::{AccessLogIR, RouteEntry, RouteTable};
+use proxy_config::ir::{AccessLogIR, PerFilterConfig, RouteEntry, RouteTable};
+use proxy_config::ConfigError;
 
 use crate::access_logging::{
     snapshot_request_headers, AccessLogContext, AccessLoggerRuntime, LoggingBody,
 };
 use crate::filter::{
     BufferedBody, DecoderCallbacks, EncoderCallbacks, FilterDataStatus, FilterHeadersStatus,
-    FilterInstanceFactory, HeaderMutationFn, HttpFilter, RequestHeaders, RequestTrailers,
-    ResponseHeaders, ResponseTrailers, TerminalFilterInstanceFactory, TerminalHttpFilter,
+    FilterInstanceFactory, HeaderMutationFn, HttpFilter, HttpFilterFactory, PerRouteConfig,
+    RequestHeaders, RequestTrailers, ResponseHeaders, ResponseTrailers,
+    TerminalFilterInstanceFactory, TerminalHttpFilter,
 };
 use crate::handler::{
     local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody as SeamBody,
@@ -125,6 +127,228 @@ use crate::stream_info::StreamInfo;
 /// `per_connection_buffer_limit_bytes` default is 1 MiB). Overflow of a filter
 /// that requested buffering yields 413 on decode / 500 on encode.
 pub const DEFAULT_BUFFER_LIMIT: usize = 1 << 20;
+
+/// One `http_filters` chain entry, as building a [`FilterChainHandler`] with
+/// `typed_per_filter_config` resolution (ADR-0004 step 4 increment 2) needs
+/// it: the Envoy filter name (`typed_per_filter_config`'s map key), the
+/// per-stream instance factory (unchanged — what `factories` alone used to
+/// carry), and the REGISTERED [`HttpFilterFactory`] itself, needed once at
+/// construction to resolve any `typed_per_filter_config` entry naming this
+/// filter through `HttpFilterFactory::parse_per_route`.
+///
+/// Rust note: not retained after construction — [`FilterChainHandler::new_with_filters`]
+/// consumes a `Vec` of these and keeps only the already-resolved
+/// [`PerRouteTable`] plus the plain instance factories, exactly like
+/// [`FilterChainHandler::new`] always has.
+pub struct ConfiguredHttpFilter {
+    pub name: String,
+    pub instance_factory: Arc<dyn FilterInstanceFactory>,
+    pub factory: Arc<dyn HttpFilterFactory>,
+}
+
+/// Resolved `typed_per_filter_config` for one HCM's filter chain (ADR-0004
+/// step 4 increment 2), built once at [`FilterChainHandler`] construction —
+/// never re-parsed per stream, mirroring how Envoy validates this against
+/// the real filter chain when it's built. Every row is `[filter_index]`
+/// -indexed, in the SAME config order `FilterChainHandler::factories` uses
+/// (the router is never a row here: it's the HCM's terminal filter, not one
+/// of the ordinary chain filters `build_per_route_table` resolves against).
+#[derive(Default)]
+struct PerRouteTable {
+    /// `[route.route_index][filter_index]`.
+    route: Vec<Vec<Option<Arc<dyn PerRouteConfig>>>>,
+    /// `[vhost position in `RouteTable::virtual_hosts`][filter_index]`.
+    virtual_host: Vec<Vec<Option<Arc<dyn PerRouteConfig>>>>,
+    /// `[filter_index]`, from `RouteConfiguration.typed_per_filter_config`
+    /// (the least-specific level).
+    route_config: Vec<Option<Arc<dyn PerRouteConfig>>>,
+    /// `route_index -> vhost position`, precomputed here because
+    /// `proxy_config::ir::RouteEntry` doesn't carry its owning vhost's index
+    /// — this is the cheap alternative to scanning `RouteTable::virtual_hosts`
+    /// on every [`per_route_config_for`] call.
+    route_to_vhost: Vec<usize>,
+}
+
+// Rust note: manual `Debug`, not `#[derive(Debug)]` -- `Arc<dyn PerRouteConfig>`
+// has no `Debug` bound (the trait only requires `Send + Sync`, deliberately;
+// see its doc), so a derive can't compile. Tests only need this to satisfy
+// `Result::expect_err`'s `T: Debug` bound; the row contents don't matter for
+// that, so this just reports shape (row counts), not content.
+impl std::fmt::Debug for PerRouteTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PerRouteTable")
+            .field("route_rows", &self.route.len())
+            .field("virtual_host_rows", &self.virtual_host.len())
+            .field("route_config_row_len", &self.route_config.len())
+            .finish()
+    }
+}
+
+impl PerRouteTable {
+    /// Look up the most specific override for `filter_index` given the
+    /// stream's resolved `route` — route > virtual host > route
+    /// configuration (Envoy's `mostSpecificPerFilterConfig`). `.get(..)`
+    /// throughout (never direct indexing): an empty [`PerRouteTable::default`]
+    /// (built by [`FilterChainHandler::new`], which has no filter NAMES to
+    /// resolve against) must behave as "no override anywhere", not panic.
+    fn lookup(&self, route: &RouteEntry, filter_index: usize) -> Option<Arc<dyn PerRouteConfig>> {
+        if let Some(cfg) = self
+            .route
+            .get(route.route_index)
+            .and_then(|row| row.get(filter_index))
+            .and_then(|slot| slot.clone())
+        {
+            return Some(cfg);
+        }
+        if let Some(cfg) = self
+            .route_to_vhost
+            .get(route.route_index)
+            .and_then(|&vhost_idx| self.virtual_host.get(vhost_idx))
+            .and_then(|row| row.get(filter_index))
+            .and_then(|slot| slot.clone())
+        {
+            return Some(cfg);
+        }
+        self.route_config
+            .get(filter_index)
+            .and_then(|slot| slot.clone())
+    }
+}
+
+/// Resolve one `typed_per_filter_config` map (one of the three levels) into
+/// a `[filter_index]`-indexed row, validating every entry against the
+/// ACTUAL chain (ground rule #1 — a name/shape mismatch is a config error,
+/// not a silent no-op):
+///
+/// - a name absent from `names` is an error naming the filter and
+///   `context`, unless the entry's `is_optional` is set (then it's skipped);
+/// - `disabled: true` is an `Unimplemented` error (not yet supported —
+///   skipping a filter per-route requires the manager to act on it at run
+///   time, which is a later increment); never silently dropped;
+/// - otherwise the entry's config is handed to that filter's
+///   `HttpFilterFactory::parse_per_route`; an `Err` (including the trait's
+///   own default — "this filter has no per-route config") propagates as-is
+///   unless `is_optional` is set, in which case it's skipped.
+fn resolve_per_filter_row(
+    entries: &BTreeMap<String, PerFilterConfig>,
+    names: &[String],
+    factories: &[Arc<dyn HttpFilterFactory>],
+    filter_count: usize,
+    context: &str,
+) -> Result<Vec<Option<Arc<dyn PerRouteConfig>>>, ConfigError> {
+    let mut row: Vec<Option<Arc<dyn PerRouteConfig>>> = vec![None; filter_count];
+    for (filter_name, cfg) in entries {
+        let field_path = format!("{context}[{filter_name}]");
+        let Some(idx) = names.iter().position(|name| name == filter_name) else {
+            if cfg.is_optional {
+                continue;
+            }
+            return Err(ConfigError::Validation {
+                field_path,
+                rule: format!(
+                    "filter '{filter_name}' is not present in this HTTP filter chain \
+                     (set `is_optional: true` on this override to ignore it)"
+                ),
+            });
+        };
+        if cfg.disabled {
+            return Err(ConfigError::Unimplemented {
+                field_path,
+                reason: format!(
+                    "disabling filter '{filter_name}' for this route/virtual-host/\
+                     route-configuration (`typed_per_filter_config.disabled`) is not \
+                     yet implemented — the filter manager cannot skip a filter at run \
+                     time yet"
+                ),
+            });
+        }
+        let config = cfg
+            .config
+            .as_ref()
+            .ok_or_else(|| ConfigError::InvalidValue {
+                field_path: field_path.clone(),
+                reason: "no config present and `disabled` is not set".to_string(),
+            })?;
+        match factories[idx].parse_per_route(config) {
+            Ok(parsed) => row[idx] = Some(parsed),
+            // `is_optional` means "ignore this override if the filter does not
+            // SUPPORT per-route config" -- it does not mean "ignore any error".
+            // `HttpFilterFactory::parse_per_route`'s default body is what
+            // reports non-support, and it reports it as `Unimplemented`; every
+            // other variant means the filter does support per-route config and
+            // rejected THIS config. Swallowing those under `is_optional` would
+            // silently drop a malformed override on a filter that would have
+            // honored a correct one -- ground rule #1, and not what Envoy does
+            // either.
+            Err(ConfigError::Unimplemented { .. }) if cfg.is_optional => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(row)
+}
+
+/// Build the [`PerRouteTable`] for one HCM's filter chain (ADR-0004 step 4
+/// increment 2): resolve `RouteConfiguration`/`VirtualHost`/`Route`-level
+/// `typed_per_filter_config` once, at build time, against the real chain —
+/// see [`resolve_per_filter_row`] for the per-entry rules. `names[i]` is
+/// `factories[i]`'s Envoy filter name; both share filter index with
+/// `FilterChainHandler::factories` (config order, router excluded).
+fn build_per_route_table(
+    names: &[String],
+    factories: &[Arc<dyn HttpFilterFactory>],
+    route_table: &RouteTable,
+) -> Result<PerRouteTable, ConfigError> {
+    let filter_count = names.len();
+
+    let route_config = resolve_per_filter_row(
+        &route_table.typed_per_filter_config,
+        names,
+        factories,
+        filter_count,
+        &format!("{}.typed_per_filter_config", route_table.name),
+    )?;
+
+    let mut virtual_host = Vec::with_capacity(route_table.virtual_hosts.len());
+    let route_count = route_table.route_count();
+    let mut route = vec![Vec::new(); route_count];
+    let mut route_to_vhost = vec![0usize; route_count];
+
+    for (vhost_idx, vhost) in route_table.virtual_hosts.iter().enumerate() {
+        let vhost_row = resolve_per_filter_row(
+            &vhost.typed_per_filter_config,
+            names,
+            factories,
+            filter_count,
+            &format!(
+                "{}.virtual_hosts[{vhost_idx}] ({}).typed_per_filter_config",
+                route_table.name, vhost.name
+            ),
+        )?;
+        virtual_host.push(vhost_row);
+
+        for route_entry in &vhost.routes {
+            let row = resolve_per_filter_row(
+                &route_entry.typed_per_filter_config,
+                names,
+                factories,
+                filter_count,
+                &format!(
+                    "{}.virtual_hosts[{vhost_idx}].routes[route_index={}].typed_per_filter_config",
+                    route_table.name, route_entry.route_index
+                ),
+            )?;
+            route[route_entry.route_index] = row;
+            route_to_vhost[route_entry.route_index] = vhost_idx;
+        }
+    }
+
+    Ok(PerRouteTable {
+        route,
+        virtual_host,
+        route_config,
+        route_to_vhost,
+    })
+}
 
 /// A [`StreamHandler`] that runs a request through an HTTP filter chain before
 /// (and the response after) an inner terminal handler. One of these is built per
@@ -173,6 +397,14 @@ pub struct FilterChainHandler {
     /// every request this (`!Send`, per-worker) handler serves, never across
     /// workers.
     access_loggers: Rc<Vec<AccessLoggerRuntime>>,
+    /// ADR-0004 step 4 increment 2: this HCM's resolved `typed_per_filter_config`,
+    /// keyed by filter index the same way `factories` is. `Arc` (not a plain
+    /// field): cloned into every stream's `ChainCtx`, same pattern as
+    /// `route_table`. Built by [`Self::new_with_filters`]; [`Self::new`] has
+    /// no filter NAMES to resolve against, so it always gets the empty
+    /// default (`per_route_config()` then always returns `None`, this
+    /// handler's pre-increment-2 behavior).
+    per_route: Arc<PerRouteTable>,
 }
 
 impl FilterChainHandler {
@@ -194,6 +426,7 @@ impl FilterChainHandler {
             xff_num_trusted_hops,
             request_id_rng: std::cell::RefCell::new(crate::headers::seed_from_entropy()),
             access_loggers: Rc::new(Vec::new()),
+            per_route: Arc::new(PerRouteTable::default()),
         }
     }
 
@@ -227,6 +460,75 @@ impl FilterChainHandler {
                 use_remote_address,
                 xff_num_trusted_hops,
             )
+        })
+    }
+
+    /// Like [`Self::new`], but `filters` carries each configured filter's
+    /// Envoy name and registered [`HttpFilterFactory`] alongside its
+    /// per-stream instance factory, so this build/rebuild also resolves
+    /// `typed_per_filter_config` against the real chain (ADR-0004 step 4
+    /// increment 2 -- see [`build_per_route_table`]). A resolution failure
+    /// (an unknown filter name, an unimplemented `disabled`, or a filter's
+    /// own `parse_per_route` rejecting its config) fails the whole build,
+    /// same as any other invalid `http_filters` entry (ground rule #1: never
+    /// silently drop a config field).
+    pub fn new_with_filters(
+        filters: Vec<ConfiguredHttpFilter>,
+        terminal_factory: Arc<dyn TerminalFilterInstanceFactory>,
+        route_table: Arc<RouteTable>,
+        generate_request_id: bool,
+        use_remote_address: bool,
+        xff_num_trusted_hops: u32,
+    ) -> Result<Self, ConfigError> {
+        let names: Vec<String> = filters.iter().map(|f| f.name.clone()).collect();
+        let http_factories: Vec<Arc<dyn HttpFilterFactory>> =
+            filters.iter().map(|f| f.factory.clone()).collect();
+        let per_route = build_per_route_table(&names, &http_factories, &route_table)?;
+        let factories = filters.into_iter().map(|f| f.instance_factory).collect();
+        Ok(Self {
+            per_route: Arc::new(per_route),
+            ..Self::new(
+                factories,
+                terminal_factory,
+                route_table,
+                generate_request_id,
+                use_remote_address,
+                xff_num_trusted_hops,
+            )
+        })
+    }
+
+    /// [`Self::new_with_filters`] + [`Self::new_with_access_logs`] combined —
+    /// what `proxy-core`'s `build_hcm_handler` actually calls, since a real
+    /// HCM carries both `http_filters` (with their names, for per-route
+    /// resolution) and `access_logs`.
+    pub fn new_with_filters_and_access_logs(
+        filters: Vec<ConfiguredHttpFilter>,
+        terminal_factory: Arc<dyn TerminalFilterInstanceFactory>,
+        route_table: Arc<RouteTable>,
+        generate_request_id: bool,
+        use_remote_address: bool,
+        xff_num_trusted_hops: u32,
+        access_logs: &[AccessLogIR],
+    ) -> Result<Self, ConfigError> {
+        let registry = proxy_observability::sink::SinkRegistry::new();
+        let access_loggers =
+            AccessLoggerRuntime::build_all(access_logs, &registry).map_err(|e| {
+                ConfigError::Io {
+                    path: "access_logs".to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+        Ok(Self {
+            access_loggers: Rc::new(access_loggers),
+            ..Self::new_with_filters(
+                filters,
+                terminal_factory,
+                route_table,
+                generate_request_id,
+                use_remote_address,
+                xff_num_trusted_hops,
+            )?
         })
     }
 
@@ -315,7 +617,9 @@ impl StreamHandler for FilterChainHandler {
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
             let mgr = FilterManager {
                 filters,
-                ctx: ChainCtx::new(stream_info.clone()).with_route_table(self.route_table.clone()),
+                ctx: ChainCtx::new(stream_info.clone())
+                    .with_route_table(self.route_table.clone())
+                    .with_per_route(self.per_route.clone()),
                 terminal,
                 buffer_limit: self.buffer_limit,
             };
@@ -461,6 +765,12 @@ struct ChainCtx {
     /// newly reachable. [`DecoderCallbacksAdapter::clear_route_cache`] resets
     /// this to `None` to force a re-resolution.
     route: Option<Arc<RouteEntry>>,
+    /// ADR-0004 step 4 increment 2: this HCM's resolved `typed_per_filter_config`
+    /// (see [`PerRouteTable`]). `None` for a standalone/test invocation with
+    /// no table attached (e.g. most direct `FilterManager` tests) --
+    /// `per_route_config()` then always returns `None`, the same shape
+    /// `route_table: None` gives `route()`.
+    per_route: Option<Arc<PerRouteTable>>,
     /// S2.5: a pending `send_local_reply()`, recorded here by
     /// [`DecoderCallbacksAdapter::send_local_reply`] and consumed by `run()`.
     /// First one wins — see that method's doc.
@@ -509,6 +819,7 @@ impl ChainCtx {
             route_path: String::new(),
             route_headers: HeaderMap::new(),
             route: None,
+            per_route: None,
             local_reply: None,
             response_headers_forwarded: false,
             reset_after_headers: false,
@@ -523,6 +834,15 @@ impl ChainCtx {
     /// them, matching pre-S2.8 behavior.
     fn with_route_table(mut self, route_table: Arc<RouteTable>) -> Self {
         self.route_table = Some(route_table);
+        self
+    }
+
+    /// Attach the resolved `typed_per_filter_config` this stream reads
+    /// through `per_route_config()` (ADR-0004 step 4 increment 2). Same
+    /// "separate builder, existing callers unaffected" shape as
+    /// [`Self::with_route_table`].
+    fn with_per_route(mut self, per_route: Arc<PerRouteTable>) -> Self {
+        self.per_route = Some(per_route);
         self
     }
 }
@@ -585,6 +905,22 @@ fn resolve_and_cache_route(ctx: &mut ChainCtx) -> Option<Arc<RouteEntry>> {
         // `clear_route_cache()` when nothing was cached in the first place.
         RouteMatch::NoRoute { .. } | RouteMatch::NoVirtualHost => None,
     }
+}
+
+/// ADR-0004 step 4 increment 2: resolve `filter_index`'s most specific
+/// `typed_per_filter_config` entry for the CALLING filter's stream —
+/// shared by [`DecoderCallbacksAdapter::per_route_config`] and
+/// [`EncoderCallbacksAdapter::per_route_config`]. Resolving the route here
+/// (via [`resolve_and_cache_route`]) is what makes this subject to the same
+/// S2.8 cache and the same `clear_route_cache()` invalidation as `route()`
+/// itself — see [`crate::filter::DecoderCallbacks::per_route_config`]'s doc.
+fn per_route_config_for(
+    ctx: &mut ChainCtx,
+    filter_index: usize,
+) -> Option<Arc<dyn PerRouteConfig>> {
+    let route = resolve_and_cache_route(ctx)?;
+    let per_route = ctx.per_route.as_ref()?;
+    per_route.lookup(&route, filter_index)
 }
 
 /// S2.5: a synthesized response requested via `send_local_reply`, recorded
@@ -2169,6 +2505,14 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
         self.ctx.route = None;
     }
 
+    fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>> {
+        // `current_idx` is the filter index the driver is calling right now
+        // (module doc on `DirectionState::current_idx`) -- exactly the
+        // "calling filter, never another's" isolation this method promises.
+        let filter_index = self.ctx.decode.current_idx;
+        per_route_config_for(self.ctx, filter_index)
+    }
+
     fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo> {
         self.ctx.stream_info.borrow_mut()
     }
@@ -2228,6 +2572,16 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
 
     fn modify_encoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut)) {
         f(&mut self.ctx.encode.positions[self.pos].buf.0);
+    }
+
+    fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>> {
+        // Position `p` = filter index `n - 1 - p` (module doc, "Position vs.
+        // filter index") -- `ctx.encode.positions` is sized to `n` by
+        // `encode_headers_phase` before any encode callback runs, so this is
+        // always in range once a callback is actually calling back.
+        let n = self.ctx.encode.positions.len();
+        let filter_index = n.checked_sub(1 + self.pos)?;
+        per_route_config_for(self.ctx, filter_index)
     }
 
     fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo> {

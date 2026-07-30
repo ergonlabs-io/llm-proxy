@@ -145,6 +145,24 @@ pub trait DecoderCallbacks {
     /// routing-relevant headers must call this (differential fixture required).
     fn clear_route_cache(&mut self);
 
+    /// The most specific `typed_per_filter_config` entry that applies to the
+    /// CALLING filter for this stream's route, or `None` (ADR-0004 step 4
+    /// increment 2).
+    ///
+    /// Specificity, most to least (Envoy's `mostSpecificPerFilterConfig`):
+    /// route > virtual host > route configuration. Resolving this resolves
+    /// the route (S2.8), so it is subject to the same cache and the same
+    /// `clear_route_cache()` invalidation — a filter that rewrites
+    /// routing-relevant headers and wants the rewritten route's override
+    /// must call `clear_route_cache()` first, exactly as for [`Self::route`]
+    /// itself.
+    ///
+    /// A filter only ever sees ITS OWN entry: the filter manager resolves
+    /// this against the position of whichever filter is calling right now
+    /// (never another filter's position), so one filter can't read another
+    /// filter's per-route config.
+    fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>>;
+
     /// The stream's single [`StreamInfo`] (Envoy's model: one per stream,
     /// owned at the filter-manager level, written by every filter AND by the
     /// router terminal — see `filter_manager::FilterChainHandler::handle`).
@@ -167,6 +185,21 @@ pub trait EncoderCallbacks {
     fn inject_encoded_data_to_filter_chain(&mut self, data: Bytes, end_stream: bool);
     fn encoding_buffer(&self) -> Option<&BufferedBody>;
     fn modify_encoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut));
+
+    /// Encoder-side counterpart to [`DecoderCallbacks::per_route_config`] —
+    /// same specificity order, same route cache, same per-filter isolation;
+    /// see that method's doc.
+    ///
+    /// Rust note: defaulted to `None` (unlike every other method here, and
+    /// unlike [`DecoderCallbacks::per_route_config`], which has no default) —
+    /// `EncoderCallbacks` already has test-double implementors outside this
+    /// increment's scope (`proxy-filters`, `proxy-core`) that this change
+    /// must not force edits onto; the real adapter
+    /// (`filter_manager::EncoderCallbacksAdapter`) overrides this with the
+    /// actual resolution.
+    fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>> {
+        None
+    }
 
     /// The stream's single [`StreamInfo`] — see [`DecoderCallbacks::stream_info`]
     /// for the shared-ownership model and the same "don't hold the guard
@@ -316,7 +349,16 @@ pub trait TerminalFilterInstanceFactory: Send + Sync {
 }
 
 /// Marker trait for parsed per-route filter config (`typed_per_filter_config`).
-pub trait PerRouteConfig: Send + Sync {}
+pub trait PerRouteConfig: Send + Sync {
+    /// Rust note: trait objects have no built-in way to recover their
+    /// concrete type; `dyn PerRouteConfig` alone can't be downcast. Each
+    /// implementor forwards this to `self` (`fn as_any(&self) -> &dyn Any {
+    /// self }`) so a filter that receives `Arc<dyn PerRouteConfig>` from
+    /// `per_route_config()` can `downcast_ref::<ItsOwnConcreteType>()` it
+    /// back — the only way it reads what its own `parse_per_route`
+    /// produced.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
 
 /// Context handed to factories at config time. TODO(WP-11): stats scope, runtime.
 pub struct FactoryContext {}
