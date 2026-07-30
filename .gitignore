@@ -3,9 +3,12 @@
 testing/diffrig/captures/
 
 # Planning docs stay local-only for now — track only README.md, CLAUDE.md,
-# the agent definitions under .claude/, and corpus provenance records.
+# the agent definitions under .claude/, corpus provenance records, and the QA
+# scenario registry (which is the spec the Go QA suite is written from, so it
+# has to be reviewable alongside the tests that cite its case IDs).
 *.md
 !README.md
 !CLAUDE.md
 !.claude/**/*.md
 !testing/corpus/fixtures/**/SOURCES.md
+!testing/qa/SCENARIOS.md
