@@ -8,9 +8,9 @@ can be reviewed alongside the tests that cite its case IDs.
 
 | Case | Property | State |
 |------|----------|-------|
-| QA-1 | Per-route token counts, both providers, one config | approved |
-| QA-2 | Bad config fails loudly with the field path, exits nonzero | approved |
-| QA-3 | Streamed response arrives incrementally | approved |
+| QA-1 | Per-route token counts, both providers, one config | implemented — **skipped, blocked** (see below) |
+| QA-2 | Bad config fails loudly with the field path, exits nonzero | passing |
+| QA-3 | Streamed response arrives incrementally | passing |
 | QA-4 | Credentials reach upstream, never reach the log | approved |
 | QA-5 | Non-streaming responses log real bytes and tokens | approved |
 | QA-6 | Upstream dying mid-stream errors, and is not retried | approved |
@@ -20,6 +20,28 @@ can be reviewed alongside the tests that cite its case IDs.
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
 `approved`.
+
+### QA-1 is blocked by two independent gaps — both found by this suite
+
+On its very first run, QA-1 established that both providers receive exactly one
+request each (routing and provider dispatch work end to end), and then **the
+configured access-log file is never created at all**. Two separate things have
+to land before it can pass:
+
+1. **The `llmproxy` dialect never wires `observability.access_logs` into the
+   generated Envoy config.** `crates/proxy-simple-config/src/lower.rs` (~line
+   124) emits only a warning — *"access logging is recorded but not emitted yet
+   (WP-24)"* — and never adds an `access_log` entry to the HCM. That warning is
+   **stale**: WP-24 landed, and access logging works fully in Envoy mode. The
+   dialect wiring was simply never done, so a proxy configured the way users
+   actually configure it produces **no access logs whatsoever**.
+2. **WP-33**: the usage filter isn't in the dialect's generated `http_filters`,
+   so even with a log destination there would be no token counts to write. See
+   `docs/wp-33-design-brief.md`.
+
+Gap 1 was not anticipated by the code review that produced the WP-33 brief —
+an independently written black-box test found it from the outside. That is the
+argument for this suite existing, and it arrived on day one.
 
 ## Maintaining this document
 
