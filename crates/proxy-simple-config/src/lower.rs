@@ -34,6 +34,25 @@ const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const DOWNSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
+const STDOUT_ACCESS_LOG_TYPE_URL: &str =
+    "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog";
+const STDERR_ACCESS_LOG_TYPE_URL: &str =
+    "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog";
+const FILE_ACCESS_LOG_TYPE_URL: &str =
+    "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog";
+
+/// The dialect's default text access-log line: Envoy's own default
+/// (`proxy_config::ir::DEFAULT_ACCESS_LOG_FORMAT`) trimmed of the fields that
+/// don't earn their width here (upstream service time, X-Forwarded-For,
+/// User-Agent), plus the LLM token/TTFT operators — token accounting is the
+/// product this proxy exists for, so the dialect's default line carries it.
+const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
+    "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" ",
+    "%RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% ",
+    "\"%REQ(X-REQUEST-ID)%\" \"%UPSTREAM_HOST%\" ",
+    "llm_tokens=\"%LLM_INPUT_TOKENS%/%LLM_CACHED_TOKENS%/%LLM_CACHE_CREATION_TOKENS%/",
+    "%LLM_OUTPUT_TOKENS%/%LLM_TOTAL_TOKENS%\" llm_ttft_ms=\"%LLM_TTFT%\"\n",
+);
 
 /// The header Anthropic requires on every Messages API request.
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
@@ -113,18 +132,17 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         ));
     }
 
-    let listener = lower_listener(config, routes, &mut warnings)?;
+    let access_log = config
+        .observability
+        .as_ref()
+        .and_then(|o| o.access_logs.as_ref())
+        .map(lower_access_log);
+    let listener = lower_listener(config, routes, access_log, &mut warnings)?;
 
     for (i, _) in config.limits.iter().enumerate() {
         warnings.push(warning(
             format!("limits[{i}]"),
             "limits are recorded but not enforced yet (token limiter WP-34, session limits WP-37)",
-        ));
-    }
-    if config.observability.is_some() {
-        warnings.push(warning(
-            "observability",
-            "access logging is recorded but not emitted yet (WP-24)",
         ));
     }
 
@@ -423,11 +441,66 @@ fn lower_route(
     Ok(route)
 }
 
+// ------------------------------------------------------------- access logs --
+
+/// `observability.access_logs` -> a single `envoy.config.accesslog.v3.AccessLog`
+/// entry, sink-selected by `output` (`stdout`/`stderr`/a file path).
+fn lower_access_log(access_logs: &AccessLogs) -> Value {
+    // Rust note: `log_format` is a `SubstitutionFormatString` `Value`, built
+    // once here and reused by whichever sink below embeds it — the three
+    // sinks differ only in `name`/`@type` (and the file sink's extra `path`).
+    let log_format = match access_logs.format {
+        LogFormat::Text => json!({ "text_format": ACCESS_LOG_TEXT_FORMAT }),
+        LogFormat::Json => json!({
+            "json_format": {
+                "start_time": "%START_TIME%",
+                "method": "%REQ(:METHOD)%",
+                "path": "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%",
+                "protocol": "%PROTOCOL%",
+                "response_code": "%RESPONSE_CODE%",
+                "response_flags": "%RESPONSE_FLAGS%",
+                "bytes_received": "%BYTES_RECEIVED%",
+                "bytes_sent": "%BYTES_SENT%",
+                "duration_ms": "%DURATION%",
+                "request_id": "%REQ(X-REQUEST-ID)%",
+                "authority": "%REQ(:AUTHORITY)%",
+                "upstream_host": "%UPSTREAM_HOST%",
+                "llm_input_tokens": "%LLM_INPUT_TOKENS%",
+                "llm_cached_tokens": "%LLM_CACHED_TOKENS%",
+                "llm_cache_creation_tokens": "%LLM_CACHE_CREATION_TOKENS%",
+                "llm_output_tokens": "%LLM_OUTPUT_TOKENS%",
+                "llm_total_tokens": "%LLM_TOTAL_TOKENS%",
+                "llm_ttft_ms": "%LLM_TTFT%",
+            }
+        }),
+    };
+
+    match access_logs.output.as_str() {
+        "stdout" => json!({
+            "name": "envoy.access_loggers.stdout",
+            "typed_config": { "@type": STDOUT_ACCESS_LOG_TYPE_URL, "log_format": log_format },
+        }),
+        "stderr" => json!({
+            "name": "envoy.access_loggers.stderr",
+            "typed_config": { "@type": STDERR_ACCESS_LOG_TYPE_URL, "log_format": log_format },
+        }),
+        path => json!({
+            "name": "envoy.access_loggers.file",
+            "typed_config": {
+                "@type": FILE_ACCESS_LOG_TYPE_URL,
+                "path": path,
+                "log_format": log_format,
+            },
+        }),
+    }
+}
+
 // ----------------------------------------------------------------- listener --
 
 fn lower_listener(
     config: &SimpleConfig,
     routes: Vec<Value>,
+    access_log: Option<Value>,
     _warnings: &mut [ConfigWarning],
 ) -> Result<Value, ConfigError> {
     let (address, tls) = match &config.listen {
@@ -439,7 +512,7 @@ fn lower_listener(
         ),
     };
 
-    let hcm = json!({
+    let mut hcm = json!({
         "name": "envoy.filters.network.http_connection_manager",
         "typed_config": {
             "@type": HCM_TYPE_URL,
@@ -458,6 +531,9 @@ fn lower_listener(
             } ]
         }
     });
+    if let Some(access_log) = access_log {
+        hcm["typed_config"]["access_log"] = json!([access_log]);
+    }
 
     let mut filter_chain = json!({ "filters": [hcm] });
     if let Some(tls) = tls {

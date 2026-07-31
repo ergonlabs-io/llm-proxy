@@ -524,3 +524,166 @@ fn sample_config_helper_is_self_contained() {
     let config = proxy_simple_config::sample_config();
     lower_to_loaded(&config).expect("sample_config() output must lower and validate");
 }
+
+// ------------------------------------------------------------- access logs --
+
+/// Pull the HCM's `typed_config` out of a lowered bootstrap, the same path
+/// every other test in this file already indexes into.
+fn hcm_typed_config(bootstrap: &serde_json::Value) -> &serde_json::Value {
+    &bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]["typed_config"]
+}
+
+#[test]
+fn access_logs_stdout_json_lands_on_the_hcm() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  access_logs: { output: stdout, format: json }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let typed_config = hcm_typed_config(&lowered.bootstrap);
+    let entry = &typed_config["access_log"][0];
+    assert_eq!(
+        entry["typed_config"]["@type"],
+        "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog"
+    );
+    assert_eq!(
+        entry["typed_config"]["log_format"]["json_format"]["llm_total_tokens"],
+        "%LLM_TOTAL_TOKENS%"
+    );
+}
+
+#[test]
+fn access_logs_file_text_lands_on_the_hcm() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  access_logs: { output: /tmp/x.log, format: text }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let typed_config = hcm_typed_config(&lowered.bootstrap);
+    let entry = &typed_config["access_log"][0];
+    assert_eq!(
+        entry["typed_config"]["@type"],
+        "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"
+    );
+    assert_eq!(entry["typed_config"]["path"], "/tmp/x.log");
+    let text_format = entry["typed_config"]["log_format"]["text_format"]
+        .as_str()
+        .expect("text_format must be a string");
+    assert!(
+        text_format.contains("%LLM_TOTAL_TOKENS%"),
+        "got: {text_format}"
+    );
+}
+
+#[test]
+fn access_logs_stderr_selects_the_stderr_sink() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  access_logs: { output: stderr, format: text }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let typed_config = hcm_typed_config(&lowered.bootstrap);
+    let entry = &typed_config["access_log"][0];
+    assert_eq!(
+        entry["typed_config"]["@type"],
+        "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog"
+    );
+}
+
+/// No `observability` at all: no `access_log` key on the HCM (not even an
+/// empty array), and no warning naming the `observability` field path — the
+/// stale WP-24 warning this task removes must actually be gone.
+#[test]
+fn no_observability_emits_no_access_log() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let typed_config = hcm_typed_config(&lowered.bootstrap);
+    assert!(
+        typed_config.get("access_log").is_none(),
+        "no observability configured must mean no access_log key at all, got {typed_config:?}"
+    );
+    assert!(
+        !lowered
+            .warnings
+            .iter()
+            .any(|w| w.field_path.starts_with("observability")),
+        "no observability warning expected, got {:?}",
+        lowered.warnings
+    );
+}
+
+/// The load-bearing check: the emitted `access_log` JSON must not merely be
+/// well-shaped, it must actually be *accepted* by the real strict-mode
+/// `proxy-config` loader and build IR with exactly one access log entry —
+/// for both supported log formats.
+#[test]
+fn generated_access_log_config_is_accepted_by_the_envoy_loader() {
+    for format in ["json", "text"] {
+        let config = parse(&format!(
+            r#"
+version: 0
+providers:
+  openai: {{ api_key: ${{OPENAI_API_KEY}} }}
+routes:
+  - {{ model: "*", provider: openai }}
+observability:
+  access_logs: {{ output: stdout, format: {format} }}
+"#,
+        ))
+        .expect("must parse");
+        let loaded = lower_to_loaded(&config)
+            .unwrap_or_else(|e| panic!("format {format} must lower and validate: {e}"));
+        let snapshot = proxy_config::build_snapshot(&loaded)
+            .unwrap_or_else(|e| panic!("format {format} must build IR: {e}"));
+
+        let listener = snapshot
+            .listeners
+            .values()
+            .next()
+            .expect("must have exactly one listener");
+        let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+            &listener.filter_chains[0].filters[0]
+        else {
+            panic!("expected an HTTP connection manager filter for format {format}");
+        };
+        assert_eq!(
+            hcm.access_logs.len(),
+            1,
+            "expected exactly one access log for format {format}, got {:?}",
+            hcm.access_logs
+        );
+    }
+}
