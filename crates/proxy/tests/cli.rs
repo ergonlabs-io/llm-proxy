@@ -60,8 +60,11 @@ fn validate_exits_nonzero_for_a_bad_config() {
 /// child process is still writing to that pipe closes the read end out from
 /// under it, and the next write earns the child an `EPIPE`. Keeping the
 /// channel (and thus the pipe) open for the process's whole lifetime avoids
-/// that race, which is why callers hang on to the `Receiver` past the first
-/// `wait_for_line` call below.
+/// that race, which is why callers hang on to the `Receiver` for the child's
+/// whole lifetime. Note that no test *gates* on these lines -- they are
+/// captured purely so a failure message can show what the child printed
+/// before it gave up (see `drain_available_lines`); readiness is always a
+/// real TCP connect via `wait_for_connectable`.
 fn spawn_line_reader(
     mut reader: BufReader<impl std::io::Read + Send + 'static>,
 ) -> mpsc::Receiver<String> {
@@ -94,30 +97,17 @@ fn spawn_line_reader(
 /// the process never binds, it just doesn't fail because the box was busy.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Waits (with a timeout) for a line matching `needle` to arrive on `rx`,
-/// returning `true` if found. Non-matching lines are discarded.
-fn wait_for_line(rx: &mpsc::Receiver<String>, needle: &str, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains(needle) => return true,
-            Ok(_) => continue,
-            Err(_) => return false,
-        }
-    }
-}
-
 /// Polls `addr` until a TCP connection succeeds or `timeout` elapses,
 /// returning whether it connected.
 ///
-/// Rust note: unlike `wait_for_line`, this doesn't depend on the child's
-/// stderr at all -- it asks the OS directly whether the listener is actually
-/// accepting connections, which is the real readiness condition we need (see
-/// the doc comment at its call site in `sigterm_drains_then_exits_cleanly`).
+/// This is the *only* readiness primitive these tests have, deliberately.
+/// There used to be a `wait_for_line(rx, "listener bound", ..)` helper
+/// alongside it, and both tests that used it flaked: a log line is emitted
+/// *around* the bind rather than *by* it, so it can be observed before the
+/// socket accepts (and, for SIGTERM, before the signal handler is installed).
+/// Asking the OS directly whether the listener is accepting connections is
+/// the real readiness condition, so the log-line helper was removed rather
+/// than left around to be reached for again.
 fn wait_for_connectable(addr: (&str, u16), timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -271,12 +261,24 @@ static_resources:
 
     let stderr = child.stderr.take().expect("child stderr not piped");
     let rx = spawn_line_reader(BufReader::new(stderr));
-    let found = wait_for_line(&rx, "listener bound", STARTUP_TIMEOUT);
+    // Readiness is a real TCP connect, not the "listener bound" log line, for
+    // the same reason `sigterm_drains_then_exits_cleanly` polls the port: a
+    // log line is emitted *around* the bind, not *by* it, so gating on the
+    // line can hand back control before the socket is actually accepting --
+    // and this test then does the one thing that requires it to be. Observed
+    // flaking under parallel test load on 2026-07-31.
+    let ready = wait_for_connectable(("127.0.0.1", port), STARTUP_TIMEOUT);
     assert!(
-        found,
-        "listener-bound line did not appear on stderr in time"
+        ready,
+        "listener at 127.0.0.1:{port} did not become connectable in time \
+         (stderr so far: {:?})",
+        drain_available_lines(&rx)
     );
 
+    // A second, fresh connection: `wait_for_connectable` proves the port
+    // accepts at least once, this proves the listener keeps accepting and
+    // that an accepted connection is actually writable rather than being
+    // immediately reset.
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .expect("connecting to the running listener should succeed");
     // A successful write proves the connection is actually live, not just
