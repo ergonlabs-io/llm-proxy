@@ -8,7 +8,7 @@ can be reviewed alongside the tests that cite its case IDs.
 
 | Case | Property | State |
 |------|----------|-------|
-| QA-1 | Per-route token counts, both providers, one config | implemented — **skipped, blocked** (see below) |
+| QA-1 | Per-route token counts, both providers, one config | implemented — **partially passing**, token half skipped (see below) |
 | QA-2 | Bad config fails loudly with the field path, exits nonzero | passing |
 | QA-3 | Streamed response arrives incrementally | passing |
 | QA-4 | Credentials reach upstream, never reach the log | approved |
@@ -21,27 +21,55 @@ can be reviewed alongside the tests that cite its case IDs.
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
 `approved`.
 
-### QA-1 is blocked by two independent gaps — both found by this suite
+### QA-1 found two independent gaps — one now fixed, one outstanding
 
 On its very first run, QA-1 established that both providers receive exactly one
 request each (routing and provider dispatch work end to end), and then **the
-configured access-log file is never created at all**. Two separate things have
-to land before it can pass:
+configured access-log file was never created at all**. Two separate things were
+in the way:
 
-1. **The `llmproxy` dialect never wires `observability.access_logs` into the
-   generated Envoy config.** `crates/proxy-simple-config/src/lower.rs` (~line
-   124) emits only a warning — *"access logging is recorded but not emitted yet
-   (WP-24)"* — and never adds an `access_log` entry to the HCM. That warning is
-   **stale**: WP-24 landed, and access logging works fully in Envoy mode. The
-   dialect wiring was simply never done, so a proxy configured the way users
-   actually configure it produces **no access logs whatsoever**.
-2. **WP-33**: the usage filter isn't in the dialect's generated `http_filters`,
-   so even with a log destination there would be no token counts to write. See
-   `docs/wp-33-design-brief.md`.
+1. ~~**The `llmproxy` dialect never wires `observability.access_logs` into the
+   generated Envoy config.**~~ **FIXED** — commit *"Emit access logs from the
+   llmproxy dialect"*. `crates/proxy-simple-config/src/lower.rs` used to emit
+   only a warning (*"access logging is recorded but not emitted yet (WP-24)"*)
+   and never add an `access_log` entry to the HCM. That warning was **stale**:
+   WP-24 had landed and access logging worked fully in Envoy mode; only the
+   dialect lowering was missing, so a proxy configured the way users actually
+   configure it produced **no access logs whatsoever**.
+2. **WP-33 — still outstanding.** The usage filter isn't in the dialect's
+   generated `http_filters`, so every `%LLM_*_TOKENS%` operator renders as the
+   absent-value `-`. See `docs/wp-33-design-brief.md`.
 
 Gap 1 was not anticipated by the code review that produced the WP-33 brief —
 an independently written black-box test found it from the outside. That is the
 argument for this suite existing, and it arrived on day one.
+
+**QA-1's current shape.** Rather than being all-or-nothing on the token counts,
+it now asserts everything that does not depend on WP-33 — two log lines, one
+per route, correct `path`, `response_code` 200, `bytes_sent` > 0 — and degrades
+to a loud `t.Skip` naming WP-33 only for the token assertions. The access-log
+file failing to appear is now a hard failure, since that is a regression of the
+fix above. It tightens automatically as WP-33 lands.
+
+A note for anyone writing assertions against a `json_format` line: **every
+value is a JSON string**, including numeric ones (`"response_code":"200"`), and
+an absent value is the literal `"-"`. Envoy's `json_format` values are
+command-operator format strings, so this matches it. Parse, don't type-assert.
+
+### Open finding: `%REQ(:METHOD)%` and `%REQ(:AUTHORITY)%` always render `-`
+
+Visible in QA-1's captured lines (`method:-`, `authority:-`) but not yet
+covered by an approved case. `header_lookup` in
+`crates/proxy-observability/src/access_log.rs` resolves a `%REQ(x)%` operator
+against an `http::HeaderMap`, and `http::HeaderName` cannot hold a leading
+colon — so no pseudo-header name can ever match, and all of them render `-`.
+Only `:PATH` works, via a targeted workaround in
+`crates/proxy-http/src/access_logging.rs` that injects `x-envoy-original-path`
+into the logged snapshot.
+
+This matters beyond the dialect: **Envoy's own default access-log format uses
+`%REQ(:METHOD)%`**, so every access log this proxy writes in Envoy mode is
+missing the request method too. Proposed as QA-10, pending owner approval.
 
 ## Maintaining this document
 

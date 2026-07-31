@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -117,28 +118,18 @@ observability:
 		t.Fatalf("QA-1: expected 1 request at the anthropic mock, got %d\n--- proxy log ---\n%s", got, proxy.Log())
 	}
 
-	// REAL FINDING (not a WP-33 usage-filter gap alone): the `llmproxy`
-	// dialect does not wire observability.access_logs into the generated
-	// Envoy config at all yet. crates/proxy-simple-config/src/lower.rs only
-	// emits a warning — "access logging is recorded but not emitted yet
-	// (WP-24)" — and never adds an `access_log` entry to the HCM, regardless
-	// of what `observability.access_logs` says. Confirmed empirically: with
-	// this exact config, the proxy answers the request with 200 and the
-	// upstream mock is hit, but `logPath` is never created. That is a
-	// precondition this case depends on beyond WP-33 (the usage filter not
-	// being in the http_filters chain) — even a wired usage filter would
-	// have nowhere to log to today.
-	if !harness.WaitForFile(logPath, 2*time.Second) {
-		t.Skipf(
-			"QA-1: SKIP — access log file %s was never created. The `llmproxy` "+
-				"dialect does not wire observability.access_logs into the generated "+
-				"Envoy config yet (crates/proxy-simple-config/src/lower.rs emits only "+
-				"a WP-24 warning, never an access_log entry on the HCM), independent of "+
-				"WP-33 (the usage filter's absence from http_filters). Both requests DID "+
-				"complete successfully end-to-end against their respective mocks "+
-				"(openai requests=%d, anthropic requests=%d) — routing and provider "+
-				"dispatch are not in question here, only log emission.",
-			logPath, len(openaiMock.Requests()), len(anthropicMock.Requests()),
+	// The dialect now wires observability.access_logs onto the HCM (this
+	// suite's first finding, fixed in "Emit access logs from the llmproxy
+	// dialect"), so the log file must actually appear. This is no longer a
+	// skip condition — a missing file here is a regression of that fix.
+	if !harness.WaitForFile(logPath, 5*time.Second) {
+		t.Fatalf(
+			"QA-1: access log file %s was never created, but the dialect is "+
+				"supposed to wire observability.access_logs onto the HCM. Both "+
+				"requests reached their mocks (openai=%d, anthropic=%d), so this "+
+				"is a log-emission regression, not a routing failure.\n"+
+				"--- proxy log ---\n%s",
+			logPath, len(openaiMock.Requests()), len(anthropicMock.Requests()), proxy.Log(),
 		)
 	}
 
@@ -147,38 +138,96 @@ observability:
 		t.Fatalf("QA-1: expected at least 2 access-log lines, got %d: %v", len(lines), lines)
 	}
 
-	findLineForModel := func(model string) map[string]any {
+	// Correlate by request path, not by model: the dialect's JSON log format
+	// has no model field yet. Emitting one is part of WP-33 (the usage filter
+	// is what knows the model), so until that lands, path is the only
+	// per-route discriminator in the line — and it is a real one, since the
+	// two routes target different providers on different paths.
+	findLineForPath := func(path string) map[string]any {
 		for _, l := range lines {
-			// Field name is whatever the JSON access-log formatter emits for
-			// the model; try the plausible candidates rather than assuming
-			// one, since this path is exactly the WP-33/WP-24 territory that
-			// hasn't shipped yet.
-			for _, key := range []string{"model", "llm_model", "request_model"} {
-				if v, ok := l[key]; ok {
-					if s, ok := v.(string); ok && s == model {
-						return l
-					}
-				}
+			if s, ok := l["path"].(string); ok && s == path {
+				return l
 			}
 		}
 		return nil
 	}
 
-	assertTokens := func(model string, wantInput, wantOutput int) {
-		line := findLineForModel(model)
-		if line == nil {
-			t.Fatalf("QA-1: no access-log line found for model %s among: %v", model, lines)
+	// Every value in a json_format line is a JSON *string*: Envoy's
+	// json_format values are command-operator format strings, so a numeric
+	// operator like %RESPONSE_CODE% still renders as "200", and an absent
+	// value renders as the literal "-". Parse accordingly rather than type-
+	// asserting to float64 — ok is false for "-" (and for anything
+	// non-numeric), which is exactly the "not populated" signal below.
+	numField := func(line map[string]any, key string) (int, bool) {
+		s, ok := line[key].(string)
+		if !ok {
+			return 0, false
 		}
-		gotInput, _ := line["llm_input_tokens"].(float64)
-		gotOutput, _ := line["llm_output_tokens"].(float64)
-		if int(gotInput) != wantInput || int(gotOutput) != wantOutput {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+
+	// The parts that do not depend on WP-33 are asserted unconditionally, so
+	// this case guards routing and log emission today rather than being
+	// all-or-nothing on the token counts.
+	type route struct {
+		path                  string
+		model                 string
+		wantInput, wantOutput int
+	}
+	routes := []route{
+		{"/v1/chat/completions", "gpt-5", 111, 222},
+		{"/v1/messages", "claude-sonnet-5", 444, 555},
+	}
+
+	var missingTokens []string
+	for _, r := range routes {
+		line := findLineForPath(r.path)
+		if line == nil {
+			t.Fatalf("QA-1: no access-log line found for path %s among: %v", r.path, lines)
+		}
+		if code, ok := numField(line, "response_code"); !ok || code != http.StatusOK {
+			t.Errorf("QA-1: %s: want response_code 200, got %v (line: %v)", r.path, line["response_code"], line)
+		}
+		if sent, ok := numField(line, "bytes_sent"); !ok || sent <= 0 {
+			t.Errorf("QA-1: %s: want bytes_sent > 0, got %v (line: %v)", r.path, line["bytes_sent"], line)
+		}
+
+		// WP-33 gap: with no usage filter in the dialect's generated
+		// http_filters, nothing populates the token buckets, so the formatter
+		// renders every %LLM_*_TOKENS% operator as the absent-value "-".
+		// Collect rather than assert, so the token half degrades to a loud
+		// skip while everything above still runs.
+		gotInput, haveInput := numField(line, "llm_input_tokens")
+		gotOutput, haveOutput := numField(line, "llm_output_tokens")
+		if !haveInput || !haveOutput {
+			missingTokens = append(missingTokens, fmt.Sprintf(
+				"%s (in=%v out=%v total=%v)",
+				r.path, line["llm_input_tokens"], line["llm_output_tokens"], line["llm_total_tokens"],
+			))
+			continue
+		}
+
+		if gotInput != r.wantInput || gotOutput != r.wantOutput {
 			t.Errorf(
-				"QA-1: model %s: want input=%d output=%d, got input=%v output=%v (line: %v)",
-				model, wantInput, wantOutput, line["llm_input_tokens"], line["llm_output_tokens"], line,
+				"QA-1: %s (model %s): want input=%d output=%d, got input=%v output=%v (line: %v)",
+				r.path, r.model, r.wantInput, r.wantOutput,
+				line["llm_input_tokens"], line["llm_output_tokens"], line,
 			)
 		}
 	}
 
-	assertTokens("gpt-5", 111, 222)
-	assertTokens("claude-sonnet-5", 444, 555)
+	if len(missingTokens) > 0 {
+		t.Skipf(
+			"QA-1: SKIP (token half only) — access logs are emitted and both routes "+
+				"logged correctly, but every %%LLM_*_TOKENS%% operator rendered as \"-\": %v. "+
+				"WP-33 has not wired the usage filter into the `llmproxy` dialect's generated "+
+				"http_filters, so nothing populates the token buckets. Routing, provider "+
+				"dispatch, log emission, response codes and byte counts all passed above.",
+			missingTokens,
+		)
+	}
 }
