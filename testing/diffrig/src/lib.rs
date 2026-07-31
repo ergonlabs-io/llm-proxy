@@ -7,5 +7,6 @@
 //! HTTP data plane (see `main.rs` and `IMPLEMENTATION_PLAN.md`).
 
 pub mod config_diff;
+pub mod harness;
 pub mod scenario;
 pub mod upstreams;
