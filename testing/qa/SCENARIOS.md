@@ -11,7 +11,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-1 | Per-route token counts, both providers, one config | implemented — **partially passing**, token half skipped (see below) |
 | QA-2 | Bad config fails loudly with the field path, exits nonzero | passing |
 | QA-3 | Streamed response arrives incrementally | passing |
-| QA-4 | Credentials reach upstream, never reach the log | approved |
+| QA-4 | Credentials reach upstream, never reach the log | passing |
 | QA-5 | Non-streaming responses log real bytes and tokens | approved |
 | QA-6 | Upstream dying mid-stream errors, and is not retried | approved |
 | QA-7 | SIGTERM during an active stream drains to completion | approved |
@@ -56,20 +56,31 @@ value is a JSON string**, including numeric ones (`"response_code":"200"`), and
 an absent value is the literal `"-"`. Envoy's `json_format` values are
 command-operator format strings, so this matches it. Parse, don't type-assert.
 
-### Open finding: `%REQ(:METHOD)%` and `%REQ(:AUTHORITY)%` always render `-`
+### Third finding, now fixed: pseudo-header operators always rendered `-`
 
-Visible in QA-1's captured lines (`method:-`, `authority:-`) but not yet
-covered by an approved case. `header_lookup` in
-`crates/proxy-observability/src/access_log.rs` resolves a `%REQ(x)%` operator
-against an `http::HeaderMap`, and `http::HeaderName` cannot hold a leading
-colon — so no pseudo-header name can ever match, and all of them render `-`.
-Only `:PATH` works, via a targeted workaround in
-`crates/proxy-http/src/access_logging.rs` that injects `x-envoy-original-path`
-into the logged snapshot.
+Visible in QA-1's captured lines as `method:-` and `authority:-`.
+`header_lookup` resolved a `%REQ(x)%` operator against an `http::HeaderMap`,
+and `http::HeaderName` cannot hold a leading colon — so no pseudo-header name
+could ever match. Only `:PATH` appeared to work, via a workaround that
+injected `x-envoy-original-path` into the logged snapshot.
 
-This matters beyond the dialect: **Envoy's own default access-log format uses
-`%REQ(:METHOD)%`**, so every access log this proxy writes in Envoy mode is
-missing the request method too. Proposed as QA-10, pending owner approval.
+This mattered well beyond the dialect: **Envoy's own default access-log format
+uses `%REQ(:METHOD)%`**, so every access log the proxy wrote in Envoy mode was
+missing the request method too. Fixed in *"Resolve Envoy pseudo-headers in
+access-log REQ/RESP operators"* — `LogContext` now carries the pseudo-headers
+as typed fields, `%RESP(:STATUS)%` works, and the unfaithful
+`x-envoy-original-path` injection is gone.
+
+Worth noting how this one hid: `header_lookup`'s own doc comment *described*
+the behavior as intended ("those simply never match today"), so two passes of
+code review read it as a known limitation rather than a live defect. The
+black-box test had no such prior and just saw a missing method.
+
+**Still open:** `:scheme` renders `-` for origin-form HTTP/1 requests, because
+it is derived from the request URI alone. Deriving it from the listener's TLS
+state needs downstream connection info that is not threaded that far yet.
+Deliberate and documented, not silently wrong — a candidate case if the owner
+wants it covered.
 
 ## Maintaining this document
 
