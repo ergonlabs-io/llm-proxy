@@ -687,3 +687,173 @@ observability:
         );
     }
 }
+
+// ------------------------------------------------------- WP-33: usage filter --
+
+/// `lower.rs` duplicates the usage filter's type URL as a literal instead of
+/// importing it, to keep the data plane out of a config crate's production
+/// dependency tree. That trade is only safe if something pins the two
+/// together — this is that something.
+#[test]
+fn usage_filter_type_url_matches_the_filter() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let filters = &lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["http_filters"];
+
+    assert_eq!(
+        filters[0]["typed_config"]["@type"],
+        proxy_filters::usage_filter::TYPE_URL,
+        "the dialect emits a type URL no registered filter factory answers to; \
+         this would be a bind-time error on every listener"
+    );
+    assert_eq!(
+        filters[0]["typed_config"]["@type"],
+        lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
+            ["typed_config"]["route_config"]["virtual_hosts"][0]["routes"][0]
+            ["typed_per_filter_config"]["llmproxy.usage"]["@type"],
+        "the per-route override must carry the same type URL as the chain entry"
+    );
+}
+
+/// WP-33 criteria 4 and 5: the usage filter is in the chain ahead of the
+/// router, and each route's override names its OWN provider's dialect. A
+/// listener-level dialect cannot express this — it is the whole reason the
+/// override exists.
+#[test]
+fn usage_filter_sits_before_the_router_with_per_route_dialects() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "gpt-*", provider: openai }
+  - { model: "claude-*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let hcm = &lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"]
+        [0]["typed_config"];
+
+    // Criterion 4: order matters. The router is terminal — a filter after it
+    // is never reached on the encode path.
+    let names: Vec<&str> = hcm["http_filters"]
+        .as_array()
+        .expect("http_filters must be an array")
+        .iter()
+        .map(|f| f["name"].as_str().expect("filter name must be a string"))
+        .collect();
+    assert_eq!(names, ["llmproxy.usage", "envoy.filters.http.router"]);
+
+    // Criterion 5: the dialect follows the route, not the listener.
+    let routes = &hcm["route_config"]["virtual_hosts"][0]["routes"];
+    let dialect =
+        |i: usize| routes[i]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"].clone();
+    assert_eq!(dialect(0), "openai");
+    assert_eq!(dialect(1), "anthropic");
+}
+
+/// WP-33 criterion 6: an `openai-compatible` upstream (a `base_url`-only
+/// provider, e.g. vLLM/Ollama/TGI) speaks OpenAI's response shape, so it gets
+/// the OpenAI dialect — the same `_ =>` fallback `auth_header` uses.
+#[test]
+fn openai_compatible_provider_gets_the_openai_dialect() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  local-vllm: { base_url: "http://127.0.0.1:8000" }
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "local-*", provider: local-vllm }
+  - { model: "claude-*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = &lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"];
+
+    assert_eq!(
+        routes[0]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        "openai"
+    );
+    assert_eq!(
+        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        "anthropic"
+    );
+}
+
+/// The JSON assertions above only prove the dialect *emits* the override.
+/// This proves it survives the full Envoy-mode pipeline — strict parse, PGV,
+/// and IR build — and lands on the route the data plane actually reads, with
+/// the filter present in the chain (an override naming an absent filter is a
+/// hard load error, so this also proves the two names agree).
+#[test]
+fn per_route_dialect_survives_into_the_ir() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "gpt-*", provider: openai }
+  - { model: "claude-*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    let listener = snapshot
+        .listeners
+        .values()
+        .next()
+        .expect("exactly one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+    assert_eq!(hcm.http_filters[0].name, "llmproxy.usage");
+
+    let routes = &hcm.route_table.virtual_hosts[0].routes;
+    for (i, want) in [(0, "openai"), (1, "anthropic")] {
+        let per_filter = routes[i]
+            .typed_per_filter_config
+            .get("llmproxy.usage")
+            .unwrap_or_else(|| panic!("route {i} must carry a usage override"));
+        assert_eq!(per_filter.type_url, proxy_filters::usage_filter::TYPE_URL);
+        assert!(
+            !per_filter.disabled,
+            "route {i} must not disable the filter"
+        );
+
+        // The IR leaves the config undecoded (ground rule #2), so read the
+        // dialect back the way the filter's own `parse_per_route` does.
+        let msg = per_filter
+            .config
+            .as_ref()
+            .unwrap_or_else(|| panic!("route {i} override must carry a config"));
+        let got = msg
+            .get_field_by_name("inline_string")
+            .expect("DataSource.inline_string")
+            .as_str()
+            .expect("inline_string must be a string")
+            .to_string();
+        assert_eq!(got, want, "route {i}");
+    }
+}

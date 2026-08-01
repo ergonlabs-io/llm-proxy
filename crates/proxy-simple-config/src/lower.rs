@@ -30,6 +30,22 @@ pub const MODEL_HEADER: &str = "x-llmproxy-model";
 
 const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
 const ROUTER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router";
+
+/// The usage/token filter's name in `http_filters`. This exact string is also
+/// the key every route's `typed_per_filter_config` override is matched
+/// against — if the two ever drift apart the config fails to load, because an
+/// override naming a filter absent from the chain is a hard error.
+const USAGE_FILTER_NAME: &str = "llmproxy.usage";
+
+/// Must equal `proxy_filters::usage_filter::TYPE_URL`. Duplicated rather than
+/// imported: this is a config crate, and depending on `proxy-filters` would
+/// drag the whole data plane (and `proxy-http`) into the dependency tree of
+/// something that only ever emits JSON — the same reason `ROUTER_TYPE_URL`
+/// above is a literal. `dialect.rs`'s `usage_filter_type_url_matches_the_filter`
+/// pins the two together via a dev-dependency, and a drift that slipped past
+/// it would still be a loud bind-time error ("no registered factory for
+/// type_url"), never a silent skip.
+const USAGE_FILTER_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
 const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const DOWNSTREAM_TLS_TYPE_URL: &str =
@@ -321,6 +337,24 @@ fn auth_header(
     }))
 }
 
+/// The token-extraction dialect this provider's responses speak.
+///
+/// Anthropic has its own response and SSE shape; everything else — OpenAI
+/// itself and the openai-compatible upstreams (vLLM, Ollama, TGI) — speaks
+/// OpenAI's. That is the same `_ =>` fallback [`auth_header`] uses, for the
+/// same reason: "openai-compatible" is a statement about the wire format.
+///
+/// Getting this wrong is worse than leaving it unset. The Anthropic scanner
+/// fed OpenAI SSE simply finds nothing and reports `None`, but the OpenAI
+/// parser on an Anthropic body can *partially* match — which would bill a
+/// customer against a number nobody computed correctly.
+fn usage_dialect(name: &str, provider: &Provider) -> &'static str {
+    match provider.effective_type(name) {
+        ProviderType::Anthropic => "anthropic",
+        _ => "openai",
+    }
+}
+
 // -------------------------------------------------------------------- routes --
 
 /// Model glob -> Envoy header matcher on [`MODEL_HEADER`]. `*` alone means
@@ -438,6 +472,20 @@ fn lower_route(
     if !headers_to_add.is_empty() {
         route["request_headers_to_add"] = Value::Array(headers_to_add);
     }
+
+    // Token accounting follows the ROUTE's provider, not the listener's: one
+    // listener serves `gpt-*` from OpenAI and `claude-*` from Anthropic, and a
+    // single listener-level dialect would be wrong for whichever one it isn't.
+    // A bare `Any` is the simpler of the two accepted forms — the
+    // `envoy.config.route.v3.FilterConfig` wrapper only buys `is_optional`,
+    // and this filter is never optional.
+    route["typed_per_filter_config"] = json!({
+        USAGE_FILTER_NAME: {
+            "@type": USAGE_FILTER_TYPE_URL,
+            "inline_string": usage_dialect(provider_name, provider),
+        }
+    });
+
     Ok(route)
 }
 
@@ -512,6 +560,22 @@ fn lower_listener(
         ),
     };
 
+    // The listener-level dialect is a fallback that is, in practice,
+    // unreachable: every route lowered above carries its own
+    // `typed_per_filter_config` override, and a request matching no route gets
+    // the dialect's 404 `direct_response` — so it never produces an upstream
+    // body for the filter to read. It still has to be *something* valid, so it
+    // is the first route's provider rather than a synthetic "unknown" variant
+    // that would widen `Dialect` for no gain.
+    let default_dialect = config
+        .routes
+        .first()
+        .map(|rule| {
+            let name = &rule.provider.provider;
+            usage_dialect(name, &config.providers[name])
+        })
+        .unwrap_or("openai");
+
     let mut hcm = json!({
         "name": "envoy.filters.network.http_connection_manager",
         "typed_config": {
@@ -526,6 +590,15 @@ fn lower_listener(
                 } ]
             },
             "http_filters": [ {
+                // Before the router, so it is in the encode chain (S2.1: encoder
+                // callbacks run in REVERSE config order) and sees response bytes
+                // on their way back out.
+                "name": USAGE_FILTER_NAME,
+                "typed_config": {
+                    "@type": USAGE_FILTER_TYPE_URL,
+                    "inline_string": default_dialect,
+                }
+            }, {
                 "name": "envoy.filters.http.router",
                 "typed_config": { "@type": ROUTER_TYPE_URL }
             } ]
