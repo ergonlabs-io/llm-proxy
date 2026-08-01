@@ -24,7 +24,7 @@ use crate::stream_info::StreamInfo;
 
 /// Request head. Pseudo-header data (`:method`, `:path`, `:authority`) is carried
 /// in the typed fields; `headers` holds regular headers only.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestHeaders {
     pub method: Method,
     pub uri: Uri,
@@ -132,6 +132,49 @@ pub trait DecoderCallbacks {
 
     /// Only legal before any data has been continued past this filter (S2.7).
     fn modify_decoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut));
+
+    /// Mutate request headers that have not yet been forwarded upstream
+    /// (WP-45 increment 2a — the seam a decode filter needs to fix up
+    /// `content-length` after splicing bytes into the body, since that's a
+    /// case `modify_decoding_buffer` alone can't cover).
+    ///
+    /// Applies `f` through a genuine live `&mut RequestHeaders` borrow of the
+    /// real request head — no clone, no splice-back, so it can never
+    /// silently discard a mutation a filter made some other way.
+    ///
+    /// Returns `false` and does nothing if the headers have already been
+    /// sent, so a late caller is a no-op rather than a silent lie. It ALSO
+    /// returns `false` and does nothing when called from **`decode_headers`
+    /// itself** (WP-45 increment 2b): `decode_headers` already hands the
+    /// filter a direct `&mut RequestHeaders` parameter that IS the request
+    /// head, and Rust's aliasing rules mean this callback cannot also hold a
+    /// second live `&mut` to that same value while the filter is still
+    /// holding the first one — there is no clone-free way to give both
+    /// access at once, and a clone-based workaround is exactly what
+    /// reintroduced the increment 2a data-loss bug this increment fixes (see
+    /// `filter_manager::tests::probe_direct_and_seam_mutations_coexist`). A
+    /// filter running in `decode_headers` should mutate its `headers`
+    /// parameter directly instead — it needs no seam there. `decode_data`
+    /// and `decode_trailers` (WP-45's actual case: the decision to splice
+    /// body bytes, and so the need to fix up `content-length`, is only made
+    /// once body bytes have been scanned) have no such parameter and DO get
+    /// the real working borrow.
+    ///
+    /// Mutating routing-relevant headers (`:authority`, `:path`) through this
+    /// does NOT auto-invalidate the S2.8 route cache, same as everywhere
+    /// else a filter can reach the request head — call
+    /// [`Self::clear_route_cache`] afterward if the rewrite should affect
+    /// routing.
+    ///
+    /// Rust note: defaulted to a no-op returning `false` (unlike most of this
+    /// trait, and like [`EncoderCallbacks::per_route_config`]'s default) —
+    /// `DecoderCallbacks` already has test-double implementors outside this
+    /// increment's scope that this change must not force edits onto; the
+    /// real adapter (`filter_manager::DecoderCallbacksAdapter`) overrides
+    /// this with the actual mutation.
+    fn modify_decoded_headers(&mut self, _f: &mut dyn FnMut(&mut RequestHeaders)) -> bool {
+        false
+    }
 
     /// The cached route (S2.8). Resolved lazily on first access: the manager
     /// matches against the LIVE `:authority`/`:path` (as of whichever filter

@@ -949,7 +949,7 @@ fn local_reply_modify_headers_callback_is_applied() {
 fn local_reply_records_response_code_details_and_is_local_reply() {
     let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     {
-        let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+        let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
         cb.send_local_reply(StatusCode::FORBIDDEN, "nope", None, "custom_reason");
     }
     assert!(ctx.stream_info.borrow().is_local_reply);
@@ -966,7 +966,7 @@ fn local_reply_records_response_code_details_and_is_local_reply() {
 fn a_second_local_reply_is_ignored() {
     let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     {
-        let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+        let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
         cb.send_local_reply(StatusCode::FORBIDDEN, "first", None, "first_reason");
         cb.send_local_reply(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1792,7 +1792,7 @@ fn informational_1xx_response_runs_a_separate_encode_callback() {
 fn inject_decoded_data_to_filter_chain_delivers_to_subsequent_filters() {
     let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
     ctx.decode.current_idx = 2;
-    let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+    let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
     cb.inject_decoded_data_to_filter_chain(Bytes::from_static(b"x"), true);
     assert_eq!(
         ctx.decode.injected.len(),
@@ -3454,6 +3454,430 @@ fn a_filter_that_always_reports_pending_work_fails_closed_instead_of_hanging() {
         assert!(
             !log.borrow().contains(&"terminal".to_string()),
             "a runaway filter must never let the request reach the terminal"
+        );
+    });
+}
+
+// --- WP-45 increment 2a: `DecoderCallbacks::modify_decoded_headers` --------
+//
+// The motivating bug: a decode filter that splices bytes into the request
+// body (WP-45's actual body-rewrite work, a separate increment) makes the
+// body longer, so `content-length` must be recomputed before the request
+// reaches the terminal/upstream. These tests pin the SEAM only -- that a
+// filter can reach request headers that have not yet been forwarded, from
+// wherever in the decode chain it decides to, and that the mutation survives
+// all the way to what the terminal (the router stand-in) actually observes.
+
+/// Where a [`HeaderMutatingFilter`] calls `modify_decoded_headers` from.
+#[derive(Clone, Copy)]
+enum HeaderMutationPoint {
+    DecodeHeaders,
+    DecodeData,
+}
+
+/// A decode filter that calls `cb.modify_decoded_headers(mutate)` from
+/// whichever callback `call_from` selects, and records the `bool` the call
+/// returned into `result`.
+struct HeaderMutatingFilter {
+    call_from: HeaderMutationPoint,
+    mutate: Rc<dyn Fn(&mut RequestHeaders)>,
+    result: Rc<RefCell<Option<bool>>>,
+}
+
+impl HttpFilter for HeaderMutatingFilter {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        if matches!(self.call_from, HeaderMutationPoint::DecodeHeaders) {
+            let mutate = self.mutate.clone();
+            let applied = cb.modify_decoded_headers(&mut |h| mutate(h));
+            *self.result.borrow_mut() = Some(applied);
+        }
+        FilterHeadersStatus::Continue
+    }
+
+    fn decode_data(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _data: &mut Bytes,
+        _end_stream: bool,
+    ) -> FilterDataStatus {
+        if matches!(self.call_from, HeaderMutationPoint::DecodeData) {
+            let mutate = self.mutate.clone();
+            let applied = cb.modify_decoded_headers(&mut |h| mutate(h));
+            *self.result.borrow_mut() = Some(applied);
+        }
+        FilterDataStatus::Continue
+    }
+}
+
+/// Run `filters` over `req` with a [`RecordingTerminal`] wired to capture the
+/// request headers it observed, so a test can assert on what the
+/// terminal/upstream actually sees rather than a local copy — mirrors
+/// [`run_chain_req_with_route_table`] but for this increment's need
+/// (`RecordingTerminal::seen_headers`, not a route table).
+async fn run_chain_req_capturing_headers(
+    filters: Vec<Box<dyn HttpFilter>>,
+    log: Log,
+    req: HttpRequestParts,
+) -> (StatusCode, HeaderMap) {
+    let seen_headers = Arc::new(Mutex::new(None));
+    let terminal = RecordingTerminal {
+        log,
+        term_log: None,
+        seen_body: Arc::new(Mutex::new(Bytes::new())),
+        seen_request_id: Arc::new(Mutex::new(None)),
+        seen_headers: Some(seen_headers.clone()),
+        captured_body: Bytes::new(),
+    };
+    let mgr = FilterManager {
+        filters,
+        ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
+        terminal: Box::new(terminal),
+        buffer_limit: DEFAULT_BUFFER_LIMIT,
+    };
+    let resp = mgr.run(req).await;
+    let status = resp.head.status;
+    let _ = resp.body.collect().await;
+    let headers = seen_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("terminal must have run and recorded headers");
+    (status, headers)
+}
+
+/// PROBE (WP-45 increment 2b): a filter mutating BOTH a direct parameter AND
+/// `modify_decoded_headers` in the same callback must keep both mutations.
+///
+/// Increment 2a's version of this probe ran from `decode_headers`, mutating
+/// the `headers` parameter directly AND via the seam in the same call --
+/// that reproduced the data-loss bug this increment fixes (a stale
+/// pre-callback clone spliced back over the direct mutation). Increment 2b's
+/// fix for `decode_headers` specifically is to make the seam a documented
+/// no-op there (see [`DecoderCallbacks::modify_decoded_headers`]'s doc) --
+/// `decode_headers` already has direct `&mut RequestHeaders` access and
+/// Rust's aliasing rules mean the seam genuinely cannot also hold a live
+/// borrow of that same value at the same time. So this probe now runs from
+/// `decode_data`, WP-45's actual load-bearing case: it directly mutates its
+/// own `data: &mut Bytes` parameter (the one direct-mutation path
+/// `decode_data` has) AND calls `modify_decoded_headers` (now a real,
+/// clone-free borrow of the head -- see the trait doc) in the same
+/// callback. Both must reach the terminal; neither may clobber the other.
+struct BothPathsFilter;
+
+impl HttpFilter for BothPathsFilter {
+    fn decode_data(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        data: &mut Bytes,
+        _end_stream: bool,
+    ) -> FilterDataStatus {
+        *data = Bytes::from_static(b"direct-body");
+        cb.modify_decoded_headers(&mut |h| {
+            h.headers.insert(
+                HeaderName::from_static("x-via-seam"),
+                HeaderValue::from_static("seam"),
+            );
+        });
+        FilterDataStatus::Continue
+    }
+}
+
+#[test]
+fn probe_direct_and_seam_mutations_coexist() {
+    block_on(async {
+        let terminal = RecordingTerminal {
+            log: log_of(),
+            term_log: None,
+            seen_body: Arc::new(Mutex::new(Bytes::new())),
+            seen_request_id: Arc::new(Mutex::new(None)),
+            seen_headers: Some(Arc::new(Mutex::new(None))),
+            captured_body: Bytes::new(),
+        };
+        let seen_body = terminal.seen_body.clone();
+        let seen_headers = terminal.seen_headers.clone().unwrap();
+        let mgr = FilterManager {
+            filters: vec![Box::new(BothPathsFilter)],
+            ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
+            terminal: Box::new(terminal),
+            buffer_limit: DEFAULT_BUFFER_LIMIT,
+        };
+        let resp = mgr.run(request(b"hi")).await;
+        let _ = resp.body.collect().await;
+
+        let seen = seen_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("terminal must have run and recorded headers");
+        assert_eq!(
+            seen.get("x-via-seam").map(|v| v.to_str().unwrap()),
+            Some("seam"),
+            "seam mutation lost"
+        );
+        assert_eq!(
+            *seen_body.lock().unwrap(),
+            Bytes::from_static(b"direct-body"),
+            "DIRECT PARAMETER MUTATION WAS CLOBBERED"
+        );
+    });
+}
+
+/// WP-45 increment 2b fallback: `modify_decoded_headers` called from
+/// `decode_headers` itself is a documented no-op (`false`, no mutation) --
+/// see [`DecoderCallbacks::modify_decoded_headers`]'s doc for why. A
+/// `decode_headers` filter already has direct `&mut RequestHeaders` access
+/// through its own parameter; giving the seam a second live borrow of that
+/// same value at the same time is impossible in safe Rust, and the
+/// clone-based workaround increment 2a used is exactly what caused the
+/// data-loss bug `probe_direct_and_seam_mutations_coexist` guards. (Before
+/// this increment, this test asserted the opposite -- that the seam DID
+/// reach the terminal from `decode_headers` -- which is what the clone/
+/// splice-back mechanism enabled at the cost of that bug.)
+#[test]
+fn modify_decoded_headers_from_decode_headers_is_a_documented_no_op() {
+    block_on(async {
+        let log = log_of();
+        let result = Rc::new(RefCell::new(None));
+        let filter = HeaderMutatingFilter {
+            call_from: HeaderMutationPoint::DecodeHeaders,
+            mutate: Rc::new(|h: &mut RequestHeaders| {
+                h.headers.insert(
+                    HeaderName::from_static("x-injected"),
+                    HeaderValue::from_static("from-headers-phase"),
+                );
+            }),
+            result: result.clone(),
+        };
+        let (status, seen) =
+            run_chain_req_capturing_headers(vec![Box::new(filter)], log, request(b"hi")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            result.borrow().clone(),
+            Some(false),
+            "modify_decoded_headers must return false when called from \
+             decode_headers -- see the trait doc's fallback note"
+        );
+        assert!(
+            seen.get("x-injected").is_none(),
+            "a no-op call must not mutate the headers either; seen: {seen:?}"
+        );
+    });
+}
+
+/// Load-bearing test for the whole increment: a filter that calls
+/// `modify_decoded_headers` from `decode_data` (WP-45's actual case -- the
+/// decision to inject body bytes, and so the need to fix up
+/// `content-length`, is only made once body bytes have been scanned) ALSO
+/// reaches the terminal. If only the `decode_headers` case worked, this seam
+/// would be useless for WP-45.
+#[test]
+fn modify_decoded_headers_from_decode_data_reaches_the_terminal() {
+    block_on(async {
+        let log = log_of();
+        let result = Rc::new(RefCell::new(None));
+        let filter = HeaderMutatingFilter {
+            call_from: HeaderMutationPoint::DecodeData,
+            mutate: Rc::new(|h: &mut RequestHeaders| {
+                h.headers.insert(
+                    HeaderName::from_static("x-injected"),
+                    HeaderValue::from_static("from-data-phase"),
+                );
+            }),
+            result: result.clone(),
+        };
+        let (status, seen) =
+            run_chain_req_capturing_headers(vec![Box::new(filter)], log, request(b"hi")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result.borrow().clone(), Some(true));
+        assert_eq!(
+            seen.get("x-injected").map(|v| v.to_str().unwrap()),
+            Some("from-data-phase"),
+            "the terminal must observe the header mutation made from \
+             decode_data via modify_decoded_headers; seen: {seen:?}"
+        );
+    });
+}
+
+/// The motivating use: adding, replacing, and removing a header from
+/// `decode_data` all take effect at the terminal -- specifically pinning
+/// replacing `content-length` with a LARGER value (WP-45's actual need, once
+/// it splices bytes into the body).
+#[test]
+fn modify_decoded_headers_add_replace_and_remove_all_take_effect() {
+    block_on(async {
+        let log = log_of();
+        let result = Rc::new(RefCell::new(None));
+        let filter = HeaderMutatingFilter {
+            call_from: HeaderMutationPoint::DecodeData,
+            mutate: Rc::new(|h: &mut RequestHeaders| {
+                // Replace: content-length grows to reflect injected bytes.
+                h.headers.insert(
+                    HeaderName::from_static("content-length"),
+                    HeaderValue::from_static("142"),
+                );
+                // Add: a header that wasn't present before.
+                h.headers.insert(
+                    HeaderName::from_static("x-brand-new"),
+                    HeaderValue::from_static("added"),
+                );
+                // Remove: a header the request arrived with.
+                h.headers.remove("x-drop-me");
+            }),
+            result: result.clone(),
+        };
+
+        let mut req = request(b"hi");
+        req.head.headers.insert(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_static("2"),
+        );
+        req.head.headers.insert(
+            HeaderName::from_static("x-drop-me"),
+            HeaderValue::from_static("still-here"),
+        );
+
+        let (status, seen) =
+            run_chain_req_capturing_headers(vec![Box::new(filter)], log, req).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result.borrow().clone(), Some(true));
+        assert_eq!(
+            seen.get("content-length").map(|v| v.to_str().unwrap()),
+            Some("142"),
+            "content-length must be replaced with the larger, recomputed \
+             value; seen: {seen:?}"
+        );
+        assert_eq!(
+            seen.get("x-brand-new").map(|v| v.to_str().unwrap()),
+            Some("added"),
+            "a brand-new header must be added; seen: {seen:?}"
+        );
+        assert!(
+            seen.get("x-drop-me").is_none(),
+            "a removed header must not reach the terminal; seen: {seen:?}"
+        );
+    });
+}
+
+/// A filter that never calls `modify_decoded_headers` sees byte-identical
+/// behavior to before this increment -- the seam is pure opt-in.
+#[test]
+fn a_filter_that_never_calls_modify_decoded_headers_is_unaffected() {
+    block_on(async {
+        let log = log_of();
+        let mut req = request(b"hi");
+        req.head.headers.insert(
+            HeaderName::from_static("x-untouched"),
+            HeaderValue::from_static("still-here"),
+        );
+        let probe = ProbeFilter::new("a", log.clone());
+        let (status, seen) = run_chain_req_capturing_headers(vec![Box::new(probe)], log, req).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.get("x-untouched").map(|v| v.to_str().unwrap()),
+            Some("still-here"),
+            "a filter that never calls modify_decoded_headers must not \
+             change what the terminal sees; seen: {seen:?}"
+        );
+    });
+}
+
+/// A terminal double (ADR-0004 step 3: an ordinary `HttpFilter` at the last
+/// decode position) that attempts `modify_decoded_headers` from its OWN
+/// `decode_headers` -- i.e. strictly after the configured decode filter chain
+/// has finished and `ChainCtx::decoded_headers_forwarded` is set. Records the
+/// `bool` the call returned, and the headers it saw right after the attempt,
+/// so a test can assert BOTH the return value and that nothing changed.
+struct LateHeaderMutationTerminal {
+    result: Rc<RefCell<Option<bool>>>,
+    observed: Rc<RefCell<Option<HeaderMap>>>,
+}
+
+impl HttpFilter for LateHeaderMutationTerminal {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        let applied = cb.modify_decoded_headers(&mut |h| {
+            h.headers.insert(
+                HeaderName::from_static("x-too-late"),
+                HeaderValue::from_static("nope"),
+            );
+        });
+        *self.result.borrow_mut() = Some(applied);
+        *self.observed.borrow_mut() = Some(headers.headers.clone());
+        FilterHeadersStatus::Continue
+    }
+
+    fn decode_data(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        _data: &mut Bytes,
+        _end_stream: bool,
+    ) -> FilterDataStatus {
+        FilterDataStatus::Continue
+    }
+}
+
+impl TerminalHttpFilter for LateHeaderMutationTerminal {
+    fn respond<'a>(
+        &'a mut self,
+        _cb: &'a mut dyn DecoderCallbacks,
+    ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
+        Box::pin(async move {
+            HttpResponseParts {
+                head: ResponseHeaders {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                },
+                body: bytes_to_seam_body(Bytes::from_static(b"resp"), None),
+            }
+        })
+    }
+}
+
+/// Once request headers can no longer affect the upstream request (the
+/// configured decode filter chain has finished and the terminal is handling
+/// the request), `modify_decoded_headers` is a no-op: it returns `false` AND
+/// leaves the headers untouched.
+#[test]
+fn modify_decoded_headers_is_a_no_op_once_headers_are_forwarded() {
+    block_on(async {
+        let result = Rc::new(RefCell::new(None));
+        let observed = Rc::new(RefCell::new(None));
+        let terminal = LateHeaderMutationTerminal {
+            result: result.clone(),
+            observed: observed.clone(),
+        };
+        let mgr = FilterManager {
+            filters: Vec::new(),
+            ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
+            terminal: Box::new(terminal),
+            buffer_limit: DEFAULT_BUFFER_LIMIT,
+        };
+        let resp = mgr.run(request(b"hi")).await;
+        assert_eq!(resp.head.status, StatusCode::OK);
+
+        assert_eq!(
+            result.borrow().clone(),
+            Some(false),
+            "modify_decoded_headers must return false once headers have \
+             already been forwarded to the terminal"
+        );
+        let seen = observed.borrow().clone().expect("terminal must have run");
+        assert!(
+            seen.get("x-too-late").is_none(),
+            "a no-op call must not mutate the headers either; seen: {seen:?}"
         );
     });
 }

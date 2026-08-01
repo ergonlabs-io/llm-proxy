@@ -935,7 +935,7 @@ fn local_reply_after_response_headers_forwarded_terminates_the_stream() {
         let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
         ctx.response_headers_forwarded = true;
         {
-            let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+            let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
             cb.send_local_reply(StatusCode::FORBIDDEN, "too late", None, "after_headers");
         }
         assert!(

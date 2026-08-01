@@ -802,6 +802,13 @@ struct ChainCtx {
     /// clones this `Rc` out of `ChainCtx` before `run()` ever takes
     /// ownership (see that call site), and reads it back through the clone.
     request_headers_snapshot: Rc<RefCell<Option<RequestSnapshot>>>,
+    /// WP-45 increment 2a: once set, request headers have already reached
+    /// the terminal, and [`DecoderCallbacksAdapter::modify_decoded_headers`]
+    /// becomes a no-op returning `false` — see that method's doc. Set by
+    /// [`FilterManager::run`] right after the decode filter chain
+    /// (`drive_decode`) returns, exactly the point configured decoder
+    /// filters stop getting a say over what the terminal forwards upstream.
+    decoded_headers_forwarded: bool,
 }
 
 impl ChainCtx {
@@ -824,6 +831,7 @@ impl ChainCtx {
             response_headers_forwarded: false,
             reset_after_headers: false,
             request_headers_snapshot: Rc::new(RefCell::new(None)),
+            decoded_headers_forwarded: false,
         }
     }
 
@@ -1034,6 +1042,12 @@ impl FilterManager {
             return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
         }
 
+        // WP-45 increment 2a: configured decoder filters have now had their
+        // say (`drive_decode` returned) — from here on the terminal handles
+        // the request, so `modify_decoded_headers` must stop taking effect
+        // (see `ChainCtx::decoded_headers_forwarded`'s doc).
+        ctx.decoded_headers_forwarded = true;
+
         // Access-log request-header snapshot, refreshed: the decode chain
         // has now run (see the fallback snapshot's doc above), so this
         // reflects any decode-filter header mutation -- but is still taken
@@ -1071,7 +1085,7 @@ impl FilterManager {
         ctx.decode.current_idx = filters.len();
         sync_route_head(&mut ctx, &head);
         {
-            let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+            let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
             let _ = terminal.decode_headers(&mut cb, &mut head, end_stream_on_headers);
         }
         if let Some(reply) = ctx.local_reply.take() {
@@ -1080,7 +1094,7 @@ impl FilterManager {
 
         let end_stream = req_trailers.is_none();
         {
-            let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+            let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
             let _ = terminal.decode_data(&mut cb, &mut decoded_body, end_stream);
         }
         if let Some(reply) = ctx.local_reply.take() {
@@ -1090,7 +1104,7 @@ impl FilterManager {
         if let Some(t) = &req_trailers {
             let mut owned = RequestTrailers(t.0.clone());
             {
-                let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+                let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
                 let _ = terminal.decode_trailers(&mut cb, &mut owned);
             }
             if let Some(reply) = ctx.local_reply.take() {
@@ -1100,7 +1114,7 @@ impl FilterManager {
 
         // --- terminal handler (router) produces the response ---
         let resp = {
-            let mut cb = DecoderCallbacksAdapter { ctx: &mut ctx };
+            let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
             terminal.respond(&mut cb).await
         };
         let HttpResponseParts { mut head, mut body } = resp;
@@ -2120,7 +2134,13 @@ async fn drive_decode(
         // immediately before this filter runs -- see `sync_route_head`'s doc
         // for why this can't be done once, up front, for the whole chain.
         sync_route_head(ctx, head);
-        let mut cb = DecoderCallbacksAdapter { ctx };
+        // WP-45 increment 2b: `head` is reborrowed as the `headers` parameter
+        // below, so `cb` is built with `::new` (no stored head borrow) — a
+        // filter running `decode_headers` already has direct `&mut` access
+        // through that parameter and can't be handed a second live `&mut` to
+        // the same place; `modify_decoded_headers` is a documented no-op from
+        // here (see the trait doc).
+        let mut cb = DecoderCallbacksAdapter::new(ctx);
         let status = filters[idx].decode_headers(&mut cb, head, end_stream_on_headers);
         // A filter that buffered via add_decoded_data must not exceed the limit.
         if ctx.decode.buffer.0.len() > buffer_limit {
@@ -2283,6 +2303,11 @@ async fn poll_async_resumption(
 /// struct isn't a clean win here (the borrows are all short-lived reborrows
 /// scoped to individual calls within `drive_decode`, not one value that
 /// outlives the whole function), so this just accepts the extra parameter.
+/// `&mut` (not `&`, WP-45 increment 2a): `decode_data`/`decode_trailers` have
+/// no `headers` parameter of their own, so — unlike `decode_headers` — `cb`
+/// CAN be built with a genuine live borrow of `head` here
+/// (`DecoderCallbacksAdapter::with_head`), and `modify_decoded_headers`
+/// writes straight through it; see that method's doc.
 ///
 /// ADR-0004 step 2: `async fn`, and `resumptions` (the same per-filter budget
 /// `drive_decode`'s header phase uses) lets a filter that stopped on
@@ -2297,7 +2322,7 @@ async fn deliver_decode_data(
     body: &mut Bytes,
     trailers: Option<&RequestTrailers>,
     data_consumed: &mut [bool],
-    head: &RequestHeaders,
+    head: &mut RequestHeaders,
     resumptions: &mut [u32],
 ) -> Result<bool, http::StatusCode> {
     data_consumed[idx] = true;
@@ -2312,7 +2337,10 @@ async fn deliver_decode_data(
     // resumptions before it finally continues or gives up; every other
     // iteration is the same synchronous `decode_data` call chunk 1 always made.
     loop {
-        let mut cb = DecoderCallbacksAdapter { ctx };
+        // WP-45 increment 2b: `head` has no competing borrow here (no
+        // `headers` parameter on `decode_data`), so `cb` holds the real
+        // borrow directly — no clone, no splice-back.
+        let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
         let status = filters[idx].decode_data(&mut cb, body, end_stream);
         if ctx.decode.buffer.0.len() > buffer_limit {
             return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
@@ -2327,7 +2355,9 @@ async fn deliver_decode_data(
             if let Some(t) = trailers {
                 ctx.decode.current_idx = idx;
                 sync_route_head(ctx, head);
-                let mut cb = DecoderCallbacksAdapter { ctx };
+                // WP-45 increment 2b: same real-borrow pattern -- no
+                // `headers` parameter on `decode_trailers` either.
+                let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
                 let mut owned = RequestTrailers(t.0.clone());
                 let _ = filters[idx].decode_trailers(&mut cb, &mut owned);
                 // S2.7: same for an injection from `decode_trailers`.
@@ -2377,7 +2407,7 @@ fn drain_decode_injections(
     filters: &mut [Box<dyn HttpFilter>],
     ctx: &mut ChainCtx,
     buffer_limit: usize,
-    head: &RequestHeaders,
+    head: &mut RequestHeaders,
 ) -> Result<(), http::StatusCode> {
     while let Some((from_idx, mut data, end_stream)) = ctx.decode.injected.pop_front() {
         let n = filters.len();
@@ -2388,7 +2418,10 @@ fn drain_decode_injections(
             // S2.8: same refresh as elsewhere -- an injected chunk's
             // recipient can call `route()` too.
             sync_route_head(ctx, head);
-            let mut cb = DecoderCallbacksAdapter { ctx };
+            // WP-45 increment 2b: same real-borrow pattern as
+            // `deliver_decode_data` -- `decode_data` has no `headers`
+            // parameter to alias.
+            let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
             let status = filters[idx].decode_data(&mut cb, &mut data, end_stream);
             if ctx.decode.buffer.0.len() > buffer_limit {
                 return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
@@ -2411,11 +2444,42 @@ fn drain_decode_injections(
 // --- callback adapters -----------------------------------------------------
 
 /// Borrows only [`ChainCtx`]; never the filter list (module doc).
-struct DecoderCallbacksAdapter<'c> {
+///
+/// `head` (WP-45 increment 2b): an optional genuine live borrow of the
+/// request head, handed in by call sites that have one to give (everywhere
+/// EXCEPT the `decode_headers` call site — see
+/// [`DecoderCallbacks::modify_decoded_headers`]'s doc for why that one
+/// site can't). `'c` and `'h` are separate lifetime parameters because `ctx`
+/// and `head` are two disjoint borrows from the caller's stack frame (one of
+/// `ChainCtx`, one of the `RequestHeaders` parameter threaded alongside it),
+/// not one value that outlives the other.
+struct DecoderCallbacksAdapter<'c, 'h> {
     ctx: &'c mut ChainCtx,
+    head: Option<&'h mut RequestHeaders>,
 }
 
-impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
+impl<'c, 'h> DecoderCallbacksAdapter<'c, 'h> {
+    /// No live head borrow to offer — either the calling filter already has
+    /// direct `&mut RequestHeaders` access (`decode_headers`) so the seam
+    /// doesn't need one, or this call site (the terminal, after
+    /// `decoded_headers_forwarded` is set) doesn't need one either, since
+    /// `modify_decoded_headers` short-circuits on that flag regardless.
+    fn new(ctx: &'c mut ChainCtx) -> Self {
+        Self { ctx, head: None }
+    }
+
+    /// `head` is a genuine live borrow of the request head, valid for this
+    /// one callback invocation — `modify_decoded_headers` writes through it
+    /// directly.
+    fn with_head(ctx: &'c mut ChainCtx, head: &'h mut RequestHeaders) -> Self {
+        Self {
+            ctx,
+            head: Some(head),
+        }
+    }
+}
+
+impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
     fn send_local_reply(
         &mut self,
         code: http::StatusCode,
@@ -2487,6 +2551,27 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_> {
 
     fn modify_decoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut)) {
         f(&mut self.ctx.decode.buffer.0);
+    }
+
+    fn modify_decoded_headers(&mut self, f: &mut dyn FnMut(&mut RequestHeaders)) -> bool {
+        // WP-45 increment 2a: "already forwarded" == the decode filter chain
+        // has finished and the terminal is (or is about to be) handling the
+        // request -- see `ChainCtx::decoded_headers_forwarded`'s doc.
+        if self.ctx.decoded_headers_forwarded {
+            return false;
+        }
+        // WP-45 increment 2b: `self.head` is `None` exactly when this
+        // adapter was built with `::new` -- either the calling filter is
+        // `decode_headers` itself (which already has a direct `&mut
+        // RequestHeaders` parameter and can't also be handed this one; see
+        // the trait doc) or no head was needed at all (a post-forward
+        // terminal call, already caught above). `Some` is a genuine live
+        // borrow: `f` writes straight through it, no clone or splice-back.
+        let Some(head) = self.head.as_deref_mut() else {
+            return false;
+        };
+        f(head);
+        true
     }
 
     fn route(&mut self) -> Option<Arc<RouteEntry>> {
