@@ -13,7 +13,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-3 | Streamed response arrives incrementally | passing |
 | QA-4 | Credentials reach upstream, never reach the log | passing |
 | QA-5 | Non-streaming responses log real bytes and tokens | approved |
-| QA-6 | Upstream dying mid-stream errors, and is not retried | approved |
+| QA-6 | Upstream dying mid-stream errors, and is not retried | implemented — **partially passing**, response_flags half skipped (see below) |
 | QA-7 | SIGTERM during an active stream drains to completion | approved |
 | QA-8 | Circuit-breaker rejection fails fast, does not queue | approved |
 | QA-9 | ~~Content-type parameter tolerance~~ | rejected — see below |
@@ -81,6 +81,33 @@ it is derived from the request URI alone. Deriving it from the listener's TLS
 state needs downstream connection info that is not threaded that far yet.
 Deliberate and documented, not silently wrong — a candidate case if the owner
 wants it covered.
+
+### QA-6 found a fourth gap: no `response_flags` for a mid-stream upstream body error
+
+On its first run, QA-6 established the two load-bearing properties cleanly:
+the mock's request counter stays at exactly 1 (no retry fires once the first
+response byte has reached the client, per S3), and the client's read of the
+proxied stream reliably ends in an observable error (`unexpected EOF`), never
+a clean close indistinguishable from success. The third property — that the
+access log's `response_flags` field records the failure — does not hold.
+
+Every `set_response_flag` call site in `proxy-http` (all twelve of them, in
+`crates/proxy-http/src/router.rs`) is in the PRE-response-headers path:
+connect failure, TLS handshake failure, reset-before-headers, request
+timeout, codec error before headers. Once headers (and, for a stream, the
+first body frames) have already reached the client, nothing sets a
+`ResponseFlag` when the response *body* subsequently errors —
+`LoggingBody::finish` (`crates/proxy-http/src/access_logging.rs`) logs
+whatever flags are already on `StreamInfo` at stream-end time, and for this
+path that is none, so the line renders `response_flags` as the absent-value
+`-` even though the request definitely failed mid-stream.
+`ResponseFlag::UpstreamProtocolError` (`UPE`,
+`crates/proxy-observability/src/flags.rs`) already exists and reads like
+exactly the right code for this case; it is simply never reached from a body
+error today. `TestQA6_StreamAbortSurfacesErrorAndIsNotRetried` degrades to a
+loud, named `t.Skip` for this one assertion, mirroring QA-1's shape: the two
+properties that do not depend on the gap are hard asserts, and the skip
+message names the exact gap so it can't quietly go stale.
 
 ## Maintaining this document
 

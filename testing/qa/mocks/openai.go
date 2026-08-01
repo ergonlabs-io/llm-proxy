@@ -34,6 +34,18 @@ type StreamConfig struct {
 	TTFT            time.Duration
 	InterChunkDelay time.Duration
 	Usage           Usage
+
+	// AbortAfterChunks, when non-nil, cuts the stream short after that many
+	// entries of Chunks have been written: instead of continuing on to the
+	// finish-reason/usage/[DONE] frames, the handler reaches for the
+	// underlying TCP connection via http.Hijacker and closes it raw. This is
+	// deliberately NOT a plain early `return` from the handler — returning
+	// normally still lets net/http write a clean terminating chunk, which
+	// produces an ordinary chunked-EOF the client can't distinguish from a
+	// short-but-successful response. Hijacking and closing the raw
+	// connection mid-chunk is what actually reproduces "upstream died
+	// mid-stream" (QA-6).
+	AbortAfterChunks *int
 }
 
 // OpenAI is a mock OpenAI-compatible upstream serving POST /v1/chat/completions.
@@ -181,6 +193,24 @@ func (m *OpenAI) serveStream(w http.ResponseWriter, body map[string]any) {
 			time.Sleep(s.InterChunkDelay)
 		}
 		writeChunk(map[string]any{"content": tok}, nil)
+
+		if s.AbortAfterChunks != nil && i+1 == *s.AbortAfterChunks {
+			// Note: reaching for http.Hijacker takes
+			// over the raw net.Conn from net/http, so nothing further --
+			// not even a terminating "0\r\n\r\n" chunk -- ever reaches the
+			// client. See the AbortAfterChunks doc comment for why a plain
+			// return isn't equivalent.
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				panic("mock: ResponseWriter does not support hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				panic(fmt.Sprintf("mock: hijack failed: %v", err))
+			}
+			_ = conn.Close()
+			return
+		}
 	}
 
 	writeChunk(map[string]any{}, "stop")
