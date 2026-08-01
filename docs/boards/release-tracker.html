@@ -263,7 +263,7 @@
   "left": [
    {
     "wp": "WP-33",
-    "what": "Usage filter now <b>wired per-route into the llmproxy dialect</b> — 6 of 7 acceptance criteria met, incl. the end-to-end one (QA-1 now asserts real per-route token values instead of skipping). <b>Not done:</b> criterion 3 — 'an invalid per-route dialect is a build error, and <code>is_optional: true</code> does not swallow it' — has no test yet."
+    "what": "Usage filter <b>wired per-route into the llmproxy dialect</b>, and <b>criterion 3 now has its test (2026-08-01)</b>: an invalid per-route dialect fails the build even under <code>is_optional: true</code>, pinned both at the error-variant level (must be InvalidValue, never Unimplemented — the latter is the one <code>is_optional</code> swallows) and end-to-end through <code>build_listener_hcm</code>. Mutation-tested. <b>Remaining:</b> GenAI TTFT/TPOT metrics and the route-level <code>streaming: strict</code> assertion."
    },
    {
     "wp": "WP-34",
@@ -279,7 +279,7 @@
    },
    {
     "wp": "WP-45",
-    "what": "<b>New 2026-08-01.</b> Request-body rewrite pipeline. Verified against a real OpenAI-compatible upstream: streaming without <code>stream_options.include_usage</code> emits no usage block at all, so the WP-33 filter runs correctly and finds nothing for that request shape. Also absorbs WP-35's body-peek model router as a shared consumer."
+    "what": "<b>New 2026-08-01, increment 1 landed the same day.</b> Request-body rewrite pipeline. Verified against a real OpenAI-compatible upstream: streaming without <code>stream_options.include_usage</code> emits no usage block at all, so the WP-33 filter runs correctly and finds nothing for that request shape. Also absorbs WP-35's body-peek model router as a shared consumer. <b>Done:</b> the bounded prefix scanner + splice policy (<code>body_rewrite.rs</code>, 14 tests, O(cap) not O(body), mutation-tested — removing the cap turns the multimodal 4b test red). <b>Next:</b> increment 2, filter wiring + the <code>observability.force_usage_reporting</code> dialect surface."
    }
   ],
   "risk": "The dialect currently <em>rejects</em> <code>limits</code> and <code>fallbacks</code> — correct under strict mode, and precisely the schema pointing at this hole. Those two features are WP-34 and WP-35. If they slip, v0.1.0 has no content."

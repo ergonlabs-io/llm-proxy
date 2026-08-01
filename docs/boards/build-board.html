@@ -847,9 +847,10 @@
    "✓ usage filter now EMITTED from the llmproxy dialect, per route — typed_per_filter_config carries the dialect (openai/anthropic) keyed off the route's provider",
    "✓ criteria 1,2,4,5,6 met — route override changes dialect, listener default preserved, two-provider HCM carries llmproxy.usage before router, gpt-*/claude-* routes get correct per-route dialects",
    "✓ criterion 7 (end-to-end) — QA-1 now ASSERTS real per-route token values instead of skipping",
-   "open: criterion 3 — 'an invalid per-route dialect is a build error, and is_optional: true does not swallow it' has NO TEST yet"
+   "✓ criterion 3 CLOSED 2026-08-01 — an invalid per-route dialect fails the build even under is_optional: true. Pinned twice: the error VARIANT (must be InvalidValue, never Unimplemented — that is the one is_optional swallows) and end-to-end through build_listener_hcm, the same fn the bind path calls. Mutation-tested",
+   "open: GenAI TTFT/TPOT metrics per OTel semconv, and the route-level `streaming: strict` assertion that config-errors if a filter on the route buffers the response"
   ],
-  "note": "▲ NOT DONE — 6/7 acceptance criteria met, criterion 3 outstanding. The ⚑ built-but-unwired flag is CLEARED (filter is in the dialect's http_filters); that is a different fact from the WP being finished"
+  "note": "▲ 7/7 acceptance criteria now met; the WP stays open for the GenAI metrics half of its title. The ⚑ built-but-unwired flag is CLEARED (filter is in the dialect's http_filters); that is a different fact from the WP being finished"
  },
  {
   "id": 34,
@@ -894,16 +895,18 @@
   "lane": "H",
   "size": "M",
   "gate": "G5",
-  "status": "ready",
+  "status": "started",
   "title": "Request-body rewrite pipeline",
   "meta": [
    "proxy-filters",
-   "NEW 2026-08-01 — bounded request-body buffer (S2 StopIterationAndBuffer, 64KiB default), parse → mutate → re-serialize with content-length recomputed",
+   "NEW 2026-08-01 — bounded PREFIX SCAN (64KiB default), NOT a whole-body buffer and NOT re-serialization: a depth-tracking tokenizer skips nested structures without materializing them, and mutation is a prefix splice just past the top-level `{`. Memory is O(cap), not O(body) — a 40MB multimodal request costs the same as a 2KB one",
    "over-cap or non-JSON: pass through untouched, never fail the request",
    "consumer A: forces stream_options.include_usage=true for openai-dialect streaming routes — verified against a real OpenAI-compatible upstream that streaming without it emits NO usage block at all",
-   "consumer B: absorbs WP-35's body-peek model router as a shared consumer of the same buffer"
+   "consumer B: absorbs WP-35's body-peek model router as a shared consumer of the same buffer",
+   "✓ INCREMENT 1 DONE 2026-08-01 — body_rewrite.rs: scanner + splice policy, 14 tests, mutation-tested (removing the cap turns the multimodal 4b test red; that is the criterion guarding against someone simplifying it back into a full-body buffer)",
+   "next: increment 2 — filter wiring + the observability.force_usage_reporting dialect surface"
   ],
-  "note": "▲ found today verifying WP-33/34 against a real upstream: the WP-33 filter runs correctly on this quadrant and finds nothing"
+  "note": "▲ found 2026-08-01 verifying WP-33/34 against a real upstream: the WP-33 filter runs correctly on this quadrant and finds nothing. Increment 1 (the shared machinery) has landed; nothing is wired to it yet"
  },
  {
   "id": 42,
