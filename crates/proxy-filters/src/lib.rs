@@ -13,6 +13,11 @@
 //!   - WP-36: Gateway API Inference Extension endpoint-picker support.
 //!   - WP-37: realtime WebSocket sessions (session-pinned routing, frame-aware
 //!     token metering, session quotas, Close-frame drains) — Appendix S10.
+//!   - WP-45: bounded request-body prefix scan + splice
+//!     ([`body_rewrite`]), shared by forced usage reporting and body-based
+//!     model routing. Increment 1: the scanner/policy library only, not yet
+//!     wired into a filter.
 
+pub mod body_rewrite;
 pub mod usage;
 pub mod usage_filter;
