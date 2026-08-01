@@ -9,6 +9,9 @@
 //!     [`usage_filter`] wires the WP-34 extractor below into the real encode
 //!     path.
 //!   - WP-34: token metering & token-based rate limiting (budget-store seam).
+//!     [`token_limit`] is the budget limiter itself, increment 1: a pure
+//!     library ([`token_limit::BudgetStore`] trait + its in-process impl),
+//!     not yet wired into an `HttpFilter` or the config/IR surface.
 //!   - WP-35: model routing (body peek -> cluster_header) & provider fallback.
 //!   - WP-36: Gateway API Inference Extension endpoint-picker support.
 //!   - WP-37: realtime WebSocket sessions (session-pinned routing, frame-aware
@@ -19,5 +22,6 @@
 //!     wired into a filter.
 
 pub mod body_rewrite;
+pub mod token_limit;
 pub mod usage;
 pub mod usage_filter;

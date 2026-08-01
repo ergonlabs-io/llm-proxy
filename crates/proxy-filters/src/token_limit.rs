@@ -1,0 +1,638 @@
+//! WP-34 increment 1 — the token budget limiter, as a pure library.
+//!
+//! This module answers one question: **is the next request allowed against a
+//! configured token budget, and if not, when will it be?** It does not touch
+//! `HttpFilter`, config/IR, or response generation — those are later
+//! increments (see `IMPLEMENTATION_PLAN.md`'s WP-34 entry). This increment is
+//! the [`BudgetStore`] trait, its in-process implementation, and the types
+//! around it.
+//!
+//! # The central semantic: retrospective enforcement, never mid-stream cutoff
+//!
+//! Token usage is not known until a response completes — [`crate::usage`]'s
+//! extractors only produce a [`TokenUsage`] at the end of a (possibly
+//! streaming) exchange. So this limiter is inherently *retrospective*: a
+//! request is admitted against usage **already accumulated** from past
+//! requests, and only once it finishes does its own cost get
+//! [`BudgetStore::record`]ed against the budget. It follows that:
+//!
+//! - A request already in flight when its budget is exhausted by another,
+//!   concurrent request is never affected — there is no mechanism here to cut
+//!   off bytes already flowing to a client, and there must never be one.
+//!   [`BudgetStore::record`] cannot fail or signal truncation; it only
+//!   updates accounting for *future* [`BudgetStore::check`] calls.
+//! - Over-limit means the *next* request is denied, not that the current one
+//!   is truncated. Envoy AI Gateway's token-based rate limiting has the same
+//!   shape, for the same reason.
+//!
+//! # Fixed window, not a leaky bucket
+//!
+//! Limits reset on a fixed window boundary rather than draining continuously.
+//! This matches how providers publish `x-ratelimit-reset`-style semantics and
+//! is far easier for an operator (or a client backing off) to reason about
+//! than a continuously-draining bucket.
+//!
+//! # Cost weights
+//!
+//! Different models cost different amounts per token. Rather than complicate
+//! `check` with a per-request price, the weight is applied once, at
+//! [`BudgetStore::record`] time: a call with `weight: 2.0` consumes budget
+//! twice as fast as one with `weight: 1.0` for the same [`TokenUsage`]. The
+//! weighted count is rounded and saturated into a `u64` — see "Saturating
+//! arithmetic" below.
+//!
+//! # Saturating arithmetic
+//!
+//! This is a billing path. A `u64` overflow here must be a can't-happen, not
+//! a rare panic or (worse) a silent wraparound that resets a would-be-denied
+//! customer's budget to near zero. Every arithmetic operation in this module
+//! that combines usage, weights, or accumulated totals uses saturating (or
+//! explicitly clamped) arithmetic.
+//!
+//! # `BudgetStore` is a seam, not a promise of two implementations today
+//!
+//! [`InProcessBudgetStore`] is the only implementation built in this
+//! increment: one rule, tracked per key, entirely in the current worker's
+//! memory. The trait exists so a Redis-backed (or otherwise
+//! control-plane-aggregated) store can land later behind the same interface
+//! without callers changing — that store is explicitly **not** built here.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use crate::usage::TokenUsage;
+
+/// The identity a budget is tracked against.
+///
+/// Rendered ahead of time (by the filter, in a later increment) from
+/// configured descriptors — e.g. an api-key header value, a route name, a
+/// model name — into one opaque string. Keeping this a plain wrapper rather
+/// than exposing the descriptor list here means [`InProcessBudgetStore`]
+/// never needs to know what a descriptor *is*; it only ever compares keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LimitKey(String);
+
+impl LimitKey {
+    /// Build a key from an ordered list of `(descriptor_name, value)` pairs.
+    ///
+    /// The exact separator is an internal implementation detail (two
+    /// different descriptor lists are never compared against each other,
+    /// only two renderings of the *same* configured list), so any injective
+    /// encoding is fine; this one is easy to eyeball in logs/tests.
+    pub fn from_descriptors(parts: &[(&str, &str)]) -> Self {
+        let mut rendered = String::new();
+        for (name, value) in parts {
+            if !rendered.is_empty() {
+                rendered.push('|');
+            }
+            rendered.push_str(name);
+            rendered.push('=');
+            rendered.push_str(value);
+        }
+        LimitKey(rendered)
+    }
+}
+
+/// Which bucket of [`TokenUsage`] a [`LimitRule`] is measured against.
+///
+/// `Total` is not simply "the sum of `Input` and `Output`" as a matter of
+/// convenience — it is defined, deliberately, as [`TokenUsage::total`], which
+/// includes the cached and cache-creation buckets too. Those buckets are
+/// priced differently from plain input/output but still consume the same
+/// per-key budget; a limiter that dropped them from `Total` would let a
+/// heavy-cache workload evade the cap it was supposed to enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitOn {
+    /// [`TokenUsage::input_tokens`] only (excludes cached/cache-creation).
+    Input,
+    /// [`TokenUsage::output_tokens`] only.
+    Output,
+    /// [`TokenUsage::total`] — every bucket.
+    Total,
+}
+
+/// One configured budget: how many (weighted) tokens are allowed on a given
+/// [`LimitOn`] bucket per fixed [`window`](Self::window).
+#[derive(Debug, Clone, Copy)]
+pub struct LimitRule {
+    pub on: LimitOn,
+    pub max_tokens: u64,
+    pub window: Duration,
+}
+
+/// The outcome of a [`BudgetStore::check`] call.
+///
+/// Both variants carry the same "how does this look to the caller" shape a
+/// provider-style rate limiter publishes (`limit` / `remaining` /
+/// `reset_after`), plus `retry_after` on `Deny` — this increment does not
+/// build the HTTP header mapping, but the fields are named to make that
+/// mapping mechanical when a later increment adds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitDecision {
+    Allow {
+        limit: u64,
+        remaining: u64,
+        reset_after: Duration,
+    },
+    Deny {
+        limit: u64,
+        remaining: u64,
+        reset_after: Duration,
+        retry_after: Duration,
+    },
+}
+
+/// Seam for a token-budget backend. See the module docs for why the trait
+/// exists ahead of a second implementation.
+///
+/// Rust note: both methods take `&self`, not `&mut self`. That is what lets a
+/// single store be shared across concurrently-in-flight requests on this
+/// worker without the caller juggling exclusive borrows; interior mutability
+/// (see [`InProcessBudgetStore`]) does the actual mutating.
+pub trait BudgetStore {
+    /// Read-only: does `key` currently have room? Must not mutate window
+    /// state — calling this any number of times with no intervening
+    /// [`record`](Self::record) must return the same answer (modulo wall-clock
+    /// window rollover, which is why `now` is a parameter rather than read
+    /// internally).
+    fn check(&self, key: &LimitKey, now: Instant) -> LimitDecision;
+
+    /// Record that `usage` (scaled by `weight`) actually happened against
+    /// `key`. Always succeeds — see the module docs' central semantic: this
+    /// can never fail, error, or signal that a stream should have been cut
+    /// off. It only affects the outcome of *future* `check` calls.
+    fn record(&self, key: &LimitKey, usage: &TokenUsage, weight: f64, now: Instant);
+}
+
+/// One key's current fixed window: when it started, and how many (weighted)
+/// tokens have been recorded in it so far.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    started_at: Instant,
+    used: u64,
+}
+
+/// The only [`BudgetStore`] implementation in this increment: a single
+/// [`LimitRule`], tracked per [`LimitKey`], entirely in this worker's memory.
+///
+/// Rust note: interior mutability here is a `RefCell`, not a `Mutex`. Per
+/// ADR-0003 the data plane is single-threaded per worker (`!Send`), so there
+/// is never contention to arbitrate — a `Mutex` would only add needless lock
+/// overhead (and an unused poisoning failure mode) for a guarantee this type
+/// doesn't need. `usage_filter.rs`'s `StreamInfo` makes the same choice for
+/// the same reason.
+pub struct InProcessBudgetStore {
+    rule: LimitRule,
+    windows: RefCell<HashMap<LimitKey, Window>>,
+}
+
+impl InProcessBudgetStore {
+    pub fn new(rule: LimitRule) -> Self {
+        Self {
+            rule,
+            windows: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The bucket of `usage` this store's rule cares about, per
+    /// [`LimitOn`]'s doc comment.
+    fn bucket(&self, usage: &TokenUsage) -> u64 {
+        match self.rule.on {
+            LimitOn::Input => usage.input_tokens,
+            LimitOn::Output => usage.output_tokens,
+            LimitOn::Total => usage.total(),
+        }
+    }
+
+    /// The `used` count for `key`'s *current* window as of `now`, treating a
+    /// window that has rolled past (or never existed) as freshly reset — but
+    /// never mutating `windows` (that is `record`'s job; `check` and this
+    /// helper stay read-only, per the trait's purity requirement).
+    fn used_in_current_window(&self, key: &LimitKey, now: Instant) -> (u64, Duration) {
+        let windows = self.windows.borrow();
+        match windows.get(key) {
+            Some(w) => {
+                let elapsed = now.saturating_duration_since(w.started_at);
+                if elapsed >= self.rule.window {
+                    // The window has rolled; a fresh one starts at `now`, so
+                    // the full window remains until the next reset.
+                    (0, self.rule.window)
+                } else {
+                    (w.used, self.rule.window - elapsed)
+                }
+            }
+            None => (0, self.rule.window),
+        }
+    }
+}
+
+impl BudgetStore for InProcessBudgetStore {
+    fn check(&self, key: &LimitKey, now: Instant) -> LimitDecision {
+        let (used, reset_after) = self.used_in_current_window(key, now);
+        let limit = self.rule.max_tokens;
+        let remaining = limit.saturating_sub(used);
+        if used < limit {
+            LimitDecision::Allow {
+                limit,
+                remaining,
+                reset_after,
+            }
+        } else {
+            LimitDecision::Deny {
+                limit,
+                remaining,
+                reset_after,
+                retry_after: reset_after,
+            }
+        }
+    }
+
+    fn record(&self, key: &LimitKey, usage: &TokenUsage, weight: f64, now: Instant) {
+        // Rust note: `f64::round` then saturating-cast via `as u64` — `as` on
+        // a float-to-int in Rust is itself a saturating conversion (NaN -> 0,
+        // out-of-range -> the type's min/max), which is exactly the "never
+        // panic, never wrap" behavior this billing path requires even for a
+        // pathological weight (e.g. `f64::MAX` or `f64::INFINITY`).
+        let raw = self.bucket(usage);
+        let weighted = (raw as f64 * weight).round();
+        let weighted_tokens = if weighted.is_sign_negative() {
+            0
+        } else {
+            weighted as u64
+        };
+
+        let mut windows = self.windows.borrow_mut();
+        let window = windows.entry(key.clone()).or_insert(Window {
+            started_at: now,
+            used: 0,
+        });
+        let elapsed = now.saturating_duration_since(window.started_at);
+        if elapsed >= self.rule.window {
+            // The window rolled since we last saw this key; this record
+            // starts a fresh one rather than adding onto a stale total.
+            window.started_at = now;
+            window.used = weighted_tokens;
+        } else {
+            window.used = window.used.saturating_add(weighted_tokens);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
+    fn rule(on: LimitOn, max_tokens: u64, window: Duration) -> LimitRule {
+        LimitRule {
+            on,
+            max_tokens,
+            window,
+        }
+    }
+
+    // ---- exact 429 onset ---------------------------------------------------
+
+    /// A scripted sequence of ten-token responses against a 25-token budget:
+    /// `remaining` must land on exact values, and `Deny` must first appear at
+    /// the exact request index this pins (request 4, the third that would
+    /// push cumulative usage past 25).
+    #[test]
+    fn exact_429_onset_and_remaining_track_scripted_usage() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 25, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        // Request 1: check (25 remaining), record 10 -> used 10.
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Allow {
+                limit: 25,
+                remaining: 25,
+                reset_after: Duration::from_secs(60),
+            }
+        );
+        store.record(&key, &usage(6, 4), 1.0, now);
+
+        // Request 2: check (15 remaining), record 10 -> used 20.
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Allow {
+                limit: 25,
+                remaining: 15,
+                reset_after: Duration::from_secs(60),
+            }
+        );
+        store.record(&key, &usage(6, 4), 1.0, now);
+
+        // Request 3: check (5 remaining) -- still allowed, used(20) < limit(25).
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Allow {
+                limit: 25,
+                remaining: 5,
+                reset_after: Duration::from_secs(60),
+            }
+        );
+        store.record(&key, &usage(6, 4), 1.0, now);
+        // Cumulative used is now 30, past the 25-token budget.
+
+        // Request 4: THIS is the exact onset -- the first Deny.
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Deny {
+                limit: 25,
+                remaining: 0,
+                reset_after: Duration::from_secs(60),
+                retry_after: Duration::from_secs(60),
+            },
+            "request 4 is the exact index at which Deny must first appear"
+        );
+    }
+
+    // ---- central semantic: record never signals truncation -----------------
+
+    /// A request already "in flight" (its usage recorded after the budget is
+    /// already exhausted by other concurrent requests) must not be rejected,
+    /// erred, or truncated by `record` -- the plan's central semantic:
+    /// over-limit rejects the *next* request, never an in-flight one.
+    #[test]
+    fn record_never_errors_or_signals_truncation_even_when_already_over_budget() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        // Exhaust the budget.
+        store.record(&key, &usage(6, 4), 1.0, now);
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Deny {
+                limit: 10,
+                remaining: 0,
+                reset_after: Duration::from_secs(60),
+                retry_after: Duration::from_secs(60),
+            }
+        );
+
+        // A request that was already in flight before the budget ran out
+        // finishes now, well over budget. `record`'s return type is `()`:
+        // there is no error path to take here at all, which is the point --
+        // the type system, not a runtime check, makes truncation impossible.
+        store.record(&key, &usage(600, 400), 1.0, now);
+
+        // The *next* request (not this one) is what pays for it: still
+        // denied, with `remaining` saturated at 0, never negative/wrapped.
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Deny {
+                limit: 10,
+                remaining: 0,
+                reset_after: Duration::from_secs(60),
+                retry_after: Duration::from_secs(60),
+            }
+        );
+    }
+
+    // ---- window rollover -----------------------------------------------
+
+    #[test]
+    fn window_rollover_restores_budget() {
+        let window = Duration::from_secs(60);
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, window));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let t0 = Instant::now();
+
+        store.record(&key, &usage(6, 4), 1.0, t0);
+        assert!(matches!(store.check(&key, t0), LimitDecision::Deny { .. }));
+
+        // Just before the window elapses: still denied.
+        let just_before = t0 + window - Duration::from_millis(1);
+        assert!(matches!(
+            store.check(&key, just_before),
+            LimitDecision::Deny { .. }
+        ));
+
+        // Exactly at / past the window boundary: budget is restored.
+        let after = t0 + window;
+        assert_eq!(
+            store.check(&key, after),
+            LimitDecision::Allow {
+                limit: 10,
+                remaining: 10,
+                reset_after: window,
+            }
+        );
+
+        // A `record` after rollover starts a fresh window rather than adding
+        // onto the stale total.
+        store.record(&key, &usage(1, 1), 1.0, after);
+        assert_eq!(
+            store.check(&key, after),
+            LimitDecision::Allow {
+                limit: 10,
+                remaining: 8,
+                reset_after: window,
+            }
+        );
+    }
+
+    // ---- check purity --------------------------------------------------
+
+    #[test]
+    fn check_is_pure_repeated_calls_agree() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        store.record(&key, &usage(3, 2), 1.0, now);
+
+        let first = store.check(&key, now);
+        for _ in 0..5 {
+            assert_eq!(
+                store.check(&key, now),
+                first,
+                "repeated check() calls with no intervening record() must agree"
+            );
+        }
+    }
+
+    // ---- cost weights ----------------------------------------------------
+
+    /// A 10x-weighted model exhausts an identical budget in 1/10th the
+    /// requests: ten 1-token (unweighted-equivalent) responses at weight 1.0
+    /// take ten `record`s to exhaust a 10-token budget; the same at weight
+    /// 10.0 exhausts it in one.
+    #[test]
+    fn cost_weight_scales_consumption() {
+        let window = Duration::from_secs(60);
+        let now = Instant::now();
+
+        let unweighted = InProcessBudgetStore::new(rule(LimitOn::Total, 10, window));
+        let weighted = InProcessBudgetStore::new(rule(LimitOn::Total, 10, window));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+
+        let mut unweighted_denies_at = None;
+        let mut weighted_denies_at = None;
+        for i in 1..=10u32 {
+            unweighted.record(&key, &usage(1, 0), 1.0, now);
+            if unweighted_denies_at.is_none()
+                && matches!(unweighted.check(&key, now), LimitDecision::Deny { .. })
+            {
+                unweighted_denies_at = Some(i);
+            }
+
+            weighted.record(&key, &usage(1, 0), 10.0, now);
+            if weighted_denies_at.is_none()
+                && matches!(weighted.check(&key, now), LimitDecision::Deny { .. })
+            {
+                weighted_denies_at = Some(i);
+            }
+        }
+
+        assert_eq!(unweighted_denies_at, Some(10));
+        assert_eq!(
+            weighted_denies_at,
+            Some(1),
+            "a 10x weight must exhaust the same budget in 1/10th the requests"
+        );
+    }
+
+    // ---- Input / Output / Total independence ------------------------------
+
+    #[test]
+    fn input_limit_ignores_output_tokens() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Input, 10, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        // All output, no input: must never deny an Input-only rule.
+        store.record(&key, &usage(0, 1_000_000), 1.0, now);
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Allow {
+                limit: 10,
+                remaining: 10,
+                reset_after: Duration::from_secs(60),
+            }
+        );
+
+        store.record(&key, &usage(10, 0), 1.0, now);
+        assert!(matches!(store.check(&key, now), LimitDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn output_limit_ignores_input_tokens() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Output, 10, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        store.record(&key, &usage(1_000_000, 0), 1.0, now);
+        assert_eq!(
+            store.check(&key, now),
+            LimitDecision::Allow {
+                limit: 10,
+                remaining: 10,
+                reset_after: Duration::from_secs(60),
+            }
+        );
+
+        store.record(&key, &usage(0, 10), 1.0, now);
+        assert!(matches!(store.check(&key, now), LimitDecision::Deny { .. }));
+    }
+
+    /// `Total` uses `TokenUsage::total()`, which includes the cached and
+    /// cache-creation buckets -- not just input + output. A rule that summed
+    /// only input + output would under-count a heavy-cache workload.
+    #[test]
+    fn total_limit_includes_cached_and_cache_creation_buckets() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        let usage_with_cache = TokenUsage {
+            input_tokens: 1,
+            cached_tokens: 4,
+            cache_creation_tokens: 5,
+            output_tokens: 0,
+        };
+        assert_eq!(usage_with_cache.total(), 10);
+
+        store.record(&key, &usage_with_cache, 1.0, now);
+        assert!(
+            matches!(store.check(&key, now), LimitDecision::Deny { .. }),
+            "cached/cache-creation tokens must count toward Total, not be dropped"
+        );
+    }
+
+    // ---- saturating arithmetic ---------------------------------------------
+
+    #[test]
+    fn saturating_at_u64_max_does_not_panic_or_wrap() {
+        // `LimitOn::Input` reads `input_tokens` directly (no summing across
+        // buckets, unlike `Total` -- see `TokenUsage::total`), so this
+        // exercises *this module's* saturating accumulation in isolation
+        // without also depending on `TokenUsage::total`'s own arithmetic.
+        let store = InProcessBudgetStore::new(rule(LimitOn::Input, 10, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        // A single pathological usage value at the u64 max.
+        store.record(&key, &usage(u64::MAX, 0), 1.0, now);
+        // Recording again must not wrap back around toward zero.
+        store.record(&key, &usage(u64::MAX, 0), 1.0, now);
+
+        match store.check(&key, now) {
+            LimitDecision::Deny { remaining, .. } => assert_eq!(remaining, 0),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn huge_weight_does_not_panic_or_wrap() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
+        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let now = Instant::now();
+
+        for weight in [f64::MAX, f64::INFINITY, 1e300] {
+            store.record(&key, &usage(1, 1), weight, now);
+        }
+
+        match store.check(&key, now) {
+            LimitDecision::Deny { remaining, .. } => assert_eq!(remaining, 0),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    // ---- distinct keys don't bleed into each other -------------------------
+
+    #[test]
+    fn distinct_keys_have_independent_budgets() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
+        let key_a = LimitKey::from_descriptors(&[("api_key", "sk-a")]);
+        let key_b = LimitKey::from_descriptors(&[("api_key", "sk-b")]);
+        let now = Instant::now();
+
+        store.record(&key_a, &usage(10, 0), 1.0, now);
+        assert!(matches!(
+            store.check(&key_a, now),
+            LimitDecision::Deny { .. }
+        ));
+        assert_eq!(
+            store.check(&key_b, now),
+            LimitDecision::Allow {
+                limit: 10,
+                remaining: 10,
+                reset_after: Duration::from_secs(60),
+            },
+            "key_b's budget must be untouched by key_a's usage"
+        );
+    }
+}
