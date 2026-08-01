@@ -867,6 +867,9 @@
    "4 non-overlapping cost buckets (input / cache-read / cache-write / output) · Anthropic message_start+delta merge · OpenAI cached-subset normalization",
    "full acceptance suite runs in CI — 0 ignored",
    "✓ now reachable on live traffic via WP-33's per-route wiring — the ⚑ built-but-unwired flag that lived here is cleared",
+   "✓ LIMITER INCREMENT 1 DONE 2026-08-01 — token_limit.rs: BudgetStore seam + InProcessBudgetStore (fixed window, per-model cost weights, saturating throughout), 11 tests, mutation-tested 3 ways. Central semantic pinned by test: over-limit rejects the NEXT request, never truncates a stream in flight",
+   "⚠ FIXED en route: TokenUsage::total() summed four provider-supplied u64s with plain `+` — panicked the worker in debug, wrapped silently in release, and access_log.rs calls it for every logged request. Now saturating",
+   "open: descriptor config surface, the 429 + x-ratelimit-* enforcement path in the router, and the dialect's `limits` key (still rejected under strict mode)",
    "open: token rate limits (needs WP-33 fully done — criterion 3 — to feed it safely)"
   ]
  },
