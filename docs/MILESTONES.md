@@ -1,6 +1,6 @@
 # Milestones — releases, and how a ticket earns its slot
 
-**Updated 2026-07-28.** Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
+**Updated 2026-08-01** (v0.0.1 shipped; current milestone is now v0.1.0). Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
 package is*) and the build board (which owns *what state each WP is in*). This document
 owns the third axis: **which release a piece of work belongs to, and why.**
 
@@ -33,7 +33,7 @@ plan. That is the point of this document — the backlog is allowed to be large,
 
 ---
 
-## v0.0.1 — First light ⬅ **current**
+## v0.0.1 — First light ✅ **shipped 2026-08-01**
 
 **Theme:** one request, all the way through, for real.
 
@@ -52,8 +52,24 @@ without ever having carried a real request, and that gap is exactly what this ga
 > response back unmodified — both non-streaming and streamed (SSE) — for OpenAI and for
 > Anthropic.
 
-Verified by the live smoke test in `testing/diffrig`, keys from env. One command, and it
-is currently red. That test is `#[ignore]`d today; the gate closes when it runs and passes.
+Verified by the live smoke test in `testing/diffrig`, keys from env. **Run on 2026-08-01
+against the real OpenAI and Anthropic endpoints: all four cases passed on the first
+attempt. The gate is closed and v0.0.1 is shipped** (tag `v0.0.1`).
+
+The tests remain `#[ignore]`d and always will be — they bill real tokens and CI holds no
+keys. So the evidence for this gate is a deliberate manual run, not a CI green, and
+re-verifying it is a manual act:
+
+```sh
+OPENAI_API_KEY=... ANTHROPIC_API_KEY=... \
+  cargo test -p diffrig --test live_smoke -- --ignored
+```
+
+**Worth recording honestly: a clean first run is weaker evidence than a run that finds
+something.** Four requests exercise one narrow path, and the machinery behind them had
+never carried real traffic before. That it worked is good news about the mocks, not proof
+the path is robust. This is why coverage stays three-tiered — our mocks, the local Ollama
+third-party tier, and real providers — rather than collapsing to "the live test passes".
 
 ### What's in the release
 
@@ -77,28 +93,27 @@ a terminal `HttpFilter`, and per-route filter config reaching the IR).
 
 ### What's left to close the gate
 
-| WP | P | What it owes |
-|----|---|--------------|
-| WP-26 | P1 | **The smoke test now exists** (`testing/diffrig/tests/live_smoke.rs`, 4 `#[ignore]`d tests: OpenAI + Anthropic, streaming and not). It has never been *run* — that needs real keys. Running it is what closes this gate. |
-| WP-13 | P1 | Whatever the first real provider round-trip exposes; the lifecycle differential suite |
-| WP-15 | P1 | Keep-alive reuse — still connect-per-stream, which a real provider will notice |
+### What closed it, and what did not
 
-**The gate is now one command away from an answer**, and nobody has run it:
-
-```sh
-OPENAI_API_KEY=... ANTHROPIC_API_KEY=... \
-  cargo test -p diffrig --test live_smoke -- --ignored
-```
+| WP | P | Outcome |
+|----|---|---------|
+| WP-26 | P1 | ✅ **Closed the gate.** `testing/diffrig/tests/live_smoke.rs`, 4 cases (OpenAI + Anthropic, streaming and not), run against real endpoints 2026-08-01, all passing. |
+| WP-13 | P1 | The first real round-trip exposed **nothing** — it passed clean. Still open for the lifecycle differential suite, which was never part of this gate. |
+| WP-15 | P1 | Still open. Keep-alive reuse — still connect-per-stream. The gate passed without it because four requests cannot surface it; a sustained real workload will. |
 
 A missing key fails loudly by name rather than skipping — a skipped test
 reporting success is exactly how a red gate looks green. The streaming cases
 assert time-to-first-frame is well under total duration, which is what
 separates real streaming from buffering the whole response and replaying it;
-every other assertion passes either way.
+every other assertion passes either way. That assertion is the one that makes
+the streaming pass mean something.
 
-Expect this list to grow once the smoke test runs. A path that has never carried a real
-request has never been tested, however green the unit suite is — that lesson already cost
-us two `StreamInfo` bugs that only a socket-level test found.
+The expectation going in was that this list would *grow* once the smoke test ran — a path
+that has never carried a real request has never been tested, however green the unit suite
+is, and that lesson had already cost us two `StreamInfo` bugs that only a socket-level
+test found. It did not grow. That is a genuinely good result and also a small one: it says
+the mock tier modeled the two providers accurately, not that the path is proven under load,
+concurrency, error responses, or long streams. None of those are in the gate.
 
 ### Explicitly not in v0.0.1
 
@@ -108,7 +123,7 @@ is v0.1.0.
 
 ---
 
-## v0.1.0 — LLM gateway
+## v0.1.0 — LLM gateway ⬅ **current**
 
 **Theme:** the reason this project exists — be a gateway a team chooses *because* it
 understands LLM traffic.

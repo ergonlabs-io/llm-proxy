@@ -4,8 +4,9 @@
 releases:
 - v: v0.0.1
   name: First light
-  state: current
-  when: in progress
+  state: shipped
+  # Quoted: bare 2026-08-01 is a YAML `date`, which json.dumps cannot serialize.
+  when: "2026-08-01"
   theme: >-
     One request, all the way through, for real. A client calls the proxy; the proxy routes
     it, opens TLS to the upstream gateway, forwards with credentials attached, and returns
@@ -16,8 +17,10 @@ releases:
     streamed SSE — for OpenAI and for Anthropic.
   verify: >-
     OPENAI_API_KEY=… ANTHROPIC_API_KEY=… cargo test -p diffrig --test live_smoke -- --ignored
-    — written, never run.
-  done: 15
+    — <b>run 2026-08-01 against the real OpenAI and Anthropic endpoints: all 4 cases passed.</b>
+    The tests stay <code>#[ignore]</code>d (they bill real tokens and CI holds no keys), so
+    the gate evidence is a deliberate manual run, not a CI green.
+  done: 16
   open: 3
   scope: >-
     Carries <b>everything built to date</b> — config pipeline, L4, TLS, h1/h2, S1 routing,
@@ -26,15 +29,17 @@ releases:
   left:
   - wp: WP-26
     what: >-
-      <b>The smoke test now exists</b> — 4 cases, OpenAI and Anthropic, streaming and not.
-      It has never been <i>run</i>; that needs real keys, and running it is what closes this
-      gate.
+      <b>Done — this is what closed the gate.</b> 4 cases (OpenAI and Anthropic, streaming
+      and not) run against the real endpoints on 2026-08-01, all passing.
   - wp: WP-13
     what: >-
-      Whatever the first real provider round-trip exposes, plus the lifecycle differential
-      suite.
+      The first real provider round-trip exposed <b>nothing</b> — it passed clean on the
+      first run. Still open for the lifecycle differential suite, which was never part of
+      this gate.
   - wp: WP-15
-    what: Keep-alive reuse — still connect-per-stream, which a real provider will notice.
+    what: >-
+      Keep-alive reuse — still connect-per-stream. The gate passed without it; 4 requests
+      cannot surface it, and a sustained real workload will. Still open, not re-slotted.
   - wp: WP-41
     what: >-
       <b>Black-box QA suite — the new instrument, and it is already paying.</b> Four real
@@ -47,14 +52,17 @@ releases:
     at all</b>, that <code>%REQ(:METHOD)%</code> always rendered <code>-</code>, and that
     a stream killed mid-flight recorded <b>no response flag</b>. All three were invisible
     from inside the code; one was described as intended in its own doc comment. Expect this
-    list to keep growing — that is the instrument working, not a setback. <b>Nothing here
-    moved the gate today</b> — the smoke test in <code>testing/diffrig/tests/live_smoke.rs</code>
-    is still never-run, and the new third-party Ollama smoke test (<code>local_openai_smoke.rs</code>)
-    is explicitly a THIRD tier between mocks and real providers, documented in its own module
-    doc as not closing this gate.
+    list to keep growing — that is the instrument working, not a setback. <b>Closed 2026-08-01:</b>
+    the live smoke test ran against real OpenAI and Anthropic endpoints and passed all four
+    cases on the first attempt — the machinery built without ever carrying a real request
+    turned out to carry one correctly. Worth naming honestly: a clean first run is a weaker
+    signal than a run that found something, because four requests exercise a narrow path.
+    Coverage stays three-tiered (mocks, the local Ollama third-party tier, real providers)
+    for exactly that reason.
 - v: v0.1.0
   name: LLM gateway
-  state: later
+  state: current
+  when: in progress
   theme: >-
     The reason this project exists — be a gateway a team chooses <em>because</em> it understands
     LLM traffic.

@@ -16,6 +16,8 @@ testing/diffrig/captures/
 *.md
 !README.md
 !CLAUDE.md
+# The release record. Cited by docs/MILESTONES.md and by the v0.0.1 tag.
+!CHANGELOG.md
 !.claude/**/*.md
 !testing/corpus/fixtures/**/SOURCES.md
 # The spec the Go QA suite is written from — reviewable alongside the tests

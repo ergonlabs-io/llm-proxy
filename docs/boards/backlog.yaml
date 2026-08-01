@@ -491,8 +491,9 @@ work_packages:
     ✓ harness fix: always rebuild the binary (a stale one silently passed a test the code
     failed)
   - >-
-    ✓ LIVE SMOKE TEST WRITTEN — tests/live_smoke.rs, 4 #[ignore]d cases (OpenAI + Anthropic,
-    streaming and not); a missing key FAILS by name, never skips
+    ✓ LIVE SMOKE TEST RUN AND PASSED 2026-08-01 — tests/live_smoke.rs, 4 #[ignore]d cases
+    (OpenAI + Anthropic, streaming and not) against the REAL endpoints; all green on the
+    first attempt. THIS SHIPPED v0.0.1. A missing key FAILS by name, never skips
   - >-
     ✓ streaming cases assert time-to-first-frame << total duration — the one assertion a buffering
     regression would trip

@@ -11,18 +11,41 @@ relevant spec section *and* the differential rig (WP-26).
 
 ---
 
-## Status (updated 2026-07-25)
+## Status (updated 2026-08-01)
 
-**653 tests green workspace-wide, 0 failed, 13 ignored** (12 WP-11 chunk-4 target-spec tests
-+ 1 docker-gated diffrig case). `make ci` clean. Branch `data-plane-foundations`, 18 commits
-ahead of `main`, not pushed.
+**779 tests green workspace-wide, 0 failed, 21 ignored.** `make ci` clean. Branch
+`data-plane-foundations`, not pushed (no remote configured).
 
-**The hermetic end-to-end milestone is met.** A request now traverses dialect config → cluster with
-upstream TLS → SNI → certificate verification → auth-header injection → h1 → real SSE streaming
-back, against OpenAI- and Anthropic-shaped mock providers, in `make ci`, with no network, no API
-keys, no docker, and no `#[ignore]`. The negative control (wrong `ca_file` → 503, not 200) is what
-makes it proof rather than decoration. What remains for the *live* milestone is only the `#[ignore]`d
-smoke test against the real endpoints (see WP-26).
+> Count them with `cargo test --workspace --no-fail-fast` — plain `--workspace` fail-fasts
+> and undercounts.
+
+**🚢 v0.0.1 — "First light" — SHIPPED 2026-08-01. The live milestone is met.** The
+`#[ignore]`d smoke test in `testing/diffrig/tests/live_smoke.rs` was run against the real
+OpenAI and Anthropic endpoints and **passed all four cases** (both providers, streaming and
+non-streaming) on the first attempt. A client request now traverses dialect config → cluster
+with upstream TLS → SNI → certificate verification → auth-header injection → h1 → real SSE
+streaming back, **against real providers**, and returns the response unmodified. See
+`CHANGELOG.md` and `docs/MILESTONES.md`; tagged `v0.0.1`.
+
+Those tests stay `#[ignore]`d permanently — they bill real tokens and CI holds no keys — so
+this gate's evidence is a deliberate manual run, not a CI green.
+
+**The hermetic end-to-end milestone was the precondition and remains the daily gate.** The
+same path runs in `make ci` against OpenAI- and Anthropic-shaped mock providers with no
+network, no API keys, no docker, and no `#[ignore]`. The negative control (wrong `ca_file` →
+503, not 200) is what makes it proof rather than decoration.
+
+**Read the clean first run correctly.** The expectation was that the first real round-trip
+would expose defects — a path that has never carried a real request has never been tested,
+and that lesson had already cost two `StreamInfo` bugs found only at socket level. It
+exposed none. That says the mock tier modeled both providers accurately; it does *not* say
+the path is proven under load, concurrency, provider error shapes, or long streams, none of
+which are in the gate. Coverage therefore stays three-tiered: our mocks (`mock_e2e.rs`), a
+real third-party server (`local_openai_smoke.rs`, Ollama), and real providers
+(`live_smoke.rs`).
+
+**Current milestone is now v0.1.0 — LLM gateway** (WP-33 remainder, WP-34, WP-35, WP-45,
+WP-14).
 
 | WP | Title | State |
 |---|---|---|
@@ -45,7 +68,7 @@ smoke test against the real endpoints (see WP-26).
 | WP-16 | Cluster manager + discovery | ✅ done — `HostSet` snapshots + diffing, `HostResolver` seam, STATIC/STRICT_DNS/LOGICAL_DNS, warming via `is_initialized`/`force_initialize`. **EDS is a manager-level stub only** (the IR has no `Eds` variant — see WP-21) |
 | WP-17 | Load balancers (S7) | ✅ done — `RoundRobinLb` (nginx SWRR), `RandomLb`, `LeastRequestLb` (P2C), `HostPicker` (priority spillover + 50% panic + host override); ring-hash/Maglev rejected at **config** time pending an Envoy differential hashing harness |
 | WP-24 | Access logging | 🔶 **config + formatter + sink done; nothing emits.** IR, lowering for `FileAccessLog`/`StdoutAccessLog`/`StderrAccessLog`, a `parse_format`/`render` command-operator engine, and now the **writer**: `AccessLogWriter` + stdout/stderr/file sinks, logrotate `reopen()`, and a registry that dedups file sinks by canonical path. `write_line` returns no `Result` — a broken log destination must never fail a request. **Outstanding (chunk 3)**: the router populates no response flags, and nothing calls the sink. **This is the card closest to done, and WP-13's differential suite is gated on it** |
-| WP-26 | Differential rig | 🔶 upstreams (echo/flaky/slow/**OpenAI chat**/**OpenAI Responses**/**Anthropic Messages**, real SSE pacing) + scenario model + **config-validation differential vs real Envoy v1.38.0** (docker-gated; `make ci` stays docker-free). Latest run: 3 agree-accept, 2 agree-reject, 3 gap-we-reject, **0 bug-we-accept**. **Now also hosts the hermetic TLS e2e** (rcgen CA + `tokio-rustls` mock providers, RFC 6761 `*.test.localhost` for hermetic DNS, dual-stack loopback binds, wrong-CA negative control). **Outstanding**: HTTP traffic-replay topology (which also closes WP-06's swap-under-load gate — the only thing keeping Lane B from complete), and the `#[ignore]`d **live smoke test** against real OpenAI/Anthropic endpoints with keys from env |
+| WP-26 | Differential rig | 🔶 upstreams (echo/flaky/slow/**OpenAI chat**/**OpenAI Responses**/**Anthropic Messages**, real SSE pacing) + scenario model + **config-validation differential vs real Envoy v1.38.0** (docker-gated; `make ci` stays docker-free). Latest run: 3 agree-accept, 2 agree-reject, 3 gap-we-reject, **0 bug-we-accept**. **Now also hosts the hermetic TLS e2e** (rcgen CA + `tokio-rustls` mock providers, RFC 6761 `*.test.localhost` for hermetic DNS, dual-stack loopback binds, wrong-CA negative control). **The `#[ignore]`d live smoke test is written AND RUN** — 4 cases against real OpenAI/Anthropic endpoints, keys from env, all passing 2026-08-01; this is what shipped v0.0.1. **Outstanding**: HTTP traffic-replay topology (which also closes WP-06's swap-under-load gate — the only thing keeping Lane B from complete) |
 | WP-27 | Config corpus + scorecard | 🔶 17 real Envoy v1.38.0 bootstraps harvested with provenance; **3/20 (15.0%)**, all rejections carrying full field paths and **zero parse errors**. Vendoring the access-log protos moved four fixtures off an opaque `Any`-decode failure onto their real next gap |
 | WP-28 | Control-plane xDS harness | 🔶 ScriptedAds SotW puppet + ACK/NACK request log |
 | WP-30 | Perf benchmarks | 🔶 **phases 1+2.** Open-loop coordinated-omission-aware driver, SSE parsing, hdrhistogram latency/TTFT/TPOT; plus a process sampler (RSS/CPU/fds, macOS + Linux, explicit error rather than zeros on an unsupported platform), a ramp-hold-bisect concurrency sweep with a multi-clause SLO gate, and a capacity table with a least-squares cost model (bytes/stream, CPU-ms/request). **The rig detects and reports its own ceilings** — ~8k streams here from the ephemeral port range — and marks a run harness-bound rather than passing it off as proxy capacity. **Outstanding**: the Linux `/proc` sampler path is written to spec but unverified (no Linux box), and the plan's Nighthawk/fortio comparison |
