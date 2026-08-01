@@ -72,7 +72,17 @@ impl TokenUsage {
     /// Total token count across all buckets. Sound to sum because the buckets
     /// don't overlap.
     pub fn total(&self) -> u64 {
-        self.input_tokens + self.cached_tokens + self.cache_creation_tokens + self.output_tokens
+        // Saturating, not `+`: every one of these four numbers comes straight
+        // from a provider's JSON via `as_u64()` with no clamping, so the sum is
+        // attacker-/bug-reachable input, not a value we computed. A plain `+`
+        // panics on overflow in debug (killing the worker) and wraps in release
+        // (logging a billing number nobody computed). `parse_usage_object`
+        // already uses `saturating_sub` against these same numbers two lines
+        // away; this is the one place that was missed.
+        self.input_tokens
+            .saturating_add(self.cached_tokens)
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.output_tokens)
     }
 }
 
@@ -482,6 +492,23 @@ mod tests {
     use super::*;
 
     // ---- extract_json_usage: OpenAI ---------------------------------------
+
+    /// `total()` sums four numbers that came from a provider's JSON, so it
+    /// must never panic or wrap. Before this was saturating, a response
+    /// reporting huge token counts panicked the worker in debug builds
+    /// ("attempt to add with overflow") and silently wrapped in release --
+    /// on the live path, since `access_log.rs` calls `total()` for every
+    /// logged request.
+    #[test]
+    fn total_saturates_instead_of_overflowing_on_provider_numbers() {
+        let u = TokenUsage {
+            input_tokens: u64::MAX,
+            cached_tokens: 1,
+            cache_creation_tokens: 1,
+            output_tokens: 1,
+        };
+        assert_eq!(u.total(), u64::MAX, "must clamp, not wrap");
+    }
 
     #[test]
     fn openai_json_basic_usage() {
