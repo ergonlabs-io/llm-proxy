@@ -108,7 +108,7 @@ use proxy_config::ir::{AccessLogIR, PerFilterConfig, RouteEntry, RouteTable};
 use proxy_config::ConfigError;
 
 use crate::access_logging::{
-    snapshot_request_headers, AccessLogContext, AccessLoggerRuntime, LoggingBody,
+    snapshot_request, AccessLogContext, AccessLoggerRuntime, LoggingBody, RequestSnapshot,
 };
 use crate::filter::{
     BufferedBody, DecoderCallbacks, EncoderCallbacks, FilterDataStatus, FilterHeadersStatus,
@@ -641,7 +641,7 @@ impl StreamHandler for FilterChainHandler {
             // this. `unwrap_or_default()` only matters if every path inside
             // `run()` somehow skipped setting it, which none do (module doc
             // on `ChainCtx::request_headers_snapshot`'s field).
-            let request_headers = request_headers_snapshot
+            let request = request_headers_snapshot
                 .borrow_mut()
                 .take()
                 .unwrap_or_default();
@@ -650,7 +650,7 @@ impl StreamHandler for FilterChainHandler {
                 stream_info,
                 start_time,
                 start_instant,
-                request_headers,
+                request,
                 response_headers: resp.head.headers.clone(),
                 response_code: resp.head.status.as_u16(),
                 downstream_remote_address,
@@ -801,7 +801,7 @@ struct ChainCtx {
     /// build the `LoggingBody` it wraps the OUTERMOST response in — so it
     /// clones this `Rc` out of `ChainCtx` before `run()` ever takes
     /// ownership (see that call site), and reads it back through the clone.
-    request_headers_snapshot: Rc<RefCell<Option<HeaderMap>>>,
+    request_headers_snapshot: Rc<RefCell<Option<RequestSnapshot>>>,
 }
 
 impl ChainCtx {
@@ -995,10 +995,7 @@ impl FilterManager {
         // fresher, post-decode-filter snapshot — see
         // `ChainCtx::request_headers_snapshot`'s doc for why that ordering
         // matters.
-        *ctx.request_headers_snapshot.borrow_mut() = Some(snapshot_request_headers(
-            &req.head.headers,
-            req.head.uri.path(),
-        ));
+        *ctx.request_headers_snapshot.borrow_mut() = Some(snapshot_request(&req.head));
 
         // --- collect the request body (buffered model) ---
         let (mut head, req_trailers, mut body) = match collect_request(req).await {
@@ -1046,8 +1043,7 @@ impl FilterManager {
         // dialect-injected provider credentials. That ordering is
         // load-bearing: an access log must never become a place a
         // `Authorization`/`x-api-key` header leaks to.
-        *ctx.request_headers_snapshot.borrow_mut() =
-            Some(snapshot_request_headers(&head.headers, head.uri.path()));
+        *ctx.request_headers_snapshot.borrow_mut() = Some(snapshot_request(&head));
 
         // S2.5: a decoder filter may have called `send_local_reply` while the
         // chain above was running. If so, the request must not reach the

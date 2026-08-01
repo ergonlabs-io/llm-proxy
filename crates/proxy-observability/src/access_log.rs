@@ -379,6 +379,17 @@ pub struct LogContext<'a> {
     pub llm_tokens: Option<LlmTokens>,
     /// WP-33: time-to-first-token -- response headers to first body byte.
     pub llm_ttft: Option<std::time::Duration>,
+    /// Envoy request pseudo-header `:method` -- e.g. `GET`. These four fields
+    /// exist because `:method`/`:path`/`:authority`/`:scheme` are not legal
+    /// `http::HeaderName`s (a colon isn't a valid HTTP field-name character),
+    /// so they can't live in `request_headers` -- see `header_lookup`'s doc.
+    pub request_method: Option<&'a str>,
+    /// Envoy request pseudo-header `:path` -- e.g. `/v1/chat/completions`.
+    pub request_path: Option<&'a str>,
+    /// Envoy request pseudo-header `:authority` -- the request's `Host`.
+    pub request_authority: Option<&'a str>,
+    /// Envoy request pseudo-header `:scheme` -- e.g. `https`.
+    pub request_scheme: Option<&'a str>,
 }
 
 /// Render a parsed format string against a request's context. Allocation is
@@ -401,8 +412,8 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
             let pattern = fmt.as_deref().unwrap_or(DEFAULT_START_TIME_FORMAT);
             let _ = write!(out, "{}", dt.format(pattern));
         }
-        FormatOp::Req(spec) => render_header(ctx.request_headers, spec, out),
-        FormatOp::Resp(spec) => render_header(ctx.response_headers, spec, out),
+        FormatOp::Req(spec) => render_req(ctx, spec, out),
+        FormatOp::Resp(spec) => render_resp(ctx, spec, out),
         FormatOp::Trailer(spec) => render_header(ctx.response_trailers, spec, out),
         FormatOp::Protocol => out.push_str(ctx.protocol.unwrap_or("-")),
         FormatOp::ResponseCode => match ctx.response_code {
@@ -477,27 +488,105 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
     }
 }
 
-fn render_header(map: &http::HeaderMap, spec: &HeaderSpec, out: &mut String) {
-    let mut value = header_lookup(map, &spec.primary);
+/// The shared core of `%REQ%`/`%RESP%`/`%TRAILER%` rendering: resolve
+/// `spec.primary`, fall back to `spec.fallback` if the primary didn't
+/// resolve, then apply `:Z` truncation -- or `-` if neither resolved. The one
+/// thing that differs between REQ/RESP/TRAILER is *how a single name
+/// resolves to a value* (plain header lookup vs. also checking Envoy
+/// pseudo-headers), so that's the only part `resolve` has to supply; this
+/// function never itself knows what a pseudo-header is.
+///
+/// Rust note: `resolve` returns `Cow` rather than `&str` because RESP's
+/// `:status` resolver has to *format* `response_code` into an owned
+/// `String` (there's no borrowed `&str` to hand back), while a plain header
+/// lookup can hand back a borrow straight out of the `HeaderMap` -- `Cow`
+/// lets one function serve both without forcing every header lookup to
+/// allocate.
+fn render_named<'a, F>(spec: &HeaderSpec, mut resolve: F, out: &mut String)
+where
+    F: FnMut(&str) -> Option<std::borrow::Cow<'a, str>>,
+{
+    let mut value = resolve(&spec.primary);
     if value.is_none() {
         if let Some(fallback) = &spec.fallback {
-            value = header_lookup(map, fallback);
+            value = resolve(fallback);
         }
     }
     match value {
         Some(v) => match spec.truncate {
             Some(n) if v.chars().count() > n => out.extend(v.chars().take(n)),
-            _ => out.push_str(v),
+            _ => out.push_str(&v),
         },
         None => out.push('-'),
     }
 }
 
-/// Header lookup by name, including Envoy pseudo-header names like
-/// `:method`/`:authority` that aren't valid `http::HeaderName` tokens (the
-/// colon isn't allowed in an HTTP field-name) — those simply never match
-/// today (rendered as `-`) until a caller starts populating a pseudo-header
-/// under a real key. This never panics on a malformed operator argument.
+fn render_header(map: &http::HeaderMap, spec: &HeaderSpec, out: &mut String) {
+    render_named(
+        spec,
+        |name| header_lookup(map, name).map(std::borrow::Cow::Borrowed),
+        out,
+    );
+}
+
+/// `%REQ(X)%`/`%REQ(X?Y)%`: a name starting with `:` is one of Envoy's four
+/// request pseudo-headers (matched case-insensitively) and resolves against
+/// the typed [`LogContext`] fields; any other pseudo-name (e.g. `:bogus`)
+/// resolves to `None` rather than panicking (ground rule #1 doesn't apply
+/// here -- the format string was already validated at parse time, this is
+/// just "no data" like any other absent header). Anything not starting with
+/// `:` falls through to a plain [`header_lookup`] against
+/// `ctx.request_headers`.
+fn render_req(ctx: &LogContext<'_>, spec: &HeaderSpec, out: &mut String) {
+    render_named(
+        spec,
+        |name| resolve_req_pseudo(ctx, name).map(std::borrow::Cow::Borrowed),
+        out,
+    );
+}
+
+fn resolve_req_pseudo<'a>(ctx: &LogContext<'a>, name: &str) -> Option<&'a str> {
+    if let Some(pseudo) = name.strip_prefix(':') {
+        return match pseudo.to_ascii_lowercase().as_str() {
+            "method" => ctx.request_method,
+            "path" => ctx.request_path,
+            "authority" => ctx.request_authority,
+            "scheme" => ctx.request_scheme,
+            _ => None,
+        };
+    }
+    header_lookup(ctx.request_headers, name)
+}
+
+/// `%RESP(X)%`/`%RESP(X?Y)%`: only `:status` is a recognized response
+/// pseudo-header (resolving to `ctx.response_code`, formatted); any other
+/// pseudo-name resolves to `None`. `%TRAILER%` does NOT go through this --
+/// trailers have no pseudo-headers, so `FormatOp::Trailer` still renders via
+/// plain [`render_header`].
+fn render_resp(ctx: &LogContext<'_>, spec: &HeaderSpec, out: &mut String) {
+    render_named(spec, |name| resolve_resp_pseudo(ctx, name), out);
+}
+
+fn resolve_resp_pseudo<'a>(ctx: &LogContext<'a>, name: &str) -> Option<std::borrow::Cow<'a, str>> {
+    if let Some(pseudo) = name.strip_prefix(':') {
+        return match pseudo.to_ascii_lowercase().as_str() {
+            "status" => ctx
+                .response_code
+                .map(|c| std::borrow::Cow::Owned(c.to_string())),
+            _ => None,
+        };
+    }
+    header_lookup(ctx.response_headers, name).map(std::borrow::Cow::Borrowed)
+}
+
+/// Header lookup by name. Handles the common case (a real HTTP field name)
+/// via `http::HeaderName`; Envoy pseudo-header names like `:method`/
+/// `:authority` are NOT valid `http::HeaderName` tokens (a colon isn't
+/// allowed in an HTTP field-name), so they never reach this function at all
+/// for `%REQ%`/`%RESP%` -- [`render_req`]/[`render_resp`] intercept and
+/// resolve those against [`LogContext`]'s typed pseudo-header fields before
+/// falling through to this plain lookup. This never panics on a malformed
+/// operator argument.
 fn header_lookup<'a>(map: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
     let header_name = http::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()).ok()?;
     map.get(header_name)?.to_str().ok()
@@ -678,6 +767,10 @@ mod tests {
             downstream_remote_address: Some("127.0.0.1:1234"),
             llm_tokens: None,
             llm_ttft: None,
+            request_method: Some("POST"),
+            request_path: Some("/v1/chat/completions"),
+            request_authority: Some("api.example.com"),
+            request_scheme: Some("https"),
         }
     }
 
@@ -746,6 +839,79 @@ mod tests {
         assert_eq!(default, "1970-01-01T00:00:00.000Z");
         let custom = render(&parse("%START_TIME(%s)%"), &c);
         assert_eq!(custom, "0");
+    }
+
+    // -------------------------------------------------- request pseudo-headers --
+
+    #[test]
+    fn req_pseudo_headers_render_context_values() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%REQ(:METHOD)% %REQ(:PATH)% %REQ(:AUTHORITY)% %REQ(:SCHEME)%");
+        assert_eq!(
+            render(&fs, &c),
+            "POST /v1/chat/completions api.example.com https"
+        );
+    }
+
+    #[test]
+    fn req_pseudo_headers_case_insensitive() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%REQ(:method)%");
+        assert_eq!(render(&fs, &c), "POST");
+    }
+
+    #[test]
+    fn req_pseudo_headers_render_dash_when_absent() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.request_method = None;
+        c.request_path = None;
+        c.request_authority = None;
+        c.request_scheme = None;
+        let fs = parse("%REQ(:METHOD)% %REQ(:PATH)% %REQ(:AUTHORITY)% %REQ(:SCHEME)%");
+        assert_eq!(render(&fs, &c), "- - - -");
+    }
+
+    #[test]
+    fn req_unknown_pseudo_header_renders_dash_not_panic() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%REQ(:BOGUS)%");
+        assert_eq!(render(&fs, &c), "-");
+    }
+
+    #[test]
+    fn resp_status_pseudo_header_renders_response_code() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%RESP(:STATUS)%");
+        assert_eq!(render(&fs, &c), "200");
+    }
+
+    #[test]
+    fn resp_unknown_pseudo_header_renders_dash() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%RESP(:BOGUS)%");
+        assert_eq!(render(&fs, &c), "-");
+    }
+
+    #[test]
+    fn req_original_path_fallback_prefers_header_then_falls_back_to_path_pseudo() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        // No `x-envoy-original-path` header set -> falls back to `:PATH`.
+        let fs = parse("%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%");
+        assert_eq!(render(&fs, &c), "/v1/chat/completions");
+
+        // Header present -> the primary wins over the `:PATH` fallback.
+        let mut req = http::HeaderMap::new();
+        req.insert("x-envoy-original-path", "/rewritten".parse().unwrap());
+        let c2 = ctx(&req, &empty, &empty, &[]);
+        let fs2 = parse("%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%");
+        assert_eq!(render(&fs2, &c2), "/rewritten");
     }
 
     #[test]

@@ -171,11 +171,15 @@ async fn build_router(
 }
 
 fn request(path: &'static str) -> HttpRequestParts {
+    request_with_method(Method::GET, path)
+}
+
+fn request_with_method(method: Method, path: &'static str) -> HttpRequestParts {
     let mut headers = HeaderMap::new();
     headers.insert(http::header::HOST, HeaderValue::from_static("test.local"));
     HttpRequestParts {
         head: RequestHeaders {
-            method: Method::GET,
+            method,
             uri: Uri::from_static(path),
             headers,
         },
@@ -252,6 +256,36 @@ async fn successful_proxied_request_writes_one_line_with_status_and_path() {
 
             let logged = read_to_string(&path);
             assert_eq!(logged, "200 /v1/chat/completions\n");
+
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+/// The bug this test exists to catch: `%REQ(:METHOD)%` (part of Envoy's OWN
+/// default access-log format) used to always render `-` -- no pseudo-header
+/// could ever match a real `http::HeaderName`-based lookup -- so every
+/// access log this proxy wrote was missing the request method.
+#[tokio::test(flavor = "current_thread")]
+async fn req_method_pseudo_header_carries_the_real_method_not_a_dash() {
+    LocalSet::new()
+        .run_until(async {
+            let addr = spawn_upstream_ok(b"hi").await;
+            let path = temp_path("req-method");
+            let handler = build_router(
+                Some(addr),
+                vec![text_logger(&path, "%REQ(:METHOD)%\n", None)],
+            )
+            .await;
+
+            let resp = handler
+                .handle(request_with_method(Method::POST, "/v1/chat/completions"))
+                .await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            resp.body.collect().await.unwrap();
+
+            let logged = read_to_string(&path);
+            assert_eq!(logged, "POST\n");
 
             std::fs::remove_file(&path).unwrap();
         })

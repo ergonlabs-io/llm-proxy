@@ -172,25 +172,56 @@ fn json_escape_into(s: &str, out: &mut String) {
     }
 }
 
-/// `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%` (the default access-log format's own
-/// path field) falls back to a `:PATH` pseudo-header `header_lookup` can
-/// never resolve (see its doc in `proxy_observability::access_log`) --
-/// populating the *primary* header here, the same normal header name real
-/// Envoy sets on a `prefix_rewrite`, is what makes that default format
-/// usable at all for the path, without touching the (frozen) formatter
-/// itself.
+/// A snapshot of everything the access-log formatter needs from a request
+/// head, taken at a point in time (see `ChainCtx::request_headers_snapshot`'s
+/// doc in `filter_manager` for exactly when). Carries the four Envoy request
+/// pseudo-headers alongside the header map -- rather than injecting them
+/// into the map under some real header name -- because none of them are
+/// legal `http::HeaderName`s (a colon isn't a valid HTTP field-name
+/// character); `proxy_observability::access_log::LogContext`'s own
+/// `request_method`/`request_path`/`request_authority`/`request_scheme`
+/// fields exist for the same reason, and this struct is what feeds them.
 ///
-/// Rust note: takes `&HeaderMap` and clones rather than mutating in place --
-/// every call site needs an independent snapshot (the caller's own headers
-/// keep flowing through the rest of the pipeline unmodified).
-pub(crate) fn snapshot_request_headers(headers: &HeaderMap, path: &str) -> HeaderMap {
-    let mut snapshot = headers.clone();
-    if !snapshot.contains_key("x-envoy-original-path") {
-        if let Ok(v) = http::HeaderValue::from_str(path) {
-            snapshot.insert("x-envoy-original-path", v);
-        }
+/// Rust note: owns everything (`String`, not `&str`) rather than borrowing
+/// from the request head -- the snapshot has to outlive the request head it
+/// was taken from (it's read back after `FilterManager::run` returns, by
+/// which point the head has already been consumed into the response path).
+#[derive(Default)]
+pub(crate) struct RequestSnapshot {
+    pub(crate) headers: HeaderMap,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) authority: Option<String>,
+    pub(crate) scheme: Option<String>,
+}
+
+/// Build a [`RequestSnapshot`] from a request head. `authority` prefers the
+/// URI's own `:authority` (`Uri::authority()` -- populated for absolute-form
+/// requests, e.g. CONNECT or an HTTP/2 `:authority` pseudo-header threaded
+/// through) and falls back to the `Host` header real origin-form requests
+/// carry instead. `scheme` comes from the URI alone; an origin-form request
+/// (the common case for a downstream HTTP/1 request line) carries no scheme,
+/// so this is commonly `None` -- rendered as `-`, same as any other absent
+/// pseudo-header.
+///
+/// Rust note: takes `&RequestHeaders` and clones its `HeaderMap` rather than
+/// mutating in place -- every call site needs an independent snapshot (the
+/// caller's own headers keep flowing through the rest of the pipeline
+/// unmodified).
+pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestSnapshot {
+    let authority = head.uri.authority().map(|a| a.to_string()).or_else(|| {
+        head.headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    });
+    RequestSnapshot {
+        headers: head.headers.clone(),
+        method: head.method.to_string(),
+        path: head.uri.path().to_string(),
+        authority,
+        scheme: head.uri.scheme_str().map(|s| s.to_string()),
     }
-    snapshot
 }
 
 /// Everything [`LoggingBody`] needs to render + write a line once the
@@ -202,7 +233,7 @@ pub(crate) struct AccessLogContext {
     pub(crate) stream_info: Rc<RefCell<StreamInfo>>,
     pub(crate) start_time: SystemTime,
     pub(crate) start_instant: Instant,
-    pub(crate) request_headers: HeaderMap,
+    pub(crate) request: RequestSnapshot,
     pub(crate) response_headers: HeaderMap,
     pub(crate) response_code: u16,
     pub(crate) downstream_remote_address: String,
@@ -305,7 +336,7 @@ impl LoggingBody {
 
         let log_ctx = LogContext {
             start_time: ctx.start_time,
-            request_headers: &ctx.request_headers,
+            request_headers: &ctx.request.headers,
             response_headers: &ctx.response_headers,
             response_trailers: &self.trailers,
             protocol: protocol.as_deref(),
@@ -319,6 +350,10 @@ impl LoggingBody {
             downstream_remote_address: Some(&ctx.downstream_remote_address),
             llm_tokens,
             llm_ttft,
+            request_method: Some(&ctx.request.method),
+            request_path: Some(&ctx.request.path),
+            request_authority: ctx.request.authority.as_deref(),
+            request_scheme: ctx.request.scheme.as_deref(),
         };
         for logger in ctx.loggers.iter() {
             logger.log(&log_ctx);
@@ -445,7 +480,13 @@ mod tests {
             stream_info: Rc::new(RefCell::new(stream_info)),
             start_time: SystemTime::now(),
             start_instant: Instant::now(),
-            request_headers: HeaderMap::new(),
+            request: RequestSnapshot {
+                headers: HeaderMap::new(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                authority: None,
+                scheme: None,
+            },
             response_headers: HeaderMap::new(),
             response_code: StatusCode::OK.as_u16(),
             downstream_remote_address: "127.0.0.1:0".to_string(),

@@ -480,6 +480,10 @@ mod tests {
             downstream_remote_address: None,
             llm_tokens: None,
             llm_ttft: None,
+            request_method: None,
+            request_path: None,
+            request_authority: None,
+            request_scheme: None,
         };
         let line = render(&fmt, &ctx);
         assert_eq!(line, "HTTP/1.1 200\n");
