@@ -70,6 +70,13 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         // -- it only does anything on a route that configures it, and a filter
         // that isn't in the registry is a hard config error at load time.
         registry.register(Arc::new(proxy_filters::usage_filter::UsageFilterFactory));
+        // WP-45 increment 2b (Lane H): the request-body rewrite filter
+        // (forced `stream_options.include_usage` for OpenAI-dialect
+        // streaming requests). Also registered unconditionally, same
+        // reasoning as the usage filter above.
+        registry.register(Arc::new(
+            proxy_filters::body_rewrite_filter::BodyRewriteFilterFactory,
+        ));
         Arc::new(registry)
     })
 }
@@ -3003,5 +3010,264 @@ static_resources:
             msg.contains("typed_config.inline_string") || msg.contains("gemini"),
             "error should name the invalid dialect field/value, got: {msg}"
         );
+    }
+
+    // --- WP-45 increment 2b: body-rewrite filter over a real socket -----------
+
+    /// A real upstream that reads a raw HTTP/1.1 request by hand, echoes the
+    /// request body back as its own response body, and reports two numbers
+    /// as response headers: the `content-length` the request DECLARED, and
+    /// the number of body bytes it actually READ off the wire. WP-45
+    /// increment 2's whole point is that those two numbers must agree after
+    /// the body-rewrite filter splices bytes in and grows `content-length`
+    /// to match -- a unit test can't observe that, since it never puts real
+    /// bytes on a real socket with real HTTP/1.1 framing.
+    async fn spawn_http_upstream_echoing_request_body() -> SocketAddr {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::task::spawn_local(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let header_end = loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    break pos;
+                                }
+                            }
+                        }
+                    };
+                    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let declared_content_length: usize = header_str
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .expect(
+                            "this fixture only serves the content-length code path -- \
+                             the request must declare one",
+                        );
+
+                    let mut body = buf[header_end + 4..].to_vec();
+                    while body.len() < declared_content_length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let actual_body_length = body.len();
+
+                    // Per HTTP/1.1 framing this fixture stops reading the
+                    // instant it's read exactly `declared_content_length`
+                    // bytes -- that's the correct, honest behavior of a real
+                    // upstream. If the proxy actually put MORE bytes on the
+                    // wire than it declared (the exact failure mode of
+                    // skipping the content-length fix-up after an
+                    // injection), those extra bytes are still sitting
+                    // unread in the kernel receive buffer right now. A short
+                    // bounded probe surfaces them as `leftover_bytes`; a
+                    // healthy request always has zero.
+                    let mut leftover = Vec::new();
+                    loop {
+                        match tokio::time::timeout(
+                            Duration::from_millis(100),
+                            stream.read(&mut chunk),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(n)) => leftover.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let leftover_bytes = leftover.len();
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nx-received-content-length: {declared_content_length}\r\nx-actual-body-length: {actual_body_length}\r\nx-leftover-bytes: {leftover_bytes}\r\nconnection: close\r\n\r\n",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// The WP-45 increment 2 acceptance test: a bootstrap YAML wires the
+    /// `type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag`
+    /// body-rewrite filter ahead of the router, a streaming OpenAI request
+    /// WITHOUT `stream_options` is sent over a real socket, and the request
+    /// the upstream actually received on the wire is asserted to (a) equal
+    /// the original body with `stream_options` spliced in, byte for byte,
+    /// and (b) leave nothing unread on the wire (`x-leftover-bytes: 0`) --
+    /// proving the splice and the `modify_decoded_headers` content-length
+    /// fix-up landed together, not just that the scanner/splice logic is
+    /// correct in isolation (that's `body_rewrite_filter`'s own unit tests).
+    ///
+    /// Mutation-tested: skipping the `modify_decoded_headers` call (so
+    /// `content-length` stays at the pre-injection length while the actual
+    /// body sent is longer) turns this red -- the fixture, obeying real
+    /// HTTP/1.1 framing, stops reading at the stale (too-small) declared
+    /// length, so the extra injected bytes are left sitting unread
+    /// (`x-leftover-bytes` > 0) and the echoed body no longer matches the
+    /// expected spliced body. A first version of this test only compared
+    /// `x-received-content-length` against how many bytes the fixture itself
+    /// chose to read up to that same declared length -- trivially equal by
+    /// construction, so it never actually caught this mutation; the
+    /// `x-leftover-bytes` probe and the exact-body comparison below are what
+    /// make it load-bearing.
+    #[test]
+    fn body_rewrite_filter_injects_and_fixes_content_length_over_a_real_upstream() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        run_local(async {
+            let proxy_port = free_port().await;
+            let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+
+            let upstream_addr = spawn_http_upstream_echoing_request_body().await;
+
+            let request_body =
+                br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {proxy_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.body_rewrite
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag
+                      default_value: true
+                      runtime_key: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: up }}
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {upstream_ip}, port_value: {upstream_port} }}
+"#,
+                proxy_port = proxy_port,
+                upstream_ip = upstream_addr.ip(),
+                upstream_port = upstream_addr.port(),
+            );
+
+            let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+                .expect("bootstrap YAML must parse");
+            let snapshot = Arc::new(build_snapshot(&loaded).expect("bootstrap YAML must lower"));
+
+            let harness = spawn_manager(snapshot).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(proxy_addr)
+                .await
+                .expect("connect should succeed");
+            let request = format!(
+                "POST / HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                request_body.len(),
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(request_body).await.unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let header_end = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response must have a header/body separator");
+            let status_line_and_headers =
+                String::from_utf8(response[..header_end].to_vec()).expect("headers valid utf8");
+            assert!(
+                status_line_and_headers.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {status_line_and_headers:?}"
+            );
+
+            let header_value = |name: &str| -> usize {
+                status_line_and_headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        if key.trim().eq_ignore_ascii_case(name) {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("upstream must report {name}"))
+            };
+            let received_content_length = header_value("x-received-content-length");
+            let actual_body_length = header_value("x-actual-body-length");
+            let leftover_bytes = header_value("x-leftover-bytes");
+
+            assert_eq!(
+                received_content_length, actual_body_length,
+                "the upstream's declared content-length must match the body bytes it actually read \
+                 up to that length (this alone is true by construction -- see the doc comment on \
+                 why the assertions below are the ones that actually catch a broken fix-up)"
+            );
+            assert_eq!(
+                leftover_bytes, 0,
+                "no bytes should be left unread on the wire past the declared content-length -- \
+                 a nonzero count means the proxy put more bytes on the wire than it declared"
+            );
+
+            let echoed_body = &response[header_end + 4..];
+            let inject = r#""stream_options":{"include_usage":true},"#;
+            let mut expected_body = Vec::with_capacity(request_body.len() + inject.len());
+            expected_body.extend_from_slice(&request_body[..1]);
+            expected_body.extend_from_slice(inject.as_bytes());
+            expected_body.extend_from_slice(&request_body[1..]);
+            assert_eq!(
+                echoed_body, expected_body,
+                "the upstream must have received the original body with stream_options spliced \
+                 in right after the opening `{{`, byte for byte"
+            );
+
+            harness.shutdown().await;
+        });
     }
 }

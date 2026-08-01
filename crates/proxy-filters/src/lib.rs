@@ -19,9 +19,13 @@
 //!   - WP-45: bounded request-body prefix scan + splice
 //!     ([`body_rewrite`]), shared by forced usage reporting and body-based
 //!     model routing. Increment 1: the scanner/policy library only, not yet
-//!     wired into a filter.
+//!     wired into a filter. Increment 2b ([`body_rewrite_filter`]) wires it
+//!     into a real decode-path `HttpFilter`, consumer A only (forced
+//!     `stream_options.include_usage` for OpenAI-dialect streaming requests).
+//!     Consumer B (body-based model routing) is not built here.
 
 pub mod body_rewrite;
+pub mod body_rewrite_filter;
 pub mod token_limit;
 pub mod usage;
 pub mod usage_filter;
