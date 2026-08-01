@@ -35,9 +35,12 @@ use http::HeaderMap;
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
+use std::sync::Arc;
+
 use proxy_http::filter::{
     EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus, FilterInstanceFactory,
-    FilterTrailersStatus, HttpFilter, HttpFilterFactory, ResponseHeaders, ResponseTrailers,
+    FilterTrailersStatus, HttpFilter, HttpFilterFactory, PerRouteConfig, ResponseHeaders,
+    ResponseTrailers,
 };
 use proxy_http::LlmTokenUsage;
 
@@ -91,6 +94,14 @@ impl HttpFilterFactory for UsageFilterFactory {
         let dialect = parse_config(config)?;
         Ok(Box::new(UsageFilterInstanceFactory { dialect }))
     }
+
+    fn parse_per_route(
+        &self,
+        config: &DynamicMessage,
+    ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
+        let dialect = parse_config(config)?;
+        Ok(Arc::new(UsagePerRouteConfig(dialect)))
+    }
 }
 
 /// Read the configured dialect out of a `DataSource`-shaped `typed_config`.
@@ -116,6 +127,14 @@ fn parse_config(config: &DynamicMessage) -> Result<Dialect, ConfigError> {
 
 /// Created once per (filter config, listener); stateless beyond the parsed
 /// dialect, so building a fresh per-stream instance is cheap.
+struct UsagePerRouteConfig(Dialect);
+
+impl PerRouteConfig for UsagePerRouteConfig {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 struct UsageFilterInstanceFactory {
     dialect: Dialect,
 }
@@ -265,7 +284,16 @@ impl HttpFilter for UsageFilterInstance {
         end_stream: bool,
     ) -> FilterHeadersStatus {
         self.headers_at = Some(Instant::now());
-        self.mode = classify_body(&headers.headers, self.dialect);
+        let dialect = cb
+            .per_route_config()
+            .and_then(|cfg| {
+                cfg.as_any()
+                    .downcast_ref::<UsagePerRouteConfig>()
+                    .map(|c| c.0)
+            })
+            .unwrap_or(self.dialect);
+        self.dialect = dialect;
+        self.mode = classify_body(&headers.headers, dialect);
 
         // A response with no body at all (e.g. a 204, or a HEAD reply) — there's
         // nothing more to observe, so finalize right here.
@@ -346,8 +374,9 @@ mod tests {
 
     use bytes::Bytes;
     use http::{HeaderValue, StatusCode};
+    use std::sync::Arc;
 
-    use proxy_http::filter::BufferedBody;
+    use proxy_http::filter::{BufferedBody, PerRouteConfig};
     use proxy_http::stream_info::StreamInfo;
 
     // --- test scaffolding ---------------------------------------------------
@@ -363,17 +392,28 @@ mod tests {
     /// (`Rc<RefCell<StreamInfo>>`), so `stream_info()` returns a `RefMut`
     /// guard rather than a plain `&mut`. The double mirrors that shape; no
     /// `Rc` is needed here since nothing else holds a handle.
-    struct TestCallbacks(std::cell::RefCell<StreamInfo>);
+    struct TestCallbacks {
+        stream_info: std::cell::RefCell<StreamInfo>,
+        per_route_config: Option<Arc<dyn PerRouteConfig>>,
+    }
 
     impl TestCallbacks {
         fn new() -> Self {
-            TestCallbacks(std::cell::RefCell::new(StreamInfo::default()))
+            TestCallbacks {
+                stream_info: std::cell::RefCell::new(StreamInfo::default()),
+                per_route_config: None,
+            }
+        }
+
+        fn with_per_route_config(mut self, config: Arc<dyn PerRouteConfig>) -> Self {
+            self.per_route_config = Some(config);
+            self
         }
 
         /// Snapshot the LLM stats for assertions, so tests don't hold a
         /// `Ref` guard across a later filter call.
         fn llm(&self) -> proxy_http::LlmStats {
-            self.0.borrow().llm.clone()
+            self.stream_info.borrow().llm.clone()
         }
     }
 
@@ -393,8 +433,15 @@ mod tests {
         fn modify_encoding_buffer(&mut self, _f: &mut dyn FnMut(&mut BytesMut)) {
             unimplemented!("usage filter must not touch the encoding buffer")
         }
+        /// Must be overridden, not inherited. `EncoderCallbacks` defaults this
+        /// to `None`, so a double that merely *stores* a per-route config
+        /// without returning it here sends every test down the no-override
+        /// path — the per-route logic looks exercised while never running.
+        fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>> {
+            self.per_route_config.clone()
+        }
         fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo> {
-            self.0.borrow_mut()
+            self.stream_info.borrow_mut()
         }
     }
 
@@ -747,5 +794,39 @@ mod tests {
         let usage = cb.llm().usage.expect("usage should be found");
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 4);
+    }
+
+    #[test]
+    fn per_route_config_override_changes_the_dialect_used() {
+        let mut filter = filter_for(Dialect::OpenAi);
+        let override_cfg = Arc::new(UsagePerRouteConfig(Dialect::Anthropic));
+        let mut cb = TestCallbacks::new().with_per_route_config(override_cfg);
+
+        let mut headers = response_headers("application/json");
+        assert_eq!(
+            filter.encode_headers(&mut cb, &mut headers, false),
+            FilterHeadersStatus::Continue
+        );
+
+        let mut data = Bytes::from_static(br#"{"usage":{"input_tokens":7,"output_tokens":9}}"#);
+        filter.encode_data(&mut cb, &mut data, true);
+
+        let usage = cb.llm().usage.expect("usage should be found");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 9);
+    }
+
+    #[test]
+    fn parse_per_route_accepts_route_level_dialect() {
+        let factory = UsageFilterFactory;
+        let per_route = factory
+            .parse_per_route(&data_source("anthropic"))
+            .expect("valid per-route config");
+        let dialect = per_route
+            .as_any()
+            .downcast_ref::<UsagePerRouteConfig>()
+            .expect("UsagePerRouteConfig")
+            .0;
+        assert_eq!(dialect, Dialect::Anthropic);
     }
 }
