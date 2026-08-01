@@ -43,8 +43,10 @@ use hyper::body::{Body, Frame};
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
 use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
+use proxy_observability::ResponseFlag;
 
 use crate::handler::{BodyError, StreamBody};
+use crate::router::idle::IdleTimeoutError;
 use crate::stream_info::StreamInfo;
 
 /// One configured logger, resolved at HCM-bind time (mirrors
@@ -289,6 +291,64 @@ impl LoggingBody {
         }
     }
 
+    /// Classifies a body-stream failure into the `ResponseFlag` an operator
+    /// needs to tell the three shapes apart: the client went away
+    /// (`BodyError::Downstream` -> DC), the upstream connection died mid-body
+    /// (`BodyError::Upstream` -> UC), or the upstream just went quiet past
+    /// the S4 idle deadline while still (as far as we know) alive (`SI`).
+    ///
+    /// Rust note: `BodyError::Upstream`'s source is a type-erased
+    /// `Box<dyn Error + Send + Sync>` (`router::idle::IdleTimeoutBody` and
+    /// every other upstream body wrapper share that one variant), so the
+    /// idle-timeout case can't be told apart by matching the `BodyError`
+    /// variant alone -- `downcast_ref` walks the erased box back to its
+    /// concrete type at runtime (this is exactly what `std::error::Error`'s
+    /// inherited `Any`-based downcast exists for).
+    fn classify(err: &BodyError) -> ResponseFlag {
+        match err {
+            BodyError::Downstream(_) => ResponseFlag::DownstreamConnectionTermination,
+            BodyError::Upstream(source) => {
+                if source.downcast_ref::<IdleTimeoutError>().is_some() {
+                    ResponseFlag::StreamIdleTimeout
+                } else {
+                    ResponseFlag::UpstreamConnectionTermination
+                }
+            }
+        }
+    }
+
+    /// Records a mid-stream failure (a `poll_frame` error, or a `Drop`
+    /// before end-of-stream) onto `StreamInfo` and emits the operator-facing
+    /// warning -- both before `finish()` snapshots the flags into the
+    /// rendered line, since `finish()` (via `ctx.take()`) is the point of no
+    /// return for this stream's log line. A no-op if `finish()` already ran
+    /// (`self.ctx` is `None`): `poll_frame` and `Drop` both call this, and
+    /// only the first to observe the failure should record it.
+    fn record_failure(&mut self, flag: ResponseFlag, detail: &dyn std::fmt::Display) {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return;
+        };
+        let (cluster, upstream_host, ttft) = {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.set_response_flag(flag);
+            (
+                info.upstream_cluster.clone(),
+                info.upstream_host.clone(),
+                info.llm.time_to_first_byte,
+            )
+        };
+        tracing::warn!(
+            response_flag = flag.code(),
+            cluster = cluster.as_deref().unwrap_or("-"),
+            upstream_host = upstream_host.as_deref().unwrap_or("-"),
+            bytes_sent = self.bytes_sent,
+            elapsed_ms = ctx.start_instant.elapsed().as_millis() as u64,
+            ttft_ms = ttft.map(|d| d.as_millis() as u64),
+            error = %detail,
+            "response stream failed mid-flight"
+        );
+    }
+
     fn finish(&mut self) {
         let Some(ctx) = self.ctx.take() else {
             // Already logged (`poll_frame` beat `Drop` to it, or vice versa).
@@ -382,11 +442,19 @@ impl Body for LoggingBody {
                     this.trailers = trailers.clone();
                 }
             }
-            // Both a clean end-of-stream and an error are terminal for
-            // logging purposes: either way nothing more will ever flow
-            // through this body, so this is the last chance to observe the
-            // final byte count before the caller (or `Drop`) moves on.
-            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.finish(),
+            // A clean end-of-stream needs no flag -- see the `Err` arm below
+            // for the failure case.
+            Poll::Ready(None) => this.finish(),
+            // An error is terminal too, but -- unlike a clean end -- it's a
+            // failure an operator needs visible in the access log: classify
+            // it into a `ResponseFlag` and warn *before* `finish()` snapshots
+            // the flags (see `record_failure`'s doc for why the ordering
+            // matters).
+            Poll::Ready(Some(Err(err))) => {
+                let flag = Self::classify(err);
+                this.record_failure(flag, err);
+                this.finish();
+            }
             Poll::Pending => {}
         }
         poll
@@ -405,8 +473,20 @@ impl Drop for LoggingBody {
     fn drop(&mut self) {
         // Covers the abandoned-stream case: a disconnecting client, or an
         // outer combinator dropping this body before it ever reached
-        // end-of-stream/error through `poll_frame`. `finish` is idempotent
-        // (`ctx.take()`), so this is a no-op if `poll_frame` already logged.
+        // end-of-stream/error through `poll_frame`. `self.ctx` is still
+        // `Some` here exactly when neither `poll_frame` arm above ran to
+        // completion -- i.e. the stream never cleanly ended and never
+        // errored, it was simply given up on. That's a downstream
+        // termination from the operator's point of view (the far end went
+        // away without us ever seeing why), same as Envoy's DC.
+        if self.ctx.is_some() {
+            self.record_failure(
+                ResponseFlag::DownstreamConnectionTermination,
+                &"response body dropped before end-of-stream",
+            );
+        }
+        // `finish` is idempotent (`ctx.take()`), so this is a no-op if
+        // `poll_frame` already logged.
         self.finish();
     }
 }
@@ -529,6 +609,294 @@ mod tests {
         assert_eq!(
             render_one(crate::stream_info::LlmStats::default()).await,
             "- - - - - -"
+        );
+    }
+
+    // --- mid-stream body failure visibility -------------------------------
+    //
+    // The gap these tests close: a response body that errors (or is dropped)
+    // *after* headers have already gone downstream used to leave
+    // `StreamInfo::response_flags` empty -- an SSE stream killed by the
+    // network logged byte-identical to a short-but-successful completion.
+    // See `LoggingBody::classify`/`record_failure`.
+
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::Duration;
+
+    use crate::router::idle::IdleTimeoutBody;
+
+    /// A minimal [`tracing::Subscriber`] that only counts WARN-level events
+    /// -- enough to prove "a mid-stream failure warns" and "a clean end does
+    /// not warn" without pulling in a tracing-capture crate as a new
+    /// dev-dependency.
+    struct WarnCounter(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Builds a bare-bones [`AccessLogContext`] rendering just
+    /// `%RESPONSE_FLAGS% %BYTES_SENT%`, wired to `capture`.
+    fn flags_ctx(capture: &Arc<CaptureSink>) -> AccessLogContext {
+        let fmt = parse_format("%RESPONSE_FLAGS% %BYTES_SENT%").unwrap();
+        let logger = AccessLoggerRuntime {
+            sink: capture.clone() as Arc<dyn AccessLogWriter>,
+            format: AccessLogFormat::Text(fmt),
+            filter: None,
+        };
+        AccessLogContext {
+            loggers: Rc::new(vec![logger]),
+            stream_info: Rc::new(RefCell::new(StreamInfo::default())),
+            start_time: SystemTime::now(),
+            start_instant: Instant::now(),
+            request: RequestSnapshot {
+                headers: HeaderMap::new(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                authority: None,
+                scheme: None,
+            },
+            response_headers: HeaderMap::new(),
+            response_code: StatusCode::OK.as_u16(),
+            downstream_remote_address: "127.0.0.1:0".to_string(),
+        }
+    }
+
+    /// A body that yields one `"hi"` data frame, then a configurable error.
+    struct OneFrameThenError {
+        frame: Option<Bytes>,
+        err: Option<BodyError>,
+    }
+
+    impl hyper::body::Body for OneFrameThenError {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(data) = this.frame.take() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+            if let Some(err) = this.err.take() {
+                return Poll::Ready(Some(Err(err)));
+            }
+            Poll::Ready(None)
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.frame.is_none() && self.err.is_none()
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::default()
+        }
+    }
+
+    /// A body that yields one `"hi"` data frame, then goes `Pending` forever
+    /// -- stands in for an SSE stream whose connection dies without ever
+    /// producing another frame or an explicit error, i.e. the "abandoned"
+    /// case `Drop` (not `poll_frame`) has to catch.
+    struct FrameThenPendingForever {
+        frame: Option<Bytes>,
+    }
+
+    impl hyper::body::Body for FrameThenPendingForever {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(data) = this.frame.take() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+            Poll::Pending
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::default()
+        }
+    }
+
+    /// A body that never produces a frame -- the inner body an idle-timeout
+    /// wrapper sits on top of, so the *only* way `IdleTimeoutBody` ever
+    /// resolves is via its own timer, not via this body doing anything.
+    struct NeverBody;
+
+    impl hyper::body::Body for NeverBody {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_body_error_mid_stream_logs_uc() {
+        let capture = Arc::new(CaptureSink::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard = tracing::subscriber::set_default(WarnCounter(counter.clone()));
+
+        let body = local_boxed(OneFrameThenError {
+            frame: Some(Bytes::from_static(b"hi")),
+            err: Some(BodyError::Upstream(Box::new(io::Error::other(
+                "connection reset by peer",
+            )))),
+        });
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+        // The inner error surfaces through `collect()` too -- draining is
+        // exactly what a real response-forwarding loop does.
+        assert!(logging_body.collect().await.is_err());
+
+        drop(guard);
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1, "expected exactly one rendered line");
+        assert_eq!(lines.remove(0), "UC 2");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a mid-stream failure must warn exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_body_error_mid_stream_logs_dc() {
+        let capture = Arc::new(CaptureSink::default());
+        let body = local_boxed(OneFrameThenError {
+            frame: Some(Bytes::from_static(b"hi")),
+            err: Some(BodyError::Downstream(Box::new(io::Error::other(
+                "client disconnected",
+            )))),
+        });
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+        assert!(logging_body.collect().await.is_err());
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.remove(0), "DC 2");
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_body_error_logs_si_not_uc() {
+        // The regression-prone case: `IdleTimeoutBody` reports its timeout
+        // through the same `BodyError::Upstream` variant a dead TCP
+        // connection would use -- classification has to downcast the boxed
+        // source to `IdleTimeoutError` to tell "went quiet" (SI) apart from
+        // "connection died" (UC).
+        let capture = Arc::new(CaptureSink::default());
+        let inner = local_boxed(NeverBody);
+        let body = local_boxed(IdleTimeoutBody::new(inner, Duration::from_millis(5)));
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(logging_body.collect().await.is_err());
+        })
+        .await
+        .expect("idle timeout must fire well within the guard timeout");
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.remove(0), "SI 0");
+    }
+
+    #[test]
+    fn body_dropped_before_end_of_stream_logs_dc() {
+        let capture = Arc::new(CaptureSink::default());
+        let body = local_boxed(FrameThenPendingForever {
+            frame: Some(Bytes::from_static(b"hi")),
+        });
+        let mut logging_body = LoggingBody::new(body, flags_ctx(&capture));
+
+        let waker = futures::task::noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        // First poll: the one real frame -- not terminal, `ctx` stays `Some`.
+        match Pin::new(&mut logging_body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(_))) => {}
+            other => panic!("expected the frame, got {other:?}"),
+        }
+        // Second poll: the body never resolves again from here on (this is
+        // the "abandoned mid-flight" shape -- a client disconnect, or an
+        // outer combinator giving up, neither of which drives this body to
+        // `None`/`Err` through `poll_frame`).
+        assert!(matches!(
+            Pin::new(&mut logging_body).poll_frame(&mut cx),
+            Poll::Pending
+        ));
+
+        // Dropped without ever reaching end-of-stream or an error.
+        drop(logging_body);
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1, "Drop must still render exactly one line");
+        assert_eq!(
+            lines.remove(0),
+            "DC 2",
+            "bytes_sent must reflect the one frame delivered before the drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_end_of_stream_sets_no_flag_and_does_not_warn() {
+        // The negative control: without this, an implementation that always
+        // set UC (or always warned) regardless of outcome would pass every
+        // test above.
+        let capture = Arc::new(CaptureSink::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard = tracing::subscriber::set_default(WarnCounter(counter.clone()));
+
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+        let collected = logging_body.collect().await.unwrap().to_bytes();
+        assert_eq!(collected.as_ref(), b"hi");
+
+        drop(guard);
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.remove(0), "- 2", "no response flag on a clean end");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "a clean end-of-stream must not warn"
         );
     }
 }

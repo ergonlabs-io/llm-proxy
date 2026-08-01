@@ -19,8 +19,13 @@ use crate::handler::{BodyError, StreamBody};
 
 /// The error surfaced through `BodyError::Upstream` when `poll_frame` has
 /// gone `idle` seconds without a frame from the inner body.
+///
+/// `pub(crate)`, not `pub(super)`: `access_logging::LoggingBody` (a sibling
+/// module of `router`, not a child) downcasts a `BodyError::Upstream`'s boxed
+/// source against this type to tell "the upstream went quiet" (SI) apart
+/// from "the upstream connection died" (UC) -- see its `poll_frame`.
 #[derive(Debug)]
-pub(super) struct IdleTimeoutError {
+pub(crate) struct IdleTimeoutError {
     idle: Duration,
 }
 
@@ -43,14 +48,18 @@ impl Error for IdleTimeoutError {}
 /// `&mut self.inner`/`&mut self.sleep` directly instead of needing a manual
 /// (`unsafe`) pin projection -- `unsafe` is denied workspace-wide, so this
 /// field shape is what makes the safe projection possible.
-pub(super) struct IdleTimeoutBody {
+/// `pub(crate)`: constructed by `router.rs` in production, and directly by
+/// `access_logging`'s tests to drive a real idle-timeout `BodyError` (rather
+/// than hand-rolling one) when proving `LoggingBody` classifies it as SI, not
+/// UC.
+pub(crate) struct IdleTimeoutBody {
     inner: StreamBody,
     idle: Duration,
     sleep: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl IdleTimeoutBody {
-    pub(super) fn new(inner: StreamBody, idle: Duration) -> Self {
+    pub(crate) fn new(inner: StreamBody, idle: Duration) -> Self {
         Self {
             inner,
             sleep: Box::pin(tokio::time::sleep(idle)),

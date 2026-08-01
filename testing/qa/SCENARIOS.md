@@ -13,7 +13,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-3 | Streamed response arrives incrementally | passing |
 | QA-4 | Credentials reach upstream, never reach the log | passing |
 | QA-5 | Non-streaming responses log real bytes and tokens | approved |
-| QA-6 | Upstream dying mid-stream errors, and is not retried | implemented — **partially passing**, response_flags half skipped (see below) |
+| QA-6 | Upstream dying mid-stream errors, and is not retried | passing |
 | QA-7 | SIGTERM during an active stream drains to completion | approved |
 | QA-8 | Circuit-breaker rejection fails fast, does not queue | approved |
 | QA-9 | ~~Content-type parameter tolerance~~ | rejected — see below |
@@ -82,7 +82,7 @@ state needs downstream connection info that is not threaded that far yet.
 Deliberate and documented, not silently wrong — a candidate case if the owner
 wants it covered.
 
-### QA-6 found a fourth gap: no `response_flags` for a mid-stream upstream body error
+### QA-6 found a fourth gap, now fixed: no `response_flags` for a mid-stream body error
 
 On its first run, QA-6 established the two load-bearing properties cleanly:
 the mock's request counter stays at exactly 1 (no retry fires once the first
@@ -101,13 +101,30 @@ first body frames) have already reached the client, nothing sets a
 whatever flags are already on `StreamInfo` at stream-end time, and for this
 path that is none, so the line renders `response_flags` as the absent-value
 `-` even though the request definitely failed mid-stream.
-`ResponseFlag::UpstreamProtocolError` (`UPE`,
-`crates/proxy-observability/src/flags.rs`) already exists and reads like
-exactly the right code for this case; it is simply never reached from a body
-error today. `TestQA6_StreamAbortSurfacesErrorAndIsNotRetried` degrades to a
-loud, named `t.Skip` for this one assertion, mirroring QA-1's shape: the two
-properties that do not depend on the gap are hard asserts, and the skip
-message names the exact gap so it can't quietly go stale.
+**FIXED** — commit *"Record a response flag when a stream fails mid-flight"*.
+`LoggingBody` now classifies the body error and sets a flag before its log
+line is snapshotted: an upstream that hung up is `UC`, a client that went away
+is `DC`, and a body abandoned before end-of-stream is `DC` too (previously it
+logged as if it had ended cleanly). A structured `WARN` carries upstream host,
+cluster, bytes delivered, TTFT and elapsed, so the network origin of a failure
+is legible from one line.
+
+Two calls worth recording, because the obvious answer was wrong on both:
+
+- **Not `UPE`.** The first analysis proposed `UpstreamProtocolError`, which
+  reads plausibly but means a protocol *violation*. A TCP connection dying
+  mid-body is a *termination* — `UC`.
+- **The S4 idle timeout must not collapse into `UC`.** It surfaces as
+  `BodyError::Upstream(IdleTimeoutError)`, so matching on the variant alone
+  reports a *stalled but alive* upstream as a dead connection. It needs a
+  `downcast_ref` to report `SI`. For LLM traffic these are entirely different
+  diagnoses — a slow model versus a broken link — and merging them would have
+  produced confidently wrong operator signal. Mutation-verified: removing the
+  downcast fails `idle_timeout_body_error_logs_si_not_uc` and nothing else.
+
+QA-6's `t.Skip` turned into a `PASS` with **no edit to the Go test**, which is
+the point of the boundary: the suite that found the gap is what confirmed the
+fix, independently of the code that produced it.
 
 ## Maintaining this document
 

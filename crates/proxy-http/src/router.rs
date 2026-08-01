@@ -80,7 +80,11 @@ use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 
 mod guarded;
-mod idle;
+// Rust note: `pub(crate)` (not private) so `access_logging::LoggingBody`, a
+// sibling of `router` rather than a child, can name `idle::IdleTimeoutError`
+// to distinguish "upstream went quiet" (SI) from "upstream connection died"
+// (UC) when classifying a body error for the access log.
+pub(crate) mod idle;
 
 /// S3.4 (Envoy's `no_retry_body_too_large`): the largest request body this
 /// router will hold in memory for retry replay. Matches
