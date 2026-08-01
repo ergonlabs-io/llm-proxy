@@ -165,6 +165,30 @@ func (p *Proxy) WaitReady(addr string, timeout time.Duration) {
 	)
 }
 
+// Signal sends sig to the proxy process. Scenarios that need to observe a
+// graceful-shutdown drain (QA-7) call this directly rather than reaching into
+// Cmd themselves, since the process might have already exited by the time the
+// signal would be sent -- that races here rather than at every call site.
+func (p *Proxy) Signal(sig os.Signal) {
+	p.t.Helper()
+	if p.hasExited() {
+		p.t.Fatalf(
+			"harness: cannot signal %s, proxy already exited\n--- proxy log (%s) ---\n%s",
+			sig, p.LogPath, p.Log(),
+		)
+	}
+	if err := p.Cmd.Process.Signal(sig); err != nil {
+		p.t.Fatalf("harness: signal %s: %v", sig, err)
+	}
+}
+
+// Terminate sends SIGTERM, the signal a graceful shutdown (drain) responds
+// to.
+func (p *Proxy) Terminate() {
+	p.t.Helper()
+	p.Signal(syscall.SIGTERM)
+}
+
 // Wait blocks until the process exits (or timeout elapses, in which case it
 // fails the test) and returns its exit code.
 func (p *Proxy) Wait(timeout time.Duration) int {

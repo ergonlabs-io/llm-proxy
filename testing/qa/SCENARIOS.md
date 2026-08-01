@@ -14,7 +14,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-4 | Credentials reach upstream, never reach the log | passing |
 | QA-5 | Non-streaming responses log real bytes and tokens | approved |
 | QA-6 | Upstream dying mid-stream errors, and is not retried | passing |
-| QA-7 | SIGTERM during an active stream drains to completion | approved |
+| QA-7 | SIGTERM during an active stream drains to completion | passing |
 | QA-8 | Circuit-breaker rejection fails fast, does not queue | approved |
 | QA-9 | ~~Content-type parameter tolerance~~ | rejected — see below |
 
@@ -89,18 +89,19 @@ the mock's request counter stays at exactly 1 (no retry fires once the first
 response byte has reached the client, per S3), and the client's read of the
 proxied stream reliably ends in an observable error (`unexpected EOF`), never
 a clean close indistinguishable from success. The third property — that the
-access log's `response_flags` field records the failure — does not hold.
+access log's `response_flags` field records the failure — did **not** hold.
 
 Every `set_response_flag` call site in `proxy-http` (all twelve of them, in
 `crates/proxy-http/src/router.rs`) is in the PRE-response-headers path:
 connect failure, TLS handshake failure, reset-before-headers, request
 timeout, codec error before headers. Once headers (and, for a stream, the
-first body frames) have already reached the client, nothing sets a
-`ResponseFlag` when the response *body* subsequently errors —
-`LoggingBody::finish` (`crates/proxy-http/src/access_logging.rs`) logs
-whatever flags are already on `StreamInfo` at stream-end time, and for this
-path that is none, so the line renders `response_flags` as the absent-value
-`-` even though the request definitely failed mid-stream.
+first body frames) had already reached the client, nothing set a
+`ResponseFlag` when the response *body* subsequently errored —
+`LoggingBody::poll_frame` discarded the error outright (`Err(_)`), so the line
+rendered `response_flags` as the absent-value `-` even though the request had
+definitely failed mid-stream. On the SSE path — most of this proxy's traffic —
+a network death was therefore byte-identical in the log to a short completion.
+
 **FIXED** — commit *"Record a response flag when a stream fails mid-flight"*.
 `LoggingBody` now classifies the body error and sets a flag before its log
 line is snapshotted: an upstream that hung up is `UC`, a client that went away
