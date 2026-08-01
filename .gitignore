@@ -2,13 +2,26 @@
 *.pb.bin
 testing/diffrig/captures/
 
-# Planning docs stay local-only for now — track only README.md, CLAUDE.md,
-# the agent definitions under .claude/, corpus provenance records, and the QA
-# scenario registry (which is the spec the Go QA suite is written from, so it
-# has to be reviewable alongside the tests that cite its case IDs).
+# Markdown is ignored by default so scratch notes don't accumulate in history.
+# Everything below is re-included because it is LOAD-BEARING: each is cited by
+# name from tracked source, so a fresh clone without it has dead links.
+#
+# The planning docs were local-only until 2026-08-01. That stopped being
+# tenable once the code started citing them — `git grep` counts ADR-0004 55
+# times, ADR-0003 34, IMPLEMENTATION_PLAN.md 30, docs/envoy-divergences.md 13.
+# A `// see ADR-0004` comment pointing at a file nobody else has is worse than
+# no comment. They also had no backup: WP-45's design existed in exactly one
+# place, on one laptop, which is the same failure mode as CLAUDE.md rule 10
+# with a different cause.
 *.md
 !README.md
 !CLAUDE.md
 !.claude/**/*.md
 !testing/corpus/fixtures/**/SOURCES.md
+# The spec the Go QA suite is written from — reviewable alongside the tests
+# that cite its case IDs.
 !testing/qa/SCENARIOS.md
+# Normative plan, milestone/ship-gate definitions, and architecture decisions.
+!PLAN.md
+!IMPLEMENTATION_PLAN.md
+!docs/**/*.md
