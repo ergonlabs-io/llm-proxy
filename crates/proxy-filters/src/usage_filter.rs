@@ -816,6 +816,40 @@ mod tests {
         assert_eq!(usage.output_tokens, 9);
     }
 
+    /// The load-bearing property behind WP-33 acceptance criterion 3: an
+    /// invalid per-route dialect must come back as `ConfigError::InvalidValue`,
+    /// never `ConfigError::Unimplemented`.
+    /// `filter_manager::resolve_per_filter_row` swallows exactly
+    /// `Unimplemented` under `is_optional: true` (its default meaning "this
+    /// filter has no per-route config at all"). If `parse_per_route`'s error
+    /// variant here ever regressed to `Unimplemented`, a typo'd per-route
+    /// dialect on an `is_optional: true` entry would be silently dropped
+    /// instead of failing the build, and the route would go on to meter with
+    /// the wrong (fallback) dialect -- exactly the silent-field-drop ground
+    /// rule #1 forbids.
+    #[test]
+    fn parse_per_route_rejects_an_invalid_dialect_as_invalid_value() {
+        let factory = UsageFilterFactory;
+        for invalid in ["gemini", ""] {
+            let err = match factory.parse_per_route(&data_source(invalid)) {
+                Ok(_) => panic!("invalid dialect must fail to parse"),
+                Err(err) => err,
+            };
+            match err {
+                ConfigError::InvalidValue { field_path, .. } => {
+                    assert_eq!(field_path, "typed_config.inline_string");
+                }
+                ConfigError::Unimplemented { .. } => panic!(
+                    "must not be Unimplemented -- that variant is swallowed by \
+                     filter_manager::resolve_per_filter_row when is_optional is \
+                     true, which would silently drop an invalid dialect instead \
+                     of failing the build"
+                ),
+                other => panic!("expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn parse_per_route_accepts_route_level_dialect() {
         let factory = UsageFilterFactory;

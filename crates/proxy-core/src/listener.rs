@@ -2902,4 +2902,106 @@ static_resources:
             let _ = std::fs::remove_file(&log_path);
         });
     }
+
+    /// WP-33 acceptance criterion 3: an invalid per-route usage dialect must
+    /// be a build error, even when the `typed_per_filter_config` entry is
+    /// wrapped `is_optional: true`. `is_optional` only tolerates a filter
+    /// that has *no* per-route config at all (`ConfigError::Unimplemented`,
+    /// the `HttpFilterFactory::parse_per_route` default) -- see
+    /// `filter_manager::resolve_per_filter_row`. A malformed dialect string
+    /// is a different failure (`ConfigError::InvalidValue`) and must not be
+    /// swallowed, or a typo'd per-route dialect would silently fall back to
+    /// the listener-level one and meter with the wrong dialect.
+    ///
+    /// This test builds the bootstrap YAML with `parse_bootstrap` +
+    /// `build_snapshot` exactly like
+    /// `usage_filter_records_tokens_from_a_real_upstream_response` above --
+    /// `build_snapshot` accepts the config (the dialect string is opaque at
+    /// lowering time; `PerFilterConfig` just carries the decoded `Any`
+    /// verbatim). The rejection only happens when the filter chain is built
+    /// against the real registered factories, so this test drives
+    /// `build_listener_hcm` directly instead of spawning a listener over a
+    /// real socket -- no `run_local`, no network, no upstream, no access log.
+    ///
+    /// Mutation-tested: changing `filter_manager::resolve_per_filter_row`'s
+    /// `Err(ConfigError::Unimplemented { .. }) if cfg.is_optional => continue`
+    /// arm to `Err(_) if cfg.is_optional => continue` turns this test red
+    /// (the build wrongly succeeds instead of erroring) -- see the task notes
+    /// for the exact mutation and restore procedure.
+    #[test]
+    fn an_invalid_per_route_usage_dialect_fails_the_build_even_when_optional() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.usage
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                      inline_string: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: up }
+                          typed_per_filter_config:
+                            llmproxy.usage:
+                              "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
+                              is_optional: true
+                              config:
+                                "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                                inline_string: gemini
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+"#;
+
+        let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+            .expect("bootstrap YAML must parse");
+        let snapshot = build_snapshot(&loaded)
+            .expect("bootstrap YAML must lower -- the dialect string is opaque at this stage");
+
+        let listener_ir = snapshot.listeners.get("l1").expect("listener l1");
+        // No clusters need to be registered for the filter chain to build --
+        // route -> cluster resolution happens per-request, not at build time.
+        let cluster_manager = Arc::new(ClusterManager::new(
+            Arc::new(proxy_cluster::resolver::TokioResolver),
+            crate::tls::transport_socket_builder(),
+        ));
+
+        let err = match build_listener_hcm(listener_ir, &cluster_manager) {
+            Ok(_) => panic!("an invalid per-route dialect must fail the build, is_optional or not"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typed_config.inline_string") || msg.contains("gemini"),
+            "error should name the invalid dialect field/value, got: {msg}"
+        );
+    }
 }
