@@ -1,0 +1,214 @@
+# Generated from the published board on 2026-08-01, then hand-maintained.
+# Edit this file, then run `make boards` -- never edit the HTML directly.
+
+releases:
+- v: v0.0.1
+  name: First light
+  state: current
+  when: in progress
+  theme: >-
+    One request, all the way through, for real. A client calls the proxy; the proxy routes
+    it, opens TLS to the upstream gateway, forwards with credentials attached, and returns
+    the response intact — streaming included.
+  gate: >-
+    A chat-completion request, from a single <code>llmproxy</code> config pointed at a real
+    provider endpoint, returns the provider's response unmodified — non-streaming <em>and</em>
+    streamed SSE — for OpenAI and for Anthropic.
+  verify: >-
+    OPENAI_API_KEY=… ANTHROPIC_API_KEY=… cargo test -p diffrig --test live_smoke -- --ignored
+    — written, never run.
+  done: 15
+  open: 3
+  scope: >-
+    Carries <b>everything built to date</b> — config pipeline, L4, TLS, h1/h2, S1 routing,
+    S2 filter chain, S3 retries, S5 breakers, S7 load balancing, access logs, token extraction.
+    The features are not the milestone; the working path through them is.
+  left:
+  - wp: WP-26
+    what: >-
+      <b>The smoke test now exists</b> — 4 cases, OpenAI and Anthropic, streaming and not.
+      It has never been <i>run</i>; that needs real keys, and running it is what closes this
+      gate.
+  - wp: WP-13
+    what: >-
+      Whatever the first real provider round-trip exposes, plus the lifecycle differential
+      suite.
+  - wp: WP-15
+    what: Keep-alive reuse — still connect-per-stream, which a real provider will notice.
+  - wp: WP-41
+    what: >-
+      <b>Black-box QA suite — the new instrument, and it is already paying.</b> Four real
+      bugs on day one; three fixed, and QA-1 now passes fully (per-route token values, no
+      longer skipping). QA-5/7/8 approved and unbuilt.
+  risk: >-
+    A great deal of machinery is finished and green without ever having carried a real request.
+    That gap is the whole point of this gate — and the QA suite has now made it concrete rather
+    than theoretical: on its first run it found that the dialect emitted <b>no access logs
+    at all</b>, that <code>%REQ(:METHOD)%</code> always rendered <code>-</code>, and that
+    a stream killed mid-flight recorded <b>no response flag</b>. All three were invisible
+    from inside the code; one was described as intended in its own doc comment. Expect this
+    list to keep growing — that is the instrument working, not a setback. <b>Nothing here
+    moved the gate today</b> — the smoke test in <code>testing/diffrig/tests/live_smoke.rs</code>
+    is still never-run, and the new third-party Ollama smoke test (<code>local_openai_smoke.rs</code>)
+    is explicitly a THIRD tier between mocks and real providers, documented in its own module
+    doc as not closing this gate.
+- v: v0.1.0
+  name: LLM gateway
+  state: later
+  theme: >-
+    The reason this project exists — be a gateway a team chooses <em>because</em> it understands
+    LLM traffic.
+  gate: >-
+    Per-request token counts (input / cache-read / cache-write / output) and TTFT/TPOT reach
+    the access log for live traffic; a token-based rate limit is enforced; and the proxy fails
+    over from one provider to another without the client seeing an error.
+  done: 0
+  open: 5
+  left:
+  - wp: WP-33
+    what: >-
+      Usage filter now <b>wired per-route into the llmproxy dialect</b> — 6 of 7 acceptance
+      criteria met, incl. the end-to-end one (QA-1 now asserts real per-route token values
+      instead of skipping). <b>Not done:</b> criterion 3 — 'an invalid per-route dialect is
+      a build error, and <code>is_optional: true</code> does not swallow it' — has no test
+      yet.
+  - wp: WP-34
+    what: >-
+      Token rate limits. Extraction is <b>done</b> — three provider dialects, streaming and
+      not, four non-overlapping cost buckets — and now reachable on live traffic via WP-33's
+      wiring.
+  - wp: WP-35
+    what: >-
+      Model routing + provider fallback. Unblocked — the S2.8 route cache landed with ADR-0004.
+      Body-peek model routing bullet moved to WP-45.
+  - wp: WP-14
+    what: Hedging, and the retry wiring provider fallback rides on.
+  - wp: WP-45
+    what: >-
+      <b>New 2026-08-01.</b> Request-body rewrite pipeline. Verified against a real OpenAI-compatible
+      upstream: streaming without <code>stream_options.include_usage</code> emits no usage
+      block at all, so the WP-33 filter runs correctly and finds nothing for that request
+      shape. Also absorbs WP-35's body-peek model router as a shared consumer.
+  risk: >-
+    The dialect currently <em>rejects</em> <code>limits</code> and <code>fallbacks</code>
+    — correct under strict mode, and precisely the schema pointing at this hole. Those two
+    features are WP-34 and WP-35. If they slip, v0.1.0 has no content.
+- v: v0.2.0
+  name: Production-ready serving
+  state: later
+  theme: Stop claiming “performant” without evidence, and be safe to run unattended.
+  gate: >-
+    A published capacity report (p99, tokens/sec ceiling, RSS under sustained long-lived streams)
+    from a run that is <em>not</em> harness-bound, plus <code>/config_dump</code> and <code>/stats</code>
+    served by the admin endpoint, plus a config swap under live traffic with zero dropped
+    streams.
+  done: 0
+  open: 7
+  left:
+  - wp: WP-30
+    what: >-
+      The sweep itself. Phases 1+2 are built; no ceiling has been published, so <b>“performant”
+      is still an untested claim</b>.
+  - wp: WP-23
+    what: >-
+      Stats registry with Envoy names — also owns the two inert <code>stat_prefix</code> fields
+      the readership guard flags.
+  - wp: WP-25
+    what: Admin server. Unblocked.
+  - wp: WP-18
+    what: >-
+      Health checking is built and green (64 tests) but <b>not reachable from config</b> —
+      <code>ClusterConfig</code> has no field for it.
+  - wp: WP-19
+    what: 'Outlier detection, same story: 78 tests green, no IR wiring.'
+  - wp: WP-06
+    what: The swap-under-load gate — the only thing keeping Lane B open.
+  - wp: WP-42
+    what: >-
+      <b>Spend controls & budgets.</b> New from the 2026-08-01 competitive review — and <i>not</i>
+      WP-34's token rate limits: a tokens/minute cap is a throttle, not a budget. Nothing
+      else in the plan says "this key may spend $X, then stop."
+  risk: >-
+    The loadgen Linux <code>/proc</code> sampler is written to spec but unverified — there
+    is no Linux box in the loop. That is a blocker for this gate, not a footnote.
+- v: v0.3.0
+  name: Dynamic configuration
+  state: later
+  theme: Be deployable the way Envoy is deployed.
+  gate: >-
+    The proxy takes its entire configuration from an ADS control plane, ACKs and NACKs correctly
+    per S8, and survives a control-plane reconnect with make-before-break cluster warming.
+  verify: testing/controlplane harness plus a go-control-plane fixture.
+  done: 0
+  open: 4
+  left:
+  - wp: WP-20
+    what: ADS client, state-of-the-world.
+  - wp: WP-21
+    what: >-
+      Warming, ordering, make-before-break — owns the missing IR <code>Eds</code> discovery
+      variant.
+  - wp: WP-22
+    what: >-
+      SDS + delta xDS. SDS is what drives WP-08's cert hot-reload seam, which is built and
+      waiting.
+  - wp: WP-28
+    what: Scenario DSL, reconnect/warming coverage in the control-plane harness.
+  scope: >-
+    Deferred deliberately: static config carries v0.0.1 through v0.2.0. This is the largest
+    single block of P2 work and it is <b>genuinely owed</b> — it's the on-ramp that lets a
+    team point an existing bootstrap at us.
+- v: v0.4.0
+  name: Envoy parity
+  state: later
+  theme: The compatibility moat — widen the set of configs we accept without a migration.
+  gate: >-
+    The config-corpus scorecard clears 80% accept on real-world Envoy configs (baseline 15%),
+    with zero <em>bug-we-accept</em> results in the differential run against Envoy v1.38.0.
+  done: 0
+  open: 7
+  left:
+  - wp: WP-27
+    what: >-
+      The scorecard is the honest instrument here — it climbs only when real configs stop
+      being rejected, and <b>cannot be gamed by adding tests</b>.
+  - wp: WP-31
+    what: cors, local_ratelimit.
+  - wp: WP-32
+    what: ext_authz, ratelimit, ext_proc — ext_proc is what v1.0.0 needs.
+  - wp: WP-10
+    what: Downstream h2 and upgrades (S10).
+  - wp: WP-11
+    what: Watermarks, StopAll resume, 1xx — the S2 remainder.
+  - wp: WP-29
+    what: 'Fuzzing: h1 parser smuggling vectors, config, routes.'
+  - wp: WP-40
+    what: Dependency-tree review and cleanup.
+- v: v1.0.0
+  name: Full LLM layer
+  state: later
+  theme: The complete inference-gateway surface, on a proven parity base.
+  gate: >-
+    Gateway API Inference Extension (EPP) support and realtime WebSocket sessions both serving,
+    on top of a green parity scorecard.
+  done: 0
+  open: 4
+  left:
+  - wp: WP-36
+    what: Inference Extension (EPP) — needs <code>ext_proc</code> from v0.4.0.
+  - wp: WP-37
+    what: Realtime WebSocket sessions — needs S10 upgrade support from v0.4.0.
+  - wp: WP-43
+    what: >-
+      <b>Response caching.</b> New from the competitive review. Streaming is the hard part
+      — a hit must replay <i>as a stream</i>, and the entry can only be written once usage
+      is known at stream end. Semantic caching is a separate decision: a near-miss served
+      as a hit is a wrong answer, not a slow one.
+  - wp: WP-44
+    what: >-
+      <b>Cost-aware model routing.</b> Extends WP-35 with a price dimension. The chosen model
+      and the reason must reach the access log — a router that silently downgrades a model
+      is indistinguishable from a bug.
+  scope: >-
+    Neither can move earlier, which is why parity is a <b>v1.0.0 dependency</b> rather than
+    optional breadth.

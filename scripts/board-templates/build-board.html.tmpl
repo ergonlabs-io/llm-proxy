@@ -1,0 +1,317 @@
+<!doctype html><html><head><!-- frame-runtime --><script>window.__FRAME_PREAMBLE={"capabilities":{"downloads":"downloads.BABDwU1K.js","mcp":"mcp.hoz5jxDa.js","permissions":"permissions.ByA9Fd8x.js","self":"self.D3u1zjZe.js","user":"user.Cp1-RnjB.js"},"transforms":"_transforms.DYk1Ltlh.js","comments":"_comments.DiwQajF_.js","translate":"_translate.C5leZL2A.js"}</script><script>(function(){"use strict";const Ee="modulepreload",we=function(e){return"/"+e},Se={},ee=function(t,n,l){let i=Promise.resolve();function s(f){const c=new Event("vite:preloadError",{cancelable:!0});if(c.payload=f,window.dispatchEvent(c),!c.defaultPrevented)throw f}return i.then(f=>{for(const c of f||[])c.status==="rejected"&&s(c.reason);return t().catch(s)})},te=["light","dark","system"];function ne(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_init;return t!==null&&typeof t=="object"}function W(e){return e!==null&&typeof e=="object"&&e.__frame_size_poke===!0}function re(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_theme;if(t===null||typeof t!="object")return!1;const n=t.theme;return typeof n=="string"&&te.includes(n)}function se(e){try{typeof reportError=="function"?reportError(e):setTimeout(()=>{throw e},0)}catch{}}const oe=Object.freeze(Object.assign(Object.create(null),{user:Object.freeze(Object.assign(Object.create(null),{id:null,isOwner:!1,canEdit:!1,name:null,avatarUrl:null,email:null}))}));function Y(e){if(window===top||e.type==="auxclick"&&e.button!==1)return;const t=e.composedPath?e.composedPath():[e.target];let n=null;for(let f=0;f<t.length;f++){const c=t[f];if(c&&c.matches&&c.matches("a[href],area[href]")){n=c;break}}if(!n&&e.target&&e.target.closest&&(n=e.target.closest("a[href],area[href]")),!n)return;const l=n.getAttribute("href");if(!l)return;let i,s;try{i=new URL(l,document.baseURI),s=new URL(document.baseURI).origin}catch{return}(i.protocol==="http:"||i.protocol==="https:")&&i.origin!==s&&(e.preventDefault(),parent.postMessage({__frame_nav:!0,url:i.href},"*"))}const K={};function D(e){if(window===top)return;const t=Date.now();t-(K[e]||0)<500||(K[e]=t,parent.postMessage({__frame_engaged:!0,kind:e},"*"))}const ie=2e3,x=["wheel","touchstart","touchmove","keydown","pointerdown"];let J=0;function ae(e){e.isTrusted&&(J=Date.now())}function ce(){addEventListener("click",Y,!0),addEventListener("auxclick",Y,!0)}function le(){for(let e=0;e<x.length;e++)addEventListener(x[e],ae,{capture:!0,passive:!0});addEventListener("scroll",e=>{e.isTrusted&&Date.now()-J<ie&&D("scroll")},{capture:!0,passive:!0}),addEventListener("pointermove",e=>{e.isTrusted&&D("pointer")},{capture:!0,passive:!0}),addEventListener("click",e=>{e.isTrusted&&D("click")},{capture:!0,passive:!0})}const I="__frame_scroll",ue=150,fe=310,de=160,me=3e4;function pe(){let e=0,t=!1,n=!1,l=!1,i=0;const s=a=>{try{sessionStorage.setItem(I,JSON.stringify({y:a}))}catch{}},f=()=>{if(t){t=!1;return}n=!0,clearTimeout(e),e=setTimeout(()=>s(scrollY),ue)};try{addEventListener("scroll",f,{passive:!0}),addEventListener("pagehide",()=>{clearTimeout(e),s(scrollY)})}catch{}const c=()=>{let a;try{a=sessionStorage.getItem(I)}catch{return null}if(a===null)return null;let _;try{_=JSON.parse(a)}catch{_=null}const m=_?.y;if(!(typeof m=="number"&&Number.isFinite(m)&&m>=0)){try{sessionStorage.removeItem(I)}catch{}return null}return m};let g=!1;const p=a=>{try{const _=scrollY;scrollTo({top:a,left:0,behavior:"instant"}),i=a,l=!0,s(a);const m=scrollY;m!==_&&(t=!0),m!==a&&!g&&(g=!0,addEventListener("load",()=>{try{if(scrollY===m){const y=c();p(y!==null?y:i)}}catch{}},{once:!0}))}catch{}},o=()=>{try{return!!location.hash}catch{return!0}};let u=!1;const d=()=>{try{if(u||innerWidth>fe||innerHeight>de)return;u=!0;const a=Date.now(),_=()=>{try{removeEventListener("resize",_)}catch{}if(Date.now()-a>me||n||o())return;const m=c();p(m!==null?m:i)};addEventListener("resize",_)}catch{}};let h=!1,b=!1;return{restore(){if(h||(h=!0,o()))return;const a=c();a!==null&&(p(a),d())},promoted(){if(b||(b=!0,o()))return;const a=c();a!==null?(p(a),d()):l&&p(i)}}}function he(e,t,n){const l=[...t.values()].filter(i=>i.targets.some(s=>s.startsWith(e+".")));return{wrap(i,s){const f=`${e}.${i}`,c=l.filter(g=>g.targets.includes(f));return c.length===0?(...g)=>{try{return s(...g)}catch(p){return Promise.reject(p)}}:(...g)=>{let p=g;for(const u of c){const d=u.module.parameters;if(d)try{p=d(p)}catch{return Promise.reject({code:"transform_error",id:u.id,scope:e,message:"parameters transform failed"})}}let o;try{o=s(...p)}catch(u){o=Promise.reject(u)}return o.then(u=>{for(let d=c.length-1;d>=0;d--){const h=c[d],b=h.module.returns;if(b)try{u=b(u)}catch{return n({id:h.id,scope:e,leg:"returns"}),u}}return u},u=>{for(let d=c.length-1;d>=0;d--){const h=c[d],b=h.module.throws;if(b)try{u=b(u)}catch{return n({id:h.id,scope:e,leg:"throws"}),Promise.reject(u)}}return Promise.reject(u)})}}}}function ge(e,t,n,l=()=>{}){const i=new Set(e.changes??[]),s=new Map;for(const f of i){const c=t[f];c&&s.set(f,c)}return{contract:e.contract,changes:i,flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:s,shellOrigin:n.shellOrigin,mount:n.mount,pipe:f=>he(f,s,l)}}(function(){const e=Object.defineProperty,t=globalThis,n=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let l=0;for(let i=0;i<n.length;i++){const s=n[i];try{e(t,s,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[s]}catch{}try{e(t,s,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[s]=="function"&&l++}if(l&&window!==top)try{parent.postMessage({__frame_rtc_lockdown_failed:l},"*")}catch{}})();const _e=1e4,ye=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function G(e){for(const t of ye)if(t.endsWith(":*"))try{const n=new URL(e);if(`${n.protocol}//${n.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}const R=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities}),U=window.__FRAME_PREAMBLE?.transforms,z=window.__FRAME_PREAMBLE?.comments,$=window.__FRAME_PREAMBLE?.translate,T=/^[\w.-]+\.js$/,be=/^[a-z][a-z0-9_-]{0,63}$/;let V=null,j=null;function q(e,t,n){try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!0,enumerable:!0})}catch{}}}let B=!1;function X(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,B=!0):B&&(delete t.dataset.theme,t.style.colorScheme="",B=!1)}const A=Object.assign(Object.create(null),{mcp:Object.assign(Object.create(null),{watchTool:{handlerArg:3}})}),M=new Map;function Q(e,t){const n=M.get(e);if(!n)return;const l=Object.assign(Object.create(null),t);Object.assign(n.impl,l),n.impl.__settled=()=>Promise.reject({code:"capability_removed",message:`${e}: method not in this runtime`});const i=n.queue;n.queue=[];for(const s of i){const f=l[s.method];if(f)if(A[e]?.[s.method])try{s.resolve(f(...s.args))}catch{k(s,A[e][s.method].handlerArg,{code:"transform_error",message:`${e}.${s.method} rejected its arguments`})}else f(...s.args).then(s.resolve,s.reject);else{const c={code:"capability_removed",message:`${e}.${s.method} is not in this runtime`},g=A[e]?.[s.method];if(g){k(s,g.handlerArg,c);continue}s.reject(c)}}}function ve(e,t){const n=M.get(e);if(!n)return;n.impl.__settled=()=>Promise.reject(t);const l=n.queue;n.queue=[];for(const i of l){const s=A[e]?.[i.method];if(s){k(i,s.handlerArg,t);continue}i.reject(t)}}function N(e,t){const n=oe[e];if(!n){ve(e,t);return}Q(e,Object.fromEntries(Object.entries(n).map(([l,i])=>[l,()=>Promise.resolve(i)])))}function k(e,t,n){if(e.syncState?.dead)return;const l=e.args[t];typeof l=="function"&&queueMicrotask(()=>{if(!e.syncState?.dead)try{l({type:"error",error:n})}catch(i){se(i)}})}const F=Object.getOwnPropertyDescriptor(window,"claude");if(window!==top&&!(F&&F.writable===!1)){ce(),le();let e=null;try{e=pe()}catch{}const t=F?.value??{};q(window,"claude",t);const n=o=>{const u={impl:Object.create(null),queue:[]};M.set(o,u);const d=u.impl,h=new Proxy(d,{get:(b,a)=>{if(typeof a!="string"||a==="then"||a==="toJSON"||a==="valueOf")return;if(a==="toString")return Object.prototype.toString;const _=A[o]?.[a];return _?(...m)=>{if(typeof m[_.handlerArg]!="function")throw new TypeError(`${o}.${a} requires a handler function`);const y=d[a];if(y)return y(...m);if(d.__settled){const v={dead:!1},P={args:[...m],syncState:v};return d.__settled().catch(C=>k(P,_.handlerArg,C)),()=>{v.dead=!0}}let E=null;const S={dead:!1};return u.queue.push({method:a,args:m,resolve:v=>{E=typeof v=="function"?v:null,S.dead&&E?.()},reject:()=>{},syncState:S}),()=>{S.dead=!0,E?.()}}:(...m)=>{const y=d[a]??d.__settled;return y?y(...m):new Promise((E,S)=>{u.queue.push({method:a,args:m,resolve:E,reject:S})})}},set:()=>!1});q(t,o,h)};for(const o of Object.keys(R)){if(t[o]!==void 0){q(t,o,t[o]);continue}n(o)}let l=null,i=null,s=0;const f=o=>{o.source!==parent||!G(o.origin)||ne(o.data)&&(l=o.data.__frame_init,j=o.origin,removeEventListener("message",f),clearTimeout(s),i?.())};addEventListener("message",f),parent.postMessage({__frame_connect:!0},"*");const c=new Promise(o=>{i=o,s=setTimeout(()=>{removeEventListener("message",f),o()},_e)}),g=document.readyState==="loading"?new Promise(o=>document.addEventListener("DOMContentLoaded",()=>o(),{once:!0})):Promise.resolve();g.then(()=>{try{e?.restore()}catch{}});const p=o=>{if(!(o.source!==parent||!G(o.origin))&&W(o.data)){removeEventListener("message",p);try{e?.promoted()}catch{}}};addEventListener("message",p),c.then(async()=>{if(!l||!j){for(const r of M.keys())N(r,{code:"not_granted",message:"frame initialization did not arrive - capability unavailable"});return}X(l.theme);const o=j;let u=!1,d=!1;addEventListener("message",r=>{if(r.source!==parent||r.origin!==o)return;re(r.data)&&X(r.data.__frame_theme.theme);const w=r.data?.__fc_mode;w&&typeof w=="object"&&!u&&z&&T.test(z)&&(u=!0,h(z).then(H=>H.install?.(o,w.on===!0)).catch(()=>{}));const O=r.data?.__ft_cmd;O&&typeof O=="object"&&!d&&$&&T.test($)&&(d=!0,h($).then(H=>H.install?.(o,O)).catch(()=>{}))});const h=r=>ee(()=>import("/_runtime/"+r),void 0),b=Object.keys(l.capabilities??{});for(const r of b)Object.hasOwn(R,r)||be.test(r)&&t[r]===void 0&&(n(r),N(r,{code:"capability_disabled",message:"capability not in this runtime generation"}));const a=b.filter(r=>Object.hasOwn(R,r)).map(r=>[r,R[r]]).filter(r=>typeof r[1]=="string"&&T.test(r[1])),[_,...m]=await Promise.allSettled([U&&T.test(U)?h(U):Promise.resolve({}),...a.map(([,r])=>h(r))]),y=j;V=ge(l,_.status==="fulfilled"&&_.value?.TRANSFORMS||{},{shellOrigin:y,mount:Q},r=>parent.postMessage({__frame_cap_telemetry:r},y));const E=r=>parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:r}},y),S=V;m.forEach((r,w)=>{const O=a[w][0];if(r.status!=="fulfilled"){E(O);return}try{r.value?.install?.(S)}catch{E(O)}});for(const[r,w]of M)if(!(w.queue.length===0&&Object.keys(w.impl).length>0)){if(b.includes(r)){N(r,{code:"capability_disabled",message:"capability not available in this session"});continue}N(r,{code:"not_granted",message:"capability not available in this session"})}await g,parent.postMessage({__frame_ready:!0},j);let v=-1,P=0;const C=()=>{P=0;const r=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);r!==v&&(v=r,parent.postMessage({__frame_size:!0,h:r},y))},L=()=>{P||(P=setTimeout(C,200))},Z=new ResizeObserver(L);Z.observe(document.documentElement),document.body&&Z.observe(document.body),document.addEventListener("load",L,!0),document.fonts?.ready.then(L,()=>{}),addEventListener("beforeprint",()=>{v=-1,C()}),L(),addEventListener("message",r=>{if(!(r.source!==parent||r.origin!==y)&&W(r.data)){try{e?.promoted()}catch{}v=-1,L()}})})}})();</script><!-- /frame-runtime --><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>llm-proxy · build board</title>
+<style>
+  :root {
+    --bg: #f2f5f7; --surface: #ffffff; --surface2: #e9eef2;
+    --ink: #1b2430; --muted: #5b6b7a; --line: #d8e0e7;
+    --accent: #0e7490; --accent-ink: #ffffff;
+    --ok: #2e7d4f; --ready: #b45309; --started: #0e7490; --blocked: #93a0ac;
+    --ok-bg: #e3f0e8; --ready-bg: #f6ead9; --started-bg: #dcedf2; --blocked-bg: #eceff2;
+    --lane-a: #6d5bb8; --lane-b: #b0562f; --lane-c: #2e6bb0; --lane-d: #3e7a4e;
+    --lane-e: #a34b7e; --lane-f: #2c7a73; --lane-g: #5b6b7a; --lane-x: #8a6d1f; --lane-h: #b84a4a;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --shadow: 0 1px 2px rgba(20, 30, 40, .06), 0 2px 8px rgba(20, 30, 40, .05);
+    --p0: #b02a37; --p1: #0e7490; --p2: #5b6b7a;
+    --p0-bg: #fbe6e8; --p1-bg: #dcedf2; --p2-bg: #eceff2;
+    --ms-now: #0e7490; --ms-now-bg: #dcedf2; --ms-next: #5b6b7a; --ms-next-bg: #eceff2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10161d; --surface: #1a222b; --surface2: #141b23;
+      --ink: #e4eaf0; --muted: #93a1af; --line: #2a3542;
+      --accent: #2fa8c4; --accent-ink: #08252c;
+      --ok: #57b380; --ready: #d9924a; --started: #2fa8c4; --blocked: #6d7a86;
+      --ok-bg: #1b2f24; --ready-bg: #33271a; --started-bg: #16303a; --blocked-bg: #212a33;
+      --lane-a: #9d8ad9; --lane-b: #d18660; --lane-c: #6d9bd4; --lane-d: #74ac82;
+      --lane-e: #c97fa8; --lane-f: #63aaa3; --lane-g: #8fa0af; --lane-x: #c0a457; --lane-h: #d47f7f;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .35);
+      --p0: #ef7a86; --p1: #2fa8c4; --p2: #8fa0af;
+      --p0-bg: #3a1f24; --p1-bg: #16303a; --p2-bg: #212a33;
+      --ms-now: #2fa8c4; --ms-now-bg: #16303a; --ms-next: #8fa0af; --ms-next-bg: #212a33;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f2f5f7; --surface: #ffffff; --surface2: #e9eef2;
+    --ink: #1b2430; --muted: #5b6b7a; --line: #d8e0e7;
+    --accent: #0e7490; --accent-ink: #ffffff;
+    --ok: #2e7d4f; --ready: #b45309; --started: #0e7490; --blocked: #93a0ac;
+    --ok-bg: #e3f0e8; --ready-bg: #f6ead9; --started-bg: #dcedf2; --blocked-bg: #eceff2;
+    --lane-a: #6d5bb8; --lane-b: #b0562f; --lane-c: #2e6bb0; --lane-d: #3e7a4e;
+    --lane-e: #a34b7e; --lane-f: #2c7a73; --lane-g: #5b6b7a; --lane-x: #8a6d1f; --lane-h: #b84a4a;
+    --shadow: 0 1px 2px rgba(20, 30, 40, .06), 0 2px 8px rgba(20, 30, 40, .05);
+    --p0: #b02a37; --p1: #0e7490; --p2: #5b6b7a;
+    --p0-bg: #fbe6e8; --p1-bg: #dcedf2; --p2-bg: #eceff2;
+    --ms-now: #0e7490; --ms-now-bg: #dcedf2; --ms-next: #5b6b7a; --ms-next-bg: #eceff2;
+  }
+  :root[data-theme="dark"] {
+    --bg: #10161d; --surface: #1a222b; --surface2: #141b23;
+    --ink: #e4eaf0; --muted: #93a1af; --line: #2a3542;
+    --accent: #2fa8c4; --accent-ink: #08252c;
+    --ok: #57b380; --ready: #d9924a; --started: #2fa8c4; --blocked: #6d7a86;
+    --ok-bg: #1b2f24; --ready-bg: #33271a; --started-bg: #16303a; --blocked-bg: #212a33;
+    --lane-a: #9d8ad9; --lane-b: #d18660; --lane-c: #6d9bd4; --lane-d: #74ac82;
+    --lane-e: #c97fa8; --lane-f: #63aaa3; --lane-g: #8fa0af; --lane-x: #c0a457; --lane-h: #d47f7f;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .35);
+    --p0: #ef7a86; --p1: #2fa8c4; --p2: #8fa0af;
+    --p0-bg: #3a1f24; --p1-bg: #16303a; --p2-bg: #212a33;
+    --ms-now: #2fa8c4; --ms-now-bg: #16303a; --ms-next: #8fa0af; --ms-next-bg: #212a33;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); font-size: 14px; line-height: 1.45;
+  }
+
+  header {
+    position: sticky; top: 0; z-index: 5;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+    padding: 18px 22px 14px;
+    /* A sticky header with no cap can grow until it fills the viewport and
+       pushes the board itself off-screen -- which is exactly what happened
+       once the "now" panel accumulated a few batches of prose. The board is
+       the page; the header is context. Cap it and let the context scroll. */
+    max-height: 62vh; overflow-y: auto;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 4px;
+  }
+  h1 {
+    font-family: var(--mono); font-size: 21px; font-weight: 600;
+    margin: 0 0 12px; letter-spacing: -.01em; text-wrap: balance;
+  }
+  h1 .dim { color: var(--muted); font-weight: 400; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .chips .sep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
+  .chip {
+    font-family: var(--mono); font-size: 12px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 999px;
+    background: var(--surface); color: var(--ink); padding: 3px 11px;
+  }
+  .chip:hover { border-color: var(--accent); }
+  .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .chip .n { opacity: .65; margin-left: 4px; font-variant-numeric: tabular-nums; }
+  .hint { font-size: 12px; color: var(--muted); margin: 10px 0 0; }
+
+  .now {
+    margin: 12px 0 0; padding: 9px 12px; border-radius: 6px;
+    background: var(--surface); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    font-size: 12.5px; line-height: 1.5; max-width: 82ch;
+  }
+  .now b { font-family: var(--mono); font-size: 12px; }
+  .now .sub { color: var(--muted); }
+  .now code { font-family: var(--mono); font-size: 11.5px; background: var(--surface2); padding: 0 4px; border-radius: 3px; }
+  .gate {
+    display: block; margin: 8px 0 0; padding: 7px 10px; border-radius: 5px;
+    background: var(--surface2); border-left: 2px solid var(--ready);
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  }
+
+  .board-wrap { overflow-x: auto; padding: 18px 22px 30px; }
+  .board { display: flex; gap: 14px; align-items: flex-start; min-width: max-content; }
+
+  .lane { width: 256px; flex: 0 0 auto; }
+  .lane-head {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 2px 4px 8px; border-bottom: 2px solid var(--line);
+    margin-bottom: 10px;
+  }
+  .lane-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; align-self: center; }
+  .lane-name { font-family: var(--mono); font-size: 12.5px; font-weight: 700; letter-spacing: .02em; }
+  .lane-sub { font-size: 11px; color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+  .lane-cards { display: flex; flex-direction: column; gap: 8px; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-left-width: 3px;
+    border-radius: 6px; padding: 9px 11px 9px 10px; box-shadow: var(--shadow);
+    transition: opacity .15s ease;
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  @media (prefers-reduced-motion: reduce) { .card { transition: none; } }
+  .card.dim { opacity: .22; }
+  .card.done   { border-left-color: var(--ok); }
+  .card.ready  { border-left-color: var(--ready); }
+  .card.started{ border-left-color: var(--started); }
+  .card.blocked{ border-left-color: var(--blocked); }
+
+  .card-top { display: flex; align-items: center; gap: 6px; }
+  .card-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .wp { font-family: var(--mono); font-size: 12px; font-weight: 700; }
+  .badge {
+    font-family: var(--mono); font-size: 10px; padding: 1px 6px;
+    border-radius: 4px; letter-spacing: .03em;
+  }
+  .badge.status-done    { background: var(--ok-bg); color: var(--ok); }
+  .badge.status-ready   { background: var(--ready-bg); color: var(--ready); }
+  .badge.status-started { background: var(--started-bg); color: var(--started); }
+  .badge.status-blocked { background: var(--blocked-bg); color: var(--blocked); }
+  .badge.gate { background: var(--surface2); color: var(--muted); }
+  .badge.ms { background: var(--ms-next-bg); color: var(--ms-next); font-weight: 700; }
+  .badge.ms.ms-now { background: var(--ms-now-bg); color: var(--ms-now); border: 1px solid var(--ms-now); }
+  .badge.prio { margin-left: auto; font-weight: 700; border: 1px solid transparent; }
+  .badge.prio-P0 { background: var(--p0-bg); color: var(--p0); border-color: var(--p0); }
+  .badge.prio-P1 { background: var(--p1-bg); color: var(--p1); }
+  .badge.prio-P2 { background: var(--p2-bg); color: var(--p2); }
+  .size { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+
+  .card-title { font-size: 13px; font-weight: 600; line-height: 1.3; text-wrap: balance; }
+  .card-meta {
+    font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+    display: flex; flex-direction: column; gap: 2px;
+    overflow-wrap: anywhere;
+  }
+  .flag { color: var(--ready); font-size: 11px; font-weight: 600; }
+</style>
+
+<header>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 45 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-01 · 779 tests green · + black-box QA suite (Go)</p>
+  <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
+  <div class="chips" id="filters">
+    <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
+    <button class="chip" data-status="ready">ready now<span class="n" id="n-ready"></span></button>
+    <button class="chip" data-status="started">started<span class="n" id="n-started"></span></button>
+    <button class="chip" data-status="blocked">blocked<span class="n" id="n-blocked"></span></button>
+    <span class="sep"></span>
+    <button class="chip" data-ms="v0.0.1">v0.0.1 · first light<span class="n" id="n-v001"></span></button>
+    <button class="chip" data-ms="v0.1.0">v0.1.0 · LLM gateway<span class="n" id="n-v010"></span></button>
+    <button class="chip" data-ms="v0.2.0">v0.2.0 · prod<span class="n" id="n-v020"></span></button>
+    <button class="chip" data-ms="v0.3.0">v0.3.0 · xDS<span class="n" id="n-v030"></span></button>
+    <button class="chip" data-ms="v0.4.0">v0.4.0 · parity<span class="n" id="n-v040"></span></button>
+    <button class="chip" data-ms="v1.0.0">v1.0.0<span class="n" id="n-v100"></span></button>
+    <span class="sep"></span>
+    <button class="chip" data-prio="P0">P0 · LLM product<span class="n" id="n-P0"></span></button>
+    <button class="chip" data-prio="P1">P1 · serving<span class="n" id="n-P1"></span></button>
+    <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
+  </div>
+  <p class="now">
+    <b>Now — v0.0.1 "first light": one request, all the way through, for real.</b>
+    A client calls the proxy; the proxy routes it, opens TLS to the upstream gateway, forwards
+    with credentials attached, and returns the response intact — streaming included. This release
+    carries everything built to date. The features are not the milestone; the working path through
+    them is.
+    <span class="gate"><b>SHIP GATE —</b> a chat-completion request, from a single <code>llmproxy</code>
+    config pointed at a real provider, returns the provider's response unmodified — non-streaming
+    <i>and</i> streamed SSE — for OpenAI and Anthropic. Verified by the <code>#[ignore]</code>d live
+    smoke test in <code>testing/diffrig</code>, keys from env. One command. Currently red.</span>
+    <span class="sub"><b>The honest read:</b> a great deal of machinery is green
+    without ever having carried a real request — closing that is what this gate is for.
+    Second standing gap: <b>"performant" is an untested claim</b> (no capacity sweep published; the
+    v0.2.0 gate).
+    <b>WP-41, the black-box QA suite, found four real bugs on day one</b> — no dialect access logs at
+    all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too), and no response flag on a
+    mid-stream failure. Three fixed; the fourth (WP-33) is wired but has one unmet acceptance
+    criterion. One had been <i>described as intended</i> in
+    its own doc comment — the class of defect an inside view cannot see.
+    <b>Competitive review (Vercel AI Gateway)</b> confirmed the plan and added WP-42/43/44:
+    spend controls (a token/min cap is a throttle, not a budget), caching, cost-aware routing.
+    They are managed-only, so self-hosting, Envoy config and xDS stay ours.
+    <b>WP-45 (new, 2026-08-01):</b> a real upstream showed OpenAI-dialect streaming emits no usage
+    block without <code>stream_options.include_usage</code> — the request-body rewrite pipeline that
+    forces it also absorbs WP-35's body-peek model routing. v0.0.1 gate is unchanged: still red.</span>
+  </p>
+  <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
+</header>
+
+<div class="board-wrap">
+  <div class="board" id="board"></div>
+</div>
+
+<script>
+  const lanes = [
+    { id: "A", name: "A · Foundations", color: "var(--lane-a)" },
+    { id: "B", name: "B · Runtime / L4", color: "var(--lane-b)" },
+    { id: "C", name: "C · HTTP", color: "var(--lane-c)" },
+    { id: "D", name: "D · Cluster", color: "var(--lane-d)" },
+    { id: "E", name: "E · xDS", color: "var(--lane-e)" },
+    { id: "F", name: "F · Observability", color: "var(--lane-f)" },
+    { id: "G", name: "G · Test infra", color: "var(--lane-g)" },
+    { id: "X", name: "Filters", color: "var(--lane-x)" },
+    { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
+  ];
+
+  const CURRENT_MS = "v0.0.1";
+
+  // status: done | ready | started | blocked ; ms = the release the WP closes in
+  const wps = /*__DATA__*/;
+
+  const board = document.getElementById("board");
+  for (const lane of lanes) {
+    const cards = wps.filter(w => w.lane === lane.id);
+    const doneN = cards.filter(w => w.status === "done").length;
+    const col = document.createElement("section");
+    col.className = "lane";
+    col.innerHTML = `
+      <div class="lane-head" style="border-bottom-color:${lane.color}">
+        <span class="lane-dot" style="background:${lane.color}"></span>
+        <span class="lane-name">${lane.name}</span>
+        <span class="lane-sub">${doneN}/${cards.length}</span>
+      </div>
+      <div class="lane-cards"></div>`;
+    const holder = col.querySelector(".lane-cards");
+    for (const w of cards) {
+      const el = document.createElement("article");
+      el.className = `card ${w.status}`;
+      el.dataset.status = w.status;
+      el.dataset.gate = w.gate;
+      el.dataset.prio = w.prio;
+      el.dataset.ms = w.ms;
+      const prioTitle = {
+        P0: "Product-defining — the LLM gateway itself",
+        P1: "Serving-critical — needed to run real traffic",
+        P2: "Envoy parity / breadth — backlog, not dropped",
+      }[w.prio];
+      el.innerHTML = `
+        <div class="card-top">
+          <span class="wp" style="color:${lane.color}">WP-${String(w.id).padStart(2, "0")}</span>
+          <span class="size">${w.size}</span>
+          <span class="badge prio prio-${w.prio}" title="${prioTitle}">${w.prio}</span>
+        </div>
+        <div class="card-title">${w.title}</div>
+        <div class="card-tags">
+          <span class="badge status-${w.status}">${w.status}</span>
+          <span class="badge gate">${w.gate}</span>
+          <span class="badge ms${w.ms === CURRENT_MS ? " ms-now" : ""}" title="Ships in ${w.ms}">${w.ms}</span>
+        </div>
+        <div class="card-meta">${w.meta.map(m => `<span>${m}</span>`).join("")}</div>
+        ${w.note ? `<div class="flag">${w.note}</div>` : ""}`;
+      holder.appendChild(el);
+    }
+    board.appendChild(col);
+  }
+
+  for (const s of ["done", "ready", "started", "blocked"]) {
+    document.getElementById("n-" + s).textContent = wps.filter(w => w.status === s).length;
+  }
+  for (const pr of ["P0", "P1", "P2"]) {
+    document.getElementById("n-" + pr).textContent = wps.filter(w => w.prio === pr).length;
+  }
+  for (const [ms, id] of [["v0.0.1", "n-v001"], ["v0.1.0", "n-v010"], ["v0.2.0", "n-v020"],
+                          ["v0.3.0", "n-v030"], ["v0.4.0", "n-v040"], ["v1.0.0", "n-v100"]]) {
+    document.getElementById(id).textContent = wps.filter(w => w.ms === ms).length;
+  }
+
+  let active = null; // { key: "status" | "prio" | "ms" | "gate", value: string }
+  const chips = document.querySelectorAll(".chip");
+  const keyOf = c => c.dataset.status ? "status" : c.dataset.prio ? "prio" : c.dataset.ms ? "ms" : "gate";
+  const valOf = c => c.dataset.status || c.dataset.prio || c.dataset.ms || c.dataset.gate;
+  chips.forEach(chip => {
+    chip.setAttribute("aria-pressed", "false");
+    chip.addEventListener("click", () => {
+      const key = keyOf(chip), value = valOf(chip);
+      active = (active && active.key === key && active.value === value) ? null : { key, value };
+      chips.forEach(c => {
+        c.setAttribute("aria-pressed", String(!!active && active.key === keyOf(c) && active.value === valOf(c)));
+      });
+      document.querySelectorAll(".card").forEach(card => {
+        card.classList.toggle("dim", !!active && card.dataset[active.key] !== active.value);
+      });
+    });
+  });
+</script>
+
+</body></html>

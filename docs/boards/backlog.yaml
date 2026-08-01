@@ -1,0 +1,764 @@
+# Generated from the published board on 2026-08-01, then hand-maintained.
+# Edit this file, then run `make boards` -- never edit the HTML directly.
+
+work_packages:
+- id: 1
+  prio: P1
+  ms: v0.0.1
+  lane: A
+  size: S
+  gate: G1
+  status: done
+  title: Repo scaffolding & CI
+  meta:
+  - workspace · toolchain · ADRs
+- id: 2
+  prio: P1
+  ms: v0.0.1
+  lane: A
+  size: M
+  gate: G1
+  status: done
+  title: Envoy protos + descriptor pool
+  meta:
+  - proxy-api
+  - pinned v1.38.0 · 5 tests
+  - + access-log protos vendored (file / stdout / stderr)
+- id: 3
+  prio: P1
+  ms: v0.0.1
+  lane: A
+  size: M
+  gate: G1
+  status: done
+  title: Bootstrap loader (YAML→proto)
+  meta:
+  - proxy-config
+  - field-path errors · --mode validate · 9 tests
+- id: 4
+  prio: P1
+  ms: v0.0.1
+  lane: A
+  size: M
+  gate: G1
+  status: done
+  title: Validation engine (PGV subset)
+  meta:
+  - proxy-config
+  - rules from descriptor pool · 14 tests
+- id: 5
+  prio: P1
+  ms: v0.0.1
+  lane: A
+  size: L
+  gate: G1
+  status: done
+  title: Internal IR + proto→IR conversion
+  meta:
+  - proxy-config
+  - S1 domain index · surface check · strict mode
+  - + upstream_protocol · retry_back_off · access_logs
+  - >-
+    ✓ typed_per_filter_config now lowered (route / vhost / route-config), incl. the FilterConfig
+    wrapper
+  note: >-
+    ▲ FIXED ground rule #1: typed_per_filter_config was silently dropped — the config loaded
+    clean and the override vanished
+- id: 38
+  prio: P0
+  ms: v0.0.1
+  lane: A
+  size: M
+  gate: G5
+  status: done
+  title: Simple config dialect (lowering)
+  meta:
+  - proxy-simple-config
+  - --config · --mode translate · providers → clusters + TLS + auth headers
+  - ✓ Anthropic default anthropic-version · api_key_file read+trimmed · x-api-key vs Bearer
+  - '✓ SECURITY: always emits a validation context + a DNS-exact SAN matcher per provider
+    host'
+  - >-
+    ✓ observability.access_logs now REACHES the generated config (stdout/stderr/file · text/json
+    · LLM token + TTFT operators in both)
+  note: >-
+    ⚠ FIXED (found by QA-1): the dialect emitted NO access logs at all — lower.rs carried
+    only a stale 'not emitted yet (WP-24)' warning long after WP-24 landed, so a proxy configured
+    the way users actually configure it logged nothing
+- id: 39
+  prio: P1
+  ms: v0.0.1
+  lane: A
+  size: S
+  gate: G2
+  status: done
+  title: IR readership guard
+  meta:
+  - proxy-config/tests/ir_readership.rs
+  - scans ir.rs pub fields, fails when one has no runtime reader
+  - >-
+    a 2nd test keeps the allowlist honest, so an entry that gains a reader fails rather than
+    lingering
+  - each allowlisted field is tagged with the WP that owns it
+  note: >-
+    ▲ mutation-verified: passing &[] for request_headers_to_add makes the guard fail, naming
+    that exact field
+- id: 40
+  prio: P2
+  ms: v0.4.0
+  lane: A
+  size: M
+  gate: G4
+  status: ready
+  title: Dependency-tree review & cleanup
+  meta:
+  - workspace-wide
+  - owner-requested
+  - proxy-config → proxy-observability is the edge that constrains log/stat-shaped types
+  - >-
+    a real cycle was hit once (unused proxy-core dep in proxy-cluster, masking a transitive
+    rand)
+  - >-
+    deliverable: documented graph in docs/ · no unused deps in CI · no duplicated types across
+    a boundary
+- id: 6
+  prio: P1
+  ms: v0.2.0
+  lane: B
+  size: M
+  gate: G1
+  status: started
+  title: Runtimes + config propagation + drain
+  meta:
+  - proxy-core · crates/proxy
+  - ADR-0003 ✓ !Send + LocalSet
+  - chunks A+B+C ✓ pool · drain · serve + SIGTERM + CLI
+  - ✓ shutdown handlers now install BEFORE any worker spawns
+  - >-
+    ✓ both serve-mode CLI tests now gate on a real TCP connect, never a log line — the log-line
+    helper was deleted outright so the bug can't be reintroduced
+  - 'open: swap-under-load gate (needs WP-26 rig) — this is what holds Lane B open'
+  note: >-
+    ⚠ FIXED: the startup log said 'waiting for SIGTERM/SIGINT' while the handler was installed
+    much later — a signal in that window killed the process outright, no drain, connections
+    dropped. Surfaced as a flaky drain test
+- id: 7
+  prio: P1
+  ms: v0.0.1
+  lane: B
+  size: M
+  gate: G1
+  status: done
+  title: Listener mgr + filter-chain match
+  meta:
+  - proxy-config · proxy-core
+  - IR criteria · 9-step matcher · SO_REUSEPORT bind/accept/RST · initial-bind fatal
+  - terminal dispatch serves tcp_proxy AND http_connection_manager
+- id: 8
+  prio: P1
+  ms: v0.0.1
+  lane: B
+  size: L
+  gate: G1
+  status: done
+  title: Transport sockets (TLS) + listener filters
+  meta:
+  - proxy-config · proxy-core · rustls (ring)
+  - >-
+    full Downstream/Upstream TLS IR+lowering · factories + dual-cert hot-reload + SAN/mTLS/expired
+    verifiers
+  - tls_inspector SNI/ALPN peek + bind-time termination (bad cert = fatal startup)
+  - ✓ UPSTREAM TLS runtime — client handshake lives in the WP-15 pool seam
+- id: 9
+  prio: P1
+  ms: v0.0.1
+  lane: B
+  size: M
+  gate: G1
+  status: done
+  title: Network filter framework + tcp_proxy
+  meta:
+  - proxy-core
+  - tcp_proxy runtime ✓ — first real end-to-end L4 proxy
+  - bidi pump w/ half-close FIN + idle timeout + concurrent (no-deadlock) directions
+  - cluster resolve → connect (timeout/retries) · serves plaintext + TLS-terminated
+- id: 10
+  prio: P1
+  ms: v0.4.0
+  lane: C
+  size: L
+  gate: G2
+  status: started
+  title: h1/h2 codecs + upgrades (S10)
+  meta:
+  - proxy-http · proxy-core
+  - 'downstream h1 codec ✓ · WIRED: HCM chain → codec over the real socket (TLS + plaintext)'
+  - >-
+    ✓ upstream h1 (send_upstream_http1) + ✓ upstream h2 (send_upstream_http2), dispatch by
+    config
+  - v0.0.1 needs only h1/h2 upstream — those are done
+  - 'open (v0.4.0): downstream h2 · upgrades (S10)'
+- id: 11
+  prio: P1
+  ms: v0.4.0
+  lane: C
+  size: L
+  gate: G2
+  status: started
+  title: HTTP filter manager (S2 machine)
+  meta:
+  - proxy-http
+  - >-
+    chunk 1 ✓ order/hold/data/buffers/413-500 · chunk 3 ✓ streaming encode + S2.5 local replies
+    + reverse teardown
+  - >-
+    chunk 2 ✓ S2 conformance suite — FOUND + FIXED a real S2.5 bug (local reply stops decode
+    iteration)
+  - ✓ S2.7 injection — the unimplemented!() panic under Lane H is gone
+  - >-
+    ✓ S2.8 ROUTE CACHE (ADR-0004 step 1) — the manager owns resolution; clear_route_cache
+    genuinely invalidates. This unblocked WP-35
+  - >-
+    ✓ PER-ROUTE FILTER CONFIG (ADR-0004 step 4) — resolved at HCM build time, exposed via
+    DecoderCallbacks::per_route_config(); route > vhost > route-config, through the S2.8 cache
+  - 'open (v0.4.0): watermarks · StopAll resume · 1xx'
+  note: >-
+    ▲ mutation-verified: shifting decode delivery to from_idx caused an INFINITE LOOP (the
+    injector re-entering itself) — stronger proof of the re-entrance guard than the test aimed
+    for
+- id: 12
+  prio: P1
+  ms: v0.0.1
+  lane: C
+  size: M
+  gate: G2
+  status: done
+  title: Route table + matching (S1)
+  meta:
+  - proxy-http
+  - match_route/select_cluster over the real RouteTable
+  - >-
+    domain precedence · first-match-wins · prefix-includes-query vs path/regex stripped ·
+    weighted stable pick
+  - 36 tests built through real YAML lowering
+- id: 13
+  prio: P1
+  ms: v0.0.1
+  lane: C
+  size: L
+  gate: G2
+  status: started
+  title: Router filter + upstream lifecycle (S4/S9)
+  meta:
+  - proxy-http · proxy-core
+  - >-
+    proxies real requests end-to-end (match → cluster → host → CB → pool → TLS → codec → encode
+    chain)
+  - >-
+    ✓ ADR-0004 step 3 — the router is now a terminal HttpFilter in the chain, not a handler
+    behind a seam
+  - >-
+    ✓ S9 request transforms COMPLETE — XFF/x-request-id/:authority/rewrites + request_headers_to_add
+    (the P0 below)
+  - ✓ S4 route timeout + idle_timeout + per-try — all disarm on headers, LLM-safe
+  - 'open (v0.0.1): lifecycle differential suite'
+  - >-
+    open (v0.4.0): maintenance mode · x-envoy-attempt-count · upgrade routing (S10.1) · redirects
+    (501)
+  note: >-
+    ▲ FIXED P0: request_headers_to_add was lowered by both front-ends and read by NOTHING
+    — every request reached its provider with no credentials
+- id: 14
+  prio: P1
+  ms: v0.1.0
+  lane: C
+  size: M
+  gate: G2
+  status: started
+  title: Retry & hedging engine (S3)
+  meta:
+  - proxy-http · retry.rs + router.rs
+  - >-
+    ✓ ENGINE BUILT AND WIRED — per-attempt CB permit + host re-pick, outcome classification,
+    S3.3 fully-jittered backoff
+  - >-
+    ✓ S3.4 body replay buffered ONLY when a policy exists (retry-free routes keep the zero-copy
+    path)
+  - ✓ S4.2 per-try timeout armed fresh per attempt
+  - ✓ 2 knobs the router can't honor are REJECTED at config load, not silently dropped
+  - >-
+    open: hedging (half this WP's title) · S5.2 retry budgets · previously-attempted-host
+    predicate
+  note: WP-35 provider fallback rides on this
+- id: 15
+  prio: P1
+  ms: v0.0.1
+  lane: C
+  size: L
+  gate: G2
+  status: started
+  title: Conn pools + circuit breakers (S5)
+  meta:
+  - proxy-cluster
+  - >-
+    ✓ UpstreamTransportSocket seam: TCP dial → rustls client handshake (SNI + ALPN from upstream_protocol)
+  - ✓ transport_socket with no registered builder = FATAL startup, never a plaintext downgrade
+  - ✓ S5 max_requests CB via GuardedBody — UO + x-envoy-overloaded fire
+  - >-
+    open (v0.0.1): keep-alive reuse — still connect-per-stream, which a real provider will
+    notice
+  note: ▲ pooling is what caps the WP-30 rig at ~8k streams (2 ports/stream) — these two compound
+- id: 16
+  prio: P1
+  ms: v0.0.1
+  lane: D
+  size: M
+  gate: G3
+  status: done
+  title: Cluster manager + discovery types
+  meta:
+  - proxy-cluster
+  - >-
+    HostSet Arc snapshots + diffing · HostResolver seam (tokio + fake) · STATIC/STRICT_DNS/LOGICAL_DNS
+  - ClusterManager over ArcSwap · warming = initial_fetch_timeout 'proceed empty'
+  - + Host.hostname carries the DNS name for SNI/verification · EDS stub only (→ 21)
+- id: 17
+  prio: P1
+  ms: v0.0.1
+  lane: D
+  size: M
+  gate: G3
+  status: done
+  title: Load balancers (S7)
+  meta:
+  - proxy-cluster
+  - >-
+    RoundRobin (nginx SWRR) · Random · LeastRequest (P2C) · HostPicker (spillover + 50% panic
+    + host_override)
+  - >-
+    ring-hash/Maglev REJECTED at config time (need Envoy differential hashing harness) · 38
+    tests
+- id: 18
+  prio: P1
+  ms: v0.2.0
+  lane: D
+  size: M
+  gate: G4
+  status: started
+  title: Active health checking
+  meta:
+  - proxy-cluster/src/health_check.rs
+  - ✓ HTTP + TCP checkers, immediate first check, timeout-bounded attempts
+  - consecutive-count thresholds (NOT ratios) — any opposite result resets the run
+  - gRPC checks + no_traffic_interval are documented gaps, not stubs · 64 tests
+  - 'open: ClusterConfig has no health_checks field — NOT REACHABLE FROM CONFIG yet'
+  note: >-
+    ⚠ FIXED ON REVIEW: transitions used ArcSwap load/store — one task per host = lost updates,
+    and since the tracker only reports the EDGE a clobbered flip is never re-published (host
+    stays wrongly Healthy forever). Now rcu; reverting loses 44 of 64
+- id: 19
+  prio: P1
+  ms: v0.2.0
+  lane: D
+  size: M
+  gate: G4
+  status: started
+  title: Outlier detection (S6)
+  meta:
+  - proxy-cluster/src/outlier.rs
+  - >-
+    ✓ consecutive-5xx + consecutive-gateway-failure detectors, ejection w/ backoff + un-eject
+    timer
+  - ✓ enforcement percentages · event log w/ enforced/unenforced attribution · 78 tests
+  - 'open: IR wiring — OutlierDetectionConfig is not reachable from config yet'
+  note: >-
+    ⚠ FIXED: a gateway error is a SUBSET of 5xx in Envoy (putHttpResponseCode nests the checks),
+    so it bumps both counters — 5 consecutive 503s DO eject via the 5xx detector. We had built
+    independent counters
+- id: 20
+  prio: P2
+  ms: v0.3.0
+  lane: E
+  size: L
+  gate: G3
+  status: ready
+  title: ADS client, SotW + ACK/NACK (S8)
+  meta:
+  - proxy-xds
+  - needs 03–05 ✓ · WP-28 harness ready
+  - 'deferred: static config carries v0.0.1 → v0.2.0'
+- id: 21
+  prio: P2
+  ms: v0.3.0
+  lane: E
+  size: M
+  gate: G3
+  status: blocked
+  title: Warming, ordering, make-before-break
+  meta:
+  - proxy-xds
+  - needs 20
+  - owns the missing IR Eds discovery variant
+- id: 22
+  prio: P2
+  ms: v0.3.0
+  lane: E
+  size: M
+  gate: G3
+  status: blocked
+  title: SDS + delta xDS + file transport
+  meta:
+  - proxy-xds
+  - needs 21 · SDS drives WP-08's cert hot-reload seam, which is built and waiting
+- id: 23
+  prio: P1
+  ms: v0.2.0
+  lane: F
+  size: M
+  gate: G2
+  status: blocked
+  title: Stats registry (Envoy names)
+  meta:
+  - proxy-observability
+  - needs 06
+  - owns the two inert stat_prefix fields flagged by the WP-39 guard
+- id: 24
+  prio: P1
+  ms: v0.0.1
+  lane: F
+  size: M
+  gate: G2
+  status: done
+  title: Access logs + response flags
+  meta:
+  - proxy-observability · proxy-http/src/router/logging.rs
+  - ✓ IR + lowering + format engine + sinks (logrotate reopen, dedup by canonical path)
+  - >-
+    ✓ router records response flags; listener builds per-HCM loggers (sink open failure =
+    fatal at bind)
+  - >-
+    ✓ emits at STREAM END via LoggingBody (incl. Drop) — hooking response headers would log
+    bytes_sent: 0 for every streamed response, i.e. most LLM traffic
+  - ✓ moved above the filter chain (ADR-0004), so filter-chain local replies are logged too
+  - >-
+    ✓ SECURITY: headers snapshotted BEFORE apply_request_transforms, so provider credentials
+    never reach the log — now guarded by QA-4 end-to-end, in both directions
+  - >-
+    ✓ pseudo-headers resolve: %REQ(:METHOD)/(:AUTHORITY)/(:SCHEME)% + %RESP(:STATUS)%, via
+    typed LogContext fields (a colon is not a legal HeaderName)
+  - >-
+    ✓ MID-STREAM FAILURES ARE NOW VISIBLE — UC upstream hung up · DC client left / body abandoned
+    · SI upstream went quiet (S4 idle), plus an operator-facing WARN with host, cluster, bytes,
+    TTFT, elapsed
+  - >-
+    ✓ transparent proxy: we log the failure, we never inject an error event into the SSE stream
+    (owner decision)
+  note: >-
+    ⚠ FIXED TWO (found by QA-1 + QA-6): %REQ(:METHOD)% rendered '-' in EVERY log line including
+    Envoy mode, since Envoy's own default format uses it; and a stream killed mid-flight set
+    NO response flag, making a network death byte-identical to a short completion on the SSE
+    path that is most LLM traffic
+- id: 25
+  prio: P2
+  ms: v0.2.0
+  lane: F
+  size: M
+  gate: G3
+  status: ready
+  title: Admin server (/config_dump …)
+  meta:
+  - proxy-admin
+  - unblocked — WP-24 ✓
+  - v0.2.0 ship gate names /config_dump + /stats explicitly
+- id: 26
+  prio: P1
+  ms: v0.0.1
+  lane: G
+  size: L
+  gate: G1
+  status: started
+  title: Differential test rig vs Envoy
+  meta:
+  - testing/diffrig
+  - >-
+    ✓ upstreams: echo/flaky/slow + OpenAI chat + OpenAI Responses + Anthropic Messages (real
+    SSE pacing + usage)
+  - ✓ config-validate differential vs docker'd Envoy v1.38.0 — 0 bug-we-accept
+  - >-
+    ✓ HERMETIC TLS E2E — rcgen CA + tokio-rustls mocks, RFC 6761 *.test.localhost DNS, dual-stack
+    binds, wrong-CA negative control
+  - >-
+    ✓ harness fix: always rebuild the binary (a stale one silently passed a test the code
+    failed)
+  - >-
+    ✓ LIVE SMOKE TEST WRITTEN — tests/live_smoke.rs, 4 #[ignore]d cases (OpenAI + Anthropic,
+    streaming and not); a missing key FAILS by name, never skips
+  - >-
+    ✓ streaming cases assert time-to-first-frame << total duration — the one assertion a buffering
+    regression would trip
+  - 'open: HTTP traffic-replay topology (also closes WP-06''s swap-under-load gate)'
+  note: >-
+    ▲ OWNS THE v0.0.1 SHIP GATE — the test now exists but has NEVER BEEN RUN (needs real keys).
+    Running it is what closes v0.0.1
+- id: 27
+  prio: P2
+  ms: v0.4.0
+  lane: G
+  size: S
+  gate: G1
+  status: started
+  title: Config corpus + scorecard
+  meta:
+  - testing/corpus
+  - 17 real Envoy v1.38 configs w/ provenance · scorecard + report
+  - baseline 3/20 (15%) · all rejects RejectedWithPath, 0 parse-err
+  - v0.4.0 ship gate = 80% accept; it cannot be gamed by adding tests
+- id: 28
+  prio: P2
+  ms: v0.3.0
+  lane: G
+  size: M
+  gate: G3
+  status: started
+  title: Control-plane xDS harness
+  meta:
+  - testing/controlplane
+  - ScriptedAds SotW puppet + ACK/NACK log · 2 tests
+  - 'next: scenario DSL · reconnect/warming · go-control-plane fixture'
+- id: 29
+  prio: P2
+  ms: v0.4.0
+  lane: G
+  size: M
+  gate: G4
+  status: blocked
+  title: Fuzzing (codecs, config, routes)
+  meta:
+  - needs 10
+- id: 30
+  prio: P1
+  ms: v0.2.0
+  lane: G
+  size: M
+  gate: G4
+  status: started
+  title: Perf benchmarks + capacity model
+  meta:
+  - testing/loadgen
+  - >-
+    ✓ phase 1 — open-loop, coordinated-omission-aware driver · SSE parsing · hdrhistogram
+    latency/TTFT/TPOT
+  - >-
+    ✓ phase 2 — process sampler (RSS/CPU/fds, macOS+Linux, explicit error not zeros) · ramp-hold-bisect
+    sweep w/ multi-clause SLO gate
+  - ✓ capacity table + least-squares cost model (bytes/stream, CPU-ms/request, R² reported)
+  - 'open: NO SWEEP PUBLISHED — ''performant'' is still an untested claim'
+  - 'open: Linux /proc path unverified (no Linux box) — a v0.2.0 blocker, not a footnote'
+  note: >-
+    detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending
+    there is reported HARNESS-BOUND, never as proxy capacity
+- id: 41
+  prio: P1
+  ms: v0.0.1
+  lane: G
+  size: M
+  gate: G1
+  status: started
+  title: Black-box QA suite (Go)
+  meta:
+  - testing/qa · zero deps · SCENARIOS.md is the reviewed spec
+  - 'boundary is PHYSICAL, not a convention: a Go module cannot import a Rust crate by accident'
+  - spawns the built binary with a config, asserts only what a client sees on the wire
+  - make ci runs it, skipping LOUDLY if the Go toolchain is absent
+  - >-
+    QA-1 ✓ (verified passing 2026-08-01 — asserts real per-route token values, no longer skips)
+    · QA-2 ✓ · QA-3 ✓ · QA-4 ✓ · QA-6 ✓ · QA-5/7/8 approved, unbuilt
+  - owner approves every case before a test is written
+  note: >-
+    ▲ FOUND 4 REAL BUGS ON DAY ONE, three now fixed — none was visible from inside the code,
+    and one was described as intended in its own doc comment
+- id: 31
+  prio: P2
+  ms: v0.4.0
+  lane: X
+  size: M
+  gate: G4
+  status: ready
+  title: 'Batch 1: cors, local_ratelimit'
+  meta:
+  - proxy-filters
+  - needs 11 ✓ — filter callbacks + registry wiring now land configured filters
+- id: 32
+  prio: P2
+  ms: v0.4.0
+  lane: X
+  size: L
+  gate: G5
+  status: blocked
+  title: 'Batch 2: ext_authz, ratelimit, ext_proc'
+  meta:
+  - proxy-filters
+  - needs 31
+  - ext_proc is what WP-36 needs — this is why parity is a v1.0.0 dependency
+- id: 33
+  prio: P0
+  ms: v0.1.0
+  lane: H
+  size: M
+  gate: G5
+  status: started
+  title: Streaming-first + GenAI metrics (TTFT/TPOT)
+  meta:
+  - proxy-filters · proxy-simple-config/src/lower.rs
+  - >-
+    ✓ usage filter now EMITTED from the llmproxy dialect, per route — typed_per_filter_config
+    carries the dialect (openai/anthropic) keyed off the route's provider
+  - >-
+    ✓ criteria 1,2,4,5,6 met — route override changes dialect, listener default preserved,
+    two-provider HCM carries llmproxy.usage before router, gpt-*/claude-* routes get correct
+    per-route dialects
+  - >-
+    ✓ criterion 7 (end-to-end) — QA-1 now ASSERTS real per-route token values instead of skipping
+  - >-
+    open: criterion 3 — 'an invalid per-route dialect is a build error, and is_optional: true
+    does not swallow it' has NO TEST yet
+  note: >-
+    ▲ NOT DONE — 6/7 acceptance criteria met, criterion 3 outstanding. The ⚑ built-but-unwired
+    flag is CLEARED (filter is in the dialect's http_filters); that is a different fact from
+    the WP being finished
+- id: 34
+  prio: P0
+  ms: v0.1.0
+  lane: H
+  size: M
+  gate: G5
+  status: started
+  title: Token metering + token rate limits
+  meta:
+  - proxy-filters · usage.rs
+  - >-
+    ✓ EXTRACTION DONE — OpenAI chat completions + OpenAI Responses + Anthropic Messages, streaming
+    and not
+  - >-
+    4 non-overlapping cost buckets (input / cache-read / cache-write / output) · Anthropic
+    message_start+delta merge · OpenAI cached-subset normalization
+  - full acceptance suite runs in CI — 0 ignored
+  - >-
+    ✓ now reachable on live traffic via WP-33's per-route wiring — the ⚑ built-but-unwired
+    flag that lived here is cleared
+  - 'open: token rate limits (needs WP-33 fully done — criterion 3 — to feed it safely)'
+- id: 35
+  prio: P0
+  ms: v0.1.0
+  lane: H
+  size: M
+  gate: G5
+  status: ready
+  title: Model routing + provider fallback
+  meta:
+  - proxy-filters
+  - ✓ UNBLOCKED — S2.8 clear_route_cache landed (ADR-0004 step 1)
+  - 'remaining dep: retry-engine wiring (WP-14) for fallback'
+  - 'MVP: model-based routing + provider fallback across OpenAI/Anthropic'
+  - >-
+    body-peek model router bullet MOVED TO WP-45 — shares its bounded-buffer machinery rather
+    than a second implementation
+  note: the dialect REJECTS `fallbacks` today — same schema-points-at-the-hole story as WP-34
+- id: 45
+  prio: P0
+  ms: v0.1.0
+  lane: H
+  size: M
+  gate: G5
+  status: ready
+  title: Request-body rewrite pipeline
+  meta:
+  - proxy-filters
+  - >-
+    NEW 2026-08-01 — bounded request-body buffer (S2 StopIterationAndBuffer, 64KiB default),
+    parse → mutate → re-serialize with content-length recomputed
+  - 'over-cap or non-JSON: pass through untouched, never fail the request'
+  - >-
+    consumer A: forces stream_options.include_usage=true for openai-dialect streaming routes
+    — verified against a real OpenAI-compatible upstream that streaming without it emits NO
+    usage block at all
+  - 'consumer B: absorbs WP-35''s body-peek model router as a shared consumer of the same
+    buffer'
+  note: >-
+    ▲ found today verifying WP-33/34 against a real upstream: the WP-33 filter runs correctly
+    on this quadrant and finds nothing
+- id: 42
+  prio: P1
+  ms: v0.2.0
+  lane: H
+  size: M
+  gate: G5
+  status: blocked
+  title: Spend controls & budgets
+  meta:
+  - proxy-filters
+  - needs 33 (usage on live traffic); 34's extraction is already done
+  - cost model over the 4 non-overlapping token buckets, priced per model
+  - 'budget scopes: key / user / project, with a period'
+  - exhausted budget REJECTS rather than queues
+  note: >-
+    ⚑ NOT the same as WP-34's token rate limits — a tokens/minute cap is a throttle, not a
+    budget. Competitive review 2026-08-01: often the actual reason a team fronts providers
+    with a gateway at all
+- id: 43
+  prio: P2
+  ms: v1.0.0
+  lane: H
+  size: L
+  gate: G5
+  status: blocked
+  title: Response caching
+  meta:
+  - proxy-filters
+  - needs 33
+  - exact-match first (prompt + model + params); semantic caching is a SEPARATE decision
+  - >-
+    streaming is the hard part: a hit must replay AS A STREAM, and the entry can only be written
+    once usage is known at stream end
+  - a hit must be visible in the access log
+  note: >-
+    ▲ open question first: a semantic near-miss served as a hit is a WRONG ANSWER, not a slow
+    one — don't fold it in silently
+- id: 44
+  prio: P2
+  ms: v1.0.0
+  lane: H
+  size: M
+  gate: G5
+  status: blocked
+  title: Cost-aware model routing
+  meta:
+  - proxy-filters
+  - needs 35 (model routing) + 42 (cost model)
+  - route by price as well as availability — cheap requests to a cheap model
+  - the chosen model AND the reason must reach the access log
+  note: >-
+    ⚑ a router that silently downgrades a model is indistinguishable from a bug — explainability
+    is an acceptance criterion, not a nicety
+- id: 36
+  prio: P2
+  ms: v1.0.0
+  lane: H
+  size: M
+  gate: G5
+  status: blocked
+  title: Inference Extension (EPP) support
+  meta:
+  - proxy-filters
+  - needs 35, 32 (ext_proc)
+- id: 37
+  prio: P2
+  ms: v1.0.0
+  lane: H
+  size: M
+  gate: G5
+  status: blocked
+  title: Realtime WebSocket sessions (S10)
+  meta:
+  - proxy-filters
+  - needs 36 + S10 upgrade support in 10/11/13

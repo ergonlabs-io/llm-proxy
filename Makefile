@@ -102,3 +102,15 @@ endif
 .PHONY: vendor-protos
 vendor-protos: ## Re-vendor the pinned Envoy protos (see scripts/vendor-protos.sh)
 	./scripts/vendor-protos.sh
+
+# ------------------------------------------------------------------- boards --
+# Tracking artifacts are GENERATED. Edit docs/boards/*.yaml, never the HTML --
+# the HTML is overwritten by `make boards` and any hand edit is lost.
+
+.PHONY: boards
+boards: ## Render the build board + release tracker from docs/boards/*.yaml
+	python3 scripts/render-boards.py
+
+.PHONY: boards-check
+boards-check: ## Fail if the rendered HTML has drifted from the YAML
+	python3 scripts/render-boards.py --check
