@@ -1270,6 +1270,20 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
     injected length; on a chunked request nothing needs recomputing at all. The body is
     never reassembled, so it also never round-trips through a JSON serializer that could
     reorder keys or renormalize numbers.
+  - **`content-length` adjustment needed a seam that did not exist (found 2026-08-01).** This
+    bullet assumed a decode filter could update the request's `content-length`. It could not:
+    every `content-length` code path in `proxy-http` was response-side, nothing recomputed the
+    request's, and `DecoderCallbacks` had no way to touch request headers after
+    `decode_headers` returned — which is exactly when the injection decision gets made, since
+    it depends on body bytes. Splicing without it sends N+42 bytes under `content-length: N`:
+    a protocol error on every injected request.
+    The alternative — strip `content-length` and force `transfer-encoding: chunked` — was
+    **rejected**: it changes wire framing on every OpenAI-dialect request including the ones
+    we never modify, and this project treats request transparency as a property worth paying
+    for (cf. the 2026-08-01 "never synthesize SSE frames" decision). So WP-45 increment 2
+    splits: **2a** adds `DecoderCallbacks::modify_decoded_headers` (mirroring the existing
+    `modify_decoding_buffer` idiom, returning `false` once headers can no longer affect the
+    upstream request), **2b** builds the filter on top of it.
   - Prefix cap default 64KiB, configurable — but note it now bounds *how far in we look for
     top-level keys*, not how large a body we accept. Bodies of any size pass through.
   - If the keys aren't found within the window, or the body isn't valid JSON: **pass through
