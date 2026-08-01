@@ -36,8 +36,25 @@ test: ## Run all tests
 	cargo test --workspace
 
 .PHONY: fmt
-fmt: ## Format all code
+fmt: ## Format all Rust code (WHOLE REPO -- see fmt-files for the agent-safe one)
 	cargo fmt --all
+
+.PHONY: fmt-check
+fmt-check: ## Check formatting without writing (what CI enforces)
+	cargo fmt --all --check
+
+.PHONY: fmt-files
+fmt-files: ## Format ONLY the listed files: make fmt-files FILES="a.rs b.rs"
+ifndef FILES
+	$(error FILES is required, e.g. make fmt-files FILES="crates/proxy-http/src/router.rs")
+endif
+	rustfmt --edition 2021 $(FILES)
+
+# Why fmt-files exists, and why agents must use it instead of `fmt`:
+# `cargo fmt --all` AND `cargo fmt -p <crate>` are both repo/crate-WIDE writes.
+# When several agents work concurrently, either one reformats other lanes'
+# in-flight uncommitted files. This has caused real losses twice (2026-07-25,
+# 2026-07-27) -- see CLAUDE.md rules 6 and 10.
 
 .PHONY: lint
 lint: ## Clippy with warnings denied (what CI enforces)
@@ -94,8 +111,43 @@ ifeq ($(GO),)
 	@echo ""
 else
 	cargo build --bin llm-proxy
-	cd testing/qa && env -u GOROOT go test ./...
+	cd testing/qa && env -u GOROOT go test -count=1 ./...
 endif
+
+# `-count=1` is NOT optional. Go's test cache keys on Go inputs and has no idea
+# the Rust binary changed underneath it, so a QA run after a Rust change can
+# report a cached PASS from the PREVIOUS binary. This bit us on 2026-08-01: a
+# deliberate mutation was reported green, and was only caught on a re-run with
+# the flag. Same shape as the stale-binary lesson from the auth-header P0.
+
+.PHONY: qa-case
+qa-case: ## Run one QA scenario: make qa-case CASE=TestQA1
+ifndef CASE
+	$(error CASE is required, e.g. make qa-case CASE=TestQA1)
+endif
+	cargo build --bin llm-proxy
+	cd testing/qa && env -u GOROOT go test -count=1 -v -run '$(CASE)' ./scenarios/
+
+.PHONY: qa-list
+qa-list: ## List the QA scenario test functions and their case IDs
+	@grep -rhoE '^func (Test[A-Za-z0-9_]+)' testing/qa/scenarios/ | sed 's/^func /  /' | sort
+
+.PHONY: qa-fmt
+qa-fmt: ## Format the Go QA suite
+	cd testing/qa && env -u GOROOT gofmt -w .
+
+.PHONY: qa-vet
+qa-vet: ## go vet the Go QA suite
+	cd testing/qa && env -u GOROOT go vet ./...
+
+.PHONY: qa-tidy
+qa-tidy: ## go mod tidy for the Go QA suite
+	cd testing/qa && env -u GOROOT go mod tidy
+
+# `env -u GOROOT` on every Go invocation: the shell profile exports a stale
+# GOROOT=/usr/local/go that no longer exists, which makes the toolchain fail in
+# confusing ways. Unsetting it per-command fixes it without touching the
+# owner's shell environment.
 
 # ------------------------------------------------------------------- protos --
 

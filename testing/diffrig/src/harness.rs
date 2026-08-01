@@ -30,6 +30,23 @@ use tokio::net::TcpStream;
 /// binary in `target/<profile>/`, building it first if this is a standalone
 /// `cargo test -p diffrig` run that never built crate `proxy`.
 pub fn resolve_llm_proxy_bin() -> PathBuf {
+    // Rust note: `OnceLock` runs the initializer exactly once per PROCESS and
+    // blocks any concurrent caller until it finishes, so every test in this
+    // binary gets the same freshly-built path.
+    //
+    // This memoization is a pure win, not a weakening of the guarantee below.
+    // Without it every test shelled out to `cargo build` independently: with
+    // tests running in parallel they then contended on cargo's build-directory
+    // lock ("Blocking waiting for file lock on build directory"), so N tests
+    // paid N builds AND serialized on the lock. `mock_e2e.rs` spent 42s of a
+    // 61s workspace test run doing this for 6 tests. The anti-stale-binary
+    // property is unchanged: the build still happens during THIS run, before
+    // any test uses the binary -- just once instead of once per test.
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(build_llm_proxy_bin).clone()
+}
+
+fn build_llm_proxy_bin() -> PathBuf {
     let bin_name = if cfg!(windows) {
         "llm-proxy.exe"
     } else {

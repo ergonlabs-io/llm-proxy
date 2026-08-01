@@ -8,7 +8,7 @@ can be reviewed alongside the tests that cite its case IDs.
 
 | Case | Property | State |
 |------|----------|-------|
-| QA-1 | Per-route token counts, both providers, one config | implemented — **partially passing**, token half skipped (see below) |
+| QA-1 | Per-route token counts, both providers, one config | passing — fully, including tokens, since 2026-08-01 |
 | QA-2 | Bad config fails loudly with the field path, exits nonzero | passing |
 | QA-3 | Streamed response arrives incrementally | passing |
 | QA-4 | Credentials reach upstream, never reach the log | passing |
@@ -21,7 +21,7 @@ can be reviewed alongside the tests that cite its case IDs.
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
 `approved`.
 
-### QA-1 found two independent gaps — one now fixed, one outstanding
+### QA-1 found two independent gaps — both now fixed
 
 On its very first run, QA-1 established that both providers receive exactly one
 request each (routing and provider dispatch work end to end), and then **the
@@ -36,20 +36,40 @@ in the way:
    WP-24 had landed and access logging worked fully in Envoy mode; only the
    dialect lowering was missing, so a proxy configured the way users actually
    configure it produced **no access logs whatsoever**.
-2. **WP-33 — still outstanding.** The usage filter isn't in the dialect's
-   generated `http_filters`, so every `%LLM_*_TOKENS%` operator renders as the
-   absent-value `-`. See `docs/wp-33-design-brief.md`.
+2. ~~**WP-33 — the usage filter isn't in the dialect's generated
+   `http_filters`**, so every `%LLM_*_TOKENS%` operator renders as the
+   absent-value `-`.~~ **FIXED 2026-08-01** — commits *"Teach the usage filter
+   to read a per-route dialect"* (`7e296e3`) and *"Emit the usage filter from
+   the llmproxy dialect, per route"* (`72c7fc8`). The filter now sits ahead of
+   the router in the dialect's chain, and each route carries a
+   `typed_per_filter_config` override naming its own provider's dialect — which
+   is what lets one proxy meter OpenAI and Anthropic correctly from one config.
+   See `docs/wp-33-design-brief.md`.
 
 Gap 1 was not anticipated by the code review that produced the WP-33 brief —
 an independently written black-box test found it from the outside. That is the
 argument for this suite existing, and it arrived on day one.
 
 **QA-1's current shape.** Rather than being all-or-nothing on the token counts,
-it now asserts everything that does not depend on WP-33 — two log lines, one
-per route, correct `path`, `response_code` 200, `bytes_sent` > 0 — and degrades
-to a loud `t.Skip` naming WP-33 only for the token assertions. The access-log
-file failing to appear is now a hard failure, since that is a regression of the
-fix above. It tightens automatically as WP-33 lands.
+it asserts everything that did not depend on WP-33 — two log lines, one per
+route, correct `path`, `response_code` 200, `bytes_sent` > 0 — and degraded to
+a loud `t.Skip` naming WP-33 only for the token assertions. The access-log file
+failing to appear is a hard failure, since that is a regression of the fix
+above.
+
+**It tightened automatically when WP-33 landed**, which was the point of
+building it that way: no edit was needed on 2026-08-01: the skip simply stopped
+firing and the case began asserting `111/222` on the OpenAI route and `444/555`
+on the Anthropic one. Keep the degrade-to-skip shape for future cases blocked
+on unshipped work — a case that cannot run yet is still worth writing, provided
+it says loudly why and starts asserting on its own.
+
+> **Run QA with `-count=1`.** Go's test cache keys on Go inputs and has no idea
+> the Rust binary changed underneath it. A QA run after a Rust change can report
+> a cached PASS from the previous binary — this actually happened on 2026-08-01
+> during a mutation check, and the mutation was only caught after re-running
+> with `-count=1`. This is the same shape as the stale-binary lesson from the
+> auth-header P0.
 
 A note for anyone writing assertions against a `json_format` line: **every
 value is a JSON string**, including numeric ones (`"response_code":"200"`), and
