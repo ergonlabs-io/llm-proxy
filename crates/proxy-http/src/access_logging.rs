@@ -256,6 +256,19 @@ pub(crate) struct AccessLogContext {
 /// for the S5/S4 concerns, is what lets this observe the real end of the
 /// stream.
 ///
+/// **Deliberately observe-only: never inject into the stream.** When a
+/// response fails mid-flight this records a `ResponseFlag` and warns, and
+/// the downstream client simply sees the stream end (an unclean EOF, which
+/// is what tells it the response was truncated). It is tempting to instead
+/// synthesize an SSE error event so the client learns *why* -- do not. This
+/// is a transparent proxy: response bytes reach the client exactly as the
+/// provider produced them. A synthetic frame would have to be forged in the
+/// provider's own event schema (OpenAI's and Anthropic's differ), so a
+/// client would either fail to parse it or, far worse, mistake it for
+/// something the model actually said. Failure attribution belongs in the
+/// access log and the operator-facing warning, not in the response body.
+/// (Owner decision, 2026-08-01.)
+///
 /// `LoggingBody` wraps the OUTERMOST response body -- see
 /// `FilterChainHandler::handle`'s doc -- specifically OUTSIDE
 /// `filter_manager::StreamingEncoder`, not nested inside the router's own
