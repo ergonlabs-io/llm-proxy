@@ -17,7 +17,7 @@ pub use echo::EchoUpstream;
 pub use flaky::{Action, FailScript, FlakyUpstream};
 pub use openai::{ChatRequestLog, OpenAiConfig, OpenAiUpstream};
 pub use slow::SlowUpstream;
-pub use tls_support::MockTls;
+pub use tls_support::{spawn_tls_passthrough, MockTls, TlsPassthrough};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

@@ -165,6 +165,95 @@ where
     })
 }
 
+/// A TLS front bound on loopback that decrypts and forwards, byte for byte,
+/// to an already-running plaintext server.
+///
+/// Why a byte pump rather than an HTTP reverse proxy: the point is to put a
+/// real TLS handshake in front of a server **we did not write** (Ollama)
+/// without becoming a second implementation of HTTP in the path. Parsing and
+/// re-emitting requests here would mean the thing under test talks to *our*
+/// framing again, which is exactly the property this tier exists to avoid.
+/// A `copy_bidirectional` cannot reframe anything.
+pub struct TlsPassthrough {
+    pub port: u16,
+    shutdown_tx: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl TlsPassthrough {
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        for task in self.tasks {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Spawn a TLS terminator on loopback (both address families, see
+/// [`TlsServerHandle`] for why) that forwards plaintext to `target`.
+pub async fn spawn_tls_passthrough(
+    tls: &MockTls,
+    target: SocketAddr,
+) -> anyhow::Result<TlsPassthrough> {
+    let acceptor = build_acceptor(tls);
+
+    let v4 = TcpListener::bind("127.0.0.1:0").await?;
+    let port = v4.local_addr()?.port();
+    let v6 = TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port))
+        .await
+        .ok();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut tasks = vec![tokio::spawn(passthrough_accept_loop(
+        v4,
+        acceptor.clone(),
+        target,
+        shutdown_rx.clone(),
+    ))];
+    if let Some(v6) = v6 {
+        tasks.push(tokio::spawn(passthrough_accept_loop(
+            v6,
+            acceptor,
+            target,
+            shutdown_rx,
+        )));
+    }
+
+    Ok(TlsPassthrough {
+        port,
+        shutdown_tx,
+        tasks,
+    })
+}
+
+async fn passthrough_accept_loop(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    target: SocketAddr,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { continue };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls_stream) = acceptor.accept(stream).await else { return };
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                        return;
+                    };
+                    // Rust note: pumps both directions until either side
+                    // closes. Errors are deliberately ignored -- a client
+                    // hanging up mid-stream is normal here, and the test
+                    // asserts on what the PROXY observed, not on this shim.
+                    let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream).await;
+                });
+            }
+        }
+    }
+}
+
 async fn accept_loop<F, Fut>(
     listener: TcpListener,
     acceptor: TlsAcceptor,
