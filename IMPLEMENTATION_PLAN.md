@@ -1462,6 +1462,35 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   lands, entries after the first are not selectable. They must **warn precisely** (naming
   `models.<name>.backends[N]` and why), never be silently accepted — the same standard the
   `limits` surface is held to.
+- **Model names support `*`, matched through a trie (owner, 2026-08-02).** The catalogue is
+  keyed by model name, and those keys take wildcards — `claude-*` and `gpt-4*` are how an
+  operator avoids enumerating every point release the day a provider ships one.
+  - **Precedence is the normative part; the trie is how it is made fast.** Exact match wins,
+    then the **longest** matching prefix, then a bare `*` catch-all. So with both `claude-*`
+    and `claude-sonnet-*` defined, `claude-sonnet-4-5` resolves to the latter. This is
+    deliberately the same shape as S1's virtual-host domain precedence (exact map, then
+    wildcard lists sorted longest-first) so the project has **one** precedence rule to learn
+    rather than two that differ in a corner.
+  - **A trie rather than S1's sorted-list scan**, because the access pattern differs: domains
+    are matched per connection against a handful of vhosts, whereas the model catalogue is hit
+    on every request once body-based routing (WP-45 consumer B) lands, and a catalogue can
+    reach hundreds of entries. A trie gives O(len(model_name)) independent of catalogue size;
+    the sorted scan is O(entries). Built once at config-load time, immutable thereafter, and
+    reachable from the request path through the same `ArcSwap` snapshot everything else uses
+    (ADR-0005: control computes, workers read).
+  - **Wildcard positions are restricted to exact / `prefix*` / `*`.** A trie cannot answer
+    mid-string globs (`*-sonnet-*`), and S1's domain matcher does not accept them either. Note
+    this is *narrower* than `routes[].model`, which falls back to `safe_regex` for a general
+    glob — so a mid-string `*` in a `models:` key must be a **load error naming the field and
+    the supported forms**, never silently treated as a literal. Two glob dialects that differ
+    silently is worse than one that is explicitly narrower.
+  - **Ambiguity must be impossible, not merely unlikely.** Two catalogue keys cannot resolve
+    the same name at equal specificity (duplicate exact keys, or two identical prefixes), so
+    that is a load error at build time rather than a first-match-wins accident.
+  - **Acceptance:** exact beats prefix beats `*`; longest prefix wins among competing
+    prefixes; a mid-string `*` is a load error; a duplicate key is a load error; lookup cost
+    does not grow with catalogue size (assert structurally — trie depth is bounded by the
+    queried name's length, not by entry count).
 - **Depends on:** WP-38 (dialect), WP-33 (per-route dialect wiring). **Unblocks:** WP-35
   (fallback now has a list to fall back *through*), WP-44 (cost-aware routing needs a price per
   backend, not per model). **Raises the stakes on WP-19** — shifting off a degraded Anthropic to
