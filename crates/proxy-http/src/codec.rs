@@ -6,12 +6,15 @@
 //! before the body completes -- see `tests/hyper_spike.rs` finding (a), the
 //! SSE first-token-early requirement this whole codec exists to preserve).
 //!
-//! Scope: downstream h1 only. h2 downstream, HTTP upgrades (Appendix S10),
-//! and the *upstream* (proxy-to-origin) codec are later WP-10 chunks. Wiring
-//! this into `proxy-core`'s listener (so an `http_connection_manager` filter
-//! chain actually serves traffic) is a deliberately deferred integration
-//! chunk -- this module is tested standalone, over an in-memory pipe, in
-//! `tests/http1_codec.rs`.
+//! Scope: downstream h1 and h2 (`serve_http1`/`serve_http2`), plus the
+//! upstream (proxy-to-origin) h1/h2 codecs (`send_upstream_http1`/
+//! `send_upstream_http2`). HTTP upgrades (Appendix S10) are a later WP-10/11
+//! chunk, as is h2c (cleartext HTTP/2, prior-knowledge or upgrade-from-h1;
+//! see `serve_http2`'s doc comment) -- ALPN-negotiated `h2` over TLS is the
+//! only way a downstream connection reaches `serve_http2` today
+//! (`proxy-core`'s listener dispatches on the negotiated protocol). This
+//! module is tested standalone, over an in-memory pipe, in
+//! `tests/http1_codec.rs` and `tests/http2_codec.rs`.
 
 use std::future::Future;
 use std::rc::Rc;
@@ -111,6 +114,75 @@ where
     // keep being polled to actually drain the in-flight request (if any) and
     // then finish. Spike finding (d): after this, hyper serves out anything
     // already in flight, then closes without accepting a next request.
+    conn.await.map_err(CodecError::Connection)
+}
+
+/// Serve one accepted downstream connection as HTTP/2 until the peer closes
+/// it, `shutdown` fires, or a connection-level error occurs -- the h2 mirror
+/// of `serve_http1`.
+///
+/// Divergence from `serve_http1`: there is no `Http2Options`/`keep_alive`
+/// parameter. HTTP/2 multiplexes many streams over one connection with no
+/// per-request `Connection: close` concept, so there is no per-connection
+/// keep-alive knob to thread through (same reasoning `send_upstream_http2`'s
+/// doc comment gives for dropping it on the client side).
+///
+/// Per-stream isolation: `hyper::server::conn::http2::Builder` requires an
+/// [`hyper::rt::Executor`] and uses it to spawn each h2 stream's
+/// `service_fn` call as its own task (see `H2Stream` in hyper's internals) --
+/// concurrent streams are NOT driven cooperatively inside one poll of this
+/// function's `Connection` future. That's what makes concurrency real rather
+/// than serialized, and why this reuses [`LocalExec`] (ADR-0003: those spawned
+/// tasks are `!Send`, so a `Send`-requiring executor like
+/// `hyper_util::rt::TokioExecutor` can't be used -- same rationale as the
+/// upstream h2 client above). Each spawned stream task calls `serve_one`
+/// fresh, which builds a new `HttpRequestParts`/hands the handler a new
+/// `HttpRequestParts` -- `handler.handle()` in turn builds a fresh
+/// `FilterManager` per call (see `FilterChainHandler::handle`'s doc comment),
+/// so two concurrent streams on this connection never share a `StreamInfo` or
+/// filter-chain instance.
+///
+/// Out of scope (see the module doc and WP-10's plan entry): h2c (cleartext
+/// HTTP/2, prior-knowledge or upgrade-from-h1) is not implemented -- this
+/// function is only ever driven over an already-ALPN-negotiated `h2` TLS
+/// stream by `proxy-core`'s listener.
+pub async fn serve_http2<IO>(
+    io: IO,
+    handler: Rc<dyn StreamHandler>,
+    shutdown: impl Future<Output = ()>,
+    downstream: DownstreamInfo,
+) -> Result<(), CodecError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let io = TokioIo::new(io);
+
+    // Rust note: same shape as `serve_http1`'s `service` closure -- see its
+    // comment for why `.clone()`-ing the `Rc` (not moving `handler`) is
+    // correct here, once per stream, for an unbounded number of streams.
+    let service = service_fn(move |req: Request<Incoming>| {
+        let handler = handler.clone();
+        async move { Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream).await) }
+    });
+
+    let builder = hyper::server::conn::http2::Builder::new(LocalExec);
+    let conn = builder.serve_connection(io, service);
+
+    // Rust note: same `tokio::pin!` + `graceful_shutdown` shape as
+    // `serve_http1` -- see its comments for why pinning is required and what
+    // `graceful_shutdown` does and doesn't do on its own.
+    tokio::pin!(conn);
+    tokio::pin!(shutdown);
+
+    tokio::select! {
+        result = &mut conn => {
+            return result.map_err(CodecError::Connection);
+        }
+        _ = &mut shutdown => {
+            conn.as_mut().graceful_shutdown();
+        }
+    }
+
     conn.await.map_err(CodecError::Connection)
 }
 

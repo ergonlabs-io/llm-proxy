@@ -30,7 +30,7 @@ use proxy_config::ir::{
     NetworkFilterSpec, SnapshotVersion,
 };
 use proxy_config::ConfigSnapshot;
-use proxy_http::codec::{serve_http1, Http1Options};
+use proxy_http::codec::{serve_http1, serve_http2, Http1Options};
 use proxy_http::filter::{FactoryContext, FilterRegistry, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
@@ -690,6 +690,12 @@ async fn serve_connection(conn: ServeConnection) {
     match (matched.transport_socket.is_some(), factory) {
         (true, Some(factory)) => match factory.wrap(stream).await {
             Ok(tls_stream) => {
+                // WP-10 h2: the ALPN protocol rustls just negotiated with the
+                // client decides which codec serves this connection -- see
+                // `downstream_codec_for_alpn`'s doc comment for why this has
+                // to be read *here* (post-handshake) rather than assumed from
+                // config, and for the h2c-is-out-of-scope note.
+                let codec = downstream_codec_for_alpn(&tls_stream);
                 // Can't `reset` (SO_LINGER) a `TlsStream` the way we can a
                 // bare `TcpStream` -- `run_terminal_filter` hands the stream
                 // back on the no-op paths so the *unimplemented*/no-filter
@@ -699,7 +705,16 @@ async fn serve_connection(conn: ServeConnection) {
                     is_tls: true,
                 };
                 let _ = run_terminal_filter(
-                    tls_stream, filter, snapshot, &registry, shutdown, &name, downstream,
+                    tls_stream,
+                    filter,
+                    snapshot,
+                    RunTerminalFilterCtx {
+                        registry: &registry,
+                        shutdown,
+                        name: &name,
+                        downstream,
+                        codec,
+                    },
                 )
                 .await;
             }
@@ -718,13 +733,24 @@ async fn serve_connection(conn: ServeConnection) {
         (false, _) => {
             // Plaintext (or TLS-passthrough, if `matched` was selected via SNI
             // but configures no `transport_socket`): dispatch straight to the
-            // terminal L4 filter on `stream`.
+            // terminal L4 filter on `stream`. No ALPN exists over plaintext,
+            // and h2c (cleartext HTTP/2) is out of scope (see
+            // `downstream_codec_for_alpn`'s doc comment) -- always h1.
             let downstream = DownstreamInfo {
                 remote: peer,
                 is_tls: false,
             };
             if let Some(stream) = run_terminal_filter(
-                stream, filter, snapshot, &registry, shutdown, &name, downstream,
+                stream,
+                filter,
+                snapshot,
+                RunTerminalFilterCtx {
+                    registry: &registry,
+                    shutdown,
+                    name: &name,
+                    downstream,
+                    codec: DownstreamCodec::Http1,
+                },
             )
             .await
             {
@@ -732,6 +758,50 @@ async fn serve_connection(conn: ServeConnection) {
             }
         }
     }
+}
+
+/// Which HTTP codec serves a downstream connection: h1 unconditionally for
+/// plaintext (see the `(false, _)` call site) and now, correctly, negotiated
+/// ALPN for TLS -- **this used to be a live bug**: `server_config.alpn_protocols`
+/// (set from `spec.alpn_protocols` in `crates/proxy-core/src/tls/mod.rs`)
+/// already let an operator configure `alpn_protocols: ["h2"]` on a downstream
+/// listener, rustls would happily negotiate `h2` with the client during
+/// `factory.wrap`, and this module then unconditionally called `serve_http1`
+/// on the result -- a config field accepted and then silently not honored
+/// (ground rule #1), and a protocol violation from the client's point of
+/// view (it believes it's speaking h2 framing to us; we read h1 framing off
+/// the same bytes). This function is the fix: read what rustls actually
+/// negotiated, post-handshake, rather than assuming h1.
+///
+/// Only `h2` selects [`DownstreamCodec::Http2`]; anything else (`http/1.1`,
+/// no ALPN negotiated at all, e.g. `alpn_protocols` left empty in config) is
+/// h1. h2c -- HTTP/2 over cleartext, either "prior knowledge" or the h1
+/// `Upgrade: h2c` mechanism -- is deliberately out of scope for this WP (see
+/// `serve_http2`'s and `proxy_http::codec`'s module doc): there is no ALPN on
+/// a plaintext connection to dispatch on, so h2c would need its own detection
+/// path this function does not implement.
+fn downstream_codec_for_alpn<IO>(
+    tls_stream: &tokio_rustls::server::TlsStream<IO>,
+) -> DownstreamCodec {
+    // Rust note: `get_ref()` on a `tokio_rustls::server::TlsStream` returns
+    // `(&IO, &rustls::ServerConnection)` (via `Deref` to `CommonState`) --
+    // the underlying I/O plus the live rustls session state, which is where
+    // the post-handshake negotiated ALPN protocol lives (`alpn_protocol()`
+    // returns `None` before the handshake completes or when neither side
+    // negotiated one).
+    match tls_stream.get_ref().1.alpn_protocol() {
+        Some(b"h2") => DownstreamCodec::Http2,
+        _ => DownstreamCodec::Http1,
+    }
+}
+
+/// See [`downstream_codec_for_alpn`]. `Copy` so it threads through
+/// `run_terminal_filter`'s already-long parameter list as cheaply as
+/// `DownstreamInfo` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownstreamCodec {
+    Http1,
+    Http2,
 }
 
 /// The matched chain's terminal network filter, resolved into cheap owned
@@ -867,6 +937,25 @@ fn build_hcm_handler(
     ))
 }
 
+/// Everything [`run_terminal_filter`] needs beyond `stream`/`filter`/
+/// `snapshot` -- WP-10 h2's new `codec` field is what pushed the plain
+/// parameter list over clippy's `too_many_arguments` threshold; bundled here
+/// rather than adding an 8th positional parameter (same motivation
+/// [`WorkerShared`]/[`ListenerCaches`] document for their own bundling).
+struct RunTerminalFilterCtx<'a> {
+    registry: &'a ConnectionRegistry,
+    shutdown: watch::Receiver<bool>,
+    name: &'a ListenerName,
+    // Rust note: `Copy`, so it threads cheaply -- also doubles as `peer` for
+    // the tracing calls below via `downstream.remote`.
+    downstream: DownstreamInfo,
+    // WP-10 h2: which codec to drive the `Http` terminal filter with --
+    // always `Http1` on the plaintext call site, ALPN-derived on the TLS one
+    // (see `downstream_codec_for_alpn`). Ignored by the `TcpProxy`/`None`
+    // arms below, which have no HTTP codec to pick.
+    codec: DownstreamCodec,
+}
+
 /// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy` and
 /// `Http` paths this registers the connection guard and runs to completion,
 /// consuming `stream` and returning `None`. On the no-filter path it logs and
@@ -877,15 +966,15 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + 'static>(
     stream: IO,
     filter: Option<TerminalFilter>,
     snapshot: Arc<ConfigSnapshot>,
-    registry: &ConnectionRegistry,
-    mut shutdown: watch::Receiver<bool>,
-    name: &ListenerName,
-    // Rust note: bundled into one `Copy` struct (rather than a bare
-    // `SocketAddr` + `bool`) so this already-long parameter list doesn't grow
-    // by two for S9 -- also doubles as `peer` for the tracing calls below via
-    // `downstream.remote`.
-    downstream: DownstreamInfo,
+    ctx: RunTerminalFilterCtx<'_>,
 ) -> Option<IO> {
+    let RunTerminalFilterCtx {
+        registry,
+        mut shutdown,
+        name,
+        downstream,
+        codec,
+    } = ctx;
     let peer = downstream.remote;
     match filter {
         Some(TerminalFilter::TcpProxy(params)) => {
@@ -917,10 +1006,20 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + 'static>(
                 }
             };
 
-            let options = Http1Options { keep_alive: true };
-            if let Err(err) = serve_http1(stream, handler, options, shutdown_fut, downstream).await
-            {
-                tracing::debug!(listener = %name, peer = %peer, error = %err, "http/1.1 connection ended with an error");
+            match codec {
+                DownstreamCodec::Http1 => {
+                    let options = Http1Options { keep_alive: true };
+                    if let Err(err) =
+                        serve_http1(stream, handler, options, shutdown_fut, downstream).await
+                    {
+                        tracing::debug!(listener = %name, peer = %peer, error = %err, "http/1.1 connection ended with an error");
+                    }
+                }
+                DownstreamCodec::Http2 => {
+                    if let Err(err) = serve_http2(stream, handler, shutdown_fut, downstream).await {
+                        tracing::debug!(listener = %name, peer = %peer, error = %err, "http/2 connection ended with an error");
+                    }
+                }
             }
             None
         }
@@ -1865,6 +1964,152 @@ mod tests {
             "test client",
         )
         .expect("client factory should build")
+    }
+
+    /// Like [`client_factory_with_sni`], but with an explicit ALPN offer --
+    /// the WP-10 h2 dispatch test below needs to control exactly which
+    /// protocol the client proposes (rather than none at all), unlike every
+    /// pre-h2 TLS test in this module.
+    fn client_factory_with_alpn(sni: &str, alpns: &[&str]) -> UpstreamTlsFactory {
+        UpstreamTlsFactory::build(
+            &UpstreamTlsSpec {
+                sni: Some(sni.to_string()),
+                params: tls_params(),
+                alpn_protocols: alpns.iter().map(|s| s.to_string()).collect(),
+                client_certificate: None,
+                validation: None,
+            },
+            "test client",
+        )
+        .expect("client factory should build")
+    }
+
+    /// An `http_connection_manager` filter whose route table always returns a
+    /// fixed-status `DirectResponse` -- the WP-10 h2 dispatch test below only
+    /// cares "did the right codec (h1 vs h2) serve this connection", not
+    /// about routing, so this is deliberately simpler than
+    /// [`hcm_filter_with_header_mutation`].
+    fn hcm_filter_direct_response(status: u16) -> NetworkFilterSpec {
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: direct_response_route_table(status),
+            http_filters: vec![],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
+            access_logs: vec![],
+        })
+    }
+
+    /// WP-10 h2 -- the ALPN dispatch test, and the regression test for the
+    /// bug [`downstream_codec_for_alpn`]'s doc comment describes: before that
+    /// function existed, this listener unconditionally called `serve_http1`
+    /// regardless of what ALPN negotiated, so an operator configuring
+    /// `alpn_protocols: ["h2", ...]` on a downstream listener got a silent
+    /// protocol violation (h2 negotiated with the client, h1 framing spoken
+    /// on the wire).
+    ///
+    /// Verified at the wire-framing level rather than through a real h2
+    /// client library: `proxy-core` deliberately carries no `hyper`/
+    /// `http-body-util` dependency (see `spawn_http_upstream_chunked_json`'s
+    /// doc comment for the established reasoning, which applies here too),
+    /// so the h2 side of this test hand-writes the client connection preface
+    /// (RFC 7540 S3.5: the `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` magic plus an
+    /// empty SETTINGS frame) and asserts the server's first frame back is
+    /// itself a SETTINGS frame at stream id 0 -- something only a real h2
+    /// codec produces. `serve_http1`'s h1 parser has no notion of that
+    /// framing at all (it would either error out on the `PRI * HTTP/2.0`
+    /// request line or hang waiting for `\r\n\r\n`-terminated headers that
+    /// never come in that shape), so this genuinely discriminates the two
+    /// codecs rather than merely checking a config field was read.
+    #[test]
+    fn alpn_negotiated_protocol_selects_the_serving_codec() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let (cert, key) = mint_self_signed("alpn.example.com");
+            let mut tls_spec = downstream_tls_spec(&cert, &key);
+            tls_spec.alpn_protocols = vec!["h2".to_string(), "http/1.1".to_string()];
+            let listener_ir = IrListenerConfig {
+                filter_chains: vec![FilterChainSpec {
+                    name: Some("tls-hcm".to_string()),
+                    match_criteria: FilterChainMatch::default(),
+                    transport_socket: Some(tls_spec),
+                    filters: vec![hcm_filter_direct_response(200)],
+                }],
+                ..match_all_listener_with_filter("l1", addr, hcm_filter_direct_response(200))
+            };
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // -- h2 side: ALPN offers only "h2".
+            let tcp = TcpStream::connect(addr).await.expect("h2 connect");
+            let client_h2 = client_factory_with_alpn("alpn.example.com", &["h2"]);
+            let mut tls_h2 = client_h2
+                .wrap(tcp, "alpn.example.com")
+                .await
+                .expect("h2 ALPN handshake should complete");
+            assert_eq!(
+                tls_h2.get_ref().1.alpn_protocol(),
+                Some(&b"h2"[..]),
+                "client should have negotiated h2"
+            );
+
+            let mut preface = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
+            // An empty SETTINGS frame: 3-byte length (0), 1-byte type (0x4),
+            // 1-byte flags (0x0), 4-byte stream id (0) -- RFC 7540 S4.1/S6.5.
+            preface.extend_from_slice(&[0, 0, 0, 0x4, 0x0, 0, 0, 0, 0]);
+            tls_h2
+                .write_all(&preface)
+                .await
+                .expect("write h2 client preface");
+
+            let mut frame_header = [0u8; 9];
+            tokio::time::timeout(Duration::from_secs(2), tls_h2.read_exact(&mut frame_header))
+                .await
+                .expect("server should respond with its own frame before the timeout")
+                .expect("read server's first frame header");
+            assert_eq!(
+                frame_header[3], 0x4,
+                "server's first frame should be its own SETTINGS frame (h2 served), got: {frame_header:?}"
+            );
+            assert_eq!(
+                &frame_header[5..9],
+                &[0, 0, 0, 0],
+                "SETTINGS is a connection-level frame (stream id 0), got: {frame_header:?}"
+            );
+
+            // -- h1 side: ALPN offers only "http/1.1".
+            let tcp = TcpStream::connect(addr).await.expect("h1 connect");
+            let client_h1 = client_factory_with_alpn("alpn.example.com", &["http/1.1"]);
+            let mut tls_h1 = client_h1
+                .wrap(tcp, "alpn.example.com")
+                .await
+                .expect("http/1.1 ALPN handshake should complete");
+            assert_eq!(
+                tls_h1.get_ref().1.alpn_protocol(),
+                Some(&b"http/1.1"[..]),
+                "client should have negotiated http/1.1"
+            );
+
+            tls_h1
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), tls_h1.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected an ordinary h1 status line (http/1.1 served), got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
     }
 
     #[test]
