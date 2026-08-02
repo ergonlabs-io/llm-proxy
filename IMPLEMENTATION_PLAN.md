@@ -1427,8 +1427,17 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
      first-class case — `vertex-us` and `vertex-eu`, or two Anthropic accounts with separate
      quota pools — which the current model also cannot express.
   3. **Model** (new `models:` block): a logical name clients use, mapping to an ordered list of
-     `{provider, model, dialect?}` backends. `ProviderModelRef` already parses `provider/model`,
-     so per-backend upstream IDs are half-built already.
+     `{provider, model, dialect?}` entries. `ProviderModelRef` already parses `provider/model`,
+     so per-provider upstream IDs are half-built already, and the shorthand string form reuses it.
+- **Vocabulary (owner, 2026-08-02): the config surface has exactly two nouns, `providers` and
+  `models`.** Vertex, Groq, Anthropic, and Nebius are all *providers*; a model names the providers
+  that serve it. The word "backend" is deliberately absent from the config — an earlier draft of
+  this WP used it for the per-model binding while the owner uses it for the connection object, which
+  would have made one word mean two things depending on nesting depth. The per-model list is
+  therefore `models.<name>.providers[]`, whose entries carry `provider:` and so read consistently
+  against the top-level `providers:` map they reference. Each entry accepts either the
+  `provider/model` shorthand string or an object form (needed when `dialect` must be explicit);
+  both must lower identically, pinned by a test.
 - **Credential schemes are a trait, not a schema field.** The mechanism follows the provider
   type: static header (`anthropic`, `openai`, `openai-compatible`, `azure-openai`), minted
   OAuth2 with refresh (`vertex`), per-request SigV4 signing (`bedrock`). Introduce a

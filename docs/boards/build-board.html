@@ -1062,7 +1062,8 @@
   "meta": [
    "proxy-simple-config · schema",
    "one logical model served by SEVERAL backends — Claude by Anthropic/Vertex/Bedrock, Kimi-K2 by Nebius/Vertex. The v0 dialect cannot express it: a route names exactly ONE provider",
-   "3 levels — provider TYPE (in code: endpoint shape + credential mechanism + default dialect) → provider INSTANCE (config: credentials + placement, two of one type is first-class) → MODEL (new `models:` block, logical name → ordered backends)",
+   "3 levels — provider TYPE (in code: endpoint shape + credential mechanism + default dialect) → provider INSTANCE (config: credentials + placement, two of one type is first-class) → MODEL (new `models:` block, logical name → ordered providers)",
+   "VOCABULARY (owner 2026-08-02): exactly TWO nouns in the config — `providers` and `models`. Vertex/Groq/Anthropic/Nebius are all providers. \"backend\" is deliberately absent; it would have meant a connection object at one nesting level and a binding at another",
    "dialect is REQUIRED not derived for vertex/bedrock — Vertex serves Anthropic-shaped Claude, Google-shaped Gemini AND OpenAI-shaped Kimi",
    "selection semantics (fallback/split/cost) deliberately deferred to WP-35/WP-44"
   ],
