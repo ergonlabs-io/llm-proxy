@@ -35,6 +35,42 @@ check: ## Fast type-check of the whole workspace (no codegen)
 test: ## Run all tests
 	cargo test --workspace
 
+# ------------------------------------------------------------ quiet testing --
+# Why these exist: agent context is the scarce resource, and `cargo test`'s
+# default output is one line PER PASSING TEST -- ~900 lines of "... ok" that
+# say nothing a summary doesn't. `--quiet` prints dots instead, while STILL
+# printing the full panic, diff, and backtrace for anything that fails. So the
+# detail arrives exactly when it is wanted and never when it isn't.
+#
+# `--no-fail-fast` matters on the workspace target: plain `--workspace` stops
+# at the first failing crate and silently undercounts the total.
+
+.PHONY: tq
+tq: ## Quiet workspace test w/ per-crate summaries (the one agents should use)
+	cargo test --workspace --no-fail-fast --quiet
+
+.PHONY: tq-count
+tq-count: ## Quiet workspace test, printing ONLY the totals line
+	@cargo test --workspace --no-fail-fast --quiet 2>&1 \
+	  | grep -E '^test result:' \
+	  | awk -F'[ ;]+' '{p+=$$4; f+=$$6; i+=$$8} \
+	      END {printf "passed=%d failed=%d ignored=%d\n", p, f, i}'
+
+tq-%: ## Quiet test of one crate, e.g. make tq-proxy-http
+	cargo test -p $* --quiet
+
+# Run ONE test by name, quietly -- what a mutation check should use rather than
+# re-running a whole crate. e.g. make t1 CRATE=proxy-filters TEST=hash_credential
+.PHONY: t1
+t1: ## Run a single test: make t1 CRATE=<crate> TEST=<name substring>
+ifndef CRATE
+	$(error CRATE is required, e.g. make t1 CRATE=proxy-http TEST=my_test)
+endif
+ifndef TEST
+	$(error TEST is required, e.g. make t1 CRATE=proxy-http TEST=my_test)
+endif
+	cargo test -p $(CRATE) --quiet $(TEST)
+
 .PHONY: fmt
 fmt: ## Format all Rust code (WHOLE REPO -- see fmt-files for the agent-safe one)
 	cargo fmt --all
