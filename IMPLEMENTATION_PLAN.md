@@ -1406,6 +1406,65 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   largest value the parser will accept) that fails against the unfixed arithmetic. A grep-based
   or lint-based guard against reintroduction is a stretch goal, not the deliverable.
 
+#### WP-49 — Backend taxonomy: providers, models, and credential schemes  (Size: L)  — **Priority: P0** · **Milestone: v0.1.0**
+- **Why (owner, 2026-08-01).** One logical model is served by several backends: Claude by
+  Anthropic *or* Vertex *or* Bedrock; Kimi-K2 by Nebius *or* Vertex. The v0 dialect cannot
+  express this at all — a `RouteRule` names exactly one `ProviderModelRef`, so a model has
+  exactly one backend. This WP is the **naming and data model only**; which backend gets
+  picked (fallback / weighted split / cost-aware) is deliberately deferred to WP-35 and WP-44.
+- **The real problem is not the list, it is that `Provider` conflates four things:** the
+  *endpoint* (host, TLS, URL path shape), the *credential scheme* (static header vs minted
+  OAuth token vs per-request signature), the *wire dialect* (OpenAI- vs Anthropic-shaped), and
+  the *model catalogue* (which models, under which upstream IDs). Multi-backend is only
+  expressible once those separate.
+- **The hierarchy (three levels):**
+  1. **Provider type** — built into the code, not config: `openai`, `anthropic`,
+     `openai-compatible`, `azure-openai`, `vertex`, `bedrock`. Fixes the endpoint shape, the
+     credential *mechanism*, and the default dialect.
+  2. **Provider instance** (today's `providers:` map — the name stays): a named, credentialed
+     placement of a type. Config supplies the *material* (api key, service-account file,
+     region, project, deployment host), never the mechanism. Two instances of one type is a
+     first-class case — `vertex-us` and `vertex-eu`, or two Anthropic accounts with separate
+     quota pools — which the current model also cannot express.
+  3. **Model** (new `models:` block): a logical name clients use, mapping to an ordered list of
+     `{provider, model, dialect?}` backends. `ProviderModelRef` already parses `provider/model`,
+     so per-backend upstream IDs are half-built already.
+- **Credential schemes are a trait, not a schema field.** The mechanism follows the provider
+  type: static header (`anthropic`, `openai`, `openai-compatible`, `azure-openai`), minted
+  OAuth2 with refresh (`vertex`), per-request SigV4 signing (`bedrock`). Introduce a
+  `CredentialProvider` seam with the static implementation only — the same shape as WP-34's
+  `BudgetStore`. **Critically, the two unbuilt schemes are not header injection:** an OAuth
+  token needs a refresh loop with its own failure mode, and SigV4 signs the canonical request,
+  so it must run *after* body rewriting (WP-45) and cannot be a `request_headers_to_add` entry.
+  Both therefore need a router hook that does not exist yet.
+- **Dialect must follow the WIRE FORMAT, not the provider name — and for two types it cannot
+  be derived at all.** Vertex serves Anthropic-shaped Claude, Google-shaped Gemini, *and*
+  OpenAI-shaped Kimi; Bedrock is similar. So `dialect` is derivable for the unambiguous types
+  and **required** on the backend entry for `vertex`/`bedrock` — omitting it is a load error,
+  not a guess. Getting this wrong is not cosmetic: `usage_dialect`'s own doc records that the
+  OpenAI parser on an Anthropic body *partially* matches, billing a customer against a number
+  nobody computed.
+- **URL path templating.** Anthropic is `POST /v1/messages`; Vertex is
+  `/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict`;
+  Azure puts a *deployment name* in the path plus an `api-version` query parameter. Host rewrite
+  and `prefix_rewrite` do not reach this — the provider type owns a path template rendered from
+  instance + model variables.
+- **Accepting a list without selection semantics is a ground-rule-#1 hazard.** Until WP-35
+  lands, entries after the first are not selectable. They must **warn precisely** (naming
+  `models.<name>.backends[N]` and why), never be silently accepted — the same standard the
+  `limits` surface is held to.
+- **Depends on:** WP-38 (dialect), WP-33 (per-route dialect wiring). **Unblocks:** WP-35
+  (fallback now has a list to fall back *through*), WP-44 (cost-aware routing needs a price per
+  backend, not per model). **Raises the stakes on WP-19** — shifting off a degraded Anthropic to
+  Vertex *is* outlier ejection, which is built (78 tests) but has no IR field to enable it.
+- **Acceptance:** a config defining one model across Anthropic + Vertex + Bedrock + an
+  OpenAI-compatible backend loads, validates, and lowers; each backend gets its own cluster,
+  upstream model ID, dialect, and credential scheme. Omitting `dialect` on a `vertex` backend is
+  a load error naming the field. Backends after the first warn that they are not yet selectable.
+  A second instance of the same provider type (`vertex-us` + `vertex-eu`) lowers to two distinct
+  clusters. Static-credential backends work end to end against the mock tier; OAuth and SigV4
+  land with their schemes and are out of scope for the first increment.
+
 ## Part 3 — Milestone gates (roll-up)
 
 | Gate | Requires WPs | Demo |
