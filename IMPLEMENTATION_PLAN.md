@@ -1335,6 +1335,77 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   6. Streaming is not regressed: the request-body buffer must not delay *response* bytes.
      `local_openai_smoke.rs`'s arrival-spread assertion covers this.
 
+#### WP-46 — TPOT in the access log  (Size: S)  — **Priority: P0** · **Milestone: v0.1.0**
+- **Why.** The v0.1.0 gate requires per-request token counts **and TTFT/TPOT** to reach the
+  access log for live traffic. `%LLM_TTFT%` exists; there is no TPOT operator, so the gate
+  clause is half met. Found 2026-08-01 by auditing the gate clause by clause — no test
+  covers a *missing* operator, and nothing else would have surfaced it.
+- **The trap, and why this is not simply "add a reader".** `StreamInfo::LlmStats` already
+  carries `max_inter_chunk`, and the obvious move is to render it as `%LLM_TPOT%`. That
+  would be **wrong**: its own doc defines it as the *largest gap between two consecutive
+  chunks* — "the tail of the TPOT distribution, which is what users feel as a stall" — not
+  TPOT. Publishing a max-gap under a TPOT label would put a number in customers' dashboards
+  that does not mean what its name says, which is worse than the field being absent.
+- **Build:**
+  - `%LLM_TPOT%` = mean time per output token, computed at render time as
+    `(duration − ttft) / output_tokens`. Every input already reaches `LogContext`
+    (`duration`, `llm_ttft`, `llm_tokens.output`), so this needs **no new `StreamInfo`
+    plumbing** — it is arithmetic in the formatter.
+  - Guard the degenerate cases the way the other LLM operators do: `output_tokens == 0`, a
+    missing TTFT, and `duration < ttft` all render `-` rather than a garbage number or a
+    division panic. Per WP-48, the arithmetic saturates.
+  - Expose `max_inter_chunk` **separately** as its own operator (e.g. `%LLM_MAX_STALL%`)
+    rather than discarding it — it is a genuinely useful stall metric, it is already
+    computed, and it is currently unreadable. `response_chunks` is in the same position.
+- **Depends on:** WP-33's usage filter (populates the fields), WP-24's format engine.
+- **Acceptance:** a streamed response through the proxy produces an access-log line whose
+  `%LLM_TPOT%` equals `(duration − ttft) / output_tokens` within rounding, asserted against
+  a scripted response with known timing and a known token count — not a mock that reports
+  the value back to itself. A non-streamed response, and a response with zero output tokens,
+  both render `-`. Mutation: rendering `max_inter_chunk` as `%LLM_TPOT%` must fail the test,
+  since that is the specific mistake this WP exists to avoid.
+
+#### WP-47 — Vendored Lane-H filter proto  (Size: M)  — **Priority: P1** · **Milestone: v0.1.0**
+- **Why.** `FilterRegistry::register` keys on `type_url` and **asserts** on a duplicate, so
+  every Lane-H filter needs a distinct one. With no vendored Lane-H proto, three filters have
+  each borrowed an unrelated already-compiled Envoy message and read fields whose names
+  happen to fit:
+  `llmproxy.usage` → `DataSource.inline_string`;
+  `llmproxy.body_rewrite` → `RuntimeFeatureFlag.default_value`/`runtime_key`;
+  `llmproxy.token_limit` → `RateLimitSettings.max_tokens`/`fill_rate`, which is really
+  Envoy's *xDS discovery throttling* config.
+  Each of those three modules independently documents that a vendored proto is the real
+  answer. The fourth filter has to stretch a fifth message.
+- **The cost is not aesthetic.** A reader cannot tell config *intent* from a borrowed message
+  name; `--mode translate` output shows operators a type URL that describes a different
+  feature; and every filter is capped at whatever fields its borrowed message happens to
+  have — which is exactly what forced WP-34's thin slice (`LimitOn::Total`, one fixed bucket
+  key, no per-descriptor config).
+- **Build:** one `llmproxy/filters/v0/*.proto` vendored into `proxy-api` and reachable from
+  `build.rs`'s roots (note `envoy.type.v3.TokenBucket` is vendored but **not** compiled —
+  it is not transitively imported by any current root, which is why WP-34 could not use it).
+  Migrate the three filters onto real messages, keeping the old type URLs accepted for one
+  release so existing configs keep loading.
+- **Acceptance:** all three filters parse their own proto; a config using a legacy borrowed
+  type URL still loads and logs a deprecation warning; the schema-lint and `--mode translate`
+  output name Lane-H messages rather than unrelated Envoy ones.
+
+#### WP-48 — Sweep arithmetic on wire-derived numbers  (Size: S)  — **Priority: P1** · **Milestone: v0.1.0**
+- **Why.** Two instances of one defect were found by review on 2026-08-01, both a plain `+`
+  on a number that arrived over the wire:
+  `TokenUsage::total()` summed four provider-reported `u64`s on the live access-log path, and
+  the WP-45 `content-length` fix-up added to a value parsed from a **client** header. Both
+  panic the worker in debug and wrap silently in release; the second is downstream-reachable,
+  so any client could trigger it. Two in one day is a pattern, and **the suites stayed green
+  through both** — neither was found by a test.
+- **Build:** audit every arithmetic operation on a value parsed from a request, a response,
+  a header, or a provider body. Saturating (or explicitly clamped) everywhere, with a test
+  per site that panics or wraps without it. Prefer making the *parse* clamp at its boundary
+  over auditing each downstream use, where that is possible.
+- **Acceptance:** each converted site has a test using boundary inputs (`u64::MAX`, and the
+  largest value the parser will accept) that fails against the unfixed arithmetic. A grep-based
+  or lint-based guard against reintroduction is a stretch goal, not the deliverable.
+
 ## Part 3 — Milestone gates (roll-up)
 
 | Gate | Requires WPs | Demo |
@@ -1343,7 +1414,7 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
 | **G2: HTTP router** | 10–15, 23, 24 | Full HTTP routing/retries/timeouts, routing diff suite 100%, lifecycle flags parity |
 | **G3: Dynamic** | 16–22, 25, 28 | Envoy Gateway drives us via ADS; make-before-break churn zero-loss |
 | **G4: Prod-ready** | 18, 19, 29, 30, 31 | Health/outlier parity, fuzz-clean, perf ≥ Envoy, dashboards work |
-| **G5: LLM gateway** | 32, 33–37, 45 | SSE streaming, token metering/limits, model routing + fallback, EPP inference LB, realtime WebSocket sessions — Envoy AI Gateway capability set with zero sidecar hops |
+| **G5: LLM gateway** | 32, 33–37, 45, 46, 47 | SSE streaming, token metering/limits, model routing + fallback, EPP inference LB, realtime WebSocket sessions — Envoy AI Gateway capability set with zero sidecar hops |
 
 ## Part 4 — Scaffolding decision
 

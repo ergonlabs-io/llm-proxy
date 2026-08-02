@@ -79,7 +79,11 @@ releases:
       <em>and TTFT/TPOT</em> reach the access log. <code>%LLM_TTFT%</code> exists;
       <b>there is no TPOT operator</b> — while <code>max_inter_chunk</code> and
       <code>response_chunks</code> are already computed into <code>StreamInfo</code> on every
-      stream and nothing can read them. A format operator and a test, no new computation.
+      stream and nothing can read them. <b>But not simply "render max_inter_chunk"</b> — that
+      field is the largest gap between chunks, a stall metric, not TPOT; publishing it under a
+      TPOT label is worse than absence. TPOT is
+      <code>(duration − ttft) / output_tokens</code>, all three already in
+      <code>LogContext</code>.
   - wp: WP-33
     what: >-
       Usage filter <b>wired per-route into the llmproxy dialect</b>, and <b>criterion 3 now
@@ -91,9 +95,11 @@ releases:
       <code>streaming: strict</code> assertion.
   - wp: WP-34
     what: >-
-      Token rate limits. Extraction is <b>done</b> — three provider dialects, streaming and
-      not, four non-overlapping cost buckets — and now reachable on live traffic via WP-33's
-      wiring.
+      Token rate limits. Extraction is <b>done</b>, and the enforcement filter is now
+      <b>built and live</b> (429 + <code>x-ratelimit-*</code>, mutation-tested) — but only
+      reachable via hand-written Envoy-mode config. <b>Remaining:</b> the dialect's
+      <code>limits</code> key, still rejected under strict mode, and per-descriptor config
+      beyond a single (route, credential) bucket.
   - wp: WP-35
     what: >-
       Model routing + provider fallback. Unblocked — the S2.8 route cache landed with ADR-0004.
