@@ -13,7 +13,7 @@ relevant spec section *and* the differential rig (WP-26).
 
 ## Status (updated 2026-08-01)
 
-**779 tests green workspace-wide, 0 failed, 21 ignored.** `make ci` clean. Branch
+**839 tests green workspace-wide, 0 failed, 21 ignored.** `make ci` clean. Branch
 `data-plane-foundations`, not pushed (no remote configured).
 
 > Count them with `cargo test --workspace --no-fail-fast` — plain `--workspace` fail-fasts
