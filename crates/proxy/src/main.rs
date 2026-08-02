@@ -8,10 +8,11 @@
 //! network filter chain (`tcp_proxy` etc.) is still a stub -- see
 //! `proxy_core::listener`'s `TODO(WP-09)`.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use proxy_config::{
@@ -22,6 +23,7 @@ use proxy_core::drain::{
 };
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
+use proxy_core::WorkerConfigHandle;
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -351,6 +353,23 @@ async fn run_serve(
         return ExitCode::FAILURE;
     }
 
+    // WP-50 increment 1: the read-only admin surface. Opt-in -- only binds
+    // when the config names an `admin` address -- and, like a listener's
+    // `initial_bind`, a bind failure here is a startup error, not a silent
+    // skip (see `start_admin`'s doc comment). Started before the worker pool
+    // so a bad admin port fails fast instead of after workers are already
+    // accepting traffic.
+    let admin_server = match start_admin(snapshot.admin, snapshot.clone(), Instant::now()).await {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("failed to start admin server: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(server) = &admin_server {
+        tracing::info!(addr = %server.local_addr(), "admin server listening");
+    }
+
     // Rust note: `WorkerPool::spawn` takes `worker_main` by value and clones
     // it once per worker thread (see its doc comment), so `bind_tx` -- an
     // `mpsc::UnboundedSender`, itself `Clone` -- gets captured once here and
@@ -444,6 +463,35 @@ async fn wait_for_initial_binds(
         }
     }
     Ok(())
+}
+
+/// Starts the read-only admin server (`proxy-admin`, WP-50 increment 1) when
+/// `admin` names a bind address; binds nothing and returns `Ok(None)`
+/// otherwise -- the admin surface is opt-in, never automatic.
+///
+/// The admin server gets its own [`WorkerConfigHandle`], separate from the
+/// ones [`WorkerPool::spawn`] hands to workers: it reads `snapshot` as it
+/// was at startup. Nothing in this binary republishes into it today (dynamic
+/// config updates are WP-20/21/22, not yet wired), so `/config_dump` shows
+/// the snapshot the process booted with -- true for the whole process
+/// lifetime today, but stated here rather than left to be discovered.
+///
+/// A bind failure is returned as an `Err`, not swallowed: `run_serve` turns
+/// it into a startup failure, holding the admin port to the same standard
+/// `initial_bind` holds every listener port to.
+async fn start_admin(
+    admin: Option<SocketAddr>,
+    snapshot: Arc<ConfigSnapshot>,
+    started_at: Instant,
+) -> Result<Option<proxy_admin::AdminServer>, String> {
+    let Some(addr) = admin else {
+        return Ok(None);
+    };
+    let config = Arc::new(WorkerConfigHandle::new(snapshot));
+    let server = proxy_admin::serve(addr, config, started_at)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(Some(server))
 }
 
 /// Each worker composes three concurrent seams over one shared
@@ -550,5 +598,57 @@ impl ShutdownSignals {
             _ = self.sigterm.recv() => {}
             _ = self.sigint.recv() => {}
         }
+    }
+}
+
+/// Wiring tests for `start_admin` -- the decision of *whether* to bind the
+/// admin port lives in this binary (`proxy-admin` itself always binds when
+/// asked), so it's tested here against a real socket rather than by
+/// inspecting `proxy-admin` in isolation.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_snapshot() -> Arc<ConfigSnapshot> {
+        Arc::new(ConfigSnapshot::default())
+    }
+
+    #[tokio::test]
+    async fn admin_none_binds_nothing() {
+        // Reserve a port, release it, then prove `start_admin(None, ..)`
+        // never touches it -- "no server started" has to be checked from
+        // the outside (a real connect attempt), not just by reading the
+        // `None` arm's code.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let port = probe.local_addr().expect("local_addr").port();
+        drop(probe);
+
+        let result = start_admin(None, empty_snapshot(), Instant::now())
+            .await
+            .expect("start_admin(None, ..) must not fail");
+        assert!(
+            result.is_none(),
+            "admin: None must not start a server (bind-only-when-configured)"
+        );
+
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "nothing should be listening on {addr}: admin was never configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_some_binds_and_serves() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = start_admin(Some(addr), empty_snapshot(), Instant::now())
+            .await
+            .expect("start_admin should succeed on an available port")
+            .expect("admin: Some(_) must start a server");
+
+        let bound = server.local_addr();
+        tokio::net::TcpStream::connect(bound)
+            .await
+            .expect("the admin port should be connectable once start_admin has bound it");
     }
 }

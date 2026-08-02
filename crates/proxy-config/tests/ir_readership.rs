@@ -24,12 +24,28 @@ use std::path::{Path, PathBuf};
 /// excluded — ground rule #2 says the data plane consumes the IR, and a field
 /// read only inside `proxy-config` (e.g. by `RouteTable::new`'s precomputed
 /// index) does not prove anything runs on it at request time.
+///
+/// **`proxy-admin` is excluded for the same reason, and the reason is worth
+/// stating because it was NOT excluded originally.** It was listed here while
+/// it was an empty stub, where the choice cost nothing. Once WP-50 landed
+/// `/config_dump`, that stopped being true: the dump renders IR fields for
+/// display, so every field it touches acquires a `.field` reference and would
+/// silently satisfy this guard. `HttpConnectionManagerConfig.stat_prefix` is
+/// what caught it — the dump rendered it and the staleness check immediately
+/// declared its allowlist entry obsolete, even though nothing yet *acts* on
+/// the field (that is still WP-23).
+///
+/// Displaying a field is not acting on it. This guard exists to catch the
+/// `request_headers_to_add` class of bug — lowered, validated, and then read
+/// by nothing, so every provider request went out unauthenticated. A
+/// `/config_dump` that grows to render the whole IR would defeat it one field
+/// at a time, quietly, with no test ever failing. That is precisely the
+/// failure mode this file was written to make impossible.
 const RUNTIME_CRATES: &[&str] = &[
     "proxy-http",
     "proxy-core",
     "proxy-cluster",
     "proxy-filters",
-    "proxy-admin",
     "proxy-xds",
 ];
 

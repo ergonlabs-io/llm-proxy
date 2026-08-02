@@ -6,7 +6,16 @@ license.workspace = true
 
 [dependencies]
 proxy-config = { workspace = true }
+proxy-core = { workspace = true }
 proxy-observability = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

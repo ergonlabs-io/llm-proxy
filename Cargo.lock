@@ -1333,8 +1333,17 @@ dependencies = [
 name = "proxy-admin"
 version = "0.0.1"
 dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "proxy-config",
+ "proxy-core",
  "proxy-observability",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
