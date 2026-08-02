@@ -1049,6 +1049,43 @@
    "deliverable: audit every arithmetic op on a value parsed from a request, a response, or a header; saturating everywhere; a test per site that panics without it"
   ],
   "note": "⚠ two in one day is a pattern, not a coincidence. Both were found by code review, not by any test — and the existing suites stayed green through both"
+ },
+ {
+  "id": 49,
+  "prio": "P0",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "L",
+  "gate": "G5",
+  "status": "ready",
+  "title": "Backend taxonomy (providers · models · credentials)",
+  "meta": [
+   "proxy-simple-config · schema",
+   "one logical model served by SEVERAL backends — Claude by Anthropic/Vertex/Bedrock, Kimi-K2 by Nebius/Vertex. The v0 dialect cannot express it: a route names exactly ONE provider",
+   "3 levels — provider TYPE (in code: endpoint shape + credential mechanism + default dialect) → provider INSTANCE (config: credentials + placement, two of one type is first-class) → MODEL (new `models:` block, logical name → ordered backends)",
+   "dialect is REQUIRED not derived for vertex/bedrock — Vertex serves Anthropic-shaped Claude, Google-shaped Gemini AND OpenAI-shaped Kimi",
+   "selection semantics (fallback/split/cost) deliberately deferred to WP-35/WP-44"
+  ],
+  "note": "▲ the config shape is the EASY part. Provider today conflates endpoint + credential scheme + wire dialect + model catalogue. Vertex needs minted OAuth w/ refresh, Bedrock needs per-request SigV4 over the canonical request — so it must run AFTER body rewrite (WP-45) and cannot be header injection. Neither has a hook today"
+ },
+ {
+  "id": 50,
+  "prio": "P0",
+  "ms": "v0.2.0",
+  "lane": "D",
+  "size": "L",
+  "gate": "G3",
+  "status": "ready",
+  "title": "Operator control plane (admin · keys · tenants)",
+  "meta": [
+   "proxy-admin · new store crate",
+   "OWNER 2026-08-01: build the OPERATOR control plane before the xDS one — non-K8s deployments have no Envoy Gateway to drive xDS, so for them this IS the management plane",
+   "inc 1: read-only surface (absorbs WP-25) — /config_dump /stats /ready /clusters",
+   "inc 2: virtual keys — client presents a proxy-issued key, proxy authenticates it and swaps in the real provider credential. The SWAP half exists (request_headers_to_add); the AUTHENTICATE half does not",
+   "inc 3: tenants, per-tenant model allow-lists, budgets w/ a period, spend history",
+   "state per ADR-0005: embedded (sqlite/sled) default, distributed behind the same trait"
+  ],
+  "note": "⚑ closes a real hole: WP-34 enforces budgets keyed on a hashed credential that NOTHING can register, attach to a team, rotate or revoke. Two hazards recorded — do NOT reuse hash_credential (FNV-1a, non-adversarial) for key AUTH; and auth fails CLOSED, the opposite of BudgetStore's fail-open"
  }
 ];
 

@@ -1465,6 +1465,53 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   clusters. Static-credential backends work end to end against the mock tier; OAuth and SigV4
   land with their schemes and are out of scope for the first increment.
 
+#### WP-50 — Operator control plane: admin surface, virtual keys, teams, budgets  (Size: L)  — **Priority: P0** · **Milestone: v0.2.0**
+> **Owner decision, 2026-08-01:** build the *operator* control plane before the xDS one
+> (WP-20/21/22). Non-K8s deployments have no Envoy Gateway to drive xDS, so for them this
+> **is** the management plane. State follows **ADR-0005**: embedded by default, distributed
+> behind the same trait.
+- **The hole this closes, stated plainly.** WP-34 enforces token budgets keyed on
+  `(route, hashed authorization header)` — that is, it enforces quotas against credentials
+  **nothing can register, attach to a team, rotate, or revoke**. The data plane grew
+  enforcement with no way to administer it. WP-42's competitive review records that budgets are
+  "often the actual reason a team fronts providers with a gateway at all"; today we can meter a
+  caller we have no way to name.
+- **Increment 1 — read-only surface (this is WP-25, absorbed here).** `/config_dump`,
+  `/stats`, `/ready`, `/clusters`. Named explicitly by the v0.2.0 ship gate, already unblocked,
+  and the prerequisite for operating the proxy at all. `/config_dump` must redact credentials —
+  the access-log path already learned this lesson once.
+- **Increment 2 — virtual keys.** A client presents a proxy-issued key; the proxy authenticates
+  it, resolves it to a tenant, and **replaces it** with the real provider credential upstream.
+  The replacing half already exists (`request_headers_to_add` injection, and the access-log
+  snapshot that deliberately runs before it); the authenticating half does not.
+  - **Do NOT reuse `token_limit_filter::hash_credential` for this.** That is FNV-1a, chosen for
+    stability across processes on a *non-adversarial* bucket key. Authenticating a credential
+    needs a cryptographic hash and a constant-time comparison; FNV gives neither, and using it
+    here would be a preimage and timing-attack surface. Different job, different primitive —
+    the fact that both "hash a credential" is exactly why this is worth writing down.
+  - Keys are stored hashed, never in plaintext, and never logged.
+- **Increment 3 — tenants, budgets, spend.** Teams/projects owning a set of keys; per-tenant
+  model allow-lists; budgets with a period (distinct from WP-34's tokens-per-minute throttle —
+  a rate limit is not a spend ceiling, see WP-42); spend history queryable per tenant.
+- **State (ADR-0005).** A `ControlPlaneStore` trait; embedded implementation (sqlite/sled) as
+  the shipped default so a single binary works with no external dependency; distributed
+  implementation later behind the same trait. Fail policy is **closed** for authentication —
+  deliberately the opposite of `BudgetStore`'s fail-open, and the difference must be documented
+  at both sites.
+- **The hot path does no I/O.** Per-request key lookup must not touch sqlite. The control side
+  owns the store and publishes an immutable snapshot through `ArcSwap`; workers do a lock-free
+  load, exactly as `ClusterManager` does for host sets. A key revoked through the API takes
+  effect on the next snapshot publish, and that latency must be stated, not hidden.
+- **Depends on:** WP-24 ✅ (access logs), WP-34 ✅ (the limiter this gives an identity to),
+  ADR-0005. **Related:** WP-23 (stats registry — same store principle), WP-42 (spend controls
+  become administrable once tenants exist), WP-49 (per-tenant model allow-lists reference the
+  model catalogue).
+- **Acceptance:** `/config_dump` renders live config with every credential redacted (asserted
+  against a config whose keys are known, so a leak fails the test); a key created through the
+  API authenticates a real request end to end and a revoked one is refused; the upstream sees
+  the *provider* credential and never the virtual key; per-tenant budget exhaustion returns 429
+  with `x-ratelimit-*`; the proxy starts and serves with no external datastore configured.
+
 ## Part 3 — Milestone gates (roll-up)
 
 | Gate | Requires WPs | Demo |
