@@ -57,6 +57,24 @@ const BODY_REWRITE_FILTER_NAME: &str = "llmproxy.body_rewrite";
 /// `dialect.rs`'s `body_rewrite_filter_type_url_matches_the_filter` pins it.
 const BODY_REWRITE_FILTER_TYPE_URL: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
+/// The token-limit filter's name in `http_filters`, emitted only when a
+/// `limits` entry actually lowers (see [`lower_limits`]). No per-route
+/// override exists for this filter (its module doc: "no per-route config in
+/// this increment"), so unlike [`USAGE_FILTER_NAME`] / [`BODY_REWRITE_FILTER_NAME`]
+/// this name never appears in a route's `typed_per_filter_config`.
+const TOKEN_LIMIT_FILTER_NAME: &str = "llmproxy.token_limit";
+
+/// Must equal `proxy_filters::token_limit_filter::TYPE_URL`. Duplicated for
+/// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
+/// `dialect.rs`'s IR-survival test pins the two together the same way.
+const TOKEN_LIMIT_FILTER_TYPE_URL: &str =
+    "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
+
+/// The only `LimitKey` the thin-slice token limiter enforces: its bucket key
+/// is hardcoded to the `authorization` header (see `token_limit_filter`'s
+/// module doc, "Config" section).
+const ENFORCED_LIMIT_HEADER: &str = "authorization";
+
 const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const DOWNSTREAM_TLS_TYPE_URL: &str =
@@ -159,19 +177,20 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         ));
     }
 
+    let token_limit_filter = lower_limits(config, &mut warnings)?;
+
     let access_log = config
         .observability
         .as_ref()
         .and_then(|o| o.access_logs.as_ref())
         .map(lower_access_log);
-    let listener = lower_listener(config, routes, access_log, &mut warnings)?;
-
-    for (i, _) in config.limits.iter().enumerate() {
-        warnings.push(warning(
-            format!("limits[{i}]"),
-            "limits are recorded but not enforced yet (token limiter WP-34, session limits WP-37)",
-        ));
-    }
+    let listener = lower_listener(
+        config,
+        routes,
+        access_log,
+        token_limit_filter,
+        &mut warnings,
+    )?;
 
     let mut bootstrap = json!({
         "static_resources": {
@@ -534,6 +553,112 @@ fn lower_route(
     Ok(route)
 }
 
+// ------------------------------------------------------------------ limits --
+
+/// `limits` -> at most one `llmproxy.token_limit` `http_filters` entry.
+///
+/// The dialect's `limits` surface is richer than what `token_limit_filter`
+/// (WP-34 increment 2) enforces today: that filter is a thin slice — a
+/// single global token-total budget, bucketed on `(route name, the
+/// `authorization` header)`, no per-descriptor config. So exactly one shape
+/// lowers for real: `key: header:authorization` with `tokens_per_minute`
+/// set. Everything else -- `global`/`client-ip` keys, any other header,
+/// `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded in
+/// the dialect but not enforced yet, and gets an explicit per-field warning
+/// naming its exact dotted path (ground rule #1: never silently drop a
+/// field). Only the FIRST supported entry is honored -- the filter has room
+/// for exactly one budget rule -- and any later one is warned about too.
+fn lower_limits(
+    config: &SimpleConfig,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<Option<Value>, ConfigError> {
+    let mut token_limit_filter: Option<Value> = None;
+
+    for (i, limit) in config.limits.iter().enumerate() {
+        let path = format!("limits[{i}]");
+
+        let key_supported = matches!(
+            &limit.key,
+            LimitKey::Header(name) if name.eq_ignore_ascii_case(ENFORCED_LIMIT_HEADER)
+        );
+        if !key_supported {
+            let key_desc = match &limit.key {
+                LimitKey::Global => "`global`".to_string(),
+                LimitKey::ClientIp => "`client-ip`".to_string(),
+                LimitKey::Header(name) => format!("`header:{name}`"),
+            };
+            warnings.push(warning(
+                format!("{path}.key"),
+                format!(
+                    "{key_desc} is not enforced; the token limiter (WP-34) hardcodes its \
+                     bucket key to the `{ENFORCED_LIMIT_HEADER}` header, so only \
+                     `key: header:{ENFORCED_LIMIT_HEADER}` limits are enforced today"
+                ),
+            ));
+        }
+
+        if let Some(tokens_per_minute) = limit.tokens_per_minute {
+            if key_supported {
+                if token_limit_filter.is_some() {
+                    warnings.push(warning(
+                        format!("{path}.tokens_per_minute"),
+                        "not enforced; the token limiter emits at most one budget per \
+                         listener, and an earlier `limits` entry already claimed it",
+                    ));
+                } else {
+                    let max_tokens = u32::try_from(tokens_per_minute.0).map_err(|_| {
+                        ConfigError::InvalidValue {
+                            field_path: format!("{path}.tokens_per_minute"),
+                            reason: format!(
+                                "`{}` exceeds the token limiter's maximum ({})",
+                                tokens_per_minute.0,
+                                u32::MAX
+                            ),
+                        }
+                    })?;
+                    // 60s fixed window: `token_limit_filter::parse_config`
+                    // derives its window as `max_tokens / fill_rate` seconds,
+                    // so a per-*minute* dialect value needs `fill_rate =
+                    // max_tokens / 60.0` to land on a 60-second window.
+                    let fill_rate = f64::from(max_tokens) / 60.0;
+                    token_limit_filter = Some(json!({
+                        "name": TOKEN_LIMIT_FILTER_NAME,
+                        "typed_config": {
+                            "@type": TOKEN_LIMIT_FILTER_TYPE_URL,
+                            "max_tokens": max_tokens,
+                            "fill_rate": fill_rate,
+                        }
+                    }));
+                }
+            }
+            // else: the key warning above already explains why this
+            // `tokens_per_minute` value produces no enforcement.
+        }
+
+        if limit.requests_per_minute.is_some() {
+            warnings.push(warning(
+                format!("{path}.requests_per_minute"),
+                "not enforced; the token limiter enforces total token budgets, not a \
+                 request-rate cap -- that would be a different feature",
+            ));
+        }
+        if limit.concurrent_sessions.is_some() {
+            warnings.push(warning(
+                format!("{path}.concurrent_sessions"),
+                "not enforced; concurrent-session limits land with WP-37",
+            ));
+        }
+        if !limit.models.is_empty() {
+            warnings.push(warning(
+                format!("{path}.models"),
+                "not enforced; the token limiter has no per-model scoping today",
+            ));
+        }
+    }
+
+    Ok(token_limit_filter)
+}
+
 // ------------------------------------------------------------- access logs --
 
 /// `observability.access_logs` -> a single `envoy.config.accesslog.v3.AccessLog`
@@ -594,6 +719,7 @@ fn lower_listener(
     config: &SimpleConfig,
     routes: Vec<Value>,
     access_log: Option<Value>,
+    token_limit_filter: Option<Value>,
     _warnings: &mut [ConfigWarning],
 ) -> Result<Value, ConfigError> {
     let (address, tls) = match &config.listen {
@@ -630,6 +756,14 @@ fn lower_listener(
             "name": BODY_REWRITE_FILTER_NAME,
             "typed_config": body_rewrite_typed_config(default_dialect),
         }));
+    }
+    if let Some(token_limit_filter) = token_limit_filter {
+        // Before `llmproxy.usage` in config order -- S2.1 encoder callbacks
+        // run in REVERSE config order, and this filter's encode-side job
+        // (recording usage against the budget) needs the usage filter's own
+        // encode callback to have already run. See
+        // `token_limit_filter`'s module doc, "Filter position" section.
+        http_filters.push(token_limit_filter);
     }
     http_filters.push(json!({
         // Before the router, so it is in the encode chain (S2.1: encoder

@@ -41,7 +41,7 @@
       "items": { "$ref": "#/$defs/Route" }
     },
     "limits": {
-      "description": "Rate limits and quotas, enforced before a request is forwarded (over-limit requests get a 429 with `x-ratelimit-*` headers). Token counts are extracted from provider responses (streaming included). NOTE: limits are enforced per proxy instance in v0; fleet-wide limits require the (future) shared budget store.",
+      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a translate-time warning naming the exact field. NOTE: limits are enforced per proxy instance in v0; fleet-wide limits require the (future) shared budget store.",
       "type": "array",
       "items": { "$ref": "#/$defs/Limit" }
     },
@@ -188,26 +188,27 @@
       "properties": {
         "key": {
           "type": "string",
-          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas).",
+          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas). Only `header:authorization` is enforced today (the token limiter's bucket key is hardcoded to it); `global`, `client-ip`, and every other `header:<name>` are recorded but produce a not-enforced warning.",
           "pattern": "^(global|client-ip|header:[A-Za-z0-9-]+)$",
-          "examples": ["global", "client-ip", "header:x-api-key"]
+          "examples": ["header:authorization", "global", "client-ip", "header:x-api-key"]
         },
         "tokens_per_minute": {
           "$ref": "#/$defs/TokenAmount",
-          "description": "Total (input + output) tokens allowed per minute per bucket. Usage is extracted from provider responses, including streamed ones; enforcement is at request admission (the request that would exceed the budget is rejected — in-flight streams are never truncated)."
+          "description": "Total (input + output) tokens allowed per minute per bucket. Usage is extracted from provider responses, including streamed ones; enforcement is at request admission (the request that would exceed the budget is rejected — in-flight streams are never truncated). Enforced only when paired with `key: header:authorization`; any other key still records this field but produces a not-enforced warning instead."
         },
         "requests_per_minute": {
           "$ref": "#/$defs/TokenAmount",
-          "description": "Requests allowed per minute per bucket."
+          "description": "Requests allowed per minute per bucket. Not enforced yet by any key -- the current limiter enforces total token budgets, not a request-rate cap (a different feature); recorded, and produces a not-enforced warning."
         },
         "concurrent_sessions": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session."
+          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session. Not enforced yet (lands with session limits, WP-37); recorded, and produces a not-enforced warning.",
+          "examples": [10]
         },
         "models": {
           "type": "array",
-          "description": "Restrict this limit to requests whose model matches one of these patterns. Omit to apply to all traffic.",
+          "description": "Restrict this limit to requests whose model matches one of these patterns. Omit to apply to all traffic. Not enforced yet -- the current limiter has no per-model scoping; recorded, and produces a not-enforced warning.",
           "items": { "$ref": "#/$defs/ModelPattern" }
         }
       }

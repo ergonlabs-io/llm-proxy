@@ -1107,3 +1107,248 @@ routes:
         assert_eq!(got, want, "route {i}");
     }
 }
+
+// ------------------------------------------------------- WP-34 increment 3: limits --
+
+fn token_limit_names(bootstrap: &serde_json::Value) -> Vec<String> {
+    hcm_typed_config(bootstrap)["http_filters"]
+        .as_array()
+        .expect("http_filters must be an array")
+        .iter()
+        .map(|f| f["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn warning_paths(warnings: &[proxy_config::ConfigWarning]) -> Vec<&str> {
+    warnings.iter().map(|w| w.field_path.as_str()).collect()
+}
+
+/// The one shape the thin-slice token limiter (`token_limit_filter`,
+/// increment 2) actually enforces: `key: header:authorization` with
+/// `tokens_per_minute` set. `100003` is deliberately not a multiple of 60 --
+/// `100003 / 60` is not round, so a `fill_rate` formula that used a wrong
+/// divisor (e.g. `max_tokens` verbatim, or `/ 60` applied to the wrong
+/// value) could not coincidentally produce the right number.
+#[test]
+fn tokens_per_minute_with_header_authorization_key_emits_the_token_limit_filter() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: header:authorization\n    tokens_per_minute: 100003\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    let names = token_limit_names(&lowered.bootstrap);
+    assert!(
+        names.contains(&"llmproxy.token_limit".to_string()),
+        "expected llmproxy.token_limit in {names:?}"
+    );
+
+    let filters = &hcm_typed_config(&lowered.bootstrap)["http_filters"];
+    let entry = filters
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "llmproxy.token_limit")
+        .expect("token_limit filter must be present");
+    assert_eq!(
+        entry["typed_config"]["@type"],
+        proxy_filters::token_limit_filter::TYPE_URL
+    );
+    assert_eq!(entry["typed_config"]["max_tokens"], 100003);
+    let fill_rate = entry["typed_config"]["fill_rate"]
+        .as_f64()
+        .expect("fill_rate must be a number");
+    assert!(
+        (fill_rate - 100003.0 / 60.0).abs() < 1e-9,
+        "fill_rate must be max_tokens/60 (a 60s window), got {fill_rate}"
+    );
+
+    // Must precede `llmproxy.usage` -- S2.1 encoder callbacks run in reverse
+    // config order, and this filter's encode-side record needs the usage
+    // filter's own encode callback to have already run.
+    let limit_pos = names
+        .iter()
+        .position(|n| n == "llmproxy.token_limit")
+        .unwrap();
+    let usage_pos = names.iter().position(|n| n == "llmproxy.usage").unwrap();
+    assert!(
+        limit_pos < usage_pos,
+        "llmproxy.token_limit must precede llmproxy.usage, got {names:?}"
+    );
+
+    // The one supported limit must not also produce a not-enforced warning.
+    let all = warning_paths(&lowered.warnings).join(",");
+    assert!(
+        !all.contains("limits[0]"),
+        "the one supported limit must not also produce a not-enforced warning: {all}"
+    );
+}
+
+/// `key: global` is not enforced -- the limiter's bucket key is hardcoded to
+/// the `authorization` header, never a global bucket.
+#[test]
+fn global_key_is_not_enforced_and_warns() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: global\n    tokens_per_minute: 1000\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    assert!(
+        !token_limit_names(&lowered.bootstrap).contains(&"llmproxy.token_limit".to_string()),
+        "an unsupported key must never emit the filter"
+    );
+    let paths = warning_paths(&lowered.warnings);
+    assert!(
+        paths.contains(&"limits[0].key"),
+        "expected a warning naming limits[0].key, got {paths:?}"
+    );
+}
+
+/// `key: client-ip` is not enforced, for the same reason as `global`.
+#[test]
+fn client_ip_key_is_not_enforced_and_warns() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: client-ip\n    tokens_per_minute: 1000\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    assert!(
+        !token_limit_names(&lowered.bootstrap).contains(&"llmproxy.token_limit".to_string()),
+        "an unsupported key must never emit the filter"
+    );
+    let paths = warning_paths(&lowered.warnings);
+    assert!(
+        paths.contains(&"limits[0].key"),
+        "expected a warning naming limits[0].key, got {paths:?}"
+    );
+}
+
+/// Any header other than `authorization` is not enforced -- the limiter
+/// hardcodes the header name.
+#[test]
+fn header_other_than_authorization_is_not_enforced_and_warns() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: header:x-api-key\n    tokens_per_minute: 1000\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    assert!(
+        !token_limit_names(&lowered.bootstrap).contains(&"llmproxy.token_limit".to_string()),
+        "an unsupported key must never emit the filter"
+    );
+    let paths = warning_paths(&lowered.warnings);
+    assert!(
+        paths.contains(&"limits[0].key"),
+        "expected a warning naming limits[0].key, got {paths:?}"
+    );
+}
+
+/// `requests_per_minute` is a request-rate cap, not a token budget -- a
+/// different feature the current filter does not implement.
+#[test]
+fn requests_per_minute_is_not_enforced_and_warns() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: header:authorization\n    requests_per_minute: 100\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    // No `tokens_per_minute` at all here, so the filter must not appear.
+    assert!(
+        !token_limit_names(&lowered.bootstrap).contains(&"llmproxy.token_limit".to_string()),
+        "requests_per_minute alone must never emit the filter"
+    );
+    let paths = warning_paths(&lowered.warnings);
+    assert!(
+        paths.contains(&"limits[0].requests_per_minute"),
+        "expected a warning naming limits[0].requests_per_minute, got {paths:?}"
+    );
+}
+
+/// `concurrent_sessions` needs WP-37.
+#[test]
+fn concurrent_sessions_is_not_enforced_and_warns() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: header:authorization\n    concurrent_sessions: 10\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    let paths = warning_paths(&lowered.warnings);
+    assert!(
+        paths.contains(&"limits[0].concurrent_sessions"),
+        "expected a warning naming limits[0].concurrent_sessions, got {paths:?}"
+    );
+}
+
+/// `models` (per-model scoping) is not enforced by the current thin slice.
+#[test]
+fn models_scoping_is_not_enforced_and_warns() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: header:authorization\n    tokens_per_minute: 500\n    models: [\"gpt-4\"]\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    // The filter must still be emitted for the supported tokens_per_minute
+    // part -- `models` is an additional, independently unsupported field,
+    // not a reason to drop the whole limit.
+    assert!(
+        token_limit_names(&lowered.bootstrap).contains(&"llmproxy.token_limit".to_string()),
+        "the token part of the limit must still be enforced despite the unsupported `models` field"
+    );
+    let paths = warning_paths(&lowered.warnings);
+    assert!(
+        paths.contains(&"limits[0].models"),
+        "expected a warning naming limits[0].models, got {paths:?}"
+    );
+}
+
+/// No `limits` key at all: nothing in the serialized bootstrap ever mentions
+/// the token-limit filter, its name, or its type URL.
+#[test]
+fn no_limits_emits_no_token_limit_filter_anywhere() {
+    let config = parse(BASIC_CONFIG).expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let whole = serde_json::to_string(&lowered.bootstrap).unwrap();
+    assert!(
+        !whole.contains("token_limit"),
+        "no limits configured must leave zero trace of the filter, got: {whole}"
+    );
+}
+
+/// The JSON assertions above only prove the dialect *emits*
+/// `llmproxy.token_limit`; they cannot catch the emitted name disagreeing
+/// with what the filter registry expects it to be bound to. `build_snapshot`
+/// resolving the filter's `type_url` against the real registry is what
+/// proves the two agree -- mirrors `per_route_dialect_survives_into_the_ir`
+/// and `body_rewrite_per_route_config_survives_into_the_ir` above.
+#[test]
+fn token_limit_filter_survives_into_the_ir() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: header:authorization\n    tokens_per_minute: 6000\n"
+    ))
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    let listener = snapshot
+        .listeners
+        .values()
+        .next()
+        .expect("exactly one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+    let entry = hcm
+        .http_filters
+        .iter()
+        .find(|f| f.name == "llmproxy.token_limit")
+        .expect("llmproxy.token_limit must be in the chain");
+    assert_eq!(entry.type_url, proxy_filters::token_limit_filter::TYPE_URL);
+}
