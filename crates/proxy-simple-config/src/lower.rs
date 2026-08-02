@@ -46,6 +46,17 @@ const USAGE_FILTER_NAME: &str = "llmproxy.usage";
 /// it would still be a loud bind-time error ("no registered factory for
 /// type_url"), never a silent skip.
 const USAGE_FILTER_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+
+/// The body-rewrite filter's name in `http_filters`, gated by
+/// `observability.force_usage_reporting` (default `true`). Same
+/// name/override-key contract as [`USAGE_FILTER_NAME`].
+const BODY_REWRITE_FILTER_NAME: &str = "llmproxy.body_rewrite";
+
+/// Must equal `proxy_filters::body_rewrite_filter::TYPE_URL`. Duplicated for
+/// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
+/// `dialect.rs`'s `body_rewrite_filter_type_url_matches_the_filter` pins it.
+const BODY_REWRITE_FILTER_TYPE_URL: &str =
+    "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const DOWNSTREAM_TLS_TYPE_URL: &str =
@@ -355,6 +366,32 @@ fn usage_dialect(name: &str, provider: &Provider) -> &'static str {
     }
 }
 
+/// `observability.force_usage_reporting`, defaulting to `true` both when the
+/// key is absent AND when the whole `observability` block is absent --
+/// `Observability::force_usage_reporting`'s serde default only covers the
+/// former, so the latter has to be handled here.
+fn force_usage_reporting(config: &SimpleConfig) -> bool {
+    config
+        .observability
+        .as_ref()
+        .map_or_else(crate::model::default_force_usage_reporting, |o| {
+            o.force_usage_reporting
+        })
+}
+
+/// `envoy.config.core.v3.RuntimeFeatureFlag` shaped `typed_config` for the
+/// body-rewrite filter: `default_value` is the on/off switch (proto3-JSON
+/// maps a `BoolValue` field to a bare JSON bool), `runtime_key` carries the
+/// dialect. Shared by the listener-level entry and every per-route override
+/// so the two can never drift in shape.
+fn body_rewrite_typed_config(dialect: &str) -> Value {
+    json!({
+        "@type": BODY_REWRITE_FILTER_TYPE_URL,
+        "default_value": true,
+        "runtime_key": dialect,
+    })
+}
+
 // -------------------------------------------------------------------- routes --
 
 /// Model glob -> Envoy header matcher on [`MODEL_HEADER`]. `*` alone means
@@ -479,12 +516,20 @@ fn lower_route(
     // A bare `Any` is the simpler of the two accepted forms — the
     // `envoy.config.route.v3.FilterConfig` wrapper only buys `is_optional`,
     // and this filter is never optional.
-    route["typed_per_filter_config"] = json!({
+    let mut typed_per_filter_config = json!({
         USAGE_FILTER_NAME: {
             "@type": USAGE_FILTER_TYPE_URL,
             "inline_string": usage_dialect(provider_name, provider),
         }
     });
+    // Token accounting follows the ROUTE's provider here too, for the exact
+    // same reason as the usage filter above -- one listener can serve
+    // `gpt-*` from OpenAI and `claude-*` from Anthropic.
+    if force_usage_reporting(config) {
+        typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
+            body_rewrite_typed_config(usage_dialect(provider_name, provider));
+    }
+    route["typed_per_filter_config"] = typed_per_filter_config;
 
     Ok(route)
 }
@@ -576,6 +621,31 @@ fn lower_listener(
         })
         .unwrap_or("openai");
 
+    let mut http_filters = Vec::new();
+    if force_usage_reporting(config) {
+        // Decode-path filter, so it must precede the router in config order --
+        // decode callbacks run in FORWARD config order (S2.1), and a decode
+        // filter placed after the router never runs at all.
+        http_filters.push(json!({
+            "name": BODY_REWRITE_FILTER_NAME,
+            "typed_config": body_rewrite_typed_config(default_dialect),
+        }));
+    }
+    http_filters.push(json!({
+        // Before the router, so it is in the encode chain (S2.1: encoder
+        // callbacks run in REVERSE config order) and sees response bytes
+        // on their way back out.
+        "name": USAGE_FILTER_NAME,
+        "typed_config": {
+            "@type": USAGE_FILTER_TYPE_URL,
+            "inline_string": default_dialect,
+        }
+    }));
+    http_filters.push(json!({
+        "name": "envoy.filters.http.router",
+        "typed_config": { "@type": ROUTER_TYPE_URL }
+    }));
+
     let mut hcm = json!({
         "name": "envoy.filters.network.http_connection_manager",
         "typed_config": {
@@ -589,19 +659,7 @@ fn lower_listener(
                     "routes": routes,
                 } ]
             },
-            "http_filters": [ {
-                // Before the router, so it is in the encode chain (S2.1: encoder
-                // callbacks run in REVERSE config order) and sees response bytes
-                // on their way back out.
-                "name": USAGE_FILTER_NAME,
-                "typed_config": {
-                    "@type": USAGE_FILTER_TYPE_URL,
-                    "inline_string": default_dialect,
-                }
-            }, {
-                "name": "envoy.filters.http.router",
-                "typed_config": { "@type": ROUTER_TYPE_URL }
-            } ]
+            "http_filters": http_filters,
         }
     });
     if let Some(access_log) = access_log {

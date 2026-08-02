@@ -233,6 +233,12 @@
               "description": "`json` emits one structured object per line (recommended for log pipelines)."
             }
           }
+        },
+        "force_usage_reporting": {
+          "type": "boolean",
+          "description": "Forces `stream_options.include_usage` onto streaming OpenAI-dialect requests that didn't already ask for it, so token usage can be logged/accounted for streamed responses. This makes the provider emit one extra final SSE frame carrying usage; well-behaved SDKs handle it, but a hand-rolled client that iterates `choices[0]` without a guard can trip over that frame. Set to `false` for strict passthrough if that's a concern.",
+          "default": true,
+          "examples": [true, false]
         }
       }
     }

@@ -126,6 +126,23 @@ pub struct Limit {
 pub struct Observability {
     #[serde(default)]
     pub access_logs: Option<AccessLogs>,
+    /// Forces `stream_options.include_usage = true` onto streaming OpenAI-
+    /// dialect requests that didn't already opt in, so the usage filter has
+    /// a final SSE frame to read tokens off of. Defaults to `true`, both when
+    /// this key is absent AND when the whole `observability` block is absent
+    /// -- see `default_force_usage_reporting`.
+    #[serde(default = "default_force_usage_reporting")]
+    pub force_usage_reporting: bool,
+}
+
+/// `pub(crate)`, not private: `lower.rs`'s `force_usage_reporting` needs the
+/// exact same default for the "whole `observability` block is absent" case
+/// -- serde's `#[serde(default = ...)]` only ever fires when the struct
+/// itself is present, so that case has to reuse this function rather than
+/// hardcode `true` a second time (two copies of the same default is exactly
+/// the kind of thing that drifts silently).
+pub(crate) fn default_force_usage_reporting() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

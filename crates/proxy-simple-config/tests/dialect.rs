@@ -696,6 +696,9 @@ observability:
 /// together — this is that something.
 #[test]
 fn usage_filter_type_url_matches_the_filter() {
+    // `force_usage_reporting` is off so `http_filters[0]` stays the usage
+    // filter; the body-rewrite filter's own type-URL pin lives in
+    // `body_rewrite_filter_type_url_matches_the_filter` below.
     let config = parse(
         r#"
 version: 0
@@ -703,6 +706,8 @@ providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
   - { model: "*", provider: openai }
+observability:
+  force_usage_reporting: false
 "#,
     )
     .expect("must parse");
@@ -731,6 +736,9 @@ routes:
 /// override exists.
 #[test]
 fn usage_filter_sits_before_the_router_with_per_route_dialects() {
+    // `force_usage_reporting` is off here so this test stays scoped to the
+    // WP-33 usage filter alone; the body-rewrite filter (WP-45) it would
+    // otherwise also emit is covered by its own tests below.
     let config = parse(
         r#"
 version: 0
@@ -740,6 +748,8 @@ providers:
 routes:
   - { model: "gpt-*", provider: openai }
   - { model: "claude-*", provider: anthropic }
+observability:
+  force_usage_reporting: false
 "#,
     )
     .expect("must parse");
@@ -803,6 +813,8 @@ routes:
 /// hard load error, so this also proves the two names agree).
 #[test]
 fn per_route_dialect_survives_into_the_ir() {
+    // `force_usage_reporting` is off so `http_filters[0]` stays the usage
+    // filter, the thing under test here.
     let config = parse(
         r#"
 version: 0
@@ -812,6 +824,8 @@ providers:
 routes:
   - { model: "gpt-*", provider: openai }
   - { model: "claude-*", provider: anthropic }
+observability:
+  force_usage_reporting: false
 "#,
     )
     .expect("must parse");
@@ -853,6 +867,242 @@ routes:
             .expect("DataSource.inline_string")
             .as_str()
             .expect("inline_string must be a string")
+            .to_string();
+        assert_eq!(got, want, "route {i}");
+    }
+}
+
+// ------------------------------------------------------- WP-45: body-rewrite filter --
+
+const BASIC_CONFIG: &str = r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+"#;
+
+fn body_rewrite_names(bootstrap: &serde_json::Value) -> Vec<String> {
+    hcm_typed_config(bootstrap)["http_filters"]
+        .as_array()
+        .expect("http_filters must be an array")
+        .iter()
+        .map(|f| f["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `lower.rs` duplicates the body-rewrite filter's type URL as a literal
+/// instead of importing it, same trade as the usage filter's. This is the
+/// pin that keeps the two from drifting apart.
+#[test]
+fn body_rewrite_filter_type_url_matches_the_filter() {
+    let config = parse(BASIC_CONFIG).expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let filters = &hcm_typed_config(&lowered.bootstrap)["http_filters"];
+
+    assert_eq!(
+        filters[0]["typed_config"]["@type"],
+        proxy_filters::body_rewrite_filter::TYPE_URL,
+        "the dialect emits a type URL no registered filter factory answers to; \
+         this would be a bind-time error on every listener"
+    );
+    assert_eq!(
+        filters[0]["typed_config"]["@type"],
+        hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"][0]
+            ["typed_per_filter_config"]["llmproxy.body_rewrite"]["@type"],
+        "the per-route override must carry the same type URL as the chain entry"
+    );
+}
+
+/// No `observability` block at all: `force_usage_reporting` still defaults
+/// to `true`, so the body-rewrite filter is still emitted. This is the case
+/// most likely to get the default wrong -- serde's field-level default only
+/// covers an explicit-but-empty `observability` block, not an absent one.
+#[test]
+fn no_observability_block_still_emits_body_rewrite_by_default() {
+    let config = parse(BASIC_CONFIG).expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    assert!(
+        body_rewrite_names(&lowered.bootstrap).contains(&"llmproxy.body_rewrite".to_string()),
+        "the filter must be on by default even with no `observability` block at all"
+    );
+}
+
+/// An `observability` block that sets only `access_logs` (no
+/// `force_usage_reporting` key) must still default the flag to `true`.
+#[test]
+fn observability_without_the_flag_still_emits_body_rewrite_by_default() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}observability:\n  access_logs: {{ output: stdout }}\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    assert!(
+        body_rewrite_names(&lowered.bootstrap).contains(&"llmproxy.body_rewrite".to_string()),
+        "an `observability` block present for another reason must not turn the default off"
+    );
+}
+
+/// `force_usage_reporting: false` leaves no trace of the filter anywhere in
+/// the serialized bootstrap -- not the chain, and not any route's
+/// `typed_per_filter_config`. Asserted against the whole serialized document
+/// so a stray per-route entry can't slip through a narrower check.
+#[test]
+fn force_usage_reporting_false_leaves_no_trace_of_the_filter() {
+    let config = parse(&format!(
+        "{BASIC_CONFIG}observability:\n  force_usage_reporting: false\n"
+    ))
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let whole = serde_json::to_string(&lowered.bootstrap).unwrap();
+    assert!(
+        !whole.contains("body_rewrite"),
+        "disabling the flag must leave zero trace of the filter, got: {whole}"
+    );
+    assert!(
+        !whole.contains(proxy_filters::body_rewrite_filter::TYPE_URL),
+        "disabling the flag must not leave the filter's type URL anywhere, got: {whole}"
+    );
+}
+
+/// Two-provider config: each route's per-route override carries ITS OWN
+/// dialect, not the listener-level default. This is the test that would
+/// catch a bug that reuses the listener default for every route.
+#[test]
+fn body_rewrite_per_route_entries_carry_their_own_dialect() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "gpt-*", provider: openai }
+  - { model: "claude-*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes =
+        &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
+
+    let dialect = |i: usize| {
+        routes[i]["typed_per_filter_config"]["llmproxy.body_rewrite"]["runtime_key"].clone()
+    };
+    assert_eq!(dialect(0), "openai");
+    assert_eq!(dialect(1), "anthropic");
+}
+
+/// The filter is a decode-path filter: it must precede the router in config
+/// order, or it never runs at all.
+#[test]
+fn body_rewrite_filter_sits_before_the_router() {
+    let config = parse(BASIC_CONFIG).expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let names = body_rewrite_names(&lowered.bootstrap);
+    let body_rewrite_pos = names
+        .iter()
+        .position(|n| n == "llmproxy.body_rewrite")
+        .expect("body_rewrite filter must be present");
+    let router_pos = names
+        .iter()
+        .position(|n| n == "envoy.filters.http.router")
+        .expect("router must be present");
+    assert!(
+        body_rewrite_pos < router_pos,
+        "body_rewrite must precede the router, got {names:?}"
+    );
+}
+
+/// An unknown key inside `observability` is still a strict-mode error with
+/// its full dotted path -- adding `force_usage_reporting` must not have
+/// loosened `deny_unknown_fields`.
+#[test]
+fn unknown_observability_key_still_errors_with_path() {
+    let err = parse(&format!(
+        "{BASIC_CONFIG}observability:\n  force_usage_reportingg: false\n"
+    ))
+    .expect_err("unknown field must fail");
+    let ConfigError::UnknownField { field_path } = &err else {
+        panic!("expected UnknownField, got: {err}");
+    };
+    assert_eq!(field_path, "observability.force_usage_reportingg");
+}
+
+/// The body-rewrite counterpart to [`per_route_dialect_survives_into_the_ir`],
+/// and it exists for the same reason that one does: the JSON assertions above
+/// only prove the dialect *emits* `llmproxy.body_rewrite`, on both the chain
+/// and every route, from the same lowering pass. They cannot catch the two
+/// names disagreeing, because nothing cross-checks them.
+///
+/// The full Envoy-mode pipeline does. A `typed_per_filter_config` entry naming
+/// a filter that is absent from the chain is a hard build error (that is
+/// WP-33's acceptance criterion 3, and `filter_manager::resolve_per_filter_row`
+/// is what enforces it), so simply getting through `build_snapshot` with the
+/// override attached proves the emitted chain name and the emitted override
+/// key agree -- a typo in either one turns this red.
+///
+/// Note this runs with `force_usage_reporting` at its DEFAULT, unlike the
+/// usage-filter tests above which switch it off to stay scoped. Here the
+/// default-on path is the point.
+#[test]
+fn body_rewrite_per_route_config_survives_into_the_ir() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "gpt-*", provider: openai }
+  - { model: "claude-*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    let listener = snapshot
+        .listeners
+        .values()
+        .next()
+        .expect("exactly one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+    assert!(
+        hcm.http_filters
+            .iter()
+            .any(|f| f.name == "llmproxy.body_rewrite"),
+        "the body-rewrite filter must be in the chain by default; chain was {:?}",
+        hcm.http_filters.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+
+    let routes = &hcm.route_table.virtual_hosts[0].routes;
+    for (i, want) in [(0, "openai"), (1, "anthropic")] {
+        let per_filter = routes[i]
+            .typed_per_filter_config
+            .get("llmproxy.body_rewrite")
+            .unwrap_or_else(|| panic!("route {i} must carry a body-rewrite override"));
+        assert_eq!(
+            per_filter.type_url,
+            proxy_filters::body_rewrite_filter::TYPE_URL
+        );
+
+        // Ground rule #2: the IR leaves the config undecoded, so read the
+        // dialect back the way the filter's own `parse_per_route` does --
+        // `RuntimeFeatureFlag.runtime_key` carries it.
+        let msg = per_filter
+            .config
+            .as_ref()
+            .unwrap_or_else(|| panic!("route {i} override must carry a config"));
+        let got = msg
+            .get_field_by_name("runtime_key")
+            .expect("RuntimeFeatureFlag.runtime_key")
+            .as_str()
+            .expect("runtime_key must be a string")
             .to_string();
         assert_eq!(got, want, "route {i}");
     }
