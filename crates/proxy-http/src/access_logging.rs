@@ -381,6 +381,8 @@ impl LoggingBody {
             bytes_received,
             llm_tokens,
             llm_ttft,
+            llm_max_stall,
+            llm_response_chunks,
         ) = {
             let mut info = ctx.stream_info.borrow_mut();
             info.bytes_sent = self.bytes_sent;
@@ -404,6 +406,8 @@ impl LoggingBody {
                 info.bytes_received,
                 llm_tokens,
                 info.llm.time_to_first_byte,
+                info.llm.max_inter_chunk,
+                info.llm.response_chunks,
             )
         };
 
@@ -423,6 +427,8 @@ impl LoggingBody {
             downstream_remote_address: Some(&ctx.downstream_remote_address),
             llm_tokens,
             llm_ttft,
+            llm_max_stall,
+            llm_response_chunks,
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
             request_authority: ctx.request.authority.as_deref(),
@@ -554,11 +560,21 @@ mod tests {
     /// log through the same path as `bytes_sent` -- not just through
     /// `access_log::render` in isolation.
     async fn render_one(llm: crate::stream_info::LlmStats) -> String {
-        let capture = Arc::new(CaptureSink::default());
-        let fmt = parse_format(
+        render_one_fmt(
             "%LLM_INPUT_TOKENS% %LLM_CACHED_TOKENS% %LLM_CACHE_CREATION_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_TOTAL_TOKENS% %LLM_TTFT%",
+            llm,
         )
-        .unwrap();
+        .await
+    }
+
+    /// Same as [`render_one`], but with a caller-supplied format string --
+    /// used by the WP-46 tests below to exercise `%LLM_TPOT%`/
+    /// `%LLM_MAX_STALL%`/`%LLM_RESPONSE_CHUNKS%` end-to-end (`StreamInfo` ->
+    /// `AccessLogContext` -> the rendered line), not from a hand-built
+    /// `LogContext`.
+    async fn render_one_fmt(fmt: &str, llm: crate::stream_info::LlmStats) -> String {
+        let capture = Arc::new(CaptureSink::default());
+        let fmt = parse_format(fmt).unwrap();
         let logger = AccessLoggerRuntime {
             sink: capture.clone() as Arc<dyn AccessLogWriter>,
             format: AccessLogFormat::Text(fmt),
@@ -623,6 +639,73 @@ mod tests {
             render_one(crate::stream_info::LlmStats::default()).await,
             "- - - - - -"
         );
+    }
+
+    // --- WP-46: TPOT / max-stall / response-chunks plumbing ---------------
+    //
+    // These drive the real `StreamInfo` -> `AccessLogContext` -> `LoggingBody`
+    // path (via `render_one_fmt`), not a hand-built `LogContext` -- the
+    // plumbing from `StreamInfo::llm` through to `LogContext` is exactly the
+    // part WP-46 adds, so it's the part worth exercising end-to-end.
+
+    #[tokio::test]
+    async fn llm_max_stall_and_response_chunks_reach_the_rendered_line() {
+        let llm = crate::stream_info::LlmStats {
+            usage: None,
+            time_to_first_byte: None,
+            max_inter_chunk: Some(std::time::Duration::from_millis(150)),
+            response_chunks: 7,
+        };
+        assert_eq!(
+            render_one_fmt("%LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%", llm).await,
+            "150 7"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_max_stall_renders_dash_when_absent_response_chunks_renders_zero() {
+        let llm = crate::stream_info::LlmStats::default();
+        assert_eq!(
+            render_one_fmt("%LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%", llm).await,
+            "- 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_tpot_reaches_the_rendered_line_via_real_stream_info() {
+        // Not a hand-built `LogContext`: `duration` here is the real elapsed
+        // wall time `LoggingBody` measures from `start_instant` to
+        // end-of-stream, so this only proves the plumbing (usage, ttft, and
+        // duration all reach `%LLM_TPOT%` through the real path) -- the exact
+        // formula is proven precisely, against a scripted `LogContext`, in
+        // `proxy_observability::access_log`'s own WP-46 tests.
+        let llm = crate::stream_info::LlmStats {
+            usage: Some(LlmTokenUsage {
+                input_tokens: 1,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 10,
+            }),
+            time_to_first_byte: Some(std::time::Duration::from_millis(0)),
+            max_inter_chunk: None,
+            response_chunks: 1,
+        };
+        let line = render_one_fmt("%LLM_TPOT%", llm).await;
+        assert_ne!(line, "-", "usage + ttft + duration are all present");
+        // TPOT renders fractional milliseconds (`<ms>.<micros>`) so that a
+        // sub-millisecond-per-token stream does not collapse to 0 -- see
+        // `access_log::tests::llm_tpot_keeps_sub_millisecond_precision_for_fast_streams`
+        // for why. This test only proves the value REACHES the line through the
+        // real StreamInfo path; the exact formula is pinned in `access_log.rs`.
+        let (ms, micros) = line
+            .split_once('.')
+            .unwrap_or_else(|| panic!("expected `<ms>.<micros>`, got {line:?}"));
+        ms.parse::<u128>()
+            .unwrap_or_else(|_| panic!("millisecond part not numeric in {line:?}"));
+        assert_eq!(micros.len(), 3, "micros must be zero-padded to 3 digits");
+        micros
+            .parse::<u128>()
+            .unwrap_or_else(|_| panic!("micros part not numeric in {line:?}"));
     }
 
     // --- mid-stream body failure visibility -------------------------------

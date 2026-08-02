@@ -480,6 +480,8 @@ mod tests {
             downstream_remote_address: None,
             llm_tokens: None,
             llm_ttft: None,
+            llm_max_stall: None,
+            llm_response_chunks: 0,
             request_method: None,
             request_path: None,
             request_authority: None,

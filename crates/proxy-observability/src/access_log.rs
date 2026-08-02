@@ -65,6 +65,17 @@ pub enum FormatOp {
     LlmTotalTokens,
     /// WP-33: `%LLM_TTFT%` -- time-to-first-token, in milliseconds.
     LlmTtft,
+    /// WP-46: `%LLM_TPOT%` -- mean time per output token, in milliseconds:
+    /// `(duration - ttft) / output_tokens`, computed at render time (see
+    /// [`render_op`]'s `LlmTpot` arm for the full guard list).
+    LlmTpot,
+    /// WP-46: `%LLM_MAX_STALL%` -- the largest gap between two consecutive
+    /// response body chunks, in milliseconds. NOT the same thing as TPOT --
+    /// see `LlmTokens`'s sibling field doc on `LogContext::llm_max_stall`.
+    LlmMaxStall,
+    /// WP-46: `%LLM_RESPONSE_CHUNKS%` -- number of response body chunks
+    /// observed for this stream.
+    LlmResponseChunks,
 }
 
 /// The argument to `%REQ%`/`%RESP%`/`%TRAILER%`: a primary header name, an
@@ -310,6 +321,18 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmTtft
         }
+        "LLM_TPOT" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmTpot
+        }
+        "LLM_MAX_STALL" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmMaxStall
+        }
+        "LLM_RESPONSE_CHUNKS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmResponseChunks
+        }
         other => {
             return Err(err(format!(
                 "unknown access-log format operator `%{other}%` in format string `{input}`"
@@ -379,6 +402,13 @@ pub struct LogContext<'a> {
     pub llm_tokens: Option<LlmTokens>,
     /// WP-33: time-to-first-token -- response headers to first body byte.
     pub llm_ttft: Option<std::time::Duration>,
+    /// WP-46: the largest gap between two consecutive response body chunks
+    /// -- the tail of the TPOT distribution, NOT the mean (`%LLM_TPOT%`
+    /// below computes the mean separately). `None` for a non-streamed
+    /// response, or one that never populated `StreamInfo::llm`.
+    pub llm_max_stall: Option<std::time::Duration>,
+    /// WP-46: number of response body chunks observed for this stream.
+    pub llm_response_chunks: u64,
     /// Envoy request pseudo-header `:method` -- e.g. `GET`. These four fields
     /// exist because `:method`/`:path`/`:authority`/`:scheme` are not legal
     /// `http::HeaderName`s (a colon isn't a valid HTTP field-name character),
@@ -485,6 +515,58 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
             }
             None => out.push('-'),
         },
+        // WP-46: mean time per output token, in milliseconds --
+        // `(duration - ttft) / output_tokens`. Every guard here renders `-`
+        // rather than a garbage number or a panic:
+        //   - no usage reported, or output_tokens == 0 (division by zero)
+        //   - no TTFT recorded
+        //   - no duration recorded
+        //   - duration < ttft (clock/measurement skew) -- `checked_sub`
+        //     catches this instead of `Duration`'s subtraction, which
+        //     PANICS on underflow.
+        // Rust note: `checked_sub` on `Duration` returns `None` on
+        // underflow instead of panicking, unlike the `-` operator.
+        FormatOp::LlmTpot => {
+            let tpot = (|| {
+                let output_tokens = ctx.llm_tokens?.output;
+                if output_tokens == 0 {
+                    return None;
+                }
+                let ttft = ctx.llm_ttft?;
+                let duration = ctx.duration?;
+                let numerator = duration.checked_sub(ttft)?;
+                // Divide in MICROseconds, render as fractional milliseconds.
+                //
+                // Integer-millisecond division renders 0 for any stream faster
+                // than one output token per millisecond -- and fast inference
+                // providers (Groq, Cerebras) run 1000-2000 tok/s routinely, so
+                // TPOT would read 0 exactly when performance is BEST, which
+                // looks like a broken stream rather than a fast one. Microsecond
+                // division keeps three significant decimals at millisecond
+                // scale.
+                //
+                // Rust note: integer arithmetic throughout (no `f64`), so the
+                // rendered value is bit-for-bit reproducible -- access-log lines
+                // get diffed and asserted on. Truncating rather than rounding,
+                // consistent with `as_millis()` elsewhere in this file.
+                Some(numerator.as_micros() / u128::from(output_tokens))
+            })();
+            match tpot {
+                Some(us_per_token) => {
+                    let _ = write!(out, "{}.{:03}", us_per_token / 1000, us_per_token % 1000);
+                }
+                None => out.push('-'),
+            }
+        }
+        FormatOp::LlmMaxStall => match ctx.llm_max_stall {
+            Some(d) => {
+                let _ = write!(out, "{}", d.as_millis());
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmResponseChunks => {
+            let _ = write!(out, "{}", ctx.llm_response_chunks);
+        }
     }
 }
 
@@ -695,6 +777,9 @@ mod tests {
             ("%LLM_OUTPUT_TOKENS%", FormatOp::LlmOutputTokens),
             ("%LLM_TOTAL_TOKENS%", FormatOp::LlmTotalTokens),
             ("%LLM_TTFT%", FormatOp::LlmTtft),
+            ("%LLM_TPOT%", FormatOp::LlmTpot),
+            ("%LLM_MAX_STALL%", FormatOp::LlmMaxStall),
+            ("%LLM_RESPONSE_CHUNKS%", FormatOp::LlmResponseChunks),
         ] {
             assert_eq!(parse(src).0, vec![expect], "operator {src}");
         }
@@ -767,6 +852,8 @@ mod tests {
             downstream_remote_address: Some("127.0.0.1:1234"),
             llm_tokens: None,
             llm_ttft: None,
+            llm_max_stall: None,
+            llm_response_chunks: 0,
             request_method: Some("POST"),
             request_path: Some("/v1/chat/completions"),
             request_authority: Some("api.example.com"),
@@ -961,5 +1048,175 @@ mod tests {
         let e = parse_format("%LLM_BOGUS%").unwrap_err();
         assert!(e.0.contains("unknown access-log format operator"), "{e}");
         assert!(e.0.contains("LLM_BOGUS"), "{e}");
+    }
+
+    // -------------------------------------------------------- WP-46: TPOT --
+
+    const LLM_TPOT_FMT: &str = "%LLM_TPOT% %LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%";
+
+    /// Deliberately chosen so `duration`, `ttft`, `output_tokens`, the
+    /// correct TPOT answer, and `max_inter_chunk` are all distinct numbers --
+    /// a formula that accidentally read the wrong field (or rendered
+    /// `max_inter_chunk` under the TPOT label, the exact mistake this WP
+    /// exists to prevent) cannot slip through by coincidence.
+    #[test]
+    fn llm_tpot_renders_mean_time_per_output_token() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.duration = Some(std::time::Duration::from_millis(1000));
+        c.llm_ttft = Some(std::time::Duration::from_millis(200));
+        c.llm_tokens = Some(LlmTokens {
+            input: 1,
+            cached: 0,
+            cache_creation: 0,
+            output: 40,
+        });
+        // Distinct from the correct TPOT answer (20ms) so a mutant that
+        // renders `max_inter_chunk` under `%LLM_TPOT%` is caught.
+        c.llm_max_stall = Some(std::time::Duration::from_millis(150));
+        c.llm_response_chunks = 7;
+        let fs = parse(LLM_TPOT_FMT);
+        // (1000 - 200) / 40 = 20ms exactly.
+        assert_eq!(render(&fs, &c), "20.000 150 7");
+    }
+
+    /// The reason TPOT divides in microseconds rather than milliseconds.
+    ///
+    /// A fast inference provider (Groq, Cerebras) streams 1000-2000 tokens/sec
+    /// routinely. Under integer-millisecond division every one of those renders
+    /// TPOT as `0` -- the metric reads zero exactly when performance is BEST,
+    /// which an operator reads as a broken stream rather than a fast one. This
+    /// pins the sub-millisecond case so nobody "simplifies" the arithmetic back
+    /// to `as_millis()`.
+    #[test]
+    fn llm_tpot_keeps_sub_millisecond_precision_for_fast_streams() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        // 2000 tokens generated in 1s after a 100ms TTFT = 0.5ms per token.
+        c.duration = Some(std::time::Duration::from_millis(1100));
+        c.llm_ttft = Some(std::time::Duration::from_millis(100));
+        c.llm_tokens = Some(LlmTokens {
+            input: 1,
+            cached: 0,
+            cache_creation: 0,
+            output: 2000,
+        });
+        c.llm_max_stall = None;
+        c.llm_response_chunks = 0;
+        let fs = parse(LLM_TPOT_FMT);
+        assert_eq!(
+            render(&fs, &c),
+            "0.500 - 0",
+            "sub-millisecond TPOT must not collapse to 0"
+        );
+    }
+
+    #[test]
+    fn llm_tpot_renders_dash_when_output_tokens_zero() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.duration = Some(std::time::Duration::from_millis(1000));
+        c.llm_ttft = Some(std::time::Duration::from_millis(200));
+        c.llm_tokens = Some(LlmTokens {
+            input: 1,
+            cached: 0,
+            cache_creation: 0,
+            output: 0,
+        });
+        let fs = parse("%LLM_TPOT%");
+        assert_eq!(render(&fs, &c), "-");
+    }
+
+    #[test]
+    fn llm_tpot_renders_dash_when_ttft_absent() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.duration = Some(std::time::Duration::from_millis(1000));
+        c.llm_ttft = None;
+        c.llm_tokens = Some(LlmTokens {
+            input: 1,
+            cached: 0,
+            cache_creation: 0,
+            output: 40,
+        });
+        let fs = parse("%LLM_TPOT%");
+        assert_eq!(render(&fs, &c), "-");
+    }
+
+    #[test]
+    fn llm_tpot_renders_dash_when_duration_absent() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.duration = None;
+        c.llm_ttft = Some(std::time::Duration::from_millis(200));
+        c.llm_tokens = Some(LlmTokens {
+            input: 1,
+            cached: 0,
+            cache_creation: 0,
+            output: 40,
+        });
+        let fs = parse("%LLM_TPOT%");
+        assert_eq!(render(&fs, &c), "-");
+    }
+
+    #[test]
+    fn llm_tpot_renders_dash_when_usage_absent() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.duration = Some(std::time::Duration::from_millis(1000));
+        c.llm_ttft = Some(std::time::Duration::from_millis(200));
+        c.llm_tokens = None;
+        let fs = parse("%LLM_TPOT%");
+        assert_eq!(render(&fs, &c), "-");
+    }
+
+    #[test]
+    fn llm_tpot_renders_dash_and_does_not_panic_when_duration_less_than_ttft() {
+        // Clock/measurement skew: `Duration` subtraction PANICS on
+        // underflow, so this must go through `checked_sub`, not `-`.
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.duration = Some(std::time::Duration::from_millis(100));
+        c.llm_ttft = Some(std::time::Duration::from_millis(200));
+        c.llm_tokens = Some(LlmTokens {
+            input: 1,
+            cached: 0,
+            cache_creation: 0,
+            output: 40,
+        });
+        let fs = parse("%LLM_TPOT%");
+        assert_eq!(render(&fs, &c), "-");
+    }
+
+    #[test]
+    fn llm_max_stall_and_response_chunks_render_dash_and_zero_when_absent() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        assert_eq!(c.llm_max_stall, None);
+        assert_eq!(c.llm_response_chunks, 0);
+        let fs = parse("%LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%");
+        assert_eq!(render(&fs, &c), "- 0");
+    }
+
+    /// One format string combining every LLM operator, all rendered
+    /// correctly together.
+    #[test]
+    fn all_llm_operators_render_together() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.llm_tokens = Some(LlmTokens {
+            input: 11,
+            cached: 22,
+            cache_creation: 33,
+            output: 40,
+        });
+        c.llm_ttft = Some(std::time::Duration::from_millis(200));
+        c.duration = Some(std::time::Duration::from_millis(1000));
+        c.llm_max_stall = Some(std::time::Duration::from_millis(150));
+        c.llm_response_chunks = 7;
+        let fs = parse(&format!(
+            "{LLM_FMT} %LLM_TPOT% %LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%"
+        ));
+        assert_eq!(render(&fs, &c), "11 22 33 40 106 200 20.000 150 7");
     }
 }
