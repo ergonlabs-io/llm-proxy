@@ -157,6 +157,12 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         routes.push(lower_route(config, i, rule, &mut warnings)?);
         has_catch_all |= rule.model == "*";
     }
+    // `models:` entries (WP-49) each get an implicit route on their own
+    // name, evaluated after the explicit `routes:` list (first match wins,
+    // same S1 rule) and before the 404 backstop.
+    for (name, model) in &config.models {
+        routes.push(lower_model(config, name, model, &mut warnings)?);
+    }
     if !has_catch_all {
         routes.push(json!({
             "match": { "prefix": "/" },
@@ -167,7 +173,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             }
         }));
     }
-    if !config.routes.is_empty() {
+    if !config.routes.is_empty() || !config.models.is_empty() {
         warnings.push(warning(
             "routes",
             format!(
@@ -252,11 +258,50 @@ fn provider_upstream(name: &str, provider: &Provider) -> Result<ProviderUpstream
     Ok(ProviderUpstream { host, port, tls })
 }
 
+/// `azure-openai`/`vertex`/`bedrock` are named in the taxonomy (WP-49) but
+/// have no working way to reach the upstream yet: Vertex needs minted OAuth2
+/// with a refresh loop, Bedrock needs per-request SigV4 signing over the
+/// canonical request (which must run after body rewriting and so cannot be
+/// `request_headers_to_add`), and Azure needs a deployment-name +
+/// `api-version` URL template neither `host_rewrite_literal` nor
+/// `prefix_rewrite` can express. `None` for the three implemented types.
+fn unsupported_credential_scheme(provider_type: ProviderType) -> Option<String> {
+    let (gap, detail) = match provider_type {
+        ProviderType::Vertex => ("credential scheme", "minted OAuth2 with refresh"),
+        ProviderType::Bedrock => ("credential scheme", "per-request SigV4 signing"),
+        ProviderType::AzureOpenai => (
+            "URL path templating",
+            "deployment name + api-version query parameter",
+        ),
+        ProviderType::Openai | ProviderType::Anthropic | ProviderType::OpenaiCompatible => {
+            return None
+        }
+    };
+    Some(format!(
+        "provider type `{}` is not yet supported: its {gap} ({detail}) is not implemented \
+         (WP-49 increment 2)",
+        provider_type.as_str()
+    ))
+}
+
 fn lower_provider(
     name: &str,
     provider: &Provider,
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<Value, ConfigError> {
+    // This is a hard load error, not a warning, and that is a deliberate
+    // departure from the `limits`/`fallbacks` pattern elsewhere in this
+    // file: an unenforced *limit* still serves real traffic, but a provider
+    // with no working credential scheme would produce a cluster that 401s
+    // on every single request. Failing at load is strictly kinder than
+    // failing per-request in production.
+    if let Some(reason) = unsupported_credential_scheme(provider.effective_type(name)) {
+        return Err(ConfigError::Unimplemented {
+            field_path: format!("providers.{name}.type"),
+            reason,
+        });
+    }
+
     let up = provider_upstream(name, provider)?;
     let cluster_name = format!("provider:{name}");
 
@@ -385,6 +430,33 @@ fn usage_dialect(name: &str, provider: &Provider) -> &'static str {
     }
 }
 
+/// A `models:` provider entry's effective dialect (WP-49): an explicit
+/// `dialect` always wins; otherwise it is derived via [`usage_dialect`] --
+/// but only for provider types whose wire format the type alone determines.
+/// `None` means "ambiguous type, no explicit `dialect`" -- `validate_semantics`
+/// (`parse.rs`) calls this exact function to reject that at parse time, so a
+/// `None` reaching `lower.rs`'s callers should be unreachable; the two
+/// checks share this one function instead of two mappings that could drift.
+///
+/// Rust note: `pub(crate)` (not `pub`), since the only caller outside this
+/// module is `parse.rs`, which lives in the same crate.
+pub(crate) fn resolved_dialect(
+    provider_name: &str,
+    provider: &Provider,
+    dialect: Option<Dialect>,
+) -> Option<&'static str> {
+    if let Some(d) = dialect {
+        return Some(d.as_str());
+    }
+    if provider
+        .effective_type(provider_name)
+        .dialect_is_ambiguous()
+    {
+        return None;
+    }
+    Some(usage_dialect(provider_name, provider))
+}
+
 /// `observability.force_usage_reporting`, defaulting to `true` both when the
 /// key is absent AND when the whole `observability` block is absent --
 /// `Observability::force_usage_reporting`'s serde default only covers the
@@ -487,6 +559,49 @@ fn lower_route(
         });
     }
 
+    let headers_to_add = provider_headers_to_add(provider_name, provider, warnings)?;
+
+    let mut route = json!({ "match": r#match, "route": action });
+    if !headers_to_add.is_empty() {
+        route["request_headers_to_add"] = Value::Array(headers_to_add);
+    }
+
+    // Token accounting follows the ROUTE's provider, not the listener's: one
+    // listener serves `gpt-*` from OpenAI and `claude-*` from Anthropic, and a
+    // single listener-level dialect would be wrong for whichever one it isn't.
+    // A bare `Any` is the simpler of the two accepted forms — the
+    // `envoy.config.route.v3.FilterConfig` wrapper only buys `is_optional`,
+    // and this filter is never optional.
+    let mut typed_per_filter_config = json!({
+        USAGE_FILTER_NAME: {
+            "@type": USAGE_FILTER_TYPE_URL,
+            "inline_string": usage_dialect(provider_name, provider),
+        }
+    });
+    // Token accounting follows the ROUTE's provider here too, for the exact
+    // same reason as the usage filter above -- one listener can serve
+    // `gpt-*` from OpenAI and `claude-*` from Anthropic.
+    if force_usage_reporting(config) {
+        typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
+            body_rewrite_typed_config(usage_dialect(provider_name, provider));
+    }
+    route["typed_per_filter_config"] = typed_per_filter_config;
+
+    Ok(route)
+}
+
+/// `request_headers_to_add` for a route targeting this provider: the auth
+/// header (if a key is configured), Anthropic's default `anthropic-version`
+/// (unless overridden), and every `extra_headers` entry. Shared by
+/// [`lower_route`] and [`lower_model`] so a provider's requests can never
+/// carry different headers depending on which one reached it -- two mappings
+/// that could disagree is exactly the hazard `usage_dialect`'s doc warns
+/// about, for the same class of field.
+fn provider_headers_to_add(
+    provider_name: &str,
+    provider: &Provider,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<Vec<Value>, ConfigError> {
     let mut headers_to_add = Vec::new();
     if let Some((key, value)) = auth_header(provider_name, provider, warnings)? {
         headers_to_add.push(json!({
@@ -523,32 +638,86 @@ fn lower_route(
             "append_action": "OVERWRITE_IF_EXISTS_OR_ADD",
         }));
     }
+    Ok(headers_to_add)
+}
 
+// -------------------------------------------------------------------- models --
+
+/// `models.<name>` -> one route (WP-49). `providers[0]` is the only entry
+/// this increment ever uses to serve traffic -- it produces the route,
+/// pointed at that entry's provider cluster with that entry's dialect.
+/// Every later entry is still fully validated (`validate_semantics` already
+/// rejected an unknown provider or an unresolvable dialect at any index, not
+/// just 0) but is not yet reachable, so it gets an explicit per-entry
+/// warning naming its exact path (ground rule #1) rather than being
+/// silently accepted -- selection among providers is WP-35.
+fn lower_model(
+    config: &SimpleConfig,
+    name: &str,
+    model: &ModelDef,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<Value, ConfigError> {
+    // `validate_semantics` already guarantees `providers` is non-empty and
+    // `providers[0]` names a real provider.
+    let entry = &model.providers[0];
+    let provider_name = entry.provider();
+    let provider = &config.providers[provider_name];
+    let up = provider_upstream(provider_name, provider)?;
+
+    if entry.model().is_some() {
+        warnings.push(warning(
+            format!("models.{name}.providers[0]"),
+            "the upstream model ID needs the request-body rewriter (WP-35); \
+             the client's original model name is forwarded for now",
+        ));
+    }
+
+    // `validate_semantics` already rejects an unresolvable dialect (an
+    // ambiguous provider type with no explicit `dialect`) at every entry
+    // index, via this exact function -- so this can't actually be `None`
+    // for a config that reached lowering.
+    let dialect = resolved_dialect(provider_name, provider, entry.dialect())
+        .expect("validated: models.<name>.providers[0]'s dialect is resolvable");
+
+    let mut r#match = json!({ "prefix": "/" });
+    if let Some(header_matcher) = model_glob_matcher(name) {
+        r#match["headers"] = json!([header_matcher]);
+    }
+
+    let action = json!({
+        "cluster": format!("provider:{provider_name}"),
+        // Same LLM-safe S4 defaults as `lower_route`: no total timeout,
+        // idle-based guard. `models:` entries don't (yet) carry their own
+        // `idle_timeout` override, so this is always the 90s default.
+        "timeout": "0s",
+        "idle_timeout": "90s",
+        "host_rewrite_literal": up.host,
+    });
+
+    let headers_to_add = provider_headers_to_add(provider_name, provider, warnings)?;
     let mut route = json!({ "match": r#match, "route": action });
     if !headers_to_add.is_empty() {
         route["request_headers_to_add"] = Value::Array(headers_to_add);
     }
 
-    // Token accounting follows the ROUTE's provider, not the listener's: one
-    // listener serves `gpt-*` from OpenAI and `claude-*` from Anthropic, and a
-    // single listener-level dialect would be wrong for whichever one it isn't.
-    // A bare `Any` is the simpler of the two accepted forms — the
-    // `envoy.config.route.v3.FilterConfig` wrapper only buys `is_optional`,
-    // and this filter is never optional.
     let mut typed_per_filter_config = json!({
         USAGE_FILTER_NAME: {
             "@type": USAGE_FILTER_TYPE_URL,
-            "inline_string": usage_dialect(provider_name, provider),
+            "inline_string": dialect,
         }
     });
-    // Token accounting follows the ROUTE's provider here too, for the exact
-    // same reason as the usage filter above -- one listener can serve
-    // `gpt-*` from OpenAI and `claude-*` from Anthropic.
     if force_usage_reporting(config) {
-        typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
-            body_rewrite_typed_config(usage_dialect(provider_name, provider));
+        typed_per_filter_config[BODY_REWRITE_FILTER_NAME] = body_rewrite_typed_config(dialect);
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
+
+    for i in 1..model.providers.len() {
+        warnings.push(warning(
+            format!("models.{name}.providers[{i}]"),
+            "not yet selectable; only providers[0] is used to serve traffic until the \
+             model router (WP-35) can choose among them",
+        ));
+    }
 
     Ok(route)
 }

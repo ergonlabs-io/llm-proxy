@@ -1352,3 +1352,397 @@ fn token_limit_filter_survives_into_the_ir() {
         .expect("llmproxy.token_limit must be in the chain");
     assert_eq!(entry.type_url, proxy_filters::token_limit_filter::TYPE_URL);
 }
+
+// -------------------------------------------------------------- WP-49: models --
+//
+// The config surface has exactly two nouns: `providers` (the top-level map)
+// and `models`. A `models.<name>.providers` entry is a provider reference,
+// same as `routes[i].provider` -- either the shorthand string form
+// (`provider` or `provider/model`, reusing `ProviderModelRef`) or the object
+// form needed whenever `dialect` must be explicit. There is no third noun
+// ("backend") anywhere in the config.
+
+/// A `models:` block with two provider entries: `providers[0]` produces the
+/// route (pointed at its provider's cluster), `providers[1]` is recorded but
+/// not yet reachable and gets an explicit warning naming its exact path
+/// (ground rule #1) -- selection among them is WP-35.
+#[test]
+fn models_first_provider_produces_the_route_later_ones_warn() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+  nebius: { base_url: "https://api.studio.nebius.ai", api_key: k }
+routes:
+  - { model: "gpt-*", provider: anthropic }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - anthropic/claude-sonnet-4-5-20250929
+      - nebius/some-other-model
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+
+    let routes =
+        &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
+    // routes[0] is the explicit `routes:` rule; routes[1] is the implicit
+    // model route built from `providers[0]`.
+    let model_route = &routes[1];
+    assert_eq!(model_route["route"]["cluster"], "provider:anthropic");
+    assert_eq!(
+        model_route["match"]["headers"][0]["string_match"]["exact"],
+        "claude-sonnet-4-5"
+    );
+
+    let paths = warning_paths(&lowered.warnings);
+    assert!(
+        paths.contains(&"models.claude-sonnet-4-5.providers[1]"),
+        "warnings: {paths:?}"
+    );
+    // `providers[0]`'s `/model` suffix (an upstream ID different from the
+    // catalogue name) is recorded but not substituted into the body yet.
+    assert!(
+        paths.contains(&"models.claude-sonnet-4-5.providers[0]"),
+        "warnings: {paths:?}"
+    );
+}
+
+/// A provider entry naming a provider that doesn't exist is a load error
+/// with the full dotted path, mirroring `route_to_unknown_provider_fails`.
+/// Uses the shorthand string form -- the common case.
+#[test]
+fn model_provider_entry_unknown_provider_fails() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "*", provider: anthropic }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - nonexistent
+"#,
+    )
+    .expect_err("unknown provider must fail");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "models.claude-sonnet-4-5.providers[0]");
+    assert!(
+        reason.contains("anthropic"),
+        "should list known providers: {reason}"
+    );
+}
+
+/// An empty `providers` list on a model is a load error.
+#[test]
+fn model_with_no_providers_fails() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "*", provider: anthropic }
+models:
+  claude-sonnet-4-5:
+    providers: []
+"#,
+    )
+    .expect_err("empty providers list must fail");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "models.claude-sonnet-4-5.providers");
+    assert!(reason.contains("at least one provider"), "got: {reason}");
+}
+
+/// `vertex`, `bedrock`, and `azure-openai` are named in the taxonomy but
+/// have no working credential/addressing scheme yet -- loading a provider of
+/// one of those types is a hard error naming the gap, caught at LOWERING
+/// (not parse) time, since it's a "can we produce a working Envoy resource"
+/// question, not a shape question.
+#[test]
+fn unbuilt_provider_types_are_hard_load_errors() {
+    for (type_name, must_contain) in [
+        ("vertex", "OAuth2"),
+        ("bedrock", "SigV4"),
+        ("azure-openai", "URL path templating"),
+    ] {
+        let config = parse(&format!(
+            r#"
+version: 0
+providers:
+  p1: {{ type: {type_name}, base_url: "https://example.com", api_key: k }}
+routes:
+  - {{ model: "*", provider: p1 }}
+"#
+        ))
+        .unwrap_or_else(|e| panic!("{type_name}: must parse, got {e}"));
+        let err =
+            proxy_simple_config::lower(&config).expect_err(&format!("{type_name}: must fail"));
+        let ConfigError::Unimplemented { field_path, reason } = &err else {
+            panic!("{type_name}: expected Unimplemented, got: {err}");
+        };
+        assert_eq!(field_path, "providers.p1.type", "{type_name}");
+        assert!(reason.contains(must_contain), "{type_name}: got {reason}");
+    }
+}
+
+/// Vertex/Bedrock serve more than one wire format under one provider type,
+/// so a `models:` entry using one MUST set `dialect` explicitly -- and the
+/// shorthand string form has nowhere to put it, so it must be rejected
+/// telling the user to switch to the object form. Caught at PARSE time
+/// (`validate_semantics`), independent of the (also-fatal, but
+/// lowering-time) unbuilt-credential-scheme error above.
+#[test]
+fn model_provider_shorthand_on_ambiguous_provider_type_fails() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+routes:
+  - { model: "*", provider: vertex-us }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - vertex-us/claude-sonnet-4-5@20250929
+"#,
+    )
+    .expect_err("the shorthand form on an ambiguous provider type must fail to parse");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "models.claude-sonnet-4-5.providers[0]");
+    assert!(reason.contains("vertex"), "got: {reason}");
+    assert!(
+        reason.contains("object form"),
+        "should point the user at the fix: {reason}"
+    );
+}
+
+/// The object-form counterpart: `dialect` omitted is still a load error, at
+/// the more specific `.dialect` field path since the object form actually
+/// has that field to point at.
+#[test]
+fn model_provider_object_form_missing_dialect_on_ambiguous_provider_fails() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+routes:
+  - { model: "*", provider: vertex-us }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - { provider: vertex-us, model: "claude-sonnet-4-5@20250929" }
+"#,
+    )
+    .expect_err("missing dialect on an ambiguous provider type must fail to parse");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "models.claude-sonnet-4-5.providers[0].dialect");
+    assert!(reason.contains("vertex"), "got: {reason}");
+}
+
+/// `dialect` omitted for `anthropic`/`openai`/`openai-compatible` entries is
+/// fine and derives the same string `usage_dialect` would.
+#[test]
+fn model_provider_dialect_derives_for_unambiguous_provider_types() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "*", provider: anthropic }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - anthropic
+"#,
+    )
+    .expect("dialect omitted on an unambiguous provider type must parse fine");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes =
+        &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
+    assert_eq!(
+        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        "anthropic"
+    );
+}
+
+/// An explicit `dialect` on the object form overrides the derived value --
+/// proves the field is actually read, not decorative. `nebius` here is
+/// openai-compatible, whose derived dialect would be "openai".
+#[test]
+fn model_provider_explicit_dialect_overrides_derived_value() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  nebius: { base_url: "https://api.studio.nebius.ai", api_key: k }
+routes:
+  - { model: "*", provider: nebius }
+models:
+  claude-via-nebius:
+    providers:
+      - { provider: nebius, dialect: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes =
+        &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
+    assert_eq!(
+        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        "anthropic"
+    );
+}
+
+/// The shorthand string form and the equivalent object form must lower
+/// identically -- this is what stops the two forms drifting apart over
+/// time, since nothing else in the type system enforces it (an `untagged`
+/// enum only guarantees each parses, not that they agree once lowered).
+#[test]
+fn shorthand_and_object_form_lower_identically() {
+    let shorthand = parse(
+        r#"
+version: 0
+providers:
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "*", provider: anthropic }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - anthropic/claude-sonnet-4-5-20250929
+"#,
+    )
+    .expect("shorthand form must parse");
+    let object_form = parse(
+        r#"
+version: 0
+providers:
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+routes:
+  - { model: "*", provider: anthropic }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - { provider: anthropic, model: claude-sonnet-4-5-20250929 }
+"#,
+    )
+    .expect("object form must parse");
+
+    let lowered_shorthand = proxy_simple_config::lower(&shorthand).expect("must lower");
+    let lowered_object = proxy_simple_config::lower(&object_form).expect("must lower");
+
+    // Compare the ENTIRE lowered bootstrap, not just the route the reference
+    // lands on. The claim these two forms make is "same meaning", and a
+    // divergence in the cluster, the filter chain, or the per-route dialect
+    // would be exactly the kind of drift this test exists to prevent -- and
+    // every one of those lives outside `routes[1]`.
+    assert_eq!(
+        lowered_shorthand.bootstrap, lowered_object.bootstrap,
+        "the two spellings of one reference must lower to a byte-identical bootstrap"
+    );
+
+    // Both forms name the same "not-yet-substituted upstream model ID"
+    // warning at the same path -- the shorthand's `/model` suffix and the
+    // object form's `model:` field are the same information.
+    assert_eq!(
+        warning_paths(&lowered_shorthand.warnings),
+        warning_paths(&lowered_object.warnings)
+    );
+}
+
+/// A `models:`-free config lowers exactly as before WP-49: the additive
+/// field changes nothing about an existing config's output.
+#[test]
+fn config_without_models_lowers_exactly_as_before() {
+    let config = parse(BASIC_CONFIG).expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes must be an array");
+    // BASIC_CONFIG's one `*` rule is a catch-all, so no synthetic 404 route
+    // is appended, and an absent `models:` block contributes no implicit
+    // routes either -- exactly the one route, unchanged.
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0]["route"]["cluster"], "provider:openai");
+}
+
+/// The IR counterpart to the JSON-level tests above, mirroring
+/// `per_route_dialect_survives_into_the_ir`: proves a `models:` entry's
+/// cluster and dialect survive the full strict-parse -> PGV -> IR pipeline,
+/// not just the JSON the dialect happens to emit.
+#[test]
+fn model_provider_survives_into_the_ir() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
+  nebius: { base_url: "https://api.studio.nebius.ai", api_key: k }
+routes:
+  - { model: "gpt-*", provider: anthropic }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - anthropic/claude-sonnet-4-5-20250929
+      - nebius
+observability:
+  force_usage_reporting: false
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    let listener = snapshot
+        .listeners
+        .values()
+        .next()
+        .expect("exactly one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+
+    // routes[0] is the explicit `gpt-*` rule; routes[1] is the implicit
+    // model route built from `claude-sonnet-4-5`'s first provider entry.
+    let model_route = &hcm.route_table.virtual_hosts[0].routes[1];
+    let proxy_config::ir::RouteActionIR::Forward(forward) = &model_route.action else {
+        panic!("expected a Forward action");
+    };
+    let proxy_config::ir::ForwardTarget::Cluster(cluster) = &forward.target else {
+        panic!("expected a Cluster target");
+    };
+    assert_eq!(cluster.as_str(), "provider:anthropic");
+
+    let per_filter = model_route
+        .typed_per_filter_config
+        .get("llmproxy.usage")
+        .expect("model route must carry a usage override");
+    let msg = per_filter
+        .config
+        .as_ref()
+        .expect("override must carry a config");
+    let got = msg
+        .get_field_by_name("inline_string")
+        .expect("DataSource.inline_string")
+        .as_str()
+        .expect("inline_string must be a string")
+        .to_string();
+    assert_eq!(got, "anthropic");
+}
