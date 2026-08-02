@@ -259,8 +259,12 @@
   "theme": "The reason this project exists — be a gateway a team chooses <em>because</em> it understands LLM traffic.",
   "gate": "Per-request token counts (input / cache-read / cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate limit is enforced; and the proxy fails over from one provider to another without the client seeing an error.",
   "done": 0,
-  "open": 5,
+  "open": 6,
   "left": [
+   {
+    "wp": "WP-46",
+    "what": "<b>The cheapest open item on this gate, and it was hiding.</b> The gate says token counts <em>and TTFT/TPOT</em> reach the access log. <code>%LLM_TTFT%</code> exists; <b>there is no TPOT operator</b> — while <code>max_inter_chunk</code> and <code>response_chunks</code> are already computed into <code>StreamInfo</code> on every stream and nothing can read them. A format operator and a test, no new computation."
+   },
    {
     "wp": "WP-33",
     "what": "Usage filter <b>wired per-route into the llmproxy dialect</b>, and <b>criterion 3 now has its test (2026-08-01)</b>: an invalid per-route dialect fails the build even under <code>is_optional: true</code>, pinned both at the error-variant level (must be InvalidValue, never Unimplemented — the latter is the one <code>is_optional</code> swallows) and end-to-end through <code>build_listener_hcm</code>. Mutation-tested. <b>Remaining:</b> GenAI TTFT/TPOT metrics and the route-level <code>streaming: strict</code> assertion."
@@ -282,7 +286,7 @@
     "what": "<b>New 2026-08-01, increment 1 landed the same day.</b> Request-body rewrite pipeline. Verified against a real OpenAI-compatible upstream: streaming without <code>stream_options.include_usage</code> emits no usage block at all, so the WP-33 filter runs correctly and finds nothing for that request shape. Also absorbs WP-35's body-peek model router as a shared consumer. <b>Done:</b> the bounded prefix scanner + splice policy (<code>body_rewrite.rs</code>, 14 tests, O(cap) not O(body), mutation-tested — removing the cap turns the multimodal 4b test red). <b>Increment 2 done (2a/2b/2c):</b> the header-mutation seam, the filter itself (OpenAI-only, Anthropic byte-identical, <code>content-length</code> corrected, proven over real sockets), and the <code>observability.force_usage_reporting</code> dialect surface defaulting to <b>true</b>. <b>Next:</b> consumer B — body-based model routing, which is what lets the dialect stop matching models on the <code>x-llmproxy-model</code> header."
    }
   ],
-  "risk": "The dialect currently <em>rejects</em> <code>limits</code> and <code>fallbacks</code> — correct under strict mode, and precisely the schema pointing at this hole. Those two features are WP-34 and WP-35. If they slip, v0.1.0 has no content."
+  "risk": "The dialect currently <em>rejects</em> <code>limits</code> and <code>fallbacks</code> — correct under strict mode, and precisely the schema pointing at this hole. Those two features are WP-34 and WP-35. If they slip, v0.1.0 has no content. <b>WP-35 is the real exposure</b>: it is a full third of this gate (mid-request provider failover), it is <code>ready</code> with nothing built, and its fallback path depends on WP-14's retry wiring. <b>Second risk, named 2026-08-01:</b> the LLM layer is now stacking on <em>serving</em> foundations that are not finished — no connection pooling (WP-15, still connect-per-stream, so every request pays a fresh TLS handshake to a provider), no downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure (WP-11). v0.0.1 proved the path carries <em>a</em> request; none of those three are exercised by four smoke requests, and all three bite under concurrency, sustained streams, or a slow consumer."
  },
  {
   "v": "v0.2.0",

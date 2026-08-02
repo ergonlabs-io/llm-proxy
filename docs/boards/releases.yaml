@@ -71,8 +71,15 @@ releases:
     the access log for live traffic; a token-based rate limit is enforced; and the proxy fails
     over from one provider to another without the client seeing an error.
   done: 0
-  open: 5
+  open: 6
   left:
+  - wp: WP-46
+    what: >-
+      <b>The cheapest open item on this gate, and it was hiding.</b> The gate says token counts
+      <em>and TTFT/TPOT</em> reach the access log. <code>%LLM_TTFT%</code> exists;
+      <b>there is no TPOT operator</b> — while <code>max_inter_chunk</code> and
+      <code>response_chunks</code> are already computed into <code>StreamInfo</code> on every
+      stream and nothing can read them. A format operator and a test, no new computation.
   - wp: WP-33
     what: >-
       Usage filter <b>wired per-route into the llmproxy dialect</b>, and <b>criterion 3 now
@@ -112,7 +119,16 @@ releases:
   risk: >-
     The dialect currently <em>rejects</em> <code>limits</code> and <code>fallbacks</code>
     — correct under strict mode, and precisely the schema pointing at this hole. Those two
-    features are WP-34 and WP-35. If they slip, v0.1.0 has no content.
+    features are WP-34 and WP-35. If they slip, v0.1.0 has no content. <b>WP-35 is the real
+    exposure</b>: it is a full third of this gate (mid-request provider failover), it is
+    <code>ready</code> with nothing built, and its fallback path depends on WP-14's retry
+    wiring. <b>Second risk, named 2026-08-01:</b> the LLM layer is now stacking on
+    <em>serving</em> foundations that are not finished — no connection pooling (WP-15, still
+    connect-per-stream, so every request pays a fresh TLS handshake to a provider), no
+    downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure
+    (WP-11). v0.0.1 proved the path carries <em>a</em> request; none of those three are
+    exercised by four smoke requests, and all three bite under concurrency, sustained streams,
+    or a slow consumer.
 - v: v0.2.0
   name: Production-ready serving
   state: later

@@ -198,6 +198,10 @@ work_packages:
     config
   - v0.0.1 needs only h1/h2 upstream — those are done
   - 'open (v0.4.0): downstream h2 · upgrades (S10)'
+  - >-
+    ▲ downstream h2 is a FOUNDATION gap, not a v0.4.0 nicety — every client must speak h1 to
+    us today. Verified 2026-08-01: there is no h2 server path at all. Anything fronting this
+    with a modern LB, or any multiplexing client, cannot connect over h2
 - id: 11
   prio: P1
   ms: v0.4.0
@@ -221,7 +225,14 @@ work_packages:
   - >-
     ✓ PER-ROUTE FILTER CONFIG (ADR-0004 step 4) — resolved at HCM build time, exposed via
     DecoderCallbacks::per_route_config(); route > vhost > route-config, through the S2.8 cache
-  - 'open (v0.4.0): watermarks · StopAll resume · 1xx'
+  - >-
+    open (v0.4.0): StopAll resume · 1xx · and WATERMARKS, which today are handled as ALIASES
+    for the buffering variants — a filter asking for watermarks gets bounded buffering that
+    413s on overflow, NOT a backpressure signal. So there is no flow control, only a cap
+  - >-
+    ▲ this is a SERVING foundation, not a feature: fast upstream + slow client + long SSE
+    stream is the exact LLM traffic shape, and it is the one the cap-not-backpressure gap
+    mishandles
   note: >-
     ▲ mutation-verified: shifting decode delivery to from_idx caused an INFINITE LOOP (the
     injector re-entering itself) — stronger proof of the re-entrance guard than the test aimed
@@ -802,3 +813,71 @@ work_packages:
   meta:
   - proxy-filters
   - needs 36 + S10 upgrade support in 10/11/13
+- id: 46
+  prio: P0
+  ms: v0.1.0
+  lane: H
+  size: S
+  gate: G5
+  status: ready
+  title: TPOT access-log operator
+  meta:
+  - proxy-observability/src/access_log.rs
+  - >-
+    the v0.1.0 gate says token counts AND TTFT/TPOT reach the access log. %LLM_TTFT% exists;
+    there is NO TPOT operator
+  - >-
+    the data is ALREADY COMPUTED — usage_filter writes max_inter_chunk and response_chunks
+    into StreamInfo.LlmStats every stream, and nothing can read them
+  - 'smallest item on the v0.1.0 list: a format operator plus a test, no new computation'
+  note: >-
+    ⚠ same class as the request_headers_to_add P0 — a field populated with no reader, invisible
+    to every check the project has except someone asking. Found 2026-08-01 while auditing the
+    gate clause by clause, not by any test
+- id: 47
+  prio: P1
+  ms: v0.1.0
+  lane: H
+  size: M
+  gate: G5
+  status: ready
+  title: Vendored Lane-H filter proto
+  meta:
+  - proxy-api · proxy-filters
+  - >-
+    three Lane-H filters now reuse UNRELATED Envoy messages for their typed_config because
+    FilterRegistry keys on type_url and asserts on duplicates
+  - >-
+    usage → DataSource(inline_string) · body_rewrite → RuntimeFeatureFlag(default_value +
+    runtime_key) · token_limit → RateLimitSettings(max_tokens + fill_rate), which is really
+    xDS discovery throttling config
+  - >-
+    each filter's own module doc independently predicts a vendored proto is the real answer;
+    the token_limit reuse is already documented as "visibly stretched"
+  - 'blocks: per-descriptor budget config (WP-34), and any filter needing a 4th config shape'
+  note: >-
+    ▲ the failure mode is not aesthetic — the next filter has to stretch a 4th unrelated
+    message, and a reader cannot tell config INTENT from a borrowed message name
+- id: 48
+  prio: P1
+  ms: v0.1.0
+  lane: A
+  size: S
+  gate: G2
+  status: ready
+  title: Sweep arithmetic on wire-derived numbers
+  meta:
+  - workspace-wide audit
+  - >-
+    TWO instances of one defect found on 2026-08-01, both plain `+` on a number that arrived
+    over the wire: TokenUsage::total() (four provider-reported u64s, on the live access-log
+    path) and body_rewrite's content-length fix-up (a CLIENT-supplied header)
+  - >-
+    both panic the worker in debug and wrap silently in release; the content-length one is
+    DOWNSTREAM-reachable, so any client could trigger it
+  - >-
+    deliverable: audit every arithmetic op on a value parsed from a request, a response, or a
+    header; saturating everywhere; a test per site that panics without it
+  note: >-
+    ⚠ two in one day is a pattern, not a coincidence. Both were found by code review, not by
+    any test — and the existing suites stayed green through both
