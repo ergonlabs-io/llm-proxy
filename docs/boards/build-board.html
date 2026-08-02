@@ -907,7 +907,10 @@
    "consumer A: forces stream_options.include_usage=true for openai-dialect streaming routes — verified against a real OpenAI-compatible upstream that streaming without it emits NO usage block at all",
    "consumer B: absorbs WP-35's body-peek model router as a shared consumer of the same buffer",
    "✓ INCREMENT 1 DONE 2026-08-01 — body_rewrite.rs: scanner + splice policy, 14 tests, mutation-tested (removing the cap turns the multimodal 4b test red; that is the criterion guarding against someone simplifying it back into a full-body buffer)",
-   "next: increment 2 — filter wiring + the observability.force_usage_reporting dialect surface"
+   "✓ INCREMENT 2 DONE 2026-08-01 — 2a: DecoderCallbacks::modify_decoded_headers (works from decode_data/trailers; honest no-op returning false from decode_headers, where a second live &mut is not expressible in safe Rust). 2b: body_rewrite_filter.rs, OpenAI-only, Anthropic byte-identical, content-length corrected, e2e over real sockets. 2c: dialect surface observability.force_usage_reporting (default TRUE)",
+   "⚠ FIXED en route: content-length fix-up used a plain `+` on a CLIENT-supplied header — panicked the worker in debug, wrapped in release. Second instance of this defect class today (see WP-34's TokenUsage::total()); this one is downstream-reachable, which is worse",
+   "▲ real memory bound is O(cap + one chunk), not the O(cap) acceptance 4b is worded as: the tail of whichever chunk crosses the cap still has to be forwarded. Still not O(body)",
+   "next: consumer B — body-based model routing (cluster header + clear_route_cache, S2.8), which is what lets the dialect stop matching models on x-llmproxy-model"
   ],
   "note": "▲ found 2026-08-01 verifying WP-33/34 against a real upstream: the WP-33 filter runs correctly on this quadrant and finds nothing. Increment 1 (the shared machinery) has landed; nothing is wired to it yet"
  },

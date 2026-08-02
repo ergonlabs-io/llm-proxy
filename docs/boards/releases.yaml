@@ -103,8 +103,12 @@ releases:
       <b>Done:</b> the bounded prefix scanner + splice policy
       (<code>body_rewrite.rs</code>, 14 tests, O(cap) not O(body), mutation-tested — removing
       the cap turns the multimodal 4b test red).
-      <b>Next:</b> increment 2, filter wiring + the
-      <code>observability.force_usage_reporting</code> dialect surface.
+      <b>Increment 2 done (2a/2b/2c):</b> the header-mutation seam, the filter itself
+      (OpenAI-only, Anthropic byte-identical, <code>content-length</code> corrected, proven
+      over real sockets), and the <code>observability.force_usage_reporting</code> dialect
+      surface defaulting to <b>true</b>.
+      <b>Next:</b> consumer B — body-based model routing, which is what lets the dialect stop
+      matching models on the <code>x-llmproxy-model</code> header.
   risk: >-
     The dialect currently <em>rejects</em> <code>limits</code> and <code>fallbacks</code>
     — correct under strict mode, and precisely the schema pointing at this hole. Those two
