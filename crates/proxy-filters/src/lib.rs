@@ -10,8 +10,11 @@
 //!     path.
 //!   - WP-34: token metering & token-based rate limiting (budget-store seam).
 //!     [`token_limit`] is the budget limiter itself, increment 1: a pure
-//!     library ([`token_limit::BudgetStore`] trait + its in-process impl),
-//!     not yet wired into an `HttpFilter` or the config/IR surface.
+//!     library ([`token_limit::BudgetStore`] trait + its in-process impl).
+//!     Increment 2 ([`token_limit_filter`]) wires it into a real decode/encode
+//!     `HttpFilter` (check on decode, record on encode-end) under
+//!     `type.llmproxy.dev/envoy.type.v3.TokenBucket`. The dialect `limits`
+//!     config surface (increment 3) is not built here.
 //!   - WP-35: model routing (body peek -> cluster_header) & provider fallback.
 //!   - WP-36: Gateway API Inference Extension endpoint-picker support.
 //!   - WP-37: realtime WebSocket sessions (session-pinned routing, frame-aware
@@ -27,5 +30,6 @@
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
 pub mod token_limit;
+pub mod token_limit_filter;
 pub mod usage;
 pub mod usage_filter;

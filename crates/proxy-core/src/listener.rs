@@ -77,6 +77,15 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::body_rewrite_filter::BodyRewriteFilterFactory,
         ));
+        // WP-34 increment 2 (Lane H): the token-budget limiter. Must be
+        // configured BEFORE `llmproxy.usage` in any listener's `http_filters`
+        // list for its encode-side `record` to observe usage the usage
+        // filter wrote (S2.1: encode runs in reverse config order) -- see
+        // `token_limit_filter`'s module doc. Also registered unconditionally,
+        // same reasoning as the filters above.
+        registry.register(Arc::new(
+            proxy_filters::token_limit_filter::TokenLimitFilterFactory,
+        ));
         Arc::new(registry)
     })
 }
@@ -3265,6 +3274,191 @@ static_resources:
                 echoed_body, expected_body,
                 "the upstream must have received the original body with stream_options spliced \
                  in right after the opening `{{`, byte for byte"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-34 increment 2: token limiter over real sockets ------------------
+
+    /// The WP-34 increment 2 acceptance test: a bootstrap wires
+    /// `llmproxy.token_limit` BEFORE `llmproxy.usage` (see
+    /// `token_limit_filter`'s module doc for why the order matters), a real
+    /// upstream reports a fixed, known token usage on every response, and a
+    /// tiny budget (100 tokens) is exhausted by the first request's actual
+    /// 120-token usage. Two sequential requests, each its own real socket:
+    /// the first gets 200 (the budget starts empty), the second gets 429
+    /// with the rate-limit headers -- proving the second is refused *because
+    /// of tokens the first actually spent*, which is the whole feature and
+    /// something no unit test (which drives `BudgetStore` or the filter
+    /// callbacks directly, never a real end-to-end usage->record->check
+    /// loop through two independent HTTP exchanges) can prove.
+    ///
+    /// Mutation-tested: see the task notes -- reordering the two filters (so
+    /// `llmproxy.usage` runs before `llmproxy.token_limit` in config order)
+    /// makes this fail (both requests come back 200, since the limiter's
+    /// encode callback then runs before the usage filter's and never
+    /// observes the usage it's supposed to record).
+    #[test]
+    fn token_limit_filter_denies_the_second_request_after_the_first_spends_its_budget() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        run_local(async {
+            let proxy_port = free_port().await;
+            let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+
+            // input=20 (100 prompt - 80 cached), cached=80, cache_creation=0,
+            // output=20 -- total=120, same fixture shape as
+            // `usage_filter_records_tokens_from_a_real_upstream_response`.
+            let upstream_body: &'static [u8] = br#"{"id":"x","usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+            let upstream_addr = spawn_http_upstream_chunked_json(upstream_body).await;
+
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {proxy_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.token_limit
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings
+                      max_tokens: 100
+                      fill_rate: 0.001
+                  - name: llmproxy.usage
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                      inline_string: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: up }}
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {upstream_ip}, port_value: {upstream_port} }}
+"#,
+                proxy_port = proxy_port,
+                upstream_ip = upstream_addr.ip(),
+                upstream_port = upstream_addr.port(),
+            );
+
+            let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+                .expect("bootstrap YAML must parse");
+            let snapshot = Arc::new(build_snapshot(&loaded).expect("bootstrap YAML must lower"));
+
+            let harness = spawn_manager(snapshot).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            async fn send_request(proxy_addr: SocketAddr) -> (u16, HashMap<String, String>) {
+                let mut stream = TcpStream::connect(proxy_addr)
+                    .await
+                    .expect("connect should succeed");
+                stream
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sk-e2e\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+
+                let mut response = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                    .await
+                    .expect("read should not time out")
+                    .expect("read should succeed");
+
+                let header_end = response
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .expect("response must have a header/body separator");
+                let head = String::from_utf8(response[..header_end].to_vec())
+                    .expect("headers should be valid utf8");
+                let mut lines = head.lines();
+                let status_line = lines.next().expect("a status line");
+                let status: u16 = status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("status line has a code")
+                    .parse()
+                    .expect("status code is numeric");
+                let headers: HashMap<String, String> = lines
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+                    })
+                    .collect();
+                (status, headers)
+            }
+
+            // First request: the budget starts empty (100 tokens allowed),
+            // so this is admitted. Its response reports 120 actual tokens
+            // used, which is what exhausts the budget for the request after
+            // it -- not this one.
+            let (first_status, _first_headers) = send_request(proxy_addr).await;
+            assert_eq!(
+                first_status, 200,
+                "the first request must be admitted -- the budget starts empty"
+            );
+
+            // FileSink-style eventual consistency isn't a factor here (the
+            // store's `record` is synchronous, in-process), but give the
+            // harness a moment to fully tear down the first connection's
+            // stream state before opening the second.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Second request, same credential/route: the first request's
+            // 120 actual tokens are now recorded against a 100-token
+            // budget, so this one must be denied.
+            let (second_status, second_headers) = send_request(proxy_addr).await;
+            assert_eq!(
+                second_status, 429,
+                "the second request must be denied -- the first request's actual usage (120) \
+                 exceeded the 100-token budget"
+            );
+            for name in [
+                "x-ratelimit-limit",
+                "x-ratelimit-remaining",
+                "x-ratelimit-reset",
+                "retry-after",
+            ] {
+                assert!(
+                    second_headers.contains_key(name),
+                    "expected header `{name}` on the 429, got: {second_headers:?}"
+                );
+            }
+            assert_eq!(
+                second_headers.get("x-ratelimit-limit").map(String::as_str),
+                Some("100")
+            );
+            assert_eq!(
+                second_headers
+                    .get("x-ratelimit-remaining")
+                    .map(String::as_str),
+                Some("0")
             );
 
             harness.shutdown().await;

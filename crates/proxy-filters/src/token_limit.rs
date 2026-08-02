@@ -52,13 +52,62 @@
 //! # `BudgetStore` is a seam, not a promise of two implementations today
 //!
 //! [`InProcessBudgetStore`] is the only implementation built in this
-//! increment: one rule, tracked per key, entirely in the current worker's
-//! memory. The trait exists so a Redis-backed (or otherwise
-//! control-plane-aggregated) store can land later behind the same interface
-//! without callers changing — that store is explicitly **not** built here.
+//! increment (and, per the product decision behind WP-34 increment 2, stays
+//! the *default* even once a remote one exists): one rule, tracked per key,
+//! shared by every worker in this process. The trait exists so a Redis-backed
+//! (or otherwise control-plane-aggregated) store can land later behind the
+//! same interface without callers changing — that store is explicitly **not**
+//! built here. The rest of this section is about making that "later" actually
+//! true rather than aspirational.
+//!
+//! # Making this distributed (the migration path, written down now)
+//!
+//! A remote store needs network I/O, and [`BudgetStore::check`] /
+//! [`BudgetStore::record`] are synchronous, `&self` methods — a remote
+//! implementation cannot block a worker thread on a round trip inside them.
+//! When that implementation lands, the filter calling this trait
+//! (`crate::token_limit_filter`) will have to hold the stream with S2
+//! `StopIteration` from `decode_headers` and resume via `continue_decoding()`
+//! once the answer arrives — the same shape WP-32's `ext_authz` / gRPC RLS
+//! filters already need for their own out-of-process calls. Three things fall
+//! out of that:
+//!
+//! 1. **Fallibility has to exist from day one, not be retrofitted.**
+//!    [`BudgetStore::check`] returns `Result<LimitDecision, BudgetUnavailable>`
+//!    even though [`InProcessBudgetStore`] never produces the `Err` case —
+//!    adding a failure channel after every call site already assumes
+//!    infallibility would be both a breaking change and a security-relevant
+//!    one (see the fail-open policy on [`BudgetUnavailable`] and in
+//!    `token_limit_filter`'s module doc).
+//! 2. **`record` stays infallible from the caller's perspective, but is only
+//!    best-effort once a remote store exists.** The response path must never
+//!    block on, or fail because of, budget bookkeeping — that would violate
+//!    the central semantic above (never truncate/never fail an in-flight
+//!    request over billing). A remote `record` is expected to queue or batch
+//!    and to drop updates under backpressure rather than apply that
+//!    consequence to the request. Callers must not treat a `record` call as
+//!    a durability guarantee.
+//! 3. **`now: Instant` is a known limitation of the seam, not a solved
+//!    problem.** It is process-local monotonic time — authoritative for
+//!    [`InProcessBudgetStore`], meaningless to compare across processes, and
+//!    not transmissible over a wire. A remote store is its own time
+//!    authority and may ignore the parameter entirely (using its own clock
+//!    to decide window rollover instead). This is not redesigned here — that
+//!    is a bigger refactor than this increment warrants — but it is named
+//!    rather than left to be rediscovered when the remote implementation
+//!    lands.
+//!
+//! Finally: to keep that future swap contained to one place, callers isolate
+//! the store call to exactly one function rather than calling `check` inline
+//! from `decode_headers` — see `token_limit_filter`'s module doc.
+//!
+//! # Fail open, not fail closed
+//!
+//! See [`BudgetUnavailable`] for the policy `token_limit_filter` applies when
+//! [`BudgetStore::check`] returns `Err`.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::usage::TokenUsage;
@@ -143,25 +192,71 @@ pub enum LimitDecision {
     },
 }
 
-/// Seam for a token-budget backend. See the module docs for why the trait
-/// exists ahead of a second implementation.
+/// A [`BudgetStore::check`] call could not reach the budget authority (a
+/// remote store's timeout, connection failure, etc.). [`InProcessBudgetStore`]
+/// never produces this — it has no I/O to fail — but the type exists on the
+/// trait from the start so callers (`crate::token_limit_filter`) have a real
+/// error channel to design around, not one bolted on after every call site
+/// already assumed infallibility.
+///
+/// **Policy: fail open.** `token_limit_filter` treats `Err` as "admit the
+/// request" — matching Envoy's rate-limit filter default
+/// (`failure_mode_deny: false`) — rather than rejecting or 500ing every
+/// request while the budget backend blips. Fail-closed is real, defensible
+/// behavior for some deployments, but it is not the default here and does not
+/// exist yet as an option; it belongs behind a future config knob, not a
+/// silent hardcoded choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BudgetUnavailable;
+
+impl std::fmt::Display for BudgetUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "budget store unavailable")
+    }
+}
+
+impl std::error::Error for BudgetUnavailable {}
+
+/// Seam for a token-budget backend. See the module docs (in particular
+/// "Making this distributed") for why the trait is shaped this way ahead of
+/// a second implementation.
 ///
 /// Rust note: both methods take `&self`, not `&mut self`. That is what lets a
-/// single store be shared across concurrently-in-flight requests on this
-/// worker without the caller juggling exclusive borrows; interior mutability
-/// (see [`InProcessBudgetStore`]) does the actual mutating.
-pub trait BudgetStore {
-    /// Read-only: does `key` currently have room? Must not mutate window
-    /// state — calling this any number of times with no intervening
-    /// [`record`](Self::record) must return the same answer (modulo wall-clock
-    /// window rollover, which is why `now` is a parameter rather than read
-    /// internally).
-    fn check(&self, key: &LimitKey, now: Instant) -> LimitDecision;
+/// single store be shared across concurrently-in-flight requests without the
+/// caller juggling exclusive borrows; interior mutability (see
+/// [`InProcessBudgetStore`]) does the actual mutating.
+///
+/// `Send + Sync`: unlike the worker-local `!Send` data-plane types (ADR-0003),
+/// a budget is inherently cross-stream and, in this process, cross-worker —
+/// see [`InProcessBudgetStore`]'s doc for why. Filter config-time plumbing
+/// (`FilterInstanceFactory` etc.) is `Send + Sync` and shared via `Arc` across
+/// every worker, so a `dyn BudgetStore` living there must be too.
+pub trait BudgetStore: Send + Sync {
+    /// Does `key` currently have room? Must not mutate window state —
+    /// calling this any number of times with no intervening
+    /// [`record`](Self::record) must return the same answer (modulo
+    /// wall-clock window rollover, which is why `now` is a parameter rather
+    /// than read internally).
+    ///
+    /// `now` is process-local monotonic time: authoritative for
+    /// [`InProcessBudgetStore`], but a known limitation of this seam for
+    /// anything else — a remote store is its own time authority and may
+    /// ignore it, using its own clock for window rollover instead. See the
+    /// module doc's "Making this distributed" section.
+    ///
+    /// Returns `Err(BudgetUnavailable)` if the budget authority could not be
+    /// reached — [`InProcessBudgetStore`] never does this — see
+    /// [`BudgetUnavailable`] for the fail-open policy callers apply.
+    fn check(&self, key: &LimitKey, now: Instant) -> Result<LimitDecision, BudgetUnavailable>;
 
     /// Record that `usage` (scaled by `weight`) actually happened against
-    /// `key`. Always succeeds — see the module docs' central semantic: this
-    /// can never fail, error, or signal that a stream should have been cut
-    /// off. It only affects the outcome of *future* `check` calls.
+    /// `key`. Infallible from the caller's side — see the module docs'
+    /// central semantic: the response path must never block on, or fail
+    /// because of, budget bookkeeping. For [`InProcessBudgetStore`] this is
+    /// also durable. It is NOT guaranteed to be durable in general: a remote
+    /// implementation is expected to queue/batch and may drop updates under
+    /// backpressure rather than propagate that failure here — treat this as
+    /// best-effort, not a commit.
     fn record(&self, key: &LimitKey, usage: &TokenUsage, weight: f64, now: Instant);
 }
 
@@ -173,25 +268,38 @@ struct Window {
     used: u64,
 }
 
-/// The only [`BudgetStore`] implementation in this increment: a single
-/// [`LimitRule`], tracked per [`LimitKey`], entirely in this worker's memory.
+/// The only [`BudgetStore`] implementation in this increment (and, per the
+/// product decision behind WP-34 increment 2, the deployment default even
+/// once a remote one exists): a single [`LimitRule`], tracked per
+/// [`LimitKey`], shared by every worker in this process.
 ///
-/// Rust note: interior mutability here is a `RefCell`, not a `Mutex`. Per
-/// ADR-0003 the data plane is single-threaded per worker (`!Send`), so there
-/// is never contention to arbitrate — a `Mutex` would only add needless lock
-/// overhead (and an unused poisoning failure mode) for a guarantee this type
-/// doesn't need. `usage_filter.rs`'s `StreamInfo` makes the same choice for
-/// the same reason.
+/// Rust note: interior mutability here is a `Mutex`, not a `RefCell` — and
+/// that is a **reversal** from increment 1, which chose `RefCell` by citing
+/// ADR-0003's worker-local `!Send` data plane. That reasoning is correct for
+/// *per-stream* state (a filter instance, `StreamInfo`, ...), which really
+/// does live and die on one worker's thread. It is wrong for a budget: a
+/// token cap is meaningful per *key* (an API credential, a route) across the
+/// whole process, not per worker. `FilterInstanceFactory` is `Send + Sync`
+/// and shared via one `Arc` across every worker (see `listener.rs`'s shared
+/// `FilterRegistry`), so a store living there is inherently reached from
+/// multiple threads. A `thread_local!`-sharded alternative (one store per
+/// worker) was considered and rejected: with N workers a configured limit of
+/// X would become an effective limit of N·X, silently — a quota feature that
+/// is wrong by the worker count is worse than no quota feature at all.
+/// `Mutex` costs one lock acquisition per `check` and one per `record` — once
+/// per *request*, not per byte streamed — so it is not a hot-path concern for
+/// this filter (see `token_limit_filter`'s module doc on where in the
+/// request lifecycle those calls happen).
 pub struct InProcessBudgetStore {
     rule: LimitRule,
-    windows: RefCell<HashMap<LimitKey, Window>>,
+    windows: Mutex<HashMap<LimitKey, Window>>,
 }
 
 impl InProcessBudgetStore {
     pub fn new(rule: LimitRule) -> Self {
         Self {
             rule,
-            windows: RefCell::new(HashMap::new()),
+            windows: Mutex::new(HashMap::new()),
         }
     }
 
@@ -210,7 +318,12 @@ impl InProcessBudgetStore {
     /// never mutating `windows` (that is `record`'s job; `check` and this
     /// helper stay read-only, per the trait's purity requirement).
     fn used_in_current_window(&self, key: &LimitKey, now: Instant) -> (u64, Duration) {
-        let windows = self.windows.borrow();
+        // Rust note: `.lock().unwrap()` -- a poisoned mutex here would mean
+        // some other call panicked while holding the lock, which never
+        // happens in this function (no panicking code runs between lock and
+        // unlock), so this can't actually fire; `sink.rs`'s `FileSink` makes
+        // the same choice for the same reason.
+        let windows = self.windows.lock().unwrap();
         match windows.get(key) {
             Some(w) => {
                 let elapsed = now.saturating_duration_since(w.started_at);
@@ -228,23 +341,23 @@ impl InProcessBudgetStore {
 }
 
 impl BudgetStore for InProcessBudgetStore {
-    fn check(&self, key: &LimitKey, now: Instant) -> LimitDecision {
+    fn check(&self, key: &LimitKey, now: Instant) -> Result<LimitDecision, BudgetUnavailable> {
         let (used, reset_after) = self.used_in_current_window(key, now);
         let limit = self.rule.max_tokens;
         let remaining = limit.saturating_sub(used);
         if used < limit {
-            LimitDecision::Allow {
+            Ok(LimitDecision::Allow {
                 limit,
                 remaining,
                 reset_after,
-            }
+            })
         } else {
-            LimitDecision::Deny {
+            Ok(LimitDecision::Deny {
                 limit,
                 remaining,
                 reset_after,
                 retry_after: reset_after,
-            }
+            })
         }
     }
 
@@ -262,7 +375,7 @@ impl BudgetStore for InProcessBudgetStore {
             weighted as u64
         };
 
-        let mut windows = self.windows.borrow_mut();
+        let mut windows = self.windows.lock().unwrap();
         let window = windows.entry(key.clone()).or_insert(Window {
             started_at: now,
             used: 0,
@@ -313,7 +426,7 @@ mod tests {
 
         // Request 1: check (25 remaining), record 10 -> used 10.
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Allow {
                 limit: 25,
                 remaining: 25,
@@ -324,7 +437,7 @@ mod tests {
 
         // Request 2: check (15 remaining), record 10 -> used 20.
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Allow {
                 limit: 25,
                 remaining: 15,
@@ -335,7 +448,7 @@ mod tests {
 
         // Request 3: check (5 remaining) -- still allowed, used(20) < limit(25).
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Allow {
                 limit: 25,
                 remaining: 5,
@@ -347,7 +460,7 @@ mod tests {
 
         // Request 4: THIS is the exact onset -- the first Deny.
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Deny {
                 limit: 25,
                 remaining: 0,
@@ -373,7 +486,7 @@ mod tests {
         // Exhaust the budget.
         store.record(&key, &usage(6, 4), 1.0, now);
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Deny {
                 limit: 10,
                 remaining: 0,
@@ -391,7 +504,7 @@ mod tests {
         // The *next* request (not this one) is what pays for it: still
         // denied, with `remaining` saturated at 0, never negative/wrapped.
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Deny {
                 limit: 10,
                 remaining: 0,
@@ -411,19 +524,22 @@ mod tests {
         let t0 = Instant::now();
 
         store.record(&key, &usage(6, 4), 1.0, t0);
-        assert!(matches!(store.check(&key, t0), LimitDecision::Deny { .. }));
+        assert!(matches!(
+            store.check(&key, t0).unwrap(),
+            LimitDecision::Deny { .. }
+        ));
 
         // Just before the window elapses: still denied.
         let just_before = t0 + window - Duration::from_millis(1);
         assert!(matches!(
-            store.check(&key, just_before),
+            store.check(&key, just_before).unwrap(),
             LimitDecision::Deny { .. }
         ));
 
         // Exactly at / past the window boundary: budget is restored.
         let after = t0 + window;
         assert_eq!(
-            store.check(&key, after),
+            store.check(&key, after).unwrap(),
             LimitDecision::Allow {
                 limit: 10,
                 remaining: 10,
@@ -435,7 +551,7 @@ mod tests {
         // onto the stale total.
         store.record(&key, &usage(1, 1), 1.0, after);
         assert_eq!(
-            store.check(&key, after),
+            store.check(&key, after).unwrap(),
             LimitDecision::Allow {
                 limit: 10,
                 remaining: 8,
@@ -454,10 +570,10 @@ mod tests {
 
         store.record(&key, &usage(3, 2), 1.0, now);
 
-        let first = store.check(&key, now);
+        let first = store.check(&key, now).unwrap();
         for _ in 0..5 {
             assert_eq!(
-                store.check(&key, now),
+                store.check(&key, now).unwrap(),
                 first,
                 "repeated check() calls with no intervening record() must agree"
             );
@@ -484,14 +600,14 @@ mod tests {
         for i in 1..=10u32 {
             unweighted.record(&key, &usage(1, 0), 1.0, now);
             if unweighted_denies_at.is_none()
-                && matches!(unweighted.check(&key, now), LimitDecision::Deny { .. })
+                && matches!(unweighted.check(&key, now), Ok(LimitDecision::Deny { .. }))
             {
                 unweighted_denies_at = Some(i);
             }
 
             weighted.record(&key, &usage(1, 0), 10.0, now);
             if weighted_denies_at.is_none()
-                && matches!(weighted.check(&key, now), LimitDecision::Deny { .. })
+                && matches!(weighted.check(&key, now), Ok(LimitDecision::Deny { .. }))
             {
                 weighted_denies_at = Some(i);
             }
@@ -516,7 +632,7 @@ mod tests {
         // All output, no input: must never deny an Input-only rule.
         store.record(&key, &usage(0, 1_000_000), 1.0, now);
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Allow {
                 limit: 10,
                 remaining: 10,
@@ -525,7 +641,10 @@ mod tests {
         );
 
         store.record(&key, &usage(10, 0), 1.0, now);
-        assert!(matches!(store.check(&key, now), LimitDecision::Deny { .. }));
+        assert!(matches!(
+            store.check(&key, now).unwrap(),
+            LimitDecision::Deny { .. }
+        ));
     }
 
     #[test]
@@ -536,7 +655,7 @@ mod tests {
 
         store.record(&key, &usage(1_000_000, 0), 1.0, now);
         assert_eq!(
-            store.check(&key, now),
+            store.check(&key, now).unwrap(),
             LimitDecision::Allow {
                 limit: 10,
                 remaining: 10,
@@ -545,7 +664,10 @@ mod tests {
         );
 
         store.record(&key, &usage(0, 10), 1.0, now);
-        assert!(matches!(store.check(&key, now), LimitDecision::Deny { .. }));
+        assert!(matches!(
+            store.check(&key, now).unwrap(),
+            LimitDecision::Deny { .. }
+        ));
     }
 
     /// `Total` uses `TokenUsage::total()`, which includes the cached and
@@ -567,7 +689,7 @@ mod tests {
 
         store.record(&key, &usage_with_cache, 1.0, now);
         assert!(
-            matches!(store.check(&key, now), LimitDecision::Deny { .. }),
+            matches!(store.check(&key, now).unwrap(), LimitDecision::Deny { .. }),
             "cached/cache-creation tokens must count toward Total, not be dropped"
         );
     }
@@ -589,7 +711,7 @@ mod tests {
         // Recording again must not wrap back around toward zero.
         store.record(&key, &usage(u64::MAX, 0), 1.0, now);
 
-        match store.check(&key, now) {
+        match store.check(&key, now).unwrap() {
             LimitDecision::Deny { remaining, .. } => assert_eq!(remaining, 0),
             other => panic!("expected Deny, got {other:?}"),
         }
@@ -605,7 +727,7 @@ mod tests {
             store.record(&key, &usage(1, 1), weight, now);
         }
 
-        match store.check(&key, now) {
+        match store.check(&key, now).unwrap() {
             LimitDecision::Deny { remaining, .. } => assert_eq!(remaining, 0),
             other => panic!("expected Deny, got {other:?}"),
         }
@@ -622,11 +744,11 @@ mod tests {
 
         store.record(&key_a, &usage(10, 0), 1.0, now);
         assert!(matches!(
-            store.check(&key_a, now),
+            store.check(&key_a, now).unwrap(),
             LimitDecision::Deny { .. }
         ));
         assert_eq!(
-            store.check(&key_b, now),
+            store.check(&key_b, now).unwrap(),
             LimitDecision::Allow {
                 limit: 10,
                 remaining: 10,
