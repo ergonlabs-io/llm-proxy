@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# llm-proxy against a local Ollama — the no-API-key, no-network example.
+#
+# Ollama serves an OpenAI-compatible API on :11434, so it needs no `type:` and
+# no credentials: any provider name that isn't `openai` or `anthropic` defaults
+# to `openai-compatible`. This is the same shape the third-party smoke test
+# uses (testing/diffrig/tests/local_openai_smoke.rs), which is why it is worth
+# keeping as a checked-in example rather than a snippet in a README.
+#
+# Run:       llm-proxy --config llmproxy-ollama.yaml
+# Inspect:   llm-proxy --config llmproxy-ollama.yaml --mode translate
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+providers:
+  ollama:
+    base_url: http://ollama.internal:11434
+
+# One provider, so one catch-all rule. Ollama's model names carry a tag
+# (`llama3.1:8b`), and `*` matches any run of characters, so a per-family
+# pattern like `llama3.1*` works if you later add a second provider above it.
+routes:
+  - model: "*"
+    provider: ollama
+
+observability:
+  access_logs:
+    output: stdout
+    format: json

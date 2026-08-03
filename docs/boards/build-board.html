@@ -444,7 +444,9 @@
    "✓ upstream h1 (send_upstream_http1) + ✓ upstream h2 (send_upstream_http2), dispatch by config",
    "v0.0.1 needs only h1/h2 upstream — those are done",
    "open (v0.4.0): downstream h2 · upgrades (S10)",
-   "▲ downstream h2 is a FOUNDATION gap, not a v0.4.0 nicety — every client must speak h1 to us today. Verified 2026-08-01: there is no h2 server path at all. Anything fronting this with a modern LB, or any multiplexing client, cannot connect over h2"
+   "▲ downstream h2 is a FOUNDATION gap, not a v0.4.0 nicety — every client must speak h1 to us today. Verified 2026-08-01: there is no h2 server path at all. Anything fronting this with a modern LB, or any multiplexing client, cannot connect over h2",
+   "✓ DOWNSTREAM h2 DONE 2026-08-02 (b0ba6a6) — serve_http2 shares StreamHandler with h1, LocalExec per ADR-0003, ALPN-negotiated dispatch per connection, 3-stream interleaved concurrency test. h2c + h1 upgrades (S10) remain out of scope",
+   "⚠ FIXED, was a LIVE BUG: downstream alpn_protocols accepted `h2`, rustls negotiated it, and the listener then served HTTP/1.1 on that socket — a config field honored at the TLS layer and ignored at the codec"
   ]
  },
  {
@@ -872,7 +874,9 @@
    "✓ LIMITER INCREMENT 1 DONE 2026-08-01 — token_limit.rs: BudgetStore seam + InProcessBudgetStore (fixed window, per-model cost weights, saturating throughout), 11 tests, mutation-tested 3 ways. Central semantic pinned by test: over-limit rejects the NEXT request, never truncates a stream in flight",
    "✓ LIMITER INCREMENT 2 DONE 2026-08-01 — token_limit_filter.rs: a real enforcing `llmproxy.token_limit` HttpFilter. Decode-side check + 429 with x-ratelimit-limit/ -remaining/-reset + retry-after; encode-side cost recording from the usage WP-33's filter already wrote to StreamInfo. 16 tests, mutation-tested 3 ways (no-op record, always-Allow check, credential dropped from the key)",
    "⚠ FIXED en route: TokenUsage::total() summed four provider-supplied u64s with plain `+` — panicked the worker in debug, wrapped silently in release, and access_log.rs calls it for every logged request. Now saturating",
-   "open: reachable ONLY via Envoy-mode config today (typed_config on RateLimitSettings) — the dialect has no `limits` key yet (increment 3, still rejected under strict mode); thin slice is LimitOn::Total keyed on (route, hashed credential) only, no per-descriptor config"
+   "open: reachable ONLY via Envoy-mode config today (typed_config on RateLimitSettings) — the dialect has no `limits` key yet (increment 3, still rejected under strict mode); thin slice is LimitOn::Total keyed on (route, hashed credential) only, no per-descriptor config",
+   "✓ INCREMENT 3 DONE 2026-08-02 — the dialect `limits` key now lowers a tokens_per_minute + key:header:authorization limit to llmproxy.token_limit (before llmproxy.usage, per S2.1). Everything the thin slice cannot enforce warns with its exact dotted path and reason",
+   "open: per-descriptor config (needs WP-47's vendored proto), and richer bucket keys"
   ]
  },
  {
@@ -912,7 +916,8 @@
    "✓ INCREMENT 2 DONE 2026-08-01 — 2a: DecoderCallbacks::modify_decoded_headers (works from decode_data/trailers; honest no-op returning false from decode_headers, where a second live &mut is not expressible in safe Rust). 2b: body_rewrite_filter.rs, OpenAI-only, Anthropic byte-identical, content-length corrected, e2e over real sockets. 2c: dialect surface observability.force_usage_reporting (default TRUE)",
    "⚠ FIXED en route: content-length fix-up used a plain `+` on a CLIENT-supplied header — panicked the worker in debug, wrapped in release. Second instance of this defect class today (see WP-34's TokenUsage::total()); this one is downstream-reachable, which is worse",
    "▲ real memory bound is O(cap + one chunk), not the O(cap) acceptance 4b is worded as: the tail of whichever chunk crosses the cap still has to be forwarded. Still not O(body)",
-   "next: consumer B — body-based model routing (cluster header + clear_route_cache, S2.8), which is what lets the dialect stop matching models on x-llmproxy-model"
+   "next: consumer B — body-based model routing (cluster header + clear_route_cache, S2.8), which is what lets the dialect stop matching models on x-llmproxy-model",
+   "✓ increments 1 + 2 complete; consumer B (body-based model routing) is what remains"
   ],
   "note": "▲ found 2026-08-01 verifying WP-33/34 against a real upstream: the WP-33 filter runs correctly on this quadrant and finds nothing. Increment 1 (the shared machinery) has landed; nothing is wired to it yet"
  },
@@ -1004,14 +1009,16 @@
   "lane": "H",
   "size": "S",
   "gate": "G5",
-  "status": "ready",
+  "status": "done",
   "title": "TPOT access-log operator",
   "meta": [
    "proxy-observability/src/access_log.rs",
    "the v0.1.0 gate says token counts AND TTFT/TPOT reach the access log. %LLM_TTFT% exists; there is NO TPOT operator",
    "the data is ALREADY COMPUTED — usage_filter writes max_inter_chunk and response_chunks into StreamInfo.LlmStats every stream, and nothing can read them",
    "▲ NOT simply \"render max_inter_chunk\": its own doc defines it as the LARGEST GAP between chunks — \"the tail of the TPOT distribution\", i.e. a stall metric, NOT TPOT. Publishing a max-gap under a TPOT label is worse than the field being absent",
-   "correct build: %LLM_TPOT% = (duration − ttft) / output_tokens, all three already in LogContext, so no new StreamInfo plumbing. Expose max_inter_chunk separately (a real stall metric, also currently unreadable) rather than discarding it"
+   "correct build: %LLM_TPOT% = (duration − ttft) / output_tokens, all three already in LogContext, so no new StreamInfo plumbing. Expose max_inter_chunk separately (a real stall metric, also currently unreadable) rather than discarding it",
+   "✓ DONE 2026-08-02 (9b68eac) — %LLM_TPOT% (mean, computed), plus %LLM_MAX_STALL% and %LLM_RESPONSE_CHUNKS% exposing two fields that were computed every stream and unreadable",
+   "⚠ caught on review: TPOT divided in integer ms, rendering 0 for any stream faster than one token/ms — i.e. reading ZERO exactly when a fast provider (Groq/Cerebras) performs best. Divides in micros now, renders fractional ms"
   ],
   "note": "⚠ same class as the request_headers_to_add P0 — a field populated with no reader, invisible to every check the project has except someone asking. Found 2026-08-01 while auditing the gate clause by clause, not by any test"
  },
@@ -1057,7 +1064,7 @@
   "lane": "H",
   "size": "L",
   "gate": "G5",
-  "status": "ready",
+  "status": "started",
   "title": "Backend taxonomy (providers · models · credentials)",
   "meta": [
    "proxy-simple-config · schema",
@@ -1065,7 +1072,9 @@
    "3 levels — provider TYPE (in code: endpoint shape + credential mechanism + default dialect) → provider INSTANCE (config: credentials + placement, two of one type is first-class) → MODEL (new `models:` block, logical name → ordered providers)",
    "VOCABULARY (owner 2026-08-02): exactly TWO nouns in the config — `providers` and `models`. Vertex/Groq/Anthropic/Nebius are all providers. \"backend\" is deliberately absent; it would have meant a connection object at one nesting level and a binding at another",
    "dialect is REQUIRED not derived for vertex/bedrock — Vertex serves Anthropic-shaped Claude, Google-shaped Gemini AND OpenAI-shaped Kimi",
-   "selection semantics (fallback/split/cost) deliberately deferred to WP-35/WP-44"
+   "selection semantics (fallback/split/cost) deliberately deferred to WP-35/WP-44",
+   "✓ INCREMENT 1 DONE 2026-08-02 (caccc5f) — the `models:` catalogue, additive so every existing `provider:` route still lowers unchanged. Shorthand and object forms lower to a byte-identical bootstrap (asserted). vertex/bedrock/azure-openai hard-error at load naming the missing credential scheme",
+   "next: wildcard model names + trie (exact > longest prefix > *), then the OAuth/SigV4 schemes"
   ],
   "note": "▲ the config shape is the EASY part. Provider today conflates endpoint + credential scheme + wire dialect + model catalogue. Vertex needs minted OAuth w/ refresh, Bedrock needs per-request SigV4 over the canonical request — so it must run AFTER body rewrite (WP-45) and cannot be header injection. Neither has a hook today"
  },
@@ -1076,7 +1085,7 @@
   "lane": "D",
   "size": "L",
   "gate": "G3",
-  "status": "ready",
+  "status": "started",
   "title": "Operator control plane (admin · keys · tenants)",
   "meta": [
    "proxy-admin · new store crate",
@@ -1084,7 +1093,10 @@
    "inc 1: read-only surface (absorbs WP-25) — /config_dump /stats /ready /clusters",
    "inc 2: virtual keys — client presents a proxy-issued key, proxy authenticates it and swaps in the real provider credential. The SWAP half exists (request_headers_to_add); the AUTHENTICATE half does not",
    "inc 3: tenants, per-tenant model allow-lists, budgets w/ a period, spend history",
-   "state per ADR-0005: embedded (sqlite/sled) default, distributed behind the same trait"
+   "state per ADR-0005: embedded (sqlite/sled) default, distributed behind the same trait",
+   "✓ INCREMENT 1 DONE 2026-08-02 (9df7deb) — /ready, /config_dump, /clusters, /server_info on the control runtime. /stats 404s naming WP-23 rather than faking an empty 200",
+   "▲ /config_dump redaction is default-deny AND structural: HeaderMutationDump.value is `&'static str`, so it cannot hold runtime data — leaking needs a type change, not an edit",
+   "⚠ it also disarmed the WP-39 readership guard: rendering an IR field for DISPLAY is not ACTING on it, so proxy-admin was removed from RUNTIME_CRATES. Any future crate that reflects over the IR needs the same exclusion"
   ],
   "note": "⚑ closes a real hole: WP-34 enforces budgets keyed on a hashed credential that NOTHING can register, attach to a team, rotate or revoke. Two hazards recorded — do NOT reuse hash_credential (FNV-1a, non-adversarial) for key AUTH; and auth fails CLOSED, the opposite of BudgetStore's fail-open"
  }

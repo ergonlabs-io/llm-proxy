@@ -202,6 +202,15 @@ work_packages:
     ▲ downstream h2 is a FOUNDATION gap, not a v0.4.0 nicety — every client must speak h1 to
     us today. Verified 2026-08-01: there is no h2 server path at all. Anything fronting this
     with a modern LB, or any multiplexing client, cannot connect over h2
+  - >-
+    ✓ DOWNSTREAM h2 DONE 2026-08-02 (b0ba6a6) — serve_http2 shares StreamHandler with h1,
+    LocalExec per ADR-0003, ALPN-negotiated dispatch per connection, 3-stream interleaved
+    concurrency test. h2c + h1 upgrades (S10) remain out of scope
+  - >-
+    ⚠ FIXED, was a LIVE BUG: downstream alpn_protocols accepted `h2`, rustls negotiated it, and
+    the listener then served HTTP/1.1 on that socket — a config field honored at the TLS layer
+    and ignored at the codec
+
 - id: 11
   prio: P1
   ms: v0.4.0
@@ -683,6 +692,13 @@ work_packages:
     the dialect has no `limits` key yet (increment 3, still rejected under strict mode);
     thin slice is LimitOn::Total keyed on (route, hashed credential) only, no per-descriptor
     config
+  - >-
+    ✓ INCREMENT 3 DONE 2026-08-02 — the dialect `limits` key now lowers a
+    tokens_per_minute + key:header:authorization limit to llmproxy.token_limit (before
+    llmproxy.usage, per S2.1). Everything the thin slice cannot enforce warns with its exact
+    dotted path and reason
+  - 'open: per-descriptor config (needs WP-47''s vendored proto), and richer bucket keys'
+
 - id: 35
   prio: P0
   ms: v0.1.0
@@ -741,6 +757,7 @@ work_packages:
     tail of whichever chunk crosses the cap still has to be forwarded. Still not O(body)
   - 'next: consumer B — body-based model routing (cluster header + clear_route_cache, S2.8),
     which is what lets the dialect stop matching models on x-llmproxy-model'
+  - '✓ increments 1 + 2 complete; consumer B (body-based model routing) is what remains'
   note: >-
     ▲ found 2026-08-01 verifying WP-33/34 against a real upstream: the WP-33 filter runs
     correctly on this quadrant and finds nothing. Increment 1 (the shared machinery) has
@@ -826,7 +843,7 @@ work_packages:
   lane: H
   size: S
   gate: G5
-  status: ready
+  status: done
   title: TPOT access-log operator
   meta:
   - proxy-observability/src/access_log.rs
@@ -844,6 +861,13 @@ work_packages:
     correct build: %LLM_TPOT% = (duration − ttft) / output_tokens, all three already in
     LogContext, so no new StreamInfo plumbing. Expose max_inter_chunk separately (a real stall
     metric, also currently unreadable) rather than discarding it
+  - >-
+    ✓ DONE 2026-08-02 (9b68eac) — %LLM_TPOT% (mean, computed), plus %LLM_MAX_STALL% and
+    %LLM_RESPONSE_CHUNKS% exposing two fields that were computed every stream and unreadable
+  - >-
+    ⚠ caught on review: TPOT divided in integer ms, rendering 0 for any stream faster than one
+    token/ms — i.e. reading ZERO exactly when a fast provider (Groq/Cerebras) performs best.
+    Divides in micros now, renders fractional ms
   note: >-
     ⚠ same class as the request_headers_to_add P0 — a field populated with no reader, invisible
     to every check the project has except someone asking. Found 2026-08-01 while auditing the
@@ -901,7 +925,7 @@ work_packages:
   lane: H
   size: L
   gate: G5
-  status: ready
+  status: started
   title: Backend taxonomy (providers · models · credentials)
   meta:
   - proxy-simple-config · schema
@@ -920,6 +944,12 @@ work_packages:
     dialect is REQUIRED not derived for vertex/bedrock — Vertex serves Anthropic-shaped Claude,
     Google-shaped Gemini AND OpenAI-shaped Kimi
   - 'selection semantics (fallback/split/cost) deliberately deferred to WP-35/WP-44'
+  - >-
+    ✓ INCREMENT 1 DONE 2026-08-02 (caccc5f) — the `models:` catalogue, additive so every
+    existing `provider:` route still lowers unchanged. Shorthand and object forms lower to a
+    byte-identical bootstrap (asserted). vertex/bedrock/azure-openai hard-error at load naming
+    the missing credential scheme
+  - 'next: wildcard model names + trie (exact > longest prefix > *), then the OAuth/SigV4 schemes'
   note: >-
     ▲ the config shape is the EASY part. Provider today conflates endpoint + credential scheme +
     wire dialect + model catalogue. Vertex needs minted OAuth w/ refresh, Bedrock needs
@@ -931,7 +961,7 @@ work_packages:
   lane: D
   size: L
   gate: G3
-  status: ready
+  status: started
   title: Operator control plane (admin · keys · tenants)
   meta:
   - proxy-admin · new store crate
@@ -945,6 +975,16 @@ work_packages:
     AUTHENTICATE half does not
   - 'inc 3: tenants, per-tenant model allow-lists, budgets w/ a period, spend history'
   - 'state per ADR-0005: embedded (sqlite/sled) default, distributed behind the same trait'
+  - >-
+    ✓ INCREMENT 1 DONE 2026-08-02 (9df7deb) — /ready, /config_dump, /clusters, /server_info on
+    the control runtime. /stats 404s naming WP-23 rather than faking an empty 200
+  - >-
+    ▲ /config_dump redaction is default-deny AND structural: HeaderMutationDump.value is
+    `&'static str`, so it cannot hold runtime data — leaking needs a type change, not an edit
+  - >-
+    ⚠ it also disarmed the WP-39 readership guard: rendering an IR field for DISPLAY is not
+    ACTING on it, so proxy-admin was removed from RUNTIME_CRATES. Any future crate that
+    reflects over the IR needs the same exclusion
   note: >-
     ⚑ closes a real hole: WP-34 enforces budgets keyed on a hashed credential that NOTHING can
     register, attach to a team, rotate or revoke. Two hazards recorded — do NOT reuse
