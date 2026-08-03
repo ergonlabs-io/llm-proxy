@@ -70,65 +70,56 @@ releases:
     Per-request token counts (input / cache-read / cache-write / output) and TTFT/TPOT reach
     the access log for live traffic; a token-based rate limit is enforced; and the proxy fails
     over from one provider to another without the client seeing an error.
-  done: 0
-  open: 6
+  done: 1
+  open: 5
   left:
   - wp: WP-46
     what: >-
-      <b>The cheapest open item on this gate, and it was hiding.</b> The gate says token counts
-      <em>and TTFT/TPOT</em> reach the access log. <code>%LLM_TTFT%</code> exists;
-      <b>there is no TPOT operator</b> — while <code>max_inter_chunk</code> and
-      <code>response_chunks</code> are already computed into <code>StreamInfo</code> on every
-      stream and nothing can read them. <b>But not simply "render max_inter_chunk"</b> — that
-      field is the largest gap between chunks, a stall metric, not TPOT; publishing it under a
-      TPOT label is worse than absence. TPOT is
-      <code>(duration − ttft) / output_tokens</code>, all three already in
-      <code>LogContext</code>.
-  - wp: WP-33
-    what: >-
-      Usage filter <b>wired per-route into the llmproxy dialect</b>, and <b>criterion 3 now
-      has its test (2026-08-01)</b>: an invalid per-route dialect fails the build even under
-      <code>is_optional: true</code>, pinned both at the error-variant level (must be
-      InvalidValue, never Unimplemented — the latter is the one <code>is_optional</code>
-      swallows) and end-to-end through <code>build_listener_hcm</code>. Mutation-tested.
-      <b>Remaining:</b> GenAI TTFT/TPOT metrics and the route-level
-      <code>streaming: strict</code> assertion.
-  - wp: WP-34
-    what: >-
-      Token rate limits. Extraction is <b>done</b>, and the enforcement filter is now
-      <b>built and live</b> (429 + <code>x-ratelimit-*</code>, mutation-tested) — but only
-      reachable via hand-written Envoy-mode config. <b>Remaining:</b> the dialect's
-      <code>limits</code> key, still rejected under strict mode, and per-descriptor config
-      beyond a single (route, credential) bucket.
+      <b>Done 2026-08-02 (9b68eac).</b> <code>%LLM_TPOT%</code> (mean, computed in micros so a
+      fast provider doesn't render 0), plus <code>%LLM_MAX_STALL%</code> and
+      <code>%LLM_RESPONSE_CHUNKS%</code> exposing two fields that were already computed every
+      stream and unreadable. This closes the access-log half of the gate's first clause; nothing
+      has run a scenario asserting it end to end yet (no QA case names TPOT/max-stall).
   - wp: WP-35
     what: >-
-      Model routing + provider fallback. Unblocked — the S2.8 route cache landed with ADR-0004.
-      Body-peek model routing bullet moved to WP-45.
-  - wp: WP-14
-    what: Hedging, and the retry wiring provider fallback rides on.
+      <b>Now the dominant open item on this gate.</b> <code>ready</code>, with no code — the
+      only WP-tagged v0.1.0 item still at zero. Depends on <b>two</b> things, not one: WP-14's
+      retry/host-repick wiring for the actual failover, and WP-45's still-open "consumer B"
+      (body-based model routing) to know which model/provider a request is even targeting. Both
+      of those moved this batch; WP-35 itself did not.
+  - wp: WP-34
+    what: >-
+      Token rate limits. Extraction is done; the enforcement filter is built and live (429 +
+      <code>x-ratelimit-*</code>, mutation-tested); and <b>increment 3 landed 2026-08-02
+      (7249825) — the dialect's <code>limits</code> key now lowers a
+      <code>tokens_per_minute</code> + credential-header key to the enforcing filter</b>, so this
+      is reachable from the dialect, not just hand-written Envoy-mode config.
+      <b>Remaining:</b> per-descriptor config beyond a single (route, credential) bucket —
+      blocked on WP-47's vendored proto, not built yet.
   - wp: WP-45
     what: >-
-      <b>New 2026-08-01, increment 1 landed the same day.</b> Request-body rewrite pipeline.
-      Verified against a real OpenAI-compatible upstream: streaming without
-      <code>stream_options.include_usage</code> emits no usage block at all, so the WP-33
-      filter runs correctly and finds nothing for that request shape. Also absorbs WP-35's
-      body-peek model router as a shared consumer.
-      <b>Done:</b> the bounded prefix scanner + splice policy
-      (<code>body_rewrite.rs</code>, 14 tests, O(cap) not O(body), mutation-tested — removing
-      the cap turns the multimodal 4b test red).
-      <b>Increment 2 done (2a/2b/2c):</b> the header-mutation seam, the filter itself
-      (OpenAI-only, Anthropic byte-identical, <code>content-length</code> corrected, proven
-      over real sockets), and the <code>observability.force_usage_reporting</code> dialect
-      surface defaulting to <b>true</b>.
-      <b>Next:</b> consumer B — body-based model routing, which is what lets the dialect stop
-      matching models on the <code>x-llmproxy-model</code> header.
+      Request-body rewrite pipeline. Increments 1 and 2 are both done (bounded prefix scanner +
+      splice policy; the OpenAI-only <code>stream_options.include_usage</code> filter,
+      content-length corrected, proven over real sockets). <b>Remaining: consumer B</b> —
+      body-based model routing — which is the same thing WP-35 is waiting on.
+  - wp: WP-33
+    what: >-
+      Usage filter wired per-route into the llmproxy dialect; criterion 3 has its test
+      (mutation-tested, pinned to the InvalidValue error variant). <b>Remaining:</b> GenAI
+      metrics per OTel semconv (a stats/metrics surface — distinct from WP-46's access-log
+      fields, which are done) and the route-level <code>streaming: strict</code> assertion.
+  - wp: WP-14
+    what: Hedging, and the retry wiring provider fallback (WP-35) rides on.
   risk: >-
-    The dialect currently <em>rejects</em> <code>limits</code> and <code>fallbacks</code>
-    — correct under strict mode, and precisely the schema pointing at this hole. Those two
-    features are WP-34 and WP-35. If they slip, v0.1.0 has no content. <b>WP-35 is the real
-    exposure</b>: it is a full third of this gate (mid-request provider failover), it is
-    <code>ready</code> with nothing built, and its fallback path depends on WP-14's retry
-    wiring. <b>Second risk, named 2026-08-01:</b> the LLM layer is now stacking on
+    <b>Corrected this pass:</b> the dialect no longer rejects <code>limits</code> — WP-34
+    increment 3 landed 2026-08-02. Only <code>fallbacks</code> is still rejected under strict
+    mode, and that is WP-35 alone now. <b>WP-35 is the real exposure</b>: it is a full third of
+    this gate (mid-request provider failover), it is <code>ready</code> with nothing built, and
+    it now has two dependencies instead of one — WP-14's retry wiring <em>and</em> WP-45's
+    consumer B, both still open. Nothing on the board demonstrates the rate-limit or
+    TTFT/TPOT-log clauses of this gate end to end either; QA has no scenario for either yet, so
+    "code exists" and "gate closes" remain two different facts. <b>Second risk, named
+    2026-08-01:</b> the LLM layer is now stacking on
     <em>serving</em> foundations that are not finished — no connection pooling (WP-15, still
     connect-per-stream, so every request pays a fresh TLS handshake to a provider), no
     downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure
@@ -155,8 +146,16 @@ releases:
     what: >-
       Stats registry with Envoy names — also owns the two inert <code>stat_prefix</code> fields
       the readership guard flags.
-  - wp: WP-25
-    what: Admin server. Unblocked.
+  - wp: WP-50
+    what: >-
+      <b>Operator control plane — absorbs the old WP-25 slot.</b> Increment 1 landed
+      2026-08-02 (9df7deb): <code>/ready</code>, <code>/config_dump</code>,
+      <code>/clusters</code>, <code>/server_info</code>, all on the control runtime, with
+      <code>/config_dump</code> redaction structural (the dump type has no field that can
+      hold a live credential) rather than a filter someone could forget to call.
+      <code>/stats</code> 404s naming WP-23 rather than faking an empty 200 — so half this
+      gate's admin clause is real, the other half is still WP-23. <b>Remaining:</b>
+      increment 2 (virtual keys, auth) and increment 3 (tenants/budgets).
   - wp: WP-18
     what: >-
       Health checking is built and green (64 tests) but <b>not reachable from config</b> —

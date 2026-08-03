@@ -484,12 +484,21 @@ work_packages:
   lane: F
   size: M
   gate: G3
-  status: ready
+  status: blocked
   title: Admin server (/config_dump …)
   meta:
   - proxy-admin
-  - unblocked — WP-24 ✓
   - v0.2.0 ship gate names /config_dump + /stats explicitly
+  - >-
+    ⚑ SUPERSEDED 2026-08-02 — WP-50's own plan text calls its increment 1 "this is WP-25,
+    absorbed here", and increment 1 shipped (9df7deb): /config_dump, /ready, /clusters,
+    /server_info. Not independently workable anymore; the remaining endpoints this card
+    named (/stats, /listeners, /drain_listeners, /healthcheck, /logging, /quitquitquit)
+    live under WP-50 or are unclaimed, not here
+  note: >-
+    ▲ found on audit 2026-08-03 — this card still read "ready, unblocked" after WP-50 had
+    already delivered its scope under a different id; status changed to blocked so it stops
+    double-counting as separate open v0.2.0 work
 - id: 26
   prio: P1
   ms: v0.0.1

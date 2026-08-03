@@ -133,10 +133,11 @@ output) and TTFT/TPOT to the access log for live traffic, enforces a token-based
 limit, and fails over from one provider to another mid-request without the client seeing an
 error.
 
-**In scope:** WP-33 (streaming-first guarantees + GenAI metrics — the encode filter that
-finally calls the WP-34 extractor on live traffic), WP-34 remainder (token rate limits;
-extraction is done), WP-35 (model routing + provider fallback), **WP-45 (request-body
-rewrite pipeline)**, WP-14 hedging.
+**In scope:** WP-33 (streaming-first guarantees + GenAI metrics), WP-34 (token rate limits),
+WP-35 (model routing + provider fallback), WP-45 (request-body rewrite pipeline), WP-14
+(hedging), and four added since: **WP-46** (TPOT in the access log), **WP-47** (a vendored
+Lane-H proto), **WP-48** (the wire-derived-arithmetic sweep), **WP-49** (the provider/model
+taxonomy).
 
 **WP-33's dialect wiring landed 2026-08-01** (`72c7fc8`, `7e296e3`): the usage filter is in
 the `llmproxy` dialect's generated chain with a per-route dialect override, so token counts
@@ -150,9 +151,22 @@ filter works and finds nothing. WP-45 forces the field on. Anthropic is unaffect
 always reports usage); the gap is exactly OpenAI-dialect + streaming, which is also the
 single most common request shape.
 
-**Risk to name out loud:** the dialect currently *rejects* `limits` and `fallbacks` —
-correct under strict mode, and precisely the schema pointing at this hole. Those two
-features are WP-34 and WP-35. If they slip, v0.1.0 has no content.
+### Where the gate actually stands (updated 2026-08-03)
+
+Two of the three clauses are real. **Token counts and TTFT/TPOT reach the access log** —
+WP-33 wired the usage filter per route, WP-45 forces `stream_options.include_usage` so a
+streaming OpenAI client that never opts in still produces usage, and WP-46 added `%LLM_TPOT%`
+alongside the existing `%LLM_TTFT%`. **A token-based rate limit is enforced** — WP-34's
+limiter runs as a filter returning 429 with `x-ratelimit-*`, and the dialect's `limits` key
+lowers onto it.
+
+**Provider failover is the remaining third, and it is the whole risk.** WP-35 is `ready` with
+no code, and it depends on both WP-14's retry wiring and WP-45's still-open consumer B
+(body-based model routing). The dialect still *rejects* `fallbacks` — correct under strict
+mode, and precisely the schema pointing at the hole. If WP-35 slips, this gate does not close.
+
+An earlier version of this note said the dialect rejects `limits` **and** `fallbacks`. Only
+`fallbacks` is rejected now; `limits` was made real by WP-34 increment 3 on 2026-08-02.
 
 ---
 

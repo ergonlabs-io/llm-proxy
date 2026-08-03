@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 48 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-01 · 856 tests green · + black-box QA suite (Go)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 50 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-03 · 904 tests green · + black-box QA suite (Go)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -189,17 +189,21 @@
     <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
   </div>
   <p class="now">
-    <b>Now — v0.0.1 "first light": one request, all the way through, for real.</b>
-    A client calls the proxy; the proxy routes it, opens TLS to the upstream gateway, forwards
-    with credentials attached, and returns the response intact — streaming included. This release
-    carries everything built to date. The features are not the milestone; the working path through
-    them is.
-    <span class="gate"><b>SHIP GATE —</b> a chat-completion request, from a single <code>llmproxy</code>
-    config pointed at a real provider, returns the provider's response unmodified — non-streaming
-    <i>and</i> streamed SSE — for OpenAI and Anthropic. Verified by the <code>#[ignore]</code>d live
-    smoke test in <code>testing/diffrig</code>, keys from env. One command. Currently red.</span>
-    <span class="sub"><b>The honest read:</b> a great deal of machinery is green
-    without ever having carried a real request — closing that is what this gate is for.
+    <b>Now — v0.1.0 "LLM gateway": be the gateway a team picks <i>because</i> it understands
+    LLM traffic.</b>
+    <b>v0.0.1 shipped 2026-08-01</b> and is tagged: the live smoke test ran against the real
+    OpenAI and Anthropic endpoints and passed all four cases (both providers, streaming and not)
+    on the first attempt. One request, all the way through, for real — that gate is closed.
+    <span class="gate"><b>SHIP GATE —</b> per-request token counts (input / cache-read /
+    cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate
+    limit is enforced; and the proxy fails over from one provider to another mid-request without
+    the client seeing an error. <b>Two of the three are now real</b> — token counts and TTFT/TPOT
+    land via WP-33/34/45/46, and the dialect's <code>limits</code> key enforces. Provider failover
+    (WP-35) is the remaining third and has no code yet.</span>
+    <span class="sub"><b>The honest read:</b> v0.0.1's clean first run is weaker evidence than a
+    run that found something — four requests exercise a narrow path, and nothing there tested
+    load, concurrency, provider error shapes, or long streams. Coverage stays three-tiered
+    (our mocks, a local Ollama, real providers) for exactly that reason.
     Second standing gap: <b>"performant" is an untested claim</b> (no capacity sweep published; the
     v0.2.0 gate).
     <b>WP-41, the black-box QA suite, found four real bugs on day one</b> — no dialect access logs at
@@ -234,7 +238,7 @@
     { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
   ];
 
-  const CURRENT_MS = "v0.0.1";
+  const CURRENT_MS = "v0.1.0";
 
   // status: done | ready | started | blocked ; ms = the release the WP closes in
   const wps = /*__DATA__*/;
