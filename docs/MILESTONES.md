@@ -1,6 +1,6 @@
 # Milestones — releases, and how a ticket earns its slot
 
-**Updated 2026-08-01** (v0.0.1 shipped; current milestone is now v0.1.0). Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
+**Updated 2026-08-03** (v0.0.1 shipped; current milestone is v0.1.0). Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
 package is*) and the build board (which owns *what state each WP is in*). This document
 owns the third axis: **which release a piece of work belongs to, and why.**
 
@@ -90,8 +90,6 @@ Shipped and green:
 Architecture landed alongside: ADR-0003 (`!Send` worker-local data plane) and ADR-0004
 (async filter chain — route resolution owned by the filter manager per S2.8, the router as
 a terminal `HttpFilter`, and per-route filter config reaching the IR).
-
-### What's left to close the gate
 
 ### What closed it, and what did not
 
