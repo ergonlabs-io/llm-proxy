@@ -810,8 +810,38 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
   stream**, retry budgets denominated in tokens/requests, fallback chain across
   clusters/models (priority list), request re-write per provider adapter (OpenAI↔Anthropic
   shape translation as an explicit, versioned mapping table).
+- **Credentials must follow the cluster, not the route — build this FIRST (2026-08-03).**
+  Provider auth is attached at the route today: `proxy-simple-config/src/lower.rs:566` sets
+  `route["request_headers_to_add"]` from the *primary* provider, and the IR carries it on
+  `RouteEntry` (`ir.rs:623`). Fallback across providers on top of that shape sends the
+  primary's API key to the fallback's endpoint — the `request_headers_to_add` P0 inverted:
+  not "credentials never reach the provider" but "credentials reach the **wrong** provider,"
+  and a real key disclosure to a third party. Nothing leaks today only because `fallbacks`
+  is dropped with a warning and no failover happens at all.
+  **Therefore: per-cluster header mutation lands before any cluster-selection work.** Envoy's
+  own precedent is `WeightedCluster.ClusterWeight.request_headers_to_add` — headers that
+  depend on which cluster was picked. `envoy.clusters.aggregate` deliberately has no
+  equivalent: it was designed for failover between *homogeneous* clusters (same service,
+  different zones). LLM providers are the heterogeneous case, which is the whole difficulty
+  of this WP and the reason it is sized M.
+- **IR decision (owner, 2026-08-03): the fallback chain is an aggregate cluster**, not a
+  per-route `fallback_clusters` list. Rationale: it is Envoy-native, so real Envoy configs
+  using `envoy.clusters.aggregate` begin working and the WP-27 scorecard can move; and it
+  keeps cluster selection inside the existing priority machinery (`load_balancer.rs`
+  `HostPicker::choose_priority` — S7 spillover, overprovisioning factor, panic threshold are
+  all built and green) rather than restructuring the router's attempt loop. Cost: a new
+  `ClusterKind` variant, member-cluster resolution, and a host pick that yields its **owning
+  cluster** so the right transport socket *and* the right credential headers apply.
+- **Router shape note.** `router.rs:273-289` resolves `cluster_name` once, *before* the
+  `attempt_loop` at :334. Every retry re-picks a host, never a cluster. Under the aggregate
+  decision this hoist survives — the aggregate is one cluster name — but only if the host
+  pick carries its owning cluster back out.
 - **Acceptance:** differential-style scripted provider outage drills: primary 429s →
-  fallback within policy, streams in flight never retried, attempt accounting exact.
+  fallback within policy, streams in flight never retried, attempt accounting exact. **Plus a
+  credential-isolation test that is not optional:** a request that fails over from provider A
+  to provider B must carry B's `Authorization` (and `anthropic-version`, and B's
+  `extra_headers`) and must **not** carry A's. Assert the negative explicitly — asserting only
+  that B's key is present passes just as well when both are sent.
 
 #### WP-36 — Gateway API Inference Extension (EPP) support  (Size: M)  — **Priority: P2**
 - Implement the Endpoint Picker protocol as consumed by Envoy AI Gateway / GKE Inference

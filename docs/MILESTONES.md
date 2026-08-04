@@ -160,11 +160,33 @@ lowers onto it.
 
 **Provider failover is the remaining third, and it is the whole risk.** WP-35 is `ready` with
 no code, and it depends on both WP-14's retry wiring and WP-45's still-open consumer B
-(body-based model routing). The dialect still *rejects* `fallbacks` — correct under strict
-mode, and precisely the schema pointing at the hole. If WP-35 slips, this gate does not close.
+(body-based model routing). If WP-35 slips, this gate does not close.
 
-An earlier version of this note said the dialect rejects `limits` **and** `fallbacks`. Only
-`fallbacks` is rejected now; `limits` was made real by WP-34 increment 3 on 2026-08-02.
+**Correction, 2026-08-03: the dialect does not *reject* `fallbacks`; it warns and serves.**
+`lower.rs:527` pushes a `ConfigWarning`, and `crates/proxy/src/main.rs:183` prints warnings to
+stderr and proceeds. `parse.rs:180` even resolves each fallback against the provider table
+first — so a `fallbacks:` block parses, validates, lowers, and is dropped with one stderr line.
+An operator who configures failover gets a proxy that does not fail over. This is deliberate
+under the warn-vs-error rule stated at `lower.rs:292` (hard-error only when *every* request
+would fail; warn when traffic still serves), and `fallbacks` is one of twelve such sites — but
+the earlier wording here claimed a safety property the code does not have, which is how the
+`request_headers_to_add` P0 hid for a day. Rejecting is safe; warn-and-drop is not the same
+thing and this document should not have said it was.
+
+**A design constraint this exposed, binding on WP-35.** Provider auth is attached at the
+*route*: `lower.rs:566` sets `route["request_headers_to_add"]` from the primary provider, and
+the IR carries it on `RouteEntry` (`ir.rs:623`). A cross-provider fallback implemented on top
+of that would send the primary's API key to the fallback's endpoint. Nothing leaks today —
+failover does not happen at all — but WP-35 cannot be built until provider credentials follow
+the *cluster* that an attempt actually dialed rather than the route that matched. Envoy's own
+precedent for cluster-dependent header mutation is `WeightedCluster.ClusterWeight.
+request_headers_to_add`; `envoy.clusters.aggregate` has no equivalent, because aggregate
+clusters were designed for failover between homogeneous clusters (same service, different
+zones), and LLM providers are the heterogeneous case.
+
+An earlier version of this note said the dialect rejects `limits` **and** `fallbacks`. Neither
+is rejected: `limits` was made real by WP-34 increment 3 on 2026-08-02, and `fallbacks` warns
+as described above.
 
 ---
 
