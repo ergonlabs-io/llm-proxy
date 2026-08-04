@@ -562,6 +562,7 @@ async fn strict_mode_cluster_manager_rejects_a_tls_cluster_without_a_transport_s
         per_connection_buffer_limit_bytes: 1 << 20,
         circuit_breakers: Default::default(),
         upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+        request_headers_to_add: Vec::new(),
     };
     let mut snapshot = std::collections::HashMap::new();
     snapshot.insert("secure".to_string(), Arc::new(cluster));

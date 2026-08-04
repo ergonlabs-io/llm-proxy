@@ -71,6 +71,19 @@ async fn build_router(
     fwd: ForwardAction,
     mutations: Vec<HeaderMutation>,
 ) -> FilterChainHandler {
+    build_router_with_cluster_mutations(addr, fwd, mutations, Vec::new()).await
+}
+
+/// Same as [`build_router`], but also lets a test set the cluster's own
+/// `request_headers_to_add` (WP-35 increment 1a) -- the mutations applied
+/// per attempt because of which cluster the attempt dialed, as opposed to
+/// `mutations`, which is the route-level set applied once up front.
+async fn build_router_with_cluster_mutations(
+    addr: SocketAddr,
+    fwd: ForwardAction,
+    mutations: Vec<HeaderMutation>,
+    cluster_mutations: Vec<HeaderMutation>,
+) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
     snapshot.insert(
@@ -90,6 +103,7 @@ async fn build_router(
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: cluster_mutations,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;
@@ -592,6 +606,81 @@ async fn empty_mutation_list_does_not_change_existing_behavior() {
                     .to_ascii_lowercase()
                     .contains("host: test.local"),
                 "expected the original Host header unchanged, got: {upstream_request:?}"
+            );
+        })
+        .await;
+}
+
+// --- WP-35 increment 1a: `ClusterConfig::request_headers_to_add`, applied per
+// attempt because of which cluster the attempt dialed ---
+
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_level_mutation_reaches_the_upstream() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, rx) = spawn_reflecting_upstream().await;
+            let router = build_router_with_cluster_mutations(
+                addr,
+                forward_to_up(None),
+                Vec::new(),
+                vec![mutation(
+                    "x-api-key",
+                    "cluster-secret",
+                    HeaderAppendAction::OverwriteIfExistsOrAdd,
+                )],
+            )
+            .await;
+
+            let resp = router.handle(request("/v1/chat/completions")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+
+            let upstream_request = rx.await.unwrap().to_ascii_lowercase();
+            assert!(
+                upstream_request.contains("x-api-key: cluster-secret"),
+                "expected the cluster's header mutation on the wire, got: {upstream_request:?}"
+            );
+        })
+        .await;
+}
+
+/// The load-bearing WP-35 guarantee: a cluster's `request_headers_to_add`
+/// wins over the route's on a key collision, since the cluster is more
+/// specific -- and critically, the route-level (e.g. a *different*
+/// provider's) credential must not leak upstream at all. Asserting only that
+/// the cluster's value is present would pass even if both were sent, so this
+/// asserts the route-level value's absence explicitly.
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_level_mutation_overrides_route_level_and_route_value_does_not_leak() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, rx) = spawn_reflecting_upstream().await;
+            let router = build_router_with_cluster_mutations(
+                addr,
+                forward_to_up(None),
+                vec![mutation(
+                    "authorization",
+                    "Bearer route-primary-key",
+                    HeaderAppendAction::OverwriteIfExistsOrAdd,
+                )],
+                vec![mutation(
+                    "authorization",
+                    "Bearer cluster-fallback-key",
+                    HeaderAppendAction::OverwriteIfExistsOrAdd,
+                )],
+            )
+            .await;
+
+            let resp = router.handle(request("/v1/chat/completions")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+
+            let upstream_request = rx.await.unwrap().to_ascii_lowercase();
+            assert!(
+                upstream_request.contains("authorization: bearer cluster-fallback-key"),
+                "expected the cluster's credential to win, got: {upstream_request:?}"
+            );
+            assert!(
+                !upstream_request.contains("route-primary-key"),
+                "the route-level (wrong-provider) credential must not leak upstream, got: {upstream_request:?}"
             );
         })
         .await;

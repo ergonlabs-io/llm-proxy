@@ -446,11 +446,23 @@ impl RouterHandler {
                 // `head` itself stays owned by the outer scope for the *next*
                 // attempt, so this clones the (small) method/uri/header-map
                 // trio rather than moving `head` away after one use.
-                let attempt_head = RequestHeaders {
+                let mut attempt_head = RequestHeaders {
                     method: head.method.clone(),
                     uri: head.uri.clone(),
                     headers: head.headers.clone(),
                 };
+                // WP-35: apply the *cluster's* header mutations here, inside
+                // the retry loop, to this attempt's own head -- never
+                // hoisted up next to `apply_request_transforms` above, which
+                // only sees the route. `entry` is the cluster this attempt
+                // actually dialed, so a later attempt that falls back to a
+                // different cluster gets that cluster's mutations, not the
+                // first attempt's. This is what keeps a provider credential
+                // from following the routing decision instead of the
+                // connection (see `ClusterConfig::request_headers_to_add`'s
+                // doc). Applied after the route-level mutations above, so a
+                // cluster-level value wins on a key collision.
+                apply_header_mutations(entry.request_headers_to_add(), &mut attempt_head.headers);
                 // Rust note: `body_bytes` is plain `Bytes`, cheap
                 // (refcounted) to `.clone()` fresh for every attempt --
                 // there's no separate "streaming" body anymore (see this
@@ -1027,6 +1039,7 @@ mod tests {
                 per_connection_buffer_limit_bytes: 1 << 20,
                 circuit_breakers,
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+                request_headers_to_add: Vec::new(),
             }),
         );
         manager.update_from_snapshot(&snapshot).await;

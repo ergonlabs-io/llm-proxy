@@ -374,6 +374,16 @@ impl ClusterEntry for ClusterHandle {
             RoutingPriority::High => &self.0.high_cb,
         }
     }
+
+    fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation] {
+        // EDS clusters have no `ClusterConfig` (see `ClusterSource::Eds`), so
+        // there's nowhere for this to come from -- empty, same as the
+        // `upstream_protocol`/`transport` defaults above.
+        match &self.0.source {
+            ClusterSource::Config(config) => &config.request_headers_to_add,
+            ClusterSource::Eds => &[],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +409,7 @@ mod tests {
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: Default::default(),
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
         })
     }
 

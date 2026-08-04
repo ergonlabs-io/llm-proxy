@@ -369,6 +369,41 @@ pub struct ClusterConfig {
     /// Which HTTP protocol the proxy speaks to this cluster's upstreams.
     /// Envoy's default when unconfigured is HTTP/1.1.
     pub upstream_protocol: UpstreamProtocol,
+    /// Request header mutations applied because *this cluster* was the one an
+    /// attempt actually dialed — applied to the per-attempt head inside the
+    /// router's retry loop, never once up front.
+    ///
+    /// **This is where provider credentials belong, and the reason is WP-35.**
+    /// The dialect originally injected the API key, `anthropic-version`, and
+    /// `extra_headers` through [`RouteEntry::request_headers_to_add`], which is
+    /// resolved once when the route matches. That is correct only while a
+    /// request can reach exactly one provider. The moment provider fallback
+    /// exists, a route-level credential means the *primary's* API key is sent
+    /// to the *fallback's* endpoint — a real key disclosure to a third party,
+    /// and the `request_headers_to_add` P0 inverted (not "credentials never
+    /// arrive" but "credentials arrive at the wrong place"). A credential has
+    /// to follow the connection, not the routing decision.
+    ///
+    /// **No Envoy proto field maps here, deliberately.** Envoy's own mechanism
+    /// for cluster-dependent header mutation is
+    /// `WeightedCluster.ClusterWeight.request_headers_to_add`, which is a
+    /// *split* construct; `envoy.clusters.aggregate` — the failover construct —
+    /// has no equivalent, because aggregate clusters were designed for
+    /// homogeneous failover (same service, different zones) where every member
+    /// shares one identity. LLM providers are the heterogeneous case. So this
+    /// field stays empty under Envoy-mode config (no Envoy config expresses
+    /// per-provider auth, so none is rejected for lacking it) and is populated
+    /// only by the `llmproxy` dialect. Ground rule #1 governs config → IR, not
+    /// IR → Envoy proto, so an IR concept with no proto source violates
+    /// nothing — the IR is a semantic model, not a proto mirror (compare
+    /// [`UpstreamProtocol`], which flattens `typed_extension_protocol_options`).
+    ///
+    /// Ordering note: these apply strictly *after*
+    /// `access_logging::snapshot_request` has already run (the snapshot is
+    /// taken after the decode chain, before the router terminal), so moving
+    /// credentials here keeps them out of the access log — the same guarantee
+    /// route-level injection had, and for the same reason.
+    pub request_headers_to_add: Vec<HeaderMutation>,
 }
 
 /// Which HTTP protocol version the proxy speaks to a cluster's upstreams.

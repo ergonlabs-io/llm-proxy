@@ -1905,6 +1905,10 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
             .unwrap_or(DEFAULT_CONN_BUFFER_LIMIT),
         circuit_breakers,
         upstream_protocol,
+        // Envoy-mode lowering has no source for this field -- see
+        // `ClusterConfig::request_headers_to_add`'s doc comment. It stays
+        // empty permanently here; only the `llmproxy` dialect populates it.
+        request_headers_to_add: Vec::new(),
     })
 }
 

@@ -391,6 +391,11 @@ pub trait ClusterEntry: Send + Sync {
 
     /// Circuit-breaker bucket for the request's priority (S5).
     fn circuit_breaker(&self, prio: RoutingPriority) -> &CircuitBreakerState;
+
+    /// Request header mutations to apply because this cluster was the one the
+    /// attempt dialed. Carries provider credentials under the `llmproxy`
+    /// dialect -- see `ClusterConfig::request_headers_to_add`.
+    fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation];
 }
 
 #[cfg(test)]

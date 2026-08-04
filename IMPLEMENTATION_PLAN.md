@@ -836,6 +836,15 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
   `attempt_loop` at :334. Every retry re-picks a host, never a cluster. Under the aggregate
   decision this hoist survives — the aggregate is one cluster name — but only if the host
   pick carries its owning cluster back out.
+- **A latent gap increment 1a opened, to be closed by WP-21 (recorded 2026-08-03).**
+  `ClusterHandle::request_headers_to_add` (`proxy-cluster/src/manager.rs`) returns `&[]` for
+  `ClusterSource::Eds`, because an EDS cluster has no `ClusterConfig` to read from. That is
+  correct and harmless *today* — EDS is a manager-level stub and the IR has no `Eds` discovery
+  variant — but the moment WP-21 makes EDS real, an EDS-discovered cluster will silently carry
+  **no credentials**, which is the `request_headers_to_add` P0 again by a different route. It
+  will not fail any current test, because no test can construct a real EDS cluster yet. WP-21
+  must either give `ClusterSource::Eds` a credential source or make the empty case a hard
+  error; it must not inherit the silent `&[]`.
 - **Acceptance:** differential-style scripted provider outage drills: primary 429s →
   fallback within policy, streams in flight never retried, attempt accounting exact. **Plus a
   credential-isolation test that is not optional:** a request that fails over from provider A

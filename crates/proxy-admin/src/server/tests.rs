@@ -111,6 +111,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         per_connection_buffer_limit_bytes: 1024 * 1024,
         circuit_breakers: Default::default(),
         upstream_protocol: UpstreamProtocol::Http1,
+        request_headers_to_add: Vec::new(),
     };
 
     Arc::new(ConfigSnapshot {

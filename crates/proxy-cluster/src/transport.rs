@@ -116,6 +116,7 @@ mod tests {
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: Default::default(),
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
         }
     }
 

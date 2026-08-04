@@ -95,6 +95,7 @@ async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandle
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
         }),
     );
     manager.update_from_snapshot(&snapshot).await;
@@ -309,6 +310,7 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                     per_connection_buffer_limit_bytes: 1 << 20,
                     circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
                     upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+                    request_headers_to_add: Vec::new(),
                 }),
             );
             manager.update_from_snapshot(&snapshot).await;
