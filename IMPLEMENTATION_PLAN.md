@@ -836,6 +836,24 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
   `attempt_loop` at :334. Every retry re-picks a host, never a cluster. Under the aggregate
   decision this hoist survives — the aggregate is one cluster name — but only if the host
   pick carries its owning cluster back out.
+- **How the dialect reaches a field with no Envoy proto source (increment 1b design,
+  2026-08-03).** The `llmproxy` dialect does not build IR directly — it emits Envoy YAML and
+  lowers through the identical strict-parse → PGV → IR pipeline ("one engine, two
+  front-ends"). So it *cannot* populate `ClusterConfig.request_headers_to_add` simply by
+  wanting to: with no Envoy `Cluster` field to carry it, there is nothing for the dialect to
+  emit, and `check_supported_surface`'s per-message allowlist (`lower.rs:99+`) would reject
+  any field it invented. This is not a flaw in the IR decision; it is the seam the
+  architecture is supposed to have.
+  **Decision: carry it in `Cluster.metadata.filter_metadata` under the key
+  `io.llmproxy.provider_auth`,** add `metadata` to the `envoy.config.cluster.v3.Cluster`
+  surface allowlist, and lower that one namespace into the IR field. `metadata` is chosen
+  over the alternatives because it is the one Envoy message genuinely *designed* to carry
+  arbitrary per-cluster side-channel data — unlike the `DataSource`/`RuntimeFeatureFlag`/
+  `RateLimitSettings` stretching WP-47 already exists to undo. It remains stringly-typed
+  (`filter_metadata` is `map<string, google.protobuf.Struct>`), so **this is a fourth
+  customer for WP-47's vendored Lane-H proto**, and WP-47's scope note should say so.
+  Ground rule #1 still binds: the dialect must reject an `io.llmproxy.provider_auth` block it
+  cannot fully map, with its dotted path.
 - **A latent gap increment 1a opened, to be closed by WP-21 (recorded 2026-08-03).**
   `ClusterHandle::request_headers_to_add` (`proxy-cluster/src/manager.rs`) returns `&[]` for
   `ClusterSource::Eds`, because an EDS cluster has no `ClusterConfig` to read from. That is
@@ -1415,6 +1433,16 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   Envoy's *xDS discovery throttling* config.
   Each of those three modules independently documents that a vendored proto is the real
   answer. The fourth filter has to stretch a fifth message.
+- **A fourth customer, and it is not a filter (added 2026-08-03).** WP-35 increment 1b carries
+  per-provider credentials to `ClusterConfig.request_headers_to_add` through
+  `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`, because no Envoy `Cluster`
+  field exists for it and the dialect can only reach the IR by emitting Envoy config. That is
+  a better-founded borrow than the three above — `filter_metadata` really is meant for
+  arbitrary per-cluster data — but it is still an untyped `google.protobuf.Struct` holding
+  what should be a typed message, and it means this WP's surface is no longer "the Lane-H
+  filters" but "everything Lane-H needs that Envoy has no field for". **Credentials travelling
+  through an unvalidated Struct raises this WP's priority case**: a typo in the metadata shape
+  is a provider that silently gets no auth header.
 - **The cost is not aesthetic.** A reader cannot tell config *intent* from a borrowed message
   name; `--mode translate` output shows operators a type URL that describes a different
   feature; and every filter is capped at whatever fields its borrowed message happens to
