@@ -1314,6 +1314,51 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   access log, because a router that silently downgrades a model is indistinguishable from a bug.
 
 #### WP-45 — Request-body rewrite pipeline (Size: M)  — **Priority: P0** · **Milestone: v0.1.0**
+> **Consumer B (body-based model routing) is the next increment — owner direction 2026-08-04,
+> raised above the rest of WP-35.** The reason is that today the `routes:` surface is
+> effectively decorative for real clients: model matching reads the `x-llmproxy-model` request
+> header, and OpenAI and Anthropic SDKs send the model in the JSON **body** and no such header.
+> So a multi-provider routes table silently sends every request to the `*` backstop. It looks
+> configured and it does not route. Provider failover (WP-35) is the named gate clause, but a
+> routing table that does not route is the worse defect, and it is reachable from the shipped
+> example config.
+>
+> **The machinery is already built.** `BodyFacts.model` is extracted today
+> (`proxy-filters/src/body_rewrite.rs`), `modify_decoded_headers` exists
+> (`proxy-http/src/filter.rs:175`), and `clear_route_cache()` exists (`filter.rs:189`). The
+> remaining work is to join them, not to build them.
+>
+> **Design decisions, made in the orchestrator (2026-08-04):**
+> 1. **Extend `body_rewrite_filter`; do NOT add a second body-scanning filter.** This WP exists
+>    precisely because two independent scanners would mean two disagreeing buffer caps. One
+>    scan, one held prefix, two consumers.
+> 2. **Separate the scan decision from the splice decision.** Today `decode_headers` short-
+>    circuits to `PassThrough` when `dialect != OpenAi`, because the only consumer was the
+>    OpenAI-only `include_usage` splice. Model extraction is dialect-agnostic — an
+>    Anthropic-dialect request still has a `model` field and still needs to match a
+>    `claude-*` route. So: scan for every dialect, splice only for OpenAI.
+> 3. **No new config knob.** When the filter is in the chain it always publishes the model
+>    header. Its borrowed `RuntimeFeatureFlag` config has no room for a third fact (WP-47), and
+>    inventing one would be a fourth stretched field. Consequence: the dialect must insert the
+>    filter whenever `routes` or `models` exist, not only when `force_usage_reporting` is on.
+> 4. **The filter must OVERWRITE a client-supplied `x-llmproxy-model`, never append or defer to
+>    it.** This is a security property, not a tidiness one. Routing is header-based today, so a
+>    client can currently steer its own request to a different provider — a cheaper model, a
+>    different tenant's credential path, a route with a laxer limit — just by setting the
+>    header. Once the body is the source of truth, the header must be derived, never trusted.
+>    A request whose body has no extractable model must have any client-supplied value
+>    **removed**, not left standing.
+> 5. **`ScanOutcome::CapExceeded` means absence is not proven.** A `model` field sitting past
+>    the prefix cap yields `None`. That must route to the backstop *deliberately*, with a test
+>    naming the behavior, rather than falling through by accident.
+> 6. **Cross-crate constant hazard, applies here exactly as it did to WP-35 increment 1b.**
+>    `MODEL_HEADER` (`x-llmproxy-model`) is defined in `proxy-simple-config` and would be
+>    consumed by a filter in `proxy-filters`. Two crates agreeing on a string by convention is
+>    the shape that produced the `io.llmproxy.provider_auth` seam gap found 2026-08-03, where
+>    each crate's tests pinned its own literal and nothing tested the join. **Acceptance
+>    requires one end-to-end test** that drives a real request with a model in the body through
+>    a dialect-generated config and asserts it reached the right cluster — asserting on
+>    behavior, not on the header string.
 - **Why.** Two v0.1.0 features need to read and edit the JSON request body, and neither can
   exist without it. Building it once, deliberately, beats two half-implementations that
   disagree about buffering limits.
