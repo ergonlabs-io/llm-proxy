@@ -213,8 +213,32 @@ routes:
     assert_eq!(last["direct_response"]["status"], 404);
 }
 
-/// Auth headers: Bearer for OpenAI-shaped, x-api-key for Anthropic; always
-/// overwrite (client-sent auth never leaks upstream).
+/// The `io.llmproxy.provider_auth` namespace under a named cluster's
+/// `metadata.filter_metadata`, i.e. the exact shape
+/// `proxy_config::lower::convert_provider_auth_metadata` reads back out --
+/// see `ClusterConfig::request_headers_to_add`'s doc comment for why this
+/// lives on the CLUSTER rather than the route.
+fn provider_auth_headers<'a>(
+    bootstrap: &'a serde_json::Value,
+    cluster_name: &str,
+) -> &'a [serde_json::Value] {
+    let clusters = bootstrap["static_resources"]["clusters"]
+        .as_array()
+        .expect("clusters must be an array");
+    let cluster = clusters
+        .iter()
+        .find(|c| c["name"] == cluster_name)
+        .unwrap_or_else(|| panic!("no cluster named `{cluster_name}`"));
+    cluster["metadata"]["filter_metadata"]["io.llmproxy.provider_auth"]["headers"]
+        .as_array()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
+/// Auth headers: Bearer for OpenAI-shaped, x-api-key for Anthropic; carried
+/// on the provider's CLUSTER, never the route -- a route-level credential
+/// would leak the primary provider's key to a fallback's endpoint once one
+/// request can reach two providers (WP-35).
 #[test]
 fn auth_headers_per_provider_type() {
     let config = parse(
@@ -230,19 +254,43 @@ routes:
     )
     .expect("must parse");
     let lowered = proxy_simple_config::lower(&config).expect("must lower");
-    let routes = &lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
-        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"];
+    let bootstrap = &lowered.bootstrap;
 
-    let hdr = |i: usize| &routes[i]["request_headers_to_add"][0];
-    assert_eq!(hdr(0)["header"]["key"], "authorization");
-    assert_eq!(hdr(0)["header"]["value"], "Bearer sk-test-openai");
-    assert_eq!(hdr(0)["append_action"], "OVERWRITE_IF_EXISTS_OR_ADD");
-    assert_eq!(hdr(1)["header"]["key"], "x-api-key");
-    assert_eq!(hdr(1)["header"]["value"], "sk-test-anthropic");
+    // No route carries a credential -- the whole point of this move.
+    let routes = &bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
+        ["typed_config"]["route_config"]["virtual_hosts"][0]["routes"];
+    for route in routes.as_array().unwrap() {
+        assert!(
+            route["request_headers_to_add"].is_null(),
+            "provider auth must not be on the route: {route}"
+        );
+    }
+
+    let openai = provider_auth_headers(bootstrap, "provider:openai");
+    assert_eq!(openai[0]["key"], "authorization");
+    assert_eq!(openai[0]["value"], "Bearer sk-test-openai");
+
+    let anthropic = provider_auth_headers(bootstrap, "provider:anthropic");
+    assert_eq!(anthropic[0]["key"], "x-api-key");
+    assert_eq!(anthropic[0]["value"], "sk-test-anthropic");
+
+    // Two providers, two clusters: provider A's key must never appear on
+    // provider B's cluster -- this is the increment's whole point.
+    let openai_values: Vec<_> = openai.iter().map(|h| h["value"].as_str()).collect();
+    let anthropic_values: Vec<_> = anthropic.iter().map(|h| h["value"].as_str()).collect();
+    assert!(
+        !openai_values.contains(&Some("sk-test-anthropic")),
+        "anthropic's key leaked onto the openai cluster: {openai:?}"
+    );
+    assert!(
+        !anthropic_values.contains(&Some("sk-test-openai")),
+        "openai's key leaked onto the anthropic cluster: {anthropic:?}"
+    );
 }
 
 /// Anthropic rejects every request that lacks `anthropic-version`, so the
-/// dialect supplies it automatically. OpenAI providers must NOT get it.
+/// dialect supplies it automatically, on the cluster. OpenAI providers must
+/// NOT get it.
 #[test]
 fn anthropic_provider_gets_the_required_version_header() {
     let config = parse(
@@ -258,24 +306,21 @@ routes:
     )
     .expect("must parse");
     let lowered = proxy_simple_config::lower(&config).expect("must lower");
-    let routes = &lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
-        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"];
+    let bootstrap = &lowered.bootstrap;
 
-    let keys = |i: usize| -> Vec<String> {
-        routes[i]["request_headers_to_add"]
-            .as_array()
-            .expect("headers must be an array")
+    let keys = |cluster_name: &str| -> Vec<String> {
+        provider_auth_headers(bootstrap, cluster_name)
             .iter()
-            .map(|h| h["header"]["key"].as_str().unwrap().to_string())
+            .map(|h| h["key"].as_str().unwrap().to_string())
             .collect()
     };
 
-    let anthropic = keys(1);
+    let anthropic = keys("provider:anthropic");
     assert!(
         anthropic.iter().any(|k| k == "anthropic-version"),
         "anthropic provider must get the version header, got {anthropic:?}"
     );
-    let openai = keys(0);
+    let openai = keys("provider:openai");
     assert!(
         !openai.iter().any(|k| k == "anthropic-version"),
         "openai provider must NOT get an anthropic header, got {openai:?}"
@@ -300,17 +345,12 @@ routes:
     )
     .expect("must parse");
     let lowered = proxy_simple_config::lower(&config).expect("must lower");
-    let headers = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
-        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"][0]
-        ["request_headers_to_add"]
-        .as_array()
-        .expect("headers must be an array")
-        .clone();
+    let headers = provider_auth_headers(&lowered.bootstrap, "provider:anthropic");
 
     let version_headers: Vec<_> = headers
         .iter()
         .filter(|h| {
-            h["header"]["key"]
+            h["key"]
                 .as_str()
                 .unwrap()
                 .eq_ignore_ascii_case("anthropic-version")
@@ -321,7 +361,7 @@ routes:
         1,
         "exactly one version header expected, got {version_headers:?}"
     );
-    assert_eq!(version_headers[0]["header"]["value"], "2099-01-01");
+    assert_eq!(version_headers[0]["value"], "2099-01-01");
 }
 
 /// LLM-safe defaults: total timeout disabled, 90s idle, retries only on
@@ -1745,4 +1785,110 @@ observability:
         .expect("inline_string must be a string")
         .to_string();
     assert_eq!(got, "anthropic");
+}
+
+/// **The join between the two crates, which nothing else tests.**
+///
+/// `proxy-simple-config` writes provider credentials into
+/// `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`;
+/// `proxy-config::lower::convert_provider_auth_metadata` reads them back out
+/// into `ClusterConfig::request_headers_to_add`. The two crates agree on that
+/// namespace string only by convention -- each holds its own
+/// `PROVIDER_AUTH_METADATA_KEY` constant, and protos never cross the
+/// `proxy-config` boundary (ground rule #2), so there is no shared Rust type
+/// to pin them together.
+///
+/// Every other test on either side asserts against the *literal* string, so
+/// each crate guards its own half and neither guards the seam. A rename that
+/// is self-consistent within one crate -- change the constant, update that
+/// crate's tests, both green -- leaves the other side looking for a key
+/// nobody emits, and every provider silently loses its credentials. Config
+/// parses, validates, lowers, and the API key evaporates: exactly the
+/// `request_headers_to_add` P0 that WP-39 exists to prevent.
+///
+/// Verified by mutation on 2026-08-03: changing only the reader-side constant
+/// left all 56 `proxy-simple-config` tests green. This test is what goes red.
+/// It asserts on the IR, not on emitted YAML, so it can only pass when both
+/// sides genuinely agree.
+#[test]
+fn provider_credentials_survive_the_dialect_to_ir_round_trip() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: sk-openai-roundtrip }
+  anthropic: { type: anthropic, api_key: sk-anthropic-roundtrip }
+routes:
+  - { model: "gpt-*", provider: openai }
+  - { model: "claude-*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    // Rust note: a small helper rather than four near-identical lookups --
+    // returns (key, value) pairs so both the presence and the absence
+    // assertions below can work off one shape.
+    let creds = |cluster: &str| -> Vec<(String, String)> {
+        snapshot.clusters[cluster]
+            .request_headers_to_add
+            .iter()
+            .map(|h| (h.key.to_ascii_lowercase(), h.value.clone()))
+            .collect()
+    };
+
+    let openai = creds("provider:openai");
+    assert!(
+        openai.contains(&(
+            "authorization".to_string(),
+            "Bearer sk-openai-roundtrip".to_string()
+        )),
+        "openai's credential must reach the IR cluster, got {openai:?}"
+    );
+
+    let anthropic = creds("provider:anthropic");
+    assert!(
+        anthropic.contains(&(
+            "x-api-key".to_string(),
+            "sk-anthropic-roundtrip".to_string()
+        )),
+        "anthropic's credential must reach the IR cluster, got {anthropic:?}"
+    );
+    assert!(
+        anthropic.iter().any(|(k, _)| k == "anthropic-version"),
+        "anthropic's required version header must reach the IR cluster, got {anthropic:?}"
+    );
+
+    // The WP-35 guarantee, asserted on the IR: neither provider's cluster
+    // carries the other's key. Assert the ABSENCE -- checking only that the
+    // right key is present passes just as well when both are there, which is
+    // precisely the cross-provider leak this increment exists to prevent.
+    assert!(
+        !openai
+            .iter()
+            .any(|(_, v)| v.contains("sk-anthropic-roundtrip")),
+        "anthropic's key leaked onto the openai cluster: {openai:?}"
+    );
+    assert!(
+        !anthropic
+            .iter()
+            .any(|(_, v)| v.contains("sk-openai-roundtrip")),
+        "openai's key leaked onto the anthropic cluster: {anthropic:?}"
+    );
+
+    // And no route carries a credential any more -- the move is complete,
+    // not duplicated. A leftover route-level copy would still reach the
+    // fallback's endpoint.
+    for table in snapshot.routes.values() {
+        for vh in &table.virtual_hosts {
+            for route in &vh.routes {
+                assert!(
+                    route.request_headers_to_add.is_empty(),
+                    "provider auth must not remain on route {:?}",
+                    route.name
+                );
+            }
+        }
+    }
 }

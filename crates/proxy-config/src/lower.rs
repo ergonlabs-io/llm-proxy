@@ -149,7 +149,16 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "per_connection_buffer_limit_bytes",
             "circuit_breakers",
             "typed_extension_protocol_options",
+            "metadata",
         ],
+        // Only the `io.llmproxy.provider_auth` namespace under
+        // `filter_metadata` is understood -- see
+        // `convert_provider_auth_metadata`. `typed_filter_metadata` is not
+        // implemented and stays out of this list so setting it is a strict-
+        // mode error rather than a silent no-op (ground rule #1); Envoy
+        // itself only consults it when the plain map is absent, so no config
+        // that already works today needs it.
+        "envoy.config.core.v3.Metadata" => &["filter_metadata"],
         // S5 circuit breakers. `per_host_thresholds` is deliberately excluded
         // (we don't model per-host limits); a config setting it is rejected
         // by the surface walk with its dotted path (ground rule #1) rather
@@ -1892,6 +1901,14 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
 
     let circuit_breakers = convert_circuit_breakers(&c.circuit_breakers, path)?;
     let upstream_protocol = convert_upstream_protocol(&c.typed_extension_protocol_options, path)?;
+    // Envoy-mode config has no proto field for per-provider auth headers --
+    // see `ClusterConfig::request_headers_to_add`'s doc comment. The
+    // `llmproxy` dialect lowers through this same Envoy-shaped pipeline
+    // ("one engine, two front-ends"), so it smuggles the headers through
+    // `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
+    // instead; a hand-written Envoy config that never sets this namespace
+    // gets an empty list here, unchanged from before.
+    let request_headers_to_add = convert_provider_auth_metadata(c.metadata.as_ref(), path)?;
 
     Ok(ClusterConfig {
         name: c.name.clone(),
@@ -1905,11 +1922,104 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
             .unwrap_or(DEFAULT_CONN_BUFFER_LIMIT),
         circuit_breakers,
         upstream_protocol,
-        // Envoy-mode lowering has no source for this field -- see
-        // `ClusterConfig::request_headers_to_add`'s doc comment. It stays
-        // empty permanently here; only the `llmproxy` dialect populates it.
-        request_headers_to_add: Vec::new(),
+        request_headers_to_add,
     })
+}
+
+/// Namespace key the `llmproxy` dialect uses to carry provider credentials
+/// through `Cluster.metadata.filter_metadata` -- see
+/// `ClusterConfig::request_headers_to_add`'s doc comment for why credentials
+/// have to live on the cluster rather than the route.
+const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
+
+/// Lower `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
+/// into `ClusterConfig::request_headers_to_add`. The expected shape is
+/// `{ headers: [ { key: "...", value: "..." }, ... ] }`; every entry lowers
+/// to [`HeaderAppendAction::OverwriteIfExistsOrAdd`], matching what the
+/// dialect used to emit at the route level.
+///
+/// `google.protobuf.Struct` is opaque to the reflective surface walk (it is
+/// a well-known type, so `check_supported_surface` stops recursing at its
+/// boundary), so ground rule #1's "every field maps or errors" guarantee has
+/// to be re-implemented by hand here for this one namespace: any shape that
+/// isn't exactly the one above -- wrong types, missing `key`/`value`,
+/// unrecognized sub-keys -- is a hard error with its full dotted path, never
+/// a silent skip. Any *other* `filter_metadata` namespace is left alone; it
+/// belongs to a different (possibly future) consumer.
+fn convert_provider_auth_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<Vec<HeaderMutation>, ConfigError> {
+    let Some(auth) = metadata.and_then(|m| m.filter_metadata.get(PROVIDER_AUTH_METADATA_KEY))
+    else {
+        return Ok(Vec::new());
+    };
+    let auth_path = format!("{path}.metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"]");
+
+    // Rust note: `Struct::fields` is a `HashMap`, so sort keys before
+    // reporting one to keep the error deterministic across runs.
+    let mut unknown: Vec<&String> = auth
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "headers")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{auth_path}.{key}"),
+            format!("`{PROVIDER_AUTH_METADATA_KEY}` only supports a `headers` list"),
+        ));
+    }
+
+    let Some(headers_value) = auth.fields.get("headers") else {
+        return Ok(Vec::new());
+    };
+    let headers_path = format!("{auth_path}.headers");
+    let list = match &headers_value.kind {
+        Some(prost_types::value::Kind::ListValue(l)) => &l.values,
+        _ => return Err(invalid(&headers_path, "must be a list")),
+    };
+
+    let mut out = Vec::with_capacity(list.len());
+    for (i, item) in list.iter().enumerate() {
+        let item_path = format!("{headers_path}[{i}]");
+        let Some(prost_types::value::Kind::StructValue(entry)) = &item.kind else {
+            return Err(invalid(
+                &item_path,
+                "must be an object with `key` and `value` string fields",
+            ));
+        };
+        let mut entry_unknown: Vec<&String> = entry
+            .fields
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "key" | "value"))
+            .collect();
+        entry_unknown.sort();
+        if let Some(key) = entry_unknown.first() {
+            return Err(unsupported(
+                format!("{item_path}.{key}"),
+                "only `key` and `value` are supported",
+            ));
+        }
+        out.push(HeaderMutation {
+            key: provider_auth_string_field(entry, "key", &item_path)?,
+            value: provider_auth_string_field(entry, "value", &item_path)?,
+            action: HeaderAppendAction::OverwriteIfExistsOrAdd,
+        });
+    }
+    Ok(out)
+}
+
+fn provider_auth_string_field(
+    s: &prost_types::Struct,
+    name: &str,
+    path: &str,
+) -> Result<String, ConfigError> {
+    match s.fields.get(name).and_then(|v| v.kind.as_ref()) {
+        Some(prost_types::value::Kind::StringValue(v)) => Ok(v.clone()),
+        Some(_) => Err(invalid(format!("{path}.{name}"), "must be a string")),
+        None => Err(invalid(format!("{path}.{name}"), "is required")),
+    }
 }
 
 /// Type URL key Envoy expects for the one `typed_extension_protocol_options`

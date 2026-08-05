@@ -379,8 +379,39 @@ fn lower_provider(
         ));
     }
 
+    // Provider credentials live on the CLUSTER, not the route -- see
+    // `ClusterConfig::request_headers_to_add`'s doc comment in
+    // `proxy-config/src/ir.rs`. There is no Envoy `Cluster` field for
+    // per-provider auth headers, so this dialect smuggles them through
+    // `metadata.filter_metadata["io.llmproxy.provider_auth"]`, which
+    // `proxy-config::lower::convert_provider_auth_metadata` reads back out
+    // on the way through the identical strict-parse -> PGV -> IR pipeline
+    // every Envoy-mode config also goes through ("one engine, two
+    // front-ends" -- this module's own doc comment). This runs once per
+    // provider (this function is called once per `providers` entry), so a
+    // provider used by five routes/models still gets exactly one set of
+    // warnings, not five identical copies.
+    let headers_to_add = provider_headers_to_add(name, provider, warnings)?;
+    if !headers_to_add.is_empty() {
+        cluster["metadata"] = json!({
+            "filter_metadata": {
+                PROVIDER_AUTH_METADATA_KEY: { "headers": headers_to_add }
+            }
+        });
+    }
+
     Ok(cluster)
 }
+
+/// Namespace key under `Cluster.metadata.filter_metadata` this dialect uses
+/// to carry provider credentials -- must match
+/// `proxy_config::lower::PROVIDER_AUTH_METADATA_KEY` exactly, since the two
+/// crates only agree on this string by convention (protos never cross the
+/// `proxy-config`/`proxy-xds` boundary, so there is no shared Rust type to
+/// pin it). `dialect.rs` tests assert this key by its literal value for the
+/// same reason `USAGE_FILTER_TYPE_URL` above is pinned by a dev-dependency
+/// test rather than trusted to stay in sync.
+const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
 
 /// The auth header this provider type expects, if a key is configured.
 fn auth_header(
@@ -559,12 +590,7 @@ fn lower_route(
         });
     }
 
-    let headers_to_add = provider_headers_to_add(provider_name, provider, warnings)?;
-
     let mut route = json!({ "match": r#match, "route": action });
-    if !headers_to_add.is_empty() {
-        route["request_headers_to_add"] = Value::Array(headers_to_add);
-    }
 
     // Token accounting follows the ROUTE's provider, not the listener's: one
     // listener serves `gpt-*` from OpenAI and `claude-*` from Anthropic, and a
@@ -590,13 +616,21 @@ fn lower_route(
     Ok(route)
 }
 
-/// `request_headers_to_add` for a route targeting this provider: the auth
-/// header (if a key is configured), Anthropic's default `anthropic-version`
-/// (unless overridden), and every `extra_headers` entry. Shared by
-/// [`lower_route`] and [`lower_model`] so a provider's requests can never
-/// carry different headers depending on which one reached it -- two mappings
-/// that could disagree is exactly the hazard `usage_dialect`'s doc warns
-/// about, for the same class of field.
+/// The provider-credential headers for this provider: the auth header (if a
+/// key is configured), Anthropic's default `anthropic-version` (unless
+/// overridden), and every `extra_headers` entry. Called once per provider,
+/// from [`lower_provider`] -- these headers now travel on the provider's
+/// CLUSTER (`metadata.filter_metadata["io.llmproxy.provider_auth"]`), not
+/// the route, so every route/model entry that targets this provider shares
+/// exactly the same credential regardless of which one reached it (WP-35;
+/// see `ClusterConfig::request_headers_to_add`'s doc comment in
+/// `proxy-config/src/ir.rs`).
+///
+/// Each entry is a plain `{key, value}` object -- the shape
+/// `proxy_config::lower::convert_provider_auth_metadata` expects under the
+/// `headers` list, simpler than `core.v3.HeaderValueOption` because there is
+/// exactly one `append_action` this dialect ever wants
+/// (`OverwriteIfExistsOrAdd`, hardcoded on the reading side).
 fn provider_headers_to_add(
     provider_name: &str,
     provider: &Provider,
@@ -604,10 +638,7 @@ fn provider_headers_to_add(
 ) -> Result<Vec<Value>, ConfigError> {
     let mut headers_to_add = Vec::new();
     if let Some((key, value)) = auth_header(provider_name, provider, warnings)? {
-        headers_to_add.push(json!({
-            "header": { "key": key, "value": value },
-            "append_action": "OVERWRITE_IF_EXISTS_OR_ADD",
-        }));
+        headers_to_add.push(json!({ "key": key, "value": value }));
     }
     // Anthropic rejects any request without `anthropic-version`, so the
     // dialect supplies it rather than letting an otherwise-complete provider
@@ -628,15 +659,12 @@ fn provider_headers_to_add(
         .any(|k| k.eq_ignore_ascii_case(ANTHROPIC_VERSION_HEADER))
     {
         headers_to_add.push(json!({
-            "header": { "key": ANTHROPIC_VERSION_HEADER, "value": DEFAULT_ANTHROPIC_VERSION },
-            "append_action": "OVERWRITE_IF_EXISTS_OR_ADD",
+            "key": ANTHROPIC_VERSION_HEADER,
+            "value": DEFAULT_ANTHROPIC_VERSION,
         }));
     }
     for (key, value) in &provider.extra_headers {
-        headers_to_add.push(json!({
-            "header": { "key": key, "value": value },
-            "append_action": "OVERWRITE_IF_EXISTS_OR_ADD",
-        }));
+        headers_to_add.push(json!({ "key": key, "value": value }));
     }
     Ok(headers_to_add)
 }
@@ -694,11 +722,7 @@ fn lower_model(
         "host_rewrite_literal": up.host,
     });
 
-    let headers_to_add = provider_headers_to_add(provider_name, provider, warnings)?;
     let mut route = json!({ "match": r#match, "route": action });
-    if !headers_to_add.is_empty() {
-        route["request_headers_to_add"] = Value::Array(headers_to_add);
-    }
 
     let mut typed_per_filter_config = json!({
         USAGE_FILTER_NAME: {
