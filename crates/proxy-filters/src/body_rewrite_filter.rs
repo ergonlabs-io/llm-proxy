@@ -1,24 +1,38 @@
-//! WP-45 increment 2b — wires the [`crate::body_rewrite`] scanner/splice
-//! engine into a real decode-path `HttpFilter`.
+//! WP-45 increment 2b/consumer-B — wires the [`crate::body_rewrite`]
+//! scanner/splice engine into a real decode-path `HttpFilter`, for BOTH
+//! consumers of the one scan (WP-45 decision 1: one scan, one held prefix,
+//! two consumers — never a second scanner):
 //!
-//! Scope, deliberately narrow: **consumer A only** — force
-//! `stream_options.include_usage = true` onto OpenAI-dialect streaming
-//! requests that didn't already opt in, so WP-33's usage filter has
-//! something to find. Consumer B (body-based model routing, via
-//! `clear_route_cache()`) is a separate future increment; this module never
-//! reads `model` for routing purposes. The `llmproxy` dialect / JSON schema
-//! surface that will eventually configure this filter from `--config` is
-//! increment 2c, also not built here — this filter is Envoy-typed-config only.
+//! - **Consumer A** — force `stream_options.include_usage = true` onto
+//!   OpenAI-dialect streaming requests that didn't already opt in, so
+//!   WP-33's usage filter has something to find. Gated on `cfg.enabled &&
+//!   cfg.dialect == OpenAi`, exactly as before.
+//! - **Consumer B** — publish the scanned `model` onto the
+//!   [`MODEL_HEADER_NAME`] request header (overwriting any client-supplied
+//!   value; removing it outright when no model was found — WP-45 decision
+//!   4, a security property, not a tidiness one) and call
+//!   `clear_route_cache()` so S2.8 re-resolves the route against it.
+//!   Dialect-agnostic and unconditional: it runs for every dialect and
+//!   regardless of `cfg.enabled` (decision 2/3 — model extraction has
+//!   nothing to do with the usage-reporting kill switch).
+//!
+//! The `llmproxy` dialect / JSON schema surface that configures this filter
+//! from `--config` is increment 2c, built separately (`proxy-simple-config`'s
+//! `lower.rs`).
 //!
 //! # State machine
 //!
-//! Per stream: `Scanning { .. } -> PassThrough`. `decode_headers` decides
-//! up front whether this request is even a candidate (OpenAI dialect, has a
-//! body, JSON content type); everything else goes straight to `PassThrough`.
-//! Once in `PassThrough` (either from the start, or once a splice decision
-//! has been made), every subsequent `decode_data` call is a straight-through
-//! no-op: `Continue`, `data` untouched, no buffer touched. See
-//! [`BodyRewriteFilterInstance::decode_data`] for the `Scanning` side.
+//! Per stream: `Scanning { .. } -> PassThrough`. `decode_headers` decides up
+//! front whether this request even has a body worth scanning (has a body,
+//! JSON content type) — dialect and `enabled` no longer gate entry, since
+//! consumer B needs every dialect. A request with no scannable body still
+//! gets its model header cleared right there (see
+//! [`BodyRewriteFilterInstance::decode_headers`]) since absence there means
+//! the same thing decision 4 means everywhere else: no proven model, no
+//! trusted header. Once in `PassThrough` (either from the start, or once a
+//! decision has been made), every subsequent `decode_data` call is a
+//! straight-through no-op: `Continue`, `data` untouched, no buffer touched.
+//! See [`BodyRewriteFilterInstance::decode_data`] for the `Scanning` side.
 //!
 //! # Memory bound: `O(prefix cap + one chunk)`, not strictly `O(cap)`
 //!
@@ -83,6 +97,45 @@ use crate::usage::Dialect;
 /// Type URL this filter is registered under (see the module doc for the
 /// `RuntimeFeatureFlag`-reuse rationale).
 pub const TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
+
+/// The request header consumer B publishes the scanned `model` onto. Must
+/// equal `proxy_simple_config::lower::MODEL_HEADER`, which the dialect's
+/// route table matches against — duplicated as a literal rather than
+/// imported, for the same cross-crate reason `lower.rs` gives for its own
+/// `USAGE_FILTER_TYPE_URL`/`BODY_REWRITE_FILTER_TYPE_URL` (`proxy-filters`
+/// cannot depend on `proxy-simple-config`: that would drag the whole data
+/// plane into a crate that only ever emits JSON, and `proxy-simple-config`
+/// already depends on `proxy-filters` as a dev-dependency to pin the type
+/// URLs the other direction). WP-45 decision 6 calls this out explicitly as
+/// the exact shape that produced the `io.llmproxy.provider_auth` seam gap
+/// found 2026-08-03: two crates agreeing on a string by convention, each
+/// crate's tests pinning its own literal, nothing testing the join. The pin
+/// here is `proxy-simple-config/tests/dialect.rs`'s
+/// `body_based_model_routing_reaches_the_right_provider`, which drives a
+/// real request through a dialect-lowered config and asserts on which
+/// CLUSTER was reached — not on this string, since a string-equality
+/// assertion is exactly the check that would have passed right through the
+/// 2026-08-03 gap.
+pub const MODEL_HEADER_NAME: &str = "x-llmproxy-model";
+
+/// Write `model` onto [`MODEL_HEADER_NAME`], or remove the header outright
+/// when `model` is `None` — WP-45 decision 4: the header is derived from the
+/// body, never trusted from the client, so "no proven model" must clear
+/// whatever the client sent rather than leave it standing. A `model` value
+/// that doesn't survive `HeaderValue::from_str` (e.g. it contains a raw
+/// newline) is treated the same as "no model": removed, never a failed
+/// request — the module's "never fails a request" rule applies here too.
+fn apply_model_header(headers: &mut HeaderMap, model: Option<&str>) {
+    let name = http::header::HeaderName::from_static(MODEL_HEADER_NAME);
+    match model.and_then(|m| HeaderValue::from_str(m).ok()) {
+        Some(value) => {
+            headers.insert(name, value);
+        }
+        None => {
+            headers.remove(name);
+        }
+    }
+}
 
 /// Parsed, validated config: whether this filter does anything at all, and
 /// which dialect it should treat as OpenAI-shaped.
@@ -234,6 +287,25 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
     media_type.eq_ignore_ascii_case("application/json")
 }
 
+impl BodyRewriteFilterInstance {
+    /// Resolve this stream's effective config: the route's
+    /// `typed_per_filter_config` override if one applies, else the
+    /// listener-level config this instance was created with. Called from
+    /// both `decode_headers` and `decode_data` (consumer A's splice
+    /// decision is only made once body bytes are in, in `decode_data`) so
+    /// the two must resolve it identically -- factored out rather than
+    /// duplicated inline.
+    fn resolve_config(&self, cb: &mut dyn DecoderCallbacks) -> BodyRewriteConfig {
+        cb.per_route_config()
+            .and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<BodyRewritePerRouteConfig>()
+                    .map(|c| c.0)
+            })
+            .unwrap_or(self.config)
+    }
+}
+
 impl HttpFilter for BodyRewriteFilterInstance {
     fn decode_headers(
         &mut self,
@@ -241,25 +313,16 @@ impl HttpFilter for BodyRewriteFilterInstance {
         headers: &mut RequestHeaders,
         end_stream: bool,
     ) -> FilterHeadersStatus {
-        let cfg = cb
-            .per_route_config()
-            .and_then(|c| {
-                c.as_any()
-                    .downcast_ref::<BodyRewritePerRouteConfig>()
-                    .map(|c| c.0)
-            })
-            .unwrap_or(self.config);
-
-        // Acceptance 3: an Anthropic body must be byte-identical in and out
-        // -- there is no `stream_options` field there, and adding one risks
-        // a 400 from a strict provider. Same short-circuit for a disabled
-        // filter, a bodyless request, and a non-JSON content type: none of
-        // these are candidates for the scan at all.
-        if !cfg.enabled
-            || cfg.dialect != Dialect::OpenAi
-            || end_stream
-            || !is_json_content_type(&headers.headers)
-        {
+        // A bodyless request, or a non-JSON content type, has no `model` to
+        // find -- WP-45 decision 4 still applies: any client-supplied
+        // `x-llmproxy-model` must be removed here, not left standing, since
+        // there is no proof of what the real model is. Mutate `headers`
+        // directly rather than through `modify_decoded_headers` -- that
+        // callback is a no-op called from inside `decode_headers` itself
+        // (see its doc); this parameter IS the live request head.
+        if end_stream || !is_json_content_type(&headers.headers) {
+            apply_model_header(&mut headers.headers, None);
+            cb.clear_route_cache();
             self.state = State::PassThrough;
             return FilterHeadersStatus::Continue;
         }
@@ -327,34 +390,57 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // Either the scanner reached a decision, or the body just ended
         // without one (truncated/malformed JSON) -- either way, finish now.
         let facts = scanner.finish();
-        if let Some(inject) = include_usage_injection(&facts) {
-            let splice_at = facts
-                .splice_at
-                .expect("include_usage_injection only returns Some when a splice point exists");
-            let tail = pending.split_off(splice_at);
-            pending.extend_from_slice(inject.as_bytes());
-            pending.unsplit(tail);
 
-            if let Some(len) = content_length {
-                // Saturating, not `+`: `len` was parsed out of a CLIENT-supplied
-                // `content-length` header, so it is untrusted input rather than a
-                // number we computed. A client sending a near-`u64::MAX`
-                // content-length would otherwise panic the worker in debug builds
-                // and wrap in release. Same defect class as `TokenUsage::total()`,
-                // and reachable from the downstream side rather than the upstream
-                // one, which makes it strictly worse.
-                let new_len = len.saturating_add(inject.len() as u64);
-                cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
-                    headers.headers.insert(
-                        CONTENT_LENGTH,
-                        HeaderValue::from_str(&new_len.to_string())
-                            .expect("a decimal integer is always a valid header value"),
-                    );
-                });
+        // Consumer A: OpenAI-only, and only when the operator hasn't turned
+        // it off (`cfg.enabled`). Unlike the old gate, `cfg` is resolved
+        // fresh here rather than in `decode_headers` -- scanning itself no
+        // longer depends on it (consumer B needs every dialect), so only
+        // the splice decision reads it.
+        let cfg = self.resolve_config(cb);
+        if cfg.enabled && cfg.dialect == Dialect::OpenAi {
+            if let Some(inject) = include_usage_injection(&facts) {
+                let splice_at = facts
+                    .splice_at
+                    .expect("include_usage_injection only returns Some when a splice point exists");
+                let tail = pending.split_off(splice_at);
+                pending.extend_from_slice(inject.as_bytes());
+                pending.unsplit(tail);
+
+                if let Some(len) = content_length {
+                    // Saturating, not `+`: `len` was parsed out of a CLIENT-supplied
+                    // `content-length` header, so it is untrusted input rather than a
+                    // number we computed. A client sending a near-`u64::MAX`
+                    // content-length would otherwise panic the worker in debug builds
+                    // and wrap in release. Same defect class as `TokenUsage::total()`,
+                    // and reachable from the downstream side rather than the upstream
+                    // one, which makes it strictly worse.
+                    let new_len = len.saturating_add(inject.len() as u64);
+                    cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
+                        headers.headers.insert(
+                            CONTENT_LENGTH,
+                            HeaderValue::from_str(&new_len.to_string())
+                                .expect("a decimal integer is always a valid header value"),
+                        );
+                    });
+                }
+                // A chunked request (`content_length == None`) needs no header
+                // fix-up at all -- there is nothing to recompute.
             }
-            // A chunked request (`content_length == None`) needs no header
-            // fix-up at all -- there is nothing to recompute.
         }
+
+        // Consumer B: unconditional (decision 3) -- publish the scanned
+        // `model`, or remove any client-supplied value when none was found
+        // (decision 4/5: `CapExceeded` with no `model` seen yet means
+        // absence is NOT proven, so this deliberately still clears the
+        // header and lets routing fall through to the `*` backstop, rather
+        // than trusting a client-supplied value). `clear_route_cache()`
+        // (S2.8) always follows, so a route match against the OLD header
+        // value is never reused.
+        let model = facts.model.clone();
+        cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
+            apply_model_header(&mut headers.headers, model.as_deref());
+        });
+        cb.clear_route_cache();
 
         *data = pending.freeze();
         // `self.state` is already `PassThrough` from the `mem::replace`
@@ -378,11 +464,12 @@ mod tests {
     // --- test scaffolding ---------------------------------------------------
 
     /// A minimal `DecoderCallbacks` double. Only `modify_decoded_headers`,
-    /// `per_route_config`, and `stream_info` are ever exercised by this
-    /// filter; every other method panics loudly so a change that starts
-    /// calling one of them (e.g. buffering via `add_decoded_data`, or
-    /// resolving the route for consumer-B-style routing) fails a test
-    /// instead of silently passing.
+    /// `per_route_config`, `clear_route_cache`, and `stream_info` are ever
+    /// exercised by this filter; every other method panics loudly so a
+    /// change that starts calling one of them (e.g. buffering via
+    /// `add_decoded_data`, or resolving the route via `route()`, which this
+    /// filter has no reason to call -- it clears the cache, it doesn't read
+    /// it) fails a test instead of silently passing.
     struct TestCallbacks {
         /// The manager's canonical request head -- `decode_headers` gets a
         /// separate, ephemeral `&mut RequestHeaders` parameter (mirroring
@@ -392,6 +479,11 @@ mod tests {
         head: RequestHeaders,
         per_route_config: Option<Arc<dyn PerRouteConfig>>,
         stream_info: RefCell<StreamInfo>,
+        /// How many times `clear_route_cache()` was called -- consumer B
+        /// (WP-45) calls it unconditionally once a decision is reached, so
+        /// tests that want to pin that can inspect this instead of only
+        /// inferring it from the header outcome.
+        route_cache_cleared: std::cell::Cell<u32>,
     }
 
     impl TestCallbacks {
@@ -400,6 +492,7 @@ mod tests {
                 head,
                 per_route_config: None,
                 stream_info: RefCell::new(StreamInfo::default()),
+                route_cache_cleared: std::cell::Cell::new(0),
             }
         }
 
@@ -442,10 +535,13 @@ mod tests {
             true
         }
         fn route(&mut self) -> Option<Arc<RouteEntry>> {
-            unimplemented!("consumer B (body-based routing) is out of scope for increment 2b")
+            unimplemented!(
+                "body_rewrite_filter clears the route cache, it never reads it via route()"
+            )
         }
         fn clear_route_cache(&mut self) {
-            unimplemented!("consumer B (body-based routing) is out of scope for increment 2b")
+            self.route_cache_cleared
+                .set(self.route_cache_cleared.get() + 1);
         }
         fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>> {
             self.per_route_config.clone()
@@ -883,5 +979,163 @@ mod tests {
             out, expected,
             "output must equal the original body with the injection spliced in right after `{{`"
         );
+    }
+
+    // ======================================================================
+    // Consumer B: body-based model routing (WP-45)
+    // ======================================================================
+
+    /// Like [`request_headers`], but with an extra client-supplied header --
+    /// used to seed a spoofed `x-llmproxy-model` before driving a request,
+    /// so tests can prove the filter overwrites/removes it rather than
+    /// trusting it.
+    fn request_headers_with(
+        content_type: Option<&str>,
+        content_length: Option<u64>,
+        extra: &[(&str, &str)],
+    ) -> RequestHeaders {
+        let mut req = request_headers(content_type, content_length);
+        for (k, v) in extra {
+            req.headers.insert(
+                http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        req
+    }
+
+    fn model_header(cb: &TestCallbacks) -> Option<&str> {
+        cb.head
+            .headers
+            .get(MODEL_HEADER_NAME)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// A body naming `model` publishes it onto `x-llmproxy-model` -- the
+    /// basic positive case, OpenAI dialect.
+    #[test]
+    fn body_model_publishes_the_routing_header() {
+        let body = br#"{"model":"gpt-4o","messages":[],"stream":false}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        let (_out, cb) = run(Dialect::OpenAi, headers, &[body]);
+        assert_eq!(model_header(&cb), Some("gpt-4o"));
+        assert_eq!(
+            cb.route_cache_cleared.get(),
+            1,
+            "a decision was reached, so the route cache must be invalidated exactly once"
+        );
+    }
+
+    /// The Anthropic dialect gets no `include_usage` splice, but model
+    /// extraction is dialect-agnostic (WP-45 decision 2) -- proves the old
+    /// `cfg.dialect != OpenAi` short-circuit no longer suppresses scanning.
+    #[test]
+    fn anthropic_dialect_body_also_publishes_the_routing_header() {
+        let body = br#"{"model":"claude-3-5-sonnet","messages":[],"stream":true}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        let (out, cb) = run(Dialect::Anthropic, headers, &[body]);
+        assert_eq!(model_header(&cb), Some("claude-3-5-sonnet"));
+        // Still byte-identical -- consumer A never touches an Anthropic body.
+        assert_eq!(out, body);
+    }
+
+    /// SECURITY (WP-45 decision 4): a client-supplied `x-llmproxy-model`
+    /// must be OVERWRITTEN by the body's real value, never left standing or
+    /// merely supplemented -- otherwise a client can steer its own request
+    /// to a different provider by lying in the header while the body says
+    /// something else.
+    #[test]
+    fn client_supplied_model_header_is_overwritten_by_the_body() {
+        let body = br#"{"model":"gpt-4o","messages":[],"stream":false}"#;
+        let headers = request_headers_with(
+            Some("application/json"),
+            Some(body.len() as u64),
+            &[(MODEL_HEADER_NAME, "claude-3-5-sonnet")],
+        );
+        let (_out, cb) = run(Dialect::OpenAi, headers, &[body]);
+        assert_eq!(
+            model_header(&cb),
+            Some("gpt-4o"),
+            "the body's model must win over whatever the client claimed in the header"
+        );
+    }
+
+    /// SECURITY (WP-45 decision 4): when the body has no extractable model,
+    /// a client-supplied `x-llmproxy-model` must be REMOVED, not left
+    /// standing -- absence must not be silently trusted as "use the header".
+    #[test]
+    fn client_supplied_model_header_is_removed_when_the_body_has_no_model() {
+        let body = br#"{"messages":[],"stream":false}"#;
+        let headers = request_headers_with(
+            Some("application/json"),
+            Some(body.len() as u64),
+            &[(MODEL_HEADER_NAME, "claude-3-5-sonnet")],
+        );
+        let (_out, cb) = run(Dialect::OpenAi, headers, &[body]);
+        assert!(
+            cb.head.headers.get(MODEL_HEADER_NAME).is_none(),
+            "a spoofed header must not survive a body with no model"
+        );
+    }
+
+    /// SECURITY: same removal, but for the short-circuit path -- a
+    /// non-JSON-content-type request never even enters `Scanning`, and must
+    /// still clear a spoofed header rather than skip straight past it.
+    #[test]
+    fn client_supplied_model_header_is_removed_for_a_non_json_request() {
+        let headers =
+            request_headers_with(Some("text/plain"), None, &[(MODEL_HEADER_NAME, "claude")]);
+        let mut filter = filter_for(Dialect::OpenAi);
+        let mut cb = TestCallbacks::new(headers.clone());
+        let mut req_headers = headers;
+        filter.decode_headers(&mut cb, &mut req_headers, false);
+        assert!(
+            req_headers.headers.get(MODEL_HEADER_NAME).is_none(),
+            "decode_headers mutates its own `headers` parameter directly for this path"
+        );
+        assert_eq!(cb.route_cache_cleared.get(), 1);
+    }
+
+    /// WP-45 decision 5: `ScanOutcome::CapExceeded` before `model` was ever
+    /// seen means absence is NOT proven -- but the policy here is still to
+    /// treat it exactly like "no model found": clear the header and let
+    /// routing fall through to the `*` backstop deliberately, rather than
+    /// trusting a client-supplied value just because we ran out of window.
+    #[test]
+    fn model_past_the_prefix_cap_yields_no_header() {
+        let filler = "x".repeat(DEFAULT_PREFIX_CAP + 4096);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"{filler}"}}],"model":"gpt-4o","stream":true}}"#
+        );
+        let headers = request_headers_with(
+            Some("application/json"),
+            Some(body.len() as u64),
+            &[(MODEL_HEADER_NAME, "claude-3-5-sonnet")],
+        );
+        let (_out, cb) = run(Dialect::OpenAi, headers, &[body.as_bytes()]);
+        assert!(
+            cb.head.headers.get(MODEL_HEADER_NAME).is_none(),
+            "a model past the cap must not be trusted from the client header either"
+        );
+    }
+
+    /// A non-JSON body (JSON content type, but not actually JSON) reaches
+    /// upstream untouched and does not fail the request -- same "never
+    /// fails a request" rule the splice side already has, now checked for
+    /// the routing side too.
+    #[test]
+    fn non_json_body_publishes_no_header_and_passes_through() {
+        let body = b"not json at all";
+        let headers = request_headers_with(
+            Some("application/json"),
+            Some(body.len() as u64),
+            &[(MODEL_HEADER_NAME, "claude-3-5-sonnet")],
+        );
+        let (out, cb) = run(Dialect::OpenAi, headers, &[body]);
+        assert_eq!(
+            out, body,
+            "an unparseable body must reach upstream untouched"
+        );
+        assert!(cb.head.headers.get(MODEL_HEADER_NAME).is_none());
     }
 }

@@ -736,8 +736,11 @@ observability:
 /// together — this is that something.
 #[test]
 fn usage_filter_type_url_matches_the_filter() {
-    // `force_usage_reporting` is off so `http_filters[0]` stays the usage
-    // filter; the body-rewrite filter's own type-URL pin lives in
+    // `force_usage_reporting` is off, but `routes` is non-empty, so WP-45's
+    // `needs_body_rewrite_filter` still inserts the body-rewrite filter
+    // (disabled, for consumer B only) ahead of the usage filter --
+    // `http_filters[1]` is the usage filter under test here. The
+    // body-rewrite filter's own type-URL pin lives in
     // `body_rewrite_filter_type_url_matches_the_filter` below.
     let config = parse(
         r#"
@@ -756,13 +759,13 @@ observability:
         ["filters"][0]["typed_config"]["http_filters"];
 
     assert_eq!(
-        filters[0]["typed_config"]["@type"],
+        filters[1]["typed_config"]["@type"],
         proxy_filters::usage_filter::TYPE_URL,
         "the dialect emits a type URL no registered filter factory answers to; \
          this would be a bind-time error on every listener"
     );
     assert_eq!(
-        filters[0]["typed_config"]["@type"],
+        filters[1]["typed_config"]["@type"],
         lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
             ["typed_config"]["route_config"]["virtual_hosts"][0]["routes"][0]
             ["typed_per_filter_config"]["llmproxy.usage"]["@type"],
@@ -776,9 +779,11 @@ observability:
 /// override exists.
 #[test]
 fn usage_filter_sits_before_the_router_with_per_route_dialects() {
-    // `force_usage_reporting` is off here so this test stays scoped to the
-    // WP-33 usage filter alone; the body-rewrite filter (WP-45) it would
-    // otherwise also emit is covered by its own tests below.
+    // `force_usage_reporting` is off, but `routes` is non-empty, so WP-45's
+    // `needs_body_rewrite_filter` still inserts the (disabled) body-rewrite
+    // filter ahead of everything else -- it's a decode-path filter and must
+    // precede the router in config order regardless of whether consumer A
+    // is turned on.
     let config = parse(
         r#"
 version: 0
@@ -805,7 +810,14 @@ observability:
         .iter()
         .map(|f| f["name"].as_str().expect("filter name must be a string"))
         .collect();
-    assert_eq!(names, ["llmproxy.usage", "envoy.filters.http.router"]);
+    assert_eq!(
+        names,
+        [
+            "llmproxy.body_rewrite",
+            "llmproxy.usage",
+            "envoy.filters.http.router"
+        ]
+    );
 
     // Criterion 5: the dialect follows the route, not the listener.
     let routes = &hcm["route_config"]["virtual_hosts"][0]["routes"];
@@ -853,8 +865,9 @@ routes:
 /// hard load error, so this also proves the two names agree).
 #[test]
 fn per_route_dialect_survives_into_the_ir() {
-    // `force_usage_reporting` is off so `http_filters[0]` stays the usage
-    // filter, the thing under test here.
+    // `force_usage_reporting` is off, but `routes` is non-empty, so
+    // `http_filters[0]` is the (disabled) body-rewrite filter and
+    // `http_filters[1]` is the usage filter, the thing under test here.
     let config = parse(
         r#"
 version: 0
@@ -882,7 +895,8 @@ observability:
     else {
         panic!("expected an HTTP connection manager");
     };
-    assert_eq!(hcm.http_filters[0].name, "llmproxy.usage");
+    assert_eq!(hcm.http_filters[0].name, "llmproxy.body_rewrite");
+    assert_eq!(hcm.http_filters[1].name, "llmproxy.usage");
 
     let routes = &hcm.route_table.virtual_hosts[0].routes;
     for (i, want) in [(0, "openai"), (1, "anthropic")] {
@@ -983,25 +997,40 @@ fn observability_without_the_flag_still_emits_body_rewrite_by_default() {
     );
 }
 
-/// `force_usage_reporting: false` leaves no trace of the filter anywhere in
-/// the serialized bootstrap -- not the chain, and not any route's
-/// `typed_per_filter_config`. Asserted against the whole serialized document
-/// so a stray per-route entry can't slip through a narrower check.
+/// `force_usage_reporting: false` turns consumer A (the `include_usage`
+/// splice) off, but must NOT remove the filter from the chain: `routes` is
+/// non-empty (a config with no routes fails semantic validation), so
+/// consumer B (body-based model routing, WP-45 decision 3) still needs it
+/// present. Pins the specific shape that must survive the flag being off:
+/// the listener-level entry stays, `default_value` flips to `false`, and no
+/// route gets a `typed_per_filter_config` override for it (that override
+/// only ever exists to carry consumer A's per-route dialect, so it has
+/// nothing to say when consumer A is off).
 #[test]
-fn force_usage_reporting_false_leaves_no_trace_of_the_filter() {
+fn force_usage_reporting_false_disables_the_splice_but_keeps_the_filter_for_routing() {
     let config = parse(&format!(
         "{BASIC_CONFIG}observability:\n  force_usage_reporting: false\n"
     ))
     .expect("must parse");
     let lowered = proxy_simple_config::lower(&config).expect("must lower");
-    let whole = serde_json::to_string(&lowered.bootstrap).unwrap();
-    assert!(
-        !whole.contains("body_rewrite"),
-        "disabling the flag must leave zero trace of the filter, got: {whole}"
+    let hcm = hcm_typed_config(&lowered.bootstrap);
+
+    let body_rewrite_entry = hcm["http_filters"]
+        .as_array()
+        .expect("http_filters must be an array")
+        .iter()
+        .find(|f| f["name"] == "llmproxy.body_rewrite")
+        .expect("the body-rewrite filter must still be in the chain (consumer B needs it)");
+    assert_eq!(
+        body_rewrite_entry["typed_config"]["default_value"], false,
+        "the operator's `force_usage_reporting: false` must reach `default_value`"
     );
+
+    let routes = &hcm["route_config"]["virtual_hosts"][0]["routes"];
     assert!(
-        !whole.contains(proxy_filters::body_rewrite_filter::TYPE_URL),
-        "disabling the flag must not leave the filter's type URL anywhere, got: {whole}"
+        routes[0]["typed_per_filter_config"]["llmproxy.body_rewrite"].is_null(),
+        "no per-route override should exist when consumer A is off -- it exists only \
+         to carry consumer A's per-route dialect"
     );
 }
 
@@ -1890,5 +1919,230 @@ routes:
                 );
             }
         }
+    }
+}
+
+// ------------------------------------------------- WP-45: body-based routing e2e --
+
+/// WP-45 acceptance 5 / decision 6: drives a REAL request, with a `model`
+/// only in the JSON body, through a dialect-lowered config's ENTIRE real
+/// pipeline -- lowering, PGV, IR, a real `FilterRegistry` resolving the
+/// dialect's `http_filters` to the real `proxy-filters` factories, a real
+/// `FilterChainHandler`, a real `ClusterManager`, and a real router --
+/// and asserts on which upstream TCP connection was actually dialed.
+///
+/// This is deliberately NOT a check of the `x-llmproxy-model` header string:
+/// `MODEL_HEADER` (this crate) and the header
+/// `proxy_filters::body_rewrite_filter` publishes are two independently
+/// literal-pinned constants (`proxy-filters` can't depend on this crate --
+/// see that filter's module doc). A test asserting on the string would pass
+/// even if the two literals drifted apart, as long as each side agreed with
+/// itself -- exactly the shape that hid the `io.llmproxy.provider_auth` gap
+/// found 2026-08-03. Asserting on which CLUSTER was reached instead requires
+/// the whole join -- dialect emits the header matcher, the real filter
+/// writes the real header, the real router matches it -- to actually work.
+mod body_routing_e2e {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use http_body_util::{BodyExt, Full};
+    use proxy_cluster::manager::ClusterManager;
+    use proxy_cluster::resolver::FakeResolver;
+    use proxy_http::filter::{
+        FactoryContext, FilterRegistry, RequestHeaders, TerminalFilterInstanceFactory,
+    };
+    use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
+    use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
+    use proxy_http::router::RouterFilterFactory;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::task::LocalSet;
+
+    use proxy_simple_config::lower_to_loaded;
+
+    /// A one-shot upstream that signals `tx` the instant it's dialed and
+    /// receives a full request, then answers 200. Two of these (one per
+    /// provider) let the test tell "reached A" from "reached B" apart by
+    /// which channel fires, not by inspecting anything about the request
+    /// itself.
+    async fn spawn_marker_upstream() -> (SocketAddr, oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(());
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        (addr, rx)
+    }
+
+    /// Build a real, runnable [`FilterChainHandler`] from a dialect-lowered
+    /// config's real IR -- the same construction `proxy-core`'s
+    /// `build_hcm_handler` does at bind time, minus the parts (TLS certs,
+    /// access-log sinks, admin) this test doesn't need.
+    async fn build_real_handler(snapshot: &proxy_config::ir::ConfigSnapshot) -> FilterChainHandler {
+        let cluster_manager = Arc::new(ClusterManager::with_default_transport(Arc::new(
+            FakeResolver::new(),
+        )));
+        let rejected = cluster_manager
+            .update_from_snapshot(&snapshot.clusters)
+            .await;
+        assert!(
+            rejected.is_empty(),
+            "no cluster should be rejected: {rejected:?}"
+        );
+
+        let listener = snapshot
+            .listeners
+            .values()
+            .next()
+            .expect("exactly one listener");
+        let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+            &listener.filter_chains[0].filters[0]
+        else {
+            panic!("expected an HTTP connection manager");
+        };
+
+        // The REAL registry, with the REAL `proxy-filters` factories --
+        // exactly the two filters `proxy-core`'s `filter_registry()`
+        // registers for this WP.
+        let mut registry = FilterRegistry::default();
+        registry.register(Arc::new(proxy_filters::usage_filter::UsageFilterFactory));
+        registry.register(Arc::new(
+            proxy_filters::body_rewrite_filter::BodyRewriteFilterFactory,
+        ));
+
+        let factory_ctx = FactoryContext {};
+        let mut filters = Vec::new();
+        for f in &hcm.http_filters {
+            if f.is_router {
+                continue;
+            }
+            let factory = registry
+                .get(&f.type_url)
+                .unwrap_or_else(|| panic!("no registered factory for type_url `{}`", f.type_url));
+            let config = f
+                .config
+                .as_ref()
+                .expect("lowering only leaves `config: None` on the router filter");
+            let instance_factory = factory
+                .create(config, &factory_ctx)
+                .unwrap_or_else(|e| panic!("filter '{}' config must parse: {e}", f.name));
+            filters.push(ConfiguredHttpFilter {
+                name: f.name.clone(),
+                instance_factory: Arc::from(instance_factory),
+                factory: factory.clone(),
+            });
+        }
+
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RouterFilterFactory::new(cluster_manager));
+        FilterChainHandler::new_with_filters(
+            filters,
+            terminal_factory,
+            hcm.route_table.clone(),
+            hcm.generate_request_id,
+            hcm.use_remote_address,
+            hcm.xff_num_trusted_hops,
+        )
+        .expect("filter chain must build against the real registry")
+    }
+
+    fn json_post_request(path: &'static str, body: &'static [u8]) -> HttpRequestParts {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("test.local"));
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string()).unwrap(),
+        );
+        HttpRequestParts {
+            head: RequestHeaders {
+                method: Method::POST,
+                uri: Uri::from_static(path),
+                headers,
+            },
+            body: local_boxed(
+                Full::new(Bytes::from_static(body))
+                    .map_err(|infallible: std::convert::Infallible| match infallible {}),
+            ),
+            downstream: DownstreamInfo::loopback(),
+        }
+    }
+
+    // Rust note: `flavor = "current_thread"` + an explicit `LocalSet` --
+    // same shape as `router_header_mutations.rs`'s tests, for the same
+    // reason: `send_upstream_http1` (inside the router terminal this
+    // handler drives) spawns a non-`Send` connection driver via
+    // `tokio::task::spawn_local`, which needs a `LocalSet` in scope.
+    #[tokio::test(flavor = "current_thread")]
+    async fn body_based_model_routing_reaches_the_right_provider() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr_a, mut rx_a) = spawn_marker_upstream().await;
+                let (addr_b, rx_b) = spawn_marker_upstream().await;
+
+                // Two providers, two model-glob routes -- the second rule is
+                // the one under test. Neither provider is `openai`/`anthropic`
+                // by name, so both default to the `openai-compatible`
+                // (plain-http) dialect and need no TLS setup to reach a local
+                // mock upstream.
+                let config_text = format!(
+                    "version: 0\n\
+                     providers:\n\
+                     \x20\x20provider-a: {{ base_url: \"http://{addr_a}\" }}\n\
+                     \x20\x20provider-b: {{ base_url: \"http://{addr_b}\" }}\n\
+                     routes:\n\
+                     \x20\x20- {{ model: \"gpt-*\", provider: provider-a }}\n\
+                     \x20\x20- {{ model: \"claude-*\", provider: provider-b }}\n"
+                );
+                let config =
+                    proxy_simple_config::parse_simple_config_with_env(&config_text, &|_| None)
+                        .expect("must parse");
+                let loaded = lower_to_loaded(&config).expect("must lower and validate");
+                let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+                let handler = build_real_handler(&snapshot).await;
+
+                // The body names the SECOND provider's model; no
+                // `x-llmproxy-model` header is set by the client at all --
+                // routing must be entirely body-derived.
+                let body = br#"{"model":"claude-3-5-sonnet","messages":[]}"#;
+                let resp = handler
+                    .handle(json_post_request("/v1/chat/completions", body))
+                    .await;
+                assert_eq!(resp.head.status, StatusCode::OK);
+                let _ = resp.body.collect().await;
+
+                assert!(
+                    rx_b.await.is_ok(),
+                    "provider B (claude-*) should have been dialed -- the body named a claude model"
+                );
+                assert!(
+                    rx_a.try_recv().is_err(),
+                    "provider A (gpt-*) must NOT have been dialed -- the body named a claude \
+                     model, not a gpt one"
+                );
+            })
+            .await;
     }
 }

@@ -15,8 +15,8 @@
 //! The result is standard Envoy config: it goes through the same strict
 //! parse, PGV validation, and IR pipeline as `-c` mode, and `--mode
 //! translate` prints it. Dialect features whose runtime lands in a later WP
-//! (body-based model extraction, fallbacks, model rewrite, limits, access
-//! logs) produce explicit warnings, never silent drops (ground rule #2).
+//! (fallbacks, model rewrite, limits, access logs) produce explicit
+//! warnings, never silent drops (ground rule #2).
 
 use proxy_config::{ConfigError, ConfigWarning, LoadedBootstrap};
 use serde_json::{json, Value};
@@ -24,8 +24,13 @@ use serde_json::{json, Value};
 use crate::model::*;
 use crate::parse::parse_host_port;
 
-/// The request header the route table matches models against. Set by clients
-/// today; set by the WP-35 model-router filter (from the request body) later.
+/// The request header the route table matches models against. Populated
+/// from the request BODY by the body-rewrite filter (WP-45's consumer B,
+/// `proxy_filters::body_rewrite_filter`) before routing runs -- overwriting
+/// or removing any client-supplied value, never trusting it (see that
+/// filter's module doc). `needs_body_rewrite_filter` below is what actually
+/// guarantees the filter is in the chain whenever this header is matched
+/// against.
 pub const MODEL_HEADER: &str = "x-llmproxy-model";
 
 const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
@@ -173,15 +178,11 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             }
         }));
     }
-    if !config.routes.is_empty() || !config.models.is_empty() {
-        warnings.push(warning(
-            "routes",
-            format!(
-                "model routing currently matches the `{MODEL_HEADER}` request header; \
-                 body-based model extraction lands with the model-router filter (WP-35)"
-            ),
-        ));
-    }
+    // WP-45: the body-rewrite filter (inserted below by
+    // `needs_body_rewrite_filter`) now scans the request body and publishes
+    // `MODEL_HEADER` from it before routing runs, so `routes`/`models`
+    // matching that header is body-derived, not merely a header the client
+    // happens to set -- no warning needed here anymore.
 
     let token_limit_filter = lower_limits(config, &mut warnings)?;
 
@@ -501,15 +502,31 @@ fn force_usage_reporting(config: &SimpleConfig) -> bool {
         })
 }
 
+/// Whether the body-rewrite filter needs to be in the chain at all (WP-45
+/// decision 3): either `force_usage_reporting` wants the `include_usage`
+/// splice, or the config has `routes`/`models` to route among -- body-based
+/// model routing (consumer B) depends on this filter unconditionally, since
+/// it's the only thing that ever reads the request body. Both reasons are
+/// independent, so this is an OR, not a replacement for
+/// [`force_usage_reporting`]: a config with routes but usage reporting
+/// turned off still needs the filter present (with `default_value: false`,
+/// so consumer A stays off), just for consumer B.
+fn needs_body_rewrite_filter(config: &SimpleConfig) -> bool {
+    force_usage_reporting(config) || !config.routes.is_empty() || !config.models.is_empty()
+}
+
 /// `envoy.config.core.v3.RuntimeFeatureFlag` shaped `typed_config` for the
 /// body-rewrite filter: `default_value` is the on/off switch (proto3-JSON
-/// maps a `BoolValue` field to a bare JSON bool), `runtime_key` carries the
-/// dialect. Shared by the listener-level entry and every per-route override
-/// so the two can never drift in shape.
-fn body_rewrite_typed_config(dialect: &str) -> Value {
+/// maps a `BoolValue` field to a bare JSON bool) for consumer A (the
+/// `include_usage` splice) ONLY -- consumer B (body-based model routing)
+/// reads the filter's presence in the chain, never this field (WP-45
+/// decision 3). `runtime_key` carries the dialect. Shared by the
+/// listener-level entry and every per-route override so the two can never
+/// drift in shape.
+fn body_rewrite_typed_config(enabled: bool, dialect: &str) -> Value {
     json!({
         "@type": BODY_REWRITE_FILTER_TYPE_URL,
-        "default_value": true,
+        "default_value": enabled,
         "runtime_key": dialect,
     })
 }
@@ -609,7 +626,7 @@ fn lower_route(
     // `gpt-*` from OpenAI and `claude-*` from Anthropic.
     if force_usage_reporting(config) {
         typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
-            body_rewrite_typed_config(usage_dialect(provider_name, provider));
+            body_rewrite_typed_config(true, usage_dialect(provider_name, provider));
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
 
@@ -731,7 +748,8 @@ fn lower_model(
         }
     });
     if force_usage_reporting(config) {
-        typed_per_filter_config[BODY_REWRITE_FILTER_NAME] = body_rewrite_typed_config(dialect);
+        typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
+            body_rewrite_typed_config(true, dialect);
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
 
@@ -941,13 +959,16 @@ fn lower_listener(
         .unwrap_or("openai");
 
     let mut http_filters = Vec::new();
-    if force_usage_reporting(config) {
+    if needs_body_rewrite_filter(config) {
         // Decode-path filter, so it must precede the router in config order --
         // decode callbacks run in FORWARD config order (S2.1), and a decode
-        // filter placed after the router never runs at all.
+        // filter placed after the router never runs at all. `enabled` here
+        // gates ONLY consumer A (the `include_usage` splice): a config with
+        // `routes`/`models` but `force_usage_reporting: false` still needs
+        // this filter present, just with the splice off -- WP-45 decision 3.
         http_filters.push(json!({
             "name": BODY_REWRITE_FILTER_NAME,
-            "typed_config": body_rewrite_typed_config(default_dialect),
+            "typed_config": body_rewrite_typed_config(force_usage_reporting(config), default_dialect),
         }));
     }
     if let Some(token_limit_filter) = token_limit_filter {

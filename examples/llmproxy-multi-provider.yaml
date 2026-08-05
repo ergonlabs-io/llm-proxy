@@ -49,15 +49,13 @@ providers:
 # bottom, so put specific patterns above broad ones. `*` matches any run of
 # characters.
 #
-# READ THIS BEFORE USING THE ROUTES BELOW. Model matching currently reads the
-# `x-llmproxy-model` REQUEST HEADER, not the `model` field in the JSON body.
-# A normal OpenAI or Anthropic SDK sends the model in the body and no such
-# header, so with this config every request falls through to the `*` backstop.
-# Body-based extraction lands with the model router (WP-35); the proxy warns
-# about this at startup rather than letting you discover it in production.
+# The model name comes from the `model` field in the JSON request body, which is
+# where every OpenAI and Anthropic SDK puts it. No client change is necessary.
 #
-# Until then, either send `x-llmproxy-model` alongside the request, or keep one
-# provider per listener.
+# Internally the proxy reads the body once, writes the name to an
+# `x-llmproxy-model` header, and matches on that header. A client cannot steer
+# its own request with that header: the proxy overwrites the header when the
+# body names a model, and deletes the header when the body does not.
 routes:
   - model: gpt-*
     provider: openai
@@ -95,10 +93,12 @@ routes:
 #     provider: openai
 #     fallbacks: [anthropic, xai]
 
-# Model catalogue (WP-49 increment 1). Naming and data model only: exactly
-# `providers[0]` serves traffic, and every entry after the first warns with its
-# path rather than being silently ignored. Model-name rewriting also warns —
-# the client's original model name is forwarded unchanged for now.
+# Model catalogue (WP-49 increment 1). A client that asks for `fast` is routed
+# to `providers[0]` — the name below matches against the body's model field like
+# any other route. Two parts are not active yet, and each warns with its path:
+# entries after the first (there is no preference order until WP-35), and
+# model-name rewriting (the client's `fast` is forwarded to the provider
+# unchanged instead of becoming `gpt-4o-mini`).
 models:
   # A stable client-facing name, so callers do not chase provider model IDs.
   fast:

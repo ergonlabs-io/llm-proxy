@@ -1472,14 +1472,20 @@ dependencies = [
 name = "proxy-simple-config"
 version = "0.0.1"
 dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
  "proxy-api",
+ "proxy-cluster",
  "proxy-config",
  "proxy-filters",
+ "proxy-http",
  "regex",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "serde_yaml",
+ "tokio",
 ]
 
 [[package]]
