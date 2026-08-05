@@ -202,7 +202,28 @@ streams.
 **In scope:** WP-23 (stats registry), WP-25 (admin server), WP-30 (perf — phases 1+2 done,
 the ceiling is unpublished), WP-06's swap-under-load gate, IR wiring for WP-18/WP-19
 (health checking and outlier detection are both built and green but neither is reachable
-from config yet), WP-15 remainder, WP-14 retry budgets.
+from config yet), WP-15 remainder, WP-14 retry budgets, and **WP-51 (OpenTelemetry)**.
+
+**Added 2026-08-03 — WP-51, and a decision that reshapes WP-23.** Owner direction: make the
+project OTel-ready, because it is the standard. Recorded and scheduled here rather than worked
+now — v0.1.0's scope is frozen and its one open gate clause is still provider failover.
+
+The load-bearing part is not the exporter, it is the **naming decision**: WP-23's registry
+carries an **OTel-native internal model** (instruments plus attribute sets, semconv names), and
+Envoy's flat dotted names become an adapter rendered for `/stats`. Attributes are strictly more
+expressive than flat names — `envoy_cluster_provider:openai_upstream_rq_total` is derivable from
+a counter with `{cluster="provider:openai"}`, but the reverse means parsing structure back out
+of names we mangled ourselves, and Envoy's label-mangling is lossy. Half the registry is LLM
+metrics with no Envoy equivalent anyway, so an Envoy-first model would have invented names for
+them regardless.
+
+This does **not** weaken the compatibility moat: Envoy-exact `/stats` output stays a
+deliverable, and WP-23's acceptance test (Envoy's own Grafana dashboard queries against our
+output) is unchanged and is what keeps the adapter honest.
+
+One state correction worth carrying: `traceparent` already survives a hop today — headers are
+cloned per attempt and mutations only add — so we are transparent to existing traces. We simply
+do not participate in them. WP-51 is additive, not a defect fix.
 
 **Named gaps:**
 

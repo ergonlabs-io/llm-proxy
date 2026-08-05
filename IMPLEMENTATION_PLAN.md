@@ -681,6 +681,30 @@ Each WP references its normative spec sections.
 ### Lane F — Observability & admin
 
 #### WP-23 — Stats registry  (Size: M)  — **Priority: P1**
+> **Owner decision 2026-08-03 — the internal model is OTel, Envoy names are an adapter.**
+> This reverses the emphasis of the bullets below, which were written Envoy-first; they stay
+> because the Envoy-exact output is still a deliverable, but it becomes a *rendering* of the
+> registry rather than the registry's own shape. Design the instrument model as OpenTelemetry
+> — instruments plus attribute sets, semconv names — and render Envoy's flat dotted names from
+> it for `/stats`.
+> **Why this direction and not the reverse:** attributes are strictly more expressive than flat
+> names. `envoy_cluster_provider:openai_upstream_rq_total` is derivable from a counter carrying
+> `{cluster="provider:openai"}`, but recovering the attribute set from the flat string means
+> parsing structure back out of names we ourselves mangled — and Envoy's label-mangling rules
+> are lossy. Going Envoy-first would also leave the LLM metrics homeless: `gen_ai.*` token
+> counts have no Envoy equivalent to be exact about, so half the registry would have invented
+> names either way.
+> **Costs, recorded honestly:** `/stats` becomes a rendering layer needing its own conformance
+> tests (the acceptance bullet below is exactly that, and does not get easier); and the OTel
+> GenAI semantic conventions are still marked experimental upstream — they have already churned
+> once (`gen_ai.usage.prompt_tokens` → `gen_ai.usage.input_tokens`). Pin a semconv version in
+> the code and treat a bump as a breaking change to the metric surface, because for anyone with
+> a dashboard it is one.
+> **Also note ADR-0005** already names stats as a stateful subsystem: the per-worker-shard
+> approach in the bullets below is the trap that ADR calls out by name (with N workers, a
+> per-worker counter that never aggregates is wrong by the worker count). Whatever WP-23 builds
+> needs the trait + embedded-default + distributed-seam shape, and export must happen on the
+> control side — never I/O on the request path.
 - Counter/gauge/histogram registry, **Envoy-exact names**: `cluster.<name>.upstream_rq_total`,
   `upstream_rq_2xx…5xx`, `upstream_rq_retry`, `upstream_rq_timeout`, `upstream_cx_*`,
   `listener.<addr>.downstream_cx_*`, `http.<stat_prefix>.downstream_rq_*`, `rq_time` histogram
@@ -1616,6 +1640,61 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   API authenticates a real request end to end and a revoked one is refused; the upstream sees
   the *provider* credential and never the virtual key; per-tenant budget exhaustion returns 429
   with `x-ratelimit-*`; the proxy starts and serves with no external datastore configured.
+
+#### WP-51 — OpenTelemetry: traces, metric export, and semconv naming  (Size: L)  — **Priority: P1** · **Milestone: v0.2.0**
+> **Owner direction, 2026-08-03: "make the project OTel telemetry ready since it is a
+> standard."** Recorded now, scheduled later — v0.1.0's scope stays frozen (milestone hygiene
+> rule 1) and its open gate clause is still WP-35 provider failover.
+
+**Where we actually stand, measured 2026-08-03 (not assumed):**
+
+| OTel signal | State | What blocks it |
+|---|---|---|
+| Logs | Strong. 79 access-log command operators, 9 LLM-specific, structured sinks with rotation. | Names are ours, not semconv. |
+| Traces | `traceparent` **passes through** — headers are cloned per attempt and mutations only add, so we never strip it. But we emit no spans and never join the trace. | Nothing. Additive. |
+| Metrics | **Nothing exists.** `/stats` is a deliberate 404. Zero `opentelemetry`/`prometheus`/`metrics` dependencies in any `Cargo.toml`. | WP-23. |
+
+Note `proxy-observability/src/lib.rs`'s own first line calls the crate a "Stats registry with
+Envoy-exact naming (WP-23)" — there is no registry module. Aspirational doc comment, same class
+as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when this WP lands.
+
+- **Increment 1 — semconv naming for the LLM access-log operators.** Align `%LLM_INPUT_TOKENS%`,
+  `%LLM_OUTPUT_TOKENS%`, `%LLM_CACHED_TOKENS%`, `%LLM_CACHE_CREATION_TOKENS%`, `%LLM_TTFT%`,
+  `%LLM_TPOT%` to the OTel GenAI conventions (`gen_ai.usage.input_tokens`, etc.), keeping the
+  existing operator names as accepted aliases for one release.
+  **Do this first, and do it before anyone builds a dashboard.** It is the cheapest item here
+  today and the most expensive one later — renaming a metric surface after it has consumers is
+  a breaking change no matter how it is packaged.
+- **Increment 2 — trace participation.** Parse W3C `traceparent`/`tracestate` on ingress, emit a
+  server span per request and a client span per upstream *attempt* (the attempt loop is where
+  fallback and retry become visible, which is most of the diagnostic value), propagate a
+  correct child context upstream. Relate it to the existing `x-request-id` (S9) rather than
+  replacing it — Envoy parity keeps that header. Sampling decisions must be honored, not
+  invented.
+- **Increment 3 — OTLP export.** Gated on WP-23, and see WP-23's amended header: the registry's
+  internal model is OTel, so export is direct rather than a mapping. **ADR-0005 binds here** —
+  the exporter is control-side; the request path never does I/O for telemetry.
+- **The `!Send` collision, flagged early because it will surprise whoever picks this up.**
+  ADR-0003 makes the data plane `!Send` and worker-local; the OTel Rust SDK's providers and
+  batching exporters are `Send + Sync` and async. These do not compose directly. The shape that
+  works is ADR-0005's, inverted: workers write into worker-local buffers, the control side
+  aggregates and exports. Do not reach for the SDK's global provider from a worker.
+- **Dependency-tree cost.** `opentelemetry` + `opentelemetry_sdk` + `opentelemetry-otlp` is a
+  substantial subtree. `tonic`/`prost` are already present (WP-02/WP-20), so OTLP-over-gRPC is
+  cheaper here than it looks, but this should be weighed against WP-40 (dep-tree cleanup) rather
+  than landing without a look.
+- **Semconv stability, stated honestly.** The OTel GenAI conventions are still marked
+  experimental upstream and have already churned once
+  (`gen_ai.usage.prompt_tokens` → `gen_ai.usage.input_tokens`). Pin a semconv version in code;
+  treat a bump as a breaking change to the metric surface, because for anyone with a dashboard
+  it is one.
+- **Depends on:** WP-23 (increment 3 only), WP-24 (done). **Related:** WP-40 (dep tree),
+  ADR-0003, ADR-0005.
+- **Acceptance:** a scripted traffic mix produces an OTLP trace whose span tree shows one server
+  span and one client span per upstream attempt, with a fallback visible as a second client
+  span under the same server span; `traceparent` from a synthetic upstream caller is joined, not
+  replaced; token counts appear under pinned semconv names; and the Envoy-name `/stats` adapter
+  still passes WP-23's own conformance tests unchanged.
 
 ## Part 3 — Milestone gates (roll-up)
 
