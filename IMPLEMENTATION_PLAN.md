@@ -436,6 +436,39 @@ Each WP references its normative spec sections.
 - **Acceptance:** `proxy -c bootstrap.yaml --mode validate` exits 0/1 correctly; config swap
   under load test shows zero dropped connections (old snapshot Arc keeps old conns alive);
   SIGTERM drains then exits.
+- **Closure path, surveyed 2026-08-06.** Two of the three acceptance clauses pass. The third
+  is the only thing holding Lane B open (WP-07/08/09 are done), and the board's note —
+  "needs the WP-26 rig" — is true but understates one thing and overstates another.
+  1. **Overstated: this does not need WP-26's docker topology.** A config swap under live
+     connections is *already* exercised in-process by
+     `listener_removal_stops_new_accepts_but_keeps_existing_open`
+     (`proxy-core/src/listener.rs` test module): it opens a connection under v1, publishes v2
+     mid-flight, asserts the pre-existing connection stays open, and asserts a fresh
+     connection observes v2. That is the acceptance clause's exact semantic at N=1. The
+     delta to the gate is **sustained concurrent load with in-flight HTTP requests, plus a
+     zero-dropped/zero-errored accounting across the swap** — a bounded extension of an
+     existing harness, needing no docker, no pinned Envoy, and no traffic-replay topology.
+     `testing/loadgen` already supplies a driver, an SSE client, and metrics if a second
+     source of sustained load is wanted.
+  2. **Understated, and unrecorded anywhere until now: the binary cannot swap config at
+     runtime at all.** There is no SIGHUP handler, no config file watcher, and no other
+     reload trigger; `-c bootstrap.yaml` is read exactly once at startup. Every
+     `ConfigPublisher::publish` call site in the repo is inside a `#[cfg(test)]` module. The
+     propagation machinery (control-side publisher → per-worker `ArcSwap` + `watch` ping) is
+     real and unit-tested, but **nothing in production ever drives it** — its intended
+     production driver is xDS, which is v0.3.0 (WP-20/21/22).
+     So an end-to-end swap *through the binary* is not merely untested, it is not currently
+     expressible. The acceptance clause is written against the propagation machinery, not the
+     binary, so closing it at the library level is honest rather than a dodge — but the
+     binary's inability to reload is a distinct gap that no card records, and it must not be
+     allowed to hide behind a green WP-06.
+  3. **Prerequisite that is not optional:** `sigterm_drains_then_exits_cleanly`
+     (`crates/proxy/tests/cli.rs`) is flaky on timing and guards the same drain path this
+     gate depends on. A gate whose neighbouring test intermittently lies is worth little, so
+     that suite has to be made deterministic first — see CLAUDE.md rule 14 for the mechanism
+     (a hardcoded `127.0.0.1:10000` from `examples/tcp-proxy.yaml` that cannot run
+     concurrently with itself) and for why raising `STARTUP_TIMEOUT` a third time is the
+     wrong fix.
 
 #### WP-07 — Listener manager & filter-chain matching  (Size: M)  — **Priority: P1**
 - Per-worker listener sockets with `SO_REUSEPORT` (+ `reuse_port` semantics on macOS dev vs
