@@ -714,24 +714,46 @@ work_packages:
   lane: H
   size: M
   gate: G5
-  status: ready
+  status: started
   title: Model routing + provider fallback
   meta:
-  - proxy-filters
-  - ✓ UNBLOCKED — S2.8 clear_route_cache landed (ADR-0004 step 1)
-  - 'remaining dep: retry-engine wiring (WP-14) for fallback'
-  - 'MVP: model-based routing + provider fallback across OpenAI/Anthropic'
+  - proxy-filters · proxy-config · proxy-cluster · proxy-simple-config
   - >-
-    body-peek model router bullet MOVED TO WP-45 — shares its bounded-buffer machinery rather
-    than a second implementation
-  note: the dialect REJECTS `fallbacks` today — same schema-points-at-the-hole story as WP-34
+    ✓ INCREMENT 1a DONE (193444e) — ClusterConfig.request_headers_to_add, applied to the
+    per-attempt head INSIDE the router's retry loop, so credentials follow the cluster an
+    attempt actually dialed rather than the route that matched
+  - >-
+    ✓ INCREMENT 1b DONE (b1ca416) — the llmproxy dialect carries provider credentials through
+    Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]; the two route-level
+    credential assignments are gone, so a credential can no longer follow routing to a
+    fallback's endpoint
+  - >-
+    increment 2 (aggregate cluster: ClusterKind::Aggregate, member-order failover, a host pick
+    that yields its owning member so that member's transport socket + credentials apply) is IN
+    PROGRESS as of 2026-08-06 — uncommitted, unverified. NOT landed; do not read as done
+  - >-
+    ✓ WP-45 consumer B landed (872b7d7) — routing now reads `model` from the real request body
+    instead of a client-supplied header, so WP-35 has something real to route on
+  - >-
+    'remaining after increment 2: Envoy-mode cluster_type lowering, dialect lowering of
+    fallbacks:, and the retry-side work (per-provider retriable predicate, never retry after
+    the first response byte of a stream)'
+  - 'remaining dep: WP-14 retry-engine wiring for the actual failover attempt loop'
+  note: >-
+    the dialect WARNS AND DROPS `fallbacks` today, it does NOT reject it — lower.rs:575 pushes
+    a ConfigWarning and proxy/src/main.rs prints warnings to stderr and proceeds, so a
+    `fallbacks:` block parses, validates, lowers, and is dropped with one stderr line. That is
+    a materially worse failure mode than rejection, not the same thing under a different name:
+    an operator who configures failover gets a proxy that silently does not fail over. This is
+    the second time this exact wording ("REJECTS") had to be corrected — see MILESTONES.md's
+    2026-08-03 correction, which this card had not picked up until now
 - id: 45
   prio: P0
   ms: v0.1.0
   lane: H
   size: M
   gate: G5
-  status: started
+  status: done
   title: Request-body rewrite pipeline
   meta:
   - proxy-filters
@@ -764,13 +786,22 @@ work_packages:
   - >-
     ▲ real memory bound is O(cap + one chunk), not the O(cap) acceptance 4b is worded as: the
     tail of whichever chunk crosses the cap still has to be forwarded. Still not O(body)
-  - 'next: consumer B — body-based model routing (cluster header + clear_route_cache, S2.8),
-    which is what lets the dialect stop matching models on x-llmproxy-model'
-  - '✓ increments 1 + 2 complete; consumer B (body-based model routing) is what remains'
+  - >-
+    ✓ CONSUMER B DONE 2026-08-05 (872b7d7) — routes on the model in the request body via the
+    same scan/splice machinery. The header is now DERIVED, never trusted: a client-supplied
+    x-llmproxy-model is overwritten when the body names a model, and removed outright when it
+    doesn't (including the bodyless, non-JSON, and cap-exceeded paths). Acceptance criterion 5's
+    end-to-end test asserts which CLUSTER was actually dialed over a real socket, not a string
+    equality — mutation-tested by diverging the two crates' MODEL_HEADER constants (404 vs 200)
+  - >-
+    ✓ all 6 acceptance criteria met — real-upstream token extraction (1), pass-through cases
+    (2/3/4), multimodal bounded-memory (4b), and body-based routing (5) are each covered by a
+    named test; streaming non-regression (6) covered by local_openai_smoke.rs's arrival-spread
+    assertion
   note: >-
     ▲ found 2026-08-01 verifying WP-33/34 against a real upstream: the WP-33 filter runs
-    correctly on this quadrant and finds nothing. Increment 1 (the shared machinery) has
-    landed; nothing is wired to it yet
+    correctly on this quadrant and finds nothing. Increment 1 (the shared machinery) landed
+    first; WP-35's fallback work now depends on this being done, not the other way around
 - id: 42
   prio: P1
   ms: v0.2.0

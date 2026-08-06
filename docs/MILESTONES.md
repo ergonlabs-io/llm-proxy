@@ -1,6 +1,6 @@
 # Milestones — releases, and how a ticket earns its slot
 
-**Updated 2026-08-03** (v0.0.1 shipped; current milestone is v0.1.0). Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
+**Updated 2026-08-06** (v0.0.1 shipped; current milestone is v0.1.0). Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
 package is*) and the build board (which owns *what state each WP is in*). This document
 owns the third axis: **which release a piece of work belongs to, and why.**
 
@@ -149,7 +149,7 @@ filter works and finds nothing. WP-45 forces the field on. Anthropic is unaffect
 always reports usage); the gap is exactly OpenAI-dialect + streaming, which is also the
 single most common request shape.
 
-### Where the gate actually stands (updated 2026-08-03)
+### Where the gate actually stands (updated 2026-08-06)
 
 Two of the three clauses are real. **Token counts and TTFT/TPOT reach the access log** —
 WP-33 wired the usage filter per route, WP-45 forces `stream_options.include_usage` so a
@@ -158,9 +158,8 @@ alongside the existing `%LLM_TTFT%`. **A token-based rate limit is enforced** �
 limiter runs as a filter returning 429 with `x-ratelimit-*`, and the dialect's `limits` key
 lowers onto it.
 
-**Provider failover is the remaining third, and it is the whole risk.** WP-35 is `ready` with
-no code, and it depends on both WP-14's retry wiring and WP-45's still-open consumer B
-(body-based model routing). If WP-35 slips, this gate does not close.
+**Provider failover is the remaining third, and it is the whole risk.** If WP-35 slips, this
+gate does not close.
 
 **Correction, 2026-08-03: the dialect does not *reject* `fallbacks`; it warns and serves.**
 `lower.rs:527` pushes a `ConfigWarning`, and `crates/proxy/src/main.rs:183` prints warnings to
@@ -187,6 +186,19 @@ zones), and LLM providers are the heterogeneous case.
 An earlier version of this note said the dialect rejects `limits` **and** `fallbacks`. Neither
 is rejected: `limits` was made real by WP-34 increment 3 on 2026-08-02, and `fallbacks` warns
 as described above.
+
+**Update, 2026-08-06: the credential-follows-cluster precondition above is now satisfied, not
+still binding.** WP-35 increment 1a (`193444e`) added `ClusterConfig.request_headers_to_add`
+and made the router apply it to the per-attempt head inside the retry loop; increment 1b
+(`b1ca416`) made the `llmproxy` dialect emit provider credentials onto the cluster (via
+`Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`) instead of the route — the two
+route-level assignments this section described are gone from `lower.rs`. So a cross-provider
+fallback built on top of the current shape would **not** leak the primary's key to the
+fallback's endpoint. **This does not mean WP-35 is done.** The fallback mechanism itself —
+increment 2, an aggregate cluster with member-order failover and a host pick that yields its
+owning member — is in progress and, as of this update, uncommitted and unverified. WP-45's
+consumer B (body-based model routing), the other named dependency, landed 2026-08-05
+(`872b7d7`). The one dependency still open is WP-14's retry/host-repick wiring.
 
 ---
 

@@ -70,8 +70,8 @@ releases:
     Per-request token counts (input / cache-read / cache-write / output) and TTFT/TPOT reach
     the access log for live traffic; a token-based rate limit is enforced; and the proxy fails
     over from one provider to another without the client seeing an error.
-  done: 1
-  open: 5
+  done: 2
+  open: 4
   left:
   - wp: WP-46
     what: >-
@@ -80,13 +80,24 @@ releases:
       <code>%LLM_RESPONSE_CHUNKS%</code> exposing two fields that were already computed every
       stream and unreadable. This closes the access-log half of the gate's first clause; nothing
       has run a scenario asserting it end to end yet (no QA case names TPOT/max-stall).
+  - wp: WP-45
+    what: >-
+      <b>Done 2026-08-05 (872b7d7) — all 6 acceptance criteria met.</b> Consumer B (body-based
+      model routing) was the last increment: routing now reads <code>model</code> from the real
+      request body instead of a client-controlled header, which was also a privilege-escalation
+      surface. The header is DERIVED, never trusted — overwritten when the body names a model,
+      removed when it doesn't. Acceptance criterion 5's test asserts which upstream CLUSTER was
+      actually dialed over a real socket, not a string match.
   - wp: WP-35
     what: >-
-      <b>Now the dominant open item on this gate.</b> <code>ready</code>, with no code — the
-      only WP-tagged v0.1.0 item still at zero. Depends on <b>two</b> things, not one: WP-14's
-      retry/host-repick wiring for the actual failover, and WP-45's still-open "consumer B"
-      (body-based model routing) to know which model/provider a request is even targeting. Both
-      of those moved this batch; WP-35 itself did not.
+      <b>The dominant open item on this gate.</b> No longer at zero: increments 1a (193444e) and
+      1b (b1ca416) landed this batch — provider credentials now follow the CLUSTER an attempt
+      actually dialed, not the route that matched, which is what a cross-provider fallback needs
+      to not leak the primary's key to the fallback's endpoint. <b>The fallback mechanism itself
+      is still not built</b> — increment 2 (an aggregate cluster: member-order failover, a host
+      pick that yields its owning member) is in progress uncommitted as of 2026-08-06, unverified,
+      and is not represented as working anywhere on this board. WP-45's consumer B dependency is
+      now resolved (see above); WP-14's retry/host-repick wiring is the one dependency still open.
   - wp: WP-34
     what: >-
       Token rate limits. Extraction is done; the enforcement filter is built and live (429 +
@@ -96,12 +107,6 @@ releases:
       is reachable from the dialect, not just hand-written Envoy-mode config.
       <b>Remaining:</b> per-descriptor config beyond a single (route, credential) bucket —
       blocked on WP-47's vendored proto, not built yet.
-  - wp: WP-45
-    what: >-
-      Request-body rewrite pipeline. Increments 1 and 2 are both done (bounded prefix scanner +
-      splice policy; the OpenAI-only <code>stream_options.include_usage</code> filter,
-      content-length corrected, proven over real sockets). <b>Remaining: consumer B</b> —
-      body-based model routing — which is the same thing WP-35 is waiting on.
   - wp: WP-33
     what: >-
       Usage filter wired per-route into the llmproxy dialect; criterion 3 has its test
@@ -111,21 +116,28 @@ releases:
   - wp: WP-14
     what: Hedging, and the retry wiring provider fallback (WP-35) rides on.
   risk: >-
-    <b>Corrected this pass:</b> the dialect no longer rejects <code>limits</code> — WP-34
-    increment 3 landed 2026-08-02. Only <code>fallbacks</code> is still rejected under strict
-    mode, and that is WP-35 alone now. <b>WP-35 is the real exposure</b>: it is a full third of
-    this gate (mid-request provider failover), it is <code>ready</code> with nothing built, and
-    it now has two dependencies instead of one — WP-14's retry wiring <em>and</em> WP-45's
-    consumer B, both still open. Nothing on the board demonstrates the rate-limit or
-    TTFT/TPOT-log clauses of this gate end to end either; QA has no scenario for either yet, so
-    "code exists" and "gate closes" remain two different facts. <b>Second risk, named
-    2026-08-01:</b> the LLM layer is now stacking on
-    <em>serving</em> foundations that are not finished — no connection pooling (WP-15, still
-    connect-per-stream, so every request pays a fresh TLS handshake to a provider), no
+    <b>Where the three gate clauses actually stand:</b> token counts + TTFT/TPOT reaching the
+    access log is closed (WP-33 + WP-45 + WP-46). Token-based rate limiting is closed (WP-34's
+    filter enforces 429s from the dialect's <code>limits</code> key). <b>Provider failover
+    mid-request is open, and it is the whole remaining risk on this gate</b> — nothing else here
+    is in question. <b>Correction (again) this pass:</b> the dialect does not <em>reject</em>
+    <code>fallbacks</code> — it warns and drops the block, then serves traffic as if it were
+    never configured. A prior pass of these boards said "rejected," which is the same wrong
+    claim the 2026-08-03 MILESTONES.md correction already made once; it is fixed here for the
+    second time. Rejection would be safe; warn-and-drop means an operator who configures failover
+    gets a proxy that silently does not fail over. WP-35's credential-safety precondition
+    (increments 1a/1b — credentials now follow the cluster, not the route) landed this batch, but
+    the failover mechanism itself has not: the in-progress aggregate-cluster work is uncommitted
+    and unverified, and this board does not count it as done. The one WP-35 dependency still open
+    is WP-14's retry wiring. QA has no scenario for the rate-limit or TTFT/TPOT-log clauses either,
+    so "the code is live" and "an end-to-end scenario proves it" remain two different facts even
+    where the clause itself is closed. <b>Second risk, named 2026-08-01:</b> the LLM layer is now
+    stacking on <em>serving</em> foundations that are not finished — no connection pooling (WP-15,
+    still connect-per-stream, so every request pays a fresh TLS handshake to a provider), no
     downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure
-    (WP-11). v0.0.1 proved the path carries <em>a</em> request; none of those three are
-    exercised by four smoke requests, and all three bite under concurrency, sustained streams,
-    or a slow consumer.
+    (WP-11). v0.0.1 proved the path carries <em>a</em> request; none of those three are exercised
+    by four smoke requests, and all three bite under concurrency, sustained streams, or a slow
+    consumer.
 - v: v0.2.0
   name: Production-ready serving
   state: later

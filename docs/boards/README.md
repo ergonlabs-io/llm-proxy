@@ -23,6 +23,23 @@ Those are the real published pages with their data array replaced by a
 `/*__DATA__*/` marker; rendering splices JSON into that spot and changes
 nothing else.
 
+### The templates carry prose, and NOTHING validates it
+
+`make boards-check` compares the rendered **data array** against the YAML. The
+narrative around the cards — the eyebrow line, the "Now" block, the ship-gate
+summary — lives in the template and is checked by no tool and no schema. It
+therefore rots silently while every automated check stays green.
+
+This is not hypothetical. On 2026-08-06 the build-board template still read
+*"v0.0.1 gate is unchanged: still red"* eleven lines below its own
+*"v0.0.1 shipped 2026-08-01"*, and still said provider failover *"has no code
+yet"* after two of its increments had landed. Both survived a board refresh
+that same day, because the refresh audited the YAML and the YAML was right.
+
+**So: every board refresh must re-read the template prose against the data it
+sits next to.** The eyebrow's WP count, test count and date are part of that —
+and a test count must come from an actual run, never from the previous value.
+
 ## Why this is generated
 
 These pages were maintained by editing ~50KB of HTML in place. One refresh cost
