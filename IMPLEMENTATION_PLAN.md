@@ -893,6 +893,42 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
   to provider B must carry B's `Authorization` (and `anthropic-version`, and B's
   `extra_headers`) and must **not** carry A's. Assert the negative explicitly — asserting only
   that B's key is present passes just as well when both are sent.
+- **The retry half of this WP is smaller than the bullets above imply (surveyed 2026-08-06,
+  while increment 2 was in flight).** Two of the three retry-side deliverables turn out to
+  need no new mechanism, and saying so is worth more than building them twice:
+  1. **"Custom retriable predicate: 429" needs no new IR.** An upstream 429 is already
+     expressible Envoy-natively as `retry_on: retriable-status-codes` plus
+     `retriable_status_codes: [429]`, and both fields exist on `RetryPolicyIR`
+     (`ir.rs:836-839`) and are honored by `trigger_fires` (`retry.rs:103`). Note that
+     Envoy's `envoy-ratelimited` token is *not* this — it fires on the local ratelimit
+     filter's own 429, not an upstream's. Combined with increment 2's `attempted_clusters`
+     skip, a 429 from provider A retries onto provider B with nothing new in the retry
+     engine. What remains is the dialect lowering `fallbacks:` to exactly this policy.
+  2. **"Never retry after the first response byte of a stream" is already true by
+     construction.** The router returns at `router.rs:585` the moment response *headers*
+     arrive, handing back a streaming body; there is no retry decision anywhere after that
+     point, so no byte forwarded downstream can ever be followed by a second attempt. The
+     one post-headers retry that does exist (a retriable status, `router.rs:560`) drains the
+     failed attempt's body first and has forwarded nothing downstream, which is
+     Envoy-correct. `AttemptOutcome::ResetAfterHeaders` is therefore unreachable from the
+     router's own paths today.
+     **So this deliverable is a regression test, not a mechanism** — and it should still be
+     written, because the property is currently an emergent consequence of where the
+     `return` sits rather than a stated invariant. Anyone later adding mid-stream retry (a
+     reasonable-sounding feature) would silently double-bill tokens and hand the client
+     duplicated content, and nothing in the suite would object.
+- **Cross-cluster validation has no home yet, and increment 2b needs one.** `lower_bootstrap`
+  converts clusters one at a time (`lower.rs:82-95`); nothing ever looks at the assembled
+  cluster map. An aggregate naming a member that does not exist — or naming another aggregate,
+  which the manager refuses to recurse into — is exactly the class of error that must fail at
+  config time with a dotted path (ground rule #1) rather than degrade into a 503 at runtime.
+  **Decision: a `validate_cluster_graph` post-pass after the cluster loop**, which both
+  front-ends inherit for free since the dialect lowers through this same pipeline. Also note
+  `envoy/extensions/clusters/aggregate/v3/cluster.proto` is vendored but **not** in
+  `proxy-api/build.rs`'s roots list, so its type URL does not resolve today; 2b must add it,
+  as that file's own comment instructs. And Envoy *requires* `lb_policy: CLUSTER_PROVIDED` on
+  an aggregate cluster, which the IR's `LbPolicy` has no variant for and `convert_cluster`
+  currently rejects.
 
 #### WP-36 — Gateway API Inference Extension (EPP) support  (Size: M)  — **Priority: P2**
 - Implement the Endpoint Picker protocol as consumed by Envoy AI Gateway / GKE Inference
