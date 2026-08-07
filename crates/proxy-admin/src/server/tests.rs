@@ -12,10 +12,11 @@ use hyper::client::conn::http1 as client_http1;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy_config::ir::{
-    ClusterConfig, ConfigSnapshot, DiscoveryType, EndpointIR, FilterChainMatch, FilterChainSpec,
-    ForwardAction, ForwardTarget, HeaderAppendAction, HeaderMutation, HttpConnectionManagerConfig,
-    HttpFilterSpec, LbPolicy, ListenerConfig, NetworkFilterSpec, PathMatch, RouteActionIR,
-    RouteEntry, RouteMatcher, RouteTable, SnapshotVersion, UpstreamProtocol, VirtualHostIR,
+    ClusterConfig, ClusterKind, ConfigSnapshot, DiscoveryType, EndpointIR, FilterChainMatch,
+    FilterChainSpec, ForwardAction, ForwardTarget, HeaderAppendAction, HeaderMutation,
+    HttpConnectionManagerConfig, HttpFilterSpec, LbPolicy, ListenerConfig, NetworkFilterSpec,
+    PathMatch, RouteActionIR, RouteEntry, RouteMatcher, RouteTable, SnapshotVersion,
+    UpstreamProtocol, VirtualHostIR,
 };
 use proxy_core::WorkerConfigHandle;
 use tokio::net::TcpStream;
@@ -107,6 +108,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
             weight: 1,
             priority: 0,
         }],
+        kind: ClusterKind::Endpoints,
         transport_socket: None,
         per_connection_buffer_limit_bytes: 1024 * 1024,
         circuit_breakers: Default::default(),

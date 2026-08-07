@@ -121,7 +121,7 @@ async fn logical_dns_hosts(
 mod tests {
     use super::*;
     use crate::resolver::FakeResolver;
-    use proxy_config::ir::LbPolicy;
+    use proxy_config::ir::{ClusterKind, LbPolicy};
     use std::time::Duration as StdDuration;
 
     fn cluster(discovery: DiscoveryType, endpoints: Vec<EndpointIR>) -> ClusterConfig {
@@ -131,6 +131,7 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: StdDuration::from_secs(5),
             endpoints,
+            kind: ClusterKind::Endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: Default::default(),

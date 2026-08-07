@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use proxy_config::ir::{ClusterConfig, ClusterName, EndpointIR, LbPolicy};
+use proxy_config::ir::{ClusterConfig, ClusterKind, ClusterName, EndpointIR, LbPolicy};
 
 use crate::discovery;
 use crate::host_set::{diff_host_sets, HostSet, HostSetDiff};
@@ -26,8 +26,8 @@ use crate::transport::{
     self, TransportSocketBuilder, TransportSocketError, UpstreamTransportSocket,
 };
 use crate::{
-    CircuitBreakerState, ClusterEntry, Host, HttpConnPool, LoadBalancerContext, RoutingPriority,
-    UpstreamProtocol,
+    CircuitBreakerState, ClusterEntry, Host, HostSelection, HttpConnPool, LoadBalancerContext,
+    RoutingPriority, SelectedMember, UpstreamProtocol,
 };
 
 /// Failure to build a cluster: either its `lb_policy` isn't implemented
@@ -64,12 +64,18 @@ enum ClusterSource {
 /// Rust note: `ArcSwap<HostSet>` is the same "control computes, workers
 /// swap" pattern `proxy_core::WorkerConfigHandle` uses for `ConfigSnapshot`
 /// (ADR-0003) -- discovery recomputes whole host sets on the control
-/// runtime; readers (`pick_host`) only ever `load`.
+/// runtime; readers (`select_host`) only ever `load`.
+///
+/// For an aggregate cluster (`ClusterConfig::kind` is `Aggregate`),
+/// `host_set`/`host_picker`/`transport`/`upstream_protocol` below are all
+/// inert placeholders -- see [`ManagedCluster::from_config`]'s aggregate arm.
 struct ManagedCluster {
     source: ClusterSource,
     host_set: ArcSwap<HostSet>,
     /// Flips to `true` once the cluster's first resolution (or, for EDS, its
-    /// first externally-supplied set) has landed.
+    /// first externally-supplied set) has landed. Also `true` from
+    /// construction for an aggregate, which has nothing of its own to
+    /// resolve (see `from_config`'s aggregate arm).
     initialized: AtomicBool,
     /// S7 host selection: the configured `lb_policy`'s [`LoadBalancer`],
     /// plus the priority-spillover / healthy-panic-threshold logic shared by
@@ -81,7 +87,9 @@ struct ManagedCluster {
     host_picker: HostPicker,
     /// S5 circuit-breaker budgets for this cluster, one bucket per routing
     /// priority; these are the buckets `ClusterEntry::circuit_breaker` hands
-    /// back.
+    /// back. An aggregate's members therefore share the aggregate's own
+    /// budget today -- see `router.rs`'s `apply_forward` for where that's
+    /// acquired.
     default_cb: CircuitBreakerState,
     high_cb: CircuitBreakerState,
     /// Which HTTP protocol the router speaks to this cluster's upstreams.
@@ -97,33 +105,65 @@ struct ManagedCluster {
 }
 
 impl ManagedCluster {
-    /// Builds a config-sourced cluster's state, including its load balancer
-    /// and transport socket -- fails if `config.lb_policy` isn't implemented
-    /// yet (`RING_HASH`/`MAGLEV`, see [`load_balancer::build`]) or if
-    /// `config.transport_socket` doesn't build (bad TLS config); ground rule
-    /// #1 forbids silently substituting another policy or downgrading to
-    /// plaintext.
+    /// Builds a config-sourced cluster's state. Branches on `config.kind`:
+    /// an `Endpoints` cluster gets a real load balancer and transport socket
+    /// (failing if `config.lb_policy` isn't implemented yet -- `RING_HASH`/
+    /// `MAGLEV`, see [`load_balancer::build`] -- or if `config.transport_socket`
+    /// doesn't build; ground rule #1 forbids silently substituting another
+    /// policy or downgrading to plaintext); an `Aggregate` cluster has no
+    /// hosts, load balancer, or transport socket of its own to build at all
+    /// (see the aggregate arm below).
     fn from_config(
         config: Arc<ClusterConfig>,
         transport_builder: &TransportSocketBuilder,
     ) -> Result<Self, ClusterBuildError> {
-        let policy = load_balancer::build(config.lb_policy)?;
-        let transport = transport_builder(&config)?;
         let default_cb = CircuitBreakerState::from_thresholds(config.circuit_breakers.default);
         let high_cb = CircuitBreakerState::from_thresholds(config.circuit_breakers.high);
-        // Read + map (IR → runtime enum) before `config` is moved into
-        // `source` below.
-        let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
-        Ok(Self {
-            source: ClusterSource::Config(config),
-            host_set: ArcSwap::from_pointee(HostSet::default()),
-            initialized: AtomicBool::new(false),
-            host_picker: HostPicker::new(policy),
-            default_cb,
-            high_cb,
-            upstream_protocol,
-            transport,
-        })
+        match &config.kind {
+            ClusterKind::Endpoints => {
+                let policy = load_balancer::build(config.lb_policy)?;
+                let transport = transport_builder(&config)?;
+                // Read + map (IR → runtime enum) before `config` is moved
+                // into `source` below.
+                let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
+                Ok(Self {
+                    source: ClusterSource::Config(config),
+                    host_set: ArcSwap::from_pointee(HostSet::default()),
+                    initialized: AtomicBool::new(false),
+                    host_picker: HostPicker::new(policy),
+                    default_cb,
+                    high_cb,
+                    upstream_protocol,
+                    transport,
+                })
+            }
+            ClusterKind::Aggregate { .. } => {
+                // WP-35 increment 2a: `select_host` never reads this
+                // cluster's own `host_set`/`host_picker`/`transport`/
+                // `upstream_protocol` for an aggregate -- it resolves
+                // straight through to whichever member actually served the
+                // host (see `ClusterHandle::select_aggregate_member`) -- so
+                // `RoundRobin`/`RawTransportSocket`/`Http1` here are inert
+                // placeholders, never real answers, exactly like `eds()`'s
+                // defaults below. `initialized` starts `true`: there is
+                // nothing here to resolve, and leaving it `false` would make
+                // WP-21 warming wait forever on a cluster that never runs
+                // discovery.
+                Ok(Self {
+                    source: ClusterSource::Config(config),
+                    host_set: ArcSwap::from_pointee(HostSet::default()),
+                    initialized: AtomicBool::new(true),
+                    host_picker: HostPicker::new(
+                        load_balancer::build(LbPolicy::RoundRobin)
+                            .expect("round robin always builds"),
+                    ),
+                    default_cb,
+                    high_cb,
+                    upstream_protocol: UpstreamProtocol::Http1,
+                    transport: Arc::new(transport::RawTransportSocket),
+                })
+            }
+        }
     }
 
     /// EDS clusters have no `ClusterConfig`/`lb_policy` of their own (see
@@ -144,6 +184,29 @@ impl ManagedCluster {
             transport: Arc::new(transport::RawTransportSocket),
         }
     }
+
+    /// True for an aggregate cluster (`ClusterConfig::kind` is `Aggregate`).
+    /// [`ClusterHandle::select_aggregate_member`] uses this to refuse
+    /// recursing into a member that is itself an aggregate.
+    fn is_aggregate(&self) -> bool {
+        matches!(
+            &self.source,
+            ClusterSource::Config(c) if matches!(c.kind, ClusterKind::Aggregate { .. })
+        )
+    }
+
+    /// This cluster's aggregate member list, in config order -- `None` for
+    /// anything [`Self::is_aggregate`] says isn't one (an `Endpoints`
+    /// cluster, or an EDS cluster, which has no `ClusterConfig` at all).
+    fn aggregate_members(&self) -> Option<&[ClusterName]> {
+        match &self.source {
+            ClusterSource::Config(c) => match &c.kind {
+                ClusterKind::Aggregate { members } => Some(members),
+                ClusterKind::Endpoints => None,
+            },
+            ClusterSource::Eds => None,
+        }
+    }
 }
 
 fn not_found(name: &str) -> io::Error {
@@ -155,7 +218,20 @@ fn not_found(name: &str) -> io::Error {
 /// single manager can be shared (`Arc<ClusterManager>`) between whatever
 /// drives config reloads and whatever drives DNS refresh timers.
 pub struct ClusterManager {
-    clusters: ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>,
+    // Rust note: wrapped in an extra `Arc` around the `ArcSwap` (not just
+    // `ArcSwap<..>` directly) so a [`ClusterHandle`] can hold a *clone of
+    // this exact registry* rather than a snapshot of what it pointed to when
+    // the handle was built. That's what makes aggregate member resolution
+    // late-bound: `Arc::clone` here is just a refcount bump (the `ArcSwap`
+    // itself, and the `HashMap` it wraps, are never copied), and every clone
+    // still `.load()`s whatever `update_from_snapshot` most recently
+    // published. Late binding matters because `update_from_snapshot`
+    // rebuilds every config-sourced cluster wholesale on every call (see its
+    // own doc) -- a member resolved *eagerly*, at the aggregate's own
+    // construction time, would keep pointing at a specific `Arc<ManagedCluster>`
+    // that the very next reload replaces, silently freezing that member's
+    // discovery even though the config for it kept updating.
+    clusters: Arc<ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>>,
     resolver: Arc<dyn HostResolver>,
     transport_builder: TransportSocketBuilder,
 }
@@ -163,7 +239,7 @@ pub struct ClusterManager {
 impl ClusterManager {
     pub fn new(resolver: Arc<dyn HostResolver>, transport_builder: TransportSocketBuilder) -> Self {
         Self {
-            clusters: ArcSwap::from_pointee(HashMap::new()),
+            clusters: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             resolver,
             transport_builder,
         }
@@ -295,6 +371,16 @@ impl ClusterManager {
             .ok_or_else(|| not_found(name))?;
         let config = match &managed.source {
             ClusterSource::Eds => return Ok(HostSetDiff::default()),
+            // An aggregate has no endpoints/discovery of its own to
+            // resolve -- an explicit no-op arm, the same as `Eds` above,
+            // not a resolve of zero endpoints (which would go through
+            // `discovery::resolve` and diff against an always-empty set for
+            // no reason).
+            ClusterSource::Config(config)
+                if matches!(config.kind, ClusterKind::Aggregate { .. }) =>
+            {
+                return Ok(HostSetDiff::default())
+            }
             ClusterSource::Config(config) => config,
         };
         let new_set = discovery::resolve(config, self.resolver.as_ref()).await?;
@@ -307,11 +393,16 @@ impl ClusterManager {
     /// The router-facing handle for a cluster, or `None` if no cluster with
     /// that name is currently known.
     pub fn cluster(&self, name: &str) -> Option<Arc<dyn ClusterEntry>> {
-        self.clusters
-            .load()
-            .get(name)
-            .cloned()
-            .map(|managed| Arc::new(ClusterHandle(managed)) as Arc<dyn ClusterEntry>)
+        self.clusters.load().get(name).cloned().map(|managed| {
+            Arc::new(ClusterHandle {
+                managed,
+                // Rust note: cloning the `Arc<ArcSwap<..>>` itself (not the
+                // map it currently points at) -- see `ClusterManager::clusters`'s
+                // doc for why this is what makes aggregate member lookups
+                // late-bound.
+                registry: Arc::clone(&self.clusters),
+            }) as Arc<dyn ClusterEntry>
+        })
     }
 
     /// Whether a cluster's first resolution/EDS update has landed (or it was
@@ -337,13 +428,101 @@ impl ClusterManager {
 }
 
 /// The router-facing view of one cluster (implements [`ClusterEntry`]).
-/// Cheap to clone -- it's just an `Arc` to the manager's internal state.
-struct ClusterHandle(Arc<ManagedCluster>);
+/// Cheap to clone -- both fields are `Arc`s.
+struct ClusterHandle {
+    managed: Arc<ManagedCluster>,
+    /// A clone of the manager's own registry `Arc<ArcSwap<..>>` -- used only
+    /// by the aggregate arm of [`ClusterEntry::select_host`]
+    /// ([`Self::select_aggregate_member`]) to resolve a member *name* to its
+    /// *current* [`ManagedCluster`] at pick time. See
+    /// `ClusterManager::clusters`'s doc for why late binding matters here.
+    registry: Arc<ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>>,
+}
+
+impl ClusterHandle {
+    /// The aggregate host-selection algorithm (WP-35): walk `members` in
+    /// config order, skipping any name already in `ctx.attempted_clusters`
+    /// (so a retry falls over instead of re-picking the member that just
+    /// failed); for each remaining candidate, resolve it against the
+    /// *current* registry, skip it (logging, not erroring -- a transient
+    /// config-reload race is real) if it isn't currently registered or is
+    /// itself an aggregate, and otherwise ask that member's own
+    /// [`HostPicker`] for a host from its own host set. The first member
+    /// that yields a host wins.
+    ///
+    /// A member that is itself an aggregate is never followed -- WP-35
+    /// increment 2a deliberately does not support nested aggregates, and
+    /// refusing to recurse makes a member cycle structurally impossible
+    /// rather than something this loop has to detect.
+    ///
+    /// Deliberate divergence from Envoy: each member's own `HostPicker`
+    /// still applies that member's full S7 logic (panic threshold, priority
+    /// spillover, overprovisioning) *within* that member, but this loop does
+    /// **not** implement Envoy's cross-member combined priority set, where a
+    /// member at partial health bleeds a *fraction* of traffic across the
+    /// member boundary. This is strict member-order failover: a member is
+    /// skipped only when it yields no host at all. For LLM provider
+    /// fallback that's the wanted semantic -- nobody wants a silent 40% of
+    /// traffic quietly landing on the fallback provider (with its own
+    /// billing and rate limits) just because the primary is partially
+    /// degraded -- but it is coarser than Envoy for the homogeneous
+    /// same-service-different-zone failover Envoy's aggregate cluster was
+    /// originally designed for.
+    fn select_aggregate_member(
+        &self,
+        members: &[ClusterName],
+        ctx: &LoadBalancerContext,
+    ) -> Option<HostSelection> {
+        let registry = self.registry.load();
+        for name in members {
+            if ctx.attempted_clusters.contains(name) {
+                continue;
+            }
+            let Some(member) = registry.get(name) else {
+                tracing::warn!(
+                    cluster = %name,
+                    "aggregate member not found in cluster registry (config-reload race?), skipping"
+                );
+                continue;
+            };
+            if member.is_aggregate() {
+                tracing::warn!(
+                    cluster = %name,
+                    "aggregate member is itself an aggregate cluster; nested aggregates are not \
+                     supported (WP-35 increment 2a), skipping"
+                );
+                continue;
+            }
+            let host_set = member.host_set.load();
+            if let Some(host) = member.host_picker.pick(&host_set, ctx) {
+                return Some(HostSelection {
+                    host,
+                    member: Some(SelectedMember {
+                        name: name.clone(),
+                        entry: Arc::new(ClusterHandle {
+                            managed: Arc::clone(member),
+                            registry: Arc::clone(&self.registry),
+                        }),
+                    }),
+                });
+            }
+        }
+        None
+    }
+}
 
 impl ClusterEntry for ClusterHandle {
-    fn pick_host(&self, ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
-        let host_set = self.0.host_set.load();
-        self.0.host_picker.pick(&host_set, ctx)
+    fn select_host(&self, ctx: &LoadBalancerContext) -> Option<HostSelection> {
+        match self.managed.aggregate_members() {
+            None => {
+                let host_set = self.managed.host_set.load();
+                self.managed
+                    .host_picker
+                    .pick(&host_set, ctx)
+                    .map(|host| HostSelection { host, member: None })
+            }
+            Some(members) => self.select_aggregate_member(members, ctx),
+        }
     }
 
     fn http_pool(&self, host: &Arc<Host>, _proto: UpstreamProtocol) -> Arc<dyn HttpConnPool> {
@@ -359,27 +538,32 @@ impl ClusterEntry for ClusterHandle {
             .unwrap_or_else(|| host.address.ip().to_string());
         Arc::new(crate::pool::ConnectPool::new(
             host.address,
-            Arc::clone(&self.0.transport),
+            Arc::clone(&self.managed.transport),
             server_name,
         ))
     }
 
     fn upstream_protocol(&self) -> UpstreamProtocol {
-        self.0.upstream_protocol
+        self.managed.upstream_protocol
     }
 
     fn circuit_breaker(&self, prio: RoutingPriority) -> &CircuitBreakerState {
         match prio {
-            RoutingPriority::Default => &self.0.default_cb,
-            RoutingPriority::High => &self.0.high_cb,
+            RoutingPriority::Default => &self.managed.default_cb,
+            RoutingPriority::High => &self.managed.high_cb,
         }
     }
 
     fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation] {
         // EDS clusters have no `ClusterConfig` (see `ClusterSource::Eds`), so
         // there's nowhere for this to come from -- empty, same as the
-        // `upstream_protocol`/`transport` defaults above.
-        match &self.0.source {
+        // `upstream_protocol`/`transport` defaults above. An aggregate's own
+        // `request_headers_to_add` is likewise never read here: the router
+        // calls this on the *member's* entry (`HostSelection::member`), not
+        // the aggregate's, so this arm never actually executes for an
+        // aggregate in practice -- but it stays correct (empty) rather than
+        // panicking if it ever did.
+        match &self.managed.source {
             ClusterSource::Config(config) => &config.request_headers_to_add,
             ClusterSource::Eds => &[],
         }
@@ -405,6 +589,29 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
             endpoints,
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+        })
+    }
+
+    /// An aggregate cluster over `members`, in the given order -- WP-35's
+    /// fallback construct. `endpoints`/`discovery` are unused for an
+    /// aggregate (see `ClusterKind::Aggregate`'s doc) but still need
+    /// *something* syntactically valid to satisfy `ClusterConfig`'s shape.
+    fn aggregate_config(name: &str, members: &[&str]) -> Arc<ClusterConfig> {
+        Arc::new(ClusterConfig {
+            name: name.to_string(),
+            discovery: DiscoveryType::Static,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints: Vec::new(),
+            kind: ClusterKind::Aggregate {
+                members: members.iter().map(|m| m.to_string()).collect(),
+            },
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: Default::default(),
@@ -548,8 +755,174 @@ mod tests {
         let ctx = LoadBalancerContext::default();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..4 {
-            seen.insert(entry.pick_host(&ctx).unwrap().address);
+            let sel = entry.select_host(&ctx).unwrap();
+            // A non-aggregate cluster's pick never carries a `member` --
+            // the entry the caller already holds is the owner, so there's
+            // nothing further to resolve.
+            assert!(sel.member.is_none());
+            seen.insert(sel.host.address);
         }
         assert_eq!(seen.len(), 2);
+    }
+
+    // --------------------------------------------------- WP-35 aggregate ---
+
+    /// Build a manager with two `Endpoints` clusters `"a"`/`"b"` (each one
+    /// healthy host) plus an aggregate `"providers"` over `["a", "b"]`.
+    async fn aggregate_over_a_and_b(a_endpoints: Vec<EndpointIR>) -> ClusterManager {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config("a", DiscoveryType::Static, a_endpoints),
+        );
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.2", 80)]),
+        );
+        snapshot.insert(
+            "providers".to_string(),
+            aggregate_config("providers", &["a", "b"]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        manager
+    }
+
+    #[tokio::test]
+    async fn aggregate_selects_the_first_member_with_a_healthy_host() {
+        let manager = aggregate_over_a_and_b(vec![endpoint("10.0.0.1", 80)]).await;
+        let entry = manager.cluster("providers").unwrap();
+
+        let ctx = LoadBalancerContext::default();
+        let sel = entry.select_host(&ctx).expect("aggregate should serve a");
+        assert_eq!(
+            sel.host.address,
+            SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80)
+        );
+        let member = sel.member.expect("aggregate pick must carry its member");
+        assert_eq!(member.name, "a");
+    }
+
+    #[tokio::test]
+    async fn aggregate_falls_over_to_the_next_member_when_the_first_has_no_hosts() {
+        // "a" configured with no endpoints at all -- an empty host set.
+        let manager = aggregate_over_a_and_b(Vec::new()).await;
+        let entry = manager.cluster("providers").unwrap();
+
+        let ctx = LoadBalancerContext::default();
+        let sel = entry.select_host(&ctx).expect("aggregate should serve b");
+        assert_eq!(
+            sel.host.address,
+            SocketAddr::new(IpAddr::from([10, 0, 0, 2]), 80)
+        );
+        let member = sel.member.expect("aggregate pick must carry its member");
+        assert_eq!(member.name, "b");
+    }
+
+    #[tokio::test]
+    async fn aggregate_skips_members_already_attempted_this_request() {
+        let manager = aggregate_over_a_and_b(vec![endpoint("10.0.0.1", 80)]).await;
+        let entry = manager.cluster("providers").unwrap();
+
+        let ctx = LoadBalancerContext {
+            attempted_clusters: vec!["a".to_string()],
+            ..Default::default()
+        };
+        let sel = entry
+            .select_host(&ctx)
+            .expect("aggregate should fall over to b");
+        assert_eq!(sel.member.unwrap().name, "b");
+
+        let ctx_exhausted = LoadBalancerContext {
+            attempted_clusters: vec!["a".to_string(), "b".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            entry.select_host(&ctx_exhausted).is_none(),
+            "every member already attempted -- no host to serve"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_member_resolution_is_late_bound_across_a_reload() {
+        let manager = aggregate_over_a_and_b(vec![endpoint("10.0.0.1", 80)]).await;
+        let entry = manager.cluster("providers").unwrap();
+
+        // Force "a" out so only "b" can serve, then reload "b" to point at a
+        // different address entirely.
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config("a", DiscoveryType::Static, Vec::new()),
+        );
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.99", 80)]),
+        );
+        snapshot.insert(
+            "providers".to_string(),
+            aggregate_config("providers", &["a", "b"]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+
+        // The SAME `entry`, obtained before the reload, must still see the
+        // new address -- proving member resolution isn't pinned to whatever
+        // `ManagedCluster` existed when the aggregate's handle was built.
+        let ctx = LoadBalancerContext::default();
+        let sel = entry.select_host(&ctx).expect("aggregate should serve b");
+        assert_eq!(
+            sel.host.address,
+            SocketAddr::new(IpAddr::from([10, 0, 0, 99]), 80)
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_skips_a_member_name_that_resolves_to_no_cluster() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.2", 80)]),
+        );
+        // "a" is named as a member but never registered.
+        snapshot.insert(
+            "providers".to_string(),
+            aggregate_config("providers", &["a", "b"]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("providers").unwrap();
+
+        let ctx = LoadBalancerContext::default();
+        let sel = entry
+            .select_host(&ctx)
+            .expect("aggregate should skip the missing member and serve b");
+        assert_eq!(sel.member.unwrap().name, "b");
+    }
+
+    #[tokio::test]
+    async fn aggregate_skips_a_member_that_is_itself_an_aggregate() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.2", 80)]),
+        );
+        // "inner" is itself an aggregate -- must not be recursed into.
+        snapshot.insert("inner".to_string(), aggregate_config("inner", &["b"]));
+        snapshot.insert(
+            "providers".to_string(),
+            aggregate_config("providers", &["inner", "b"]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("providers").unwrap();
+
+        let ctx = LoadBalancerContext::default();
+        let sel = entry
+            .select_host(&ctx)
+            .expect("aggregate should skip the nested aggregate and serve b");
+        assert_eq!(sel.member.unwrap().name, "b");
     }
 }

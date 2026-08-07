@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use proxy_cluster::manager::ClusterManager;
 use proxy_config::ir::{
-    CaSource, ClusterConfig, DataSourceIR, DownstreamTlsSpec, TlsCertificateIR, TlsParametersIR,
-    TlsVersion, UpstreamTlsSpec, ValidationContextIR,
+    CaSource, ClusterConfig, ClusterKind, DataSourceIR, DownstreamTlsSpec, TlsCertificateIR,
+    TlsParametersIR, TlsVersion, UpstreamTlsSpec, ValidationContextIR,
 };
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, ConfigSnapshot, StrictMode};
 use proxy_core::drain::ConnectionRegistry;
@@ -548,6 +548,7 @@ async fn strict_mode_cluster_manager_rejects_a_tls_cluster_without_a_transport_s
             weight: 1,
             priority: 0,
         }],
+        kind: ClusterKind::Endpoints,
         transport_socket: Some(UpstreamTlsSpec {
             sni: Some("upstream.test".to_string()),
             params: default_params(),

@@ -21,9 +21,9 @@ use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::resolver::FakeResolver;
 use proxy_config::ir::{
-    ClusterConfig, ClusterName, DiscoveryType, EndpointIR, ForwardAction, ForwardTarget,
-    HeaderAppendAction, HeaderMutation, LbPolicy, PathMatch, RouteActionIR, RouteEntry,
-    RouteMatcher, RouteTable, VirtualHostIR,
+    ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, ForwardAction,
+    ForwardTarget, HeaderAppendAction, HeaderMutation, LbPolicy, PathMatch, RouteActionIR,
+    RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
 };
 use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
@@ -99,6 +99,7 @@ async fn build_router_with_cluster_mutations(
                 weight: 1,
                 priority: 0,
             }],
+            kind: ClusterKind::Endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: proxy_config::ir::CircuitBreakers::default(),

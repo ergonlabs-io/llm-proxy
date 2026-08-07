@@ -297,8 +297,9 @@ impl LoadBalancer for LeastRequestLb {
 
 /// Combines a policy-specific [`LoadBalancer`] with the priority-spillover /
 /// healthy-panic-threshold behavior that's identical across every policy
-/// (S7). This is the single path [`crate::manager::ClusterHandle::pick_host`]
-/// calls into, so that shared behavior can't drift between policies.
+/// (S7). This is the single path a non-aggregate cluster's
+/// `ClusterEntry::select_host` (and, per-member, an aggregate's) calls into,
+/// so that shared behavior can't drift between policies.
 pub struct HostPicker {
     policy: Box<dyn LoadBalancer>,
     // Rust note: which priority a given request lands on is itself a
@@ -671,6 +672,7 @@ mod tests {
         let ctx = LoadBalancerContext {
             hash: None,
             host_override: Some(addr(2)),
+            attempted_clusters: Vec::new(),
         };
         for _ in 0..5 {
             assert_eq!(picker.pick(&set, &ctx).unwrap().address, addr(2));
@@ -684,6 +686,7 @@ mod tests {
         let ctx = LoadBalancerContext {
             hash: None,
             host_override: Some(addr(99)),
+            attempted_clusters: Vec::new(),
         };
         let picked = picker.pick(&set, &ctx).unwrap();
         assert!(picked.address == addr(1) || picked.address == addr(2));

@@ -61,7 +61,9 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
-use proxy_cluster::{LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol};
+use proxy_cluster::{
+    ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
+};
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher};
 use proxy_observability::ResponseFlag;
 
@@ -326,6 +328,13 @@ impl RouterHandler {
         // `send`. With no retry policy the loop runs exactly once, so this is
         // unobservable from a no-retry route's point of view.
         //
+        // WP-35: built once, outside the loop (not fresh per attempt like
+        // `attempt_head` below), because `attempted_clusters` has to
+        // accumulate *across* attempts -- an aggregate's second attempt
+        // needs to see the first attempt's pick to skip it. `mut` because
+        // the loop pushes onto it after every pick.
+        let mut ctx = LoadBalancerContext::default();
+
         // Rust note: this `async` block (no `move`) captures `dcb` (a `&mut
         // dyn DecoderCallbacks`) by unique reborrow, not by value -- so once
         // this future is dropped (whether by completing or by the outer
@@ -340,6 +349,17 @@ impl RouterHandler {
                 // (a retry) drops it and the next attempt acquires fresh --
                 // exactly what "an attempt is free to land on a different
                 // host" implies for its circuit-breaker accounting too.
+                //
+                // WP-35: deliberately still `entry` (the *routed* cluster),
+                // not the not-yet-known `attempt_entry` a few lines below --
+                // this matches Envoy, whose `Router::Filter` checks the
+                // routed cluster's `max_requests` before any host selection
+                // even runs, not the eventually-dialed host's cluster.
+                // Concretely: today an aggregate's members all share the
+                // aggregate's own `max_requests` budget (there is no
+                // per-member budget to acquire instead -- S5's other three
+                // budgets are connection-pool-level, WP-15, and likewise
+                // untouched by which member ends up dialed).
                 let cb = entry.circuit_breaker(RoutingPriority::Default);
                 let Some(rq_guard) = cb.try_acquire_request() else {
                     tracing::debug!(response_flag = "UO", cluster = %cluster_name, "circuit breaker: max_requests exceeded");
@@ -353,15 +373,41 @@ impl RouterHandler {
                     return resp;
                 };
 
-                let ctx = LoadBalancerContext::default();
-                let Some(host) = entry.pick_host(&ctx) else {
+                let Some(sel) = entry.select_host(&ctx) else {
                     tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
                     dcb.stream_info()
                         .set_response_flag(ResponseFlag::NoHealthyUpstream);
                     return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
                 };
+                let host = sel.host;
+                // WP-35: `entry` is the *routed* cluster (a plain cluster,
+                // or an aggregate); `sel.member` is set only when `entry` is
+                // an aggregate and names the member that actually owns
+                // `host`. Everything from here on -- protocol, pool,
+                // credentials, `%UPSTREAM_CLUSTER%` -- has to come from
+                // whichever cluster owns the host, never from `entry`
+                // itself, or an aggregate's members would share the
+                // aggregate's (empty) credentials instead of their own.
+                //
+                // Rust note: `attempt_entry` reborrows either
+                // `sel.member`'s `Arc<dyn ClusterEntry>` (`.as_ref()`) or
+                // the outer `entry: Arc<dyn ClusterEntry>` (`.as_ref()`) --
+                // both produce the same `&dyn ClusterEntry` type, so the
+                // rest of the loop body doesn't need to know which case
+                // it's in.
+                let (attempt_cluster, attempt_entry): (&str, &dyn ClusterEntry) = match &sel.member
+                {
+                    Some(m) => (m.name.as_str(), m.entry.as_ref()),
+                    None => (cluster_name.as_str(), entry.as_ref()),
+                };
+                // Record this attempt's cluster so a retry that falls back
+                // to an aggregate skips it on the next pick (see
+                // `LoadBalancerContext::attempted_clusters`'s doc). A plain
+                // `String` clone, not a borrow, so it doesn't conflict with
+                // `attempt_cluster` still being read below.
+                ctx.attempted_clusters.push(attempt_cluster.to_string());
 
-                let proto = entry.upstream_protocol();
+                let proto = attempt_entry.upstream_protocol();
                 // WP-24: both known right here, at the dial site -- recorded
                 // onto `StreamInfo` for `%UPSTREAM_HOST%`/`%UPSTREAM_CLUSTER%`/
                 // `%PROTOCOL%` before the connect is even attempted, so a
@@ -369,10 +415,13 @@ impl RouterHandler {
                 // was aimed at (matching Envoy's own access-log behavior on
                 // an upstream failure). A later retry attempt overwrites
                 // these with its own host, which is what makes the *last*
-                // attempt's target the one that ends up logged.
+                // attempt's target the one that ends up logged. `%UPSTREAM_CLUSTER%`
+                // names `attempt_cluster` (the cluster actually dialed), not
+                // the routed `cluster_name` -- matching Envoy's own
+                // `upstream_host->cluster().name()`.
                 {
                     let mut info = dcb.stream_info();
-                    info.upstream_cluster = Some(cluster_name.clone());
+                    info.upstream_cluster = Some(attempt_cluster.to_string());
                     info.upstream_host = Some(host.address.to_string());
                     info.protocol = Some(
                         match proto {
@@ -382,7 +431,7 @@ impl RouterHandler {
                         .to_string(),
                     );
                 }
-                let pool = entry.http_pool(&host, proto);
+                let pool = attempt_entry.http_pool(&host, proto);
                 let upstream = match pool.new_stream().await {
                     Ok(upstream) => upstream,
                     Err(err) => {
@@ -395,7 +444,7 @@ impl RouterHandler {
                         }
                         return match err {
                             PoolError::Overflow => {
-                                tracing::debug!(response_flag = "UO", cluster = %cluster_name, "pool overflow");
+                                tracing::debug!(response_flag = "UO", cluster = %attempt_cluster, "pool overflow");
                                 dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamOverflow);
                                 let mut resp = local_reply(
@@ -408,7 +457,7 @@ impl RouterHandler {
                                 resp
                             }
                             PoolError::ConnectFailure(_) | PoolError::ConnectTimeout => {
-                                tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream connect failure");
+                                tracing::debug!(response_flag = "UF", cluster = %attempt_cluster, "upstream connect failure");
                                 dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
                                 local_reply(
@@ -424,7 +473,7 @@ impl RouterHandler {
                             // gets its own arm so the log line says which
                             // half actually broke.
                             PoolError::TlsHandshake(_) => {
-                                tracing::debug!(response_flag = "UF", cluster = %cluster_name, "upstream TLS handshake failure");
+                                tracing::debug!(response_flag = "UF", cluster = %attempt_cluster, "upstream TLS handshake failure");
                                 dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
                                 local_reply(
@@ -433,7 +482,7 @@ impl RouterHandler {
                                 )
                             }
                             PoolError::ResetBeforeHeaders => {
-                                tracing::debug!(response_flag = "UR", cluster = %cluster_name, "upstream reset before headers");
+                                tracing::debug!(response_flag = "UR", cluster = %attempt_cluster, "upstream reset before headers");
                                 dcb.stream_info()
                                     .set_response_flag(ResponseFlag::UpstreamRemoteReset);
                                 local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream reset")
@@ -454,15 +503,22 @@ impl RouterHandler {
                 // WP-35: apply the *cluster's* header mutations here, inside
                 // the retry loop, to this attempt's own head -- never
                 // hoisted up next to `apply_request_transforms` above, which
-                // only sees the route. `entry` is the cluster this attempt
-                // actually dialed, so a later attempt that falls back to a
-                // different cluster gets that cluster's mutations, not the
-                // first attempt's. This is what keeps a provider credential
-                // from following the routing decision instead of the
-                // connection (see `ClusterConfig::request_headers_to_add`'s
-                // doc). Applied after the route-level mutations above, so a
+                // only sees the route. `attempt_entry` is the cluster this
+                // attempt actually dialed -- the routed `entry` itself for a
+                // plain cluster, or the resolved member for an aggregate --
+                // so a later attempt that falls back to a different provider
+                // gets that provider's credentials, never a previous
+                // attempt's. This is what keeps a provider credential from
+                // following the routing decision instead of the connection
+                // (see `ClusterConfig::request_headers_to_add`'s doc, and
+                // `ClusterKind::Aggregate`'s for why the member -- not the
+                // aggregate, which carries none -- is what has to supply
+                // this). Applied after the route-level mutations above, so a
                 // cluster-level value wins on a key collision.
-                apply_header_mutations(entry.request_headers_to_add(), &mut attempt_head.headers);
+                apply_header_mutations(
+                    attempt_entry.request_headers_to_add(),
+                    &mut attempt_head.headers,
+                );
                 // Rust note: `body_bytes` is plain `Bytes`, cheap
                 // (refcounted) to `.clone()` fresh for every attempt --
                 // there's no separate "streaming" body anymore (see this
@@ -536,7 +592,7 @@ impl RouterHandler {
                             }
                             tracing::debug!(
                                 response_flag = "UT",
-                                cluster = %cluster_name,
+                                cluster = %attempt_cluster,
                                 timeout_ms = d.as_millis(),
                                 "upstream per-try timeout waiting for response headers"
                             );
@@ -592,7 +648,7 @@ impl RouterHandler {
                                 continue;
                             }
                         }
-                        tracing::debug!(response_flag = "UC", cluster = %cluster_name, "upstream codec error");
+                        tracing::debug!(response_flag = "UC", cluster = %attempt_cluster, "upstream codec error");
                         dcb.stream_info()
                             .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
                         return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
@@ -854,9 +910,9 @@ mod tests {
     use proxy_cluster::manager::ClusterManager;
     use proxy_cluster::resolver::FakeResolver;
     use proxy_config::ir::{
-        CircuitBreakerThresholds, CircuitBreakers, ClusterConfig, ClusterName, DiscoveryType,
-        EndpointIR, ForwardAction, ForwardTarget, LbPolicy, PathMatch, RouteEntry, RouteMatcher,
-        RouteTable, VirtualHostIR,
+        CircuitBreakerThresholds, CircuitBreakers, ClusterConfig, ClusterKind, ClusterName,
+        DiscoveryType, EndpointIR, ForwardAction, ForwardTarget, LbPolicy, PathMatch, RouteEntry,
+        RouteMatcher, RouteTable, VirtualHostIR,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1035,6 +1091,7 @@ mod tests {
                     weight: 1,
                     priority: 0,
                 }],
+                kind: ClusterKind::Endpoints,
                 transport_socket: None,
                 per_connection_buffer_limit_bytes: 1 << 20,
                 circuit_breakers,

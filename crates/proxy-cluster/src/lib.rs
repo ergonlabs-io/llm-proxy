@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use proxy_config::ir::ClusterName;
 
 pub mod discovery;
 pub mod health_check;
@@ -186,6 +187,17 @@ pub struct LoadBalancerContext {
     pub hash: Option<u64>,
     /// Host override from an endpoint picker (`x-gateway-destination-endpoint`, WP-36).
     pub host_override: Option<SocketAddr>,
+    /// Cluster names an earlier attempt of this same request already dialed
+    /// (WP-35). An aggregate skips these when choosing a member, so a retry
+    /// falls over to the next provider instead of re-picking the one that
+    /// just failed. Empty on the first attempt; ignored by non-aggregate
+    /// clusters, which have no members to skip among.
+    ///
+    /// Rust note: a plain `Vec`, not a `HashSet` -- member lists and retry
+    /// counts are both single digits, so a linear scan is cheaper than
+    /// hashing, and there's no risk of the list growing large enough for
+    /// that to matter.
+    pub attempted_clusters: Vec<ClusterName>,
 }
 
 /// Circuit-breaker accounting for one (cluster, priority) — S5's four
@@ -376,10 +388,60 @@ pub trait HttpConnPool: Send + Sync {
     fn new_stream(&self) -> BoxFuture<'static, Result<UpstreamStream, PoolError>>;
 }
 
+/// One attempt's host selection: the picked host, plus (WP-35) the cluster
+/// that actually owns it.
+#[derive(Debug)]
+pub struct HostSelection {
+    pub host: Arc<Host>,
+    /// Set **only** when the entry that made the pick is an aggregate: the
+    /// member cluster the host actually belongs to. `None` means the entry
+    /// the caller already holds owns the host -- true for every
+    /// non-aggregate cluster -- so the common path allocates nothing.
+    ///
+    /// The owning cluster, not the routed one, is what supplies the
+    /// transport socket, the upstream protocol, and (WP-35) the provider
+    /// credentials. A caller that ignores this field sends the aggregate's
+    /// (empty) credentials to a real provider.
+    pub member: Option<SelectedMember>,
+}
+
+/// The member cluster [`ClusterEntry::select_host`] actually resolved a host
+/// against, when the entry making the pick was an aggregate.
+#[derive(Clone)]
+pub struct SelectedMember {
+    pub name: ClusterName,
+    pub entry: Arc<dyn ClusterEntry>,
+}
+
+impl std::fmt::Debug for SelectedMember {
+    // Rust note: `dyn ClusterEntry` has no `Debug` bound (adding one would
+    // ripple through every implementor for a field only ever inspected in
+    // tests/logs), so this writes the one field that actually identifies the
+    // member instead of deriving.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedMember")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What the router (WP-13) sees of a cluster.
 pub trait ClusterEntry: Send + Sync {
-    /// Load-balancer host pick (S7: policy, panic threshold, priority spillover).
-    fn pick_host(&self, ctx: &LoadBalancerContext) -> Option<Arc<Host>>;
+    /// Load-balancer host pick (S7: policy, panic threshold, priority
+    /// spillover), plus the cluster that owns the picked host (WP-35: an
+    /// aggregate's members are different providers with different
+    /// credentials, so "which cluster owns this host" is no longer always
+    /// the entry the caller already holds).
+    ///
+    /// This is the *only* way to get a host out of a `ClusterEntry` --
+    /// there is exactly one implementation and two call sites, both updated
+    /// alongside this trait, so there is no reason to keep an old
+    /// `pick_host` around next to it. A second way to get a host that
+    /// silently drops the owner is a way to send provider A's API key to
+    /// provider B (ground rule #1: dropping that information is exactly the
+    /// class of silent config error the rule exists to prevent, even though
+    /// no proto field is involved here).
+    fn select_host(&self, ctx: &LoadBalancerContext) -> Option<HostSelection>;
 
     /// The pool for a picked host.
     fn http_pool(&self, host: &Arc<Host>, proto: UpstreamProtocol) -> Arc<dyn HttpConnPool>;

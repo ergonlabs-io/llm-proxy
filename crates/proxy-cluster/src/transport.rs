@@ -112,6 +112,7 @@ mod tests {
             lb_policy: proxy_config::ir::LbPolicy::RoundRobin,
             connect_timeout: std::time::Duration::from_secs(5),
             endpoints: Vec::new(),
+            kind: proxy_config::ir::ClusterKind::Endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: Default::default(),

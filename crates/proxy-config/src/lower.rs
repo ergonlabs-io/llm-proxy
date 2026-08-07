@@ -1916,6 +1916,11 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         lb_policy,
         connect_timeout,
         endpoints,
+        // Envoy-mode lowering of `cluster_type` (the proto field that would
+        // carry `envoy.clusters.aggregate`) is a later WP-35 increment --
+        // `ClusterDiscoveryType::ClusterType` is already rejected above as
+        // unsupported, so every cluster this function returns is `Endpoints`.
+        kind: ClusterKind::Endpoints,
         transport_socket,
         per_connection_buffer_limit_bytes: c
             .per_connection_buffer_limit_bytes

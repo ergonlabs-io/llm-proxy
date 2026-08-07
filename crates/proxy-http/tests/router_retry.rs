@@ -20,9 +20,9 @@ use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::resolver::FakeResolver;
 use proxy_config::ir::{
-    ClusterConfig, ClusterName, DiscoveryType, EndpointIR, ForwardAction, ForwardTarget, LbPolicy,
-    PathMatch, RetryBackOff, RetryOn, RetryPolicyIR, RouteActionIR, RouteEntry, RouteMatcher,
-    RouteTable, VirtualHostIR,
+    ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, ForwardAction,
+    ForwardTarget, LbPolicy, PathMatch, RetryBackOff, RetryOn, RetryPolicyIR, RouteActionIR,
+    RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
 };
 use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
@@ -91,6 +91,7 @@ async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandle
                 weight: 1,
                 priority: 0,
             }],
+            kind: ClusterKind::Endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
@@ -306,6 +307,7 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                             priority: 0,
                         },
                     ],
+                    kind: ClusterKind::Endpoints,
                     transport_socket: None,
                     per_connection_buffer_limit_bytes: 1 << 20,
                     circuit_breakers: proxy_config::ir::CircuitBreakers::default(),

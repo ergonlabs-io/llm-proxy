@@ -1161,8 +1161,8 @@ mod tests {
 
     use crate::tls::UpstreamTlsFactory;
     use proxy_config::ir::{
-        ClusterConfig, DataSourceIR, DiscoveryType, DownstreamTlsSpec, EndpointIR, LbPolicy,
-        TcpProxyConfig, TlsCertificateIR, TlsParametersIR, TlsVersion, UpstreamTlsSpec,
+        ClusterConfig, ClusterKind, DataSourceIR, DiscoveryType, DownstreamTlsSpec, EndpointIR,
+        LbPolicy, TcpProxyConfig, TlsCertificateIR, TlsParametersIR, TlsVersion, UpstreamTlsSpec,
     };
     use rcgen::{CertificateParams, DnType, KeyPair};
 
@@ -1336,6 +1336,7 @@ mod tests {
                 weight: 1,
                 priority: 0,
             }],
+            kind: ClusterKind::Endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1024 * 1024,
             circuit_breakers: Default::default(),

@@ -359,6 +359,24 @@ pub struct ClusterConfig {
     /// Envoy default: 5s.
     pub connect_timeout: Duration,
     pub endpoints: Vec<EndpointIR>,
+    /// Whether this cluster owns its own hosts ([`ClusterKind::Endpoints`],
+    /// the common case) or is an [`envoy.clusters.aggregate`][agg] that
+    /// serves its members' hosts instead ([`ClusterKind::Aggregate`],
+    /// WP-35 provider fallback).
+    ///
+    /// [agg]: https://www.envoyproxy.io/docs/envoy/latest/configuration/upstream/cluster_manager/cluster_runtime#aggregate-cluster
+    ///
+    /// This is a separate field rather than a `DiscoveryType::Aggregate`
+    /// variant because `discovery` answers a narrower question -- "how do I
+    /// turn *this cluster's own* endpoints into hosts" -- and an aggregate
+    /// has no endpoints at all to turn into anything. Folding "aggregate" in
+    /// as a `DiscoveryType` variant would force every `match` that's really
+    /// only about STATIC/STRICT_DNS/LOGICAL_DNS resolution mechanics
+    /// (`discovery.rs`'s resolver dispatch, `lower.rs`'s STATIC-endpoint-
+    /// must-be-an-IP check) to grow an arm for a case that can structurally
+    /// never reach it -- exactly the kind of unreachable-but-required-to-
+    /// handle match arm a separate field avoids.
+    pub kind: ClusterKind,
     /// Upstream TLS, when configured.
     pub transport_socket: Option<UpstreamTlsSpec>,
     /// Envoy default: 1 MiB.
@@ -486,6 +504,40 @@ pub enum DiscoveryType {
     StrictDns,
     /// DNS-resolve, use one address at a time (WP-16).
     LogicalDns,
+}
+
+/// Where a cluster's hosts come from -- see [`ClusterConfig::kind`]'s doc for
+/// why this is a field on `ClusterConfig` rather than a `DiscoveryType`
+/// variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusterKind {
+    /// Hosts come from this cluster's own `endpoints` + `discovery`. Every
+    /// cluster before WP-35 increment 2a, and still the overwhelming common
+    /// case.
+    Endpoints,
+    /// `envoy.clusters.aggregate`: this cluster has no hosts of its own.
+    /// Host selection walks `members`, in the order listed, and serves the
+    /// first member that yields a host -- see
+    /// `proxy_cluster::manager::ClusterHandle::select_aggregate_member` for
+    /// the exact algorithm (including how it deliberately diverges from
+    /// Envoy's own cross-member combined priority set).
+    ///
+    /// This exists for WP-35 provider fallback: one route target (the
+    /// aggregate) whose members are different LLM providers, each with its
+    /// own TLS and credentials (`ClusterConfig::request_headers_to_add`) --
+    /// a retried attempt that falls over to the next member must carry that
+    /// member's identity, never the aggregate's or a previous member's.
+    ///
+    /// `endpoints`, `discovery`, `transport_socket`, and `upstream_protocol`
+    /// are all unused on a `ClusterConfig` whose `kind` is `Aggregate` -- the
+    /// member that actually serves the request supplies all four. Ground
+    /// rule #1 ("every field maps to IR or errors") does not apply to these
+    /// four staying unread here: they simply don't apply to an aggregate,
+    /// the same way `endpoints` doesn't apply to an EDS cluster.
+    Aggregate {
+        /// Member cluster names, in the order failover tries them.
+        members: Vec<ClusterName>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
