@@ -1,0 +1,30 @@
+# nextest configuration (https://nexte.st/docs/configuration/).
+#
+# Why this file exists: `crates/proxy/tests/cli.rs` spawns the real debug
+# binary and waits for a listener on `127.0.0.1:10000` -- a port hardcoded in
+# `examples/tcp-proxy.yaml`. Those tests cannot run at the same time as each
+# other on any machine, and under the full workspace gate the suite has been
+# measured at 325s against 1.5s standalone. See CLAUDE.md rule 14.
+
+[profile.default]
+# `make tq` already passes `--no-fail-fast` so a run cannot undercount by
+# stopping at the first failing crate (CLAUDE.md rule 11). Same intent here.
+fail-fast = false
+
+# Report -- do not kill -- anything slower than 60s. The point is that the
+# cli.rs slowdown shows up BY NAME instead of as an unexplained total; a flake
+# caught under `make tq-count` today is unidentifiable because only totals
+# print. Deliberately no `retries`: retrying a flake hides it, and the repo's
+# standing instruction is that this slowdown gets diagnosed, not papered over
+# (raising STARTUP_TIMEOUT a third time would make the gate quieter without
+# making it more truthful).
+slow-timeout = { period = "60s" }
+
+[test-groups]
+# Tests that bind the example config's fixed port, serialized against each
+# other while the rest of the workspace stays parallel.
+serial-fixed-port = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(proxy::cli)'
+test-group = 'serial-fixed-port'
