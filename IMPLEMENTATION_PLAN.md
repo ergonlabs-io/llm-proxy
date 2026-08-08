@@ -1646,6 +1646,22 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
 - **Acceptance:** all three filters parse their own proto; a config using a legacy borrowed
   type URL still loads and logs a deprecation warning; the schema-lint and `--mode translate`
   output name Lane-H messages rather than unrelated Envoy ones.
+- **Increment 1 landed 2026-08-08 (`4171c8d`), scoped down to the vendoring itself.**
+  `crates/proxy-api/vendor/llmproxy/filters/v0/auth.proto` is compiled into the descriptor
+  pool and `llmproxy.auth` (WP-50) parses it. **The three existing borrows are untouched and
+  their migration is still this WP's work** — this increment only stopped the count going to
+  five, because the auth filter could not have borrowed anything: its config is a *repeated
+  structured record* (key id, tenant, digest, revoked), no compiled Envoy message has that
+  shape, and the only borrow available was a JSON blob in a string field carrying **credential
+  material** through a field nothing validates. That is this WP's own objection about provider
+  credentials in a `Struct`, aimed at the keys guarding the proxy itself.
+- **One constraint the vendoring inherited, worth knowing before migrating the others.**
+  `Authentication.hmac_secret` is an `envoy.config.core.v3.DataSource` restricted to
+  `filename`/`inline_string`, because `allowed_fields` declares `DataSource`'s supported
+  surface **once for the whole project**. Widening it for `environment_variable` would
+  silently claim support at every other `DataSource` site (TLS certificates,
+  `direct_response` bodies) where it is not implemented. Reusing an Envoy message inside a
+  Lane-H one is right, but it imports that message's project-wide surface decision with it.
 
 #### WP-48 — Sweep arithmetic on wire-derived numbers  (Size: S)  — **Priority: P1** · **Milestone: v0.1.0**
 - **Why.** Two instances of one defect were found by review on 2026-08-01, both a plain `+`
@@ -1816,6 +1832,27 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
     here would be a preimage and timing-attack surface. Different job, different primitive —
     the fact that both "hash a credential" is exactly why this is worth writing down.
   - Keys are stored hashed, never in plaintext, and never logged.
+  - **Increment 2a landed 2026-08-08 (`cb1c066`, `120ad78`, `0dfe3a1`).** `Authenticator`
+    trait + `AuthenticatorChain` + `Principal`; `VirtualKeyAuthenticator` verifying keyed
+    HMAC-SHA-256 in constant time; the `llmproxy.auth` filter parsing
+    `llmproxy.filters.v0.Authentication` under strict mode; identity published on
+    `StreamInfo::auth`; and **the token limiter re-keyed onto it** — which is the whole point
+    of the increment and is mutation-verified (reverting the read to `None` turns
+    `an_authenticated_tenant_cannot_get_a_fresh_budget_by_changing_the_header` red).
+  - **Not built, and deliberately: the `ArcSwap` snapshot.** The brief lists it under 2a, but
+    with keys coming only from config there is nothing to refresh — a config reload builds a
+    fresh factory, which is already the correct lifetime. `ArcSwap` earns its place in **2b**,
+    when a `CredentialStore` starts publishing new snapshots underneath a running proxy.
+    Building it now would be a lock-free swap over a value that never swaps.
+  - **Filter ORDER became a security property, and is now enforced at config load.** The
+    limiter's fallback to the hashed header is only safe because an auth filter refuses
+    unauthenticated requests before it runs. Configure `llmproxy.auth` *after*
+    `llmproxy.token_limit` and nothing errors, nothing logs, and the limiter silently drops
+    back to bucketing on a client-supplied header. `lower::check_lane_h_filter_order` rejects
+    that, and the pre-existing `token_limit`-before-`usage` rule (whose module doc had said
+    "there is no code assertion for this") with it. The two rules run in **opposite**
+    directions because decode is config order and encode is reversed (S2.1), so the error text
+    has to explain why the required order looks backwards.
 - **Increment 3 — tenants, budgets, spend.** Teams/projects owning a set of keys; per-tenant
   model allow-lists; budgets with a period (distinct from WP-34's tokens-per-minute throttle —
   a rate limit is not a spend ceiling, see WP-42); spend history queryable per tenant.
