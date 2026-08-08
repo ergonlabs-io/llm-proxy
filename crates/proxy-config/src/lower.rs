@@ -156,6 +156,15 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // WP-35 increment 2b-i: the only custom cluster type implemented is
         // `envoy.clusters.aggregate` (see `convert_cluster`'s
         // `ClusterDiscoveryType::ClusterType` arm).
+        //
+        // Both entries are forward-compat insurance, and NO test can exercise
+        // either one today -- each message's full field set is already mapped,
+        // so there is no real-but-unlisted field a config could set. Do not
+        // delete them as dead weight: `allowed_fields` returning `None` skips
+        // the field-name check entirely (see `check_supported_surface`), so
+        // the day an Envoy proto bump adds a field to either message, its
+        // absence here is a silent no-op -- ground rule #1's exact failure
+        // mode, arriving with no code change of ours to blame it on.
         "envoy.config.cluster.v3.Cluster.CustomClusterType" => &["name", "typed_config"],
         "envoy.extensions.clusters.aggregate.v3.ClusterConfig" => &["clusters"],
         // Only the `io.llmproxy.provider_auth` namespace under

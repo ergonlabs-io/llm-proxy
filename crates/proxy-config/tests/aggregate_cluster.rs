@@ -306,6 +306,39 @@ fn empty_member_list_is_rejected() {
     );
 }
 
+/// `cluster_type.name` says `envoy.clusters.aggregate` but `typed_config`
+/// carries some other resolvable type. The name is what Envoy dispatches on,
+/// so a config can disagree with itself here; decoding the `Any` as an
+/// aggregate `ClusterConfig` anyway would reinterpret whatever bytes are
+/// present as a member list.
+#[test]
+fn aggregate_typed_config_of_the_wrong_type_is_rejected() {
+    let body = r#"
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#;
+    let yaml = yaml_with_aggregate(body);
+    let err = snapshot_from(&yaml).expect_err("a non-aggregate typed_config must fail");
+    // Assert the VARIANT, not just the path. An empty `Router` payload decodes
+    // as an aggregate `ClusterConfig` with zero members, so the empty-member
+    // check would reject this config too -- at a path that also starts
+    // `cluster_type.typed_config`. Verified by mutation (2026-08-07): with a
+    // path-only assertion, deleting the type check entirely left this test
+    // green.
+    assert!(
+        matches!(err, ConfigError::UnknownTypeUrl { .. }),
+        "expected UnknownTypeUrl, got: {err:?}"
+    );
+    assert!(
+        err_path(&err).contains("cluster_type.typed_config"),
+        "got path: {}",
+        err_path(&err)
+    );
+}
+
 /// A `cluster_type.name` other than `envoy.clusters.aggregate` is an
 /// unsupported custom cluster type, naming `cluster_type.name`.
 #[test]
@@ -328,8 +361,18 @@ fn unsupported_custom_cluster_type_name_is_rejected() {
 }
 
 /// An unknown field inside the aggregate `typed_config` is rejected by strict
-/// mode -- proves the surface walk actually recurses into the new `Any`
-/// rather than treating it as an opaque leaf.
+/// mode, which proves the `Any` is decoded as a *typed message* whose type URL
+/// resolves in the descriptor pool -- i.e. that
+/// `envoy/extensions/clusters/aggregate/v3/cluster.proto` really is a
+/// `proxy-api/build.rs` root. Without it the type URL would not resolve at all.
+///
+/// It does **not** prove the surface walk's allowlist does anything here, and
+/// an earlier version of this test claimed that it did. Verified by mutation
+/// (2026-08-07): adding `"bogus"` to the aggregate's `allowed_fields` entry
+/// leaves this test green, because a field absent from the descriptor is
+/// rejected by the proto3 JSON deserializer (`loader.rs:169`) long before
+/// `check_supported_surface` ever runs. See that entry's comment for why it is
+/// nonetheless correct to keep.
 #[test]
 fn unknown_field_inside_aggregate_typed_config_is_rejected() {
     let body = r#"
