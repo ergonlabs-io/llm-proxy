@@ -1790,8 +1790,24 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   `/stats`, `/ready`, `/clusters`. Named explicitly by the v0.2.0 ship gate, already unblocked,
   and the prerequisite for operating the proxy at all. `/config_dump` must redact credentials —
   the access-log path already learned this lesson once.
-- **Increment 2 — virtual keys.** A client presents a proxy-issued key; the proxy authenticates
-  it, resolves it to a tenant, and **replaces it** with the real provider credential upstream.
+- **Increment 2 — virtual keys. Design brief: `docs/wp-50-auth-design-brief.md` (2026-08-08),
+  which is normative for the seams; this bullet is the summary.** A client presents a
+  proxy-issued key; the proxy authenticates it, resolves it to a tenant, and **replaces it**
+  with the real provider credential upstream.
+  - **This is on v0.1.0's critical path, not v0.2.0's, for one reason:** WP-34 buckets on
+    `hash_credential(<client-supplied Authorization header>)` and nothing verifies that header,
+    so a caller gets a fresh quota by changing it. v0.1.0's "a token-based rate limit is
+    enforced" clause cannot be honestly verified until the limiter keys on an identity the
+    proxy assigns. Increment 2a re-keys it onto `Principal.tenant`; that is the point of it.
+  - **Authentication is a trait, not a virtual-key filter** — OIDC lands later as a second
+    `impl Authenticator` and nothing above it changes. `AuthOutcome` must distinguish
+    "no credential of this kind" from "bad credential of this kind": collapsing them turns a
+    chain of authenticators into a probing oracle.
+  - **Model-scoped authz cannot run at header time.** The model name is in the request body,
+    so "may this tenant use `gpt-5`?" is structurally a post-WP-45-body-peek filter.
+  - **SHA-256 (keyed, HMAC) is correct; Argon2/bcrypt is not.** These are high-entropy keys the
+    proxy generates, not user-chosen passwords — deliberately-slow hashing on the hot path is a
+    self-inflicted DoS.
   The replacing half already exists (`request_headers_to_add` injection, and the access-log
   snapshot that deliberately runs before it); the authenticating half does not.
   - **Do NOT reuse `token_limit_filter::hash_credential` for this.** That is FNV-1a, chosen for
