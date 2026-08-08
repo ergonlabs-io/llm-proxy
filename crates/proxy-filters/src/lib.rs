@@ -28,11 +28,15 @@
 //!     Consumer B (body-based model routing) is not built here.
 //!   - WP-50: downstream authentication. [`auth`] is increment 2a-i: the pure
 //!     library core (`Authenticator` trait, `Principal`, the virtual-key
-//!     HMAC authenticator). Not yet wired into an `HttpFilter`, and the
-//!     token limiter is not yet re-keyed onto `Principal.tenant` -- see
+//!     HMAC authenticator, and the `AuthenticatorChain` seam a future
+//!     `JwtAuthenticator` slots into). Increment 2a-ii ([`auth_filter`]) wires
+//!     it into a real decode-path `HttpFilter` under
+//!     `type.llmproxy.dev/llmproxy.filters.v0.Authentication`. The token
+//!     limiter is not yet re-keyed onto `Principal.tenant` -- see
 //!     `docs/wp-50-auth-design-brief.md`.
 
 pub mod auth;
+pub mod auth_filter;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
 pub mod token_limit;

@@ -393,6 +393,17 @@ impl KeySet {
         self.entries.insert(digest.as_ref().to_vec(), record);
     }
 
+    /// Adds a key to this set from an already-computed digest. This is the
+    /// path `auth_filter::parse_config` uses: configuration carries
+    /// `digest_hex`, never a plaintext key (see the `VirtualKey.digest_hex`
+    /// proto doc), so [`Self::insert`] -- which hashes a plaintext -- cannot
+    /// be the config-loading entry point. [`Self::insert`] itself stays,
+    /// unchanged, because the tests in this module still build a `KeySet`
+    /// from plaintext keys directly.
+    pub fn insert_digest(&mut self, digest: Vec<u8>, record: KeyRecord) {
+        self.entries.insert(digest, record);
+    }
+
     /// Finds the record for `presented`: one HMAC to derive the digest, one
     /// table lookup, then one constant-time verification of the candidate.
     ///
@@ -483,6 +494,65 @@ impl Authenticator for VirtualKeyAuthenticator {
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }
+    }
+}
+
+/// Walks a sequence of [`Authenticator`]s and produces one [`AuthOutcome`]
+/// for a request -- the seam the design brief's "authenticator is a trait"
+/// section names: today this chain holds exactly one
+/// [`VirtualKeyAuthenticator`], and a future `JwtAuthenticator` (increment
+/// 2c) is meant to slot in beside it without this type, or anything above
+/// it, changing shape.
+///
+/// Rust note: `Vec<Box<dyn Authenticator>>` -- a trait object per entry,
+/// since the chain is heterogeneous (a virtual-key authenticator today, a
+/// JWT one later) and its length is a runtime config choice, not something
+/// generics could express.
+pub struct AuthenticatorChain {
+    authenticators: Vec<Box<dyn Authenticator>>,
+}
+
+impl AuthenticatorChain {
+    pub fn new(authenticators: Vec<Box<dyn Authenticator>>) -> Self {
+        AuthenticatorChain { authenticators }
+    }
+
+    /// Tries each authenticator in configured order and returns the first
+    /// terminal outcome:
+    /// - the first `Authenticated` wins immediately;
+    /// - the first `Rejected` is returned **immediately, without trying the
+    ///   rest**. This is the entire reason [`AuthOutcome`] has three variants
+    ///   instead of two -- see its doc. A "simplification" that turns this
+    ///   loop into "keep going until something authenticates" would treat
+    ///   `Rejected` the same as `NoCredential` and reopen exactly the
+    ///   probing oracle that distinction exists to close: a caller could
+    ///   present a bad credential of one kind, learn it was recognized as
+    ///   that kind (from the fact that a *different* authenticator's
+    ///   `Rejected` did not stop the chain), and repeat per authenticator.
+    /// - if every authenticator answers `NoCredential`, so does this method.
+    pub fn authenticate(&self, headers: &HeaderMap) -> AuthOutcome {
+        for authenticator in &self.authenticators {
+            match authenticator.authenticate(headers) {
+                AuthOutcome::Authenticated(principal) => {
+                    return AuthOutcome::Authenticated(principal)
+                }
+                AuthOutcome::Rejected(err) => return AuthOutcome::Rejected(err),
+                AuthOutcome::NoCredential => continue,
+            }
+        }
+        AuthOutcome::NoCredential
+    }
+}
+
+impl fmt::Debug for AuthenticatorChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Count only, consistent with every other Debug in this module (see
+        // the module doc's closing paragraph) -- there is nothing secret in
+        // an authenticator list, but the convention here is to spell every
+        // impl out explicitly rather than mix derived and hand-written ones.
+        f.debug_struct("AuthenticatorChain")
+            .field("authenticators", &self.authenticators.len())
+            .finish()
     }
 }
 

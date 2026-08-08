@@ -15,9 +15,48 @@
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
 
-const AUTH: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
-const TOKEN_LIMIT: &str = "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
-const USAGE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+// The type URLs under test are `lower.rs`'s OWN constants, not fresh copies:
+// a test that re-declared these literals would pin itself to the filters and
+// leave `lower.rs` free to drift from both.
+use proxy_config::lower::{
+    AUTH_FILTER_TYPE as AUTH, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT, USAGE_FILTER_TYPE as USAGE,
+};
+
+/// `lower.rs` cannot import the filters' constants — `proxy-filters` depends
+/// on `proxy-config`, so the production dependency cannot point back — and
+/// duplicates them as string literals instead. That duplication is only safe
+/// if something fails when the two copies drift, which is this test.
+///
+/// **What drift would actually cost.** `check_lane_h_filter_order` matches on
+/// `type_url` equality. Rename a filter's `TYPE_URL` without updating
+/// `lower.rs` and the ordering rules stop matching anything: no error, no
+/// warning, and every wrongly-ordered chain loads clean again — the exact
+/// silent failure the check was written to remove, reintroduced by a rename
+/// that looks purely local. A `proxy-filters` dev-dependency is a cheap price
+/// for making that impossible.
+#[test]
+fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
+    assert_eq!(
+        AUTH,
+        proxy_filters::auth_filter::TYPE_URL,
+        "the auth filter's type URL changed; update `AUTH_FILTER_TYPE` in \
+         proxy-config/src/lower.rs or the auth-before-token_limit ordering rule \
+         silently stops firing"
+    );
+    assert_eq!(
+        TOKEN_LIMIT,
+        proxy_filters::token_limit_filter::TYPE_URL,
+        "the token limiter's type URL changed; update `TOKEN_LIMIT_FILTER_TYPE` in \
+         proxy-config/src/lower.rs or BOTH ordering rules silently stop firing"
+    );
+    assert_eq!(
+        USAGE,
+        proxy_filters::usage_filter::TYPE_URL,
+        "the usage filter's type URL changed; update `USAGE_FILTER_TYPE` in \
+         proxy-config/src/lower.rs or the token_limit-before-usage ordering rule \
+         silently stops firing"
+    );
+}
 
 /// One `http_filters` entry. The configs are the minimum each message needs to
 /// decode — this pass only reads `type_url`, never the payload.

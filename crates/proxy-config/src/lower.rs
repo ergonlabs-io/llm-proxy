@@ -1199,9 +1199,13 @@ fn convert_hcm(
 // token_limit_filter}::TYPE_URL`; `tests::lane_h_type_urls_match_the_filters`
 // in `proxy-filters` pins them equal, so a rename cannot silently disable
 // these checks.
-const AUTH_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
-const TOKEN_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
-const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+// `pub` solely so `tests/lane_h_filter_order.rs` can assert THESE constants
+// equal to the filters' own -- pinning a private copy the test re-declares
+// would pin nothing.
+pub const AUTH_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
+pub const TOKEN_LIMIT_FILTER_TYPE: &str =
+    "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
+pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
 
 /// Rejects Lane-H filter chains whose order silently disables a filter.
 ///

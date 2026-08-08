@@ -86,6 +86,18 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::token_limit_filter::TokenLimitFilterFactory,
         ));
+        // WP-50 increment 2a (Lane H): downstream authentication. Must be
+        // configured BEFORE `llmproxy.token_limit` in any listener's
+        // `http_filters` list -- decode callbacks run in FORWARD config order
+        // (S2.1), and the limiter buckets on the tenant this filter resolves.
+        // Unlike the two ordering notes above, that one is ENFORCED:
+        // `proxy_config::lower::check_lane_h_filter_order` rejects the wrong
+        // order at load time, because getting it wrong silently drops the
+        // limiter back to bucketing on a client-supplied header. Registered
+        // unconditionally, same reasoning as the filters above -- and note
+        // that registering it does NOT enable authentication anywhere; only a
+        // listener that configures the filter authenticates.
+        registry.register(Arc::new(proxy_filters::auth_filter::AuthFilterFactory));
         Arc::new(registry)
     })
 }
