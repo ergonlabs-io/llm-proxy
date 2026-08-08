@@ -159,7 +159,18 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     let mut routes = Vec::new();
     let mut has_catch_all = false;
     for (i, rule) in config.routes.iter().enumerate() {
-        routes.push(lower_route(config, i, rule, &mut warnings)?);
+        let (route, aggregate_cluster) = lower_route(config, i, rule, &mut warnings)?;
+        routes.push(route);
+        // WP-35 increment 2c: a route with `fallbacks` lowers an extra
+        // `envoy.clusters.aggregate` cluster alongside its provider
+        // clusters -- declaration order doesn't matter (Envoy resolves the
+        // member graph after every cluster is assembled; see
+        // `aggregate_declared_before_its_members_still_lowers` in
+        // `proxy-config`), so appending here is fine even though the
+        // provider clusters above were built first.
+        if let Some(aggregate_cluster) = aggregate_cluster {
+            clusters.push(aggregate_cluster);
+        }
         has_catch_all |= rule.model == "*";
     }
     // `models:` entries (WP-49) each get an implicit route on their own
@@ -392,7 +403,23 @@ fn lower_provider(
     // provider (this function is called once per `providers` entry), so a
     // provider used by five routes/models still gets exactly one set of
     // warnings, not five identical copies.
-    let headers_to_add = provider_headers_to_add(name, provider, warnings)?;
+    let mut headers_to_add = provider_headers_to_add(name, provider, warnings)?;
+    // WP-35 increment 2c: the Host header follows the CLUSTER, not the
+    // route. A route with fallbacks can fail over to a different provider
+    // cluster (see `lower_route`'s aggregate-cluster handling), and
+    // `host_rewrite_literal` on the ROUTE would still carry the PRIMARY
+    // provider's host to whichever member actually serves the request --
+    // the exact "value pinned to the routing decision instead of the
+    // connection" bug class WP-35 increment 1a existed to kill. Setting it
+    // here too means the member that actually dials the request always
+    // supplies its own Host, exactly like its credentials
+    // (`router.rs`'s `apply_header_mutations` call applies cluster-level
+    // `request_headers_to_add` after the route-level transforms and lets it
+    // win on a key collision). This runs for every provider, not only ones
+    // used in a fallback chain: a route with no fallbacks already sets the
+    // identical value via `host_rewrite_literal`, so this is a no-op there,
+    // and one rule is simpler than two.
+    headers_to_add.push(json!({ "key": "host", "value": up.host }));
     if !headers_to_add.is_empty() {
         cluster["metadata"] = json!({
             "filter_metadata": {
@@ -555,15 +582,29 @@ fn model_glob_matcher(pattern: &str) -> Option<Value> {
     Some(json!({ "name": MODEL_HEADER, "string_match": string_match }))
 }
 
+/// `cluster_type.typed_config`'s `@type` for the one custom cluster type
+/// this dialect ever emits -- must match
+/// `proxy_config::lower::AGGREGATE_CLUSTER_CONFIG_TYPE`, prefixed with
+/// `type.googleapis.com/` the way every other `typed_config` in this file
+/// is.
+const AGGREGATE_CLUSTER_CONFIG_TYPE_URL: &str =
+    "type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig";
+
+/// Lower `rule.provider` + `rule.fallbacks` into the route's `route.cluster`
+/// and, if there are fallbacks, the extra aggregate cluster that names them
+/// (WP-35 increment 2c). Returns `(route, aggregate_cluster)`; the caller
+/// appends `aggregate_cluster` to the bootstrap's `clusters` list alongside
+/// the provider clusters.
 fn lower_route(
     config: &SimpleConfig,
     index: usize,
     rule: &RouteRule,
     warnings: &mut Vec<ConfigWarning>,
-) -> Result<Value, ConfigError> {
+) -> Result<(Value, Option<Value>), ConfigError> {
     let provider_name = &rule.provider.provider;
     let provider = &config.providers[provider_name];
     let up = provider_upstream(provider_name, provider)?;
+    let primary_dialect = usage_dialect(provider_name, provider);
 
     if rule.provider.model.is_some() {
         warnings.push(warning(
@@ -572,13 +613,51 @@ fn lower_route(
              the original model name is forwarded for now",
         ));
     }
-    if !rule.fallbacks.is_empty() {
-        warnings.push(warning(
-            format!("routes[{index}].fallbacks"),
-            "fallbacks need the model-router filter (WP-35); \
-             only same-provider retries are active for now",
-        ));
+
+    // WP-35 increment 2c: `provider:{name}` for the primary, then each
+    // fallback in listed order -- listed order IS the failover order an
+    // aggregate cluster fails over in.
+    let mut member_clusters = vec![format!("provider:{provider_name}")];
+    for (j, fallback) in rule.fallbacks.iter().enumerate() {
+        let fallback_path = format!("routes[{index}].fallbacks[{j}]");
+        // `validate_semantics` (parse.rs) already rejected an unknown
+        // `fallbacks[j].provider` via `check_provider_ref`, so this index is
+        // safe.
+        let fallback_provider = &config.providers[&fallback.provider];
+        let fallback_dialect = usage_dialect(&fallback.provider, fallback_provider);
+        // A hard error, not a warning: an OpenAI-shaped request body is not
+        // valid for Anthropic (and vice versa), and the response would be
+        // scanned for tokens by the wrong dialect's parser -- silently
+        // producing wrong billing numbers, not just a broken request. The
+        // request/response translation that would make a cross-dialect
+        // chain work is explicitly later WP-35 scope; failing here at
+        // config time is ground rule #1's shape, not laziness.
+        if fallback_dialect != primary_dialect {
+            return Err(ConfigError::InvalidValue {
+                field_path: fallback_path,
+                reason: format!(
+                    "`{}` speaks the `{fallback_dialect}` dialect, but this route's primary \
+                     provider `{provider_name}` speaks `{primary_dialect}` -- a \
+                     `{primary_dialect}`-shaped request body is not valid for a \
+                     `{fallback_dialect}` upstream, and its response would be parsed for \
+                     tokens by the wrong dialect's parser (silently wrong billing numbers); \
+                     cross-dialect fallback needs request/response translation, which is \
+                     later WP-35 scope. Same-dialect fallbacks (e.g. openai -> an \
+                     openai-compatible provider) are supported.",
+                    fallback.provider
+                ),
+            });
+        }
+        if fallback.model.is_some() {
+            warnings.push(warning(
+                fallback_path,
+                "model rewrite (`provider/model`) needs the request-body rewriter (WP-35); \
+                 the original model name is forwarded for now",
+            ));
+        }
+        member_clusters.push(format!("provider:{}", fallback.provider));
     }
+    let member_count = member_clusters.len();
 
     let mut r#match = json!({ "prefix": "/" });
     if let Some(header_matcher) = model_glob_matcher(&rule.model) {
@@ -588,8 +667,39 @@ fn lower_route(
     let idle_timeout = rule
         .idle_timeout
         .unwrap_or(SimpleDuration(std::time::Duration::from_secs(90)));
+
+    // A route with no fallbacks targets its provider cluster directly, same
+    // as before this increment. A route WITH fallbacks targets a fresh
+    // aggregate cluster instead -- named `fallback:route-{index}`, which
+    // cannot collide with a provider cluster's `provider:{name}` (different
+    // prefix).
+    let (route_cluster, aggregate_cluster) = if rule.fallbacks.is_empty() {
+        (format!("provider:{provider_name}"), None)
+    } else {
+        let aggregate_name = format!("fallback:route-{index}");
+        let aggregate = json!({
+            "name": aggregate_name,
+            // Envoy REQUIRES this on an aggregate cluster -- see
+            // `proxy-config::lower::convert_cluster`. It must NOT carry
+            // `load_assignment`, `transport_socket`,
+            // `typed_extension_protocol_options`, or `metadata`: all five
+            // are inert on an aggregate (the member that actually serves a
+            // request supplies its own endpoints/TLS/protocol/credentials)
+            // and are hard errors on our own strict loader.
+            "lb_policy": "CLUSTER_PROVIDED",
+            "cluster_type": {
+                "name": "envoy.clusters.aggregate",
+                "typed_config": {
+                    "@type": AGGREGATE_CLUSTER_CONFIG_TYPE_URL,
+                    "clusters": member_clusters,
+                }
+            }
+        });
+        (aggregate_name, Some(aggregate))
+    };
+
     let mut action = json!({
-        "cluster": format!("provider:{provider_name}"),
+        "cluster": route_cluster,
         // LLM-safe S4 defaults: no total timeout (0 disables), idle-based guard.
         "timeout": "0s",
         "idle_timeout": idle_timeout.to_string(),
@@ -599,10 +709,17 @@ fn lower_route(
     // S3, LLM-safe: retry only what is certainly unserved. Envoy's router
     // never retries once response bytes have streamed downstream.
     let attempts = rule.retries.as_ref().map_or(1, |r| r.attempts);
-    if attempts > 0 {
+    // WP-35 increment 2c: `LoadBalancerContext::attempted_clusters` makes
+    // each retry against an aggregate pick the NEXT member, so reaching the
+    // last of N members needs at least N-1 retries -- below that, a
+    // configured fallback would silently never see traffic, which is
+    // ground rule #1's "accepted but not honored" shape again.
+    let min_retries_for_failover = u32::try_from(member_count - 1).unwrap_or(u32::MAX);
+    let num_retries = attempts.max(min_retries_for_failover);
+    if num_retries > 0 {
         action["retry_policy"] = json!({
             "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",
-            "num_retries": attempts,
+            "num_retries": num_retries,
             "retriable_status_codes": [429, 500, 502, 503],
         });
     }
@@ -618,19 +735,21 @@ fn lower_route(
     let mut typed_per_filter_config = json!({
         USAGE_FILTER_NAME: {
             "@type": USAGE_FILTER_TYPE_URL,
-            "inline_string": usage_dialect(provider_name, provider),
+            "inline_string": primary_dialect,
         }
     });
     // Token accounting follows the ROUTE's provider here too, for the exact
     // same reason as the usage filter above -- one listener can serve
-    // `gpt-*` from OpenAI and `claude-*` from Anthropic.
+    // `gpt-*` from OpenAI and `claude-*` from Anthropic. A fallback member
+    // is guaranteed to share `primary_dialect` (checked above), so this
+    // stays correct across a failover too.
     if force_usage_reporting(config) {
         typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
-            body_rewrite_typed_config(true, usage_dialect(provider_name, provider));
+            body_rewrite_typed_config(true, primary_dialect);
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
 
-    Ok(route)
+    Ok((route, aggregate_cluster))
 }
 
 /// The provider-credential headers for this provider: the auth header (if a

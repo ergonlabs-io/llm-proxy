@@ -23,7 +23,13 @@ providers:
 routes:
   - model: gpt-5*
     provider: openai
-    fallbacks: [anthropic/claude-sonnet-5]
+    # Fallbacks are tried in order when the primary fails. Every provider in
+    # the chain must speak the same wire dialect: an OpenAI-shaped request
+    # body is not valid for Anthropic, and its response would be parsed for
+    # token counts by the wrong parser. So `openai -> local-vllm` (both
+    # OpenAI-compatible) works, and `openai -> anthropic` is rejected at load
+    # time until request/response translation lands.
+    fallbacks: [local-vllm]
   - model: llama-*
     provider: local-vllm
   - model: "*"

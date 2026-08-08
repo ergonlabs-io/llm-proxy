@@ -31,17 +31,41 @@ fn example_config_lowers_end_to_end() {
     // The lowered bootstrap must also build IR (the serve-path contract).
     let snapshot = proxy_config::build_snapshot(&loaded).expect("lowered config must build IR");
 
-    // providers -> clusters, deterministically named.
+    // providers -> clusters, deterministically named, plus one aggregate per
+    // route that declares `fallbacks` (WP-35 increment 2c). The example's
+    // `gpt-5*` route falls back to `local-vllm`, so it gets
+    // `fallback:route-0`.
     let mut names: Vec<_> = snapshot.clusters.keys().cloned().collect();
     names.sort();
     assert_eq!(
         names,
         [
+            "fallback:route-0",
             "provider:anthropic",
             "provider:local-vllm",
             "provider:openai"
         ]
     );
+
+    // The aggregate really is one, and its members are in failover order --
+    // primary first. Asserting the kind (not just the name) is what proves
+    // the dialect emitted something our own strict loader accepted as an
+    // aggregate rather than a cluster that merely happens to be called
+    // `fallback:...`.
+    let aggregate = snapshot
+        .clusters
+        .get("fallback:route-0")
+        .expect("aggregate cluster");
+    match &aggregate.kind {
+        proxy_config::ir::ClusterKind::Aggregate { members } => assert_eq!(
+            members,
+            &vec![
+                "provider:openai".to_string(),
+                "provider:local-vllm".to_string()
+            ]
+        ),
+        other => panic!("expected ClusterKind::Aggregate, got {other:?}"),
+    }
 
     // openai is https: LOGICAL_DNS + TLS with SNI; local-vllm is plain http.
     let openai = &snapshot.clusters["provider:openai"];
@@ -62,7 +86,7 @@ fn example_config_lowers_end_to_end() {
 
     assert_eq!(snapshot.admin, Some("127.0.0.1:9901".parse().unwrap()));
 
-    // Warnings surface every not-yet-enforced feature (fallbacks, limits, ...).
+    // Warnings surface every not-yet-enforced feature (limits, ...).
     assert!(!loaded.warnings.is_empty());
     let all = loaded
         .warnings
@@ -70,8 +94,16 @@ fn example_config_lowers_end_to_end() {
         .map(|w| w.field_path.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    assert!(all.contains("fallbacks"), "warnings: {all}");
     assert!(all.contains("limits"), "warnings: {all}");
+    // `fallbacks` must NOT warn any more: WP-35 increment 2c implements it,
+    // and this route's chain really does lower to the `fallback:route-0`
+    // aggregate asserted above. A warning here would mean the feature had
+    // silently regressed to being parsed-and-dropped, which is the state this
+    // increment ended.
+    assert!(
+        !all.contains("fallbacks"),
+        "fallbacks are implemented and must not warn; warnings: {all}"
+    );
 }
 
 /// An `https://` provider with no `ca_file` must still get a validation
