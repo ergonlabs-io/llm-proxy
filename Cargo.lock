@@ -327,7 +327,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "controlplane"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "corpus"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "proxy-config",
@@ -424,7 +424,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "diffrig"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -877,7 +877,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "loadgen"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "proxy-admin",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-admin"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-api"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "prost",
  "prost-reflect",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-cluster"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-config"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "http",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-filters"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "http",
@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-http"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-observability"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "http",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-simple-config"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "http",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-xds"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "proxy-api",
  "proxy-config",
