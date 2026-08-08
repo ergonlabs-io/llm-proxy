@@ -98,6 +98,50 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # code -- see `rig.rs`.
 rlimit = "0.10"
 
+# ---------------------------------------------------------------- profiles --
+# This section is a DISK-SIZE measure, not a speed one. Say so plainly,
+# because the obvious assumption is the opposite.
+#
+# Measured 2026-08-07 on the dev machine (8 cores, 16 GB RAM):
+#   - Adding this section moved a warm `cargo test --workspace` from 705s to
+#     675s. That is noise, not a win. On macOS the dev profile defaults to
+#     `split-debuginfo = "unpacked"`, so DWARF lives in separate `.o` files
+#     and was never inside the executables the test run loads -- test binaries
+#     measured ~54 MB before this change and ~52 MB after. Reducing `debug`
+#     therefore cannot speed up loading them, and did not.
+#   - What it does do is shrink `target/`, which matters here for a specific
+#     reason: with 16 GB of RAM and a `target/` that reached 78 GB, the tree
+#     cannot be held in page cache, so every cargo invocation re-reads
+#     fingerprint metadata from disk. Keeping `target/` small is a standing
+#     performance property on this box, not just hygiene.
+#
+# `line-tables-only` keeps panic backtraces resolving to file and line, and
+# drops variable inspection, which nothing on this project has used.
+#
+# Do NOT add `[build] jobs = N` on the strength of the memory-pressure story:
+# it was tried the same day and measured WORSE. Rebuilding after touching
+# `proxy-config/src/lower.rs` took 115.77s at `-j 8` versus 164.69s at `-j 4`.
+# Halving the job count did cut kernel time (146.53s -> 113.58s, consistent
+# with real memory pressure) but cost 42% more wall clock, because the box is
+# not thrashing badly enough for serialization to pay.
+[profile.dev]
+debug = "line-tables-only"
+
+# The generated proto tree is machine-written and nobody sets a breakpoint in
+# it, so it carries no debuginfo at all. This is the single biggest
+# contributor to `target/debug/deps`.
+[profile.dev.package.proxy-api]
+debug = 0
+
+# `cargo test` builds test targets under `profile.test`, which inherits from
+# `dev` but must be set explicitly for the override above to apply to the
+# binaries the test run actually builds.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package.proxy-api]
+debug = 0
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
