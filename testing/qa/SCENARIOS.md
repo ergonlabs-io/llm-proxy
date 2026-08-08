@@ -16,7 +16,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-6 | Upstream dying mid-stream errors, and is not retried | passing |
 | QA-7 | SIGTERM during an active stream drains to completion | passing |
 | QA-8 | Circuit-breaker rejection fails fast, does not queue | approved |
-| QA-10 | TTFT and TPOT reach the access log with sane values | approved |
+| QA-10 | TTFT and TPOT reach the access log with sane values | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
 | QA-9 | ~~Content-type parameter tolerance~~ | rejected — see below |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
