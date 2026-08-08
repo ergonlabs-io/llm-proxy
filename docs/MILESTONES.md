@@ -286,6 +286,40 @@ that as of this update. Holding the release at `current` on one remaining clause
 three, is still this document's judgment call and not something the gate text forces by
 itself — recorded here so it can be argued with.
 
+### Update, 2026-08-08 (end of day): the third clause is verified — and it was not verifiable at all before today
+
+`testing/diffrig/tests/auth_e2e.rs::two_virtual_keys_on_the_same_tenant_share_one_token_budget`
+is the diffrig drill the previous paragraph asked for: the real `llm-proxy` binary, a real
+over-limit request, real HTTP over sockets, `429` on exhaustion. Mutation-checked end to end —
+reverting the limiter's tenant read makes it return `200` instead of `429`. **All three gate
+clauses are now verified.**
+
+**But the more important correction is to what this document said on 2026-08-06**, where the
+clause was listed as one of the "two of the three [that] are real", on the grounds that "WP-34's
+limiter runs as a filter returning 429 with `x-ratelimit-*`, and the dialect's `limits` key
+lowers onto it". Both halves of that were true and the conclusion was still wrong. The limiter
+bucketed on `hash_credential(<the client's own `authorization` header>)`, and **nothing verified
+that header** — so a caller who exhausted their quota changed one string and received a fresh
+one. A limit that any caller can reset on demand is not an enforced limit, and an over-limit
+drill written before today would have passed while proving nothing: it would have measured a
+single well-behaved client against a bucket that client was free to abandon.
+
+WP-50 increment 2a re-keyed the limiter onto an identity the proxy assigns, which is why the
+drill can exist now and could not before. **This is the third time this section has had to walk
+back a safety property it asserted from mechanism rather than from a test** (`fallbacks`
+warn-and-drop, 2026-08-03; the route-level credential note, 2026-08-06). The recurring error has
+one shape: *the component runs* was read as *the property holds*. The two are different claims
+and only the second closes a gate clause.
+
+**The residual caveat, stated so it is not discovered later.** All three verifications run
+against mock upstreams. v0.0.1 shipped on a live smoke run against real OpenAI and Anthropic
+endpoints, and no equivalent live run has been done for this milestone. For failover and rate
+limiting the mock is arguably the *better* instrument — forcing a 429 and exhausting a budget on
+demand is exactly what a real provider will not do to order — but "arguably better" is an
+argument, not the standard v0.0.1 set. Whether v0.1.0 ships on this evidence or waits for a live
+smoke is the owner's call, and it is now the **only** thing standing between this release and
+`shipped`. The code and its verification are done.
+
 ---
 
 ## v0.2.0 — Production-ready serving
