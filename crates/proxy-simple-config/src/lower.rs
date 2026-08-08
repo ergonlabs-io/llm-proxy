@@ -18,6 +18,8 @@
 //! (fallbacks, model rewrite, limits, access logs) produce explicit
 //! warnings, never silent drops (ground rule #2).
 
+use std::collections::HashMap;
+
 use proxy_config::{ConfigError, ConfigWarning, LoadedBootstrap};
 use serde_json::{json, Value};
 
@@ -35,6 +37,23 @@ pub const MODEL_HEADER: &str = "x-llmproxy-model";
 
 const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
 const ROUTER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router";
+
+/// The auth filter's name in `http_filters` -- always the FIRST entry when
+/// `auth:` is configured (see [`lower_listener`]): ahead of
+/// `llmproxy.body_rewrite` so an unauthenticated request is refused before
+/// the body-peek filter buffers anything, and ahead of `llmproxy.token_limit`
+/// so the limiter buckets on the tenant this filter resolves --
+/// `proxy_config::lower::check_lane_h_filter_order` enforces the second half
+/// of that ordering as a hard error, so getting it wrong fails loudly rather
+/// than silently. No per-route override exists for this filter, so unlike
+/// [`USAGE_FILTER_NAME`]/[`BODY_REWRITE_FILTER_NAME`] this name never appears
+/// in a route's `typed_per_filter_config`.
+const AUTH_FILTER_NAME: &str = "llmproxy.auth";
+
+/// Must equal `proxy_filters::auth_filter::TYPE_URL`. Duplicated for the same
+/// dependency-tree reason as [`USAGE_FILTER_TYPE_URL`]; `tests/auth.rs`'s
+/// `auth_filter_type_url_matches_the_filter` pins the two together.
+const AUTH_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
 
 /// The usage/token filter's name in `http_filters`. This exact string is also
 /// the key every route's `typed_per_filter_config` override is matched
@@ -206,6 +225,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     // matching that header is body-derived, not merely a header the client
     // happens to set -- no warning needed here anymore.
 
+    let auth_filter = lower_auth(config, &mut warnings)?;
     let token_limit_filter = lower_limits(config, &mut warnings)?;
 
     let access_log = config
@@ -217,6 +237,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         config,
         routes,
         access_log,
+        auth_filter,
         token_limit_filter,
         &mut warnings,
     )?;
@@ -894,6 +915,183 @@ fn lower_model(
     Ok(route)
 }
 
+// -------------------------------------------------------------------- auth --
+
+/// Validates `auth.keys[i].digest`: exactly 64 lowercase hex characters.
+///
+/// Mirrors the shape checks `proxy_filters::auth_filter::parse_digest_hex`
+/// makes on the SAME value once it reaches the proto -- duplicated rather
+/// than shared (protos, and the filter code that reads them, never cross
+/// into this crate; ground rule #2), so a malformed digest is rejected HERE,
+/// with a dialect path (`auth.keys[i].digest`), before it ever reaches that
+/// function's proto path (`typed_config.virtual_keys[i].digest_hex`), which
+/// names a field the operator's document doesn't have.
+fn validate_digest(digest: &str, path: &str) -> Result<(), ConfigError> {
+    if digest.len() != 64 {
+        return Err(ConfigError::InvalidValue {
+            field_path: path.to_string(),
+            reason: format!("must be exactly 64 hex characters, got {}", digest.len()),
+        });
+    }
+    if digest.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(ConfigError::InvalidValue {
+            field_path: path.to_string(),
+            reason: "must be lowercase hex".to_string(),
+        });
+    }
+    if !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ConfigError::InvalidValue {
+            field_path: path.to_string(),
+            reason: "must contain only hex characters (0-9, a-f)".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `auth` -> at most one `llmproxy.auth` `http_filters` entry (WP-50
+/// increment 2a-iii). All validation happens HERE, with dialect paths
+/// (`auth.keys[0].digest`) -- never `auth_filter::parse_config`'s proto paths
+/// (`typed_config.virtual_keys[0].digest_hex`), which the operator's document
+/// doesn't have a `typed_config` to point into. This is also why the file
+/// read for `hmac_secret_file` happens here rather than being deferred to
+/// that function: an unreadable secret file should fail at `translate`/load
+/// time naming `auth.hmac_secret_file`, not at listener-bind time naming a
+/// proto field nobody wrote.
+fn lower_auth(
+    config: &SimpleConfig,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<Option<Value>, ConfigError> {
+    let Some(auth) = &config.auth else {
+        return Ok(None);
+    };
+
+    let hmac_secret = match (&auth.hmac_secret, &auth.hmac_secret_file) {
+        (Some(secret), None) => {
+            if secret.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field_path: "auth.hmac_secret".to_string(),
+                    reason: "must not be empty (an empty secret would make every credential \
+                             digest effectively unkeyed)"
+                        .to_string(),
+                });
+            }
+            json!({ "inline_string": secret })
+        }
+        (None, Some(file)) => {
+            // Same wording as `api_key_file`'s warning -- see that field's
+            // comment in `lower_provider`/`auth_header`.
+            warnings.push(warning(
+                "auth.hmac_secret_file",
+                "the key file is read once at startup; hot reload lands with WP-35",
+            ));
+            // Read once, here, purely to validate (readable, non-empty) with
+            // a dialect-scoped error -- the CONTENTS are discarded, never
+            // echoed, and never folded into `hmac_secret`: the lowered
+            // config keeps `filename` (not `inline_string`), so the real
+            // proxy reads this file again itself at listener-bind time
+            // (`auth_filter::parse_hmac_secret`), exactly once per restart,
+            // same as `api_key_file` today.
+            let contents = std::fs::read_to_string(file).map_err(|e| ConfigError::Io {
+                path: file.clone(),
+                reason: e.to_string(),
+            })?;
+            if contents.trim_end_matches(['\n', '\r']).is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field_path: "auth.hmac_secret_file".to_string(),
+                    reason: "must not be empty (an empty secret would make every credential \
+                             digest effectively unkeyed)"
+                        .to_string(),
+                });
+            }
+            json!({ "filename": file })
+        }
+        (None, None) => {
+            return Err(ConfigError::InvalidValue {
+                field_path: "auth".to_string(),
+                reason: "set either hmac_secret or hmac_secret_file".to_string(),
+            });
+        }
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::InvalidValue {
+                field_path: "auth".to_string(),
+                reason: "set either hmac_secret or hmac_secret_file, not both".to_string(),
+            });
+        }
+    };
+
+    // Rust note: these two maps remember which earlier index first used a
+    // given `id`/`digest`, so a duplicate error can name the SECOND
+    // (offending) index -- same shape as `auth_filter::parse_config`'s
+    // `seen_key_ids`/`seen_digests`, kept independent per ground rule #2.
+    let mut seen_ids: HashMap<&str, usize> = HashMap::new();
+    let mut seen_digests: HashMap<&str, usize> = HashMap::new();
+    let mut virtual_keys = Vec::with_capacity(auth.keys.len());
+
+    for (i, key) in auth.keys.iter().enumerate() {
+        let path = format!("auth.keys[{i}]");
+        if key.id.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.id"),
+                reason: "must not be empty".to_string(),
+            });
+        }
+        if key.tenant.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.tenant"),
+                reason: "must not be empty".to_string(),
+            });
+        }
+        validate_digest(&key.digest, &format!("{path}.digest"))?;
+
+        if let Some(&first) = seen_ids.get(key.id.as_str()) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.id"),
+                reason: format!("duplicate `id`; already used at index {first}"),
+            });
+        }
+        if let Some(&first) = seen_digests.get(key.digest.as_str()) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.digest"),
+                reason: format!(
+                    "duplicate `digest`; already used at index {first} (two records for one \
+                     digest means one is unreachable, and which one wins would depend on \
+                     config order)"
+                ),
+            });
+        }
+        seen_ids.insert(&key.id, i);
+        seen_digests.insert(&key.digest, i);
+
+        virtual_keys.push(json!({
+            "key_id": key.id,
+            "tenant": key.tenant,
+            "digest_hex": key.digest,
+            "revoked": key.revoked,
+        }));
+    }
+
+    if auth.keys.is_empty() {
+        // Legal (fail closed is the correct reading of "authentication is
+        // enabled, and no credential is valid"), but almost certainly not
+        // what the operator meant -- ground rule #1's "warn, don't silently
+        // accept" shape for a value that parses fine but does nothing.
+        warnings.push(warning(
+            "auth.keys",
+            "empty -- this `auth:` block authenticates nothing and therefore refuses every \
+             request (fail closed); add at least one key, or remove `auth:` entirely",
+        ));
+    }
+
+    Ok(Some(json!({
+        "name": AUTH_FILTER_NAME,
+        "typed_config": {
+            "@type": AUTH_FILTER_TYPE_URL,
+            "hmac_secret": hmac_secret,
+            "virtual_keys": virtual_keys,
+        }
+    })))
+}
+
 // ------------------------------------------------------------------ limits --
 
 /// `limits` -> at most one `llmproxy.token_limit` `http_filters` entry.
@@ -918,22 +1116,68 @@ fn lower_limits(
     for (i, limit) in config.limits.iter().enumerate() {
         let path = format!("limits[{i}]");
 
+        // `key: tenant` needs an `auth:` block to mean anything -- without
+        // one, nothing authenticates a tenant, so the limiter would silently
+        // fall back to bucketing on the client-supplied `authorization`
+        // header (see `token_limit_filter`'s module doc, "bucket key" table)
+        // while the config claims "per tenant". Ground rule #1: a hard
+        // error, not a warning -- this is a config that lies about what it
+        // enforces, not merely a feature that isn't wired up yet.
+        if matches!(&limit.key, LimitKey::Tenant) && config.auth.is_none() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.key"),
+                reason: "`key: tenant` requires an `auth:` block; with none configured, \
+                         nothing would authenticate a tenant, and the limiter would silently \
+                         fall back to bucketing on the client-supplied `authorization` header \
+                         instead -- add `auth:`, or use a different key"
+                    .to_string(),
+            });
+        }
+        // The inverse mismatch: an `auth:` block changes what a HEADER key
+        // actually buckets on at runtime (the limiter prefers the
+        // authenticated tenant whenever one exists -- see
+        // `token_limit_filter`'s bucket-key table), regardless of which
+        // header this config names. `key: header:authorization` still
+        // *lowers* (it remains the one enforced header key absent auth), so
+        // this is a warning, not an error: it tells the truth about what
+        // will actually happen rather than what the config's key literally
+        // says.
+        if let LimitKey::Header(name) = &limit.key {
+            if config.auth.is_some() {
+                warnings.push(warning(
+                    format!("{path}.key"),
+                    format!(
+                        "`header:{name}` is recorded, but with `auth:` configured the token \
+                         limiter buckets on the authenticated tenant regardless of this header \
+                         -- write `key: tenant` to say what will actually happen"
+                    ),
+                ));
+            }
+        }
+
         let key_supported = matches!(
             &limit.key,
             LimitKey::Header(name) if name.eq_ignore_ascii_case(ENFORCED_LIMIT_HEADER)
-        );
+        ) || matches!(&limit.key, LimitKey::Tenant);
         if !key_supported {
             let key_desc = match &limit.key {
                 LimitKey::Global => "`global`".to_string(),
                 LimitKey::ClientIp => "`client-ip`".to_string(),
                 LimitKey::Header(name) => format!("`header:{name}`"),
+                // Unreachable: `key_supported` is always true for `Tenant`
+                // once we reach here (the hard error above already returned
+                // for the unauthenticated case). Kept for match
+                // exhaustiveness, not because this arm can fire.
+                LimitKey::Tenant => "`tenant`".to_string(),
             };
             warnings.push(warning(
                 format!("{path}.key"),
                 format!(
-                    "{key_desc} is not enforced; the token limiter (WP-34) hardcodes its \
-                     bucket key to the `{ENFORCED_LIMIT_HEADER}` header, so only \
-                     `key: header:{ENFORCED_LIMIT_HEADER}` limits are enforced today"
+                    "{key_desc} is not enforced; the token limiter (WP-34) derives its \
+                     bucket key from the authenticated tenant when there is one and from \
+                     the `{ENFORCED_LIMIT_HEADER}` header otherwise, and has no per-key \
+                     configurability, so only `key: tenant` (with `auth:` configured) and \
+                     `key: header:{ENFORCED_LIMIT_HEADER}` are enforced today"
                 ),
             ));
         }
@@ -1069,6 +1313,7 @@ fn lower_listener(
     config: &SimpleConfig,
     routes: Vec<Value>,
     access_log: Option<Value>,
+    auth_filter: Option<Value>,
     token_limit_filter: Option<Value>,
     _warnings: &mut [ConfigWarning],
 ) -> Result<Value, ConfigError> {
@@ -1098,6 +1343,13 @@ fn lower_listener(
         .unwrap_or("openai");
 
     let mut http_filters = Vec::new();
+    if let Some(auth_filter) = auth_filter {
+        // FIRST, ahead of everything else Lane-H adds -- see
+        // `AUTH_FILTER_NAME`'s doc for why (an unauthenticated request must
+        // be refused before the body-peek filter buffers it, and the token
+        // limiter must see `StreamInfo::auth.tenant` already written).
+        http_filters.push(auth_filter);
+    }
     if needs_body_rewrite_filter(config) {
         // Decode-path filter, so it must precede the router in config order --
         // decode callbacks run in FORWARD config order (S2.1), and a decode

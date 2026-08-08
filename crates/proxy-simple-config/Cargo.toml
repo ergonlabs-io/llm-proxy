@@ -30,6 +30,10 @@ http = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }
+# Test-only, WP-50 increment 2a-iii: `tests/auth.rs` computes the SAME
+# HMAC-SHA256 digest `auth_filter::parse_config` verifies against, so its
+# fixtures exercise the real filter rather than a value nobody checked.
+ring = { workspace = true }
 
 [lints]
 workspace = true

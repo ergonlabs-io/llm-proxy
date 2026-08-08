@@ -1484,6 +1484,7 @@ dependencies = [
  "proxy-filters",
  "proxy-http",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "serde_path_to_error",

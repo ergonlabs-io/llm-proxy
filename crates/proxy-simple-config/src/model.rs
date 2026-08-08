@@ -26,6 +26,11 @@ pub struct SimpleConfig {
     pub listen: Option<Listen>,
     #[serde(default)]
     pub admin: Option<String>,
+    /// Downstream authentication (WP-50 increment 2a-iii). Absent means the
+    /// proxy admits every request unauthenticated, same as today. Present,
+    /// even with `keys: []`, switches the listener to fail-closed.
+    #[serde(default)]
+    pub auth: Option<Auth>,
     /// Rust note: `BTreeMap` (not `HashMap`) keeps providers sorted by name,
     /// making the lowered Envoy config deterministic — same input, same output.
     pub providers: BTreeMap<String, Provider>,
@@ -82,6 +87,43 @@ pub struct Provider {
     pub ca_file: Option<String>,
     #[serde(default)]
     pub connect_timeout: Option<SimpleDuration>,
+}
+
+/// `auth`: downstream authentication (WP-50 increment 2a-iii). Mirrors the
+/// `api_key`/`api_key_file` shape on [`Provider`] -- exactly one of
+/// `hmac_secret`/`hmac_secret_file` -- for the same reason: a secret belongs
+/// in the environment or a mounted file, never inlined twice with two
+/// conventions for saying so.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    #[serde(default)]
+    pub hmac_secret: Option<String>,
+    #[serde(default)]
+    pub hmac_secret_file: Option<String>,
+    /// The configured virtual keys. May be empty -- legal (fail closed: an
+    /// `auth:` block with no keys authenticates nothing and therefore
+    /// refuses every request), but almost certainly a mistake, so lowering
+    /// warns rather than silently accepting it.
+    #[serde(default)]
+    pub keys: Vec<AuthKey>,
+}
+
+/// One entry in `auth.keys`. The plaintext key never appears in
+/// configuration -- only a keyed digest of it (`digest`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthKey {
+    /// Names this credential in audit logs. Must be unique within `auth.keys`.
+    pub id: String,
+    /// The tenant (account/team) this key authenticates as. Several keys may
+    /// share a tenant; that's the normal case.
+    pub tenant: String,
+    /// Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`, exactly
+    /// 64 characters.
+    pub digest: String,
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -423,13 +465,18 @@ pub fn is_valid_provider_name(name: &str) -> bool {
     bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// `global`, `client-ip`, or `header:<name>`.
+/// `global`, `client-ip`, `tenant`, or `header:<name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub enum LimitKey {
     Global,
     ClientIp,
     Header(String),
+    /// One bucket per authenticated tenant (WP-50 increment 2a-iii).
+    /// Requires an `auth:` block -- without one, nothing would authenticate
+    /// a tenant, so configuring this key is a load error rather than a
+    /// silent fallback to bucketing on a client-supplied header.
+    Tenant,
 }
 
 impl TryFrom<String> for LimitKey {
@@ -438,6 +485,7 @@ impl TryFrom<String> for LimitKey {
         match s.as_str() {
             "global" => Ok(Self::Global),
             "client-ip" => Ok(Self::ClientIp),
+            "tenant" => Ok(Self::Tenant),
             _ => match s.strip_prefix("header:") {
                 Some(name)
                     if !name.is_empty()
@@ -446,7 +494,8 @@ impl TryFrom<String> for LimitKey {
                     Ok(Self::Header(name.to_string()))
                 }
                 _ => Err(format!(
-                    "`{s}` is not a limit key (expected `global`, `client-ip`, or `header:<name>`)"
+                    "`{s}` is not a limit key (expected `global`, `client-ip`, `tenant`, or \
+                     `header:<name>`)"
                 )),
             },
         }

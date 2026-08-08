@@ -25,6 +25,10 @@
       "$ref": "#/$defs/HostPort",
       "examples": ["127.0.0.1:9901"]
     },
+    "auth": {
+      "description": "Downstream authentication (WP-50): verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is the opposite axis and defaults OPEN: an authenticated tenant with no configured policy may use every model and provider. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
+      "$ref": "#/$defs/Auth"
+    },
     "providers": {
       "description": "Named upstream LLM API providers. The key is the provider name referenced by `routes` (lowercase letters, digits, hyphens). Names `openai` and `anthropic` infer their `type` and `base_url` automatically — a working OpenAI provider is just `openai: { api_key: ${OPENAI_API_KEY} }`.",
       "type": "object",
@@ -112,6 +116,63 @@
             "cert_file": { "type": "string", "description": "Path to the PEM certificate chain." },
             "key_file": { "type": "string", "description": "Path to the PEM private key." }
           }
+        }
+      }
+    },
+    "Auth": {
+      "type": "object",
+      "description": "Downstream authentication. Exactly one of `hmac_secret` / `hmac_secret_file` is required -- mirrors the `api_key`/`api_key_file` choice on a `Provider`.",
+      "additionalProperties": false,
+      "properties": {
+        "hmac_secret": {
+          "type": "string",
+          "description": "The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` interpolation rather than inlining it.",
+          "examples": ["${LLMPROXY_AUTH_SECRET}"]
+        },
+        "hmac_secret_file": {
+          "type": "string",
+          "description": "Read the HMAC secret from this file (trailing whitespace trimmed; read once at startup -- hot reload lands with WP-35)."
+        },
+        "keys": {
+          "type": "array",
+          "default": [],
+          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a translate-time warning.",
+          "items": { "$ref": "#/$defs/AuthKey" }
+        }
+      },
+      "oneOf": [
+        { "required": ["hmac_secret"], "not": { "required": ["hmac_secret_file"] } },
+        { "required": ["hmac_secret_file"], "not": { "required": ["hmac_secret"] } }
+      ]
+    },
+    "AuthKey": {
+      "type": "object",
+      "description": "One virtual key. The plaintext key never appears in configuration -- only a keyed digest of it.",
+      "additionalProperties": false,
+      "required": ["id", "tenant", "digest"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Names this credential in audit logs and in the access log's response-code details. Must be unique within `auth.keys`.",
+          "examples": ["alice-laptop"]
+        },
+        "tenant": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The tenant (account/team) this key authenticates as. Several keys may share a tenant; that's the normal case -- revoking one leaked key must not revoke the whole account.",
+          "examples": ["acme"]
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`, exactly 64 characters -- the plaintext is shown to the operator once, at creation, and is never recoverable from configuration. Compute it with (note `printf %s`, not a here-string -- `<<<` appends a trailing newline that changes the digest): `printf %s \"llmp_yourkey\" | openssl dgst -sha256 -hmac \"$LLMPROXY_AUTH_SECRET\" -hex`",
+          "examples": ["3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a"]
+        },
+        "revoked": {
+          "type": "boolean",
+          "default": false,
+          "description": "A revoked key is refused, distinguished from an unknown key in the access log's response-code details (`auth_revoked_key` vs `auth_unknown_key`) but NOT on the wire -- both produce an identical 401, so a caller can't learn from the response alone whether a key they guessed was ever valid."
         }
       }
     },
@@ -245,9 +306,9 @@
       "properties": {
         "key": {
           "type": "string",
-          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas). Only `header:authorization` is enforced today (the token limiter's bucket key is hardcoded to it); `global`, `client-ip`, and every other `header:<name>` are recorded but produce a not-enforced warning.",
-          "pattern": "^(global|client-ip|header:[A-Za-z0-9-]+)$",
-          "examples": ["header:authorization", "global", "client-ip", "header:x-api-key"]
+          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas). `header:authorization` and `tenant` are enforced today (the token limiter's bucket key is hardcoded to the `authorization` header, but automatically prefers the authenticated tenant instead whenever `auth:` is configured -- so a `header:<name>` limit alongside `auth:` produces a not-enforced-as-written warning suggesting `key: tenant`). `global`, `client-ip`, and every other `header:<name>` without `auth:` are recorded but produce a not-enforced warning.",
+          "pattern": "^(global|client-ip|tenant|header:[A-Za-z0-9-]+)$",
+          "examples": ["header:authorization", "tenant", "global", "client-ip", "header:x-api-key"]
         },
         "tokens_per_minute": {
           "$ref": "#/$defs/TokenAmount",
