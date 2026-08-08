@@ -551,3 +551,123 @@ async fn two_virtual_keys_on_the_same_tenant_share_one_token_budget() {
     upstream.shutdown().await;
     drop(scratch);
 }
+
+// ------------------------------------- the dialect path, with a secret FILE --
+
+/// Render an `llmproxy-v0` **dialect** config (the surface real operators
+/// write) with an `auth:` block whose secret comes from a FILE.
+///
+/// `secret_path` is written by the caller into the scratch dir; the dialect
+/// lowers `hmac_secret_file` to the proto's `filename` specifier and
+/// deliberately does NOT inline the contents, so the running proxy opens this
+/// path itself at listener-bind time.
+fn dialect_config(listener_port: u16, upstream_port: u16, secret_path: &std::path::Path) -> String {
+    let key_live_digest = digest_hex(HMAC_SECRET, KEY_LIVE);
+    format!(
+        r#"
+version: 0
+listen: 127.0.0.1:{listener_port}
+auth:
+  hmac_secret_file: {secret_file}
+  keys:
+    - id: alice-laptop
+      tenant: acme
+      digest: {key_live_digest}
+providers:
+  p1:
+    base_url: http://127.0.0.1:{upstream_port}
+    api_key: {PROVIDER_KEY}
+routes:
+  - model: "*"
+    provider: p1
+"#,
+        secret_file = secret_path.display(),
+    )
+}
+
+/// **The dialect surface authenticates a real request, end to end.**
+///
+/// Every other test in this file hands the proxy a hand-written Envoy
+/// bootstrap. The dialect tests in `proxy-simple-config` go the other way:
+/// they prove an `auth:` block lowers and that the result satisfies
+/// `auth_filter::parse_config`. Neither covers the join — a real operator's
+/// `llmproxy.yaml`, consumed by the real binary, authenticating over a
+/// socket — and that join is **not** covered by transitivity, for one
+/// specific reason:
+///
+/// **`hmac_secret_file` lowers to a `filename`, not to the file's contents.**
+/// The dialect reads the file once at load time purely to validate it, then
+/// throws the bytes away and emits the *path*. The running proxy opens that
+/// path again itself, later, at listener-bind time
+/// (`auth_filter::parse_hmac_secret`). Nothing before this test ever executed
+/// that second read: the Envoy-mode suite above uses `inline_string`, and the
+/// dialect unit tests stop at the lowered JSON. A path that resolved during
+/// lowering but not at bind time — a relative path against a different cwd,
+/// a permissions difference, a file removed in between — would pass every
+/// other test in this repository and fail every real request with a 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dialect_config_with_a_secret_file_authenticates_a_real_request() {
+    let upstream = OpenAiUpstream::spawn(upstream_config())
+        .await
+        .expect("spawn mock upstream");
+
+    let scratch = ScratchDir::new("auth-dialect-secret-file");
+    // No trailing newline: `auth_filter::parse_hmac_secret` must key the HMAC
+    // on exactly these bytes, and a stray `\n` would change every digest --
+    // the same trap the documented `openssl` one-liner warns about (`printf
+    // %s`, never a here-string).
+    let secret_path = scratch.write("auth-secret", HMAC_SECRET);
+
+    let listener_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let config_yaml = dialect_config(listener_port, upstream.port(), &secret_path);
+    let config_path = scratch.write("llmproxy.yaml", &config_yaml);
+
+    let bin = resolve_llm_proxy_bin();
+    // `spawn`, not `spawn_envoy`: this is the `--config` dialect path, which
+    // is exactly what `spawn_envoy`'s doc says to prefer once an `auth:`
+    // block exists. It now does.
+    let mut proxy = ProxyProcess::spawn(&bin, &config_path, &scratch.path().join("proxy.log"));
+    proxy.wait_until_ready(listener_addr, READY_TIMEOUT);
+
+    // A configured key authenticates and reaches the upstream.
+    let ok = send_chat_request(
+        listener_addr,
+        &[("authorization", &format!("Bearer {KEY_LIVE}"))],
+    )
+    .await;
+    assert_eq!(
+        ok.status, 200,
+        "a key configured through the DIALECT must authenticate against a secret the proxy \
+         read from `hmac_secret_file` at bind time, got {}: {}",
+        ok.status, ok.body
+    );
+    assert_eq!(
+        upstream.log.requests().len(),
+        1,
+        "the authenticated request must have reached the upstream"
+    );
+
+    // And the fail-closed half, so a config that 200s everything (i.e. one
+    // where the auth filter silently never got emitted) cannot pass this
+    // test on the strength of the assertion above.
+    let denied = send_chat_request(
+        listener_addr,
+        &[("authorization", &format!("Bearer {UNKNOWN_KEY}"))],
+    )
+    .await;
+    assert_eq!(
+        denied.status, 401,
+        "an unconfigured key must be refused by the dialect-lowered filter too, got {}: {}",
+        denied.status, denied.body
+    );
+    assert_eq!(
+        upstream.log.requests().len(),
+        1,
+        "the refused request must not have reached the upstream"
+    );
+
+    drop(proxy);
+    upstream.shutdown().await;
+    drop(scratch);
+}
