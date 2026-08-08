@@ -94,6 +94,11 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
             ));
         }
     }
+    // WP-35 increment 2b-ii: aggregate members refer to other clusters by
+    // name, so they can only be checked once the whole map exists -- this
+    // cannot fold into the loop above, because a member may be declared
+    // after the aggregate that names it.
+    validate_cluster_graph(sr, &snapshot)?;
     Ok(snapshot)
 }
 
@@ -2061,6 +2066,84 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         upstream_protocol,
         request_headers_to_add,
     })
+}
+
+/// WP-35 increment 2b-ii: a cross-cluster post-pass over the assembled
+/// cluster map, checking that every aggregate's members are wired correctly.
+/// It cannot run inside `build_snapshot`'s per-cluster loop -- a member
+/// cluster may be declared *after* the aggregate that names it, and
+/// declaration order must not matter, so the whole map has to exist first.
+///
+/// For every `ClusterKind::Aggregate`, walks its `members` in listed order
+/// and rejects the first of:
+/// - the aggregate naming itself (checked before the nested-aggregate check
+///   below, so the error says plainly "names itself" rather than the more
+///   confusing "member `agg` is itself an aggregate")
+/// - a member naming no cluster in the snapshot ("unknown cluster")
+/// - a member whose own `kind` is `Aggregate` -- aggregates cannot nest;
+///   `ClusterHandle::select_aggregate_member` (`proxy-cluster/src/manager.rs`)
+///   deliberately refuses to recurse into one, so that member would be
+///   silently skipped at runtime rather than failing outright
+/// - a duplicate member name within one aggregate -- always a runtime no-op,
+///   since `LoadBalancerContext::attempted_clusters` skips a cluster already
+///   tried this request
+///
+/// Ground rule #1's shape exactly: each of these degrades into a silent
+/// runtime no-op (a 503 with no explanation, or a fallback that never
+/// receives traffic) instead of a config-time error, unless caught here.
+///
+/// Rust note: `sr.clusters` (the original proto list) is re-walked with
+/// `enumerate()` rather than iterating `snapshot.clusters` (a `HashMap`,
+/// keyed by name) so the error path can report the aggregate's original
+/// config index -- the name-keyed IR map has already forgotten it, and a
+/// `HashMap`'s iteration order is unspecified besides.
+fn validate_cluster_graph(
+    sr: &proxy_api::envoy::config::bootstrap::v3::bootstrap::StaticResources,
+    snapshot: &ConfigSnapshot,
+) -> Result<(), ConfigError> {
+    for (i, c) in sr.clusters.iter().enumerate() {
+        let ir = snapshot
+            .clusters
+            .get(&c.name)
+            .expect("build_snapshot just inserted every sr.clusters entry by this same name");
+        let ClusterKind::Aggregate { members } = &ir.kind else {
+            continue;
+        };
+        let path = format!("static_resources.clusters[{i}].cluster_type.typed_config.clusters");
+        let mut seen = std::collections::HashSet::new();
+        for (j, member) in members.iter().enumerate() {
+            let member_path = format!("{path}[{j}]");
+            if member == &c.name {
+                return Err(invalid(
+                    &member_path,
+                    format!("aggregate cluster `{}` names itself as a member", c.name),
+                ));
+            }
+            let Some(member_ir) = snapshot.clusters.get(member) else {
+                return Err(invalid(&member_path, format!("unknown cluster `{member}`")));
+            };
+            if matches!(member_ir.kind, ClusterKind::Aggregate { .. }) {
+                return Err(invalid(
+                    &member_path,
+                    format!(
+                        "member `{member}` is itself an aggregate cluster; aggregates cannot \
+                         nest -- select_aggregate_member refuses to recurse into one, so this \
+                         member would be silently skipped at runtime"
+                    ),
+                ));
+            }
+            if !seen.insert(member.as_str()) {
+                return Err(invalid(
+                    &member_path,
+                    format!(
+                        "duplicate member `{member}` in aggregate cluster `{}`",
+                        c.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Namespace key the `llmproxy` dialect uses to carry provider credentials

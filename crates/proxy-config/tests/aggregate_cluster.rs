@@ -392,3 +392,249 @@ fn unknown_field_inside_aggregate_typed_config_is_rejected() {
         err_path(&err)
     );
 }
+
+// ---------------------------------------------------------------------------
+// WP-35 increment 2b-ii: `validate_cluster_graph`, the cross-cluster post-pass
+// that checks an aggregate's members once the whole cluster map exists.
+// `err_path` above already covers `InvalidValue`, which is what every check
+// here returns.
+
+/// A valid multi-member aggregate over three endpoints clusters still lowers
+/// -- regression against the post-pass being too strict.
+#[test]
+fn three_member_aggregate_still_lowers() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: a
+      type: STATIC
+      load_assignment:
+        cluster_name: a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.1, port_value: 443 } }
+    - name: b
+      type: STATIC
+      load_assignment:
+        cluster_name: b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.2, port_value: 443 } }
+    - name: c
+      type: STATIC
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.3, port_value: 443 } }
+    - name: agg
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+          clusters: [a, b, c]
+"#;
+    let snapshot = snapshot_from(yaml).expect("a valid three-member aggregate must lower");
+    let agg = snapshot.clusters.get("agg").expect("cluster");
+    match &agg.kind {
+        ClusterKind::Aggregate { members } => {
+            assert_eq!(
+                members,
+                &vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            );
+        }
+        other => panic!("expected ClusterKind::Aggregate, got {other:?}"),
+    }
+}
+
+/// A three-member aggregate whose *middle* member does not exist must be
+/// rejected naming `clusters[1]` -- the middle position catches an off-by-one
+/// in either index that a first- or last-position test would miss.
+#[test]
+fn missing_middle_member_is_rejected_with_correct_index() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: a
+      type: STATIC
+      load_assignment:
+        cluster_name: a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.1, port_value: 443 } }
+    - name: c
+      type: STATIC
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.3, port_value: 443 } }
+    - name: agg
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+          clusters: [a, missing, c]
+"#;
+    let err = snapshot_from(yaml).expect_err("a missing middle member must fail");
+    let path = err_path(&err);
+    assert!(
+        path.contains("clusters[2]") // the aggregate is clusters[2]
+            && path.contains("cluster_type.typed_config.clusters[1]"), // the missing member is member index 1
+        "got path: {path}"
+    );
+    assert!(
+        matches!(&err, ConfigError::InvalidValue { reason, .. } if reason.contains("unknown cluster")),
+        "got: {err}"
+    );
+}
+
+/// An aggregate naming another aggregate as a member must be rejected --
+/// `select_aggregate_member` refuses to recurse into a nested aggregate, so
+/// that member would be silently skipped at runtime. The error must mention
+/// the nesting.
+#[test]
+fn aggregate_naming_another_aggregate_is_rejected() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: a
+      type: STATIC
+      load_assignment:
+        cluster_name: a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.1, port_value: 443 } }
+    - name: b
+      type: STATIC
+      load_assignment:
+        cluster_name: b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.2, port_value: 443 } }
+    - name: inner
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+          clusters: [a, b]
+    - name: outer
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+          clusters: [inner]
+"#;
+    let err = snapshot_from(yaml).expect_err("an aggregate naming another aggregate must fail");
+    assert!(
+        err_path(&err).contains("clusters[3].cluster_type.typed_config.clusters[0]"),
+        "got path: {}",
+        err_path(&err)
+    );
+    assert!(
+        matches!(&err, ConfigError::InvalidValue { reason, .. } if reason.contains("nest")),
+        "expected a message mentioning nesting, got: {err}"
+    );
+}
+
+/// An aggregate naming itself as a member is a special case of the nesting
+/// check above, but must be reported plainly as a self-reference.
+#[test]
+fn aggregate_naming_itself_is_rejected() {
+    let body = r#"
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+          clusters: [a, agg]
+"#;
+    let yaml = yaml_with_aggregate(body);
+    let err = snapshot_from(&yaml).expect_err("an aggregate naming itself must fail");
+    assert!(
+        err_path(&err).contains("cluster_type.typed_config.clusters[1]"),
+        "got path: {}",
+        err_path(&err)
+    );
+    assert!(
+        matches!(&err, ConfigError::InvalidValue { reason, .. } if reason.contains("names itself")),
+        "expected a message saying it names itself, got: {err}"
+    );
+}
+
+/// A duplicate member name within one aggregate is always a runtime no-op
+/// (`LoadBalancerContext::attempted_clusters` skips a cluster already tried)
+/// and must be rejected.
+#[test]
+fn duplicate_member_is_rejected() {
+    let body = r#"
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+          clusters: [a, a]
+"#;
+    let yaml = yaml_with_aggregate(body);
+    let err = snapshot_from(&yaml).expect_err("a duplicate member must fail");
+    assert!(
+        err_path(&err).contains("cluster_type.typed_config.clusters[1]"),
+        "got path: {}",
+        err_path(&err)
+    );
+    assert!(
+        matches!(&err, ConfigError::InvalidValue { reason, .. } if reason.contains("duplicate")),
+        "got: {err}"
+    );
+}
+
+/// Declaration order must not matter: an aggregate declared *before* its
+/// members in the config still lowers successfully. This is the test that
+/// proves `validate_cluster_graph` really is a post-pass over the assembled
+/// map, rather than an in-loop check that happened to work because the
+/// fixture always listed members first.
+#[test]
+fn aggregate_declared_before_its_members_still_lowers() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: agg
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.aggregate
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+          clusters: [a, b]
+    - name: a
+      type: STATIC
+      load_assignment:
+        cluster_name: a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.1, port_value: 443 } }
+    - name: b
+      type: STATIC
+      load_assignment:
+        cluster_name: b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 10.0.0.2, port_value: 443 } }
+"#;
+    let snapshot =
+        snapshot_from(yaml).expect("an aggregate declared before its members must still lower");
+    let agg = snapshot.clusters.get("agg").expect("cluster");
+    assert!(matches!(agg.kind, ClusterKind::Aggregate { .. }));
+}
