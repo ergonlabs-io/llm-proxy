@@ -26,7 +26,13 @@
 //!     into a real decode-path `HttpFilter`, consumer A only (forced
 //!     `stream_options.include_usage` for OpenAI-dialect streaming requests).
 //!     Consumer B (body-based model routing) is not built here.
+//!   - WP-50: downstream authentication. [`auth`] is increment 2a-i: the pure
+//!     library core (`Authenticator` trait, `Principal`, the virtual-key
+//!     HMAC authenticator). Not yet wired into an `HttpFilter`, and the
+//!     token limiter is not yet re-keyed onto `Principal.tenant` -- see
+//!     `docs/wp-50-auth-design-brief.md`.
 
+pub mod auth;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
 pub mod token_limit;

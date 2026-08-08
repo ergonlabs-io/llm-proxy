@@ -1433,6 +1433,7 @@ dependencies = [
  "proxy-api",
  "proxy-config",
  "proxy-http",
+ "ring",
  "serde",
  "serde_json",
 ]

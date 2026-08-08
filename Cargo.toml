@@ -76,6 +76,13 @@ x509-parser = "0.16"
 # pure Rust, no cmake, matching the rest of the TLS stack's toolchain choice.
 tls-parser = "0.12"
 
+# WP-50 downstream auth: HMAC-SHA256 for virtual-key verification and
+# `constant_time::verify_slices_are_equal` for the comparison. Already compiled
+# in the tree as rustls's crypto provider, so this is a direct dependency on
+# something that was being built anyway -- and it keeps the same "no cmake/NASM
+# toolchain" property the rustls feature choice above was made for.
+ring = "0.17"
+
 # Utilities
 arc-swap = "1"
 thiserror = "2"
