@@ -33,5 +33,12 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 
+[dev-dependencies]
+# WP-50 increment 2a e2e (auth_e2e.rs): compute virtual-key digests
+# (hex(HMAC-SHA256(secret, plaintext_key))) at test run time, matching
+# `proxy-filters::auth_filter`'s own derivation -- never hardcode a digest,
+# see that test file's module doc for why.
+ring = { workspace = true }
+
 [lints]
 workspace = true

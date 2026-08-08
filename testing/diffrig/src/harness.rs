@@ -123,15 +123,36 @@ pub struct ProxyProcess {
 }
 
 impl ProxyProcess {
-    /// Spawn `llm-proxy --config config_path`, with stdout/stderr captured
-    /// to a file (not a pipe -- a pipe can fill up and deadlock the child if
-    /// nobody drains it; a plain file has no such limit) so a startup
-    /// failure can be diagnosed.
+    /// Spawn `llm-proxy --config config_path` (dialect mode), with
+    /// stdout/stderr captured to a file (not a pipe -- a pipe can fill up
+    /// and deadlock the child if nobody drains it; a plain file has no such
+    /// limit) so a startup failure can be diagnosed.
     pub fn spawn(bin: &Path, config_path: &Path, log_path: &Path) -> Self {
+        Self::spawn_with_flag(bin, "--config", config_path, log_path)
+    }
+
+    /// Spawn `llm-proxy -c config_path` (Envoy mode), otherwise identical to
+    /// [`Self::spawn`].
+    ///
+    /// This exists because some Lane-H filters (e.g. the WP-50 auth filter,
+    /// as of this writing) have no dialect (`llmproxy.yaml`) surface yet --
+    /// `--config` only understands the fields `proxy-simple-config` knows
+    /// how to lower, so a test that needs `llmproxy.auth` in `http_filters`
+    /// must hand the proxy a real Envoy bootstrap document instead. Prefer
+    /// [`Self::spawn`] once a dialect `auth:` block lands; it exercises the
+    /// same lowering path real users hit and needs no hand-written YAML.
+    pub fn spawn_envoy(bin: &Path, config_path: &Path, log_path: &Path) -> Self {
+        Self::spawn_with_flag(bin, "-c", config_path, log_path)
+    }
+
+    // Rust note: shared body for `spawn`/`spawn_envoy` -- only the flag name
+    // differs, so it's a parameter rather than two near-identical `Command`
+    // builders.
+    fn spawn_with_flag(bin: &Path, flag: &str, config_path: &Path, log_path: &Path) -> Self {
         let log_file = std::fs::File::create(log_path).expect("create proxy log file");
         let log_file_err = log_file.try_clone().expect("clone log file handle");
         let child = Command::new(bin)
-            .arg("--config")
+            .arg(flag)
             .arg(config_path)
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
