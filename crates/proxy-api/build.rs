@@ -42,6 +42,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let root_paths: Vec<PathBuf> = roots.iter().map(|r| vendor.join(r)).collect();
 
+    // Tell cargo exactly what this script depends on.
+    //
+    // Without at least one `rerun-if-changed`, cargo falls back to re-running
+    // the build script whenever ANY file in the package changes -- and every
+    // rerun rewrites the generated tree in OUT_DIR with fresh mtimes, which
+    // invalidates `proxy-api` and therefore every crate in the workspace,
+    // since they all depend on it. Declaring the inputs turns that into "rerun
+    // only when a vendored proto or this script actually changes".
+    //
+    // `vendor/` is watched as a directory rather than file-by-file: protoc
+    // pulls transitive imports we never name in `roots`, so listing only the
+    // roots would miss a change to an imported proto and silently serve stale
+    // generated code -- the worse failure of the two.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", vendor.display());
+
     tonic_build::configure()
         .build_client(true)
         .build_server(true) // servers are reused by the testing/controlplane harness

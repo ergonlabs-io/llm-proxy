@@ -45,19 +45,63 @@ test: ## Run all tests
 # `--no-fail-fast` matters on the workspace target: plain `--workspace` stops
 # at the first failing crate and silently undercounts the total.
 
+# nextest, not `cargo test`, for the workspace targets. Measured 2026-08-07:
+# a healthy workspace run is 957 tests in 79s, but runs were routinely hitting
+# 656-863s because 8 tests in `diffrig` (mock_e2e, tls_e2e) intermittently HANG
+# holding LISTEN sockets, and `cargo test` will wait on them forever with no
+# indication of which test is stuck. nextest names slow tests as they pass 60s
+# and, via `terminate-after` in .config/nextest.toml, kills them at 3 minutes
+# so a hang becomes a NAMED FAILURE instead of an unexplained stall.
+#
+# nextest does NOT run doctests -- that is a documented gap, not an oversight
+# on its part -- so `tq-doc` exists and `ci` runs it explicitly. Skipping it
+# would silently stop testing the compiled examples in proxy-simple-config,
+# proxy-config/ir.rs, and proxy-filters/usage.rs.
+
 .PHONY: tq
-tq: ## Quiet workspace test w/ per-crate summaries (the one agents should use)
-	cargo test --workspace --no-fail-fast --quiet
+tq: ## Workspace test via nextest (the one agents should use). Excludes doctests; see tq-doc.
+	cargo nextest run --workspace
 
 .PHONY: tq-count
-tq-count: ## Quiet workspace test, printing ONLY the totals line
-	@cargo test --workspace --no-fail-fast --quiet 2>&1 \
-	  | grep -E '^test result:' \
-	  | awk -F'[ ;]+' '{p+=$$4; f+=$$6; i+=$$8} \
-	      END {printf "passed=%d failed=%d ignored=%d\n", p, f, i}'
+tq-count: ## Workspace test, printing ONLY the totals line
+	@cargo nextest run --workspace 2>&1 \
+	  | grep -E '^\s+Summary' \
+	  | sed -E 's/.*Summary[^]]*\] *//'
 
-tq-%: ## Quiet test of one crate, e.g. make tq-proxy-http
-	cargo test -p $* --quiet
+.PHONY: tq-doc
+tq-doc: ## Doctests only -- nextest cannot run these, so they need their own pass
+	cargo test --workspace --doc
+
+# The default inner-loop target. Tests ONLY the crates you actually touched,
+# instead of paying for the whole workspace on every edit.
+#
+# Scope, stated plainly so it is not mistaken for a gate: this runs the crates
+# whose files changed, and NOT their reverse dependencies. Editing
+# `proxy-config/src/ir.rs` will therefore test `proxy-config` and say nothing
+# about `proxy-http`, which consumes that IR. That is the deliberate trade --
+# it is an inner-loop tool, not a substitute for `make tq` before committing.
+#
+# BASE selects what "changed" means; it defaults to HEAD (working-tree edits).
+# Use `make tq-changed BASE=main` to cover a whole branch.
+.PHONY: tq-changed
+tq-changed: ## Test only crates you changed, e.g. make tq-changed BASE=main
+	@base="$${BASE:-HEAD}"; \
+	dirs=$$( { git diff --name-only "$$base" -- crates testing; \
+	           git diff --name-only -- crates testing; \
+	           git ls-files -o --exclude-standard -- crates testing; } 2>/dev/null \
+	         | awk -F/ 'NF>2 {print $$1"/"$$2}' | sort -u ); \
+	if [ -z "$$dirs" ]; then echo "tq-changed: nothing changed vs $$base"; exit 0; fi; \
+	args=""; \
+	for d in $$dirs; do \
+	  n=$$(sed -n 's/^name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$$d/Cargo.toml" 2>/dev/null | head -1); \
+	  if [ -n "$$n" ]; then args="$$args -p $$n"; fi; \
+	done; \
+	if [ -z "$$args" ]; then echo "tq-changed: no cargo packages resolved from: $$dirs"; exit 0; fi; \
+	echo "tq-changed: testing$$args  (vs $$base; reverse deps NOT included)"; \
+	cargo nextest run $$args
+
+tq-%: ## Test one crate via nextest, e.g. make tq-proxy-http
+	cargo nextest run -p $*
 
 # Run ONE test by name, quietly -- what a mutation check should use rather than
 # re-running a whole crate. e.g. make t1 CRATE=proxy-filters TEST=hash_credential
@@ -97,10 +141,11 @@ lint: ## Clippy with warnings denied (what CI enforces)
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: ci
-ci: ## Everything CI runs: format check, lint, tests, black-box QA
+ci: ## Everything CI runs: format check, lint, tests, doctests, black-box QA
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace
+	cargo nextest run --workspace
+	@$(MAKE) tq-doc
 	@$(MAKE) qa
 
 .PHONY: clean

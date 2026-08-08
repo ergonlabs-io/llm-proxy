@@ -130,7 +130,7 @@ async fn spawn_suite(
 /// regression cover for the P0 where `request_headers_to_add` was lowered
 /// by the front-end but read by nothing, so every request reached its
 /// provider with no credentials.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_non_streaming_round_trip_preserves_status_headers_body_and_forwards_credentials() {
     let (listener_addr, openai_upstream, anthropic_upstream, scratch, proxy) = spawn_suite(
         "openai-non-streaming",
@@ -194,7 +194,7 @@ async fn openai_non_streaming_round_trip_preserves_status_headers_body_and_forwa
 /// The Anthropic-dialect twin of the OpenAI round-trip test above: `/v1/messages`
 /// shape, `x-api-key` + the dialect's default `anthropic-version` actually
 /// arriving at the upstream, and the client's request body forwarded intact.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anthropic_non_streaming_round_trip_preserves_status_headers_body_and_forwards_credentials()
 {
     let (listener_addr, openai_upstream, anthropic_upstream, scratch, proxy) = spawn_suite(
@@ -272,7 +272,7 @@ async fn anthropic_non_streaming_round_trip_preserves_status_headers_body_and_fo
 /// on `ttft` is solid; the spread assertion uses a generous ~60% margin
 /// below the theoretical minimum gap to absorb CI scheduling jitter without
 /// going so loose it would pass under buffering.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_streaming_delivers_frames_as_they_are_produced_not_buffered() {
     let ttft = Duration::from_millis(400);
     let inter_token_delay = Duration::from_millis(30);
@@ -345,7 +345,7 @@ async fn openai_streaming_delivers_frames_as_they_are_produced_not_buffered() {
 
 /// The Anthropic twin of the streaming-timing proof above, using
 /// `content_block_delta` events instead of OpenAI's data-only chunks.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anthropic_streaming_delivers_frames_as_they_are_produced_not_buffered() {
     let ttft = Duration::from_millis(400);
     let inter_token_delay = Duration::from_millis(30);
@@ -413,7 +413,7 @@ async fn anthropic_streaming_delivers_frames_as_they_are_produced_not_buffered()
 /// A `stream: true` request's flag reaches the upstream exactly as sent --
 /// separate from the timing proofs above, this is a plain content check on
 /// what the mock recorded.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_stream_flag_reaches_upstream_unmangled() {
     let (listener_addr, openai_upstream, anthropic_upstream, scratch, proxy) =
         spawn_suite("stream-flag", base_openai_config(), base_anthropic_config()).await;
@@ -447,7 +447,7 @@ async fn client_stream_flag_reaches_upstream_unmangled() {
 /// An upstream 5xx must be surfaced to the client as-is, never swallowed or
 /// turned into a 200 -- exercised for both providers since each has its own
 /// error envelope shape.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_5xx_is_surfaced_to_the_client_not_swallowed_or_turned_into_200() {
     let mut openai_config = base_openai_config();
     openai_config.forced_error = Some((503, "mock upstream overloaded".to_string()));

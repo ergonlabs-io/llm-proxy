@@ -109,7 +109,7 @@ fn base_anthropic_config() -> AnthropicConfig {
 /// proxy to two mock upstreams, driven purely through the dialect config --
 /// non-streaming and streaming, both providers, with the auth headers the
 /// dialect injects actually observed at the upstream.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_tls_end_to_end_proxies_both_providers_with_real_streaming() {
     let openai_host = "llmproxy-openai.test.localhost";
     let anthropic_host = "llmproxy-anthropic.test.localhost";
@@ -328,7 +328,7 @@ async fn upstream_tls_end_to_end_proxies_both_providers_with_real_streaming() {
 /// handshake, and the client must see a 503 (the router's upstream-connect
 /// local reply) -- never a 200. Without this test, the suite above cannot
 /// distinguish "TLS was verified" from "TLS was skipped".
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_ca_file_fails_the_handshake_and_the_client_gets_503_not_200() {
     let openai_host = "llmproxy-openai-negative.test.localhost";
     let real_tls = MockTls::new(openai_host);

@@ -147,6 +147,23 @@ impl ProxyProcess {
     /// process's captured log) after `timeout`. Also fails fast if the
     /// child has already exited -- a listener that will never come up
     /// should not eat the whole timeout budget.
+    ///
+    /// **This function BLOCKS the calling thread** (`std::thread::sleep`, and
+    /// a blocking `connect_timeout`), and callers are `async fn`s. Any test
+    /// calling it must therefore use a **multi-threaded** runtime:
+    ///
+    /// ```ignore
+    /// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// ```
+    ///
+    /// Plain `#[tokio::test]` is a `current_thread` runtime -- ONE thread. The
+    /// mock upstreams are `tokio::spawn`ed onto that same runtime, so blocking
+    /// here freezes them: the proxy waits on upstreams that cannot be polled
+    /// by the only thread that could poll them, and the test hangs. Measured
+    /// 2026-08-07, that was the cause of 8 tests (6 in `mock_e2e`, 2 in
+    /// `tls_e2e`) intermittently hanging and turning a 79s workspace run into
+    /// 656-863s. Nothing bounded it, because no request in those tests is
+    /// wrapped in `tokio::time::timeout`.
     pub fn wait_until_ready(&mut self, addr: SocketAddr, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
