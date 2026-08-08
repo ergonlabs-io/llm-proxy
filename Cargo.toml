@@ -127,6 +127,18 @@ rlimit = "0.10"
 [profile.dev]
 debug = "line-tables-only"
 
+# Measured 2026-08-08: `target/debug/deps` held **1,013,436 `.o` files**, which
+# WERE essentially all of the 46 GB (46G / 1.01M ~= 46 KB average; the 1037
+# `.rlib` + 2982 `.rmeta` + 44 `.dylib` are rounding error). macOS dev builds
+# default to `split-debuginfo = "unpacked"`, so DWARF stays in the object files
+# and the linker only records paths to them -- cargo must retain every one --
+# and dev's default `codegen-units = 256` multiplies that per crate, per stale
+# hash-variant (cargo never GCs those).
+#
+# The file COUNT hurts twice: 46 GB on a box with 16 GB of RAM, and filesystem
+# latency -- a plain `ls -f` of that one directory took ~50 seconds.
+codegen-units = 16
+
 # The generated proto tree is machine-written and nobody sets a breakpoint in
 # it, so it carries no debuginfo at all. This is the single biggest
 # contributor to `target/debug/deps`.
