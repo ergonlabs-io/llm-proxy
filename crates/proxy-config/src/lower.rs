@@ -1075,6 +1075,8 @@ fn convert_hcm(
     path: &str,
 ) -> Result<HttpConnectionManagerConfig, ConfigError> {
     use hcm_v3::http_connection_manager::RouteSpecifier;
+    // (see `check_lane_h_filter_order` below for the ordering rules these
+    // three type URLs participate in)
     let route_table = match &hcm.route_specifier {
         Some(RouteSpecifier::RouteConfig(rc)) => {
             convert_route_table(rc, &format!("{path}.route_config"))?
@@ -1159,6 +1161,8 @@ fn convert_hcm(
         }
     }
 
+    check_lane_h_filter_order(&http_filters, path)?;
+
     // Envoy default true; the proto field is a `BoolValue`, so unset means
     // "generate" and a present value takes precedence, including an explicit
     // `false`.
@@ -1182,6 +1186,105 @@ fn convert_hcm(
         access_logs,
         xff_num_trusted_hops,
     })
+}
+
+// --------------------------------------------------- Lane-H filter ordering --
+
+// The Lane-H filter type URLs this pass knows about.
+//
+// Duplicated as string literals rather than imported from `proxy-filters`,
+// which is the crate that actually defines them: `proxy-filters` depends on
+// `proxy-config`, so the dependency cannot point this way (ground rule #2).
+// The canonical definitions are `proxy_filters::{auth_filter, usage_filter,
+// token_limit_filter}::TYPE_URL`; `tests::lane_h_type_urls_match_the_filters`
+// in `proxy-filters` pins them equal, so a rename cannot silently disable
+// these checks.
+const AUTH_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
+const TOKEN_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
+const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+
+/// Rejects Lane-H filter chains whose order silently disables a filter.
+///
+/// # Why this is a config error and not a doc comment
+///
+/// Both orderings below fail *silently* when they are wrong. Nothing errors at
+/// runtime, no log line appears, and every request succeeds — the affected
+/// filter simply reads `None` out of `StreamInfo` forever and does something
+/// plausible-looking with it. That is ground rule #1's failure mode exactly
+/// (a config that means one thing and does another), and the only place it can
+/// be caught is here, where the whole chain is visible at once. A filter
+/// factory sees only its own `typed_config`; `FactoryContext` carries no view
+/// of its neighbours.
+///
+/// # The two rules run in OPPOSITE directions, and that is not a mistake
+///
+/// S2.1: **decoder** callbacks run in config order, **encoder** callbacks in
+/// *reverse* config order. So "must have already run" means the opposite thing
+/// on each path:
+///
+/// - `llmproxy.auth` before `llmproxy.token_limit` — both are **decode**-side.
+///   The limiter buckets on `StreamInfo::auth.tenant`, which the auth filter
+///   writes. Reversed, the limiter sees `None` and falls back to bucketing on
+///   the client's `authorization` header — which is exactly the spoofable key
+///   WP-50 removed, so the reversed order is a **security** downgrade, not a
+///   cosmetic one.
+/// - `llmproxy.token_limit` before `llmproxy.usage` — the limiter's *record*
+///   is **encode**-side, and reads the usage the usage filter wrote. Because
+///   encode order is reversed, "the usage filter has already run" means it is
+///   **later** in config order. Reversed, every request records **zero**
+///   tokens against its budget: the limit exists and never fires.
+///
+/// Both rules are stated at their own call sites too
+/// (`token_limit_filter`'s module doc); this function is the enforcement.
+fn check_lane_h_filter_order(
+    http_filters: &[HttpFilterSpec],
+    path: &str,
+) -> Result<(), ConfigError> {
+    // Rust note: `position` returns the index of the FIRST match. A duplicate
+    // Lane-H filter is already impossible -- `FilterRegistry` keys on
+    // `type_url` -- so first-match is the only match.
+    let index_of = |type_url: &str| http_filters.iter().position(|f| f.type_url == type_url);
+
+    let rules = [
+        (
+            AUTH_FILTER_TYPE,
+            "llmproxy.auth",
+            TOKEN_LIMIT_FILTER_TYPE,
+            "llmproxy.token_limit",
+            "the token limiter buckets on the tenant the auth filter resolves, and decode \
+             callbacks run in config order; with this order reversed the limiter silently \
+             falls back to bucketing on the client-supplied `authorization` header, which \
+             a caller can change to get a fresh quota",
+        ),
+        (
+            TOKEN_LIMIT_FILTER_TYPE,
+            "llmproxy.token_limit",
+            USAGE_FILTER_TYPE,
+            "llmproxy.usage",
+            "the token limiter records usage on the ENCODE path, which runs in REVERSE \
+             config order, so the usage filter must come LATER in config order for its \
+             report to exist by then; with this order reversed every request silently \
+             records zero tokens against its budget",
+        ),
+    ];
+
+    for (first_type, first_name, second_type, second_name, reason) in rules {
+        // A rule only applies when BOTH filters are present -- either one
+        // alone is a perfectly ordinary chain.
+        if let (Some(first), Some(second)) = (index_of(first_type), index_of(second_type)) {
+            if first > second {
+                return Err(invalid(
+                    format!("{path}.http_filters[{first}]"),
+                    format!(
+                        "`{first_name}` must be configured BEFORE `{second_name}` \
+                         (currently at index {second}): {reason}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ------------------------------------------------------------ access log --

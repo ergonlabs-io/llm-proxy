@@ -76,15 +76,61 @@
 //! `usage_filter`'s module docs already predict for their own next config
 //! knob.
 //!
+//! # The bucket key: an authenticated tenant if there is one, else the credential
+//!
+//! **WP-50 increment 2a.** This filter originally bucketed on
+//! `(route, hash_credential(<the client's `authorization` header>))`. Nothing
+//! verified that header, so a caller who wanted more quota changed it and got a
+//! fresh bucket — the limit was advisory by construction, and v0.1.0's "a
+//! token-based rate limit is enforced" clause could not be honestly verified.
+//!
+//! It now prefers an identity the *proxy* assigned:
+//!
+//! | `StreamInfo::auth.tenant` | bucket key |
+//! |---|---|
+//! | `Some(t)` | `(route, tenant=t)` — an identity the caller cannot choose |
+//! | `None` | `(route, cred=<hashed header>)` — the legacy, spoofable key |
+//!
+//! Three things about that table are load-bearing.
+//!
+//! **The two key spaces never overlap.** The descriptor *name* differs
+//! (`tenant` vs `cred`), not just its value, so no hashed credential can ever
+//! collide with a tenant id and no caller can hop out of their tenant's bucket
+//! by manipulating the header. See
+//! `tests::a_tenant_bucket_and_a_credential_bucket_never_collide`.
+//!
+//! **The fallback is not a bypass, but only because of what stands in front of
+//! it.** `auth.tenant` is `None` exactly when no auth filter authenticated
+//! this stream. With an auth filter configured, that cannot happen on an
+//! admitted request: it fails closed and refuses the stream with a 401 before
+//! this filter's `decode_headers` ever runs, so every request reaching here
+//! carries a tenant. Without one, there is no assigned identity in the system
+//! at all and the hashed header is the only key available — the same
+//! best-effort behavior as before, and no worse.
+//!
+//! **Which means the ordering requirement is a security property, not a
+//! preference.** Decoder callbacks run in **config order** (S2.1), so
+//! `llmproxy.auth` MUST be configured BEFORE `llmproxy.token_limit` in
+//! `http_filters`. Get it backwards and nothing errors and nothing logs: this
+//! filter reads an `auth.tenant` that the auth filter has not written yet,
+//! sees `None`, and silently falls back to the spoofable credential hash —
+//! quietly undoing the whole point of authenticating. This is the second
+//! ordering trap in this file (the first, `llmproxy.usage` on the *encode*
+//! side, runs in the opposite direction — see above), and they are opposites
+//! because encode order is reversed, which is exactly why neither is obvious.
+//! `proxy_core::listener` rejects the wrong order at config-load time; that
+//! check, not this comment, is the actual guard.
+//!
 //! # The credential never reaches the key in cleartext
 //!
-//! The `authorization` header's value identifies a caller, so it must never
-//! land somewhere it could reach a log — this repo already takes credential
-//! care seriously elsewhere (the access-log request-header snapshot is taken
-//! before route-injected auth is applied, in `filter_manager::drive_decode`).
-//! [`hash_credential`] hashes it before it ever touches a [`LimitKey`]; see
-//! that function's doc for why a plain (non-cryptographic) hash is
-//! sufficient here.
+//! On the fallback path the `authorization` header's value identifies a
+//! caller, so it must never land somewhere it could reach a log — this repo
+//! already takes credential care seriously elsewhere (the access-log
+//! request-header snapshot is taken before route-injected auth is applied, in
+//! `filter_manager::drive_decode`). [`hash_credential`] hashes it before it
+//! ever touches a [`LimitKey`]; see that function's doc for why a plain
+//! (non-cryptographic) hash is sufficient here. A tenant id needs no such
+//! treatment — it is an identifier the operator chose, not a secret.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -357,17 +403,36 @@ impl HttpFilter for TokenLimitFilterInstance {
             .route()
             .and_then(|route| route.name.clone())
             .unwrap_or_default();
-        let credential = headers
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        let credential_hash = hash_credential(credential);
 
-        let key = LimitKey::from_descriptors(&[
-            ("route", route_name.as_str()),
-            ("cred", credential_hash.as_str()),
-        ]);
+        // Rust note: `stream_info()` hands back a `RefMut` guard that must not
+        // be held across another call on `cb` (see its doc). Cloning the
+        // `Option<String>` out and letting the guard drop at the end of this
+        // statement keeps that rule visibly satisfied.
+        let tenant: Option<String> = cb.stream_info().auth.tenant.clone();
+
+        let key = match tenant {
+            // An identity the proxy assigned. The client's `authorization`
+            // header is deliberately not consulted at all on this path -- it
+            // has no influence on which bucket the request lands in.
+            Some(tenant) => {
+                LimitKey::from_descriptors(&[("route", route_name.as_str()), ("tenant", &tenant)])
+            }
+            // No auth filter authenticated this stream. See the module doc's
+            // bucket-key section: the descriptor NAME differs from the
+            // authenticated case, so these two key spaces can never collide.
+            None => {
+                let credential = headers
+                    .headers
+                    .get(AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default();
+                let credential_hash = hash_credential(credential);
+                LimitKey::from_descriptors(&[
+                    ("route", route_name.as_str()),
+                    ("cred", credential_hash.as_str()),
+                ])
+            }
+        };
 
         match self.check_budget(&key) {
             // Fail open: a store error is treated exactly like `Allow` (see
@@ -628,6 +693,12 @@ mod tests {
         fn set_usage(&self, usage: LlmTokenUsage) {
             self.stream_info.borrow_mut().llm.usage = Some(usage);
         }
+
+        /// Stand in for the WP-50 auth filter, which runs earlier in config
+        /// order on the decode path and writes exactly this.
+        fn set_authenticated_tenant(&self, tenant: &str) {
+            self.stream_info.borrow_mut().auth.tenant = Some(tenant.to_string());
+        }
     }
 
     impl DecoderCallbacks for TestCallbacks {
@@ -754,8 +825,35 @@ mod tests {
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
     ) -> Option<(StatusCode, HeaderMap)> {
+        run_request_inner(store, route, None, credential, usage)
+    }
+
+    /// As [`run_request`], but with an authenticated tenant already written
+    /// into `StreamInfo` — i.e. an auth filter ran ahead of this one, which is
+    /// the ordering the module doc requires. `credential` is still passed
+    /// through so a test can prove the header does NOT influence the bucket.
+    fn run_request_as_tenant(
+        store: &Arc<dyn BudgetStore>,
+        route: &str,
+        tenant: &str,
+        credential: Option<&str>,
+        usage: Option<LlmTokenUsage>,
+    ) -> Option<(StatusCode, HeaderMap)> {
+        run_request_inner(store, route, Some(tenant), credential, usage)
+    }
+
+    fn run_request_inner(
+        store: &Arc<dyn BudgetStore>,
+        route: &str,
+        tenant: Option<&str>,
+        credential: Option<&str>,
+        usage: Option<LlmTokenUsage>,
+    ) -> Option<(StatusCode, HeaderMap)> {
         let mut filter = filter_with(Arc::clone(store));
         let mut cb = TestCallbacks::new(Some(route_named(route)));
+        if let Some(tenant) = tenant {
+            cb.set_authenticated_tenant(tenant);
+        }
         let mut head = request_headers(credential);
         filter.decode_headers(&mut cb, &mut head, true);
 
@@ -925,6 +1023,160 @@ mod tests {
             other.is_none(),
             "the same credential on a distinct route must have an independent budget"
         );
+    }
+
+    // --- WP-50: the bucket key is an assigned identity, not a client header ---
+
+    /// **This is the test that turns the rate limit from advisory into
+    /// enforceable, and it is the whole point of WP-50 increment 2a.**
+    ///
+    /// Before the re-key, a caller who exhausted their budget changed their
+    /// `authorization` header and got a fresh one — the bucket was derived
+    /// from a value they controlled. Now that an auth filter has resolved the
+    /// stream to a tenant, the header is not consulted at all: the same tenant
+    /// presenting a completely different credential must land in the SAME
+    /// exhausted bucket.
+    #[test]
+    fn an_authenticated_tenant_cannot_get_a_fresh_budget_by_changing_the_header() {
+        let store = store_with(10, Duration::from_secs(60));
+
+        run_request_as_tenant(
+            &store,
+            "r1",
+            "tenant-a",
+            Some("Bearer llmp_first"),
+            Some(usage(10)),
+        );
+        let denied = run_request_as_tenant(
+            &store,
+            "r1",
+            "tenant-a",
+            Some("Bearer llmp_first"),
+            Some(usage(0)),
+        );
+        assert!(denied.is_some(), "tenant-a's budget must now be exhausted");
+
+        let evasion_attempt = run_request_as_tenant(
+            &store,
+            "r1",
+            "tenant-a",
+            Some("Bearer llmp_a-completely-different-credential"),
+            Some(usage(0)),
+        );
+        assert!(
+            evasion_attempt.is_some(),
+            "changing the `authorization` header must NOT buy a fresh budget once the \
+             stream is authenticated -- the bucket keys on the tenant the proxy assigned, \
+             not on anything the caller can choose. This is the enforcement property \
+             WP-50 increment 2a exists to deliver."
+        );
+    }
+
+    #[test]
+    fn distinct_tenants_get_independent_budgets() {
+        let store = store_with(10, Duration::from_secs(60));
+
+        run_request_as_tenant(&store, "r1", "tenant-a", None, Some(usage(10)));
+        let denied = run_request_as_tenant(&store, "r1", "tenant-a", None, Some(usage(0)));
+        assert!(denied.is_some(), "tenant-a's budget must now be exhausted");
+
+        let other = run_request_as_tenant(&store, "r1", "tenant-b", None, Some(usage(0)));
+        assert!(
+            other.is_none(),
+            "a distinct tenant on the same route must have an independent budget"
+        );
+    }
+
+    /// Two keys shared by one tenant are one budget — the case that makes a
+    /// per-account quota mean anything. (Handing each key its own full budget
+    /// would let an account multiply its quota by issuing more keys.)
+    #[test]
+    fn two_keys_belonging_to_one_tenant_share_that_tenants_budget() {
+        let store = store_with(10, Duration::from_secs(60));
+
+        run_request_as_tenant(
+            &store,
+            "r1",
+            "tenant-a",
+            Some("Bearer llmp_key-one"),
+            Some(usage(10)),
+        );
+        let denied = run_request_as_tenant(
+            &store,
+            "r1",
+            "tenant-a",
+            Some("Bearer llmp_key-two"),
+            Some(usage(0)),
+        );
+        assert!(
+            denied.is_some(),
+            "a second key on the same tenant must draw on the same exhausted budget"
+        );
+    }
+
+    /// The two key spaces are distinguished by descriptor NAME, not just
+    /// value, so an unauthenticated caller can never be handed a bucket that
+    /// an authenticated tenant is also using (in either direction).
+    #[test]
+    fn a_tenant_bucket_and_a_credential_bucket_never_collide() {
+        let store = store_with(10, Duration::from_secs(60));
+
+        // Exhaust the budget of the tenant literally named after the hash the
+        // fallback path would produce for this credential -- the most
+        // adversarial value available, and the collision a value-only
+        // distinction would allow.
+        let credential = "Bearer sk-collide";
+        let colliding_name = hash_credential(credential);
+        run_request_as_tenant(&store, "r1", &colliding_name, None, Some(usage(10)));
+        let denied = run_request_as_tenant(&store, "r1", &colliding_name, None, Some(usage(0)));
+        assert!(denied.is_some(), "that tenant's budget must be exhausted");
+
+        // An unauthenticated request whose credential hashes to that same
+        // string must still get its own budget.
+        let unauthenticated = run_request(&store, "r1", Some(credential), Some(usage(0)));
+        assert!(
+            unauthenticated.is_none(),
+            "a hashed credential and a tenant id must never share a bucket, even when \
+             the two strings are identical -- the descriptor NAME (`cred` vs `tenant`) \
+             is what keeps the key spaces disjoint"
+        );
+    }
+
+    /// With no auth filter in the chain there is no assigned identity to key
+    /// on, and the filter must keep working exactly as it did before WP-50
+    /// rather than failing or bucketing everyone together.
+    #[test]
+    fn with_no_authenticated_tenant_the_filter_falls_back_to_the_hashed_credential() {
+        let store = store_with(10, Duration::from_secs(60));
+
+        run_request(&store, "r1", Some("Bearer sk-a"), Some(usage(10)));
+        let denied = run_request(&store, "r1", Some("Bearer sk-a"), Some(usage(0)));
+        assert!(denied.is_some(), "sk-a's budget must now be exhausted");
+
+        // Name the bucket it landed in, exactly: the legacy `cred` one. This
+        // is the half that a re-key which quietly changed the fallback's
+        // descriptor name would fail -- the `denied.is_some()` above would
+        // still pass, because SOME bucket got exhausted.
+        //
+        // `reset_after`/`retry_after` count down from the window start, so
+        // only the variant and its two stable fields are asserted.
+        match store.check(
+            &LimitKey::from_descriptors(&[
+                ("route", "r1"),
+                ("cred", &hash_credential("Bearer sk-a")),
+            ]),
+            Instant::now(),
+        ) {
+            Ok(LimitDecision::Deny {
+                limit, remaining, ..
+            }) => {
+                assert_eq!((limit, remaining), (10, 0));
+            }
+            other => panic!(
+                "an unauthenticated stream must still bucket on the hashed credential, \
+                 so THIS key must be the exhausted one; got {other:?}"
+            ),
+        }
     }
 
     // --- credential care ------------------------------------------------------
