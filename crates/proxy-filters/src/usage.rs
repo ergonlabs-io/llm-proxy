@@ -198,6 +198,59 @@ impl RawTokens {
     }
 }
 
+/// Interpret one JSON value from a provider's `usage` object as a token
+/// count, tolerating the shapes real providers send while refusing to
+/// silently turn "unparseable" into `0`.
+///
+/// **Why `None`, not `0`, for anything we can't make sense of:** downstream,
+/// `None` means "this provider reported no usage for this field" and renders
+/// as absent, while `0` means "this provider reported zero tokens" and is a
+/// number someone will bill against. `serde_json`'s own `as_u64()` returns
+/// `None` for *any* JSON number that isn't a non-negative integer — including
+/// a perfectly ordinary `150.0`, which real providers do emit — and every
+/// caller here used to feed that straight into `.unwrap_or(0)` two calls
+/// downstream in [`usage_from_object`]. That silently turned "provider sent a
+/// float" into "provider sent zero", which is a confident wrong billing
+/// number with nothing logged and nothing erroring. This function is the
+/// single place that distinction gets made, so it only has to be gotten
+/// right once:
+/// - a non-negative JSON integer passes through unchanged;
+/// - a non-negative finite float is truncated toward zero (`150.0` means
+///   150; a provider using a float for a count is a formatting difference,
+///   not missing data);
+/// - a negative number, NaN, or infinity is `None` — not data we can bill
+///   from;
+/// - anything that isn't a number (string, bool, object, null), or an absent
+///   field, is `None`.
+fn token_count(value: Option<&serde_json::Value>) -> Option<u64> {
+    let value = value?;
+    // The common path: already a non-negative JSON integer.
+    if let Some(int) = value.as_u64() {
+        return Some(int);
+    }
+    // Anything else that still parses as a JSON number is a float (or a
+    // negative/out-of-range integer, which `as_f64` also accepts) — reject
+    // negative and non-finite values, then truncate the rest toward zero.
+    let float = value.as_f64()?;
+    // `is_finite` here is unreachable and deliberately kept. `serde_json`
+    // cannot hold a non-finite number at all -- `Number::from_f64` rejects
+    // NaN and infinity, and JSON itself has no syntax for them -- so nothing
+    // from the wire, and nothing constructible as a `Value`, arrives here
+    // non-finite. It stays because `as u64` on a NaN yields 0, which is
+    // precisely the confident-wrong-billing-number this function exists to
+    // prevent, and because the guard costs one comparison on a path that runs
+    // once per response. Do not "simplify" it away on the grounds that no test
+    // covers it: no test CAN.
+    if !float.is_finite() || float.is_sign_negative() {
+        return None;
+    }
+    // Rust note: `as u64` on an `f64` saturates rather than wrapping or
+    // producing UB (this has been guaranteed since Rust 1.45's "unified
+    // float-to-int casts") — a float bigger than `u64::MAX` becomes
+    // `u64::MAX` here, not a wrapped-around small number.
+    Some(float as u64)
+}
+
 /// Read the per-bucket token counts for `dialect` out of a `usage` object,
 /// applying the normalization documented on [`TokenUsage`] (all `None` when
 /// `usage` is not a JSON object).
@@ -205,17 +258,18 @@ fn read_tokens(dialect: Dialect, usage: &serde_json::Value) -> RawTokens {
     if !usage.is_object() {
         return RawTokens::default();
     }
-    let u64_at = |key: &str| usage.get(key).and_then(|v| v.as_u64());
+    let u64_at = |key: &str| token_count(usage.get(key));
     match dialect {
         Dialect::OpenAi => {
             // `cached_tokens` is nested under `prompt_tokens_details` and is a
             // *subset* of `prompt_tokens`; subtract it out so `input` is the
             // non-cached remainder (saturating, in case a provider ever reports
             // cached > prompt). OpenAI bills no cache-write bucket.
-            let cached = usage
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64());
+            let cached = token_count(
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens")),
+            );
             let input =
                 u64_at("prompt_tokens").map(|prompt| prompt.saturating_sub(cached.unwrap_or(0)));
             RawTokens {
@@ -239,10 +293,11 @@ fn read_tokens(dialect: Dialect, usage: &serde_json::Value) -> RawTokens {
             // under different field names and a nested `_details` object.
             // Subtract the cached portion out so `input` is the non-cached
             // remainder. OpenAI bills no cache-write bucket here either.
-            let cached = usage
-                .get("input_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64());
+            let cached = token_count(
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens")),
+            );
             let input =
                 u64_at("input_tokens").map(|total| total.saturating_sub(cached.unwrap_or(0)));
             RawTokens {
@@ -491,6 +546,74 @@ mod tests {
 
     use super::*;
 
+    // ---- token_count: a present-but-unparseable count must never read as 0 --
+    //
+    // WP-48 (re-scoped): `serde_json::Value::as_u64()` returns `None` for any
+    // JSON number that isn't a non-negative integer -- including an ordinary
+    // `150.0`, which real providers emit -- and that `None` used to become a
+    // silent `0` two calls downstream. These are table-driven per the case
+    // table in the task spec.
+
+    #[test]
+    fn token_count_cases() {
+        use serde_json::json;
+
+        let cases: &[(&str, serde_json::Value, Option<u64>)] = &[
+            ("non-negative integer passes through", json!(150), Some(150)),
+            (
+                "non-negative whole float truncates to the same value",
+                json!(150.0),
+                Some(150),
+            ),
+            (
+                "non-negative fractional float truncates toward zero",
+                json!(150.9),
+                Some(150),
+            ),
+            ("negative integer is None, not 0", json!(-5), None),
+            ("negative float is None, not 0", json!(-5.5), None),
+            ("a numeric string is not a number", json!("150"), None),
+            ("null is None", json!(null), None),
+            ("a bool is not a number", json!(true), None),
+            ("an object is not a number", json!({"n": 150}), None),
+            (
+                "a float above u64::MAX saturates instead of wrapping",
+                json!(1e30),
+                Some(u64::MAX),
+            ),
+        ];
+
+        for (why, value, expected) in cases {
+            assert_eq!(token_count(Some(value)), *expected, "{why}");
+        }
+
+        // NaN and infinity: these two assert the right ANSWER for the wrong
+        // REASON, and it is worth being precise about which.
+        //
+        // Rust note: `serde_json::Number::from_f64` returns `None` for any
+        // non-finite float, and `impl From<f64> for Value` maps that to
+        // `Value::Null`. So BOTH of these values are `Value::Null` by the time
+        // `token_count` sees them, and both take its "not a number" arm --
+        // neither one ever reaches the `!float.is_finite()` guard. A JSON
+        // document cannot express NaN or infinity either, so no provider
+        // response can reach that guard from the wire.
+        //
+        // They stay because they pin the observable contract (a caller writing
+        // `Value::from(f64::NAN)` gets `None`, never `0`), but do not read them
+        // as coverage of the `is_finite` branch -- see its own comment.
+        let nan = serde_json::Value::from(f64::NAN);
+        assert_eq!(token_count(Some(&nan)), None, "NaN is None, not 0");
+        let infinity = serde_json::Value::from(f64::INFINITY);
+        assert_eq!(
+            token_count(Some(&infinity)),
+            None,
+            "infinity is None, not 0"
+        );
+
+        // Absent field.
+        assert_eq!(token_count(None), None, "absent field is None");
+    }
+
     // ---- extract_json_usage: OpenAI ---------------------------------------
 
     /// `total()` sums four numbers that came from a provider's JSON, so it
@@ -594,6 +717,64 @@ mod tests {
         );
     }
 
+    // ---- WP-48: a present-but-unparseable count must never read as 0 ------
+    //
+    // End-to-end (through `extract_json_usage`, not just `token_count`
+    // directly): a full OpenAI-shaped `usage` object with float counts must
+    // produce the right `TokenUsage`, cached-token subtraction included.
+    // Before this fix, every one of these three floats (`prompt_tokens`,
+    // `completion_tokens`, `cached_tokens`) would have parsed as `None` via
+    // `as_u64()` and silently rendered as 0.
+
+    #[test]
+    fn openai_json_usage_with_float_counts() {
+        let body = br#"{"usage":{"prompt_tokens":100.0,"completion_tokens":20.0,"prompt_tokens_details":{"cached_tokens":80.0}}}"#;
+        let usage = extract_json_usage(Dialect::OpenAi, body).expect("usage should be found");
+        assert_eq!(
+            usage.input_tokens, 20,
+            "100.0 prompt - 80.0 cached, both floats"
+        );
+        assert_eq!(usage.cached_tokens, 80);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.total(), 120);
+    }
+
+    /// The `saturating_sub` interaction, one direction: `cached_tokens`
+    /// parses but `prompt_tokens` does not (a string here). `input` must come
+    /// out defaulted to 0 via the normal "field absent" path -- not a
+    /// negative-then-wrapped garbage number -- and `cached_tokens`, which did
+    /// parse, must be unaffected by its sibling's failure.
+    #[test]
+    fn openai_json_usage_unparseable_prompt_with_valid_cached() {
+        let body = br#"{"usage":{"prompt_tokens":"bad","completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+        let usage = extract_json_usage(Dialect::OpenAi, body).expect("usage should be found");
+        assert_eq!(
+            usage.input_tokens, 0,
+            "unparseable prompt_tokens defaults input to 0, doesn't underflow against cached"
+        );
+        assert_eq!(usage.cached_tokens, 80, "cached_tokens itself still parses");
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    /// The other direction: `prompt_tokens` parses (as a float) but the
+    /// nested `cached_tokens` does not (negative, here) -- the subtraction
+    /// must treat cached as 0 rather than corrupting `input`, and the
+    /// negative count itself must not leak through as a token count.
+    #[test]
+    fn openai_json_usage_valid_prompt_with_unparseable_cached() {
+        let body = br#"{"usage":{"prompt_tokens":100.0,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":-1}}}"#;
+        let usage = extract_json_usage(Dialect::OpenAi, body).expect("usage should be found");
+        assert_eq!(
+            usage.input_tokens, 100,
+            "negative cached_tokens is None, so nothing is subtracted"
+        );
+        assert_eq!(
+            usage.cached_tokens, 0,
+            "a negative cache count is not data we bill from"
+        );
+        assert_eq!(usage.output_tokens, 5);
+    }
+
     // ---- extract_json_usage: Anthropic ------------------------------------
 
     #[test]
@@ -619,6 +800,18 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, 15);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total(), 70);
+    }
+
+    /// WP-48 end-to-end: an Anthropic `usage` object with float counts must
+    /// still produce the right `TokenUsage`, all four buckets included.
+    #[test]
+    fn anthropic_json_usage_with_float_counts() {
+        let body = br#"{"usage":{"input_tokens":10.0,"output_tokens":5.0,"cache_read_input_tokens":40.0,"cache_creation_input_tokens":15.0}}"#;
+        let usage = extract_json_usage(Dialect::Anthropic, body).expect("usage should be found");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_tokens, 40);
+        assert_eq!(usage.cache_creation_tokens, 15);
+        assert_eq!(usage.output_tokens, 5);
     }
 
     // ---- extract_json_usage: OpenAI Responses API -------------------------
@@ -656,6 +849,21 @@ mod tests {
             "no cache present, nothing to subtract"
         );
         assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    /// WP-48 end-to-end: an OpenAI Responses `usage` object with float
+    /// counts, cached-token subtraction included -- 14.0 - 4.0 = 10, not 0.
+    #[test]
+    fn openai_responses_json_usage_with_float_counts() {
+        let body = br#"{"usage":{"input_tokens":14.0,"output_tokens":5.0,"input_tokens_details":{"cached_tokens":4.0}}}"#;
+        let usage =
+            extract_json_usage(Dialect::OpenAiResponses, body).expect("usage should be found");
+        assert_eq!(
+            usage.input_tokens, 10,
+            "14.0 - 4.0 cached, both floats, is 10, not 0"
+        );
+        assert_eq!(usage.cached_tokens, 4);
         assert_eq!(usage.output_tokens, 5);
     }
 
