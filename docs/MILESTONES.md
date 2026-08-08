@@ -1,6 +1,6 @@
 # Milestones — releases, and how a ticket earns its slot
 
-**Updated 2026-08-06** (v0.0.1 shipped; current milestone is v0.1.0). Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
+**Updated 2026-08-08** (v0.0.1 shipped; current milestone is v0.1.0). Companion to `IMPLEMENTATION_PLAN.md` (which owns *what each work
 package is*) and the build board (which owns *what state each WP is in*). This document
 owns the third axis: **which release a piece of work belongs to, and why.**
 
@@ -199,6 +199,49 @@ increment 2, an aggregate cluster with member-order failover and a host pick tha
 owning member — is in progress and, as of this update, uncommitted and unverified. WP-45's
 consumer B (body-based model routing), the other named dependency, landed 2026-08-05
 (`872b7d7`). The one dependency still open is WP-14's retry/host-repick wiring.
+
+**Update, 2026-08-08: the failover mechanism landed, and the gate's third clause is now
+code-complete — that is not the same claim as "v0.1.0 is ready to ship."** Increment 2 landed
+across four commits (`cb84f83`, `a2bfef7`, `d4ac161`, `399b954`) on 2026-08-07/08: 2a built the
+aggregate-cluster runtime mechanism (`ClusterKind::Aggregate`, member-order failover via
+`attempted_clusters`, a host pick that yields its owning member) with a credential-isolation
+test that asserts the negative — a request that fails over from provider A to provider B must
+**not** carry A's key, not just that B's key is present; 2b-i made it reachable from Envoy-mode
+config (`cluster_type` lowering, `LbPolicy::ClusterProvided` as a real IR variant, since Envoy
+requires it on an aggregate); 2b-ii added `validate_cluster_graph`, rejecting a missing member,
+a nested aggregate, a self-reference, or a duplicate at config time with a dotted path; 2c made
+the `llmproxy` dialect lower `fallbacks:` to exactly this, closing the warn-and-drop gap this
+document corrected twice (2026-08-03 and again above on 2026-08-06). `examples/llmproxy.yaml`
+changed as a direct result — its `gpt-5* → anthropic/claude-sonnet-5` showcase was cross-dialect
+and is now correctly rejected at load time; it now falls back to `local-vllm` instead. The one
+dependency this WP carried on WP-14 needed no new retry-engine work: 429-as-retriable and
+never-retry-after-first-byte were already true by construction, as recorded above.
+
+**Scope actually closes at same-dialect fallback.** Cross-dialect fallback (e.g. `openai`
+primary, `anthropic` fallback) is a hard config-time error naming the route and fallback index,
+not a silent drop — forwarding an OpenAI-shaped body to Anthropic, or parsing its response with
+the wrong dialect's token parser, is the wrong-provider-shape version of WP-48's arithmetic bug.
+The request/response translation table this would need is real, unstarted work and has been
+split into **WP-52** (scheduled v1.0.0, alongside WP-44, which also extends WP-35). Leaving
+WP-35 "open" indefinitely for scope it was never going to finish this milestone would have been
+the less honest call than closing it at what actually shipped — **WP-35 is now `done`.**
+
+**All three gate clauses are code-complete. That is still not the same fact as "verified end to
+end," and this release stays `current`, not `shipped`, until it is.** QA-1 gives real black-box
+evidence for the token-count clause (passing since 2026-08-01). Rate limiting and provider
+failover have neither a QA scenario nor a live run against real providers backing them — the
+same caveat this document has carried since 2026-08-01, now applying to all three clauses
+instead of one. v0.0.1 did not ship on code-complete; it shipped on a live smoke run against
+real OpenAI and Anthropic endpoints, run and recorded. Until an equivalent check exists for
+rate-limit enforcement and cross-provider failover, this document records the gate's code as
+closed and the release as not yet shipped — a judgment call, not a rule the code forces, and
+recorded here as one so it can be argued with.
+
+**WP-48 landed the same batch (`41f1c59`), re-scoped by its own audit.** No live overflow bug
+existed outside `usage.rs` — everything else already saturated. The real defect: `as_u64()`
+returns `None` for a JSON float, so a provider reporting `"output_tokens": 150.0` billed as
+zero, silently. Fixed at all five call sites through one helper; unparseable input is now
+`None` (renders absent), never `0` (a number someone bills against).
 
 ---
 

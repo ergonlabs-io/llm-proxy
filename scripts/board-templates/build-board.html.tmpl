@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 50 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-03 · 904 tests green · + black-box QA suite (Go)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 965 tests green (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -197,14 +197,18 @@
     <span class="gate"><b>SHIP GATE —</b> per-request token counts (input / cache-read /
     cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate
     limit is enforced; and the proxy fails over from one provider to another mid-request without
-    the client seeing an error. <b>Two of the three are now real</b> — token counts and TTFT/TPOT
-    land via WP-33/34/45/46, and the dialect's <code>limits</code> key enforces. Provider failover
-    (WP-35) is the remaining third. Its <i>credential-safety precondition</i> has landed — increments
-    1a and 1b moved provider auth off the route and onto the cluster an attempt actually dialed, so a
-    fallback can no longer be sent the primary's API key — but the failover <i>mechanism</i>
-    (the aggregate cluster) is still in progress. Until it lands, a configured
-    <code>fallbacks:</code> block is parsed, validated, and then dropped with one stderr warning:
-    an operator who configures failover gets a proxy that does not fail over.</span>
+    the client seeing an error. <b>All three clauses are now code-complete</b> — token counts and
+    TTFT/TPOT land via WP-33/34/45/46, the dialect's <code>limits</code> key enforces the rate
+    limit, and provider failover (WP-35) landed 2026-08-07/08: an aggregate cluster with
+    member-order failover, reachable from both front-ends (Envoy <code>cluster_type</code> and the
+    dialect's <code>fallbacks:</code> key, which now lowers for real instead of warning and
+    dropping), with credentials and the Host header both following the cluster an attempt actually
+    dialed rather than the route that matched. <b>Code-complete is not the same claim as shipped.</b>
+    QA-1 backs the token-count clause with real black-box evidence; nothing yet backs rate-limit
+    enforcement or failover the way v0.0.1's live smoke run backed <em>its</em> gate, so this
+    release stays <code>current</code>. WP-35's scope closed narrower than its title: same-dialect
+    fallback only — cross-dialect (openai → anthropic) is a deliberate hard error, split into new
+    WP-52 rather than left as a silent gap.</span>
     <span class="sub"><b>The honest read:</b> v0.0.1's clean first run is weaker evidence than a
     run that found something — four requests exercise a narrow path, and nothing there tested
     load, concurrency, provider error shapes, or long streams. Coverage stays three-tiered
@@ -223,7 +227,17 @@
     block without <code>stream_options.include_usage</code> — the request-body rewrite pipeline that
     forces it also absorbed WP-35's model routing, which now reads the model from the request
     <i>body</i> rather than a client-supplied header. That closed a privilege-escalation surface:
-    a client could otherwise pick its own provider, credential, and budget.</span>
+    a client could otherwise pick its own provider, credential, and budget.
+    <b>Test-suite note (2026-08-08):</b> full workspace runs took 656–863s; they now take
+    <b>50.8s</b> (965 green, zero slow). Two causes, found in that order. 8 <code>diffrig</code>
+    tests were intermittently <i>hanging</i> rather than merely slow — mitigated to 2 by a
+    multi-threaded runtime plus a <code>terminate-after</code> gate that turns a hang into a
+    named failure; not fixed, those tests still carry no request timeouts. The larger cause was
+    <code>codegen-units = 256</code>: macOS keeps DWARF in the object files, so
+    <code>target/debug/deps</code> held <b>1,013,436 <code>.o</code> files</b> (46 GB). Setting
+    <code>codegen-units = 16</code> took it to 2,834 files / 2.9 GB and cold-build CPU use from
+    0.31 to 4.7 of 8 cores. The measured "memory pressure" was the symptom, not the cause — which
+    is why throttling jobs had measured 42% <i>worse</i>.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>

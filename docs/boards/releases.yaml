@@ -70,74 +70,96 @@ releases:
     Per-request token counts (input / cache-read / cache-write / output) and TTFT/TPOT reach
     the access log for live traffic; a token-based rate limit is enforced; and the proxy fails
     over from one provider to another without the client seeing an error.
-  done: 2
-  open: 4
+  done: 4
+  open: 5
   left:
-  - wp: WP-46
-    what: >-
-      <b>Done 2026-08-02 (9b68eac).</b> <code>%LLM_TPOT%</code> (mean, computed in micros so a
-      fast provider doesn't render 0), plus <code>%LLM_MAX_STALL%</code> and
-      <code>%LLM_RESPONSE_CHUNKS%</code> exposing two fields that were already computed every
-      stream and unreadable. This closes the access-log half of the gate's first clause; nothing
-      has run a scenario asserting it end to end yet (no QA case names TPOT/max-stall).
-  - wp: WP-45
-    what: >-
-      <b>Done 2026-08-05 (872b7d7) — all 6 acceptance criteria met.</b> Consumer B (body-based
-      model routing) was the last increment: routing now reads <code>model</code> from the real
-      request body instead of a client-controlled header, which was also a privilege-escalation
-      surface. The header is DERIVED, never trusted — overwritten when the body names a model,
-      removed when it doesn't. Acceptance criterion 5's test asserts which upstream CLUSTER was
-      actually dialed over a real socket, not a string match.
   - wp: WP-35
     what: >-
-      <b>The dominant open item on this gate.</b> No longer at zero: increments 1a (193444e) and
-      1b (b1ca416) landed this batch — provider credentials now follow the CLUSTER an attempt
-      actually dialed, not the route that matched, which is what a cross-provider fallback needs
-      to not leak the primary's key to the fallback's endpoint. <b>The fallback mechanism itself
-      is still not built</b> — increment 2 (an aggregate cluster: member-order failover, a host
-      pick that yields its owning member) is in progress uncommitted as of 2026-08-06, unverified,
-      and is not represented as working anywhere on this board. WP-45's consumer B dependency is
-      now resolved (see above); WP-14's retry/host-repick wiring is the one dependency still open.
+      <b>Done 2026-08-07/08 (cb84f83, a2bfef7, d4ac161, 399b954) — this closes the gate's third
+      and last clause.</b> The aggregate cluster (member-order failover via
+      <code>attempted_clusters</code>, a host pick that yields its owning member) is reachable
+      from both front-ends: Envoy-mode <code>cluster_type</code>, and the dialect's
+      <code>fallbacks:</code> key, which now lowers for real instead of warning and dropping.
+      <code>validate_cluster_graph</code> rejects a missing/self/nested/duplicate member at
+      config time with a dotted path. A credential-isolation test asserts the negative — B's
+      request must not carry A's key. <b>Scope note: this is SAME-DIALECT fallback only.</b>
+      Cross-dialect (openai → anthropic) is a deliberate hard error, split into new WP-52
+      (v1.0.0) rather than silently left undone inside this WP.
+  - wp: WP-48
+    what: >-
+      <b>Done 2026-08-07 (41f1c59), re-scoped by its own audit.</b> No live overflow bug existed
+      outside <code>usage.rs</code>. The real defect: <code>as_u64()</code> returns
+      <code>None</code> for a JSON float, so a provider reporting <code>150.0</code> output
+      tokens billed as zero, silently. Fixed at all 5 call sites through one helper.
+  - wp: WP-46
+    what: >-
+      Done 2026-08-02 (9b68eac). <code>%LLM_TPOT%</code> (mean, computed in micros so a
+      fast provider doesn't render 0), plus <code>%LLM_MAX_STALL%</code> and
+      <code>%LLM_RESPONSE_CHUNKS%</code>. Closes the access-log half of the first clause; no QA
+      case names TPOT/max-stall, so nothing has run this end to end yet.
+  - wp: WP-45
+    what: >-
+      Done 2026-08-05 (872b7d7) — all 6 acceptance criteria met. Consumer B (body-based model
+      routing) reads <code>model</code> from the real request body instead of a
+      client-controlled header, closing a privilege-escalation surface.
+  - wp: WP-49
+    what: >-
+      Backend taxonomy. Increment 1 done 2026-08-02 (caccc5f) — the <code>models:</code>
+      catalogue. <b>Remaining:</b> wildcard model names + trie, then the OAuth/SigV4 credential
+      schemes Vertex/Bedrock need — those must run after WP-45's body rewrite and cannot be
+      header injection, and there is no hook for that today.
+  - wp: WP-47
+    what: >-
+      Vendored Lane-H filter proto. Not started. Three filters currently reuse unrelated Envoy
+      messages for typed_config (a borrowed <code>RateLimitSettings</code> for token-limit
+      config is already documented as "visibly stretched") — blocks per-descriptor rate-limit
+      config beyond a single (route, credential) bucket.
   - wp: WP-34
     what: >-
       Token rate limits. Extraction is done; the enforcement filter is built and live (429 +
-      <code>x-ratelimit-*</code>, mutation-tested); and <b>increment 3 landed 2026-08-02
-      (7249825) — the dialect's <code>limits</code> key now lowers a
-      <code>tokens_per_minute</code> + credential-header key to the enforcing filter</b>, so this
-      is reachable from the dialect, not just hand-written Envoy-mode config.
-      <b>Remaining:</b> per-descriptor config beyond a single (route, credential) bucket —
-      blocked on WP-47's vendored proto, not built yet.
+      <code>x-ratelimit-*</code>, mutation-tested); the dialect's <code>limits</code> key
+      lowers to it. <b>Remaining:</b> per-descriptor config beyond a single (route, credential)
+      bucket — blocked on WP-47.
   - wp: WP-33
     what: >-
-      Usage filter wired per-route into the llmproxy dialect; criterion 3 has its test
-      (mutation-tested, pinned to the InvalidValue error variant). <b>Remaining:</b> GenAI
-      metrics per OTel semconv (a stats/metrics surface — distinct from WP-46's access-log
-      fields, which are done) and the route-level <code>streaming: strict</code> assertion.
+      Usage filter wired per-route into the llmproxy dialect. <b>Remaining:</b> GenAI metrics
+      per OTel semconv (distinct from WP-46's access-log fields, which are done) and the
+      route-level <code>streaming: strict</code> assertion.
   - wp: WP-14
-    what: Hedging, and the retry wiring provider fallback (WP-35) rides on.
+    what: >-
+      Hedging, S5.2 retry budgets, previously-attempted-host predicate. WP-35's failover
+      shipped on this engine as already built — 429-as-retriable and
+      never-retry-after-first-byte needed no new mechanism here.
   risk: >-
-    <b>Where the three gate clauses actually stand:</b> token counts + TTFT/TPOT reaching the
-    access log is closed (WP-33 + WP-45 + WP-46). Token-based rate limiting is closed (WP-34's
-    filter enforces 429s from the dialect's <code>limits</code> key). <b>Provider failover
-    mid-request is open, and it is the whole remaining risk on this gate</b> — nothing else here
-    is in question. <b>Correction (again) this pass:</b> the dialect does not <em>reject</em>
-    <code>fallbacks</code> — it warns and drops the block, then serves traffic as if it were
-    never configured. A prior pass of these boards said "rejected," which is the same wrong
-    claim the 2026-08-03 MILESTONES.md correction already made once; it is fixed here for the
-    second time. Rejection would be safe; warn-and-drop means an operator who configures failover
-    gets a proxy that silently does not fail over. WP-35's credential-safety precondition
-    (increments 1a/1b — credentials now follow the cluster, not the route) landed this batch, but
-    the failover mechanism itself has not: the in-progress aggregate-cluster work is uncommitted
-    and unverified, and this board does not count it as done. The one WP-35 dependency still open
-    is WP-14's retry wiring. QA has no scenario for the rate-limit or TTFT/TPOT-log clauses either,
-    so "the code is live" and "an end-to-end scenario proves it" remain two different facts even
-    where the clause itself is closed. <b>Second risk, named 2026-08-01:</b> the LLM layer is now
-    stacking on <em>serving</em> foundations that are not finished — no connection pooling (WP-15,
-    still connect-per-stream, so every request pays a fresh TLS handshake to a provider), no
-    downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure
-    (WP-11). v0.0.1 proved the path carries <em>a</em> request; none of those three are exercised
-    by four smoke requests, and all three bite under concurrency, sustained streams, or a slow
-    consumer.
+    <b>All three gate clauses are now code-complete — that is a different fact from "verified
+    end to end," and this release stays marked current, not shipped, until that gap closes.</b>
+    Token counts + TTFT/TPOT reaching the access log: closed (WP-33 + WP-45 + WP-46), and QA-1
+    gives real black-box evidence for the token-count half (passing since 2026-08-01; nothing
+    names TPOT specifically). Token-based rate limiting: closed (WP-34's filter enforces 429s
+    from the dialect's <code>limits</code> key) — no QA scenario exercises it. <b>Provider
+    failover landed 2026-08-07/08</b> (WP-35 increments 2a/2b-i/2b-ii/2c) — no QA scenario
+    exercises it either. v0.0.1 did not ship on code-complete: it shipped on a live smoke run
+    against real OpenAI and Anthropic endpoints, actually executed and recorded. Until an
+    equivalent check exists for rate-limit enforcement and cross-provider failover, "the code
+    is live" and "an end-to-end scenario proves it" remain two different facts for all three
+    clauses, not just the one this document used to flag. <b>Judgment call, stated plainly:</b>
+    holding this release at <code>current</code> rather than flipping it to <code>shipped</code>
+    is this document's call, not something the gate text forces by itself — recorded here so it
+    can be argued with. <b>WP-35's own scope closed narrower than its title suggests:</b>
+    same-dialect fallback only. Cross-dialect (openai → anthropic) is a deliberate hard error at
+    config time, not silently unsupported — the translation work it would need is real and
+    un-started, and is now WP-52 (v1.0.0), not a loose end inside this WP. <b>Second risk, named
+    2026-08-01, unchanged:</b> the LLM layer is stacking on <em>serving</em> foundations that are
+    not finished — no connection pooling (WP-15, still connect-per-stream), no downstream h2
+    (WP-10), and watermarks aliased to buffering rather than real backpressure (WP-11). None of
+    those three are exercised by the tests that closed this gate's clauses, and all three bite
+    under concurrency, sustained streams, or a slow consumer. <b>Third risk, new this pass:</b>
+    the workspace suite (965 tests, <code>cargo nextest</code>, not directly comparable to the
+    prior <code>cargo test</code> counts) had 8 tests in <code>diffrig</code> intermittently
+    hanging rather than merely slow, inflating full-run times 656–863s against a healthy ~79s.
+    Mitigated to 2 slow tests via a multi-threaded runtime plus a <code>terminate-after</code>
+    gate that turns a hang into a named failure — not fixed: those tests still carry no request
+    timeouts.
 - v: v0.2.0
   name: Production-ready serving
   state: later

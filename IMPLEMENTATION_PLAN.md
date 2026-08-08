@@ -962,6 +962,37 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
   as that file's own comment instructs. And Envoy *requires* `lb_policy: CLUSTER_PROVIDED` on
   an aggregate cluster, which the IR's `LbPolicy` has no variant for and `convert_cluster`
   currently rejects.
+- **Increment 2 landed 2026-08-07/08 (`cb84f83`, `a2bfef7`, `d4ac161`, `399b954`) — the
+  failover mechanism now exists and the v0.1.0 gate's failover clause is code-complete.**
+  2a built the runtime mechanism (member-order failover via `attempted_clusters`, a host pick
+  that yields its owning member) with a credential-isolation test that asserts the negative —
+  B's request must **not** carry A's key, not just that B's key is present. 2b-i made the
+  aggregate reachable from Envoy-mode config (`ClusterDiscoveryType::ClusterType` lowering,
+  `LbPolicy::ClusterProvided` as a real IR variant, five fields — `load_assignment`,
+  `transport_socket`, `typed_extension_protocol_options`, `metadata`, any non-`CLUSTER_PROVIDED`
+  `lb_policy` — rejected outright on an aggregate as inert-and-therefore-silently-ignored
+  otherwise). 2b-ii added `validate_cluster_graph`, a post-pass over the assembled cluster map
+  run after (not inside) the per-cluster loop so declaration order doesn't matter; it rejects a
+  missing member, a nested aggregate, a self-reference, or a duplicate member at config time
+  with a dotted path. 2c made the `llmproxy` dialect lower `fallbacks:` to exactly this — an
+  aggregate named `fallback:route-{index}`, members in listed order (listed order **is**
+  failover order), `num_retries` raised to `max(attempts, members - 1)` so every member is
+  reachable. The Host header follows the same per-cluster-headers mechanism increment 1a
+  built, for the identical reason 1a existed: a route-level `host_rewrite_literal` would have
+  sent the primary's Host to the fallback's endpoint.
+- **The retry-side survey (recorded above, 2026-08-06) held — no new retry-engine mechanism
+  was needed.** 429-as-retriable is existing `RetryPolicyIR` config; never-retry-after-first-byte
+  is already true by construction. So the one dependency this WP carried on WP-14 is resolved
+  without any WP-14 change.
+- **Scope actually closes at same-dialect fallback — cross-dialect is a hard error, not built,
+  and split into WP-52 (2026-08-08).** A `fallbacks:` entry naming a different dialect (e.g. an
+  `openai`-shaped route falling back to an `anthropic` provider) is rejected at config time
+  naming `routes[i].fallbacks[j]`. The request/response shape translation this WP's original
+  bullet called for ("OpenAI↔Anthropic shape translation as an explicit, versioned mapping
+  table") is real, substantial, un-started work — not a corner of this WP. See WP-52. **This WP
+  is done for what it now covers: same-dialect provider fallback via an aggregate cluster.**
+  Leaving it "open" indefinitely for scope that was never going to land this milestone would
+  have been the less honest call than closing it at what actually shipped.
 
 #### WP-36 — Gateway API Inference Extension (EPP) support  (Size: M)  — **Priority: P2**
 - Implement the Endpoint Picker protocol as consumed by Envoy AI Gateway / GKE Inference
@@ -1610,6 +1641,21 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
 - **Acceptance:** each converted site has a test using boundary inputs (`u64::MAX`, and the
   largest value the parser will accept) that fails against the unfixed arithmetic. A grep-based
   or lint-based guard against reintroduction is a stretch goal, not the deliverable.
+- **Landed 2026-08-07 (`41f1c59`), re-scoped by the audit itself.** There was no live overflow
+  bug: every wire-derived arithmetic site outside `usage.rs` already saturates. The audit found
+  a different defect in the same class instead: `serde_json::Value::as_u64()` returns `None`
+  for **any** JSON number that is not a non-negative integer — including an ordinary `150.0`,
+  which real providers emit — so `read_tokens`'s `unwrap_or(0)` billed a real usage report as
+  **zero**, silently, with the request succeeding and nothing logged. All five `as_u64()` call
+  sites now route through one `token_count` helper: a non-negative integer passes through, a
+  non-negative finite float truncates toward zero, anything else (negative, non-finite,
+  non-number, absent) is `None` — never `0`. `None` is the load-bearing choice: downstream it
+  renders as absent ("this provider reported no usage"), where `0` is a number someone bills
+  against ("this provider reported zero tokens").
+- **Deliberately not done: unifying `TokenUsage`, `LlmTokenUsage`, and `LlmTokens`.** The audit
+  flagged the four-bucket sum as triplicated across the three types, but all three `total()`
+  implementations already saturate correctly — merging them buys no correctness fix and is a
+  cross-crate dependency-direction decision, out of scope for an arithmetic sweep.
 
 #### WP-49 — Backend taxonomy: providers, models, and credential schemes  (Size: L)  — **Priority: P0** · **Milestone: v0.1.0**
 - **Why (owner, 2026-08-01).** One logical model is served by several backends: Claude by
@@ -1809,6 +1855,35 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   span under the same server span; `traceparent` from a synthetic upstream caller is joined, not
   replaced; token counts appear under pinned semconv names; and the Envoy-name `/stats` adapter
   still passes WP-23's own conformance tests unchanged.
+
+#### WP-52 — Cross-dialect provider fallback: request/response translation table  (Size: L)  — **Priority: P2** · **Milestone: v1.0.0**
+- **Why (split out of WP-35, 2026-08-08).** WP-35 closes same-dialect provider fallback
+  (openai-compatible chains, e.g. `openai` → `local-vllm`) for v0.1.0. Cross-dialect fallback
+  (e.g. an `openai`-shaped route falling back to an `anthropic` provider) is a **hard
+  config-time error** as of WP-35 increment 2c, not a warning and not silently wrong — it has
+  to stay rejected until this WP exists. Forwarding an OpenAI-shaped request body to Anthropic's
+  endpoint produces a malformed request, and even where an endpoint tolerated it, the response
+  would be scanned for tokens by the wrong dialect's usage parser — the wrong-provider-shape
+  version of the silently-wrong-billing-number failure WP-48 exists to prevent at the
+  arithmetic level.
+- **Build:** an explicit, versioned per-provider-pair mapping — not a generic JSON diff —
+  covering at minimum: request shape (`model`, `messages`/`content` blocks, sampling params),
+  streaming event framing (OpenAI's and Anthropic's SSE `data:` chunk shapes differ), and the
+  usage/token block each dialect's usage filter parses. Runs on the fallback attempt only —
+  same-dialect chains keep the zero-translation path WP-35 already built. This WP owns, and
+  must not inherit unexamined, the decision of whether translation is expressible as a
+  bounded-buffer transform (reusing WP-45's substrate) or needs a full reshape: a
+  request/response *shape* change is not generally a prefix splice the way `include_usage`
+  injection is.
+- **Depends on:** WP-35 (done — same-dialect fallback and the aggregate-cluster mechanism this
+  reuses), WP-45 (bounded-buffer body pipeline, possible substrate), WP-49 (backend taxonomy —
+  translation needs to know the source and target provider *type*, not just the cluster name).
+- **Acceptance:** a scripted primary-fails/fallback-succeeds drill across dialects (openai →
+  anthropic and the reverse) produces a response indistinguishable from what the fallback
+  provider's own dialect would produce natively — non-streaming and streaming — with usage
+  attributed to the fallback provider's fields, never defaulted or dropped. A provider pair with
+  no registered mapping still hard-errors at config time naming the dotted path, exactly as
+  today.
 
 ## Part 3 — Milestone gates (roll-up)
 

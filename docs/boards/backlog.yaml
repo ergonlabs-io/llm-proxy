@@ -309,7 +309,9 @@ work_packages:
   - >-
     open: hedging (half this WP's title) · S5.2 retry budgets · previously-attempted-host
     predicate
-  note: WP-35 provider fallback rides on this
+  note: >-
+    WP-35 provider fallback shipped on this engine AS BUILT — 429-as-retriable and
+    never-retry-after-first-byte needed no new mechanism here, both were already true
 - id: 15
   prio: P1
   ms: v0.0.1
@@ -442,6 +444,11 @@ work_packages:
   - proxy-observability
   - needs 06
   - owns the two inert stat_prefix fields flagged by the WP-39 guard
+  - >-
+    OWNER 2026-08-03: the internal model is OTel now — instruments + attribute sets +
+    semconv names — and Envoy's flat dotted /stats names become a RENDERING of the registry,
+    not its own shape (attributes are strictly more expressive; recovering them from a flat
+    mangled name is the harder direction). See WP-51, which this decision was made for
 - id: 24
   prio: P1
   ms: v0.0.1
@@ -714,39 +721,42 @@ work_packages:
   lane: H
   size: M
   gate: G5
-  status: started
+  status: done
   title: Model routing + provider fallback
   meta:
   - proxy-filters · proxy-config · proxy-cluster · proxy-simple-config
   - >-
-    ✓ INCREMENT 1a DONE (193444e) — ClusterConfig.request_headers_to_add, applied to the
-    per-attempt head INSIDE the router's retry loop, so credentials follow the cluster an
-    attempt actually dialed rather than the route that matched
+    ✓ INCREMENT 1a+1b DONE — provider credentials follow the CLUSTER an attempt actually
+    dialed (ClusterConfig.request_headers_to_add, applied inside the router's retry loop), not
+    the route that matched
   - >-
-    ✓ INCREMENT 1b DONE (b1ca416) — the llmproxy dialect carries provider credentials through
-    Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]; the two route-level
-    credential assignments are gone, so a credential can no longer follow routing to a
-    fallback's endpoint
+    ✓ INCREMENT 2 DONE 2026-08-07/08 (cb84f83, a2bfef7, d4ac161, 399b954) — the aggregate
+    cluster (ClusterKind::Aggregate), member-order failover via attempted_clusters, a host
+    pick that yields its owning member; reachable from BOTH front-ends (Envoy cluster_type
+    AND the dialect's fallbacks: key, which now lowers for real instead of warning and
+    dropping); validate_cluster_graph rejects a missing/self/nested/duplicate member at
+    config time with a dotted path
   - >-
-    increment 2 (aggregate cluster: ClusterKind::Aggregate, member-order failover, a host pick
-    that yields its owning member so that member's transport socket + credentials apply) is IN
-    PROGRESS as of 2026-08-06 — uncommitted, unverified. NOT landed; do not read as done
+    ✓ credential-isolation test asserts the NEGATIVE — a request that fails over from provider
+    A to provider B must not carry A's key, not just that B's key is present
+    (router_aggregate.rs::credential_isolation_across_failover)
   - >-
-    ✓ WP-45 consumer B landed (872b7d7) — routing now reads `model` from the real request body
-    instead of a client-supplied header, so WP-35 has something real to route on
+    ✓ WP-45 consumer B landed (872b7d7) — routing reads `model` from the real request body,
+    so this WP has something real to route on
   - >-
-    'remaining after increment 2: Envoy-mode cluster_type lowering, dialect lowering of
-    fallbacks:, and the retry-side work (per-provider retriable predicate, never retry after
-    the first response byte of a stream)'
-  - 'remaining dep: WP-14 retry-engine wiring for the actual failover attempt loop'
+    THIS CLOSES the v0.1.0 gate's failover clause. Scope that closes here: SAME-DIALECT
+    fallback (e.g. openai → an openai-compatible provider). examples/llmproxy.yaml's fallback
+    showcase changed from cross-dialect (gpt-5* → anthropic) to local-vllm as a result
+  - >-
+    ⚑ NOT in this WP: cross-dialect fallback (openai → anthropic) is a hard config-time
+    error naming routes[i].fallbacks[j], deliberately — the request/response shape
+    translation it needs is real, un-started work. Split into WP-52 (v1.0.0), not silently
+    dropped from scope
   note: >-
-    the dialect WARNS AND DROPS `fallbacks` today, it does NOT reject it — lower.rs:575 pushes
-    a ConfigWarning and proxy/src/main.rs prints warnings to stderr and proceeds, so a
-    `fallbacks:` block parses, validates, lowers, and is dropped with one stderr line. That is
-    a materially worse failure mode than rejection, not the same thing under a different name:
-    an operator who configures failover gets a proxy that silently does not fail over. This is
-    the second time this exact wording ("REJECTS") had to be corrected — see MILESTONES.md's
-    2026-08-03 correction, which this card had not picked up until now
+    historical: the dialect used to WARN AND DROP `fallbacks` (parsed, validated, lowered,
+    then dropped with one stderr line) — corrected in MILESTONES.md 2026-08-03 and again
+    2026-08-06. Increment 2c (399b954) replaced that with a real lowering, so this note is
+    now history, not the current behavior
 - id: 45
   prio: P0
   ms: v0.1.0
@@ -942,23 +952,28 @@ work_packages:
   lane: A
   size: S
   gate: G2
-  status: ready
+  status: done
   title: Sweep arithmetic on wire-derived numbers
   meta:
   - workspace-wide audit
   - >-
-    TWO instances of one defect found on 2026-08-01, both plain `+` on a number that arrived
-    over the wire: TokenUsage::total() (four provider-reported u64s, on the live access-log
-    path) and body_rewrite's content-length fix-up (a CLIENT-supplied header)
+    ✓ DONE 2026-08-07 (41f1c59) — RE-SCOPED BY THE AUDIT: no live overflow bug existed outside
+    usage.rs, every other wire-derived site already saturates
   - >-
-    both panic the worker in debug and wrap silently in release; the content-length one is
-    DOWNSTREAM-reachable, so any client could trigger it
+    the real defect: serde_json's as_u64() returns None for a JSON FLOAT, so a provider
+    reporting "output_tokens": 150.0 silently billed as ZERO — confident wrong number, not a
+    crash, and nothing logged
   - >-
-    deliverable: audit every arithmetic op on a value parsed from a request, a response, or a
-    header; saturating everywhere; a test per site that panics without it
+    all 5 as_u64() call sites now route through one token_count helper: non-negative int
+    passes, non-negative finite float truncates, anything else (negative/non-finite/absent) is
+    None — never 0. None renders absent downstream; 0 is a number someone bills against
+  - >-
+    deliberately NOT done: unifying TokenUsage/LlmTokenUsage/LlmTokens — all three total()s
+    already saturate correctly, so merging is a dependency-direction decision, not a
+    correctness fix, and stayed out of scope
   note: >-
-    ⚠ two in one day is a pattern, not a coincidence. Both were found by code review, not by
-    any test — and the existing suites stayed green through both
+    ⚠ two in one day (this + the content-length fix-up) is a pattern, not a coincidence. Both
+    were found by code review, not by any test — the existing suites stayed green through both
 - id: 49
   prio: P0
   ms: v0.1.0
@@ -1030,4 +1045,58 @@ work_packages:
     register, attach to a team, rotate or revoke. Two hazards recorded — do NOT reuse
     hash_credential (FNV-1a, non-adversarial) for key AUTH; and auth fails CLOSED, the opposite
     of BudgetStore's fail-open
+- id: 51
+  prio: P1
+  ms: v0.2.0
+  lane: F
+  size: L
+  gate: G4
+  status: ready
+  title: OpenTelemetry (traces · metrics · semconv naming)
+  meta:
+  - proxy-observability
+  - >-
+    OWNER 2026-08-03: make the project OTel-ready — recorded and scheduled, not worked yet,
+    since v0.1.0's scope stays frozen
+  - >-
+    measured 2026-08-03 — logs strong (79 access-log operators, 9 LLM-specific) but ours not
+    semconv-named; traceparent PASSES THROUGH already (nothing strips it) but we emit no spans;
+    metrics is NOTHING (0 otel/prometheus/metrics deps, /stats a deliberate 404)
+  - >-
+    inc 1: semconv-name the LLM access-log operators (gen_ai.usage.* etc, old names alias for
+    one release) · inc 2: trace participation (parse traceparent, span per request + per
+    upstream attempt) · inc 3: OTLP export, gated on WP-23
+  - >-
+    ▲ the !Send collision: ADR-0003 makes the data plane !Send/worker-local, the OTel SDK's
+    providers are Send+Sync. Fix is ADR-0005's shape inverted — workers write local buffers,
+    control side aggregates + exports
+  note: >-
+    this decision is WHY WP-23's registry became OTel-native (see WP-23's card) — Envoy's flat
+    /stats names are now a rendering of this model, not the model itself
+- id: 52
+  prio: P2
+  ms: v1.0.0
+  lane: H
+  size: L
+  gate: G5
+  status: blocked
+  title: Cross-dialect provider fallback (request/response translation table)
+  meta:
+  - proxy-filters · proxy-config · proxy-simple-config
+  - split out of WP-35 2026-08-08 — same-dialect fallback (WP-35) is done; cross-dialect is not
+  - >-
+    needs 35 (done — the aggregate-cluster mechanism this reuses) + 45 (bounded-buffer body
+    pipeline, possible substrate) + 49 (backend taxonomy — needs the PROVIDER TYPE, not just
+    the cluster name)
+  - >-
+    an openai-shaped route falling back to anthropic is a HARD config-time error today
+    (routes[i].fallbacks[j]), on purpose — sending an OpenAI-shaped body to Anthropic, or
+    scanning its response with the wrong dialect's usage parser, is the wrong-provider-shape
+    version of WP-48's silent-wrong-billing-number bug
+  - >-
+    open design decision this WP owns: bounded-buffer transform (reuse WP-45) vs full reshape —
+    a shape change isn't generally a prefix splice the way include_usage injection is
+  note: >-
+    ⚑ rejecting cross-dialect fallback is the SAFE interim state, not a regression — see WP-35's
+    2026-08-08 note. This WP is what turns the rejection into support
 
