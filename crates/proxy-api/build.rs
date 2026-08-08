@@ -37,6 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/config/accesslog/v3/accesslog.proto",
         "envoy/extensions/access_loggers/file/v3/file.proto",
         "envoy/extensions/access_loggers/stream/v3/stream.proto",
+        // Lane-H (LLM) extensions we define ourselves, rather than borrowing an
+        // unrelated Envoy message -- WP-47 increment 1. Note this is the only
+        // root NOT under `vendor/envoy`: `scripts/vendor-protos.sh` does not
+        // manage it, because it is ours and is not re-fetched on a proto bump.
+        "llmproxy/filters/v0/auth.proto",
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);

@@ -1,0 +1,103 @@
+// Downstream authentication for the llm-proxy data plane (WP-50 increment 2a).
+//
+// This is the FIRST vendored Lane-H proto -- WP-47 increment 1. Every Lane-H
+// filter before it borrowed an unrelated already-compiled Envoy message and
+// read fields whose names happened to fit (`llmproxy.usage` reads
+// `DataSource.inline_string`; `llmproxy.body_rewrite` reads
+// `RuntimeFeatureFlag.default_value`; `llmproxy.token_limit` reads
+// `RateLimitSettings.max_tokens`/`fill_rate`, which is really Envoy's xDS
+// discovery-throttling config). Those three borrows still stand and their
+// migration remains WP-47's own scope; this file exists because the fourth
+// filter could not be built that way at all:
+//
+//   - Authentication config is a REPEATED STRUCTURED record (key id, tenant,
+//     digest, revoked). No compiled Envoy message has that shape, so the only
+//     way to borrow one would have been a JSON blob inside a string field.
+//   - That blob would carry CREDENTIAL MATERIAL through a field nothing
+//     validates. WP-47 already raises exactly this objection about provider
+//     credentials travelling as an unvalidated `google.protobuf.Struct`: a typo
+//     in the shape is a silent auth failure. Repeating it here, for the keys
+//     that guard the proxy itself, was not defensible.
+//
+// The `llmproxy.filters.v0` package is deliberately versioned from the start:
+// v0 signals that the shape is not yet frozen, and gives WP-47's migration of
+// the other three filters somewhere to land without renaming this one.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+import "envoy/config/core/v3/base.proto";
+
+// Configures the downstream authentication filter.
+//
+// The filter resolves an inbound request to a caller identity or refuses the
+// request. It fails CLOSED: with this filter in the chain, a request that
+// presents no recognized credential is refused, never admitted anonymously.
+// (Authorization is the opposite axis and defaults OPEN -- an authenticated
+// tenant with no configured policy may use every model and provider. See
+// `docs/wp-50-auth-design-brief.md`.)
+message Authentication {
+  // Required. The operator secret that keys the HMAC over virtual keys.
+  //
+  // A `DataSource` rather than an inline string so the secret can live in a
+  // file instead of the config document.
+  //
+  // Supported specifiers are `filename` and `inline_string`, and ONLY those
+  // two -- not because this filter could not read the others, but because
+  // `DataSource`'s supported surface is declared once for the whole project
+  // (`proxy-config`'s `allowed_fields`), and `environment_variable` /
+  // `inline_bytes` are not implemented at the sites where `DataSource` already
+  // appears (TLS certificates, `direct_response` bodies). Widening the entry
+  // here would silently claim support at those sites too. A config that sets
+  // either one is rejected with its dotted path rather than ignored.
+  //
+  // `watched_directory` is likewise not supported: rotating this secret
+  // invalidates every configured digest at once, so it is a deliberate
+  // reconfiguration, not something to pick up from a file-move event.
+  envoy.config.core.v3.DataSource hmac_secret = 1;
+
+  // The configured virtual keys.
+  //
+  // May be empty. An `Authentication` filter with no keys authenticates
+  // nothing and therefore refuses everything -- which is the correct reading
+  // of "authentication is enabled, and no credential is valid", not a
+  // misconfiguration to be rescued by admitting traffic.
+  repeated VirtualKey virtual_keys = 2;
+}
+
+// One virtual key. The plaintext key NEVER appears in configuration.
+message VirtualKey {
+  // Required. Names this credential in audit logs and in
+  // `%RESPONSE_CODE_DETAILS%`. Must be unique within one filter config.
+  //
+  // Separate from `tenant` on purpose: revoking one leaked key must not revoke
+  // the whole account, and an audit trail needs to name the key rather than
+  // just the account it belongs to.
+  string key_id = 1;
+
+  // Required. The tenant (account/team) this key authenticates as. Several
+  // keys may share a tenant; that is the normal case.
+  string tenant = 2;
+
+  // Required. Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`,
+  // exactly 64 characters.
+  //
+  // The digest, not the key: the plaintext is shown to the operator once, at
+  // creation, and is never recoverable from configuration. A keyed HMAC (not a
+  // bare SHA-256) means read access to this file does not by itself permit
+  // offline precomputation of matching keys.
+  //
+  // Hex rather than a proto `bytes` field, which the proto3 JSON mapping would
+  // render as base64: a hex digest is greppable in incident response and can
+  // be compared by eye against a `sha256`/`openssl dgst` transcript, which is
+  // how an operator will actually verify one.
+  string digest_hex = 3;
+
+  // A revoked key is refused. It stays in the configuration deliberately: the
+  // distinction between "unknown key" and "revoked key" is what lets an
+  // operator tell a compromised credential still being tried from a caller who
+  // simply typed the wrong thing. The DOWNSTREAM response is identical for
+  // both -- the difference reaches the access log, never the caller.
+  bool revoked = 4;
+}

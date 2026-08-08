@@ -65,6 +65,38 @@ pub struct LlmStats {
     pub response_chunks: u64,
 }
 
+/// WP-50: who the downstream caller was authenticated as, written by the auth
+/// filter (`proxy-filters`) on the decode path.
+///
+/// # Why plain `String`s and not `proxy_filters::auth::Principal`
+///
+/// Same dependency direction as [`LlmTokenUsage`] above: `proxy-filters`
+/// depends on `proxy-http`, so the richer type cannot travel the other way.
+/// The auth filter converts at its boundary. What crosses is deliberately only
+/// the two *identifiers* — a `Principal` also carries an `Arc<TenantPolicy>`,
+/// and policy is not something a downstream consumer of `StreamInfo` (access
+/// logs, stats) has any business reading.
+///
+/// # `None` means "not authenticated", and every reader must treat it as such
+///
+/// A stream where the auth filter is not configured, or that was refused
+/// before authentication, leaves both fields `None`. **A consumer keying
+/// anything security-relevant off `tenant` must fail closed on `None` rather
+/// than substitute a default**, because the alternative — one shared implicit
+/// bucket for every unauthenticated caller — is exactly the identity confusion
+/// authentication exists to remove. See
+/// `proxy_filters::token_limit_filter`'s bucket-key selection for the one
+/// consumer that exists today and how it handles the absent case.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuthInfo {
+    /// The tenant (account/team) the credential resolved to.
+    pub tenant: Option<String>,
+    /// WHICH credential authenticated — kept distinct from `tenant` because
+    /// revoking one leaked key must not revoke the whole account, and an
+    /// audit trail needs to name the key.
+    pub key_id: Option<String>,
+}
+
 /// Envoy's `StreamInfo`: populated throughout the request lifecycle, consumed by
 /// access logging (WP-24) and stats (WP-23).
 ///
@@ -105,6 +137,11 @@ pub struct StreamInfo {
     /// WP-33: GenAI observations, written by the usage filter (`proxy-filters`)
     /// on the encode path. Left at `Default` for every non-LLM stream.
     pub llm: LlmStats,
+    /// WP-50: the authenticated caller, written by the auth filter
+    /// (`proxy-filters`) on the decode path. Both fields stay `None` when no
+    /// auth filter is configured — see [`AuthInfo`] for why that case must
+    /// never be papered over with a default identity.
+    pub auth: AuthInfo,
 }
 
 impl StreamInfo {

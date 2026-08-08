@@ -172,6 +172,17 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // mode, arriving with no code change of ours to blame it on.
         "envoy.config.cluster.v3.Cluster.CustomClusterType" => &["name", "typed_config"],
         "envoy.extensions.clusters.aggregate.v3.ClusterConfig" => &["clusters"],
+        // WP-50 / WP-47 increment 1: the first proto this project defines
+        // itself rather than borrowing from Envoy. Listed for the same
+        // forward-compat reason as the two entries above -- every field is
+        // mapped today, so no config can trip these -- but with one difference
+        // that makes them likelier to matter: WE add the fields to this
+        // message. An `llmproxy.filters.v0` field added without a matching
+        // entry here would be accepted and ignored, which is ground rule #1's
+        // exact failure mode arriving from our own change rather than an Envoy
+        // bump.
+        "llmproxy.filters.v0.Authentication" => &["hmac_secret", "virtual_keys"],
+        "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
         // Only the `io.llmproxy.provider_auth` namespace under
         // `filter_metadata` is understood -- see
         // `convert_provider_auth_metadata`. `typed_filter_metadata` is not
