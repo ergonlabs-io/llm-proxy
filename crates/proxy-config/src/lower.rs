@@ -25,6 +25,7 @@ use proxy_api::envoy::config::listener::v3 as listener_v3;
 use proxy_api::envoy::config::route::v3 as route_v3;
 use proxy_api::envoy::extensions::access_loggers::file::v3 as access_log_file_v3;
 use proxy_api::envoy::extensions::access_loggers::stream::v3 as access_log_stream_v3;
+use proxy_api::envoy::extensions::clusters::aggregate::v3 as aggregate_cluster_v3;
 use proxy_api::envoy::extensions::filters::listener::tls_inspector::v3 as tls_inspector_v3;
 use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
@@ -142,6 +143,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.config.cluster.v3.Cluster" => &[
             "name",
             "type",
+            "cluster_type",
             "connect_timeout",
             "lb_policy",
             "load_assignment",
@@ -151,6 +153,11 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "typed_extension_protocol_options",
             "metadata",
         ],
+        // WP-35 increment 2b-i: the only custom cluster type implemented is
+        // `envoy.clusters.aggregate` (see `convert_cluster`'s
+        // `ClusterDiscoveryType::ClusterType` arm).
+        "envoy.config.cluster.v3.Cluster.CustomClusterType" => &["name", "typed_config"],
+        "envoy.extensions.clusters.aggregate.v3.ClusterConfig" => &["clusters"],
         // Only the `io.llmproxy.provider_auth` namespace under
         // `filter_metadata` is understood -- see
         // `convert_provider_auth_metadata`. `typed_filter_metadata` is not
@@ -1812,17 +1819,30 @@ fn convert_data_source(
 
 // ----------------------------------------------------------------- clusters --
 
+/// `CustomClusterType.name` for the one custom cluster type implemented.
+const AGGREGATE_CLUSTER_TYPE_NAME: &str = "envoy.clusters.aggregate";
+
+/// `CustomClusterType.typed_config`'s expected type name for an aggregate
+/// cluster.
+const AGGREGATE_CLUSTER_CONFIG_TYPE: &str = "envoy.extensions.clusters.aggregate.v3.ClusterConfig";
+
 fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig, ConfigError> {
     use cluster_v3::cluster::{
         ClusterDiscoveryType, DiscoveryType as ProtoDiscovery, LbPolicy as ProtoLb,
     };
 
-    let discovery = match &c.cluster_discovery_type {
-        None => DiscoveryType::Static, // proto default: STATIC
+    // `discovery` and `kind` come out of the same `cluster_discovery_type`
+    // oneof match -- an aggregate cluster (`ClusterType`) has no discovery
+    // mechanism of its own, so the two questions ("how do I turn this
+    // cluster's own endpoints into hosts" vs "does this cluster own hosts at
+    // all") have to be answered together here, even though `ClusterConfig`
+    // keeps them as separate fields (see its `kind` doc for why).
+    let (discovery, kind) = match &c.cluster_discovery_type {
+        None => (DiscoveryType::Static, ClusterKind::Endpoints), // proto default: STATIC
         Some(ClusterDiscoveryType::Type(t)) => match ProtoDiscovery::try_from(*t) {
-            Ok(ProtoDiscovery::Static) => DiscoveryType::Static,
-            Ok(ProtoDiscovery::StrictDns) => DiscoveryType::StrictDns,
-            Ok(ProtoDiscovery::LogicalDns) => DiscoveryType::LogicalDns,
+            Ok(ProtoDiscovery::Static) => (DiscoveryType::Static, ClusterKind::Endpoints),
+            Ok(ProtoDiscovery::StrictDns) => (DiscoveryType::StrictDns, ClusterKind::Endpoints),
+            Ok(ProtoDiscovery::LogicalDns) => (DiscoveryType::LogicalDns, ClusterKind::Endpoints),
             Ok(ProtoDiscovery::Eds) => {
                 return Err(unsupported(
                     format!("{path}.type"),
@@ -1836,18 +1856,64 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
                 ))
             }
         },
-        Some(ClusterDiscoveryType::ClusterType(_)) => {
-            return Err(unsupported(
-                format!("{path}.cluster_type"),
-                "custom cluster types are not implemented",
-            ))
+        Some(ClusterDiscoveryType::ClusterType(ct)) => {
+            if ct.name != AGGREGATE_CLUSTER_TYPE_NAME {
+                return Err(unsupported(
+                    format!("{path}.cluster_type.name"),
+                    format!(
+                        "only `{AGGREGATE_CLUSTER_TYPE_NAME}` custom cluster types are \
+                         implemented, found `{}`",
+                        ct.name
+                    ),
+                ));
+            }
+            let cfg_path = format!("{path}.cluster_type.typed_config");
+            let any = ct
+                .typed_config
+                .as_ref()
+                .ok_or_else(|| invalid(&cfg_path, "typed_config is required"))?;
+            if type_name(any) != AGGREGATE_CLUSTER_CONFIG_TYPE {
+                return Err(ConfigError::UnknownTypeUrl {
+                    field_path: cfg_path,
+                    type_url: any.type_url.clone(),
+                });
+            }
+            let agg: aggregate_cluster_v3::ClusterConfig = decode_any(any, &cfg_path)?;
+            // Belt and suspenders: the proto's own `repeated.min_items = 1`
+            // PGV annotation on `clusters` already rejects this during
+            // `parse_bootstrap` (`validate::validate_message`, WP-04), before
+            // `convert_cluster` ever runs, so this arm is unreachable through
+            // the normal `parse_bootstrap` -> `build_snapshot` pipeline today.
+            // It stays because `build_snapshot`'s own doc only promises it is
+            // "the only door between protobuf-land and the data plane" --
+            // nothing guarantees every future caller of it validated first
+            // (module doc: xDS resources will run PGV too, but haven't yet).
+            if agg.clusters.is_empty() {
+                return Err(invalid(
+                    format!("{cfg_path}.clusters"),
+                    "an aggregate cluster needs at least one member",
+                ));
+            }
+            (
+                // Inert: an aggregate is forbidden from carrying its own
+                // endpoints (rejected below), so `convert_endpoint` never
+                // runs for one and this value is never read.
+                DiscoveryType::Static,
+                ClusterKind::Aggregate {
+                    // Member order IS the failover order (S7 / `ClusterKind`'s
+                    // doc) -- preserve `clusters`' listed order exactly.
+                    members: agg.clusters.clone(),
+                },
+            )
         }
     };
+    let is_aggregate = matches!(kind, ClusterKind::Aggregate { .. });
 
     let lb_policy = match ProtoLb::try_from(c.lb_policy) {
         Ok(ProtoLb::RoundRobin) => LbPolicy::RoundRobin,
         Ok(ProtoLb::LeastRequest) => LbPolicy::LeastRequest,
         Ok(ProtoLb::Random) => LbPolicy::Random,
+        Ok(ProtoLb::ClusterProvided) => LbPolicy::ClusterProvided,
         // RING_HASH / MAGLEV: the `LbPolicy` variants exist so the IR can
         // model them, but WP-17 deliberately does not implement them yet --
         // a consistent-hash that isn't bit-identical to Envoy's silently
@@ -1877,10 +1943,67 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         }
     };
 
+    // Envoy requires `lb_policy: CLUSTER_PROVIDED` on an aggregate cluster
+    // (it has no hosts of its own to run a real policy over) and forbids it
+    // everywhere else (we implement no cluster-provided host-picking for a
+    // cluster that owns hosts) -- see `LbPolicy::ClusterProvided`'s doc.
+    if is_aggregate && lb_policy != LbPolicy::ClusterProvided {
+        return Err(invalid(
+            format!("{path}.lb_policy"),
+            "an aggregate cluster (cluster_type: envoy.clusters.aggregate) requires \
+             lb_policy: CLUSTER_PROVIDED; note the proto default when lb_policy is unset (0) \
+             is ROUND_ROBIN, so it must be set explicitly",
+        ));
+    }
+    if !is_aggregate && lb_policy == LbPolicy::ClusterProvided {
+        return Err(unsupported(
+            format!("{path}.lb_policy"),
+            "CLUSTER_PROVIDED is only implemented for envoy.clusters.aggregate (cluster_type); \
+             this cluster owns its own hosts and needs a real host-picking policy",
+        ));
+    }
+
     let connect_timeout = match &c.connect_timeout {
         Some(d) => to_std_duration(d, &format!("{path}.connect_timeout"))?,
         None => DEFAULT_CONNECT_TIMEOUT,
     };
+
+    // Everything below is inert on an aggregate cluster: the member that
+    // actually serves a request supplies its own endpoints, TLS, upstream
+    // protocol, and (for the dialect) credentials -- ground rule #1 forbids
+    // silently accepting-and-ignoring any of them, so each is a hard error
+    // naming its own dotted path rather than a silent no-op.
+    if is_aggregate {
+        if c.load_assignment.is_some() {
+            return Err(invalid(
+                format!("{path}.load_assignment"),
+                "an aggregate cluster has no endpoints of its own -- hosts come from its \
+                 members",
+            ));
+        }
+        if c.transport_socket.is_some() {
+            return Err(invalid(
+                format!("{path}.transport_socket"),
+                "inert on an aggregate cluster: the member cluster that actually serves a \
+                 request supplies its own TLS",
+            ));
+        }
+        if !c.typed_extension_protocol_options.is_empty() {
+            return Err(invalid(
+                format!("{path}.typed_extension_protocol_options"),
+                "inert on an aggregate cluster: the member cluster that actually serves a \
+                 request supplies the upstream protocol",
+            ));
+        }
+        if c.metadata.is_some() {
+            return Err(invalid(
+                format!("{path}.metadata"),
+                "inert on an aggregate cluster, and dangerous if it carries \
+                 `io.llmproxy.provider_auth`: credentials set here would silently never apply \
+                 -- they belong on the member cluster that actually serves the request",
+            ));
+        }
+    }
 
     let mut endpoints = Vec::new();
     if let Some(la) = &c.load_assignment {
@@ -1899,6 +2022,10 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         .map(|ts| convert_upstream_tls(ts, &format!("{path}.transport_socket")))
         .transpose()?;
 
+    // Circuit breakers stay meaningful on an aggregate: the router applies
+    // the breaker to the *routed* cluster before the host pick, matching
+    // Envoy, so an aggregate's own thresholds do real work even though it
+    // has no hosts of its own.
     let circuit_breakers = convert_circuit_breakers(&c.circuit_breakers, path)?;
     let upstream_protocol = convert_upstream_protocol(&c.typed_extension_protocol_options, path)?;
     // Envoy-mode config has no proto field for per-provider auth headers --
@@ -1916,11 +2043,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         lb_policy,
         connect_timeout,
         endpoints,
-        // Envoy-mode lowering of `cluster_type` (the proto field that would
-        // carry `envoy.clusters.aggregate`) is a later WP-35 increment --
-        // `ClusterDiscoveryType::ClusterType` is already rejected above as
-        // unsupported, so every cluster this function returns is `Endpoints`.
-        kind: ClusterKind::Endpoints,
+        kind,
         transport_socket,
         per_connection_buffer_limit_bytes: c
             .per_connection_buffer_limit_bytes

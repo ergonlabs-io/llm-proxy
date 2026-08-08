@@ -547,6 +547,18 @@ pub enum LbPolicy {
     RingHash,
     Random,
     Maglev,
+    /// Envoy's `CLUSTER_PROVIDED`: the cluster implementation picks its own
+    /// host rather than delegating to one of the policies above. Envoy
+    /// *requires* this on an `envoy.clusters.aggregate` cluster
+    /// ([`ClusterKind::Aggregate`]) -- an aggregate has no hosts of its own
+    /// to run a policy over, so lowering rejects any other `lb_policy` there
+    /// (`lower.rs::convert_cluster`), and the converse: this policy on a
+    /// cluster that *does* own hosts (`ClusterKind::Endpoints`) is rejected
+    /// too, since we implement no cluster-provided host-picking of our own.
+    /// `proxy_cluster::load_balancer::build` has its own defensive arm for
+    /// this variant -- see its comment for why that arm is expected to be
+    /// unreachable in practice.
+    ClusterProvided,
 }
 
 /// An upstream endpoint. `host` is an IP for STATIC clusters and may be a DNS

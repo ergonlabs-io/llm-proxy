@@ -438,6 +438,11 @@ fn lb_policy_str(p: LbPolicy) -> &'static str {
         LbPolicy::RingHash => "RING_HASH",
         LbPolicy::Random => "RANDOM",
         LbPolicy::Maglev => "MAGLEV",
+        // `/config_dump` must round-trip what the config actually said;
+        // mapping this to "ROUND_ROBIN" would misreport an aggregate
+        // cluster's lb_policy in the one surface people use to check what
+        // the proxy loaded.
+        LbPolicy::ClusterProvided => "CLUSTER_PROVIDED",
     }
 }
 

@@ -67,6 +67,16 @@ pub fn build(policy: LbPolicy) -> Result<Box<dyn LoadBalancer>, LbError> {
         LbPolicy::Random => Ok(Box::new(RandomLb::new())),
         LbPolicy::LeastRequest => Ok(Box::new(LeastRequestLb::new())),
         LbPolicy::RingHash | LbPolicy::Maglev => Err(LbError::UnsupportedPolicy(policy)),
+        // `CLUSTER_PROVIDED` gets its own arm rather than joining the one
+        // above: RING_HASH/MAGLEV mean "not implemented yet"; this means
+        // "there is no host-picking `LoadBalancer` to build here, by
+        // design" -- an aggregate cluster (the only user of this policy,
+        // see `LbPolicy::ClusterProvided`'s doc) has no hosts of its own,
+        // only members. This arm is defensive: `ManagedCluster::from_config`'s
+        // aggregate branch (`proxy-cluster/src/manager.rs:140-166`) never
+        // calls `build` at all, so reaching this in practice would mean a
+        // bug elsewhere, not a missing feature here.
+        LbPolicy::ClusterProvided => Err(LbError::UnsupportedPolicy(policy)),
     }
 }
 

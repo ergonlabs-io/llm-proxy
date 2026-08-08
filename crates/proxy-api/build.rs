@@ -28,6 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/extensions/filters/listener/tls_inspector/v3/tls_inspector.proto",
         "envoy/extensions/transport_sockets/tls/v3/tls.proto",
         "envoy/extensions/upstreams/http/v3/http_protocol_options.proto",
+        // Aggregate clusters (WP-35 provider fallback): the type URL under a
+        // `Cluster.cluster_type.typed_config` must resolve for the surface
+        // walk to see inside it.
+        "envoy/extensions/clusters/aggregate/v3/cluster.proto",
         // Access logging (WP-24): common AccessLog/AccessLogFilter types plus
         // the two logger extensions we implement (file, stdout/stderr).
         "envoy/config/accesslog/v3/accesslog.proto",
