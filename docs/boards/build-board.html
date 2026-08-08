@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 965 tests green (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 968 tests green, 21 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -197,29 +197,33 @@
     <span class="gate"><b>SHIP GATE —</b> per-request token counts (input / cache-read /
     cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate
     limit is enforced; and the proxy fails over from one provider to another mid-request without
-    the client seeing an error. <b>All three clauses are now code-complete</b> — token counts and
-    TTFT/TPOT land via WP-33/34/45/46, the dialect's <code>limits</code> key enforces the rate
-    limit, and provider failover (WP-35) landed 2026-08-07/08: an aggregate cluster with
-    member-order failover, reachable from both front-ends (Envoy <code>cluster_type</code> and the
-    dialect's <code>fallbacks:</code> key, which now lowers for real instead of warning and
-    dropping), with credentials and the Host header both following the cluster an attempt actually
-    dialed rather than the route that matched. <b>Code-complete is not the same claim as shipped.</b>
-    QA-1 backs the token-count clause with real black-box evidence; nothing yet backs rate-limit
-    enforcement or failover the way v0.0.1's live smoke run backed <em>its</em> gate, so this
-    release stays <code>current</code>. WP-35's scope closed narrower than its title: same-dialect
-    fallback only — cross-dialect (openai → anthropic) is a deliberate hard error, split into new
-    WP-52 rather than left as a silent gap.</span>
+    the client seeing an error. <b>Two of three clauses are now VERIFIED end to end, not just
+    code-complete (2026-08-08).</b> Token counts + TTFT/TPOT: QA-1 backs the token-count half with
+    real black-box evidence since 2026-08-01, and new QA-10 now does the same for TTFT/TPOT —
+    against a mock with known pacing it observed ttft=402ms/tpot=122.129ms/max_stall=152ms in the
+    actual access log, and in writing that test found a real bug (the dialect never emitted TPOT
+    at all despite WP-46 building it, now fixed) plus a live off-by-one in
+    <code>%LLM_RESPONSE_CHUNKS%</code>, also fixed. Provider failover (WP-35): a new
+    <code>testing/diffrig</code> drill drives the real binary against a real dialect config and a
+    mock forced to 429 — exact attempt accounting, the credential-isolation negative (standby's key
+    only), and the standby's own Host header, all mutation-tested. <b>Token-based rate limiting is
+    the one clause left unverified</b> — WP-34's filter enforces 429s from the dialect's
+    <code>limits</code> key and is unit-mutation-tested, but nothing drives it end to end against
+    the real binary yet; the owner explicitly deferred that this session, so this release stays
+    <code>current</code> on that one clause alone. WP-35's scope closed narrower than its title:
+    same-dialect fallback only — cross-dialect (openai → anthropic) is a deliberate hard error,
+    split into new WP-52 rather than left as a silent gap.</span>
     <span class="sub"><b>The honest read:</b> v0.0.1's clean first run is weaker evidence than a
     run that found something — four requests exercise a narrow path, and nothing there tested
     load, concurrency, provider error shapes, or long streams. Coverage stays three-tiered
     (our mocks, a local Ollama, real providers) for exactly that reason.
     Second standing gap: <b>"performant" is an untested claim</b> (no capacity sweep published; the
     v0.2.0 gate).
-    <b>WP-41, the black-box QA suite, found four real bugs on day one</b> — no dialect access logs at
-    all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too), and no response flag on a
-    mid-stream failure. Three fixed; the fourth (WP-33) is wired but has one unmet acceptance
-    criterion. One had been <i>described as intended</i> in
-    its own doc comment — the class of defect an inside view cannot see.
+    <b>WP-41, the black-box QA suite, found four real bugs on day one, and a fifth on 2026-08-08</b>
+    — no dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode
+    too), no response flag on a mid-stream failure, and (via new QA-10) <code>%LLM_RESPONSE_CHUNKS%</code>
+    over-counting by one on every response with a body. All five fixed. One had been
+    <i>described as intended</i> in its own doc comment — the class of defect an inside view cannot see.
     <b>Competitive review (Vercel AI Gateway)</b> confirmed the plan and added WP-42/43/44:
     spend controls (a token/min cap is a throttle, not a budget), caching, cost-aware routing.
     They are managed-only, so self-hosting, Envoy config and xDS stay ours.
@@ -229,7 +233,8 @@
     <i>body</i> rather than a client-supplied header. That closed a privilege-escalation surface:
     a client could otherwise pick its own provider, credential, and budget.
     <b>Test-suite note (2026-08-08):</b> full workspace runs took 656–863s; they now take
-    <b>50.8s</b> (965 green, zero slow). Two causes, found in that order. 8 <code>diffrig</code>
+    <b>50.8s</b> (968 green, zero slow — the 50.8s figure predates the +3 failover-drill tests
+    and has not been re-measured since). Two causes, found in that order. 8 <code>diffrig</code>
     tests were intermittently <i>hanging</i> rather than merely slow — mitigated to 2 by a
     multi-threaded runtime plus a <code>terminate-after</code> gate that turns a hang into a
     named failure; not fixed, those tests still carry no request timeouts. The larger cause was
@@ -831,9 +836,10 @@
    "spawns the built binary with a config, asserts only what a client sees on the wire",
    "make ci runs it, skipping LOUDLY if the Go toolchain is absent",
    "QA-1 ✓ (verified passing 2026-08-01 — asserts real per-route token values, no longer skips) · QA-2 ✓ · QA-3 ✓ · QA-4 ✓ · QA-6 ✓ · QA-5/7/8 approved, unbuilt",
+   "QA-10 (TTFT/TPOT reach the access log with sane values) implemented 2026-08-08, `make qa` green x3 — SCENARIOS.md's own status table still lists it `approved` rather than `passing`; flagging the mismatch here rather than editing that table myself. 10 cases total, QA-9 remains rejected (false premise, already handled elsewhere)",
    "owner approves every case before a test is written"
   ],
-  "note": "▲ FOUND 4 REAL BUGS ON DAY ONE, three now fixed — none was visible from inside the code, and one was described as intended in its own doc comment"
+  "note": "▲ FOUND 4 REAL BUGS ON DAY ONE, three now fixed — none was visible from inside the code, and one was described as intended in its own doc comment. QA-10 has since found a fifth (WP-46's response_chunks over-count, 2026-08-08)"
  },
  {
   "id": 31,
@@ -903,7 +909,8 @@
    "⚠ FIXED en route: TokenUsage::total() summed four provider-supplied u64s with plain `+` — panicked the worker in debug, wrapped silently in release, and access_log.rs calls it for every logged request. Now saturating",
    "open: reachable ONLY via Envoy-mode config today (typed_config on RateLimitSettings) — the dialect has no `limits` key yet (increment 3, still rejected under strict mode); thin slice is LimitOn::Total keyed on (route, hashed credential) only, no per-descriptor config",
    "✓ INCREMENT 3 DONE 2026-08-02 — the dialect `limits` key now lowers a tokens_per_minute + key:header:authorization limit to llmproxy.token_limit (before llmproxy.usage, per S2.1). Everything the thin slice cannot enforce warns with its exact dotted path and reason",
-   "open: per-descriptor config (needs WP-47's vendored proto), and richer bucket keys"
+   "open: per-descriptor config (needs WP-47's vendored proto), and richer bucket keys",
+   "▲ NOW THE ONLY v0.1.0 gate clause with no end-to-end evidence (2026-08-08) — the other two (token counts+TTFT/TPOT via QA-10, provider failover via testing/diffrig/failover_e2e.rs) were verified this pass. No QA-N scenario or diffrig drill exercises 429-on-limit-exceeded against the real binary yet. Owner explicitly deferred this session — see releases.yaml risk"
   ]
  },
  {
@@ -921,7 +928,8 @@
    "✓ INCREMENT 2 DONE 2026-08-07/08 (cb84f83, a2bfef7, d4ac161, 399b954) — the aggregate cluster (ClusterKind::Aggregate), member-order failover via attempted_clusters, a host pick that yields its owning member; reachable from BOTH front-ends (Envoy cluster_type AND the dialect's fallbacks: key, which now lowers for real instead of warning and dropping); validate_cluster_graph rejects a missing/self/nested/duplicate member at config time with a dotted path",
    "✓ credential-isolation test asserts the NEGATIVE — a request that fails over from provider A to provider B must not carry A's key, not just that B's key is present (router_aggregate.rs::credential_isolation_across_failover)",
    "✓ WP-45 consumer B landed (872b7d7) — routing reads `model` from the real request body, so this WP has something real to route on",
-   "THIS CLOSES the v0.1.0 gate's failover clause. Scope that closes here: SAME-DIALECT fallback (e.g. openai → an openai-compatible provider). examples/llmproxy.yaml's fallback showcase changed from cross-dialect (gpt-5* → anthropic) to local-vllm as a result",
+   "✓ VERIFIED END-TO-END 2026-08-08 (c1314b6) — testing/diffrig/tests/failover_e2e.rs drives the real llm-proxy binary against a real llmproxy dialect config with fallbacks:, mock primary forced to 429. Three assertions, each mutation-tested: attempt accounting exact (one request per upstream), standby receives its OWN credential with the primary's key NOWHERE on the wire (negative asserted explicitly), standby receives its OWN Host. This is the v0.1.0 gate's failover clause going from code-complete to verified — see docs/MILESTONES.md",
+   "Scope that closes here: SAME-DIALECT fallback (e.g. openai → an openai-compatible provider). examples/llmproxy.yaml's fallback showcase changed from cross-dialect (gpt-5* → anthropic) to local-vllm as a result",
    "⚑ NOT in this WP: cross-dialect fallback (openai → anthropic) is a hard config-time error naming routes[i].fallbacks[j], deliberately — the request/response shape translation it needs is real, un-started work. Split into WP-52 (v1.0.0), not silently dropped from scope"
   ],
   "note": "historical: the dialect used to WARN AND DROP `fallbacks` (parsed, validated, lowered, then dropped with one stderr line) — corrected in MILESTONES.md 2026-08-03 and again 2026-08-06. Increment 2c (399b954) replaced that with a real lowering, so this note is now history, not the current behavior"
@@ -1047,9 +1055,12 @@
    "▲ NOT simply \"render max_inter_chunk\": its own doc defines it as the LARGEST GAP between chunks — \"the tail of the TPOT distribution\", i.e. a stall metric, NOT TPOT. Publishing a max-gap under a TPOT label is worse than the field being absent",
    "correct build: %LLM_TPOT% = (duration − ttft) / output_tokens, all three already in LogContext, so no new StreamInfo plumbing. Expose max_inter_chunk separately (a real stall metric, also currently unreadable) rather than discarding it",
    "✓ DONE 2026-08-02 (9b68eac) — %LLM_TPOT% (mean, computed), plus %LLM_MAX_STALL% and %LLM_RESPONSE_CHUNKS% exposing two fields that were computed every stream and unreadable",
-   "⚠ caught on review: TPOT divided in integer ms, rendering 0 for any stream faster than one token/ms — i.e. reading ZERO exactly when a fast provider (Groq/Cerebras) performs best. Divides in micros now, renders fractional ms"
+   "⚠ caught on review: TPOT divided in integer ms, rendering 0 for any stream faster than one token/ms — i.e. reading ZERO exactly when a fast provider (Groq/Cerebras) performs best. Divides in micros now, renders fractional ms",
+   "⚠ SECOND completeness gap, found+fixed 2026-08-08 (b0485e8): the operators existed but neither llmproxy dialect access-log format (text or JSON) ever carried them — both formats stopped at %LLM_TTFT%. A user of the dialect could not get TPOT at any setting. Both formats now carry TPOT/MAX_STALL/RESPONSE_CHUNKS. This is a completeness gap in this WP's original delivery, not new scope",
+   "✓ VERIFIED END-TO-END 2026-08-08 — new QA-10 (testing/qa/SCENARIOS.md), against a mock paced at 400ms TTFT / 150ms inter-chunk, observes ttft=402ms tpot=122.129ms max_stall=152ms in the actual access log. Load-bearing assertion is TPOT strictly non-zero, since TPOT already shipped the silent zero-on-fast-provider bug above once",
+   "⚠ THIRD bug, found BY that QA-10 assertion (b0485e8): %LLM_RESPONSE_CHUNKS% over-reported by exactly one on every response with a body — encode_data timed the synthetic empty end-of-stream frame as a chunk, which also fed a phantom gap into %LLM_MAX_STALL%. Fixed; TTFT/TPOT themselves were unaffected"
   ],
-  "note": "⚠ same class as the request_headers_to_add P0 — a field populated with no reader, invisible to every check the project has except someone asking. Found 2026-08-01 while auditing the gate clause by clause, not by any test"
+  "note": "⚠ same class as the request_headers_to_add P0, TWICE — a field populated with no reader (2026-08-01), then a reader with nothing to read from the dialect's own log formats (2026-08-08). Both were invisible to every check the project had except someone asking or a black-box assertion against known pacing, not by unit tests"
  },
  {
   "id": 47,

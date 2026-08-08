@@ -243,6 +243,49 @@ returns `None` for a JSON float, so a provider reporting `"output_tokens": 150.0
 zero, silently. Fixed at all five call sites through one helper; unparseable input is now
 `None` (renders absent), never `0` (a number someone bills against).
 
+**Update, 2026-08-08 (later the same day): two of the three clauses moved from code-complete
+to verified; the third is now the only one that has not.** This is the distinction the
+previous update held the release open on, closing for two-thirds of it.
+
+- **Provider failover, verified (`c1314b6`).** `testing/diffrig/tests/failover_e2e.rs` drives
+  the real `llm-proxy` binary against a real `llmproxy` dialect config with `fallbacks:` and a
+  mock primary forced to 429 — real HTTP over sockets, not the router-unit level
+  `router_aggregate.rs` already covered. Three assertions, each mutation-tested: attempt
+  accounting exact (one request logged per upstream, catching a proxy that double-dials or
+  retries the primary); the credential-isolation negative (the standby receives its own
+  `Bearer key-standby`, and `key-primary` appears **nowhere** in what it received — asserted
+  as an explicit negative, since a positive-only check passes just as well when both keys are
+  on the wire, which is the actual disclosure scenario); and the standby's own Host header
+  (mutating WP-35 2c's per-cluster host header turned this red with the primary's host
+  arriving at the fallback's endpoint).
+- **Token counts + TTFT/TPOT, verified (`b0485e8`) — after fixing a product gap that made it
+  impossible.** The `llmproxy` dialect never emitted TPOT: WP-46 built `%LLM_TPOT%`,
+  `%LLM_MAX_STALL%`, and `%LLM_RESPONSE_CHUNKS%` on 2026-08-02, but neither dialect log format
+  (text or JSON) ever carried them past `%LLM_TTFT%` — a user of the dialect could not obtain
+  TPOT at any setting, while this gate names it explicitly. This is a WP-46 **completeness
+  gap**, not new scope; both formats now carry all three fields. New QA-10 (`testing/qa/
+  SCENARIOS.md`) then proved the values are real, not merely present: against a mock paced at
+  400ms TTFT / 150ms inter-chunk, the access log shows `ttft=402ms tpot=122.129ms
+  max_stall=152ms`. The load-bearing assertion is TPOT strictly non-zero, because TPOT had
+  already shipped one silent bug of exactly that shape (integer-ms division rendering `0` for
+  fast providers). Writing that test caught a second, live bug in the same pass:
+  `%LLM_RESPONSE_CHUNKS%` over-reported by exactly one on every response with a body —
+  `encode_data` timed the synthetic empty end-of-stream frame as a chunk, which also fed a
+  phantom gap into `%LLM_MAX_STALL%`. Fixed; TTFT/TPOT themselves were unaffected.
+- **Token-based rate limiting remains unverified, and is now the only clause in that state.**
+  WP-34's filter enforces 429s from the dialect's `limits` key and is mutation-tested at the
+  unit level, but nothing drives the real binary against a real over-limit request the way the
+  other two clauses now do. The owner explicitly deferred this verification this session — it
+  is the one item left before this release can defensibly flip to `shipped`.
+
+**This release stays `current`, not `shipped`.** v0.0.1 did not ship on code-complete; it
+shipped on a live smoke run against real OpenAI and Anthropic endpoints, actually executed and
+recorded. Rate-limit enforcement has no equivalent yet — a QA-11-style scenario or a diffrig
+drill against the real binary would close it, but nothing has been written or approved for
+that as of this update. Holding the release at `current` on one remaining clause, rather than
+three, is still this document's judgment call and not something the gate text forces by
+itself — recorded here so it can be argued with.
+
 ---
 
 ## v0.2.0 — Production-ready serving

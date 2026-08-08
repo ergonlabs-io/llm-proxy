@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 965 tests green (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 968 tests green, 21 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -197,29 +197,33 @@
     <span class="gate"><b>SHIP GATE —</b> per-request token counts (input / cache-read /
     cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate
     limit is enforced; and the proxy fails over from one provider to another mid-request without
-    the client seeing an error. <b>All three clauses are now code-complete</b> — token counts and
-    TTFT/TPOT land via WP-33/34/45/46, the dialect's <code>limits</code> key enforces the rate
-    limit, and provider failover (WP-35) landed 2026-08-07/08: an aggregate cluster with
-    member-order failover, reachable from both front-ends (Envoy <code>cluster_type</code> and the
-    dialect's <code>fallbacks:</code> key, which now lowers for real instead of warning and
-    dropping), with credentials and the Host header both following the cluster an attempt actually
-    dialed rather than the route that matched. <b>Code-complete is not the same claim as shipped.</b>
-    QA-1 backs the token-count clause with real black-box evidence; nothing yet backs rate-limit
-    enforcement or failover the way v0.0.1's live smoke run backed <em>its</em> gate, so this
-    release stays <code>current</code>. WP-35's scope closed narrower than its title: same-dialect
-    fallback only — cross-dialect (openai → anthropic) is a deliberate hard error, split into new
-    WP-52 rather than left as a silent gap.</span>
+    the client seeing an error. <b>Two of three clauses are now VERIFIED end to end, not just
+    code-complete (2026-08-08).</b> Token counts + TTFT/TPOT: QA-1 backs the token-count half with
+    real black-box evidence since 2026-08-01, and new QA-10 now does the same for TTFT/TPOT —
+    against a mock with known pacing it observed ttft=402ms/tpot=122.129ms/max_stall=152ms in the
+    actual access log, and in writing that test found a real bug (the dialect never emitted TPOT
+    at all despite WP-46 building it, now fixed) plus a live off-by-one in
+    <code>%LLM_RESPONSE_CHUNKS%</code>, also fixed. Provider failover (WP-35): a new
+    <code>testing/diffrig</code> drill drives the real binary against a real dialect config and a
+    mock forced to 429 — exact attempt accounting, the credential-isolation negative (standby's key
+    only), and the standby's own Host header, all mutation-tested. <b>Token-based rate limiting is
+    the one clause left unverified</b> — WP-34's filter enforces 429s from the dialect's
+    <code>limits</code> key and is unit-mutation-tested, but nothing drives it end to end against
+    the real binary yet; the owner explicitly deferred that this session, so this release stays
+    <code>current</code> on that one clause alone. WP-35's scope closed narrower than its title:
+    same-dialect fallback only — cross-dialect (openai → anthropic) is a deliberate hard error,
+    split into new WP-52 rather than left as a silent gap.</span>
     <span class="sub"><b>The honest read:</b> v0.0.1's clean first run is weaker evidence than a
     run that found something — four requests exercise a narrow path, and nothing there tested
     load, concurrency, provider error shapes, or long streams. Coverage stays three-tiered
     (our mocks, a local Ollama, real providers) for exactly that reason.
     Second standing gap: <b>"performant" is an untested claim</b> (no capacity sweep published; the
     v0.2.0 gate).
-    <b>WP-41, the black-box QA suite, found four real bugs on day one</b> — no dialect access logs at
-    all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too), and no response flag on a
-    mid-stream failure. Three fixed; the fourth (WP-33) is wired but has one unmet acceptance
-    criterion. One had been <i>described as intended</i> in
-    its own doc comment — the class of defect an inside view cannot see.
+    <b>WP-41, the black-box QA suite, found four real bugs on day one, and a fifth on 2026-08-08</b>
+    — no dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode
+    too), no response flag on a mid-stream failure, and (via new QA-10) <code>%LLM_RESPONSE_CHUNKS%</code>
+    over-counting by one on every response with a body. All five fixed. One had been
+    <i>described as intended</i> in its own doc comment — the class of defect an inside view cannot see.
     <b>Competitive review (Vercel AI Gateway)</b> confirmed the plan and added WP-42/43/44:
     spend controls (a token/min cap is a throttle, not a budget), caching, cost-aware routing.
     They are managed-only, so self-hosting, Envoy config and xDS stay ours.
@@ -229,7 +233,8 @@
     <i>body</i> rather than a client-supplied header. That closed a privilege-escalation surface:
     a client could otherwise pick its own provider, credential, and budget.
     <b>Test-suite note (2026-08-08):</b> full workspace runs took 656–863s; they now take
-    <b>50.8s</b> (965 green, zero slow). Two causes, found in that order. 8 <code>diffrig</code>
+    <b>50.8s</b> (968 green, zero slow — the 50.8s figure predates the +3 failover-drill tests
+    and has not been re-measured since). Two causes, found in that order. 8 <code>diffrig</code>
     tests were intermittently <i>hanging</i> rather than merely slow — mitigated to 2 by a
     multi-threaded runtime plus a <code>terminate-after</code> gate that turns a hang into a
     named failure; not fixed, those tests still carry no request timeouts. The larger cause was

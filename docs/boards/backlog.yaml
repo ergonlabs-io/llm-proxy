@@ -610,10 +610,16 @@ work_packages:
   - >-
     QA-1 ✓ (verified passing 2026-08-01 — asserts real per-route token values, no longer skips)
     · QA-2 ✓ · QA-3 ✓ · QA-4 ✓ · QA-6 ✓ · QA-5/7/8 approved, unbuilt
+  - >-
+    QA-10 (TTFT/TPOT reach the access log with sane values) implemented 2026-08-08, `make qa`
+    green x3 — SCENARIOS.md's own status table still lists it `approved` rather than
+    `passing`; flagging the mismatch here rather than editing that table myself. 10 cases
+    total, QA-9 remains rejected (false premise, already handled elsewhere)
   - owner approves every case before a test is written
   note: >-
     ▲ FOUND 4 REAL BUGS ON DAY ONE, three now fixed — none was visible from inside the code,
-    and one was described as intended in its own doc comment
+    and one was described as intended in its own doc comment. QA-10 has since found a fifth
+    (WP-46's response_chunks over-count, 2026-08-08)
 - id: 31
   prio: P2
   ms: v0.4.0
@@ -714,6 +720,11 @@ work_packages:
     llmproxy.usage, per S2.1). Everything the thin slice cannot enforce warns with its exact
     dotted path and reason
   - 'open: per-descriptor config (needs WP-47''s vendored proto), and richer bucket keys'
+  - >-
+    ▲ NOW THE ONLY v0.1.0 gate clause with no end-to-end evidence (2026-08-08) — the other two
+    (token counts+TTFT/TPOT via QA-10, provider failover via testing/diffrig/failover_e2e.rs)
+    were verified this pass. No QA-N scenario or diffrig drill exercises 429-on-limit-exceeded
+    against the real binary yet. Owner explicitly deferred this session — see releases.yaml risk
 
 - id: 35
   prio: P0
@@ -744,9 +755,17 @@ work_packages:
     ✓ WP-45 consumer B landed (872b7d7) — routing reads `model` from the real request body,
     so this WP has something real to route on
   - >-
-    THIS CLOSES the v0.1.0 gate's failover clause. Scope that closes here: SAME-DIALECT
-    fallback (e.g. openai → an openai-compatible provider). examples/llmproxy.yaml's fallback
-    showcase changed from cross-dialect (gpt-5* → anthropic) to local-vllm as a result
+    ✓ VERIFIED END-TO-END 2026-08-08 (c1314b6) — testing/diffrig/tests/failover_e2e.rs drives
+    the real llm-proxy binary against a real llmproxy dialect config with fallbacks:, mock
+    primary forced to 429. Three assertions, each mutation-tested: attempt accounting exact
+    (one request per upstream), standby receives its OWN credential with the primary's key
+    NOWHERE on the wire (negative asserted explicitly), standby receives its OWN Host. This is
+    the v0.1.0 gate's failover clause going from code-complete to verified — see
+    docs/MILESTONES.md
+  - >-
+    Scope that closes here: SAME-DIALECT fallback (e.g. openai → an openai-compatible
+    provider). examples/llmproxy.yaml's fallback showcase changed from cross-dialect
+    (gpt-5* → anthropic) to local-vllm as a result
   - >-
     ⚑ NOT in this WP: cross-dialect fallback (openai → anthropic) is a hard config-time
     error naming routes[i].fallbacks[j], deliberately — the request/response shape
@@ -918,10 +937,27 @@ work_packages:
     ⚠ caught on review: TPOT divided in integer ms, rendering 0 for any stream faster than one
     token/ms — i.e. reading ZERO exactly when a fast provider (Groq/Cerebras) performs best.
     Divides in micros now, renders fractional ms
+  - >-
+    ⚠ SECOND completeness gap, found+fixed 2026-08-08 (b0485e8): the operators existed but
+    neither llmproxy dialect access-log format (text or JSON) ever carried them — both
+    formats stopped at %LLM_TTFT%. A user of the dialect could not get TPOT at any setting.
+    Both formats now carry TPOT/MAX_STALL/RESPONSE_CHUNKS. This is a completeness gap in this
+    WP's original delivery, not new scope
+  - >-
+    ✓ VERIFIED END-TO-END 2026-08-08 — new QA-10 (testing/qa/SCENARIOS.md), against a mock
+    paced at 400ms TTFT / 150ms inter-chunk, observes ttft=402ms tpot=122.129ms
+    max_stall=152ms in the actual access log. Load-bearing assertion is TPOT strictly
+    non-zero, since TPOT already shipped the silent zero-on-fast-provider bug above once
+  - >-
+    ⚠ THIRD bug, found BY that QA-10 assertion (b0485e8): %LLM_RESPONSE_CHUNKS% over-reported
+    by exactly one on every response with a body — encode_data timed the synthetic empty
+    end-of-stream frame as a chunk, which also fed a phantom gap into %LLM_MAX_STALL%. Fixed;
+    TTFT/TPOT themselves were unaffected
   note: >-
-    ⚠ same class as the request_headers_to_add P0 — a field populated with no reader, invisible
-    to every check the project has except someone asking. Found 2026-08-01 while auditing the
-    gate clause by clause, not by any test
+    ⚠ same class as the request_headers_to_add P0, TWICE — a field populated with no reader
+    (2026-08-01), then a reader with nothing to read from the dialect's own log formats
+    (2026-08-08). Both were invisible to every check the project had except someone asking or
+    a black-box assertion against known pacing, not by unit tests
 - id: 47
   prio: P1
   ms: v0.1.0

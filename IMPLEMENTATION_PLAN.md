@@ -993,6 +993,15 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
   is done for what it now covers: same-dialect provider fallback via an aggregate cluster.**
   Leaving it "open" indefinitely for scope that was never going to land this milestone would
   have been the less honest call than closing it at what actually shipped.
+- **Acceptance criterion satisfied end-to-end 2026-08-08 (`c1314b6`), not just at the router-unit
+  level.** `testing/diffrig/tests/failover_e2e.rs` is the differential-style outage drill this
+  WP's acceptance bullet called for: the real `llm-proxy` binary, a real `llmproxy` dialect
+  config with `fallbacks:`, real HTTP over sockets, a mock primary forced to 429. Three
+  assertions, each mutation-tested (mutating the WP-35 mechanism it targets turns the matching
+  assertion red, then restores clean): attempt accounting exact (one request per upstream); the
+  credential-isolation negative (standby's own key, primary's key nowhere on the wire — not
+  merely "the standby's key is present"); and the standby's own Host header. This is the
+  evidence the v0.1.0 gate's failover clause needed to move from code-complete to verified.
 
 #### WP-36 — Gateway API Inference Extension (EPP) support  (Size: M)  — **Priority: P2**
 - Implement the Endpoint Picker protocol as consumed by Envoy AI Gateway / GKE Inference
@@ -1590,6 +1599,18 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   the value back to itself. A non-streamed response, and a response with zero output tokens,
   both render `-`. Mutation: rendering `max_inter_chunk` as `%LLM_TPOT%` must fail the test,
   since that is the specific mistake this WP exists to avoid.
+- **Completeness gap, found+fixed 2026-08-08 (b0485e8), while building the verification this
+  WP's own acceptance criterion calls for.** The operators landed 2026-08-02 and the acceptance
+  criterion above was satisfied at the unit level, but **neither `llmproxy` dialect access-log
+  format (text or JSON) ever emitted `%LLM_TPOT%`/`%LLM_MAX_STALL%`/`%LLM_RESPONSE_CHUNKS%`** —
+  both formats stopped at `%LLM_TTFT%` in `lower.rs`. A user configuring this proxy through its
+  own primary surface (the dialect, not hand-written Envoy YAML) could not obtain TPOT at any
+  setting, while the v0.1.0 gate names it explicitly. Fixed: both formats now carry all three.
+  New QA-10 (`testing/qa/SCENARIOS.md`) is the end-to-end acceptance evidence this WP's own
+  criterion asked for and never had until now; in writing it, it also caught a real bug —
+  `%LLM_RESPONSE_CHUNKS%` over-reported by exactly one on every response with a body
+  (`encode_data` timed the synthetic empty end-of-stream frame as a chunk, which also fed a
+  phantom gap into `%LLM_MAX_STALL%`) — also fixed.
 
 #### WP-47 — Vendored Lane-H filter proto  (Size: M)  — **Priority: P1** · **Milestone: v0.1.0**
 - **Why.** `FilterRegistry::register` keys on `type_url` and **asserts** on a duplicate, so
