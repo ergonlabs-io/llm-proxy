@@ -1315,7 +1315,9 @@ dependencies = [
 name = "proxy"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
+ "http",
  "proxy-admin",
  "proxy-cluster",
  "proxy-config",
@@ -1325,6 +1327,7 @@ dependencies = [
  "proxy-observability",
  "proxy-simple-config",
  "proxy-xds",
+ "ring",
  "tokio",
  "tracing",
  "tracing-subscriber",

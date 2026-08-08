@@ -333,6 +333,79 @@ impl fmt::Debug for HmacSecret {
     }
 }
 
+/// The secret bytes to key an HMAC with, given the raw contents of a secret
+/// **file** -- trailing ASCII whitespace removed.
+///
+/// # Why this exists at all, and why it is not optional
+///
+/// `echo "s3cret" > /etc/llmproxy/auth-secret` -- the most obvious way an
+/// operator creates this file -- appends a newline. Without trimming, that
+/// newline becomes part of the HMAC key, and then the digest the proxy
+/// computes matches only a tool that ALSO included it. The documented
+/// fallback (`openssl dgst -hmac "$(cat file)"`) does not: shell command
+/// substitution strips trailing newlines. The two disagree, every key fails,
+/// and the only symptom is a 401 with nothing in it to explain why. Trimming
+/// is what the `hmac_secret_file` schema description has always promised;
+/// until 2026-08-08 the code did not do it.
+///
+/// # Files only, deliberately
+///
+/// An inline secret (`hmac_secret: ...`, or `$LLMPROXY_AUTH_SECRET` for
+/// `--mode keygen`) is NOT trimmed. YAML already strips whitespace around a
+/// plain scalar, and a secret someone deliberately quoted with trailing
+/// spaces should be taken literally. The newline problem is specific to
+/// files, because it is a file-creation tool that adds one.
+///
+/// # Both readers must call this
+///
+/// `auth_filter::parse_hmac_secret` (which VERIFIES keys) and
+/// `llm-proxy --mode keygen` (which GENERATES them) both read this file. If
+/// only one trimmed, every generated key would fail to authenticate -- the
+/// same drift [`digest_hex`] exists to prevent, one layer up.
+pub fn secret_bytes_from_file(raw: &[u8]) -> &[u8] {
+    // Rust note: `rposition` finds the last non-whitespace byte; `map_or(0,
+    // ..)` makes an all-whitespace file trim to empty rather than panicking,
+    // and callers already reject an empty secret.
+    let end = raw
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    &raw[..end]
+}
+
+/// `hex(HMAC-SHA256(secret, plaintext_key))` -- the value that goes in a
+/// config's `digest` / `digest_hex` field.
+///
+/// This is the ONE place in the codebase a digest is derived from a
+/// plaintext key: [`KeySet::insert`] below calls this directly (rather than
+/// duplicating the HMAC-and-hex-encode), and so does `llm-proxy --mode
+/// keygen` (`crates/proxy/src/keygen.rs`, WP-50 increment 2a-iv) -- the tool
+/// that GENERATES a key and the code path that later loads a [`KeySet`] to
+/// VERIFY one both call this exact function, so they cannot drift apart.
+/// `HmacSecret`'s inner `ring::hmac::Key` is private to this module, which is
+/// why this has to live here rather than alongside the rest of `--mode
+/// keygen` in `crates/proxy`.
+pub fn digest_hex(secret: &HmacSecret, plaintext_key: &str) -> String {
+    let digest = ring::hmac::sign(&secret.0, plaintext_key.as_bytes());
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Reverses [`digest_hex`]'s formatting. Private and infallible-by-panic
+/// rather than returning a `Result`: unlike `auth_filter::parse_digest_hex`
+/// (which validates untrusted config text character by character and must
+/// name a dotted field path on failure, ground rule #1), the only strings
+/// this is ever handed are ones [`digest_hex`] just produced a few lines
+/// above, so there is nothing external to validate.
+fn decode_hex_digest(hex: &str) -> Vec<u8> {
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let s = std::str::from_utf8(pair).expect("digest_hex output is ASCII");
+            u8::from_str_radix(s, 16).expect("digest_hex output is valid hex")
+        })
+        .collect()
+}
+
 /// A single configured virtual key, identified only by the HMAC digest of
 /// its plaintext value -- the plaintext is never retained anywhere.
 pub struct KeyRecord {
@@ -388,9 +461,13 @@ impl KeySet {
     /// Adds a key to this set. `presented_key` is the caller-facing
     /// plaintext value (e.g. `llmp_abc123...`); only `HMAC-SHA256(secret,
     /// presented_key)` is retained.
+    ///
+    /// Goes through [`digest_hex`] (and back) rather than calling
+    /// `ring::hmac::sign` directly -- see that function's doc for why: it is
+    /// the single derivation this whole module and `--mode keygen` share.
     pub fn insert(&mut self, secret: &HmacSecret, presented_key: &str, record: KeyRecord) {
-        let digest = ring::hmac::sign(&secret.0, presented_key.as_bytes());
-        self.entries.insert(digest.as_ref().to_vec(), record);
+        let digest = decode_hex_digest(&digest_hex(secret, presented_key));
+        self.entries.insert(digest, record);
     }
 
     /// Adds a key to this set from an already-computed digest. This is the

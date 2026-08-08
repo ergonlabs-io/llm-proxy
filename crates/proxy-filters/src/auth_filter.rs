@@ -96,8 +96,14 @@ fn parse_hmac_secret(config: &DynamicMessage) -> Result<Vec<u8>, ConfigError> {
         // path and a kernel-level reason (e.g. "No such file or
         // directory") -- so it is safe to fold straight into the reason
         // string. Never read the file again for logging purposes.
-        fs::read(&filename)
-            .map_err(|e| invalid("typed_config.hmac_secret.filename", format!("{e}")))?
+        let raw = fs::read(&filename)
+            .map_err(|e| invalid("typed_config.hmac_secret.filename", format!("{e}")))?;
+        // Trailing whitespace is stripped -- see `auth::secret_bytes_from_file`
+        // for why this is load-bearing rather than tidy (`echo secret > file`
+        // adds a newline that would otherwise silently become part of the
+        // key). `--mode keygen` reads the same file through the same
+        // function, so the generator and this verifier cannot disagree.
+        crate::auth::secret_bytes_from_file(&raw).to_vec()
     } else if data_source.has_field_by_name("inline_string") {
         data_source
             .get_field_by_name("inline_string")
@@ -586,6 +592,77 @@ mod tests {
                 assert_eq!(field_path, "typed_config.hmac_secret.filename");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    /// A secret file with a TRAILING NEWLINE must key the HMAC on the secret
+    /// alone.
+    ///
+    /// `echo "s3cret" > /etc/llmproxy/auth-secret` is the most obvious way an
+    /// operator creates this file, and it appends a newline. Before
+    /// 2026-08-08 that newline silently became part of the key, so the digest
+    /// this code computed matched only a tool that also included it — and the
+    /// documented `openssl dgst -hmac "$(cat file)"` fallback does not,
+    /// because shell command substitution strips trailing newlines. Every key
+    /// then failed with a bare 401 carrying nothing to explain why.
+    ///
+    /// The digest here is deliberately computed over the UNTRIMMED secret
+    /// (`b"operator-hmac-secret"`, no newline) while the file on disk has one:
+    /// the two match only if `parse_hmac_secret` trims. `--mode keygen` reads
+    /// the same file through the same `auth::secret_bytes_from_file`, so the
+    /// generator cannot drift from this verifier.
+    #[test]
+    fn a_secret_file_with_a_trailing_newline_keys_on_the_secret_alone() {
+        let path = std::env::temp_dir().join(format!(
+            "llm-proxy-auth-filter-test-secret-newline-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"operator-hmac-secret\n").expect("write temp secret file");
+
+        let digest = digest_hex(b"operator-hmac-secret", "llmp_test-key");
+        let config = authentication(
+            filename_secret(&path),
+            vec![virtual_key("key-1", "tenant-a", &digest, false)],
+        );
+        let (secret, key_set) = parse_config(&config).expect("valid filename config must parse");
+        let authenticator = VirtualKeyAuthenticator::new(secret, Arc::new(key_set));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer llmp_test-key"),
+        );
+        let outcome = authenticator.authenticate(&headers);
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(outcome, AuthOutcome::Authenticated(_)),
+            "a secret file's trailing newline must not become part of the HMAC key -- \
+             untrimmed, every key an operator generates fails with an unexplained 401"
+        );
+    }
+
+    /// A file of nothing but whitespace is an empty secret, not a secret made
+    /// of spaces — it must be rejected like any other empty one rather than
+    /// silently keying the HMAC on zero bytes.
+    #[test]
+    fn a_whitespace_only_secret_file_is_rejected_as_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "llm-proxy-auth-filter-test-secret-blank-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"   \n\t\n").expect("write temp secret file");
+
+        let config = authentication(filename_secret(&path), vec![]);
+        let result = parse_config(&config);
+        std::fs::remove_file(&path).ok();
+
+        match result {
+            Err(ConfigError::InvalidValue { field_path, .. }) => {
+                assert_eq!(field_path, "typed_config.hmac_secret");
+            }
+            Err(other) => panic!("expected InvalidValue, got {other:?}"),
+            Ok(_) => panic!("a whitespace-only secret file must be rejected as empty"),
         }
     }
 

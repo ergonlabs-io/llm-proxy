@@ -82,6 +82,11 @@ tls-parser = "0.12"
 # something that was being built anyway -- and it keeps the same "no cmake/NASM
 # toolchain" property the rustls feature choice above was made for.
 ring = "0.17"
+# WP-50 increment 2a-iv (`llm-proxy --mode keygen`): base64url encoding of the
+# generated virtual key. Already compiled into the tree as a transitive
+# dependency (rcgen, tonic-build, ...), so this promotes an existing build
+# artifact to a direct dependency instead of adding new build cost.
+base64 = "0.22"
 
 # Utilities
 arc-swap = "1"

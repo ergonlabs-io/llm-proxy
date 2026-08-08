@@ -166,7 +166,7 @@
         "digest": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$",
-          "description": "Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`, exactly 64 characters -- the plaintext is shown to the operator once, at creation, and is never recoverable from configuration. Compute it with (note `printf %s`, not a here-string -- `<<<` appends a trailing newline that changes the digest): `printf %s \"llmp_yourkey\" | openssl dgst -sha256 -hmac \"$LLMPROXY_AUTH_SECRET\" -hex`",
+          "description": "Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`, exactly 64 characters -- the plaintext is shown to the operator once, at creation, and is never recoverable from configuration. Generate both together with `llm-proxy --mode keygen --tenant <tenant> --key-id <id>` (reads the same secret via `--hmac-secret-file`/`$LLMPROXY_AUTH_SECRET`, and prints a ready-to-paste `id`/`tenant`/`digest` block). If you have no `llm-proxy` binary handy, `openssl` computes the same digest (note `printf %s`, not a here-string -- `<<<` appends a trailing newline that changes the digest): `printf %s \"llmp_yourkey\" | openssl dgst -sha256 -hmac \"$LLMPROXY_AUTH_SECRET\" -hex`",
           "examples": ["3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a"]
         },
         "revoked": {

@@ -2,9 +2,10 @@
 //!
 //! Implemented: Envoy bootstrap loading (`-c`, WP-03), PGV validation (WP-04),
 //! IR building (WP-05), the simple dialect (`--config`, WP-38), `--mode
-//! validate` / `--mode translate`, serve mode's control runtime, worker pool,
-//! SIGTERM/SIGINT drain sequence (WP-06 chunk C), and the per-worker listener
-//! manager (WP-07 chunk C) that binds sockets and accepts connections. The L4
+//! validate` / `--mode translate`, `--mode keygen` (WP-50 increment 2a-iv,
+//! see `keygen`), serve mode's control runtime, worker pool, SIGTERM/SIGINT
+//! drain sequence (WP-06 chunk C), and the per-worker listener manager
+//! (WP-07 chunk C) that binds sockets and accepts connections. The L4
 //! network filter chain (`tcp_proxy` etc.) is still a stub -- see
 //! `proxy_core::listener`'s `TODO(WP-09)`.
 
@@ -26,22 +27,51 @@ use proxy_core::runtime::{WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig}
 use proxy_core::WorkerConfigHandle;
 use tokio::sync::mpsc;
 
+mod keygen;
+
 #[derive(Parser)]
 #[command(name = "llm-proxy", version, about = "Proxy for LLM inference APIs")]
-#[command(group(clap::ArgGroup::new("input").required(true).args(["config_path", "config"])))]
+// Rust note: no `.required(true)` here any more -- `--mode keygen` needs
+// neither `-c`/`--config-path` nor `--config`, so "at least one" can no
+// longer be a blanket clap-level rule. The group still enforces "not both"
+// (its `multiple` flag defaults to `false`); "at least one, unless keygen"
+// is checked by hand in `main()`, right where `--mode translate`'s own extra
+// requirement already is.
+#[command(group(clap::ArgGroup::new("input").args(["config_path", "config"])))]
 struct Args {
     /// Path to an Envoy bootstrap config (.yaml / .yml / .json / .pb).
+    /// Required for `serve`/`validate`/`translate`; unused by `keygen`.
     #[arg(short = 'c', long = "config-path", value_name = "PATH")]
     config_path: Option<PathBuf>,
 
     /// Path to a simple llm-proxy config (schema/llmproxy-v0.schema.json).
+    /// Required for `serve`/`validate`/`translate`; unused by `keygen`.
     #[arg(long = "config", value_name = "PATH")]
     config: Option<PathBuf>,
 
     /// `validate` checks the config and exits; `translate` prints the Envoy
-    /// bootstrap generated from a `--config` dialect file; `serve` runs.
+    /// bootstrap generated from a `--config` dialect file; `serve` runs;
+    /// `keygen` prints a fresh virtual key and its digest and needs no
+    /// config at all -- see `--tenant`/`--key-id`/`--hmac-secret-file`.
     #[arg(long, value_enum, default_value_t = Mode::Serve)]
     mode: Mode,
+
+    /// `--mode keygen`: the tenant the generated key authenticates as.
+    /// Required for `keygen`; unused otherwise.
+    #[arg(long, value_name = "TENANT")]
+    tenant: Option<String>,
+
+    /// `--mode keygen`: names this credential in audit logs
+    /// (`auth.keys[].id`). Defaults to an obvious placeholder the operator
+    /// is expected to replace before deploying the printed config fragment.
+    #[arg(long = "key-id", value_name = "ID", default_value = "REPLACE_ME")]
+    key_id: String,
+
+    /// `--mode keygen`: derive the digest's HMAC secret from this file
+    /// (matches the dialect's `auth.hmac_secret_file`). Takes precedence
+    /// over `$LLMPROXY_AUTH_SECRET` if both are set.
+    #[arg(long = "hmac-secret-file", value_name = "PATH")]
+    hmac_secret_file: Option<PathBuf>,
 
     /// Warn on unknown Envoy config fields instead of failing (default:
     /// strict). Has no effect on `--config` dialect files, which are always
@@ -102,6 +132,9 @@ enum Mode {
     Serve,
     Validate,
     Translate,
+    /// WP-50 increment 2a-iv: generate a virtual key + digest. The one mode
+    /// that touches no config at all -- see `run_keygen`.
+    Keygen,
 }
 
 /// CLI-facing drain strategy. Rust note: `proxy_core::drain::DrainStrategy`
@@ -165,6 +198,28 @@ fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing(args.log_level);
 
+    // `keygen` needs no config -- and, unlike every other mode, must never
+    // reach `load`/`build_snapshot` below. Handled first and returns
+    // unconditionally.
+    if args.mode == Mode::Keygen {
+        return run_keygen(&args);
+    }
+
+    // The `input` ArgGroup (see `Args`'s doc) only forbids passing BOTH
+    // `-c`/`--config-path` and `--config` now; "at least one, for every mode
+    // except keygen" has to be checked here instead. Getting this wrong in
+    // either direction is exactly the regression this task guards against
+    // with a test: silently letting `serve` through with no config would
+    // mean a "config required" invariant that used to be enforced by clap
+    // quietly stops being enforced at all.
+    if args.config_path.is_none() && args.config.is_none() {
+        eprintln!(
+            "a config is required: pass -c/--config-path or --config \
+             (only --mode keygen runs without one)"
+        );
+        return ExitCode::FAILURE;
+    }
+
     // `translate` only makes sense for the dialect: Envoy config IS the output.
     if args.mode == Mode::Translate && args.config.is_none() {
         eprintln!("--mode translate requires a --config dialect file (-c files already are Envoy configs)");
@@ -210,6 +265,32 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Mode::Serve => serve(args, snapshot),
+        // `main` returns via `run_keygen` before this point is ever reached
+        // for `Mode::Keygen` (see the early `if args.mode == Mode::Keygen`
+        // check) -- an explicit arm rather than a wildcard so a future new
+        // `Mode` variant still fails to compile here instead of silently
+        // falling through.
+        Mode::Keygen => unreachable!("--mode keygen returns from main() before this match"),
+    }
+}
+
+/// `--mode keygen`: validates `--tenant` (the one option this mode requires
+/// that clap can't enforce for it alone, since `Args` has no per-mode
+/// required flags -- see the doc on `Args::tenant`), then delegates to
+/// `keygen::run`, which resolves the secret, generates the key, and prints
+/// the paste-ready fragment. Returns before `load`/`build_snapshot` are ever
+/// reached; this mode touches no config.
+fn run_keygen(args: &Args) -> ExitCode {
+    let Some(tenant) = args.tenant.as_deref().filter(|t| !t.trim().is_empty()) else {
+        eprintln!("--mode keygen requires --tenant <TENANT>");
+        return ExitCode::FAILURE;
+    };
+    match keygen::run(tenant, &args.key_id, args.hmac_secret_file.as_ref()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
