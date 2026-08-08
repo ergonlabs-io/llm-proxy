@@ -309,7 +309,19 @@ impl HttpFilter for UsageFilterInstance {
         data: &mut Bytes,
         end_stream: bool,
     ) -> FilterDataStatus {
-        self.record_chunk_timing();
+        // A zero-length frame is not a response chunk, and must not be timed
+        // as one. `proxy_http::filter_manager` delivers a synthetic empty
+        // `end_stream=true` frame after the upstream body ends, so that a
+        // filter which gated on end-of-stream can release its buffer. Timing
+        // it unconditionally made `%LLM_RESPONSE_CHUNKS%` over-report by
+        // exactly one on every response with a body, and fed the gap between
+        // the last real chunk and that synthetic one into
+        // `%LLM_MAX_STALL%` -- a stall that no client ever waited through.
+        // (`%LLM_TTFT%` and `%LLM_TPOT%` were unaffected: TTFT is the first
+        // gap and TPOT divides by `output_tokens`, not by this count.)
+        if !data.is_empty() {
+            self.record_chunk_timing();
+        }
 
         match &mut self.mode {
             BodyMode::Sse(scanner) => scanner.push(data),

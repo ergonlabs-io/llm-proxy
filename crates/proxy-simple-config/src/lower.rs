@@ -94,14 +94,25 @@ const FILE_ACCESS_LOG_TYPE_URL: &str =
 /// The dialect's default text access-log line: Envoy's own default
 /// (`proxy_config::ir::DEFAULT_ACCESS_LOG_FORMAT`) trimmed of the fields that
 /// don't earn their width here (upstream service time, X-Forwarded-For,
-/// User-Agent), plus the LLM token/TTFT operators — token accounting is the
-/// product this proxy exists for, so the dialect's default line carries it.
+/// User-Agent), plus the LLM token and streaming-latency operators — token
+/// accounting is the product this proxy exists for, so the dialect's default
+/// line carries it.
+///
+/// `%LLM_TPOT%` is here, not just `%LLM_TTFT%`, and that is the point of the
+/// pair: TTFT says how long the user waited to see *anything*, TPOT says how
+/// fast it then streamed. Either alone hides the failure the other catches.
+/// (Added 2026-08-08: WP-46 built `%LLM_TPOT%`, `%LLM_MAX_STALL%` and
+/// `%LLM_RESPONSE_CHUNKS%`, but no dialect format ever emitted them — so a
+/// user configuring this proxy through its own dialect could not get TPOT at
+/// any setting, which the v0.1.0 gate requires.)
 const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" ",
     "%RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% ",
     "\"%REQ(X-REQUEST-ID)%\" \"%UPSTREAM_HOST%\" ",
     "llm_tokens=\"%LLM_INPUT_TOKENS%/%LLM_CACHED_TOKENS%/%LLM_CACHE_CREATION_TOKENS%/",
-    "%LLM_OUTPUT_TOKENS%/%LLM_TOTAL_TOKENS%\" llm_ttft_ms=\"%LLM_TTFT%\"\n",
+    "%LLM_OUTPUT_TOKENS%/%LLM_TOTAL_TOKENS%\" llm_ttft_ms=\"%LLM_TTFT%\" ",
+    "llm_tpot_ms=\"%LLM_TPOT%\" llm_max_stall_ms=\"%LLM_MAX_STALL%\" ",
+    "llm_response_chunks=\"%LLM_RESPONSE_CHUNKS%\"\n",
 );
 
 /// The header Anthropic requires on every Messages API request.
@@ -1018,7 +1029,16 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "llm_cache_creation_tokens": "%LLM_CACHE_CREATION_TOKENS%",
                 "llm_output_tokens": "%LLM_OUTPUT_TOKENS%",
                 "llm_total_tokens": "%LLM_TOTAL_TOKENS%",
+                // TTFT and TPOT are a pair -- see ACCESS_LOG_TEXT_FORMAT's
+                // doc for why neither is useful alone. `max_stall` is the
+                // tail of the TPOT distribution rather than the mean, which
+                // is what catches a stream that delivered on average fine
+                // while stalling badly once; `response_chunks` is what makes
+                // a TPOT value interpretable (a mean over 2 chunks is noise).
                 "llm_ttft_ms": "%LLM_TTFT%",
+                "llm_tpot_ms": "%LLM_TPOT%",
+                "llm_max_stall_ms": "%LLM_MAX_STALL%",
+                "llm_response_chunks": "%LLM_RESPONSE_CHUNKS%",
             }
         }),
     };

@@ -70,7 +70,14 @@ tq-count: ## Workspace test, printing ONLY the totals line
 
 .PHONY: tq-doc
 tq-doc: ## Doctests only -- nextest cannot run these, so they need their own pass
-	cargo test --workspace --doc
+# `--exclude proxy-api` is REQUIRED, not tidiness. proxy-api sets
+# `doctest = false` in its Cargo.toml because Envoy's generated proto doc
+# comments are full of YAML and protobuf snippets that are not Rust
+# (`key: envoy.xxx`, `filter_metadata:`). An explicit `--doc` overrides that
+# setting and tries to compile all 33 of them, every one of which fails. The
+# normal `cargo test` path respects `doctest = false`, which is why this only
+# bites here.
+	cargo test --workspace --exclude proxy-api --doc
 
 # The default inner-loop target. Tests ONLY the crates you actually touched,
 # instead of paying for the whole workspace on every edit.

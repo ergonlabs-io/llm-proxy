@@ -16,6 +16,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-6 | Upstream dying mid-stream errors, and is not retried | passing |
 | QA-7 | SIGTERM during an active stream drains to completion | passing |
 | QA-8 | Circuit-breaker rejection fails fast, does not queue | approved |
+| QA-10 | TTFT and TPOT reach the access log with sane values | approved |
 | QA-9 | ~~Content-type parameter tolerance~~ | rejected — see below |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -386,8 +387,48 @@ nothing to configure black-box), retry budgets (unimplemented), ALPN defaults
   test the code failed.
 - `make qa` builds the binary, then runs `go test ./...`. `make ci` invokes
   `make qa`, **skipping loudly with a visible notice if the Go toolchain is
-  absent** rather than failing. The loud part is not cosmetic — Go is currently
-  not installed on the primary dev machine, which is exactly the situation
-  where a silent skip would let the suite rot.
+  absent** rather than failing. The loud part is not cosmetic — a silent skip
+  would let the suite rot. (Go *is* installed on the primary dev machine as of
+  2026-08-08: go1.26.5, and `make qa` runs green in ~5s. This note previously
+  said it was absent.)
 - Timing assertions (QA-3, QA-7, QA-8) must assert shape with generous
   tolerance, never tight equality, and should be loop-verified before landing.
+
+---
+
+### QA-10 — TTFT and TPOT reach the access log, with values that match the upstream's pacing
+
+**Why:** v0.1.0's ship gate names these explicitly — "token counts *and
+TTFT/TPOT* reach the access log for live traffic" — and until 2026-08-08 the
+TPOT half could not be satisfied at all through the `llmproxy` dialect: WP-46
+built `%LLM_TPOT%`, `%LLM_MAX_STALL%` and `%LLM_RESPONSE_CHUNKS%`, and no
+dialect log format ever emitted them. QA-1 reads the token fields out of the
+same log line and never looks at the latency ones.
+
+There is a sharper reason than coverage. **TPOT has already shipped one silent
+bug of exactly the shape a black-box test catches:** it divided in integer
+milliseconds, so it rendered `0` for fast providers (1000–2000 tok/s) —
+reading zero precisely when performance was best. It was fixed by dividing in
+micros, but nothing outside a unit test guards it, and `0` in a log field looks
+entirely plausible to a reader. Only an assertion against a mock with *known*
+pacing can tell a real measurement from a broken one.
+
+**Config:** `llmproxy` dialect, single provider, JSON access log to a file —
+the dialect's default format, so this also proves the default carries these
+fields rather than a hand-written format doing the work.
+
+**Steps:** one streaming request against a mock paced with a large
+time-to-first-token and a known inter-chunk delay across several chunks (QA-3's
+pacing setup is the template).
+
+**Expected:** the request's access-log line carries
+- `llm_ttft_ms` at roughly the configured TTFT (generous lower bound),
+- `llm_tpot_ms` **strictly greater than zero** and in the neighbourhood of the
+  configured inter-chunk delay — the non-zero half is the load-bearing
+  assertion, since that is the regression that already happened once,
+- `llm_response_chunks` equal to the number of chunks the mock sent.
+
+Timing assertions are shape-with-tolerance, never tight equality, per this
+document's own standing rule.
+
+**Ignored by default:** no.
