@@ -188,6 +188,38 @@ impl fmt::Debug for KeyId {
 /// behind an `Arc`, so that adding the first policy field is a change to
 /// this one struct rather than a signature change through every call site
 /// that carries a `Principal`.
+///
+/// # The default grants everything (owner decision, 2026-08-08)
+///
+/// A tenant with no policy configured may use every model and every provider.
+/// Restriction is opt-in: an operator adds an allow-list when they want one.
+///
+/// **This does not contradict the module's fail-closed rule, and the two axes
+/// must not be confused.** *Authentication* fails closed — an unknown or
+/// revoked credential is a 401, always. *Authorization* defaults open — once
+/// we know who you are, absent any configured restriction, you may proceed.
+///
+/// # The trap this creates, for whoever adds the first field
+///
+/// "No policy configured" and "a configured policy that failed to load" must
+/// **not** produce the same value. The first is this `Default` and grants
+/// everything; the second is a config error and must fail loudly with its
+/// dotted path (ground rule #1), because silently substituting the permissive
+/// default for a policy the operator *wrote* would turn a typo into a
+/// privilege escalation.
+///
+/// For the same reason, express access as an explicit enum rather than a
+/// collection whose emptiness has to be interpreted:
+///
+/// ```ignore
+/// enum ModelAccess { All, Only(Vec<ModelPattern>) }   // do this
+/// models: Vec<ModelPattern>                            // NOT this
+/// ```
+///
+/// With a bare `Vec`, `vec![]` has to mean either "everything" or "nothing",
+/// and whichever you pick, the other becomes inexpressible — while
+/// `ModelAccess::Only(vec![])` says "deny all" unambiguously and
+/// `ModelAccess::All` is the documented default.
 #[derive(Clone, Default)]
 pub struct TenantPolicy {}
 

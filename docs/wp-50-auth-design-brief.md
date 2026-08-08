@@ -154,6 +154,41 @@ Tuesday is worse — a revoked key that still works is the failure this whole
 increment exists to prevent. So: keep serving, but **bound it**, and make the
 bound configurable and logged when exceeded.
 
+## Authorization defaults: a principal with no policy may do everything
+
+**Owner decision, 2026-08-08.** A tenant with no configured policy has access
+to every model and every provider. Restriction is opt-in — an operator adds an
+allow-list when they want one, and until then authentication alone is the
+gate.
+
+**This is a different axis from the fail-closed rule above, and conflating the
+two is the likely misreading.** Authentication fails **closed**: an unknown,
+malformed, or revoked credential is a 401, always. Authorization defaults
+**open**: once the proxy knows who you are, absent a configured restriction,
+you proceed. Both statements are deliberate and they do not conflict.
+
+Two consequences for whoever implements the first policy field:
+
+1. **"No policy configured" and "a configured policy that failed to load" must
+   not produce the same value.** The first is the permissive default. The
+   second is a config error and must fail loudly with its dotted path (ground
+   rule #1). Substituting the permissive default for a policy the operator
+   actually wrote would convert a typo into a privilege escalation — the exact
+   silent-degradation shape this project treats as P0.
+
+2. **Express access as an enum, not as a collection whose emptiness must be
+   interpreted.**
+
+   ```rust
+   enum ModelAccess { All, Only(Vec<ModelPattern>) }   // do this
+   models: Vec<ModelPattern>                            // not this
+   ```
+
+   With a bare `Vec`, `vec![]` has to mean either "everything" or "nothing";
+   whichever is chosen, the other becomes inexpressible. `ModelAccess::Only(
+   vec![])` says "deny all" unambiguously, and `ModelAccess::All` is the
+   documented default.
+
 ## The store seam (persistent, shared across deployments)
 
 The owner intends multiple proxy deployments sharing one store. That is
