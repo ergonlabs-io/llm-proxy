@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use proxy_observability::stats::{
     instruments, Handle, HistogramHandle, Registry, StatsControl, WorkerId,
 };
@@ -61,14 +62,21 @@ pub struct ClusterStatHandles {
 /// introduces. See the module doc for why growing this table is safe to do
 /// from outside the router.
 ///
-/// Rust note: `by_cluster` is a `Mutex`, not a plain `HashMap`, purely so
-/// [`Self::resolve_missing`] can insert through a shared `&self` --
-/// `for_cluster` still costs only an uncontended lock + a `HashMap::get` on
-/// every request, and inserts only ever happen on the rare, config-reload
-/// path (same trade `RouterStats::warned_unknown_clusters` below already
-/// makes).
+/// Rust note: `by_cluster` is an `ArcSwap`, not a plain `HashMap` behind a
+/// `Mutex` -- the same "control computes, workers `load`" shape
+/// `proxy_observability::stats::Registry` uses for its own `Snapshot` and
+/// `ClusterManager` uses for `HostSet` (see ADR-0005). `for_cluster` runs on
+/// every upstream attempt and `StatHandles` is shared across every worker
+/// through one `Arc`, so a `Mutex` here would be a single lock every worker
+/// contends on for every request -- not the "uncontended lock" an earlier
+/// version of this comment claimed. `ArcSwap::load` is lock-free, so
+/// `for_cluster` costs a pointer load + a `HashMap::get`, no matter how many
+/// workers call it concurrently. [`Self::resolve_missing`] (control side,
+/// reload-only) builds a whole new map and swaps it in -- see that method's
+/// doc for why copying the map is fine here specifically, which is NOT the
+/// general rule for this codebase's `Arc`-swapped state.
 pub struct StatHandles {
-    by_cluster: Mutex<HashMap<String, ClusterStatHandles>>,
+    by_cluster: ArcSwap<HashMap<String, ClusterStatHandles>>,
 }
 
 impl StatHandles {
@@ -87,7 +95,7 @@ impl StatHandles {
         cluster_names: impl IntoIterator<Item = &'a str>,
     ) -> Self {
         let table = Self {
-            by_cluster: Mutex::new(HashMap::new()),
+            by_cluster: ArcSwap::from_pointee(HashMap::new()),
         };
         table.resolve_missing(control, cluster_names);
         table
@@ -102,23 +110,42 @@ impl StatHandles {
     /// in the freshly reloaded snapshot -- so a cluster introduced after
     /// boot gets counted from its first request instead of silently falling
     /// into the unknown-cluster path the module doc describes.
+    ///
+    /// Builds a fresh `HashMap` (the current entries plus whatever's new)
+    /// and swaps it in, rather than mutating in place -- `ArcSwap` has no
+    /// in-place insert, only `load`/`store`/`rcu`. Copying the map here is
+    /// safe and cheap: this runs only on the rare, config-reload path, and
+    /// [`ClusterStatHandles`] is `Copy` (two handle indices), so the copy
+    /// carries no live state that could be lost mid-swap. **This is NOT the
+    /// same argument as the stats `Registry`'s own shard storage**, which
+    /// deliberately never copies on growth (see that module's "Growth must
+    /// not move or copy a live atomic" doc section) -- there, the values
+    /// being copied would be live `AtomicU64` counters, and any increment
+    /// landing between the snapshot read and the new registry's publish
+    /// would be lost. Here, a handle is just an index into that registry;
+    /// copying the index loses nothing, because the counter it points to
+    /// still lives in the registry's own `Arc`'d storage, untouched by this
+    /// swap.
     pub fn resolve_missing<'a>(
         &self,
         control: &StatsControl,
         cluster_names: impl IntoIterator<Item = &'a str>,
     ) {
-        let mut by_cluster = self
-            .by_cluster
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let current = self.by_cluster.load();
+        let mut next: HashMap<String, ClusterStatHandles> = (**current).clone();
+        let mut changed = false;
         for name in cluster_names {
-            if by_cluster.contains_key(name) {
+            if next.contains_key(name) {
                 continue;
             }
             let rq = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", name)]);
             let rq_time =
                 control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", name)]);
-            by_cluster.insert(name.to_string(), ClusterStatHandles { rq, rq_time });
+            next.insert(name.to_string(), ClusterStatHandles { rq, rq_time });
+            changed = true;
+        }
+        if changed {
+            self.by_cluster.store(Arc::new(next));
         }
     }
 
@@ -128,14 +155,11 @@ impl StatHandles {
     ///
     /// Rust note: returns an owned `ClusterStatHandles` (it's `Copy` --
     /// two handle indices, nothing to avoid cloning) rather than a
-    /// reference, because the value now lives behind a `Mutex`: a reference
-    /// into the guard couldn't outlive this call.
+    /// reference, because the value now lives behind an `ArcSwap`: a
+    /// reference into the loaded `Arc` couldn't outlive this call. This is
+    /// a lock-free `load()`, not a lock -- see the struct doc.
     pub fn for_cluster(&self, cluster: &str) -> Option<ClusterStatHandles> {
-        self.by_cluster
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(cluster)
-            .copied()
+        self.by_cluster.load().get(cluster).copied()
     }
 }
 

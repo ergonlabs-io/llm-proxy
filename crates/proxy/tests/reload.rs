@@ -379,14 +379,31 @@ fn sighup_with_a_broken_config_keeps_serving_and_logs_error() {
     // accident (a crashed-and-respawned process would still answer "not
     // connectable" here, and a hung-but-alive process could still answer
     // `try_wait` with `None`).
-    assert!(
-        matches!(harness.child.try_wait(), Ok(None)),
-        "the process must still be running after a broken reload"
-    );
-    assert!(
-        TcpStream::connect(("127.0.0.1", port)).is_ok(),
-        "the original listener must still be serving after a broken reload"
-    );
+    //
+    // Both are also checked repeatedly over a settle window, not once: a
+    // process that is mid-exit still reads as alive to a single `try_wait`,
+    // and its listener socket can still accept a connection briefly after
+    // the process has decided to die. Sampling once right after the log line
+    // proves "it had not died yet", not "it stayed alive" -- confirmed by
+    // mutation-testing this test against a `std::process::exit(1)` swapped
+    // into the reload-failure branch in `main.rs`, which the single-sample
+    // version only caught in 2 of 4 runs. Requiring both checks to hold for
+    // the whole window is what makes that mutation fail every time.
+    let settle_deadline = Instant::now() + Duration::from_millis(750);
+    loop {
+        assert!(
+            matches!(harness.child.try_wait(), Ok(None)),
+            "the process must still be running after a broken reload"
+        );
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "the original listener must still be serving after a broken reload"
+        );
+        if Instant::now() >= settle_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     harness.finish();
 }

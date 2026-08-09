@@ -1448,6 +1448,7 @@ dependencies = [
 name = "proxy-http"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "futures",
  "h2",
