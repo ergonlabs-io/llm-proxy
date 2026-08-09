@@ -307,6 +307,17 @@ use arc_swap::ArcSwap;
 /// about that format.
 pub mod envoy_render;
 
+/// WP-23 increment 4: renders a [`Registry`] into Prometheus text exposition
+/// format, with Envoy's own name-mangling/label-escaping rules. See the
+/// module's own doc comment for how this deliberately differs from
+/// [`envoy_render`]'s per-attribute-value name expansion.
+pub mod prometheus_render;
+
+/// WP-23 increment 4's Grafana-dashboard conformance test -- provisional,
+/// see the module's own doc comment for why.
+#[cfg(test)]
+mod prometheus_conformance;
+
 /// The OTel semantic-conventions revision this module's instrument names and
 /// attribute keys were written against. See the module doc's "Decision 5" —
 /// changing this value is a breaking change to the metric surface and must

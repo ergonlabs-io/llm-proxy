@@ -11,7 +11,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy_core::WorkerConfigHandle;
-use proxy_observability::stats::{envoy_render, Registry};
+use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -168,6 +168,21 @@ fn handle(
                 StatusCode::NOT_FOUND,
                 "the stats registry (WP-23) is not configured for this admin server instance; \
                  this proxy does not fake an empty /stats",
+            ),
+        },
+        // WP-23 increment 4: `prometheus_render::render` is the same
+        // reads-only, no-I/O guarantee as `envoy_render::render` above --
+        // see that function's doc. `text()` already sets
+        // `prometheus_render::CONTENT_TYPE`'s exact value
+        // (`text/plain; charset=utf-8`, confirmed against Envoy's own admin
+        // default -- see `prometheus_render`'s module doc), so this reuses
+        // it rather than building a second response path.
+        "/stats/prometheus" => match registry {
+            Some(registry) => text(StatusCode::OK, &prometheus_render::render(registry)),
+            None => text(
+                StatusCode::NOT_FOUND,
+                "the stats registry (WP-23) is not configured for this admin server instance; \
+                 this proxy does not fake an empty /stats/prometheus",
             ),
         },
         other => text(
