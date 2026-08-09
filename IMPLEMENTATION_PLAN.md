@@ -1978,8 +1978,9 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   numbers for the same request**, both exist in the market, and neither is more natural. A
   default would be a coin flip applied to every invoice. Ground rule #1 applied to arithmetic
   rather than to a field name.
-- **Cumulative volume discounts are explicitly OUT of scope** and are not the same feature
-  despite looking like it. "First 1M tokens this month at X" makes cost depend on every
+- **Cumulative volume discounts are explicitly OUT of scope** (owner, 2026-08-08: "no point
+  supporting that, we can have a separate system for it -- this can maintain the raw prices")
+  and are not the same feature despite looking like it. "First 1M tokens this month at X" makes cost depend on every
   earlier request, so two concurrent requests can both price low and the total depends on
   scheduling; it couples pricing to WP-42's read-modify-write spend counter; and retroactive
   forms ("exceed 1M and *all* this month bills lower") re-price history outright, which is
@@ -2014,6 +2015,15 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   replicas: a rollout takes minutes, and during it the same request prices differently
   depending on which replica served it, invisibly. An effective date makes every replica
   agree on when new prices start regardless of when each got the file.
+- **This WP is the RATE CARD, and the figure it produces is a LIST price.** It answers "what
+  did this request cost at list price, under the prices in effect when it completed" -- a pure
+  function of the request. Volume discounts, negotiated rebates, credits and committed-spend
+  agreements belong to a separate downstream system, and the cost records are the interface to
+  it. Naming consequence, and it is not cosmetic: the field is `list_cost_nanodollars` and the
+  access-log operator is `%LLM_LIST_COST%`, **not** `cost`. A field called `cost` on a record
+  a discount system will later adjust invites a dashboard, an alert, or an invoice to treat it
+  as the final amount owed; the explicit name makes a double-count read as wrong rather than
+  plausible.
 - **Build:** increment 1, the price model + dialect config surface (strict validation, dotted
   paths); increment 2, cost records computed at response end, stamped with the list version
   and surfaced on `StreamInfo` and in access logs — spend becomes *visible* before it becomes

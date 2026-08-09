@@ -165,10 +165,30 @@ this brief is built on:
   ("exceed 1M and *all* of this month's tokens bill at the lower rate"). That directly
   contradicts the central guarantee: a cost record could no longer be final when written.
 
-So cumulative discounts are **explicitly out of scope**, and if they are ever wanted they
-need their own design — most likely as a *reconciliation* pass over immutable cost records
-rather than as a change to how a request is priced. Recorded here so the resemblance to
-per-request tiers does not get someone to implement one while thinking about the other.
+So cumulative discounts are **explicitly out of scope**. Owner decision, 2026-08-08: *"no
+point supporting that, we can have a separate system for it. This can maintain the raw
+prices."*
+
+### What that makes this system, and the naming consequence
+
+**WP-53 is the rate card.** It answers "what did this request cost at list price, under the
+prices in effect when it completed?" — a pure function of the request. Anything that adjusts
+that figure afterwards (volume discounts, negotiated rebates, credits, committed-spend
+agreements) belongs to a separate downstream system, and **the cost records are the interface
+to it.** That is a good boundary: it is exactly the line between a stateless per-request
+calculation and a stateful periodic reconciliation, and the two have different correctness
+requirements.
+
+It has one consequence that is easy to get wrong and expensive to unpick: **do not call the
+figure `cost`.** Call it what it is — a *list-price* cost. A field named `cost` on a record
+that a discount system will later adjust invites a dashboard, an alert, or an invoice to
+treat it as the final amount owed. Naming it `list_cost_nanodollars` (and the access-log
+operator `%LLM_LIST_COST%`) makes the downstream system's existence visible at every call
+site, and makes a double-count read as obviously wrong rather than plausible.
+
+The same reasoning that keeps `KeyId` separate from `TenantId`, and `input_tokens`
+separate from `cached_tokens`: when two numbers can be confused and one of them is money, the type or the
+name has to keep them apart.
 
 ## An unpriced model must be `None`, never `$0`
 
