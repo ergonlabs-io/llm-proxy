@@ -254,3 +254,16 @@ boards: ## Render the build board + release tracker from docs/boards/*.yaml
 .PHONY: boards-check
 boards-check: ## Fail if the rendered HTML has drifted from the YAML
 	python3 scripts/render-boards.py --check
+
+# --------------------------------------------------------------- docs site --
+# The Astro + Starlight site at docs/site/. `npm install` is not run by these
+# targets -- run it once yourself (or let `npm run` fail loudly) so a docs
+# edit doesn't pay a dependency-install tax on every invocation.
+
+.PHONY: docs-dev
+docs-dev: ## Run the docs site dev server (docs/site), http://localhost:4321
+	cd docs/site && npm run dev
+
+.PHONY: docs-build
+docs-build: ## Production build of the docs site to docs/site/dist/
+	cd docs/site && npm run build
