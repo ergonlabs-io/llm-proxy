@@ -379,6 +379,29 @@ One state correction worth carrying: `traceparent` already survives a hop today 
 cloned per attempt and mutations only add — so we are transparent to existing traces. We simply
 do not participate in them. WP-51 is additive, not a defect fix.
 
+**WP-23 progress, 2026-08-08 — and a warning about how to read it.** Increments 1–3 landed
+(`ba980f2`, `8764fee`, `d8f6c80`): the registry with per-worker shards, histograms with
+Envoy's default buckets, and the Envoy text renderer. `/stats` now returns `200` instead of
+the honest 404.
+
+**That is NOT this gate's `/stats` clause being met, and the difference is easy to miss.**
+The instrumentation call sites are WP-23 increment 5 and have not landed, so `/stats` today
+returns `200` with an **empty body** — a correctly-rendered view of a registry against which
+nothing has been recorded. To a Prometheus scraper that is indistinguishable from a healthy
+proxy serving no traffic, and it satisfies a naive reading of "`/config_dump` and `/stats`
+served by the admin endpoint" while providing nothing at all.
+
+The 404 it replaced carried the comment *"this proxy does not fake an empty /stats"*. That
+comment was written to prevent exactly this misreading, so it is restated here rather than
+lost with the code that held it: **this clause closes when `/stats` reports real traffic**,
+which needs increment 5, and increment 4 (`/stats/prometheus` plus the Grafana-dashboard
+conformance test) is what proves the output is Envoy-shaped rather than merely present.
+
+One known unknown to carry into increment 4: **the histogram text line format is
+unverified.** Nothing authoritative for it exists in this repo — the vendored protos cover
+bucket boundaries, not admin-endpoint rendering — so it sits behind one named function,
+labelled as an unconfirmed recollection. The Grafana conformance test is what will settle it.
+
 **Named gaps:**
 
 - The loadgen Linux `/proc` sampler is written to spec but unverified — no Linux box in
