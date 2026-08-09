@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+use proxy_config::ir::SnapshotVersion;
 use proxy_config::{
     build_snapshot, load_bootstrap_file, ConfigSnapshot, LoadedBootstrap, StrictMode,
 };
@@ -347,9 +348,87 @@ fn load(args: &Args) -> Result<(String, LoadedBootstrap), (String, String)> {
     Ok((display, loaded))
 }
 
+/// Which config front-end (`-c`/`--config-path` Envoy bootstrap, or
+/// `--config` dialect) and file `serve` was started with -- captured once,
+/// right after argument parsing, and threaded down into the SIGHUP reload
+/// path (see [`reload`]) instead of a reload re-deriving it from `Args`
+/// itself.
+///
+/// This is what makes "a reload goes through the SAME front-end it booted
+/// with" true by construction rather than by care: a `Bootstrap`-sourced
+/// process can only ever call `load_bootstrap_file` again on SIGHUP, and a
+/// `Dialect`-sourced one can only ever call `load_simple_config_file` again
+/// -- there is no code path that lets one call into the other's loader,
+/// unlike re-inspecting `Args` on every reload, which would silently start
+/// working from whatever `Args` happens to hold this time.
+#[derive(Debug)]
+enum ConfigSource {
+    /// `-c`/`--config-path`: an Envoy bootstrap file, loaded with `strict`
+    /// (mirrors `--permissive` at boot; a reload keeps the same strictness
+    /// the process booted with).
+    Bootstrap { path: PathBuf, strict: StrictMode },
+    /// `--config`: the simple llm-proxy dialect (schema/llmproxy-v0.schema.json).
+    Dialect { path: PathBuf },
+}
+
+impl ConfigSource {
+    /// Derives the source from the same `Args` fields `load` above reads,
+    /// once, right after the clap parse that guarantees exactly one of
+    /// `config_path`/`config` is set.
+    fn from_args(args: &Args) -> Self {
+        if let Some(path) = &args.config_path {
+            let strict = if args.permissive {
+                StrictMode::Permissive
+            } else {
+                StrictMode::Strict
+            };
+            ConfigSource::Bootstrap {
+                path: path.clone(),
+                strict,
+            }
+        } else {
+            let path = args
+                .config
+                .clone()
+                .expect("clap group guarantees one of config_path/config is set");
+            ConfigSource::Dialect { path }
+        }
+    }
+
+    /// Re-parses and re-lowers this source's file from scratch: the exact
+    /// same library calls `load`/`build_snapshot` make at boot, minus
+    /// `load`'s two CLI-only conveniences (the cross-mode hint text and
+    /// `--mode translate`'s stdout side effect) -- a SIGHUP reload has
+    /// neither a terminal to hint at nor a reason to print an Envoy YAML
+    /// translation. Warnings are logged via `tracing` rather than
+    /// `eprintln!`, since this runs from the serve-mode signal loop, not the
+    /// startup path.
+    fn load(&self) -> Result<ConfigSnapshot, String> {
+        let loaded = match self {
+            ConfigSource::Bootstrap { path, strict } => {
+                load_bootstrap_file(path, *strict).map_err(|e| e.to_string())?
+            }
+            ConfigSource::Dialect { path } => {
+                let config = proxy_simple_config::load_simple_config_file(path)
+                    .map_err(|e| e.to_string())?;
+                proxy_simple_config::lower_to_loaded(&config).map_err(|e| e.to_string())?
+            }
+        };
+        for warning in &loaded.warnings {
+            tracing::warn!(field_path = %warning.field_path, message = %warning.message, "config reload warning");
+        }
+        build_snapshot(&loaded).map_err(|e| e.to_string())
+    }
+}
+
 /// Serve mode: build the control runtime, spawn the worker pool, wait for
-/// SIGTERM/SIGINT, then run the graceful shutdown sequence.
+/// SIGTERM/SIGINT/SIGHUP, then run the graceful shutdown sequence.
 fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
+    // Captured before anything below moves out of `args` -- see
+    // `ConfigSource`'s doc for why a reload has to be pinned to this, rather
+    // than re-deriving it from `Args` each time SIGHUP arrives.
+    let config_source = ConfigSource::from_args(&args);
+
     if let Some(base_id) = args.base_id {
         tracing::warn!(
             base_id,
@@ -380,6 +459,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
         args.service_node,
         args.service_cluster,
         Arc::new(snapshot),
+        config_source,
     ))
 }
 
@@ -397,6 +477,7 @@ async fn run_serve(
     service_node: Option<String>,
     service_cluster: Option<String>,
     snapshot: Arc<ConfigSnapshot>,
+    config_source: ConfigSource,
 ) -> ExitCode {
     // Collected before `snapshot` moves into `WorkerPool::spawn` purely so
     // the startup log line below can name what got bound; each worker binds
@@ -439,13 +520,14 @@ async fn run_serve(
     // `cluster_manager` above -- and a `StatHandles` table resolved, once,
     // for every cluster this boot snapshot names. `StatsControl` itself
     // (the only thing that can `resolve` a NEW handle) never leaves this
-    // function: `registry` (a plain `Arc<Registry>` clone) is what both the
-    // admin server and every worker's `RouterStats` actually hold. See
-    // `proxy_observability::stats`'s module doc, "Increment 5", for why the
-    // two are split, and `proxy_http::stat_handles`'s module doc for why a
-    // cluster added by a config reload after this point isn't in the table
-    // yet (dynamic config updates aren't wired into this binary at all --
-    // WP-20/21/22).
+    // function -- but unlike before the SIGHUP reload path landed, it does
+    // not go out of scope either: the signal loop below holds onto it (and
+    // a clone of `stat_handles`) so `reload` can extend the SAME table for
+    // a cluster a later config only introduces then, via
+    // `StatHandles::resolve_missing`. `registry` (a plain `Arc<Registry>`
+    // clone) is what both the admin server and every worker's `RouterStats`
+    // actually hold. See `proxy_observability::stats`'s module doc,
+    // "Increment 5", for why the two are split.
     let stats_control = proxy_observability::stats::StatsControl::new(concurrency);
     let stat_handles = Arc::new(proxy_http::stat_handles::StatHandles::build(
         &stats_control,
@@ -484,21 +566,30 @@ async fn run_serve(
     // status gets back to the control runtime without changing
     // `WorkerPool`'s public API: it's plumbed entirely through the closure's
     // capture, not through `WorkerContext`.
-    // Install the shutdown handlers BEFORE spawning any worker. Workers begin
-    // binding listeners as soon as they start, so installing after the spawn
-    // would leave a window in which the proxy is already accepting connections
-    // while a SIGTERM would still kill it outright with no drain -- see
-    // `ShutdownSignals`'s doc comment. Nothing is listening yet at this point,
-    // so there is nothing to tear down if installation fails.
-    let mut shutdown_signals = match ShutdownSignals::install() {
+    // Install the shutdown/reload handlers BEFORE spawning any worker. Workers
+    // begin binding listeners as soon as they start, so installing after the
+    // spawn would leave a window in which the proxy is already accepting
+    // connections while a SIGTERM would still kill it outright with no drain
+    // -- see `ControlSignals`'s doc comment. Nothing is listening yet at this
+    // point, so there is nothing to tear down if installation fails.
+    let mut control_signals = match ControlSignals::install() {
         Ok(signals) => signals,
         Err(err) => {
-            eprintln!("failed to install shutdown signal handlers: {err}");
+            eprintln!("failed to install shutdown/reload signal handlers: {err}");
             return ExitCode::FAILURE;
         }
     };
 
     let (bind_tx, mut bind_rx) = mpsc::unbounded_channel::<(WorkerId, Result<(), String>)>();
+
+    // Cloned before `cluster_manager`/`stat_handles` move into the
+    // `WorkerPool::spawn` closure below (which needs its own copies, one per
+    // worker) -- these are what `reload` uses to apply a SIGHUP'd snapshot to
+    // the SAME cluster manager and stats table every worker already reads
+    // through.
+    let cluster_manager_for_reload = cluster_manager.clone();
+    let stat_handles_for_reload = stat_handles.clone();
+    let mut current_version = snapshot.version;
 
     let publisher = WorkerPool::spawn(
         WorkerPoolConfig {
@@ -525,7 +616,7 @@ async fn run_serve(
         service_node = service_node.as_deref().unwrap_or("-"),
         service_cluster = service_cluster.as_deref().unwrap_or("-"),
         listeners = %listener_summary.join(", "),
-        "llm-proxy started, waiting for SIGTERM/SIGINT"
+        "llm-proxy started, waiting for SIGTERM/SIGINT/SIGHUP"
     );
 
     // Startup gate: every worker must report a successful initial bind
@@ -540,11 +631,121 @@ async fn run_serve(
         return ExitCode::FAILURE;
     }
 
-    shutdown_signals.recv().await;
+    // Runs until a shutdown signal arrives; a SIGHUP along the way triggers a
+    // config reload and loops back to waiting, exactly like Envoy's own
+    // hot-reload trigger. See `reload`'s doc for what "reload" does and does
+    // not apply, and requirement 1's test (`sighup_with_a_broken_config_...`
+    // in `tests/reload.rs`) for why a failed reload must never reach the
+    // `break` below.
+    loop {
+        match control_signals.recv().await {
+            ControlSignal::Shutdown => break,
+            ControlSignal::Reload => {
+                if let Some(new_version) = reload(
+                    &config_source,
+                    current_version,
+                    &publisher,
+                    &cluster_manager_for_reload,
+                    &stats_control,
+                    &stat_handles_for_reload,
+                )
+                .await
+                {
+                    current_version = new_version;
+                }
+            }
+        }
+    }
 
     let outcome = graceful_shutdown(publisher, drain_time, strategy).await;
     tracing::info!(?outcome, "drain sequence finished, exiting");
     ExitCode::SUCCESS
+}
+
+/// The SIGHUP config-reload path: re-reads `source`'s file through the exact
+/// front-end it was booted with ([`ConfigSource::load`]), and on success
+/// republishes a fresh snapshot -- on failure, logs and leaves every piece of
+/// running state untouched.
+///
+/// Order of operations on success, and why: [`proxy_http::stat_handles::StatHandles::resolve_missing`]
+/// runs first so a cluster this table has never seen has a handle resolved
+/// *before* traffic can possibly reach it; [`proxy_cluster::manager::ClusterManager::update_from_snapshot`]
+/// runs next, exactly the call `run_serve` makes at boot, so the shared
+/// cluster manager every worker's router reads through picks up added,
+/// removed, or changed clusters; [`ConfigPublisher::publish`] runs last, so
+/// listeners (via each worker's `config_ping` -> `reconcile`, already
+/// covered by `proxy-core`'s own tests) never start routing to a cluster the
+/// manager doesn't know about yet.
+///
+/// A cluster `update_from_snapshot` rejects (unimplemented `lb_policy`, a
+/// bad `transport_socket`, ...) is logged at `error` and left out of the
+/// live cluster set -- unlike at boot, where the same rejection is fatal,
+/// here it cannot be: requirement 1 is that a reload never takes the process
+/// down, and that has to hold even for a failure `build_snapshot` itself
+/// has no way to catch.
+///
+/// Returns the new [`SnapshotVersion`] on success so the caller can advance
+/// `current_version` for the *next* reload, or `None` on any failure (old
+/// snapshot, old version, old cluster set: all still serving).
+async fn reload(
+    source: &ConfigSource,
+    current_version: SnapshotVersion,
+    publisher: &proxy_core::runtime::ConfigPublisher,
+    cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
+    stats_control: &proxy_observability::stats::StatsControl,
+    stat_handles: &proxy_http::stat_handles::StatHandles,
+) -> Option<SnapshotVersion> {
+    let mut snapshot = match source.load() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            // Requirement 1: this is the one log line an operator's typo has
+            // to produce. `err` is a `ConfigError`/`proxy-simple-config`
+            // error `Display`, which already carries the full dotted field
+            // path (ground rule #1) -- the same detail the boot-time
+            // `eprintln!("{err}")` in `main()` shows, just routed through
+            // `tracing` instead since this runs mid-serve.
+            tracing::error!(
+                error = %err,
+                "SIGHUP: config reload failed; continuing to serve the previous snapshot"
+            );
+            return None;
+        }
+    };
+
+    // `build_snapshot` always stamps a freshly loaded config as version 1
+    // (it has no notion of "this is a reload") -- requirement 3 is that the
+    // version strictly advances across reloads, so this overwrites it with
+    // the next number in the sequence this process has been handing out
+    // since boot (`current_version`, threaded in by the caller).
+    snapshot.version = SnapshotVersion(current_version.0 + 1);
+
+    stat_handles.resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
+
+    let rejected = cluster_manager
+        .update_from_snapshot(&snapshot.clusters)
+        .await;
+    for (name, err) in &rejected {
+        tracing::error!(
+            cluster = %name,
+            error = %err,
+            "SIGHUP: cluster rejected during reload; it is not part of the live cluster set \
+             (a request routed to it will fail until this is fixed and reloaded again)"
+        );
+    }
+
+    let listeners = snapshot.listeners.len();
+    let clusters = snapshot.clusters.len();
+    let version = snapshot.version;
+    publisher.publish(Arc::new(snapshot));
+
+    tracing::info!(
+        version = version.0,
+        listeners,
+        clusters,
+        rejected_clusters = rejected.len(),
+        "SIGHUP: config reload succeeded"
+    );
+    Some(version)
 }
 
 /// Waits for `expected` workers to each report `Ok(())` over `bind_rx`, or
@@ -704,45 +905,60 @@ async fn worker_main(
     let _ = listener_manager.await;
 }
 
-/// SIGTERM and SIGINT, with their handlers already **installed**.
+/// What [`ControlSignals::recv`] resolved on -- either begin the drain
+/// sequence, or run a config reload and keep serving.
+enum ControlSignal {
+    /// SIGTERM or SIGINT.
+    Shutdown,
+    /// SIGHUP: see [`reload`].
+    Reload,
+}
+
+/// SIGTERM, SIGINT, and SIGHUP, with their handlers already **installed**.
 ///
 /// The distinction that matters: `tokio::signal::unix::signal()` registers the
 /// handler with the OS when it is *called*, not when the returned stream is
-/// first polled. Installing both up front — before we announce readiness and
-/// before the initial-bind gate — is what makes the announcement true. If the
-/// handler were installed only at the point we start awaiting it (as this used
-/// to do), any signal arriving between "started" and that await would be
-/// handled by the **default disposition**: immediate termination by signal, no
-/// drain, live connections dropped. That window is small but entirely real —
-/// an orchestrator terminating a pod during a fast rollout or a scale-down
-/// race lands squarely in it.
+/// first polled. Installing all three up front — before we announce readiness
+/// and before the initial-bind gate — is what makes the announcement true. If
+/// the handler were installed only at the point we start awaiting it (as this
+/// used to do, for SIGTERM/SIGINT, before SIGHUP existed here), any signal
+/// arriving between "started" and that await would be handled by the
+/// **default disposition**: for SIGTERM/SIGINT that's immediate termination by
+/// signal, no drain, live connections dropped; for SIGHUP it's process
+/// termination too (SIGHUP's default disposition is "terminate", not
+/// "ignore" — the opposite of what a reload trigger wants). That window is
+/// small but entirely real — an orchestrator terminating a pod during a fast
+/// rollout or a scale-down race lands squarely in it.
 ///
 /// Rust note: SIGINT is taken as a `Signal` stream rather than via
 /// `tokio::signal::ctrl_c()` for exactly the same reason — `ctrl_c()` is a
 /// future that installs its handler on first poll, which would reintroduce the
 /// gap for SIGINT alone.
-struct ShutdownSignals {
+struct ControlSignals {
     sigterm: tokio::signal::unix::Signal,
     sigint: tokio::signal::unix::Signal,
+    sighup: tokio::signal::unix::Signal,
 }
 
-impl ShutdownSignals {
-    /// Installs both handlers. Failing to install one is a startup failure,
-    /// not something to discover at shutdown time.
+impl ControlSignals {
+    /// Installs all three handlers. Failing to install one is a startup
+    /// failure, not something to discover at shutdown/reload time.
     fn install() -> std::io::Result<Self> {
         use tokio::signal::unix::{signal, SignalKind};
         Ok(Self {
             sigterm: signal(SignalKind::terminate())?,
             sigint: signal(SignalKind::interrupt())?,
+            sighup: signal(SignalKind::hangup())?,
         })
     }
 
-    /// Resolves on the first of either signal. We only care about the first,
-    /// so racing the two streams in a `select!` is enough.
-    async fn recv(&mut self) {
+    /// Resolves on the first of the three signals, and says which kind it
+    /// was so the caller's loop can tell a reload from a shutdown.
+    async fn recv(&mut self) -> ControlSignal {
         tokio::select! {
-            _ = self.sigterm.recv() => {}
-            _ = self.sigint.recv() => {}
+            _ = self.sigterm.recv() => ControlSignal::Shutdown,
+            _ = self.sigint.recv() => ControlSignal::Shutdown,
+            _ = self.sighup.recv() => ControlSignal::Reload,
         }
     }
 }
@@ -805,5 +1021,190 @@ mod tests {
         tokio::net::TcpStream::connect(bound)
             .await
             .expect("the admin port should be connectable once start_admin has bound it");
+    }
+
+    // ---- ConfigSource: front-end pinning (requirement 2) ------------------
+    //
+    // These are unit tests against the private `ConfigSource`/`Args` types
+    // rather than a spawned-binary integration test -- the property under
+    // test ("a `-c` process can only ever reload via the bootstrap loader,
+    // a `--config` one only via the dialect loader") is a fact about which
+    // Rust code path runs, which a `match` arm proves directly and a log
+    // scrape over a real process could only prove indirectly. The SIGHUP
+    // *end-to-end* behavior (a reload actually taking effect, a broken one
+    // not taking the process down) is `tests/reload.rs`, which does spawn
+    // the real binary.
+
+    /// Builds an `Args` with every field beyond the three under test set to
+    /// its CLI default, so a new required field added to `Args` later fails
+    /// this to compile rather than silently getting an arbitrary value.
+    fn test_args(config_path: Option<PathBuf>, config: Option<PathBuf>, permissive: bool) -> Args {
+        Args {
+            config_path,
+            config,
+            mode: Mode::Serve,
+            tenant: None,
+            key_id: "REPLACE_ME".to_string(),
+            hmac_secret_file: None,
+            permissive,
+            concurrency: 1,
+            drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
+            drain_strategy: DrainStrategyArg::Gradual,
+            base_id: None,
+            log_level: LogLevel::Info,
+            service_node: None,
+            service_cluster: None,
+        }
+    }
+
+    #[test]
+    fn config_source_from_args_picks_bootstrap_for_dash_c() {
+        let path = PathBuf::from("/tmp/whatever-bootstrap.yaml");
+        let args = test_args(Some(path.clone()), None, false);
+        match ConfigSource::from_args(&args) {
+            ConfigSource::Bootstrap {
+                path: got,
+                strict: StrictMode::Strict,
+            } => assert_eq!(got, path),
+            other => {
+                panic!("-c must produce ConfigSource::Bootstrap{{strict: Strict}}, not {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn config_source_from_args_carries_permissive_through_to_strict_mode() {
+        let args = test_args(Some(PathBuf::from("/tmp/whatever.yaml")), None, true);
+        match ConfigSource::from_args(&args) {
+            ConfigSource::Bootstrap {
+                strict: StrictMode::Permissive,
+                ..
+            } => {}
+            other => {
+                panic!("--permissive must carry through as StrictMode::Permissive, not {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn config_source_from_args_picks_dialect_for_dash_dash_config() {
+        let path = PathBuf::from("/tmp/whatever-dialect.yaml");
+        let args = test_args(None, Some(path.clone()), false);
+        match ConfigSource::from_args(&args) {
+            ConfigSource::Dialect { path: got } => assert_eq!(got, path),
+            other => panic!("--config must produce ConfigSource::Dialect, not {other:?}"),
+        }
+    }
+
+    const BOOTSTRAP_ONE_LISTENER_YAML: &str = r#"
+static_resources:
+  listeners:
+    - name: ingress_tcp
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 19999 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8081 }
+"#;
+
+    const DIALECT_ONE_ROUTE_YAML: &str = r#"
+version: 0
+listen: 127.0.0.1:19999
+providers:
+  local-vllm:
+    base_url: http://127.0.0.1:8081
+routes:
+  - model: "*"
+    provider: local-vllm
+"#;
+
+    /// Rust note: `write` + `remove_file` here (no shared "with a temp file"
+    /// helper) matches the rest of this crate's tests
+    /// (`crates/proxy/tests/*.rs`) -- each writes and cleans up its own,
+    /// since there's no `tempfile` dependency in this crate.
+    fn write_temp(name_hint: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "llm-proxy-configsource-test-{name_hint}-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).expect("failed to write temp config");
+        path
+    }
+
+    #[test]
+    fn config_source_load_bootstrap_reflects_the_file_on_disk() {
+        let path = write_temp("bootstrap-ok", BOOTSTRAP_ONE_LISTENER_YAML);
+        let source = ConfigSource::Bootstrap {
+            path: path.clone(),
+            strict: StrictMode::Strict,
+        };
+        let snapshot = source.load().expect("a valid bootstrap file must load");
+        assert_eq!(snapshot.listeners.len(), 1);
+        assert_eq!(snapshot.clusters.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_source_load_dialect_reflects_the_file_on_disk() {
+        let path = write_temp("dialect-ok", DIALECT_ONE_ROUTE_YAML);
+        let source = ConfigSource::Dialect { path: path.clone() };
+        let snapshot = source.load().expect("a valid dialect file must load");
+        assert_eq!(snapshot.listeners.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_source_load_reports_a_parse_error_without_panicking() {
+        // Requirement 1's other half, at the unit level: `ConfigSource::load`
+        // must return `Err`, never panic, on a config that fails to parse --
+        // `reload`'s caller depends on this to keep the old snapshot.
+        let path = write_temp("bootstrap-broken", "not: valid: yaml: [");
+        let source = ConfigSource::Bootstrap {
+            path: path.clone(),
+            strict: StrictMode::Strict,
+        };
+        let err = source
+            .load()
+            .expect_err("malformed YAML must be an Err, not a panic or a lossy Ok");
+        assert!(!err.is_empty(), "error message should not be empty");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_source_load_dialect_is_never_confused_with_bootstrap() {
+        // Requirement 2, at the unit level: pointing the BOOTSTRAP loader at
+        // a dialect file (or vice versa) must fail cleanly, not silently
+        // half-parse -- this is what makes "impossible by construction" an
+        // actual guarantee rather than a description of the happy path.
+        let path = write_temp("dialect-via-bootstrap", DIALECT_ONE_ROUTE_YAML);
+        let source = ConfigSource::Bootstrap {
+            path: path.clone(),
+            strict: StrictMode::Strict,
+        };
+        assert!(
+            source.load().is_err(),
+            "a dialect file loaded through the Bootstrap front-end must not succeed"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -21,12 +21,15 @@
 //! # A cluster with no entry is a no-op, not a panic
 //!
 //! `StatHandles` is built once, from the cluster names present in the boot
-//! snapshot. Dynamic cluster addition after that (config reload growing the
-//! cluster set) isn't wired into this table yet -- nothing in this binary
-//! republishes into it today, matching `start_admin`'s own note that dynamic
-//! config updates (WP-20/21/22) haven't landed. So a cluster name the router
-//! asks about that isn't in the table is a real, if rare, possibility, and
-//! must never be allowed to fail a request: [`RouterStats::record_attempt`]/
+//! snapshot -- but the table itself is not frozen after that:
+//! [`StatHandles::resolve_missing`] lets a SIGHUP config reload
+//! (`crates/proxy/src/main.rs`) extend the SAME table (every worker holds a
+//! clone of the one `Arc<StatHandles>`, so a resolve there is visible to
+//! every worker's `for_cluster` immediately) with any cluster name the new
+//! snapshot introduces. Until a reload does that, though -- and for any
+//! cluster this process never learns about at all -- a name the router asks
+//! about that isn't in the table is a real possibility, and must never be
+//! allowed to fail a request: [`RouterStats::record_attempt`]/
 //! [`RouterStats::record_attempt_duration_ms`] silently no-op on a lookup
 //! miss, logging at most once per unique unknown name (see
 //! [`RouterStats::warn_unknown_cluster_once`]) so the gap stays visible
@@ -52,11 +55,20 @@ pub struct ClusterStatHandles {
     pub rq_time: HistogramHandle,
 }
 
-/// Cluster name -> [`ClusterStatHandles`], built once at boot from the
-/// config snapshot's cluster set. See the module doc for why this is a
-/// fixed, boot-time table rather than something the router grows itself.
+/// Cluster name -> [`ClusterStatHandles`], built at boot from the config
+/// snapshot's cluster set and, since the SIGHUP reload path landed, grown in
+/// place by [`Self::resolve_missing`] for any cluster a later reload
+/// introduces. See the module doc for why growing this table is safe to do
+/// from outside the router.
+///
+/// Rust note: `by_cluster` is a `Mutex`, not a plain `HashMap`, purely so
+/// [`Self::resolve_missing`] can insert through a shared `&self` --
+/// `for_cluster` still costs only an uncontended lock + a `HashMap::get` on
+/// every request, and inserts only ever happen on the rare, config-reload
+/// path (same trade `RouterStats::warned_unknown_clusters` below already
+/// makes).
 pub struct StatHandles {
-    by_cluster: HashMap<String, ClusterStatHandles>,
+    by_cluster: Mutex<HashMap<String, ClusterStatHandles>>,
 }
 
 impl StatHandles {
@@ -74,21 +86,56 @@ impl StatHandles {
         control: &StatsControl,
         cluster_names: impl IntoIterator<Item = &'a str>,
     ) -> Self {
-        let mut by_cluster = HashMap::new();
+        let table = Self {
+            by_cluster: Mutex::new(HashMap::new()),
+        };
+        table.resolve_missing(control, cluster_names);
+        table
+    }
+
+    /// Resolves `UPSTREAM_RQ`/`UPSTREAM_RQ_TIME` for every name in
+    /// `cluster_names` this table doesn't already have an entry for -- a
+    /// no-op for any name already present. [`Self::build`] is just this
+    /// called once against an empty table; the SIGHUP reload path
+    /// (`crates/proxy/src/main.rs`) calls it again, against the SAME
+    /// `Arc<StatHandles>` every worker already holds, for every cluster name
+    /// in the freshly reloaded snapshot -- so a cluster introduced after
+    /// boot gets counted from its first request instead of silently falling
+    /// into the unknown-cluster path the module doc describes.
+    pub fn resolve_missing<'a>(
+        &self,
+        control: &StatsControl,
+        cluster_names: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut by_cluster = self
+            .by_cluster
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         for name in cluster_names {
+            if by_cluster.contains_key(name) {
+                continue;
+            }
             let rq = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", name)]);
             let rq_time =
                 control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", name)]);
             by_cluster.insert(name.to_string(), ClusterStatHandles { rq, rq_time });
         }
-        Self { by_cluster }
     }
 
     /// Looks up `cluster`'s pre-resolved handles, or `None` if this table
     /// was never told about that cluster -- see the module doc for why that
     /// has to be a lookup miss the caller can handle, not a panic.
-    pub fn for_cluster(&self, cluster: &str) -> Option<&ClusterStatHandles> {
-        self.by_cluster.get(cluster)
+    ///
+    /// Rust note: returns an owned `ClusterStatHandles` (it's `Copy` --
+    /// two handle indices, nothing to avoid cloning) rather than a
+    /// reference, because the value now lives behind a `Mutex`: a reference
+    /// into the guard couldn't outlive this call.
+    pub fn for_cluster(&self, cluster: &str) -> Option<ClusterStatHandles> {
+        self.by_cluster
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(cluster)
+            .copied()
     }
 }
 
@@ -220,6 +267,47 @@ mod tests {
     fn for_cluster_is_none_for_an_unbuilt_cluster() {
         let (_control, handles) = control_and_handles(&["openai"]);
         assert!(handles.for_cluster("anthropic").is_none());
+    }
+
+    #[test]
+    fn resolve_missing_adds_a_new_cluster_without_disturbing_existing_ones() {
+        let (control, handles) = control_and_handles(&["openai"]);
+        let registry = control.registry();
+        let stats = RouterStats::new(registry.clone(), handles.clone(), WorkerId(0));
+        stats.record_attempt("openai");
+
+        // Simulates a SIGHUP reload's snapshot naming a cluster this table
+        // never saw at boot.
+        handles.resolve_missing(&control, ["openai", "anthropic"]);
+
+        assert!(
+            handles.for_cluster("anthropic").is_some(),
+            "resolve_missing should have added the new cluster"
+        );
+        // The pre-existing cluster's handle (and what it already counted)
+        // must survive untouched -- `resolve_missing` skips names already
+        // present rather than re-resolving (which would hand back a fresh,
+        // zeroed handle).
+        let h = handles.for_cluster("openai").unwrap();
+        assert_eq!(registry.value(h.rq), 1);
+
+        stats.record_attempt("anthropic");
+        let h2 = handles.for_cluster("anthropic").unwrap();
+        assert_eq!(registry.value(h2.rq), 1);
+    }
+
+    #[test]
+    fn resolve_missing_is_visible_through_every_arc_clone() {
+        // The whole point of the `Mutex`-backed table: a reload resolves
+        // through ONE `Arc<StatHandles>`, but every worker holds its own
+        // clone of that same `Arc` -- so the insert has to show up there
+        // too, not just on the handle that made the call.
+        let (control, handles) = control_and_handles(&["openai"]);
+        let worker_clone = handles.clone();
+
+        handles.resolve_missing(&control, ["anthropic"]);
+
+        assert!(worker_clone.for_cluster("anthropic").is_some());
     }
 
     #[test]
