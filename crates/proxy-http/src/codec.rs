@@ -324,39 +324,53 @@ where
     }
 }
 
-/// Send one request upstream over `io` as HTTP/2 and return the response,
-/// head-first with a streaming body -- the h2 mirror of
-/// `send_upstream_http1`.
+/// Handshake a fresh HTTP/2 client connection over `io` and spawn its
+/// connection-driving task, returning the request sender -- the "dial" half
+/// of what `send_upstream_http2` used to do in one shot, split out (WP-15
+/// slice A) so `crate::upstream_pool::UpstreamConnCache` can handshake once
+/// per `ConnKey` and hand clones of the resulting sender to many requests,
+/// instead of every request handshaking its own connection.
 ///
-/// Divergence from `send_upstream_http1`: there is no `Http2Options`/
-/// `keep_alive` parameter. HTTP/2 is multiplexed over one connection; there is
-/// no per-request `Connection: close` concept, so we never set (or need) that
-/// header. Connection lifecycle (when to tear down / reuse the underlying
-/// `SendRequest`) is the pool's concern, not this function's -- a later WP.
-///
-/// Generic over `IO` for the same reason `send_upstream_http1` is.
-pub async fn send_upstream_http2<IO>(
+/// Rust note: same `spawn_local` + dropped `JoinHandle` shape
+/// `send_upstream_http1` uses, and for the same reason (the `Connection`
+/// future is `!Send`, since it drives our deliberately `!Send` `StreamBody`,
+/// ADR-0003). Detaching it here used to mean "the connection tears down once
+/// `sender`/the response body are dropped" (v1, connect-per-stream); now that
+/// a cache can hold `sender` far longer than one request, this task simply
+/// lives exactly as long as whatever holds `sender` does -- that's what makes
+/// reuse work, not a leak, as long as the holder eventually drops it (the
+/// cache's `clear`/`invalidate`, or the process exiting).
+pub async fn handshake_upstream_http2<IO>(
     io: IO,
-    req: HttpRequestParts,
-) -> Result<HttpResponseParts, UpstreamCodecError>
+) -> Result<hyper::client::conn::http2::SendRequest<StreamBody>, UpstreamCodecError>
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     let io = TokioIo::new(io);
 
     let builder = hyper::client::conn::http2::Builder::new(LocalExec);
-    let (mut sender, conn) = builder
+    let (sender, conn) = builder
         .handshake::<_, StreamBody>(io)
         .await
         .map_err(UpstreamCodecError::Handshake)?;
 
-    // Same rationale as `send_upstream_http1`: the `Connection` future is
-    // `!Send` (it drives our `!Send` `StreamBody`), so it's driven with
-    // `spawn_local` rather than `tokio::spawn`, and detached (dropped
-    // `JoinHandle`) -- an acceptable v1 simplification, since the connection
-    // tears down when `sender`/the response body are dropped either way.
-    let conn_task = tokio::task::spawn_local(conn);
+    tokio::task::spawn_local(conn);
 
+    Ok(sender)
+}
+
+/// Send one request over an already-handshaken HTTP/2 `sender` and return the
+/// response, head-first with a streaming body -- the part of
+/// `send_upstream_http2` that doesn't care whether `sender` was just produced
+/// by `handshake_upstream_http2` or came out of a
+/// `crate::upstream_pool::UpstreamConnCache`. hyper's h2 `SendRequest` is
+/// `Clone` and multiplexes concurrent requests over the one underlying
+/// connection internally, so a cached caller passes in a clone, never the
+/// cache's own copy.
+pub async fn send_on_http2(
+    mut sender: hyper::client::conn::http2::SendRequest<StreamBody>,
+    req: HttpRequestParts,
+) -> Result<HttpResponseParts, UpstreamCodecError> {
     let RequestHeaders {
         method,
         uri,
@@ -394,7 +408,6 @@ where
     let response = match sender.send_request(request).await {
         Ok(response) => response,
         Err(send_err) => {
-            conn_task.abort();
             return Err(UpstreamCodecError::Send(send_err));
         }
     };
@@ -407,6 +420,33 @@ where
     let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
 
     Ok(HttpResponseParts { head, body })
+}
+
+/// Send one request upstream over `io` as HTTP/2 and return the response,
+/// head-first with a streaming body -- the h2 mirror of
+/// `send_upstream_http1`. Dial-then-send in one call, composed from
+/// `handshake_upstream_http2` + `send_on_http2` (WP-15 slice A); kept for
+/// callers (and the existing standalone tests) that don't need connection
+/// reuse. The router's real forwarding path calls the two split functions
+/// directly through `crate::upstream_pool::UpstreamConnCache` instead, so a
+/// concurrent request to the same upstream can reuse the connection this
+/// function would otherwise dial fresh every time.
+///
+/// Divergence from `send_upstream_http1`: there is no `Http2Options`/
+/// `keep_alive` parameter. HTTP/2 is multiplexed over one connection; there is
+/// no per-request `Connection: close` concept, so we never set (or need) that
+/// header.
+///
+/// Generic over `IO` for the same reason `send_upstream_http1` is.
+pub async fn send_upstream_http2<IO>(
+    io: IO,
+    req: HttpRequestParts,
+) -> Result<HttpResponseParts, UpstreamCodecError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let sender = handshake_upstream_http2(io).await?;
+    send_on_http2(sender, req).await
 }
 
 /// Convert one `hyper::Request<Incoming>` into [`HttpRequestParts`], hand it

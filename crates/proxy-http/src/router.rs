@@ -11,8 +11,11 @@
 //! ## v1 scope
 //!
 //! In scope: `Forward` routing to a `Cluster`/`ClusterHeader`/`Weighted`
-//! target, HTTP/1.1 upstream only, connect-per-stream (no pooling/reuse --
-//! see `proxy_cluster::pool`), `DirectResponse` for inline bodies, the
+//! target, both HTTP/1.1 and HTTP/2 upstreams. HTTP/1.1 is connect-per-stream
+//! (no pooling/reuse -- see `proxy_cluster::pool`); HTTP/2 reuses one
+//! connection per (cluster, address) across concurrent/sequential requests
+//! via `crate::upstream_pool::UpstreamConnCache` (WP-15 slice A -- see that
+//! module's doc). `DirectResponse` for inline bodies, the
 //! upstream request transforms `prefix_rewrite`/`host_rewrite_literal`/
 //! `x-envoy-expected-rq-timeout-ms`, the S4 route timeout
 //! (`ForwardAction::timeout`, bounding time-to-response-headers only), and
@@ -41,9 +44,12 @@
 //!   HCM `stream_idle_timeout` field yet, so a `None` route `idle_timeout`
 //!   means "no idle timeout" for now, not "inherit the listener's".
 //! - The retry & hedging engine (S3, WP-14).
-//! - HTTP/2 upstream (`UpstreamProtocol::Http2`).
-//! - Connection reuse / real pooling (WP-15 follow-up;
-//!   `ConnectPool` is connect-per-stream today).
+//! - HTTP/1.1 connection reuse (keep-alive) -- WP-15 slice B; h1 stays
+//!   connect-per-stream through `ConnectPool` even after slice A, which only
+//!   covers HTTP/2 (see `crate::upstream_pool`'s module doc for why).
+//! - Connection-level circuit breakers (`max_connections`,
+//!   `max_pending_requests`) -- WP-15 slice D; this router still only
+//!   enforces the S5 `max_requests` per-cluster budget above.
 //! - `RouteActionIR::Redirect` (returns 501 below).
 //!
 //! WP-24 chunk 3: response flags are recorded onto a per-request
@@ -55,6 +61,7 @@
 //! INSIDE the encode filter chain, so logging from here can never observe
 //! what an encode filter does at end-of-stream).
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -62,12 +69,12 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::{
-    ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
+    ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol, UpstreamStream,
 };
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher};
 use proxy_observability::ResponseFlag;
 
-use crate::codec::{send_upstream_http1, send_upstream_http2, Http1Options, UpstreamCodecError};
+use crate::codec::{send_on_http2, send_upstream_http1, Http1Options, UpstreamCodecError};
 use crate::filter::{
     DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
     RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
@@ -78,8 +85,22 @@ use crate::handler::{
 };
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, select_cluster};
+use crate::upstream_pool::{ConnKey, UpstreamConnCache};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
+
+/// What `apply_forward`'s attempt loop got back from connecting to the
+/// picked host: an h1 [`UpstreamStream`] for a fresh connect-per-stream dial,
+/// or an h2 `SendRequest` that may be freshly dialed or a clone of an
+/// already-cached one (WP-15 slice A -- see `crate::upstream_pool`'s module
+/// doc). One `Result<Connected, PoolError>` for both protocols keeps the
+/// shared connect-failure handling (S3 retry classification, circuit-breaker
+/// outcome, response-flag mapping) a single match arm instead of two
+/// near-duplicate ones.
+enum Connected {
+    Http1(UpstreamStream),
+    Http2(hyper::client::conn::http2::SendRequest<StreamBody>),
+}
 
 mod guarded;
 // Rust note: `pub(crate)` (not private) so `access_logging::LoggingBody`, a
@@ -132,6 +153,13 @@ impl TerminalFilterInstanceFactory for RouterFilterFactory {
 /// across a seam.
 pub struct RouterHandler {
     clusters: Arc<ClusterManager>,
+    /// WP-15 slice A: this worker's h2 connection-reuse cache. `Rc`, not a
+    /// field on `RouterFilterFactory` -- see `upstream_pool::worker_conn_cache`'s
+    /// doc for why the factory (which must stay `Send + Sync`) can't hold
+    /// this directly, and why a `thread_local!` is the fallback instead.
+    /// Fetched fresh per stream (a cheap `Rc` clone -- pointer bump), so
+    /// every request this worker serves shares the one underlying cache.
+    conn_cache: Rc<UpstreamConnCache>,
     /// Captured in `decode_headers` (cloned, since `RequestHeaders` isn't
     /// `Clone` and the callback only lends us `&mut`); consumed by
     /// `respond()`.
@@ -148,6 +176,7 @@ impl RouterHandler {
     pub fn new(clusters: Arc<ClusterManager>) -> Self {
         Self {
             clusters,
+            conn_cache: crate::upstream_pool::worker_conn_cache(),
             captured_head: None,
             captured_body: Bytes::new(),
             captured_trailers: None,
@@ -432,8 +461,25 @@ impl RouterHandler {
                     );
                 }
                 let pool = attempt_entry.http_pool(&host, proto);
-                let upstream = match pool.new_stream().await {
-                    Ok(upstream) => upstream,
+                // WP-15 slice A: h2 upstreams are reused across requests via
+                // this worker's `UpstreamConnCache` -- one TCP connection
+                // (and handshake) per (cluster, address, protocol),
+                // multiplexed by hyper's h2 `SendRequest`. h1 stays
+                // connect-per-stream (`pool.new_stream()` directly),
+                // unchanged from before this slice -- see
+                // `crate::upstream_pool`'s module doc for why h2 only.
+                let conn_key = matches!(proto, UpstreamProtocol::Http2)
+                    .then(|| ConnKey::new(attempt_cluster, host.address, proto));
+                let connect_result: Result<Connected, PoolError> = match &conn_key {
+                    Some(key) => self
+                        .conn_cache
+                        .get_or_connect(key.clone(), pool.as_ref())
+                        .await
+                        .map(Connected::Http2),
+                    None => pool.new_stream().await.map(Connected::Http1),
+                };
+                let connected = match connect_result {
+                    Ok(connected) => connected,
                     Err(err) => {
                         let outcome = AttemptOutcome::from_pool_error(&err);
                         if let Some(state) = &mut retry_state {
@@ -471,7 +517,11 @@ impl RouterHandler {
                             // Envoy folds this into the same `UF`/
                             // connect-failure bucket as a TCP failure, but it
                             // gets its own arm so the log line says which
-                            // half actually broke.
+                            // half actually broke. WP-15 slice A: an h2
+                            // preface/settings handshake failure (through
+                            // `UpstreamConnCache::get_or_connect`) is folded
+                            // into this same variant too -- see that
+                            // function's doc for why.
                             PoolError::TlsHandshake(_) => {
                                 tracing::debug!(response_flag = "UF", cluster = %attempt_cluster, "upstream TLS handshake failure");
                                 dcb.stream_info()
@@ -538,22 +588,23 @@ impl RouterHandler {
                 // future so the two arms share one type. h2 here is
                 // prior-knowledge cleartext (h2c) over the pool's raw TCP
                 // stream -- no per-request `Connection: close`, so it takes
-                // no `Http1Options`.
+                // no `Http1Options`. WP-15 slice A: the h2 arm sends over
+                // whatever `SendRequest` `connected` carries -- possibly a
+                // clone of an already-cached, already-handshaken sender, not
+                // a fresh one this attempt just dialed.
                 let send: std::pin::Pin<
                     Box<
                         dyn std::future::Future<
                             Output = Result<HttpResponseParts, UpstreamCodecError>,
                         >,
                     >,
-                > = match proto {
-                    UpstreamProtocol::Http1 => Box::pin(send_upstream_http1(
+                > = match connected {
+                    Connected::Http1(upstream) => Box::pin(send_upstream_http1(
                         upstream.io,
                         upstream_req,
                         Http1Options { keep_alive: false },
                     )),
-                    UpstreamProtocol::Http2 => {
-                        Box::pin(send_upstream_http2(upstream.io, upstream_req))
-                    }
+                    Connected::Http2(sender) => Box::pin(send_on_http2(sender, upstream_req)),
                 };
 
                 // S4.2: a route with a retry policy may additionally set
@@ -641,6 +692,15 @@ impl RouterHandler {
                         return resp;
                     }
                     Err(err) => {
+                        // WP-15 slice A, hazard 2: a send failure on a cached
+                        // h2 sender means it's suspect (e.g. the peer closed
+                        // right as we sent) -- evict it so the next
+                        // request/retry redials rather than risking the same
+                        // now-dead sender again before its `is_closed()`
+                        // catches up.
+                        if let Some(key) = &conn_key {
+                            self.conn_cache.invalidate(key);
+                        }
                         let outcome = AttemptOutcome::from_codec_error(&err);
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome) {
@@ -1050,6 +1110,140 @@ mod tests {
         addr
     }
 
+    /// Test-only executor for the h2 mock upstreams below -- same shape as
+    /// `codec::LocalExec`, needed only on the *server* side of these tests
+    /// (the codec under test supplies its own internally).
+    #[derive(Clone)]
+    struct TestLocalExec;
+
+    impl<F> hyper::rt::Executor<F> for TestLocalExec
+    where
+        F: std::future::Future + 'static,
+    {
+        fn execute(&self, fut: F) {
+            tokio::task::spawn_local(fut);
+        }
+    }
+
+    /// Answer every request on `io` as HTTP/2 with a plain `200 OK`, empty
+    /// body -- the common server-side service the h2 mock upstreams below all
+    /// share.
+    async fn serve_h2_ok_forever(io: tokio::net::TcpStream) {
+        let io = hyper_util::rt::TokioIo::new(io);
+        let service =
+            hyper::service::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
+                // Rust note: no `.map_err` needed here (contrast
+                // `body_with_trailers`'s use of the same `Full`) -- `Full`'s own
+                // `Error` type is `std::convert::Infallible`, which already
+                // implements `std::error::Error`, satisfying hyper's server body
+                // bound directly.
+                Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+            });
+        let _ = hyper::server::conn::http2::Builder::new(TestLocalExec)
+            .serve_connection(io, service)
+            .await;
+    }
+
+    /// A loopback HTTP/2 upstream that accepts connections in a loop and
+    /// counts how many it has accepted -- what the WP-15 slice A
+    /// connection-reuse tests assert against directly: N requests through a
+    /// warm/reused connection must NOT increment this past 1.
+    async fn spawn_counting_h2_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_clone = accepted.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (io, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::task::spawn_local(serve_h2_ok_forever(io));
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// Like [`spawn_counting_h2_upstream`], but its FIRST connection dies the
+    /// moment the returned `oneshot::Sender` fires -- simulating an
+    /// upstream-initiated close (GOAWAY, or the peer just hanging up)
+    /// mid-life rather than a graceful one. Every connection after the first
+    /// is served normally, forever, so a redial following the kill succeeds.
+    async fn spawn_killable_h2_upstream() -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        oneshot::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_clone = accepted.clone();
+        let (kill_tx, kill_rx) = oneshot::channel::<()>();
+
+        tokio::task::spawn_local(async move {
+            let (io, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let conn_task = tokio::task::spawn_local(serve_h2_ok_forever(io));
+            // Wait for the test to say "the first response was received",
+            // then kill this connection out from under the client -- proving
+            // the NEXT request has to notice (`is_closed()`) and redial
+            // rather than hang or fail against a dead sender.
+            let _ = kill_rx.await;
+            conn_task.abort();
+
+            loop {
+                let (io, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::task::spawn_local(serve_h2_ok_forever(io));
+            }
+        });
+
+        (addr, accepted, kill_tx)
+    }
+
+    /// Like [`spawn_upstream_answers_ok_repeatedly`], but counts how many TCP
+    /// connections it has accepted -- what `h1_stays_connect_per_stream`
+    /// asserts against to prove slice A's h2 cache didn't accidentally start
+    /// reusing h1 connections too.
+    async fn spawn_counting_h1_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_clone = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
     /// Build a one-cluster, one-route `RouterHandler` forwarding to `addr`
     /// under cluster name `"up"`.
     /// ADR-0004 step 3: `RouterHandler` is no longer a `StreamHandler` on its
@@ -1096,6 +1290,71 @@ mod tests {
                 per_connection_buffer_limit_bytes: 1 << 20,
                 circuit_breakers,
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+                request_headers_to_add: Vec::new(),
+            }),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+
+        let route_table = RouteTable::new(
+            "test-routes".to_string(),
+            vec![VirtualHostIR {
+                name: "vh".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![Arc::new(RouteEntry {
+                    name: None,
+                    matcher,
+                    action: RouteActionIR::Forward(fwd),
+                    request_headers_to_add: Vec::new(),
+                    typed_per_filter_config: BTreeMap::new(),
+                    route_index: 0,
+                })],
+                typed_per_filter_config: BTreeMap::new(),
+            }],
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RouterFilterFactory::new(Arc::new(manager)));
+        FilterChainHandler::new(
+            Vec::new(),
+            terminal_factory,
+            Arc::new(route_table),
+            false,
+            false,
+            0,
+        )
+    }
+
+    /// Like [`build_router`], but the cluster's `upstream_protocol` is
+    /// HTTP/2 -- lets the WP-15 slice A connection-reuse tests exercise the
+    /// real `RouterHandler` -> `UpstreamConnCache` path end to end, instead
+    /// of poking the cache directly.
+    async fn build_router_h2(
+        addr: SocketAddr,
+        matcher: RouteMatcher,
+        fwd: ForwardAction,
+    ) -> FilterChainHandler {
+        let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+        let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
+        snapshot.insert(
+            "up".to_string(),
+            Arc::new(ClusterConfig {
+                name: "up".to_string(),
+                discovery: DiscoveryType::Static,
+                lb_policy: LbPolicy::RoundRobin,
+                connect_timeout: Duration::from_secs(5),
+                endpoints: vec![EndpointIR {
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                    weight: 1,
+                    priority: 0,
+                }],
+                kind: ClusterKind::Endpoints,
+                transport_socket: None,
+                per_connection_buffer_limit_bytes: 1 << 20,
+                circuit_breakers: CircuitBreakers::default(),
+                upstream_protocol: proxy_config::ir::UpstreamProtocol::Http2,
                 request_headers_to_add: Vec::new(),
             }),
         );
@@ -1658,6 +1917,123 @@ mod tests {
                     "the rewrite + clear_route_cache() must steer the terminal \
                      onto route /b (status 202), not the originally-matched \
                      route /a (status 201)"
+                );
+            })
+            .await;
+    }
+
+    // ------------------------------------------- WP-15 slice A: h2 reuse --
+
+    /// The point of the whole slice: N concurrent h2 requests to one cluster
+    /// must open exactly ONE TCP connection, not N. `join_all` drives all N
+    /// `router.handle()` futures concurrently (each yields at a real network
+    /// `.await`, exactly like N real concurrent connections would), so
+    /// without the `UpstreamConnCache` single-flight dial coordination this
+    /// would open N connections instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_h2_requests_to_one_cluster_share_one_connection() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_counting_h2_upstream().await;
+                let router =
+                    build_router_h2(addr, prefix_matcher("/"), forward_to_up(None, None, None))
+                        .await;
+
+                const N: usize = 8;
+                let responses =
+                    futures::future::join_all((0..N).map(|_| router.handle(request("/")))).await;
+                for resp in responses {
+                    assert_eq!(resp.head.status, StatusCode::OK);
+                }
+
+                assert_eq!(
+                    accepted.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "{N} concurrent h2 requests to one cluster must open exactly one TCP connection"
+                );
+            })
+            .await;
+    }
+
+    /// A second, *sequential* request reuses the first request's connection
+    /// -- the simpler, non-racy half of the reuse property above.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_sequential_h2_request_reuses_the_first_connection() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_counting_h2_upstream().await;
+                let router =
+                    build_router_h2(addr, prefix_matcher("/"), forward_to_up(None, None, None))
+                        .await;
+
+                let resp1 = router.handle(request("/")).await;
+                assert_eq!(resp1.head.status, StatusCode::OK);
+                let resp2 = router.handle(request("/")).await;
+                assert_eq!(resp2.head.status, StatusCode::OK);
+
+                assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    /// Hazard 3: the upstream closing the connection out from under a cached
+    /// sender must not wedge the router -- the next request has to notice
+    /// (`is_closed()`) and transparently redial, not fail or hang.
+    #[tokio::test(flavor = "current_thread")]
+    async fn upstream_close_triggers_a_redial_on_the_next_request() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted, kill_tx) = spawn_killable_h2_upstream().await;
+                let router =
+                    build_router_h2(addr, prefix_matcher("/"), forward_to_up(None, None, None))
+                        .await;
+
+                let resp1 = router.handle(request("/")).await;
+                assert_eq!(resp1.head.status, StatusCode::OK);
+                assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+                kill_tx.send(()).expect("upstream task still alive");
+                // Give the abort, and this (single-threaded) LocalSet's
+                // client-side connection-driving task, a chance to actually
+                // run and notice the close before the next request checks
+                // `is_closed()` -- otherwise this test would be racing hyper's
+                // internal bookkeeping instead of exercising it.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                let resp2 = router.handle(request("/")).await;
+                assert_eq!(
+                    resp2.head.status,
+                    StatusCode::OK,
+                    "must succeed by redialing, not fail against the dead sender"
+                );
+                assert_eq!(
+                    accepted.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "the redial must open a second TCP connection"
+                );
+            })
+            .await;
+    }
+
+    /// h1 is unchanged by this slice: an h1 cluster still opens one
+    /// connection per request (`build_router`'s default cluster is h1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn h1_stays_connect_per_stream() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_counting_h1_upstream().await;
+                let router =
+                    build_router(addr, prefix_matcher("/"), forward_to_up(None, None, None)).await;
+
+                let resp1 = router.handle(request("/")).await;
+                assert_eq!(resp1.head.status, StatusCode::OK);
+                let resp2 = router.handle(request("/")).await;
+                assert_eq!(resp2.head.status, StatusCode::OK);
+
+                assert_eq!(
+                    accepted.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "an h1 cluster must still open one connection per request (no reuse)"
                 );
             })
             .await;
