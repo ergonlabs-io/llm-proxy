@@ -32,6 +32,7 @@ pub mod retry;
 pub mod route;
 pub mod router;
 pub mod stream_info;
+pub mod upstream_pool;
 
 pub use codec::{serve_http1, CodecError, Http1Options};
 pub use filter::{
