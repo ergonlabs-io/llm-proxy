@@ -21,7 +21,7 @@
       "examples": ["0.0.0.0:8080", { "address": "0.0.0.0:8443", "tls": { "cert_file": "/etc/llmproxy/tls.crt", "key_file": "/etc/llmproxy/tls.key" } }]
     },
     "admin": {
-      "description": "Admin/observability endpoint (`/ready`, `/stats/prometheus`, `/config_dump`). Disabled when omitted. Bind to loopback unless you know why not.",
+      "description": "Admin/observability endpoint (`/ready`, `/config_dump`, `/clusters`, `/server_info`, `/stats`). `/stats` renders Envoy's text format. Disabled when omitted. Bind to loopback unless you know why not.",
       "$ref": "#/$defs/HostPort",
       "examples": ["127.0.0.1:9901"]
     },
@@ -64,7 +64,7 @@
       "items": { "$ref": "#/$defs/Limit" }
     },
     "observability": {
-      "description": "Metrics and access logging. Prometheus metrics (including token counters, TTFT/TPOT histograms, per-model dimensions) are always computed and exposed on the admin endpoint when `admin` is configured.",
+      "description": "Metrics and access logging. Access logging is fully implemented, including token counts and TTFT/TPOT. Metrics are NOT yet recorded: the registry and the `/stats` renderer exist, but no call site writes to them, so `/stats` answers 200 with an empty body until WP-23 increment 6 lands. Do not build alerting on it yet.",
       "$ref": "#/$defs/Observability"
     }
   },
@@ -108,7 +108,7 @@
       "properties": {
         "address": { "$ref": "#/$defs/HostPort" },
         "tls": {
-          "description": "Terminate TLS for client connections. Certificate files are watched and hot-reloaded on change — no restart needed for renewal.",
+          "description": "Terminate TLS for client connections. Certificate files are read once at startup; a renewed certificate needs a restart to be served. The hot-swap mechanism exists internally but nothing watches the files yet, so do not plan renewal around it.",
           "type": "object",
           "additionalProperties": false,
           "required": ["cert_file", "key_file"],
@@ -198,7 +198,7 @@
         },
         "api_key_file": {
           "type": "string",
-          "description": "Read the API key from this file (trailing whitespace trimmed; watched and hot-reloaded). Preferred over `api_key` for secret managers that mount files."
+          "description": "Read the API key from this file (trailing whitespace trimmed; read once at startup -- hot reload lands with WP-35). Preferred over `api_key` for secret managers that mount files."
         },
         "extra_headers": {
           "type": "object",
