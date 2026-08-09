@@ -449,6 +449,13 @@ work_packages:
     semconv names — and Envoy's flat dotted /stats names become a RENDERING of the registry,
     not its own shape (attributes are strictly more expressive; recovering them from a flat
     mangled name is the harder direction). See WP-51, which this decision was made for
+  - >-
+    ✓ DESIGN BRIEF landed 2026-08-08 (83c778f, docs/wp-23-stats-design-brief.md) — hot path
+    increments an opaque Handle (index), never a name, so no attribute-set hashing on the
+    request path; stats explicitly NOT ADR-0005's distributed case (a budget must be shared
+    across replicas or the quota multiplies, a stat must NOT be, or the TSDB double-counts) —
+    this WP owes the trait-shaped exporter seam, not a shared store. Design only: no registry
+    code yet, still blocked on WP-06
 - id: 24
   prio: P1
   ms: v0.0.1
@@ -964,7 +971,7 @@ work_packages:
   lane: H
   size: M
   gate: G5
-  status: ready
+  status: started
   title: Vendored Lane-H filter proto
   meta:
   - proxy-api · proxy-filters
@@ -979,6 +986,15 @@ work_packages:
     each filter's own module doc independently predicts a vendored proto is the real answer;
     the token_limit reuse is already documented as "visibly stretched"
   - 'blocks: per-descriptor budget config (WP-34), and any filter needing a 4th config shape'
+  - >-
+    ✓ INCREMENT 1 landed 2026-08-08 (4171c8d) — llmproxy/filters/v0/auth.proto, the FIRST config
+    message this project defines rather than borrows, compiled into the descriptor pool and
+    parsed by llmproxy.auth (WP-50). Scoped down to the vendoring itself: it could not have
+    borrowed anything, since Authentication's config is a repeated structured record (key id,
+    tenant, digest, revoked) that no compiled Envoy message shapes
+  - >-
+    ▲ the three PRE-EXISTING borrows (usage, body_rewrite, token_limit) are UNTOUCHED — migrating
+    them is still this WP's open work; increment 1 only stopped the count going to five
   note: >-
     ▲ the failure mode is not aesthetic — the next filter has to stretch a 4th unrelated
     message, and a reader cannot tell config INTENT from a borrowed message name
@@ -1076,6 +1092,27 @@ work_packages:
     ⚠ it also disarmed the WP-39 readership guard: rendering an IR field for DISPLAY is not
     ACTING on it, so proxy-admin was removed from RUNTIME_CRATES. Any future crate that
     reflects over the IR needs the same exclusion
+  - >-
+    ✓ INCREMENT 2a DONE 2026-08-08 (cb1c066, 120ad78, 0dfe3a1, f4efd48 + design brief 9dc3ad0) —
+    Authenticator trait + AuthenticatorChain + Principal; VirtualKeyAuthenticator verifying keyed
+    HMAC-SHA-256 in constant time; llmproxy.auth filter (WP-47's new proto) enforcing under
+    strict mode, fails CLOSED; identity on StreamInfo::auth; WP-34's token limiter RE-KEYED onto
+    it (mutation-verified: reverting the read to None lets a caller reset its own budget); an
+    `auth:` block in the dialect; `llm-proxy --mode keygen`
+  - >-
+    ⚑ this is what closed v0.1.0's rate-limit gate clause — WP-34 previously bucketed on
+    hash_credential(<client's own Authorization header>), which nothing verified, so any caller
+    could get a fresh quota by changing one string. Not planned as v0.1.0 scope; became the
+    precondition once that gap was found
+  - >-
+    ▲ filter ORDER is now a config-load-time security check: llmproxy.auth configured AFTER
+    llmproxy.token_limit silently drops back to the unauthenticated hashed-header bucket, and
+    check_lane_h_filter_order now rejects it
+  - >-
+    not built, deliberately: the ArcSwap snapshot. With keys coming only from config there is
+    nothing to refresh yet — earns its place in inc 2b, when a CredentialStore starts
+    publishing new snapshots underneath a running proxy
+  - 'remaining: inc 2b (persistent/shared key store — keys are in-memory + config-only today), 2c (OIDC), inc 3 (tenants/budgets/admin CRUD)'
   note: >-
     ⚑ closes a real hole: WP-34 enforces budgets keyed on a hashed credential that NOTHING can
     register, attach to a team, rotate or revoke. Two hazards recorded — do NOT reuse

@@ -185,7 +185,7 @@
 </style>
 
 <div class="wrap">
-  <p class="eyebrow">llm-proxy · release tracking · 52 work packages · 968 tests green, 21 skipped (cargo nextest, workspace) + black-box QA suite (10 cases) · 2026-08-08</p>
+  <p class="eyebrow">llm-proxy · release tracking · 52 work packages · 1045 tests green, 24 skipped (cargo nextest, workspace) + black-box QA suite (10 cases) · 2026-08-08</p>
   <h1>Release tracker</h1>
   <p class="lede">
     Six releases, each with exactly one <strong>ship gate</strong>: a single objectively checkable
@@ -254,10 +254,11 @@
  {
   "v": "v0.1.0",
   "name": "LLM gateway",
-  "state": "current",
-  "when": "in progress",
+  "state": "shipped",
+  "when": "2026-08-08",
   "theme": "The reason this project exists — be a gateway a team chooses <em>because</em> it understands LLM traffic.",
   "gate": "Per-request token counts (input / cache-read / cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate limit is enforced; and the proxy fails over from one provider to another without the client seeing an error.",
+  "verify": "All three clauses verified end to end against the real binary over real sockets — <b>against mock upstreams, not real providers.</b> Token counts + TTFT/TPOT: QA-1 and QA-10. Provider failover: <code>testing/diffrig/tests/failover_e2e.rs</code>. Token rate limiting: <code>testing/diffrig/tests/auth_e2e.rs</code>. Unlike v0.0.1 (a manual live run against real OpenAI and Anthropic endpoints, executed and recorded), this release was tagged <b>without</b> running its live-provider drill. That drill exists — one command, three billable calls — and is deliberately not yet run: <code>OPENAI_API_KEY=sk-… cargo test -p diffrig --test live_gate_v0_1_0 -- --ignored</code>. Recorded as a departure from the v0.0.1 standard in <code>docs/MILESTONES.md</code>, not folded into the gate text.",
   "done": 4,
   "open": 5,
   "left": [
@@ -283,11 +284,11 @@
    },
    {
     "wp": "WP-47",
-    "what": "Vendored Lane-H filter proto. Not started. Three filters currently reuse unrelated Envoy messages for typed_config (a borrowed <code>RateLimitSettings</code> for token-limit config is already documented as \"visibly stretched\") — blocks per-descriptor rate-limit config beyond a single (route, credential) bucket."
+    "what": "<b>Increment 1 landed 2026-08-08 (4171c8d) — the vendoring itself, not the migration.</b> <code>llmproxy/filters/v0/auth.proto</code> is the first config message this project defines rather than borrows, compiled into the descriptor pool and parsed by <code>llmproxy.auth</code> (WP-50). <b>The three pre-existing filters (usage, body_rewrite, token_limit) still borrow unrelated Envoy messages for their <code>typed_config</code> and are untouched</b> — migrating them is still this WP's open work; this increment only stopped a fourth borrow from being needed."
    },
    {
     "wp": "WP-34",
-    "what": "<b>Token rate limits — now the ONLY unverified v0.1.0 gate clause (2026-08-08).</b> Extraction is done; the enforcement filter is built and live (429 + <code>x-ratelimit-*</code>, mutation-tested at the unit level); the dialect's <code>limits</code> key lowers to it. But nothing drives the real binary end to end against a real 429-on-limit-exceeded the way WP-35's failover drill or QA-10 now do for the other two clauses — the owner explicitly deferred this verification this session. <b>Remaining, in priority order:</b> an end-to-end drill (QA-11-style, or a diffrig test) proving enforcement against the real binary; then per-descriptor config beyond a single (route, credential) bucket, blocked on WP-47."
+    "what": "<b>Verified end to end 2026-08-08 (<code>testing/diffrig/tests/auth_e2e.rs::two_virtual_keys_on_the_same_tenant_share_one_token_budget</code>), and the correction matters more than the pass.</b> The limiter itself was built earlier and looked sufficient — 429 + <code>x-ratelimit-*</code>, mutation-tested at the unit level — but it bucketed on <code>hash_credential(&lt;the client's own Authorization header&gt;)</code>, which nothing verified: a caller who exhausted their quota could change one string and get a fresh one. WP-50 increment 2a re-keyed it onto <code>Principal.tenant</code>, an identity the proxy itself assigns, which is what makes the drill mean something. Mutation-checked: reverting the tenant read turns a 429 into a 200. <b>Remaining, not gate-blocking:</b> per-descriptor config beyond a single (route, credential) bucket, blocked on WP-47's filter migration."
    },
    {
     "wp": "WP-33",
@@ -298,16 +299,17 @@
     "what": "Hedging, S5.2 retry budgets, previously-attempted-host predicate. WP-35's failover shipped on this engine as already built — 429-as-retriable and never-retry-after-first-byte needed no new mechanism here."
    }
   ],
-  "risk": "<b>Two of the three gate clauses moved from code-complete to verified this pass (2026-08-08); the third — token-based rate limiting — did not, and that is now the only thing between this release and a defensible ship.</b> Token counts + TTFT/TPOT reaching the access log: closed (WP-33 + WP-45 + WP-46) AND verified — QA-1 has given real black-box evidence for the token-count half since 2026-08-01, and new QA-10 (<code>make qa</code> green x3) now does the same for TTFT/TPOT, catching a live over-count bug in <code>%LLM_RESPONSE_CHUNKS%</code> in the process. <b>Provider failover</b> (WP-35 increments 2a/2b-i/2b-ii/2c, landed 2026-08-07/08) is now ALSO verified — <code>testing/diffrig/tests/failover_e2e.rs</code> drives the real binary against a real dialect config and a mock forced to 429, with attempt accounting, the credential-isolation negative, and the standby's own Host header all mutation-tested. <b>Token-based rate limiting is the one clause left with no end-to-end evidence.</b> WP-34's filter enforces 429s from the dialect's <code>limits</code> key and is mutation-tested at the unit level, but nothing drives the real binary against a real over-limit request the way the other two clauses now do — the owner explicitly deferred this verification this session. v0.0.1 did not ship on code-complete: it shipped on a live smoke run against real OpenAI and Anthropic endpoints, actually executed and recorded. This release needs the rate-limit equivalent of that run (or a QA-11-style scenario / diffrig drill) before it can flip to <code>shipped</code>. <b>Judgment call, stated plainly:</b> holding this release at <code>current</code> rather than flipping it to <code>shipped</code> is this document's call, not something the gate text forces by itself — recorded here so it can be argued with, and it now rests on one clause instead of three. <b>WP-35's own scope closed narrower than its title suggests:</b> same-dialect fallback only. Cross-dialect (openai → anthropic) is a deliberate hard error at config time, not silently unsupported — the translation work it would need is real and un-started, and is now WP-52 (v1.0.0), not a loose end inside this WP. <b>Second risk, named 2026-08-01, unchanged:</b> the LLM layer is stacking on <em>serving</em> foundations that are not finished — no connection pooling (WP-15, still connect-per-stream), no downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure (WP-11). None of those three are exercised by the tests that closed this gate's clauses, and all three bite under concurrency, sustained streams, or a slow consumer. <b>Third risk, unchanged:</b> the workspace suite (968 tests, <code>cargo nextest</code>, +3 this pass for the failover drill, not directly comparable to the prior <code>cargo test</code> counts) had 8 tests in <code>diffrig</code> intermittently hanging rather than merely slow, inflating full-run times 656–863s against a healthy ~79s. Mitigated to 2 slow tests via a multi-threaded runtime plus a <code>terminate-after</code> gate that turns a hang into a named failure — not fixed: those tests still carry no request timeouts."
+  "risk": "<b>Shipped 2026-08-08 with all three gate clauses verified end to end — against mock upstreams, not real providers, and that is the residual caveat, not a footnote.</b> Token counts + TTFT/TPOT: closed and verified since 2026-08-08 (QA-1, QA-10). Provider failover: verified by <code>testing/diffrig/tests/failover_e2e.rs</code> against a mock forced to 429. Token-based rate limiting: verified last, on the same day, by <code>testing/diffrig/tests/auth_e2e.rs</code> — and only <em>became</em> verifiable once WP-50 increment 2a gave the limiter a proxy-assigned identity to key on; before that, the obvious drill would have measured a client against a bucket it was free to abandon by changing its own header. <b>v0.0.1 shipped on a manual live run against real OpenAI and Anthropic endpoints, executed and recorded; this release did not.</b> The live drill exists (<code>testing/diffrig/tests/live_gate_v0_1_0.rs</code>, one command, three billable calls) and was deliberately not run before tagging — recorded in <code>docs/MILESTONES.md</code> as a departure from the v0.0.1 standard, not a gap that was missed. For failover and rate limiting the mock arguably exercises the failure path better than a real provider would on demand (forcing a 429, exhausting a budget), but that is an argument, not the standard the previous release met. <b>WP-35's own scope closed narrower than its title suggests:</b> same-dialect fallback only. Cross-dialect (openai → anthropic) is a deliberate hard error at config time, not silently unsupported — the translation work it would need is real and un-started, and is now WP-52 (v1.0.0), not a loose end inside this WP. <b>Second risk, named 2026-08-01, unchanged:</b> the LLM layer is stacking on <em>serving</em> foundations that are not finished — no connection pooling (WP-15, still connect-per-stream), no downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure (WP-11). None of those three are exercised by the tests that closed this gate's clauses, and all three bite under concurrency, sustained streams, or a slow consumer. <b>Third risk, updated 2026-08-08:</b> the workspace suite is <b>1045 tests green, 24 skipped</b> (<code>cargo nextest</code>, a real re-run, not carried forward — up from 968/21 at the last refresh, which this batch's volume of landed work explains). The <code>diffrig</code> hang mitigation (multi-threaded runtime + <code>terminate-after</code>) holds; the underlying tests still carry no request timeouts, unchanged. <b>Fourth, closed this pass:</b> the <code>cli.rs</code> drain test once suspected flaky-on-timing was root-caused as a fixed-port collision (<code>f5f6fc9</code>) and given its own ephemeral port — 12/12 clean re-runs, and 3/3 with both old fixed ports deliberately held by another process."
  },
  {
   "v": "v0.2.0",
   "name": "Production-ready serving",
-  "state": "later",
+  "state": "current",
+  "when": "in progress",
   "theme": "Stop claiming “performant” without evidence, and be safe to run unattended.",
   "gate": "A published capacity report (p99, tokens/sec ceiling, RSS under sustained long-lived streams) from a run that is <em>not</em> harness-bound, plus <code>/config_dump</code> and <code>/stats</code> served by the admin endpoint, plus a config swap under live traffic with zero dropped streams.",
   "done": 0,
-  "open": 7,
+  "open": 8,
   "left": [
    {
     "wp": "WP-30",
@@ -315,11 +317,11 @@
    },
    {
     "wp": "WP-23",
-    "what": "Stats registry with Envoy names — also owns the two inert <code>stat_prefix</code> fields the readership guard flags."
+    "what": "Stats registry with Envoy names — also owns the two inert <code>stat_prefix</code> fields the readership guard flags. <b>Design brief landed 2026-08-08 (<code>docs/wp-23-stats-design-brief.md</code>, commit 83c778f)</b> — OTel-native model, hot path increments an index not a name, stats explicitly NOT ADR-0005's distributed case (each replica reports its own; pre-aggregating would break <code>rate()</code> on restart). Design only — no registry code yet, and it still needs WP-06."
    },
    {
     "wp": "WP-50",
-    "what": "<b>Operator control plane — absorbs the old WP-25 slot.</b> Increment 1 landed 2026-08-02 (9df7deb): <code>/ready</code>, <code>/config_dump</code>, <code>/clusters</code>, <code>/server_info</code>, all on the control runtime, with <code>/config_dump</code> redaction structural (the dump type has no field that can hold a live credential) rather than a filter someone could forget to call. <code>/stats</code> 404s naming WP-23 rather than faking an empty 200 — so half this gate's admin clause is real, the other half is still WP-23. <b>Remaining:</b> increment 2 (virtual keys, auth) and increment 3 (tenants/budgets)."
+    "what": "<b>Operator control plane — absorbs the old WP-25 slot.</b> Increment 1 (2026-08-02, 9df7deb): <code>/ready</code>, <code>/config_dump</code>, <code>/clusters</code>, <code>/server_info</code>, with <code>/config_dump</code> redaction structural (the dump type has no field that can hold a live credential). <code>/stats</code> still 404s naming WP-23 rather than faking an empty 200 — so this gate's admin clause is half real, half still WP-23. <b>Increment 2a landed 2026-08-08</b> (downstream authentication: proxy-issued virtual keys, keyed HMAC-SHA-256 verified in constant time, fail-closed, an <code>Authenticator</code> trait chain so OIDC lands later without reshaping anything, an <code>auth:</code> dialect block, <code>llm-proxy --mode keygen</code>) — this is what let WP-34's token limit re-key onto a proxy-assigned identity and become the v0.1.0 gate's last verified clause. <b>Remaining: increment 2b (persistent/shared key store — keys are in-memory and config-only today), 2c (OIDC), and increment 3 (tenants, per-tenant model allow-lists, budgets, spend history, admin CRUD).</b>"
    },
    {
     "wp": "WP-18",
@@ -336,9 +338,13 @@
    {
     "wp": "WP-42",
     "what": "<b>Spend controls & budgets.</b> New from the 2026-08-01 competitive review — and <i>not</i> WP-34's token rate limits: a tokens/minute cap is a throttle, not a budget. Nothing else in the plan says \"this key may spend $X, then stop.\""
+   },
+   {
+    "wp": "WP-51",
+    "what": "OpenTelemetry (traces, metrics, semconv naming). Scheduled 2026-08-03, not started — the naming decision it forced is why WP-23's registry above is OTel-native rather than Envoy-first."
    }
   ],
-  "risk": "The loadgen Linux <code>/proc</code> sampler is written to spec but unverified — there is no Linux box in the loop. That is a blocker for this gate, not a footnote."
+  "risk": "<b>Now the current milestone (v0.1.0 shipped 2026-08-08); stated honestly, each gate clause is at a different stage, and none is closed.</b> <code>/config_dump</code> works today (redaction is structural, not a filter that can be forgotten). <code>/stats</code> returns a 404 that explicitly names the reason — <code>\"not implemented yet (WP-23: stats registry); this proxy does not fake an empty /stats\"</code> — rather than a silently-empty 200. The capacity report has no ceiling published yet (WP-30 phases 1+2 only). The config-swap-under-load clause has no evidence either way. <b>The loadgen Linux <code>/proc</code> sampler is written to spec but unverified — there is no Linux box in the loop.</b> That is a blocker for this gate, not a footnote. <b>One named gap closed, worth recording since <code>docs/MILESTONES.md</code> carried it as open:</b> the drain test (<code>sigterm_drains_then_exits_cleanly</code>) suspected flaky-on-timing was root-caused 2026-08-08 as a fixed-port collision, not a timing bug — fixed by giving it its own ephemeral port (<code>f5f6fc9</code>), verified 12/12 clean re-runs plus 3/3 with both old fixed ports deliberately held by another process."
  },
  {
   "v": "v0.3.0",
@@ -415,7 +421,7 @@
   "theme": "The complete inference-gateway surface, on a proven parity base.",
   "gate": "Gateway API Inference Extension (EPP) support and realtime WebSocket sessions both serving, on top of a green parity scorecard.",
   "done": 0,
-  "open": 4,
+  "open": 5,
   "left": [
    {
     "wp": "WP-36",
@@ -424,6 +430,10 @@
    {
     "wp": "WP-37",
     "what": "Realtime WebSocket sessions — needs S10 upgrade support from v0.4.0."
+   },
+   {
+    "wp": "WP-52",
+    "what": "<b>Cross-dialect provider fallback.</b> Split out of WP-35 on 2026-08-08 — same-dialect fallback shipped in v0.1.0; an openai-shaped route falling back to an anthropic one is a hard config-time error today, not silently accepted. Needs WP-35 (done, the mechanism this reuses), WP-45 (the bounded-buffer body pipeline, a possible substrate), and WP-49 (the provider-type distinction, not just the cluster name)."
    },
    {
     "wp": "WP-43",

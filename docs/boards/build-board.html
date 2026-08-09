@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 968 tests green, 21 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 1045 tests green, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -189,60 +189,76 @@
     <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
   </div>
   <p class="now">
-    <b>Now — v0.1.0 "LLM gateway": be the gateway a team picks <i>because</i> it understands
-    LLM traffic.</b>
-    <b>v0.0.1 shipped 2026-08-01</b> and is tagged: the live smoke test ran against the real
-    OpenAI and Anthropic endpoints and passed all four cases (both providers, streaming and not)
-    on the first attempt. One request, all the way through, for real — that gate is closed.
-    <span class="gate"><b>SHIP GATE —</b> per-request token counts (input / cache-read /
+    <b>Now — v0.2.0 "production-ready serving": stop claiming "performant" without evidence, and
+    be safe to run unattended.</b>
+    <b>v0.1.0 "LLM gateway" shipped 2026-08-08</b> and is tagged. <b>v0.0.1 shipped 2026-08-01</b>:
+    the live smoke test ran against the real OpenAI and Anthropic endpoints and passed all four
+    cases (both providers, streaming and not) on the first attempt.
+    <span class="gate"><b>v0.1.0's SHIP GATE —</b> per-request token counts (input / cache-read /
     cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate
     limit is enforced; and the proxy fails over from one provider to another mid-request without
-    the client seeing an error. <b>Two of three clauses are now VERIFIED end to end, not just
-    code-complete (2026-08-08).</b> Token counts + TTFT/TPOT: QA-1 backs the token-count half with
-    real black-box evidence since 2026-08-01, and new QA-10 now does the same for TTFT/TPOT —
-    against a mock with known pacing it observed ttft=402ms/tpot=122.129ms/max_stall=152ms in the
-    actual access log, and in writing that test found a real bug (the dialect never emitted TPOT
-    at all despite WP-46 building it, now fixed) plus a live off-by-one in
-    <code>%LLM_RESPONSE_CHUNKS%</code>, also fixed. Provider failover (WP-35): a new
-    <code>testing/diffrig</code> drill drives the real binary against a real dialect config and a
-    mock forced to 429 — exact attempt accounting, the credential-isolation negative (standby's key
-    only), and the standby's own Host header, all mutation-tested. <b>Token-based rate limiting is
-    the one clause left unverified</b> — WP-34's filter enforces 429s from the dialect's
-    <code>limits</code> key and is unit-mutation-tested, but nothing drives it end to end against
-    the real binary yet; the owner explicitly deferred that this session, so this release stays
-    <code>current</code> on that one clause alone. WP-35's scope closed narrower than its title:
+    the client seeing an error. <b>All three clauses verified end to end, against mock upstreams —
+    not against real providers.</b> Token counts + TTFT/TPOT: QA-1 and QA-10, against a mock with
+    known pacing (observed ttft=402ms/tpot=122.129ms/max_stall=152ms in the actual access log).
+    Provider failover (WP-35): <code>testing/diffrig/tests/failover_e2e.rs</code> drives the real
+    binary against a real dialect config and a mock forced to 429 — exact attempt accounting, the
+    credential-isolation negative (standby's key only), and the standby's own Host header, all
+    mutation-tested. Token-based rate limiting: <code>testing/diffrig/tests/auth_e2e.rs</code>,
+    verified last — it could not be verified honestly until WP-50 increment 2a gave the limiter a
+    proxy-assigned identity to key on, since before that a caller could reset its own quota by
+    changing its own <code>Authorization</code> header. <b>Unlike v0.0.1, this release was tagged
+    without running its live-provider drill</b> — it exists
+    (<code>testing/diffrig/tests/live_gate_v0_1_0.rs</code>, one command, three billable calls) and
+    was deliberately not run before tagging; recorded in <code>docs/MILESTONES.md</code> as a named
+    departure, not a gap that was missed. WP-35's scope closed narrower than its title:
     same-dialect fallback only — cross-dialect (openai → anthropic) is a deliberate hard error,
-    split into new WP-52 rather than left as a silent gap.</span>
-    <span class="sub"><b>The honest read:</b> v0.0.1's clean first run is weaker evidence than a
-    run that found something — four requests exercise a narrow path, and nothing there tested
-    load, concurrency, provider error shapes, or long streams. Coverage stays three-tiered
-    (our mocks, a local Ollama, real providers) for exactly that reason.
-    Second standing gap: <b>"performant" is an untested claim</b> (no capacity sweep published; the
-    v0.2.0 gate).
-    <b>WP-41, the black-box QA suite, found four real bugs on day one, and a fifth on 2026-08-08</b>
-    — no dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode
-    too), no response flag on a mid-stream failure, and (via new QA-10) <code>%LLM_RESPONSE_CHUNKS%</code>
-    over-counting by one on every response with a body. All five fixed. One had been
-    <i>described as intended</i> in its own doc comment — the class of defect an inside view cannot see.
-    <b>Competitive review (Vercel AI Gateway)</b> confirmed the plan and added WP-42/43/44:
-    spend controls (a token/min cap is a throttle, not a budget), caching, cost-aware routing.
-    They are managed-only, so self-hosting, Envoy config and xDS stay ours.
-    <b>WP-45 (shipped 2026-08-05):</b> a real upstream showed OpenAI-dialect streaming emits no usage
-    block without <code>stream_options.include_usage</code> — the request-body rewrite pipeline that
-    forces it also absorbed WP-35's model routing, which now reads the model from the request
-    <i>body</i> rather than a client-supplied header. That closed a privilege-escalation surface:
-    a client could otherwise pick its own provider, credential, and budget.
-    <b>Test-suite note (2026-08-08):</b> full workspace runs took 656–863s; they now take
-    <b>50.8s</b> (968 green, zero slow — the 50.8s figure predates the +3 failover-drill tests
-    and has not been re-measured since). Two causes, found in that order. 8 <code>diffrig</code>
-    tests were intermittently <i>hanging</i> rather than merely slow — mitigated to 2 by a
-    multi-threaded runtime plus a <code>terminate-after</code> gate that turns a hang into a
-    named failure; not fixed, those tests still carry no request timeouts. The larger cause was
-    <code>codegen-units = 256</code>: macOS keeps DWARF in the object files, so
-    <code>target/debug/deps</code> held <b>1,013,436 <code>.o</code> files</b> (46 GB). Setting
-    <code>codegen-units = 16</code> took it to 2,834 files / 2.9 GB and cold-build CPU use from
-    0.31 to 4.7 of 8 cores. The measured "memory pressure" was the symptom, not the cause — which
-    is why throttling jobs had measured 42% <i>worse</i>.</span>
+    split into new WP-52 (v1.0.0) rather than left as a silent gap.</span>
+    <span class="gate"><b>v0.2.0's SHIP GATE —</b> a published capacity report (p99, tokens/sec
+    ceiling, RSS under sustained long-lived streams) from a run that is not harness-bound, plus
+    <code>/config_dump</code> and <code>/stats</code> on the admin endpoint, plus a config swap
+    under live traffic with zero dropped streams. <b>Stated honestly, none of the three is closed
+    and each is at a different stage.</b> <code>/config_dump</code> works today (WP-50 increment 1,
+    redaction structural — the dump type has no field that can hold a live credential).
+    <code>/stats</code> still 404s, explicitly naming the reason
+    (<code>"not implemented yet (WP-23: stats registry); this proxy does not fake an empty
+    /stats"</code>) rather than faking an empty 200 — WP-23 got a design brief 2026-08-08
+    (OTel-native model, index-not-name on the hot path) but no registry code yet, and it still
+    needs WP-06. No capacity ceiling is published (WP-30 phases 1+2 only). The config-swap clause
+    has no evidence either way. The loadgen Linux <code>/proc</code> sampler is written to spec but
+    <b>unverified — no Linux box in the loop</b>, and that is a blocker for this gate, not a
+    footnote.</span>
+    <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
+    mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
+    budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
+    that is an argument, not the v0.0.1 standard, which was a manual run against real endpoints,
+    executed and recorded. <b>Second standing risk, unchanged since 2026-08-01:</b> the LLM layer
+    stacks on serving foundations that are not finished — no connection pooling (WP-15, still
+    connect-per-stream), no downstream h2 (WP-10), watermarks aliased to buffering rather than real
+    backpressure (WP-11) — none exercised by the tests that closed v0.1.0's gate.
+    <b>WP-41, the black-box QA suite, found five real bugs across the two milestones</b> — no
+    dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too),
+    no response flag on a mid-stream failure, a JSON-float usage report silently billed as zero
+    (WP-48), and <code>%LLM_RESPONSE_CHUNKS%</code> over-counting by one on every response with a
+    body. All five fixed; one had been <i>described as intended</i> in its own doc comment — the
+    class of defect an inside view cannot see.
+    <b>WP-50 increment 2a (downstream authentication, 2026-08-08)</b> was not planned v0.1.0 scope —
+    it became the precondition once the rate-limit clause turned out to be advisory by
+    construction. Proxy-issued virtual keys, keyed HMAC-SHA-256 verified in constant time, fail
+    closed, an <code>Authenticator</code> trait chain so OIDC lands later without reshaping
+    anything above it. Increments 2b (persistent key store), 2c (OIDC), and 3
+    (tenants/budgets/admin CRUD) remain, as does WP-47's migration of the three pre-existing
+    borrowed-message filters — only increment 1, the vendored <code>auth.proto</code> itself,
+    landed alongside 2a.
+    <b>Test-suite note, re-measured 2026-08-08:</b> full workspace run is <b>18.3s</b>, 1045 tests
+    green, 24 skipped, zero slow — a real re-run, not carried forward from the 968/21 count at the
+    last refresh (this batch's volume of landed work explains the jump). The <code>cli.rs</code>
+    drain test once suspected of a "200x slowdown" and separately flagged flaky-on-timing was
+    root-caused 2026-08-08 as a fixed-port collision — the readiness fence connected to whatever
+    else was squatting on <code>:10000</code> and reported ready, then failed three screens later
+    at the drain assertion. Fixed by giving it its own ephemeral port; 12/12 clean re-runs, 3/3 with
+    both old fixed ports deliberately held by another process. The <code>diffrig</code> hang
+    mitigation (multi-threaded runtime + <code>terminate-after</code>) holds; those tests still
+    carry no request timeouts, unchanged.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
@@ -264,7 +280,7 @@
     { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
   ];
 
-  const CURRENT_MS = "v0.1.0";
+  const CURRENT_MS = "v0.2.0";
 
   // status: done | ready | started | blocked ; ms = the release the WP closes in
   const wps = [
@@ -696,7 +712,8 @@
    "proxy-observability",
    "needs 06",
    "owns the two inert stat_prefix fields flagged by the WP-39 guard",
-   "OWNER 2026-08-03: the internal model is OTel now — instruments + attribute sets + semconv names — and Envoy's flat dotted /stats names become a RENDERING of the registry, not its own shape (attributes are strictly more expressive; recovering them from a flat mangled name is the harder direction). See WP-51, which this decision was made for"
+   "OWNER 2026-08-03: the internal model is OTel now — instruments + attribute sets + semconv names — and Envoy's flat dotted /stats names become a RENDERING of the registry, not its own shape (attributes are strictly more expressive; recovering them from a flat mangled name is the harder direction). See WP-51, which this decision was made for",
+   "✓ DESIGN BRIEF landed 2026-08-08 (83c778f, docs/wp-23-stats-design-brief.md) — hot path increments an opaque Handle (index), never a name, so no attribute-set hashing on the request path; stats explicitly NOT ADR-0005's distributed case (a budget must be shared across replicas or the quota multiplies, a stat must NOT be, or the TSDB double-counts) — this WP owes the trait-shaped exporter seam, not a shared store. Design only: no registry code yet, still blocked on WP-06"
   ]
  },
  {
@@ -1069,14 +1086,16 @@
   "lane": "H",
   "size": "M",
   "gate": "G5",
-  "status": "ready",
+  "status": "started",
   "title": "Vendored Lane-H filter proto",
   "meta": [
    "proxy-api · proxy-filters",
    "three Lane-H filters now reuse UNRELATED Envoy messages for their typed_config because FilterRegistry keys on type_url and asserts on duplicates",
    "usage → DataSource(inline_string) · body_rewrite → RuntimeFeatureFlag(default_value + runtime_key) · token_limit → RateLimitSettings(max_tokens + fill_rate), which is really xDS discovery throttling config",
    "each filter's own module doc independently predicts a vendored proto is the real answer; the token_limit reuse is already documented as \"visibly stretched\"",
-   "blocks: per-descriptor budget config (WP-34), and any filter needing a 4th config shape"
+   "blocks: per-descriptor budget config (WP-34), and any filter needing a 4th config shape",
+   "✓ INCREMENT 1 landed 2026-08-08 (4171c8d) — llmproxy/filters/v0/auth.proto, the FIRST config message this project defines rather than borrows, compiled into the descriptor pool and parsed by llmproxy.auth (WP-50). Scoped down to the vendoring itself: it could not have borrowed anything, since Authentication's config is a repeated structured record (key id, tenant, digest, revoked) that no compiled Envoy message shapes",
+   "▲ the three PRE-EXISTING borrows (usage, body_rewrite, token_limit) are UNTOUCHED — migrating them is still this WP's open work; increment 1 only stopped the count going to five"
   ],
   "note": "▲ the failure mode is not aesthetic — the next filter has to stretch a 4th unrelated message, and a reader cannot tell config INTENT from a borrowed message name"
  },
@@ -1137,7 +1156,12 @@
    "state per ADR-0005: embedded (sqlite/sled) default, distributed behind the same trait",
    "✓ INCREMENT 1 DONE 2026-08-02 (9df7deb) — /ready, /config_dump, /clusters, /server_info on the control runtime. /stats 404s naming WP-23 rather than faking an empty 200",
    "▲ /config_dump redaction is default-deny AND structural: HeaderMutationDump.value is `&'static str`, so it cannot hold runtime data — leaking needs a type change, not an edit",
-   "⚠ it also disarmed the WP-39 readership guard: rendering an IR field for DISPLAY is not ACTING on it, so proxy-admin was removed from RUNTIME_CRATES. Any future crate that reflects over the IR needs the same exclusion"
+   "⚠ it also disarmed the WP-39 readership guard: rendering an IR field for DISPLAY is not ACTING on it, so proxy-admin was removed from RUNTIME_CRATES. Any future crate that reflects over the IR needs the same exclusion",
+   "✓ INCREMENT 2a DONE 2026-08-08 (cb1c066, 120ad78, 0dfe3a1, f4efd48 + design brief 9dc3ad0) — Authenticator trait + AuthenticatorChain + Principal; VirtualKeyAuthenticator verifying keyed HMAC-SHA-256 in constant time; llmproxy.auth filter (WP-47's new proto) enforcing under strict mode, fails CLOSED; identity on StreamInfo::auth; WP-34's token limiter RE-KEYED onto it (mutation-verified: reverting the read to None lets a caller reset its own budget); an `auth:` block in the dialect; `llm-proxy --mode keygen`",
+   "⚑ this is what closed v0.1.0's rate-limit gate clause — WP-34 previously bucketed on hash_credential(<client's own Authorization header>), which nothing verified, so any caller could get a fresh quota by changing one string. Not planned as v0.1.0 scope; became the precondition once that gap was found",
+   "▲ filter ORDER is now a config-load-time security check: llmproxy.auth configured AFTER llmproxy.token_limit silently drops back to the unauthenticated hashed-header bucket, and check_lane_h_filter_order now rejects it",
+   "not built, deliberately: the ArcSwap snapshot. With keys coming only from config there is nothing to refresh yet — earns its place in inc 2b, when a CredentialStore starts publishing new snapshots underneath a running proxy",
+   "remaining: inc 2b (persistent/shared key store — keys are in-memory + config-only today), 2c (OIDC), inc 3 (tenants/budgets/admin CRUD)"
   ],
   "note": "⚑ closes a real hole: WP-34 enforces budgets keyed on a hashed credential that NOTHING can register, attach to a team, rotate or revoke. Two hazards recorded — do NOT reuse hash_credential (FNV-1a, non-adversarial) for key AUTH; and auth fails CLOSED, the opposite of BudgetStore's fail-open"
  },
