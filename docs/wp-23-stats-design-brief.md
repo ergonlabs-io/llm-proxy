@@ -111,6 +111,47 @@ sits next to the instrument definitions, and **bumping it is a breaking change t
 surface** — for anyone with a dashboard, it is exactly that. It goes in the CHANGELOG under a
 heading that says so.
 
+## Correction, 2026-08-09 — `resolve(&mut self)` cannot survive a config swap
+
+Increment 1 gave `Registry::resolve` a `&mut self` receiver, and Decision 1's write-up
+praised it: the borrow split makes "resolution cannot race an increment" a compiler-checked
+property rather than a comment. That reasoning is sound and the conclusion was still wrong,
+for a reason none of the increment-1 tests could show.
+
+**The registry is shared as `Arc<Registry>` from process start.** Once it is, `&mut self` is
+unobtainable. So handles can be resolved only *before* sharing — at boot — and **a config
+swap that introduces a new cluster can never register its counters.** The new cluster serves
+traffic and reports nothing, silently, forever.
+
+That is not a corner case here. *"A config swap under live traffic with zero dropped
+streams"* is one of v0.2.0's three ship-gate clauses, and `run_listener_manager` already
+rebuilds listeners on `config_ping`. The stats registry would be the one subsystem that
+quietly does not participate.
+
+### The fix, and why it is the shape this project already uses
+
+Resolution must take `&self` and use interior mutability: a mutex around the
+name→handle map and the shard growth, touched **only on the control side at config time**,
+with increments staying lock-free atomics. This is what Envoy itself does.
+
+The one real hazard is growing the shard storage while readers hold `&self` — a `Vec` that
+reallocates moves its elements out from under a concurrent reader. So the shard storage is
+published through **`ArcSwap`**: growth builds a new outer table and swaps it in, readers do
+a lock-free `load`. That is precisely ADR-0005's *"the control side publishes an immutable
+snapshot through `ArcSwap`; workers do a lock-free load"* — the same pattern `ClusterManager`
+uses for host sets and the auth filter uses for key sets, so it is a pattern this codebase
+already reads fluently rather than a new mechanism.
+
+**What is lost by the change, stated honestly:** the compile-time no-race guarantee becomes a
+runtime discipline. It should be replaced by something enforceable rather than by a comment —
+a debug assertion that resolution never runs on a worker thread, or resolution taking a
+control-side handle type that workers do not have.
+
+**Rejected: rebuilding the registry on each swap and copying counter values across.** It
+looks simpler and it loses increments that land between snapshot and swap. For monotonic
+counters that shows up as a dip in `rate()` at every config reload — a metrics bug that would
+be blamed on the traffic rather than on the reload.
+
 ## Increments
 
 - **1 — the registry core.** Instruments, attributes, `Handle` resolution, sharded storage,
@@ -120,9 +161,14 @@ heading that says so.
 - **3 — the Envoy `/stats` text renderer** and the admin wiring that replaces the honest 404.
 - **4 — `/stats/prometheus`**, with Envoy's label-mangling rules, and the Grafana-dashboard
   acceptance test.
-- **5 — instrumentation call sites**: cluster/listener/HTTP counters at the points WP-13/14/15
-  already own. Deliberately last: until increments 1–4 exist, every call site added is a guess
-  about an API that has not been exercised.
+- **5 — the registry lifecycle under config reload** (added 2026-08-09; see the correction
+  above). `resolve(&self)` with control-side interior mutability and `ArcSwap`-published shard
+  storage, so a config swap can register new instruments. **Must land before increment 6**:
+  adding call sites first would bake in the assumption that every handle exists at boot, and
+  every one of them would need revisiting.
+- **6 — instrumentation call sites**: cluster/listener/HTTP counters at the points WP-13/14/15
+  already own. Deliberately last: until the increments above exist, every call site added is a
+  guess about an API that has not been exercised.
 
 ## What this brief does not decide
 
