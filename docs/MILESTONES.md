@@ -383,11 +383,29 @@ do not participate in them. WP-51 is additive, not a defect fix.
 
 - The loadgen Linux `/proc` sampler is written to spec but unverified — no Linux box in
   the loop. That is a blocker for this gate, not a footnote.
-- `sigterm_drains_then_exits_cleanly` (`crates/proxy/tests/cli.rs`) is **flaky on timing**
-  — observed failing once on 2026-07-29, then passing in isolation and on a clean rerun.
-  It guards the drain path this milestone's swap-under-load gate depends on, so it has to
-  be made deterministic before that gate can mean anything. A test that intermittently
-  lies devalues every gate that cites the suite.
+- ~~`sigterm_drains_then_exits_cleanly` (`crates/proxy/tests/cli.rs`) is **flaky on
+  timing**~~ — **closed 2026-08-08, and the diagnosis in this bullet was wrong twice over.**
+
+  The 2026-07-29 timing flake had already been fixed when this bullet was written: the test
+  used to gate readiness on a log line emitted *before* the SIGTERM handler was installed,
+  and was changed to poll the listener socket instead. It was not "flaky on timing" any
+  more. Re-run 12× in isolation on 2026-08-08: 12 passes, 1.14–1.30s, no variance worth the
+  name.
+
+  What *was* still wrong is a different bug, and it was not a timing one. The test loaded
+  `examples/tcp-proxy.yaml`, which binds a fixed `:10000` (and a fixed admin `:9901`).
+  Measured by holding `:10000` from another process: the readiness fence **passed** — it
+  connected to the squatter — and the test then failed at the exit-status assertion, three
+  screens away, implicating the drain path. A fence that reports ready when a *different*
+  process is listening is not a fence; it is a false-negative generator aimed at whatever
+  code runs next, which is exactly how a port collision gets written up as "flaky on
+  timing".
+
+  Fixed by giving the test its own ephemeral port (the swap its sibling
+  `serve_mode_accepts_connections_on_its_listener` already had), verified by re-running with
+  both old fixed ports held: 3/3 pass. The general lesson is the one this document keeps
+  relearning — "intermittent" is a symptom, and naming it as the cause stops the search
+  early.
 
 ---
 

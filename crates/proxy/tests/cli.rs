@@ -134,7 +134,66 @@ fn drain_available_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
 
 #[test]
 fn sigterm_drains_then_exits_cleanly() {
-    let config = repo_root().join("examples/tcp-proxy.yaml");
+    // Reuse the example's SHAPE, not the example file, with an ephemeral port
+    // -- the same swap `serve_mode_accepts_connections_on_its_listener` makes
+    // below, and for a sharper reason here.
+    //
+    // This test used `examples/tcp-proxy.yaml` directly, which binds a fixed
+    // `0.0.0.0:10000` and a fixed admin `127.0.0.1:9901`. Anything else
+    // holding either one -- another `llm-proxy`, a leftover child from an
+    // earlier run, an unrelated service -- broke this test, and **it broke it
+    // in the worst available way**: measured 2026-08-08 by holding :10000
+    // from another process, the readiness fence below PASSED (it connected to
+    // the squatter) and the test then failed much later, at the exit-status
+    // assertion, pointing at the drain path rather than at the port. A fence
+    // that reports ready when a *different* process is listening is not a
+    // fence; it is a false negative generator aimed at whatever code runs
+    // next.
+    //
+    // `free_port()` removes the collision, which also makes the fence mean
+    // what its comment below claims. `.config/nextest.toml` still serializes
+    // this binary; that serialization was added for this fixed port and could
+    // now be relaxed, but that is a separate change with its own risk.
+    let port = free_port();
+    let config_yaml = format!(
+        r#"
+static_resources:
+  listeners:
+    - name: ingress_tcp
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+
+  clusters:
+    - name: backend
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 8081 }}
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 8082 }}
+"#
+    );
+    let config = std::env::temp_dir().join(format!(
+        "llm-proxy-sigterm-drain-test-{}-{}.yaml",
+        std::process::id(),
+        port
+    ));
+    std::fs::write(&config, config_yaml).expect("failed to write temp config");
+
     let mut child = Command::new(BIN)
         .args([
             "-c",
@@ -169,10 +228,10 @@ fn sigterm_drains_then_exits_cleanly() {
     // in every worker, which happens-before `run_serve`'s `wait_for_shutdown_signal`
     // call (see `wait_for_initial_binds` gating it) -- a real readiness fence
     // instead of a log line that can precede it.
-    let ready = wait_for_connectable(("127.0.0.1", 10000), STARTUP_TIMEOUT);
+    let ready = wait_for_connectable(("127.0.0.1", port), STARTUP_TIMEOUT);
     assert!(
         ready,
-        "listener at 127.0.0.1:10000 did not become connectable in time \
+        "listener at 127.0.0.1:{port} did not become connectable in time \
          (stderr so far: {:?})",
         drain_available_lines(&rx)
     );
@@ -190,6 +249,7 @@ fn sigterm_drains_then_exits_cleanly() {
     let exit = child
         .wait_timeout_or_kill(Duration::from_secs(5))
         .expect("llm-proxy did not exit after SIGTERM within timeout");
+    let _ = std::fs::remove_file(&config);
     assert!(
         exit.success(),
         "expected exit 0 after SIGTERM, got {exit:?}"
