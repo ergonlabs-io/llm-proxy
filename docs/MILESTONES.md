@@ -418,10 +418,30 @@ lost with the code that held it: **this clause closes when `/stats` reports real
 which needs increment 5, and increment 4 (`/stats/prometheus` plus the Grafana-dashboard
 conformance test) is what proves the output is Envoy-shaped rather than merely present.
 
-One known unknown to carry into increment 4: **the histogram text line format is
-unverified.** Nothing authoritative for it exists in this repo — the vendored protos cover
-bucket boundaries, not admin-endpoint rendering — so it sits behind one named function,
-labelled as an unconfirmed recollection. The Grafana conformance test is what will settle it.
+~~One known unknown to carry into increment 4: **the histogram text line format is
+unverified.**~~ — **settled 2026-08-09 in increment 4, and increment 3's recollection was
+RIGHT**: `P<n>(interval,cumulative)`, space-joined, confirmed against Envoy's own source.
+
+It was not the Grafana test that settled it, and the route there is worth keeping. Envoy has
+**two** `quantileSummary()` implementations — `HistogramStatisticsImpl`'s (`"P{:g}: {:g}"`,
+joined `", "`) and `ParentHistogramImpl`'s (`"P{:g}({},{})"`, joined `" "`) — and
+`stats_render.cc` renders a `ParentHistogram`, so the admin endpoint calls the second. A
+first pass read only `histogram_impl.cc`, found a real `quantileSummary()` there, concluded
+the pair shape was wrong, rewrote the renderer to the colon form, and relabelled the section
+CONFIRMED with a commit hash. That is strictly worse than the original uncertainty: the
+label moved from unconfirmed to confirmed while the code moved from right to wrong. Caught
+in review by checking which symbol the admin path actually calls. **"Checked against the
+source" is only as good as having checked the right symbol.**
+
+One narrower gap remains, isolated rather than hidden: Envoy formats each number with C++
+`%g`, this renderer uses Rust's round-trip `Display`, and the two can disagree beyond ~6
+significant digits.
+
+**The Grafana conformance test is provisional, for an honest reason:** the Envoy repo
+vendors no Grafana dashboard at all (checked against the full recursive tree, untruncated),
+and the only catalog dashboard found is third-party rather than from the project. The test
+therefore pins the metric families the registry defines and says in its own doc comment that
+it should be replaced, not extended, if an authoritative dashboard appears.
 
 **Named gaps:**
 
