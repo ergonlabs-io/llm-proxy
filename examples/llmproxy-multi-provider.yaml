@@ -1,0 +1,153 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# llm-proxy — three frontier providers behind one endpoint.
+#
+# Run:      llm-proxy --config llmproxy-multi-provider.yaml
+# Inspect:  llm-proxy --config llmproxy-multi-provider.yaml --mode translate
+#           (prints the generated Envoy bootstrap — the dialect is a front-end
+#           over Envoy config, not a separate engine)
+# Check:    llm-proxy --config llmproxy-multi-provider.yaml --mode validate
+#
+# Set these before starting:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export XAI_API_KEY=xai-...
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+providers:
+  # `openai` and `anthropic` are known names: type and base_url are both
+  # inferred, so an api_key is all they need.
+  openai:
+    api_key: ${OPENAI_API_KEY}
+
+  anthropic:
+    api_key: ${ANTHROPIC_API_KEY}
+    # `anthropic-version` is added automatically (Anthropic rejects requests
+    # without it). Set it in extra_headers to pin a different version.
+
+  # xAI has no dedicated provider type because it does not need one: the Grok
+  # API is OpenAI-shaped, so `openai-compatible` is the correct and complete
+  # answer. Any name the proxy does not recognize defaults to that type, so
+  # only base_url is required here.
+  #
+  # base_url is host-only: the client's own path (/v1/chat/completions) is
+  # forwarded unchanged, so `https://api.x.ai` + that path is xAI's real
+  # endpoint. A base_url carrying a path is a load error in v0, not a silent
+  # truncation — see the note at the bottom of this file.
+  #
+  # The same three lines serve vLLM, Ollama, TGI, Together, Fireworks and
+  # DeepSeek — change the URL.
+  xai:
+    type: openai-compatible
+    base_url: https://api.x.ai
+    api_key: ${XAI_API_KEY}
+
+# Routes match on the client's requested model name. First match wins, top to
+# bottom, so put specific patterns above broad ones. `*` matches any run of
+# characters.
+#
+# The model name comes from the `model` field in the JSON request body, which is
+# where every OpenAI and Anthropic SDK puts it. No client change is necessary.
+#
+# Internally the proxy reads the body once, writes the name to an
+# `x-llmproxy-model` header, and matches on that header. A client cannot steer
+# its own request with that header: the proxy overwrites the header when the
+# body names a model, and deletes the header when the body does not.
+routes:
+  - model: gpt-*
+    provider: openai
+
+  - model: o[0-9]*
+    provider: openai
+
+  - model: claude-*
+    provider: anthropic
+
+  - model: grok-*
+    provider: xai
+
+  # Backstop: anything unmatched goes to OpenAI. Without a catch-all, an
+  # unmatched model name gets a 404 — which is often what you want in
+  # production, so delete this rule to make unknown models an explicit error.
+  - model: "*"
+    provider: openai
+
+# ---------------------------------------------------------------------------
+# NOT YET ENFORCED — shown so the shape is familiar, but read the notes.
+#
+# The proxy accepts these keys, prints a warning naming the exact field path,
+# and serves anyway. They are written here rather than omitted because the
+# warning tells you precisely what is and is not active; a config that silently
+# did nothing would be worse. Check stderr on startup, or run `--mode validate`.
+# ---------------------------------------------------------------------------
+
+# Provider fallback (WP-35, in progress). Today this warns and only
+# same-provider retries are active — a request will NOT move to Anthropic if
+# OpenAI fails. Uncomment once WP-35 lands.
+#
+# routes:
+#   - model: gpt-*
+#     provider: openai
+#     fallbacks: [anthropic, xai]
+
+# Model catalogue (WP-49 increment 1). A client that asks for `fast` is routed
+# to `providers[0]` — the name below matches against the body's model field like
+# any other route. Two parts are not active yet, and each warns with its path:
+# entries after the first (there is no preference order until WP-35), and
+# model-name rewriting (the client's `fast` is forwarded to the provider
+# unchanged instead of becoming `gpt-4o-mini`).
+models:
+  # A stable client-facing name, so callers do not chase provider model IDs.
+  fast:
+    providers: [openai/gpt-4o-mini]
+
+  reasoning:
+    providers: [openai/o3-mini]
+
+  # Second and later entries warn today; they become a real preference order
+  # with WP-35.
+  balanced:
+    providers:
+      - anthropic/claude-sonnet-4-5-20250929
+      - xai/grok-2-latest
+
+limits:
+  # This one is REAL — it returns 429 with `x-ratelimit-*` headers.
+  #
+  # Two constraints, both narrower than they look. The bucket key must be
+  # exactly `header:authorization`: the token limiter hardcodes that header
+  # today, so `header:x-api-key` parses, warns, and enforces nothing. And only
+  # `tokens_per_minute` is applied — one budget per listener.
+  # `requests_per_minute`, `concurrent_sessions`, and per-model scoping each
+  # warn with their path and are not enforced.
+  - key: header:authorization
+    tokens_per_minute: 100k
+
+observability:
+  access_logs:
+    output: stdout
+    format: json
+    # Token counts and streaming latency reach the log per request. For a
+    # streaming OpenAI-shaped client the proxy forces
+    # `stream_options.include_usage` on, so usage is reported even when the
+    # client never asked for it.
+
+# ---------------------------------------------------------------------------
+# A v0 limitation worth knowing before you add a fourth provider.
+#
+# `base_url` is host-and-port only; a path prefix is a hard load error. That is
+# correct for every provider whose OpenAI-compatible endpoint sits at the root
+# — OpenAI, xAI, Together, Fireworks, DeepSeek, and any vLLM/Ollama/TGI server
+# — because the client's own `/v1/...` path is forwarded unchanged.
+#
+# It does NOT work for a provider that nests its OpenAI-compatible API under a
+# prefix. Groq is the notable one: its endpoint is
+# `https://api.groq.com/openai/v1/chat/completions`, so it needs the `/openai`
+# prefix and cannot be expressed in v0 at all. There is no workaround in the
+# dialect today — the config fails at load with the field path rather than
+# silently dropping the prefix and 404ing at runtime, which is the right
+# failure but is still a gap.
+# ---------------------------------------------------------------------------

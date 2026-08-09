@@ -1,0 +1,99 @@
+# TLS downstream listener with SNI-based filter-chain matching + tls_inspector:
+# real Envoy accepts this surface end-to-end, and llm-proxy's WP-08 TLS
+# lowering supports the same fields -- expected verdict: AgreeAccept.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: ingress_tls
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10443 }
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+      filter_chains:
+        - filter_chain_match:
+            server_names: ["*.example.com"]
+            transport_protocol: tls
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                  tls_maximum_protocol_version: TLSv1_3
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+                        -----BEGIN CERTIFICATE-----
+                        MIIDDTCCAfWgAwIBAgIUKAXbWnSMo24/8idEliDHbOZ/3lUwDQYJKoZIhvcNAQEL
+                        BQAwFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wHhcNMjYwNzIxMTQzMzQ1WhcNMzYw
+                        NzE4MTQzMzQ1WjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTCCASIwDQYJKoZIhvcN
+                        AQEBBQADggEPADCCAQoCggEBAJ0gOuWPoxr7f5SjoD1nB5qr7E40TsBfuimp6k2H
+                        4dT5OkbOkvRMWnTukJPQPGZU+AIOzhBTZueLbSjnKae8UPrxZ5DYvnRHTbb2HsW+
+                        CDvO9EK6p4YK6NjrOaFEt+GcMywzitYhAPw063mJHbOxKjPxEApPoIQLDALqfmXK
+                        gI4n/1i5rayD+wwpPB5bkrgf9/o0tOctG2TqBfggbnSdpbhgTNKtPErdq+lM2sbM
+                        pC10BpgJmjL2af0Y3BZBOCFUYQIyCto4NrY0hgTM6IAicDX+hNaCT0CJegti4L64
+                        hX+J6uHFtHkJFsnhX3xV86mgdGs/Clz3puAGan5W/eg1EgkCAwEAAaNTMFEwHQYD
+                        VR0OBBYEFA11CZ5m/xbMo1Yo80vTox9KRycyMB8GA1UdIwQYMBaAFA11CZ5m/xbM
+                        o1Yo80vTox9KRycyMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB
+                        AIsEbzhK23vE3QaS+qHGiH4pU3ZYDlL99kZe3jEGjOikcYG8ITVFssQ1AtsdUd1i
+                        szffRCCnjllBaSw0F6Io4EN0C7bKgU707YlzgKmQ+pQ524vchXoGe2e3XA/bDaDe
+                        NGnGTN8LTwtXlfdmFH35J2BjkM905UyBrGpVB3z5yRfShNYlQtQnRKhgIiaMpcGX
+                        gYUySUUke40lOFlZ1+ZMxJcIsOirBCJmSaRdl1T7G/aBIuyRB0dW2WI/YjbogR3w
+                        zsrCq+tXn7SS3EZPNhSn01cmVjl+AVKM2CU5fk7vkIfcngQQ3yg0FB4Ov4Wdxx9z
+                        /NBhftMKLa+jXG1KRKol/lI=
+                        -----END CERTIFICATE-----
+                    private_key:
+                      inline_string: |
+                        -----BEGIN PRIVATE KEY-----
+                        MIIEugIBADANBgkqhkiG9w0BAQEFAASCBKQwggSgAgEAAoIBAQCdIDrlj6Ma+3+U
+                        o6A9Zweaq+xONE7AX7opqepNh+HU+TpGzpL0TFp07pCT0DxmVPgCDs4QU2bni20o
+                        5ymnvFD68WeQ2L50R0229h7Fvgg7zvRCuqeGCujY6zmhRLfhnDMsM4rWIQD8NOt5
+                        iR2zsSoz8RAKT6CECwwC6n5lyoCOJ/9Yua2sg/sMKTweW5K4H/f6NLTnLRtk6gX4
+                        IG50naW4YEzSrTxK3avpTNrGzKQtdAaYCZoy9mn9GNwWQTghVGECMgraODa2NIYE
+                        zOiAInA1/oTWgk9AiXoLYuC+uIV/ierhxbR5CRbJ4V98VfOpoHRrPwpc96bgBmp+
+                        Vv3oNRIJAgMBAAECgf9chl4oUCz79p1qKfByN/mCWzsL0kGNhtFZN3WBskKJ5zkp
+                        +PsQYOXjdZgtcrIekGp6y70MYBB4yOG+9GDTJVGKdB1Iblm4n0RkOQpl50Fx9qxf
+                        nwqHJGV5VwrYrF6bvB9mJ/PZpBWwbnk7WELlTa5MZ+fKKpmbJ+Yq0WsdBeIt0vN8
+                        sIPHhhdTF87rFWS8aOske/EwKOizIXeMPZplUZsk2tvFWZi33M7dg2bl27A8rQDF
+                        SwjNs8adEXEz5VU2cgCocEEI+IIBWArl4FE2RurNGCLiFRRxfbDU3o8T2YcFDaUG
+                        iBgrMftETLPH7zN5YowEoRtHyWdTSa6WetRcZG0CgYEAzmt//wxwMkfweV19RRnQ
+                        tm1d76rs4MzCPvnkXHWckqpYiEQ071vV1tlsn6095v03MwQDNO36iLntzbjoqy7I
+                        OCH1v4lMsmmDu48TfG1kjZXQ6nwxp87v5Nr5iNJ6v7lK/UHuUHSwa7urAURdk6K/
+                        baBHoT6krThG/DXjoncLJ90CgYEAwt2z8prq0snaSVCMQuL+wT+8usD1xM9HVcLe
+                        1sC6mNl0Bbj+rnaHk0udjFasvC1/EoBq60LiRcR+mLsFR5ABZI+sGUPNTSZPEIX+
+                        rpOkniQxGwcoYp/BQyEGnF1TPv25V6BkIri10A4o1c2aKCRzdVbEQPCnkkz+rOb0
+                        jxUV5h0CgYAOdC6RQGC21Jy9EtPLu+QGciAKwTA3CX9sg3j/FGkzR+RNHmGKhSaz
+                        FaRqhen4u7BazSQgV62cV1CUgCcinXL9ozse/1E0iPjlcD5QDyTkWSI42RttAauA
+                        neitMPfRZvseQriaP6F+2bQ+sXfP96xp07hQTR+g1Xj6/hcDcEyCrQKBgG+gXMKu
+                        57GUG80/rPlr2w+MmWpJuv/g1TZViR1wDfQdLQ9SJ+J817ES8c9An3a0gURx982I
+                        5OGea/7Fs4KJBaM7ghR++I4nUcdfWsNapERK6y5WbVYBuc3gj07nTxaYdaGyqWoS
+                        cWQbmFzRiGtSZiljaMzijruKC6G0M4f7Ri4pAoGACUQgOHu2kPf1KeNoIBwyO9aO
+                        4CoTM0tj2vscaXFt/pCxpEchaVMGK0UChPsqzp6+vLyz1Yo70tB5qqKvSHmYsQgU
+                        On0U1oldG4oG3iwloG4h2SQMLknVL61t/dMNcMyml96UQ6SW4zoFiYcLEjP+NzCG
+                        q0Hs45ntIpRX7srQ9XY=
+                        -----END PRIVATE KEY-----
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls
+                cluster: backend
+
+  clusters:
+    - name: backend
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8081 }

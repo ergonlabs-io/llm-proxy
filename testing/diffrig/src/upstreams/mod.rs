@@ -5,23 +5,28 @@
 //! (`127.0.0.1:0`) and hand back their bound address plus a request log the
 //! test harness can query.
 
+mod anthropic;
 mod echo;
 mod flaky;
 mod openai;
 mod slow;
+mod tls_support;
 
+pub use anthropic::{AnthropicConfig, AnthropicUpstream, MessagesRequestLog};
 pub use echo::EchoUpstream;
 pub use flaky::{Action, FailScript, FlakyUpstream};
 pub use openai::{ChatRequestLog, OpenAiConfig, OpenAiUpstream};
 pub use slow::SlowUpstream;
+pub use tls_support::{spawn_tls_passthrough, MockTls, TlsPassthrough};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -184,6 +189,50 @@ pub(crate) async fn record_request_with_body(
 /// response from it without re-reading the request.
 pub(crate) async fn record_request(req: Request<Incoming>, log: &RequestLog) -> RecordedRequest {
     record_request_with_body(req, log).await.0
+}
+
+// --- shared SSE framing/pacing ----------------------------------------------
+//
+// `openai` (chat completions + Responses API) and `anthropic` (messages) each
+// stream Server-Sent Events, differing only in whether a frame carries a
+// named `event:` line and in exactly what pacing schedule they build. The
+// framing and the paced delivery itself are identical, so both live here once
+// instead of three times.
+
+/// Render a data-only SSE frame (OpenAI chat-completions style): just a
+/// `data:` line and the blank-line terminator.
+pub(crate) fn sse_data_frame(payload: &str) -> String {
+    format!("data: {payload}\n\n")
+}
+
+/// Render a named SSE frame (Anthropic messages, OpenAI Responses API style):
+/// an `event:` line naming the event type, then the `data:` line.
+pub(crate) fn sse_named_frame(event: &str, payload: &str) -> String {
+    format!("event: {event}\ndata: {payload}\n\n")
+}
+
+/// Turn a schedule of `(delay-before-this-frame, already-rendered frame
+/// text)` pairs into a paced `ResponseBody`.
+///
+/// Rust note: `futures::stream::unfold` builds a `Stream` from a seed (here,
+/// "how far through `frames` are we") plus an async step function; hyper's
+/// `StreamBody` then polls that stream and writes each item out as an
+/// HTTP/1.1 chunk as soon as it's ready, which is what gives real (not
+/// buffered) pacing. This is the same approach `openai`'s chat-completions
+/// streaming used before it was factored out to be shared.
+pub(crate) fn paced_sse_body(frames: Vec<(Duration, String)>) -> ResponseBody {
+    let stream = futures::stream::unfold((0usize, frames), |(i, frames)| async move {
+        let (delay, payload) = frames.get(i)?.clone();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let event = Bytes::from(payload);
+        Some((
+            Ok::<_, std::convert::Infallible>(Frame::data(event)),
+            (i + 1, frames),
+        ))
+    });
+    StreamBody::new(stream).boxed()
 }
 
 #[cfg(test)]

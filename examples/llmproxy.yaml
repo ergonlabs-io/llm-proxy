@@ -9,6 +9,23 @@ version: 0
 listen: 0.0.0.0:8080
 admin: 127.0.0.1:9901
 
+# Downstream authentication (WP-50). Fails closed: with this block present, a
+# request with no recognized key gets a 401, never admitted anonymously.
+# Uncomment to require one of the listed virtual keys on every request.
+# (hmac_secret_file here, not hmac_secret + env-var interpolation, so this
+# example still parses with no extra environment variable set.)
+# Generate a key + its digest together with (reads the same secret file):
+#   llm-proxy --mode keygen --tenant acme --key-id alice-laptop --hmac-secret-file /etc/llmproxy/auth-secret
+# No llm-proxy binary handy? openssl computes the same digest (note `printf
+# %s`, not a here-string -- `<<<` appends a trailing newline that changes it):
+#   printf %s "llmp_yourkey" | openssl dgst -sha256 -hmac "$(cat /etc/llmproxy/auth-secret)" -hex
+# auth:
+#   hmac_secret_file: /etc/llmproxy/auth-secret
+#   keys:
+#     - id: alice-laptop
+#       tenant: acme
+#       digest: 3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a
+
 providers:
   # `openai` and `anthropic` infer their type and base_url from the name.
   openai:
@@ -23,7 +40,13 @@ providers:
 routes:
   - model: gpt-5*
     provider: openai
-    fallbacks: [anthropic/claude-sonnet-5]
+    # Fallbacks are tried in order when the primary fails. Every provider in
+    # the chain must speak the same wire dialect: an OpenAI-shaped request
+    # body is not valid for Anthropic, and its response would be parsed for
+    # token counts by the wrong parser. So `openai -> local-vllm` (both
+    # OpenAI-compatible) works, and `openai -> anthropic` is rejected at load
+    # time until request/response translation lands.
+    fallbacks: [local-vllm]
   - model: llama-*
     provider: local-vllm
   - model: "*"

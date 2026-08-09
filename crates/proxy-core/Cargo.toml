@@ -6,13 +6,35 @@ license.workspace = true
 
 [dependencies]
 proxy-config = { workspace = true }
+proxy-http = { workspace = true }
+# WP-13: threads the shared ClusterManager through the listener manager into
+# the HTTP router terminal.
+proxy-cluster = { workspace = true }
+# WP-33a (Lane H): the usage/token filter, registered into the shared
+# FilterRegistry below so a `typed_config` can reach it.
+proxy-filters = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
 core_affinity = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
+prost-reflect = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-native-certs = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
+tls-parser = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+proxy-api = { workspace = true }
+rcgen = { workspace = true }
+regex = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "io-util"] }
 
 [lints]
 workspace = true

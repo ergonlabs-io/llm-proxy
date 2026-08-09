@@ -1,0 +1,3726 @@
+//! Per-worker listener manager (WP-07 chunk C): each worker binds its own
+//! socket per listener, accepts connections, matches them against the
+//! listener's filter chains (`crate::filter_chain`), and dispatches to the
+//! matched chain's terminal L4 network filter -- `tcp_proxy` (WP-09,
+//! `crate::tcp_proxy`) today; HTTP connection manager L4 entry is WP-10/11.
+//!
+//! ## Platform divergence: `SO_REUSEPORT` accept balancing
+//!
+//! Every worker binds its own socket to the *same* listener address with
+//! `SO_REUSEPORT`. On Linux the kernel load-balances incoming connections
+//! across every socket bound this way -- that's the production path, and it's
+//! what makes the share-nothing worker design (ADR-0003) able to accept
+//! without a central accept thread handing sockets off to workers. On macOS,
+//! `SO_REUSEPORT` allows the bind but does **not** balance accepts across the
+//! duplicate sockets (in practice, whichever socket was bound most recently
+//! tends to receive most/all new connections); this is a dev-only caveat --
+//! fine for local development and tests, not representative of production
+//! (Linux) accept distribution.
+
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use proxy_cluster::manager::ClusterManager;
+use proxy_config::ir::{
+    HttpConnectionManagerConfig, ListenerConfig, ListenerFilterSpec, ListenerName,
+    NetworkFilterSpec, SnapshotVersion,
+};
+use proxy_config::ConfigSnapshot;
+use proxy_http::codec::{serve_http1, serve_http2, Http1Options};
+use proxy_http::filter::{FactoryContext, FilterRegistry, TerminalFilterInstanceFactory};
+use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
+use proxy_http::handler::{DownstreamInfo, StreamHandler};
+use proxy_http::router::RouterFilterFactory;
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::drain::ConnectionRegistry;
+use crate::filter_chain::{select_filter_chain, ConnectionProperties};
+use crate::header_mutation_filter::HeaderMutationFactory;
+use crate::tcp_proxy::{self, TcpProxyParams};
+use crate::tls::{DownstreamTlsFactory, TlsBuildError};
+use crate::tls_inspector::inspect_client_hello;
+use crate::WorkerConfigHandle;
+
+/// The shared [`FilterRegistry`]: every worker's listeners look up HTTP
+/// filter factories by `type_url` against the same registered set, built
+/// exactly once (ground rule from WP-11's wiring task: "construct it once
+/// and share it, do not build a registry per connection").
+///
+/// Rust note: `std::sync::OnceLock` is the safe, `std`-only way to build a
+/// value lazily on first access and share it thereafter -- no `unsafe`, and
+/// no extra crate dependency for something this simple. Registration happens
+/// exactly once (the first caller to reach `get_or_init` blocks any
+/// concurrent caller until it's done), so [`FilterRegistry::register`]'s
+/// "called twice for the same type_url" assertion can never fire here.
+fn filter_registry() -> &'static Arc<FilterRegistry> {
+    static REGISTRY: std::sync::OnceLock<Arc<FilterRegistry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = FilterRegistry::default();
+        registry.register(Arc::new(HeaderMutationFactory));
+        // WP-33a (Lane H): the usage/token filter. Registered unconditionally
+        // -- it only does anything on a route that configures it, and a filter
+        // that isn't in the registry is a hard config error at load time.
+        registry.register(Arc::new(proxy_filters::usage_filter::UsageFilterFactory));
+        // WP-45 increment 2b (Lane H): the request-body rewrite filter
+        // (forced `stream_options.include_usage` for OpenAI-dialect
+        // streaming requests). Also registered unconditionally, same
+        // reasoning as the usage filter above.
+        registry.register(Arc::new(
+            proxy_filters::body_rewrite_filter::BodyRewriteFilterFactory,
+        ));
+        // WP-34 increment 2 (Lane H): the token-budget limiter. Must be
+        // configured BEFORE `llmproxy.usage` in any listener's `http_filters`
+        // list for its encode-side `record` to observe usage the usage
+        // filter wrote (S2.1: encode runs in reverse config order) -- see
+        // `token_limit_filter`'s module doc. Also registered unconditionally,
+        // same reasoning as the filters above.
+        registry.register(Arc::new(
+            proxy_filters::token_limit_filter::TokenLimitFilterFactory,
+        ));
+        // WP-50 increment 2a (Lane H): downstream authentication. Must be
+        // configured BEFORE `llmproxy.token_limit` in any listener's
+        // `http_filters` list -- decode callbacks run in FORWARD config order
+        // (S2.1), and the limiter buckets on the tenant this filter resolves.
+        // Unlike the two ordering notes above, that one is ENFORCED:
+        // `proxy_config::lower::check_lane_h_filter_order` rejects the wrong
+        // order at load time, because getting it wrong silently drops the
+        // limiter back to bucketing on a client-supplied header. Registered
+        // unconditionally, same reasoning as the filters above -- and note
+        // that registering it does NOT enable authentication anywhere; only a
+        // listener that configures the filter authenticates.
+        registry.register(Arc::new(proxy_filters::auth_filter::AuthFilterFactory));
+        Arc::new(registry)
+    })
+}
+
+/// Compiled downstream TLS factories for one listener's filter chains
+/// (WP-08 chunk C3), aligned by index with `ListenerConfig.filter_chains`,
+/// plus the `default_filter_chain`. `None` in a slot means that chain has no
+/// `transport_socket` (plaintext) -- or, only after a failed *runtime*
+/// rebuild (see `spawn_accept_loop`), that its factory couldn't be rebuilt.
+///
+/// Rust note: these factories hold live `rustls` state (cert resolvers,
+/// crypto providers) so they can't live in `ConfigSnapshot` -- `proxy-config`
+/// can't depend on `proxy-core`'s TLS types (ground rule #2). Instead each
+/// accept loop keeps its own `ListenerTls`, built once at bind time and
+/// rebuilt lazily whenever it notices the snapshot version changed.
+struct ListenerTls {
+    chain_factories: Vec<Option<Arc<DownstreamTlsFactory>>>,
+    default_factory: Option<Arc<DownstreamTlsFactory>>,
+}
+
+impl ListenerTls {
+    /// An "everything resets" placeholder used when a runtime rebuild fails:
+    /// every chain that needs TLS gets `None` (see the `(true, None)` arm in
+    /// `spawn_accept_loop`), so connections matching a TLS chain are reset
+    /// rather than silently served in the clear.
+    fn empty_for(listener: &ListenerConfig) -> Self {
+        Self {
+            chain_factories: vec![None; listener.filter_chains.len()],
+            default_factory: None,
+        }
+    }
+}
+
+/// Build the compiled TLS factories for every `filter_chains[i]` (and the
+/// `default_filter_chain`) of `listener` whose `transport_socket` is
+/// configured. `None` transport_socket -> `None` slot (plaintext); a build
+/// error names the listener + chain in its `TlsBuildError::context` and
+/// propagates, letting the caller decide fatal-vs-log-and-skip.
+fn build_listener_tls(listener: &ListenerConfig) -> Result<ListenerTls, TlsBuildError> {
+    let mut chain_factories = Vec::with_capacity(listener.filter_chains.len());
+    for (i, chain) in listener.filter_chains.iter().enumerate() {
+        let factory = match &chain.transport_socket {
+            Some(spec) => {
+                let context = format!("listener '{}' filter_chains[{i}]", listener.name);
+                Some(Arc::new(DownstreamTlsFactory::build(spec, &context)?))
+            }
+            None => None,
+        };
+        chain_factories.push(factory);
+    }
+    let default_factory = match listener
+        .default_filter_chain
+        .as_ref()
+        .and_then(|c| c.transport_socket.as_ref())
+    {
+        Some(spec) => {
+            let context = format!("listener '{}' default_filter_chain", listener.name);
+            Some(Arc::new(DownstreamTlsFactory::build(spec, &context)?))
+        }
+        None => None,
+    };
+    Ok(ListenerTls {
+        chain_factories,
+        default_factory,
+    })
+}
+
+/// A listener's HTTP filter chain (`http_filters`) failed to build for one
+/// HCM terminal filter -- a `type_url` with no registered
+/// [`proxy_http::filter::HttpFilterFactory`], or a filter's `typed_config`
+/// failing that factory's own validation. Same fatal-at-[`initial_bind`] /
+/// logged-and-skip-at-reconcile treatment as [`TlsBuildError`] (see
+/// [`InitialBindError`]'s doc comment): this is a startup error, never a
+/// silent skip of a configured filter (ground rule #1).
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {reason}")]
+pub struct HttpFilterChainBuildError {
+    context: String,
+    reason: String,
+}
+
+/// Compiled HTTP filter-chain handlers for one listener's filter chains
+/// (this WP-11 wiring task), aligned by index with
+/// `ListenerConfig.filter_chains`, plus the `default_filter_chain` -- the HCM
+/// counterpart to [`ListenerTls`], built and rebuilt on the same cadence
+/// (bind time, then whenever the accept loop notices the snapshot version
+/// changed). `None` in a slot means that chain's terminal filter isn't an
+/// HTTP connection manager at all (e.g. a plain `tcp_proxy`) -- or, only
+/// after a failed *runtime* rebuild, that its handler couldn't be rebuilt.
+struct ListenerHcm {
+    chain_handlers: Vec<Option<Rc<dyn StreamHandler>>>,
+    default_handler: Option<Rc<dyn StreamHandler>>,
+}
+
+impl ListenerHcm {
+    /// Same "everything resets" placeholder as [`ListenerTls::empty_for`],
+    /// used when a runtime rebuild fails.
+    fn empty_for(listener: &ListenerConfig) -> Self {
+        Self {
+            chain_handlers: vec![None; listener.filter_chains.len()],
+            default_handler: None,
+        }
+    }
+}
+
+/// Build the compiled HTTP filter-chain handler for every `filter_chains[i]`
+/// (and the `default_filter_chain`) of `listener` whose terminal network
+/// filter is an HTTP connection manager. A chain whose terminal filter isn't
+/// an HCM (or has no filters at all) gets a `None` slot -- mirrors
+/// `build_listener_tls`'s shape exactly.
+fn build_listener_hcm(
+    listener: &ListenerConfig,
+    cluster_manager: &Arc<ClusterManager>,
+) -> Result<ListenerHcm, HttpFilterChainBuildError> {
+    let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
+    for (i, chain) in listener.filter_chains.iter().enumerate() {
+        let handler = match chain.filters.last() {
+            Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
+                let context = format!("listener '{}' filter_chains[{i}]", listener.name);
+                Some(build_hcm_handler(hcm, &context, cluster_manager)?)
+            }
+            _ => None,
+        };
+        chain_handlers.push(handler);
+    }
+    let default_handler = match listener
+        .default_filter_chain
+        .as_ref()
+        .and_then(|c| c.filters.last())
+    {
+        Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
+            let context = format!("listener '{}' default_filter_chain", listener.name);
+            Some(build_hcm_handler(hcm, &context, cluster_manager)?)
+        }
+        _ => None,
+    };
+    Ok(ListenerHcm {
+        chain_handlers,
+        default_handler,
+    })
+}
+
+/// One listener this worker currently has bound: its address (so we can tell
+/// "address changed" from "just a chain update" on the next config ping) and
+/// the accept-loop task driving it.
+///
+/// Rust note: `pub` (it's the value type of the map `initial_bind` hands to
+/// `run_listener_manager`, both public API) but its fields stay private --
+/// callers outside this module only ever pass the whole map through, never
+/// inspect one listener's bookkeeping directly.
+pub struct BoundListener {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+/// A listener failed to bind (or have its TLS termination configured)
+/// during [`initial_bind`] -- fatal, unlike reconcile-time failures (see
+/// `reconcile`'s doc comment). Two causes, same fatal treatment: a socket
+/// that won't bind, or a filter chain's `transport_socket` whose certs won't
+/// load (Envoy parity: both fail a static listener's warm-up).
+///
+/// Rust note: `#[error(transparent)]` on `Tls` forwards straight to
+/// `TlsBuildError`'s own `Display` (which already names the listener +
+/// chain via its `context` field), so there's no need to duplicate that
+/// context here.
+#[derive(Debug, thiserror::Error)]
+pub enum InitialBindError {
+    #[error("listener '{name}' failed to bind {addr}: {source}")]
+    Bind {
+        name: ListenerName,
+        addr: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Tls(#[from] TlsBuildError),
+    #[error(transparent)]
+    Http(#[from] HttpFilterChainBuildError),
+}
+
+/// Bind a `socket2` socket for `listener` and hand it to tokio.
+///
+/// Rust note: `socket2` gives us access to `SO_REUSEADDR`/`SO_REUSEPORT`,
+/// which `std`/`tokio` don't expose directly. Converting it into a
+/// `tokio::net::TcpListener` goes through `std::net::TcpListener` as an
+/// intermediate step -- `Socket: Into<std::net::TcpListener>` on unix, and
+/// `TcpListener::from_std` just registers an already-bind/listen()'d,
+/// already-nonblocking std socket with tokio's reactor. No `unsafe` needed;
+/// the raw-fd handoff is entirely inside these safe abstractions.
+fn bind_listener(listener: &ListenerConfig) -> io::Result<TcpListener> {
+    let addr = listener.address;
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    // Rust note: `SO_REUSEPORT` is a unix-only socket option; `socket2` only
+    // exposes `set_reuse_port` when compiled for unix targets, so this crate
+    // (like the rest of llm-proxy) is unix-only for now.
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    let backlog = listener.tcp_backlog_size.unwrap_or(128) as i32;
+    socket.listen(backlog)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+}
+
+/// Bind `listener_ir` and spawn its accept loop, returning the [`BoundListener`]
+/// on success. The one place that actually calls `bind_listener` +
+/// `spawn_accept_loop` together; [`initial_bind`] and reconcile-time binding
+/// (`bind_and_spawn`) each decide what to do with the `Err` case differently.
+/// Bundles the per-worker state every bind/accept function below needs
+/// (config handle, connection registry, drain signal, cluster manager) --
+/// purely to keep `spawn_bound`/`bind_and_spawn`'s argument count under
+/// clippy's `too_many_arguments` threshold, the same motivation
+/// [`ListenerCaches`] documents for the per-listener build outputs.
+/// [`initial_bind`]/[`reconcile`] (the public-ish entry points) keep their
+/// four separate parameters -- this bundle is purely an internal plumbing
+/// convenience built once at their top and threaded down by reference.
+struct WorkerShared<'a> {
+    config: &'a Arc<WorkerConfigHandle>,
+    registry: &'a ConnectionRegistry,
+    shutdown: &'a watch::Receiver<bool>,
+    cluster_manager: &'a Arc<ClusterManager>,
+}
+
+fn spawn_bound(
+    name: &ListenerName,
+    listener_ir: &Arc<ListenerConfig>,
+    version: SnapshotVersion,
+    shared: &WorkerShared<'_>,
+) -> Result<BoundListener, InitialBindError> {
+    // Built before the socket bind: no point opening a listening socket for a
+    // filter chain whose certs won't load, or whose HTTP filter chain
+    // references an unregistered filter.
+    let tls = build_listener_tls(listener_ir)?;
+    let hcm = build_listener_hcm(listener_ir, shared.cluster_manager)?;
+    let tcp_listener = bind_listener(listener_ir).map_err(|source| InitialBindError::Bind {
+        name: name.clone(),
+        addr: listener_ir.address,
+        source,
+    })?;
+    let addr = listener_ir.address;
+    tracing::info!(listener = %name, %addr, "listener bound");
+    let task = spawn_accept_loop(
+        name.clone(),
+        tcp_listener,
+        version,
+        ListenerCaches { tls, hcm },
+        AcceptLoopShared {
+            config: shared.config.clone(),
+            registry: shared.registry.clone(),
+            shutdown: shared.shutdown.clone(),
+            cluster_manager: shared.cluster_manager.clone(),
+        },
+    );
+    Ok(BoundListener { addr, task })
+}
+
+/// Bind `listener_ir` and spawn its accept loop, inserting the result into
+/// `bound`. Reconcile-time only: bind failures here are logged and the
+/// listener is skipped (rather than panicking the worker) -- a later config
+/// push or manual intervention is the recovery path, matching how Envoy
+/// itself degrades a single bad listener update. Contrast [`initial_bind`],
+/// where a bind failure is fatal.
+fn bind_and_spawn(
+    name: ListenerName,
+    listener_ir: &Arc<ListenerConfig>,
+    version: SnapshotVersion,
+    bound: &mut HashMap<ListenerName, BoundListener>,
+    shared: &WorkerShared<'_>,
+) {
+    match spawn_bound(&name, listener_ir, version, shared) {
+        Ok(b) => {
+            bound.insert(name, b);
+        }
+        Err(err) => {
+            tracing::error!(listener = %name, address = %listener_ir.address, error = %err, "failed to bind listener; skipping");
+        }
+    }
+}
+
+/// Bind every `bind_to_port` listener in `snapshot` for the very first time.
+///
+/// Unlike reconcile-time binds, a failure here is fatal (returns `Err`
+/// instead of logging and skipping): Envoy itself fails startup when a
+/// static bootstrap listener can't bind, and starting the worker with fewer
+/// listeners than configured -- silently serving a subset -- is exactly the
+/// silent degradation ground rule #1 forbids. On error, any listeners this
+/// call already bound are unwound (their accept-loop tasks aborted) before
+/// returning, so a failed `initial_bind` leaves nothing running.
+///
+/// On success, hand the returned map to [`run_listener_manager`], which picks
+/// up reconciliation against subsequent config pushes from there.
+pub fn initial_bind(
+    snapshot: &Arc<ConfigSnapshot>,
+    config: &Arc<WorkerConfigHandle>,
+    registry: &ConnectionRegistry,
+    shutdown: &watch::Receiver<bool>,
+    cluster_manager: &Arc<ClusterManager>,
+) -> Result<HashMap<ListenerName, BoundListener>, InitialBindError> {
+    let shared = WorkerShared {
+        config,
+        registry,
+        shutdown,
+        cluster_manager,
+    };
+    let mut bound: HashMap<ListenerName, BoundListener> = HashMap::new();
+    for (name, listener_ir) in snapshot.listeners.iter() {
+        if !listener_ir.bind_to_port {
+            tracing::debug!(listener = %name, "bind_to_port=false; not binding");
+            continue;
+        }
+        match spawn_bound(name, listener_ir, snapshot.version, &shared) {
+            Ok(b) => {
+                bound.insert(name.clone(), b);
+            }
+            Err(err) => {
+                for (_, b) in bound.drain() {
+                    b.task.abort();
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(bound)
+}
+
+/// The two per-listener caches [`spawn_accept_loop`] seeds its accept loop
+/// with and keeps refreshed on every snapshot version change -- bundled into
+/// one type purely to keep `spawn_accept_loop`'s argument count down
+/// (clippy's `too_many_arguments`); see [`build_listener_tls`] and
+/// [`build_listener_hcm`] for how each half is built.
+struct ListenerCaches {
+    tls: ListenerTls,
+    hcm: ListenerHcm,
+}
+
+/// The owned counterpart to [`WorkerShared`] -- `spawn_accept_loop`'s task is
+/// `'static`, so it needs owned clones (cheap: `Arc`/`ConnectionRegistry`/
+/// `watch::Receiver` are all handle types) rather than borrows.
+struct AcceptLoopShared {
+    config: Arc<WorkerConfigHandle>,
+    registry: ConnectionRegistry,
+    shutdown: watch::Receiver<bool>,
+    cluster_manager: Arc<ClusterManager>,
+}
+
+/// One accept loop per bound listener, spawned with `spawn_local` (this
+/// module is worker-local / `!Send` per ADR-0003, same as the rest of
+/// `proxy-core`).
+fn spawn_accept_loop(
+    name: ListenerName,
+    tcp_listener: TcpListener,
+    initial_version: SnapshotVersion,
+    initial: ListenerCaches,
+    shared: AcceptLoopShared,
+) -> JoinHandle<()> {
+    let ListenerCaches {
+        tls: initial_tls,
+        hcm: initial_hcm,
+    } = initial;
+    let AcceptLoopShared {
+        config,
+        registry,
+        mut shutdown,
+        cluster_manager,
+    } = shared;
+    tokio::task::spawn_local(async move {
+        // Rust note: `mut` locals, not behind a lock -- this whole task is
+        // single-threaded (`spawn_local` on a `!Send` `LocalSet`, ADR-0003),
+        // so nothing else can observe or race these between `.await` points.
+        // `tls_cache`/`hcm_cache` are `Rc`s so each accepted connection's task
+        // gets a cheap clone of the same compiled factories/handlers (pointer
+        // bump, no rebuild).
+        let mut tls_version = initial_version;
+        let mut tls_cache = Rc::new(initial_tls);
+        let mut hcm_cache = Rc::new(initial_hcm);
+        loop {
+            let (stream, peer) = tokio::select! {
+                accepted = tcp_listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        tracing::warn!(listener = %name, error = %err, "accept() failed");
+                        continue;
+                    }
+                },
+                _ = shutdown.changed() => {
+                    return;
+                }
+            };
+
+            // Rust note: the snapshot is reloaded here, once per *accepted
+            // connection*, not once for the whole lifetime of this accept
+            // loop. That is deliberate: it's what lets `run_listener_manager`
+            // leave an accept loop running untouched when a listener's
+            // filter chains change but its address doesn't (see its doc
+            // comment) -- the next connection simply sees the new snapshot.
+            let snapshot = config.load();
+
+            // The accept loop's own TLS factory cache goes stale exactly when
+            // the snapshot version does (WP-08 chunk C3): a chain-only config
+            // change takes effect for new connections without a rebind (see
+            // the "Rust note" above `spawn_accept_loop`'s doc), so a new
+            // `transport_socket` or rotated cert on an existing chain needs a
+            // rebuild here, not a new bind. A rebuild failure is logged and
+            // treated as "no TLS factories for this listener" rather than
+            // fatal -- reconcile-time failures already degrade this way, and
+            // a runtime cert typo shouldn't take an established listener
+            // down. Rust note: this is a *whole-listener* fallback (every
+            // chain's factory reset to `None`) rather than a per-chain retry
+            // of just the changed chain -- simpler, at the cost of briefly
+            // resetting TLS connections on chains that didn't actually
+            // change alongside the one that broke. This rebuild is the only
+            // per-connection work done *inline* in the accept loop; it's
+            // synchronous (no `.await`), so it can't stall new accepts.
+            if snapshot.version != tls_version {
+                if let Some(l) = snapshot.listeners.get(&name) {
+                    match build_listener_tls(l) {
+                        Ok(rebuilt) => tls_cache = Rc::new(rebuilt),
+                        Err(err) => {
+                            tracing::warn!(listener = %name, error = %err, "failed to rebuild TLS factories after config change; TLS-requiring chains on this listener will reset connections until fixed");
+                            tls_cache = Rc::new(ListenerTls::empty_for(l));
+                        }
+                    }
+                    // Same rebuild cadence and same "whole-listener fallback"
+                    // tradeoff as the TLS cache just above, for the HTTP
+                    // filter-chain handlers.
+                    match build_listener_hcm(l, &cluster_manager) {
+                        Ok(rebuilt) => hcm_cache = Rc::new(rebuilt),
+                        Err(err) => {
+                            tracing::warn!(listener = %name, error = %err, "failed to rebuild HTTP filter chain after config change; HCM chains on this listener will reset connections until fixed");
+                            hcm_cache = Rc::new(ListenerHcm::empty_for(l));
+                        }
+                    }
+                }
+                tls_version = snapshot.version;
+            }
+
+            // Everything after the accept -- the ClientHello peek, filter-chain
+            // matching, the TLS handshake, and the connection handler -- runs
+            // in its own task, NOT inline in the accept loop. Rust note: this
+            // is load-bearing. The `tls_inspector` peek and `factory.wrap`
+            // handshake both `.await` on the client (they wait for its bytes);
+            // doing them inline would let one slow or stalled client block
+            // every other new connection on this worker's listener (a trivial
+            // per-worker denial of service, bounded only by the inspector
+            // timeout). Spawning per connection keeps the accept loop doing
+            // nothing but `accept()` + the synchronous cache refresh above.
+            tokio::task::spawn_local(serve_connection(ServeConnection {
+                stream,
+                peer,
+                listener_name: name.clone(),
+                snapshot,
+                tls: tls_cache.clone(),
+                hcm: hcm_cache.clone(),
+                registry: registry.clone(),
+                shutdown: shutdown.clone(),
+            }));
+        }
+    })
+}
+
+/// Everything one accepted connection needs to be served, moved into its own
+/// task off the accept loop (see the "load-bearing" Rust note in
+/// `spawn_accept_loop`). Grouped into a struct only to keep the argument list
+/// readable -- Rust note: none of these are `Send` (`Rc<ListenerTls>`,
+/// `Arc<ConfigSnapshot>` handlers), which is fine because the whole listener
+/// manager runs on a single-threaded `LocalSet` per ADR-0003.
+struct ServeConnection {
+    stream: TcpStream,
+    peer: SocketAddr,
+    listener_name: ListenerName,
+    /// The snapshot this connection matched under; held for the connection's
+    /// whole lifetime, which is exactly the passive-drain seam (config the
+    /// control runtime has since replaced stays alive as long as connections
+    /// accepted under it).
+    snapshot: Arc<ConfigSnapshot>,
+    /// TLS factories compiled from `snapshot` -- built consistently with it in
+    /// the accept loop before this task was spawned.
+    tls: Rc<ListenerTls>,
+    /// HTTP filter-chain handlers compiled from `snapshot`, same cadence as
+    /// `tls` above.
+    hcm: Rc<ListenerHcm>,
+    registry: ConnectionRegistry,
+    shutdown: watch::Receiver<bool>,
+}
+
+async fn serve_connection(conn: ServeConnection) {
+    let ServeConnection {
+        stream,
+        peer,
+        listener_name: name,
+        snapshot,
+        tls,
+        hcm,
+        registry,
+        shutdown,
+    } = conn;
+
+    let local_addr = stream.local_addr().unwrap_or(peer);
+    let listener_ir = snapshot.listeners.get(&name);
+
+    // If this listener has a `tls_inspector` listener filter, peek the
+    // ClientHello (without consuming it) before filter-chain matching so
+    // `server_names`/`application_protocols`/`transport_protocol` criteria can
+    // key on it.
+    //
+    // Rust note: `ListenerFilterSpec` currently has only one variant, so
+    // destructuring it directly in the closure param (instead of a `match`) is
+    // an *irrefutable* pattern -- if a second variant is ever added, this line
+    // stops compiling until it's handled here too, which is exactly ground
+    // rule #1 (never silently drop a config field) enforced by the type
+    // checker.
+    let mut server_name = None;
+    let mut transport_protocol = "raw_buffer".to_string();
+    let mut application_protocols = vec![];
+    let tls_inspector_cfg = listener_ir
+        .and_then(|l| l.listener_filters.first())
+        .map(|ListenerFilterSpec::TlsInspector(cfg)| *cfg);
+    if let Some(cfg) = tls_inspector_cfg {
+        match inspect_client_hello(&stream, cfg.max_client_hello_size).await {
+            Ok(Some(tls)) => {
+                transport_protocol = "tls".to_string();
+                server_name = tls.server_name;
+                application_protocols = tls.application_protocols;
+            }
+            Ok(None) => {
+                // Not TLS, or the ClientHello couldn't be parsed within
+                // limits: treat as plaintext, same as if tls_inspector weren't
+                // configured at all.
+            }
+            Err(err) => {
+                // A real socket error, not a parse failure -- log and fall
+                // back to plaintext; the connection will most likely fail
+                // shortly after anyway, but the inspector itself must not be
+                // fatal.
+                tracing::debug!(listener = %name, peer = %peer, error = %err, "tls_inspector: socket error while peeking ClientHello");
+            }
+        }
+    }
+
+    let props = ConnectionProperties {
+        destination_addr: local_addr,
+        source_addr: peer,
+        direct_source_addr: peer,
+        server_name,
+        transport_protocol,
+        application_protocols,
+    };
+
+    let Some(matched) = listener_ir.and_then(|l| select_filter_chain(&props, l)) else {
+        tracing::debug!(listener = %name, peer = %peer, "no filter chain matched; resetting connection");
+        // Rust note: `SO_LINGER(0)` makes the kernel send a TCP RST instead of
+        // the usual FIN close handshake once the socket is dropped -- this is
+        // what Envoy does on a `filter_chain_match` miss, rather than a clean
+        // close.
+        reset(&stream, &name);
+        return;
+    };
+
+    let buffer_limit = listener_ir
+        .map(|l| l.per_connection_buffer_limit_bytes)
+        .unwrap_or(1024 * 1024);
+
+    // Which cache slot corresponds to `matched`: its index in `filter_chains`,
+    // or the `default_filter_chain` slot if it isn't found there (Rust note:
+    // `ptr::eq` on references into the immutable, `Arc`'d snapshot is valid and
+    // needs no `unsafe` -- see `filter_chain`'s own property test for the same
+    // technique). Looked up once and reused for both the TLS factory and the
+    // HCM handler caches below, which are aligned the same way.
+    let chain_idx = listener_ir.and_then(|l| {
+        l.filter_chains
+            .iter()
+            .position(|c| std::ptr::eq(c, matched))
+    });
+
+    // Extracted before the stream is moved into either branch below: the
+    // matched chain's terminal (and, today, only) network filter, turned into
+    // cheap owned params/handle. A chain with no filters can't happen
+    // (lowering rejects empty `filters`), but `None` here is handled
+    // defensively. The HCM handler itself was built once at bind time (see
+    // `build_listener_hcm`), not per connection -- this just looks up the
+    // slot `matched` corresponds to.
+    let hcm_handler = match chain_idx {
+        Some(idx) => hcm.chain_handlers.get(idx).cloned().flatten(),
+        None => hcm.default_handler.clone(),
+    };
+    let filter = terminal_filter(matched, buffer_limit, hcm_handler);
+
+    let factory = matched
+        .transport_socket
+        .as_ref()
+        .and_then(|_| match chain_idx {
+            Some(idx) => tls.chain_factories.get(idx).cloned().flatten(),
+            None => tls.default_factory.clone(),
+        });
+
+    match (matched.transport_socket.is_some(), factory) {
+        (true, Some(factory)) => match factory.wrap(stream).await {
+            Ok(tls_stream) => {
+                // WP-10 h2: the ALPN protocol rustls just negotiated with the
+                // client decides which codec serves this connection -- see
+                // `downstream_codec_for_alpn`'s doc comment for why this has
+                // to be read *here* (post-handshake) rather than assumed from
+                // config, and for the h2c-is-out-of-scope note.
+                let codec = downstream_codec_for_alpn(&tls_stream);
+                // Can't `reset` (SO_LINGER) a `TlsStream` the way we can a
+                // bare `TcpStream` -- `run_terminal_filter` hands the stream
+                // back on the no-op paths so the *unimplemented*/no-filter
+                // cases just drop it and let the close be a clean FIN.
+                let downstream = DownstreamInfo {
+                    remote: peer,
+                    is_tls: true,
+                };
+                let _ = run_terminal_filter(
+                    tls_stream,
+                    filter,
+                    snapshot,
+                    RunTerminalFilterCtx {
+                        registry: &registry,
+                        shutdown,
+                        name: &name,
+                        downstream,
+                        codec,
+                    },
+                )
+                .await;
+            }
+            Err(err) => {
+                tracing::debug!(listener = %name, peer = %peer, error = %err, "TLS handshake failed; dropping connection");
+            }
+        },
+        (true, None) => {
+            // The matched chain needs TLS termination but no factory is
+            // available (a runtime rebuild failed -- see `spawn_accept_loop`);
+            // can't serve this chain, so reset rather than silently run it in
+            // the clear.
+            tracing::warn!(listener = %name, peer = %peer, "matched chain requires TLS but no factory is available; resetting connection");
+            reset(&stream, &name);
+        }
+        (false, _) => {
+            // Plaintext (or TLS-passthrough, if `matched` was selected via SNI
+            // but configures no `transport_socket`): dispatch straight to the
+            // terminal L4 filter on `stream`. No ALPN exists over plaintext,
+            // and h2c (cleartext HTTP/2) is out of scope (see
+            // `downstream_codec_for_alpn`'s doc comment) -- always h1.
+            let downstream = DownstreamInfo {
+                remote: peer,
+                is_tls: false,
+            };
+            if let Some(stream) = run_terminal_filter(
+                stream,
+                filter,
+                snapshot,
+                RunTerminalFilterCtx {
+                    registry: &registry,
+                    shutdown,
+                    name: &name,
+                    downstream,
+                    codec: DownstreamCodec::Http1,
+                },
+            )
+            .await
+            {
+                reset(&stream, &name);
+            }
+        }
+    }
+}
+
+/// Which HTTP codec serves a downstream connection: h1 unconditionally for
+/// plaintext (see the `(false, _)` call site) and now, correctly, negotiated
+/// ALPN for TLS -- **this used to be a live bug**: `server_config.alpn_protocols`
+/// (set from `spec.alpn_protocols` in `crates/proxy-core/src/tls/mod.rs`)
+/// already let an operator configure `alpn_protocols: ["h2"]` on a downstream
+/// listener, rustls would happily negotiate `h2` with the client during
+/// `factory.wrap`, and this module then unconditionally called `serve_http1`
+/// on the result -- a config field accepted and then silently not honored
+/// (ground rule #1), and a protocol violation from the client's point of
+/// view (it believes it's speaking h2 framing to us; we read h1 framing off
+/// the same bytes). This function is the fix: read what rustls actually
+/// negotiated, post-handshake, rather than assuming h1.
+///
+/// Only `h2` selects [`DownstreamCodec::Http2`]; anything else (`http/1.1`,
+/// no ALPN negotiated at all, e.g. `alpn_protocols` left empty in config) is
+/// h1. h2c -- HTTP/2 over cleartext, either "prior knowledge" or the h1
+/// `Upgrade: h2c` mechanism -- is deliberately out of scope for this WP (see
+/// `serve_http2`'s and `proxy_http::codec`'s module doc): there is no ALPN on
+/// a plaintext connection to dispatch on, so h2c would need its own detection
+/// path this function does not implement.
+fn downstream_codec_for_alpn<IO>(
+    tls_stream: &tokio_rustls::server::TlsStream<IO>,
+) -> DownstreamCodec {
+    // Rust note: `get_ref()` on a `tokio_rustls::server::TlsStream` returns
+    // `(&IO, &rustls::ServerConnection)` (via `Deref` to `CommonState`) --
+    // the underlying I/O plus the live rustls session state, which is where
+    // the post-handshake negotiated ALPN protocol lives (`alpn_protocol()`
+    // returns `None` before the handshake completes or when neither side
+    // negotiated one).
+    match tls_stream.get_ref().1.alpn_protocol() {
+        Some(b"h2") => DownstreamCodec::Http2,
+        _ => DownstreamCodec::Http1,
+    }
+}
+
+/// See [`downstream_codec_for_alpn`]. `Copy` so it threads through
+/// `run_terminal_filter`'s already-long parameter list as cheaply as
+/// `DownstreamInfo` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownstreamCodec {
+    Http1,
+    Http2,
+}
+
+/// The matched chain's terminal network filter, resolved into cheap owned
+/// data ahead of the stream move (see the call site in `serve_connection`).
+/// `filters.last()` and `.first()` are the same slot today -- lowering only
+/// ever produces exactly one filter per chain -- but `.last()` is what
+/// matches Envoy's "the terminal filter is the last one in the chain"
+/// semantics for when a second, non-terminal L4 filter exists (see
+/// `net_filter`'s module doc).
+enum TerminalFilter {
+    TcpProxy(TcpProxyParams),
+    /// HTTP connection manager: the codec-facing `StreamHandler` -- built
+    /// once at bind time (see `build_listener_hcm`/`build_hcm_handler`), not
+    /// per connection; `terminal_filter` just clones the `Rc` handed to it.
+    Http(Rc<dyn StreamHandler>),
+}
+
+/// `hcm_handler` is the (already-built) handler for the slot `matched`
+/// occupies in this worker's `ListenerHcm` cache -- see the call site in
+/// `serve_connection`, which looks it up the same way it looks up the TLS
+/// factory. `None` there just means `matched`'s terminal filter isn't an HCM
+/// (or, on a failed runtime rebuild, that it couldn't be rebuilt), same as a
+/// missing TLS factory.
+fn terminal_filter(
+    matched: &proxy_config::ir::FilterChainSpec,
+    buffer_limit: u32,
+    hcm_handler: Option<Rc<dyn StreamHandler>>,
+) -> Option<TerminalFilter> {
+    match matched.filters.last()? {
+        NetworkFilterSpec::TcpProxy(tp) => Some(TerminalFilter::TcpProxy(TcpProxyParams {
+            cluster: tp.cluster.clone(),
+            idle_timeout: tp.idle_timeout,
+            max_connect_attempts: tp.max_connect_attempts,
+            buffer_limit,
+        })),
+        NetworkFilterSpec::HttpConnectionManager(_) => hcm_handler.map(TerminalFilter::Http),
+    }
+}
+
+/// Build the `StreamHandler` the downstream h1 codec (`proxy_http::codec`)
+/// drives for one HTTP connection manager terminal filter: every non-router
+/// `http_filters` entry becomes one `FilterInstanceFactory` (config order),
+/// looked up in the shared [`filter_registry`] by `type_url`; a `type_url`
+/// with no registered factory is a startup error (`context` names the
+/// listener/chain), never a silent skip (ground rule #1). The router itself
+/// (`envoy.filters.http.router`, `is_router: true`) is the terminal --
+/// [`proxy_http::router::RouterHandler`] -- not one of these chain filters
+/// (WP-13).
+fn build_hcm_handler(
+    hcm: &HttpConnectionManagerConfig,
+    context: &str,
+    cluster_manager: &Arc<ClusterManager>,
+) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
+    let registry = filter_registry();
+    let factory_ctx = FactoryContext {};
+    let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
+    for f in &hcm.http_filters {
+        if f.is_router {
+            continue;
+        }
+        let factory = registry
+            .get(&f.type_url)
+            .ok_or_else(|| HttpFilterChainBuildError {
+                context: context.to_string(),
+                reason: format!(
+                    "http filter '{}' (type_url `{}`) has no registered factory",
+                    f.name, f.type_url
+                ),
+            })?;
+        // Invariant enforced by `proxy-config`'s lowering: `config` is `None`
+        // only for the router filter, which the `continue` above already
+        // skipped -- every other entry carries a decoded `typed_config`.
+        let config = f
+            .config
+            .as_ref()
+            .expect("lowering only leaves `config: None` on the router filter");
+        let instance_factory =
+            factory
+                .create(config, &factory_ctx)
+                .map_err(|e| HttpFilterChainBuildError {
+                    context: context.to_string(),
+                    reason: format!("http filter '{}': {e}", f.name),
+                })?;
+        filters.push(ConfiguredHttpFilter {
+            name: f.name.clone(),
+            instance_factory: Arc::from(instance_factory),
+            // ADR-0004 step 4 increment 2: kept alongside the instance
+            // factory -- `FilterChainHandler::new_with_filters` needs the
+            // registered `HttpFilterFactory` (not just the per-stream
+            // instance factory) once, at construction, to resolve any
+            // `typed_per_filter_config` entry naming this filter through
+            // `HttpFilterFactory::parse_per_route`.
+            factory: factory.clone(),
+        });
+    }
+
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+        Arc::new(RouterFilterFactory::new(cluster_manager.clone()));
+
+    // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
+    // bind/rebuild cadence as everything else in this function (a fresh
+    // `FilterChainHandler` -- and so a fresh set of loggers/sinks -- is built
+    // every time `build_listener_hcm` rebuilds this chain, mirroring
+    // `build_listener_tls`'s cadence for certs). A sink that can't be opened
+    // (e.g. an unwritable file path) is a startup/config error, same
+    // fatal-at-`initial_bind`/logged-and-skip-at-reconcile treatment as an
+    // unregistered filter or a bad cert.
+    //
+    // Access logging now lives on `FilterChainHandler`, not `RouterHandler`
+    // -- see `proxy_http::filter_manager`'s and `proxy_http::access_logging`'s
+    // module docs for why (the router sits INSIDE the encode filter chain,
+    // so logging from there can never observe what an encode filter does at
+    // end-of-stream).
+    //
+    // ADR-0004 step 4 increment 2: `new_with_filters_and_access_logs` (not
+    // plain `new_with_access_logs`) -- `filters` carries each entry's Envoy
+    // name and registered factory, needed to resolve `typed_per_filter_config`
+    // against the real chain once, here, rather than never (ground rule #1).
+    Ok(Rc::new(
+        FilterChainHandler::new_with_filters_and_access_logs(
+            filters,
+            terminal_factory,
+            hcm.route_table.clone(),
+            hcm.generate_request_id,
+            hcm.use_remote_address,
+            hcm.xff_num_trusted_hops,
+            &hcm.access_logs,
+        )
+        .map_err(|e| HttpFilterChainBuildError {
+            context: context.to_string(),
+            reason: format!("failed to build filter chain: {e}"),
+        })?,
+    ))
+}
+
+/// Everything [`run_terminal_filter`] needs beyond `stream`/`filter`/
+/// `snapshot` -- WP-10 h2's new `codec` field is what pushed the plain
+/// parameter list over clippy's `too_many_arguments` threshold; bundled here
+/// rather than adding an 8th positional parameter (same motivation
+/// [`WorkerShared`]/[`ListenerCaches`] document for their own bundling).
+struct RunTerminalFilterCtx<'a> {
+    registry: &'a ConnectionRegistry,
+    shutdown: watch::Receiver<bool>,
+    name: &'a ListenerName,
+    // Rust note: `Copy`, so it threads cheaply -- also doubles as `peer` for
+    // the tracing calls below via `downstream.remote`.
+    downstream: DownstreamInfo,
+    // WP-10 h2: which codec to drive the `Http` terminal filter with --
+    // always `Http1` on the plaintext call site, ALPN-derived on the TLS one
+    // (see `downstream_codec_for_alpn`). Ignored by the `TcpProxy`/`None`
+    // arms below, which have no HTTP codec to pick.
+    codec: DownstreamCodec,
+}
+
+/// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy` and
+/// `Http` paths this registers the connection guard and runs to completion,
+/// consuming `stream` and returning `None`. On the no-filter path it logs and
+/// hands `stream` back so the caller can decide how to close it (a plaintext
+/// `TcpStream` can be `reset`; a `TlsStream` is just dropped -- see the call
+/// sites).
+async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + 'static>(
+    stream: IO,
+    filter: Option<TerminalFilter>,
+    snapshot: Arc<ConfigSnapshot>,
+    ctx: RunTerminalFilterCtx<'_>,
+) -> Option<IO> {
+    let RunTerminalFilterCtx {
+        registry,
+        mut shutdown,
+        name,
+        downstream,
+        codec,
+    } = ctx;
+    let peer = downstream.remote;
+    match filter {
+        Some(TerminalFilter::TcpProxy(params)) => {
+            let guard = registry.register();
+            tcp_proxy::proxy_connection(stream, snapshot, params, guard, shutdown).await;
+            None
+        }
+        Some(TerminalFilter::Http(handler)) => {
+            // Held for the whole HTTP connection's lifetime -- same role as
+            // `tcp_proxy`'s guard above -- so drain accounting sees this
+            // connection as live until the codec returns.
+            let _guard = registry.register();
+
+            // Rust note: `serve_http1` wants an `impl Future<Output = ()>`,
+            // not a `watch::Receiver` directly (it's decoupled from
+            // proxy-core's drain machinery on purpose -- see its doc
+            // comment). `changed()` only ever resolves once in practice (the
+            // sender flips `false` -> `true` exactly once, at drain time),
+            // but the loop guards against spurious/duplicate notifications
+            // rather than assuming that.
+            let shutdown_fut = async move {
+                if *shutdown.borrow() {
+                    return;
+                }
+                while shutdown.changed().await.is_ok() {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+            };
+
+            match codec {
+                DownstreamCodec::Http1 => {
+                    let options = Http1Options { keep_alive: true };
+                    if let Err(err) =
+                        serve_http1(stream, handler, options, shutdown_fut, downstream).await
+                    {
+                        tracing::debug!(listener = %name, peer = %peer, error = %err, "http/1.1 connection ended with an error");
+                    }
+                }
+                DownstreamCodec::Http2 => {
+                    if let Err(err) = serve_http2(stream, handler, shutdown_fut, downstream).await {
+                        tracing::debug!(listener = %name, peer = %peer, error = %err, "http/2 connection ended with an error");
+                    }
+                }
+            }
+            None
+        }
+        None => {
+            tracing::debug!(listener = %name, peer = %peer, "matched chain has no terminal filter; resetting connection");
+            Some(stream)
+        }
+    }
+}
+
+/// Reset a connection with a TCP RST (via `SO_LINGER(0)`) instead of a clean
+/// FIN close -- Envoy's behavior on a `filter_chain_match` miss or an
+/// un-serviceable TLS chain.
+fn reset(stream: &TcpStream, listener: &str) {
+    if let Err(err) = SockRef::from(stream).set_linger(Some(Duration::ZERO)) {
+        tracing::warn!(listener = %listener, error = %err, "failed to set SO_LINGER for reset-close");
+    }
+    // `stream` is dropped by the caller (it owns it); the linger option we
+    // just set is what turns that drop into an RST.
+}
+
+/// Reconcile `bound` against `snapshot`: bind new listeners, rebind ones
+/// whose address changed, leave unchanged ones alone, and stop accepting on
+/// ones that were removed.
+fn reconcile(
+    snapshot: &Arc<ConfigSnapshot>,
+    bound: &mut HashMap<ListenerName, BoundListener>,
+    config: &Arc<WorkerConfigHandle>,
+    registry: &ConnectionRegistry,
+    shutdown: &watch::Receiver<bool>,
+    cluster_manager: &Arc<ClusterManager>,
+) {
+    let shared = WorkerShared {
+        config,
+        registry,
+        shutdown,
+        cluster_manager,
+    };
+    // Removed: present in `bound`, absent from the new snapshot. Stop
+    // accepting; established connections under the old listener keep their
+    // own `Arc<ConfigSnapshot>` clone and drain independently (v1 "full
+    // listener replace + drain" semantics -- no partial in-place chain
+    // surgery on live connections).
+    let removed: Vec<ListenerName> = bound
+        .keys()
+        .filter(|name| !snapshot.listeners.contains_key(*name))
+        .cloned()
+        .collect();
+    for name in removed {
+        if let Some(b) = bound.remove(&name) {
+            tracing::info!(listener = %name, "listener removed from config; no longer accepting (existing connections drain independently)");
+            b.task.abort();
+        }
+    }
+
+    for (name, listener_ir) in snapshot.listeners.iter() {
+        if !listener_ir.bind_to_port {
+            // Envoy only uses such listeners via internal redirection
+            // (`internal_listener`); we don't implement that, so we simply
+            // never bind or accept for them.
+            tracing::debug!(listener = %name, "bind_to_port=false; not binding");
+            continue;
+        }
+
+        match bound.get(name) {
+            Some(existing) if existing.addr == listener_ir.address => {
+                // Unchanged address: leave the accept loop running. It
+                // reloads the snapshot per accepted connection (see
+                // `spawn_accept_loop`), so filter-chain changes on this
+                // listener take effect for new connections without a rebind.
+            }
+            Some(existing) => {
+                tracing::info!(listener = %name, old_addr = %existing.addr, new_addr = %listener_ir.address, "listener address changed; rebinding");
+                existing.task.abort();
+                bind_and_spawn(name.clone(), listener_ir, snapshot.version, bound, &shared);
+            }
+            None => {
+                bind_and_spawn(name.clone(), listener_ir, snapshot.version, bound, &shared);
+            }
+        }
+    }
+}
+
+/// Runs for the rest of a worker's lifetime: reconciles `bound` (already
+/// populated by a prior, fallible [`initial_bind`] call) against each new
+/// snapshot the control runtime publishes (`config_ping`), until `shutdown`
+/// fires -- at which point every accept loop is aborted and this returns.
+///
+/// Rust note: the split between `initial_bind` (fallible, run first, can
+/// report a fatal startup error) and this function (infallible from here on
+/// -- reconcile-time bind failures are logged and skipped, not fatal) is
+/// deliberate. Callers that care about startup failing loudly (`crates/proxy`
+/// `serve()`) call `initial_bind` themselves and only reach this function on
+/// success.
+///
+/// Established connections are unaffected by any of this: they hold their
+/// own `Arc<ConfigSnapshot>` and their own task, independent of the accept
+/// loop that spawned them.
+pub async fn run_listener_manager(
+    mut bound: HashMap<ListenerName, BoundListener>,
+    config: Arc<WorkerConfigHandle>,
+    mut config_ping: watch::Receiver<SnapshotVersion>,
+    mut shutdown: watch::Receiver<bool>,
+    registry: ConnectionRegistry,
+    cluster_manager: Arc<ClusterManager>,
+) {
+    loop {
+        tokio::select! {
+            changed = config_ping.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let snapshot = config.load();
+                reconcile(&snapshot, &mut bound, &config, &registry, &shutdown, &cluster_manager);
+            }
+            _ = shutdown.changed() => {
+                break;
+            }
+        }
+    }
+
+    for (_, bound_listener) in bound.drain() {
+        bound_listener.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::run_local;
+    use proxy_config::ir::{
+        FilterChainMatch, FilterChainSpec, ListenerConfig as IrListenerConfig, SourceType,
+    };
+    use std::collections::BTreeMap;
+    use std::io::ErrorKind;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as TokioTcpListener;
+    use tokio::net::TcpStream;
+
+    use crate::tls::UpstreamTlsFactory;
+    use proxy_config::ir::{
+        ClusterConfig, ClusterKind, DataSourceIR, DiscoveryType, DownstreamTlsSpec, EndpointIR,
+        LbPolicy, TcpProxyConfig, TlsCertificateIR, TlsParametersIR, TlsVersion, UpstreamTlsSpec,
+    };
+    use rcgen::{CertificateParams, DnType, KeyPair};
+
+    /// Rust note: standard "reserve an ephemeral port, then reuse the
+    /// number" technique for tests that need a fixed port ahead of time --
+    /// bind on port 0, read back whatever the OS assigned, then drop the
+    /// listener so the port is free again. There's a small window where
+    /// another process could grab it first; acceptable for tests.
+    async fn free_port() -> u16 {
+        let l = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    /// A `tcp_proxy` filter targeting `cluster`, no idle timeout, a single
+    /// connect attempt -- the minimal filter every "held open" fixture below
+    /// needs now that empty filter lists no longer hold a connection open
+    /// (WP-09: a chain with no terminal filter is reset, matching Envoy/the
+    /// lowering-time non-empty-filters invariant).
+    fn tcp_proxy_filter(cluster: &str) -> NetworkFilterSpec {
+        tcp_proxy_filter_with_idle(cluster, None)
+    }
+
+    fn tcp_proxy_filter_with_idle(
+        cluster: &str,
+        idle_timeout: Option<Duration>,
+    ) -> NetworkFilterSpec {
+        NetworkFilterSpec::TcpProxy(TcpProxyConfig {
+            stat_prefix: "test".to_string(),
+            cluster: cluster.to_string(),
+            idle_timeout,
+            max_connect_attempts: 1,
+        })
+    }
+
+    /// A minimal `http_connection_manager` filter -- an empty route table (no
+    /// virtual hosts) and no http_filters. Since WP-13, the terminal is a
+    /// real [`proxy_http::router::RouterHandler`], so a request against this
+    /// empty table always takes the `NoVirtualHost` path (404) -- see
+    /// `hcm_terminal_filter_serves_http_over_the_real_socket`, which exists
+    /// to prove HTTP is served over the real socket at all, not any
+    /// particular route outcome.
+    fn hcm_filter() -> NetworkFilterSpec {
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: Arc::new(
+                proxy_config::ir::RouteTable::new(
+                    "test-routes".to_string(),
+                    vec![],
+                    BTreeMap::new(),
+                )
+                .expect("empty route table can't have duplicate domains"),
+            ),
+            http_filters: vec![],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
+            access_logs: vec![],
+        })
+    }
+
+    /// A one-vhost, one-route table matching every request (`*` domain,
+    /// empty-prefix path) with a `DirectResponse` action -- the router
+    /// terminal synthesizes this response itself, no cluster/upstream
+    /// involved. Used by `hcm_filter_chain_mutates_headers_over_the_real_socket`
+    /// to prove the header-mutation filter's mutation survives the real
+    /// router terminal (as opposed to the WP-13 acceptance test below, which
+    /// proves the `Forward` path to a real upstream).
+    fn direct_response_route_table(status: u16) -> Arc<proxy_config::ir::RouteTable> {
+        use proxy_config::ir::{
+            PathMatch, RouteActionIR, RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
+        };
+        Arc::new(
+            RouteTable::new(
+                "test-routes".to_string(),
+                vec![VirtualHostIR {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Arc::new(RouteEntry {
+                        name: None,
+                        matcher: RouteMatcher {
+                            path: PathMatch::Prefix(String::new()),
+                            case_sensitive: true,
+                            headers: vec![],
+                        },
+                        action: RouteActionIR::DirectResponse { status, body: None },
+                        request_headers_to_add: vec![],
+                        typed_per_filter_config: BTreeMap::new(),
+                        route_index: 0,
+                    })],
+                    typed_per_filter_config: BTreeMap::new(),
+                }],
+                BTreeMap::new(),
+            )
+            .expect("single vhost can't have duplicate domains"),
+        )
+    }
+
+    /// An `http_connection_manager` filter whose `http_filters` chain is the
+    /// built-in [`crate::header_mutation_filter`] followed by the terminal
+    /// router -- what actually exercises the `FilterRegistry` ->
+    /// `FilterChainHandler` wiring end to end (see
+    /// `hcm_filter_chain_mutates_headers_over_the_real_socket` below). The
+    /// route table is [`direct_response_route_table`] (200), so the real
+    /// router terminal produces a response for the header-mutation encode
+    /// filter to mutate -- WP-13 replaced the fixed-200 stub this used to
+    /// exercise.
+    fn hcm_filter_with_header_mutation(header_name: &str, header_value: &str) -> NetworkFilterSpec {
+        use crate::header_mutation_filter::{header_value_option, TYPE_URL};
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: direct_response_route_table(200),
+            http_filters: vec![
+                proxy_config::ir::HttpFilterSpec {
+                    name: "llmproxy.header_mutation".to_string(),
+                    type_url: TYPE_URL.to_string(),
+                    config: Some(header_value_option(header_name, header_value)),
+                    is_router: false,
+                },
+                proxy_config::ir::HttpFilterSpec {
+                    name: "envoy.filters.http.router".to_string(),
+                    type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                        .to_string(),
+                    config: None,
+                    is_router: true,
+                },
+            ],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
+            access_logs: vec![],
+        })
+    }
+
+    /// A single match-all-chain listener whose sole filter is `filter` --
+    /// the general form [`match_all_listener`] delegates to for the common
+    /// (idle-timeout-less `tcp_proxy`) case.
+    fn match_all_listener_with_filter(
+        name: &str,
+        addr: SocketAddr,
+        filter: NetworkFilterSpec,
+    ) -> IrListenerConfig {
+        IrListenerConfig {
+            name: name.to_string(),
+            address: addr,
+            filter_chains: vec![FilterChainSpec {
+                name: Some("default".to_string()),
+                match_criteria: FilterChainMatch::default(),
+                transport_socket: None,
+                filters: vec![filter],
+            }],
+            default_filter_chain: None,
+            listener_filters: vec![],
+            per_connection_buffer_limit_bytes: 1024 * 1024,
+            tcp_backlog_size: None,
+            bind_to_port: true,
+        }
+    }
+
+    /// A STATIC cluster with a single priority-0 endpoint at `addr`.
+    fn static_cluster(name: &str, addr: SocketAddr) -> ClusterConfig {
+        ClusterConfig {
+            name: name.to_string(),
+            discovery: DiscoveryType::Static,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints: vec![EndpointIR {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                weight: 1,
+                priority: 0,
+            }],
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1024 * 1024,
+            circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+        }
+    }
+
+    /// Accept connections on an ephemeral port forever and hold each one open
+    /// without reading or writing -- a stand-in upstream for tests that only
+    /// care whether the *downstream* side of a `tcp_proxy`'d connection stays
+    /// open (matching the old drain-and-discard stub's observable behavior),
+    /// not about what flows over the wire.
+    async fn spawn_holding_upstream() -> SocketAddr {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        tokio::task::spawn_local(async move {
+                            let _stream = stream; // held for the task's lifetime
+                            std::future::pending::<()>().await;
+                        });
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        addr
+    }
+
+    /// Accept connections forever and echo back whatever's read, byte for
+    /// byte, until the peer closes -- the default WP-09 upstream fixture for
+    /// tests that actually push data through the pump.
+    async fn spawn_echo_upstream() -> SocketAddr {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::task::spawn_local(async move {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn snapshot_with(listener: IrListenerConfig, version: u64) -> Arc<ConfigSnapshot> {
+        Arc::new(ConfigSnapshot {
+            listeners: HashMap::from([(listener.name.clone(), Arc::new(listener))]),
+            version: SnapshotVersion(version),
+            ..Default::default()
+        })
+    }
+
+    /// Like [`snapshot_with`], plus a cluster map -- needed by any fixture
+    /// whose matched chain actually dispatches to `tcp_proxy` at runtime.
+    fn snapshot_with_cluster(
+        listener: IrListenerConfig,
+        cluster: ClusterConfig,
+        version: u64,
+    ) -> Arc<ConfigSnapshot> {
+        Arc::new(ConfigSnapshot {
+            listeners: HashMap::from([(listener.name.clone(), Arc::new(listener))]),
+            clusters: HashMap::from([(cluster.name.clone(), Arc::new(cluster))]),
+            version: SnapshotVersion(version),
+            ..Default::default()
+        })
+    }
+
+    fn match_all_listener(name: &str, addr: SocketAddr, cluster: &str) -> IrListenerConfig {
+        match_all_listener_with_filter(name, addr, tcp_proxy_filter(cluster))
+    }
+
+    fn sni_only_listener(name: &str, addr: SocketAddr, cluster: &str) -> IrListenerConfig {
+        IrListenerConfig {
+            name: name.to_string(),
+            address: addr,
+            filter_chains: vec![FilterChainSpec {
+                name: Some("sni-only".to_string()),
+                match_criteria: FilterChainMatch {
+                    server_names: vec!["example.com".to_string()],
+                    source_type: SourceType::Any,
+                    ..Default::default()
+                },
+                transport_socket: None,
+                filters: vec![tcp_proxy_filter(cluster)],
+            }],
+            default_filter_chain: None,
+            listener_filters: vec![],
+            per_connection_buffer_limit_bytes: 1024 * 1024,
+            tcp_backlog_size: None,
+            bind_to_port: true,
+        }
+    }
+
+    /// Same match criteria as [`sni_only_listener`], but with a `tls_inspector`
+    /// listener filter -- the only thing that lets `server_names` matching
+    /// actually see the ClientHello's SNI (WP-08 chunk C2).
+    fn sni_only_listener_with_tls_inspector(
+        name: &str,
+        addr: SocketAddr,
+        cluster: &str,
+    ) -> IrListenerConfig {
+        IrListenerConfig {
+            listener_filters: vec![proxy_config::ir::ListenerFilterSpec::TlsInspector(
+                proxy_config::ir::TlsInspectorConfig::default(),
+            )],
+            ..sni_only_listener(name, addr, cluster)
+        }
+    }
+
+    /// Drive a `rustls::ClientConnection` far enough to produce its first
+    /// flight (the ClientHello) without touching the network, and hand back
+    /// the raw bytes it would have written to the wire. Same technique as
+    /// `tls_inspector`'s own unit tests.
+    fn client_hello_bytes(server_name: &str) -> Vec<u8> {
+        let root_store = rustls::RootCertStore::empty();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let server_name: rustls::pki_types::ServerName<'static> =
+            server_name.to_string().try_into().unwrap();
+        let mut conn =
+            rustls::ClientConnection::new(std::sync::Arc::new(config), server_name).unwrap();
+        let mut bytes = Vec::new();
+        conn.write_tls(&mut bytes).unwrap();
+        bytes
+    }
+
+    struct Harness {
+        config: Arc<WorkerConfigHandle>,
+        config_tx: watch::Sender<SnapshotVersion>,
+        shutdown_tx: watch::Sender<bool>,
+        registry: ConnectionRegistry,
+        manager: tokio::task::JoinHandle<()>,
+    }
+
+    /// Builds a [`ClusterManager`] populated (and force-initialized, so
+    /// `pick_host` never has to wait on real DNS) from `snapshot`'s cluster
+    /// map -- the same manager both the `tcp_proxy` fixtures' listener wiring
+    /// and (WP-13) the HTTP router's `RouterHandler` see.
+    async fn cluster_manager_for(snapshot: &ConfigSnapshot) -> Arc<ClusterManager> {
+        let manager = Arc::new(ClusterManager::new(
+            Arc::new(proxy_cluster::resolver::TokioResolver),
+            crate::tls::transport_socket_builder(),
+        ));
+        manager.update_from_snapshot(&snapshot.clusters).await;
+        for name in snapshot.clusters.keys() {
+            manager.force_initialize(name);
+        }
+        manager
+    }
+
+    async fn spawn_manager(initial: Arc<ConfigSnapshot>) -> Harness {
+        let config = Arc::new(WorkerConfigHandle::new(initial.clone()));
+        let (config_tx, config_rx) = watch::channel(initial.version);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = ConnectionRegistry::new();
+        let cluster_manager = cluster_manager_for(&initial).await;
+
+        let bound = initial_bind(&initial, &config, &registry, &shutdown_rx, &cluster_manager)
+            .expect("initial_bind should succeed in tests");
+
+        let manager = tokio::task::spawn_local(run_listener_manager(
+            bound,
+            config.clone(),
+            config_rx,
+            shutdown_rx,
+            registry.clone(),
+            cluster_manager,
+        ));
+
+        Harness {
+            config,
+            config_tx,
+            shutdown_tx,
+            registry,
+            manager,
+        }
+    }
+
+    impl Harness {
+        fn publish(&self, snapshot: Arc<ConfigSnapshot>) {
+            self.config.store(snapshot.clone());
+            let _ = self.config_tx.send(snapshot.version);
+        }
+
+        async fn shutdown(self) {
+            let _ = self.shutdown_tx.send(true);
+            self.manager.await.expect("listener manager task panicked");
+        }
+    }
+
+    #[test]
+    fn accept_and_match_keeps_connection_open() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let listener_ir = match_all_listener("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            // Give the accept loop a moment to actually bind.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            stream.write_all(b"hello").await.unwrap();
+
+            // No EOF within ~100ms: the connection is being held open by the
+            // stub handler, not immediately closed.
+            let mut buf = [0u8; 8];
+            let result =
+                tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf)).await;
+            assert!(
+                result.is_err(),
+                "expected read to time out (connection held open), got {result:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn no_match_closes_with_reset() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = sni_only_listener("l1", addr, "unused");
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+
+            let mut buf = [0u8; 8];
+            let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
+            match result {
+                Ok(Ok(0)) => {} // clean EOF is acceptable too, platform-dependent
+                Ok(Err(err)) => {
+                    assert!(
+                        matches!(err.kind(), ErrorKind::ConnectionReset | ErrorKind::Other)
+                            || err.raw_os_error().is_some(),
+                        "expected a reset-ish error, got {err:?}"
+                    );
+                }
+                other => panic!("expected immediate EOF/reset, got {other:?}"),
+            }
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tls_inspector_sni_match_keeps_connection_open() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            let hello = client_hello_bytes("example.com");
+            stream.write_all(&hello).await.unwrap();
+
+            // Matched (SNI == example.com): held open by the stub handler.
+            let mut buf = [0u8; 8];
+            let result =
+                tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf)).await;
+            assert!(
+                result.is_err(),
+                "expected read to time out (connection held open on SNI match), got {result:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tls_inspector_sni_mismatch_closes_with_reset() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "unused");
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            let hello = client_hello_bytes("other.com");
+            stream.write_all(&hello).await.unwrap();
+
+            let mut buf = [0u8; 8];
+            let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
+            match result {
+                Ok(Ok(0)) => {} // clean EOF is acceptable too, platform-dependent
+                Ok(Err(err)) => {
+                    assert!(
+                        matches!(err.kind(), ErrorKind::ConnectionReset | ErrorKind::Other)
+                            || err.raw_os_error().is_some(),
+                        "expected a reset-ish error, got {err:?}"
+                    );
+                }
+                other => panic!("expected immediate EOF/reset, got {other:?}"),
+            }
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tls_inspector_plaintext_connection_closes_with_reset() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "unused");
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+            // Not TLS at all, so tls_inspector reports it as plaintext --
+            // the sni-only chain never matches raw_buffer connections.
+            let mut buf = [0u8; 8];
+            let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
+            match result {
+                Ok(Ok(0)) => {}
+                Ok(Err(err)) => {
+                    assert!(
+                        matches!(err.kind(), ErrorKind::ConnectionReset | ErrorKind::Other)
+                            || err.raw_os_error().is_some(),
+                        "expected a reset-ish error, got {err:?}"
+                    );
+                }
+                other => panic!("expected immediate EOF/reset, got {other:?}"),
+            }
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn chain_update_without_rebind_applies_to_new_connections_only() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let v1 = match_all_listener("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                v1,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Held connection under v1 (match-all chain).
+            let mut held = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed under v1");
+
+            // Give the accept loop a chance to actually accept and match
+            // this connection *before* publishing v2 below -- otherwise the
+            // server-side accept (which runs on this same executor) could be
+            // scheduled after the config swap and match under v2 instead,
+            // which is not what this test is exercising.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                harness.registry.live(),
+                1,
+                "held connection should be registered"
+            );
+
+            // Publish v2: same name/address, but now the only chain requires
+            // SNI -- so it never matches a raw connection. No rebind should
+            // happen (v1's accept loop keeps running).
+            let v2 = sni_only_listener("l1", addr, "unused");
+            harness.publish(snapshot_with(v2, 2));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // The connection held from before the config change stays open
+            // (it matched under v1's snapshot and its handler doesn't
+            // re-evaluate the match).
+            let mut buf = [0u8; 8];
+            let result =
+                tokio::time::timeout(Duration::from_millis(100), held.read(&mut buf)).await;
+            assert!(result.is_err(), "pre-existing connection should stay open");
+
+            // A brand new connection now observes v2's behavior: no match,
+            // closed immediately.
+            let mut fresh = TcpStream::connect(addr)
+                .await
+                .expect("connect should still succeed (socket still bound)");
+            let result = tokio::time::timeout(Duration::from_secs(1), fresh.read(&mut buf)).await;
+            match result {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => {
+                    panic!("expected new connection to observe v2's no-match close, got {other:?}")
+                }
+            }
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn listener_removal_stops_new_accepts_but_keeps_existing_open() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let v1 = match_all_listener("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                v1,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut held = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed before removal");
+
+            // See the equivalent comment in
+            // `chain_update_without_rebind_applies_to_new_connections_only`:
+            // give the accept loop a chance to accept+match this connection
+            // before the listener is removed out from under it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                harness.registry.live(),
+                1,
+                "held connection should be registered"
+            );
+
+            // Publish a snapshot with no listeners at all.
+            let snapshot_v2 = Arc::new(ConfigSnapshot {
+                version: SnapshotVersion(2),
+                ..Default::default()
+            });
+            harness.publish(snapshot_v2);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // New connect attempts fail: nothing is listening anymore.
+            let connect_result =
+                tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await;
+            match connect_result {
+                Ok(Err(_)) => {} // refused, as expected
+                Err(_) => {}     // timed out trying to connect -- also fine
+                Ok(Ok(_)) => panic!("expected connect to fail after listener removal"),
+            }
+
+            // The pre-existing connection is untouched.
+            let mut buf = [0u8; 8];
+            let result =
+                tokio::time::timeout(Duration::from_millis(100), held.read(&mut buf)).await;
+            assert!(result.is_err(), "pre-existing connection should stay open");
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-08 chunk C3: downstream TLS termination in the accept path -----
+
+    fn tls_params() -> TlsParametersIR {
+        TlsParametersIR {
+            min_version: TlsVersion::V1_2,
+            max_version: TlsVersion::V1_3,
+            cipher_suites: vec![],
+            ecdh_curves: vec![],
+        }
+    }
+
+    fn tls_cert_ir(cert: &rcgen::Certificate, key: &KeyPair) -> TlsCertificateIR {
+        TlsCertificateIR {
+            cert_chain: DataSourceIR::Inline(cert.pem()),
+            private_key: DataSourceIR::Inline(key.serialize_pem()),
+        }
+    }
+
+    /// Mint a self-signed leaf for `name` -- good enough for these tests,
+    /// which check that the *right* factory served the connection (matching
+    /// cert bytes / a completed handshake), not chain-of-trust validation
+    /// (already covered by `proxy-core/tests/tls.rs`).
+    fn mint_self_signed(name: &str) -> (rcgen::Certificate, KeyPair) {
+        let key = KeyPair::generate().expect("ecdsa keygen");
+        let mut params = CertificateParams::new(vec![name.to_string()]).expect("leaf params");
+        params.distinguished_name.push(DnType::CommonName, name);
+        let cert = params.self_signed(&key).expect("self-sign");
+        (cert, key)
+    }
+
+    fn downstream_tls_spec(cert: &rcgen::Certificate, key: &KeyPair) -> DownstreamTlsSpec {
+        DownstreamTlsSpec {
+            certificates: vec![tls_cert_ir(cert, key)],
+            params: tls_params(),
+            alpn_protocols: vec![],
+            validation: None,
+            require_client_certificate: false,
+            disable_stateless_session_resumption: false,
+        }
+    }
+
+    /// A single-chain listener (match-all) whose `transport_socket`
+    /// terminates TLS with a freshly minted self-signed cert for `cn`, plus
+    /// the `tls_inspector` listener filter (needed for chains that key on
+    /// SNI; harmless for the match-all case too).
+    fn tls_chain_listener(
+        name: &str,
+        addr: SocketAddr,
+        cn: &str,
+        cluster: &str,
+    ) -> (IrListenerConfig, rcgen::Certificate) {
+        let (cert, key) = mint_self_signed(cn);
+        let listener = IrListenerConfig {
+            listener_filters: vec![proxy_config::ir::ListenerFilterSpec::TlsInspector(
+                proxy_config::ir::TlsInspectorConfig::default(),
+            )],
+            filter_chains: vec![FilterChainSpec {
+                name: Some("tls".to_string()),
+                match_criteria: FilterChainMatch::default(),
+                transport_socket: Some(downstream_tls_spec(&cert, &key)),
+                filters: vec![tcp_proxy_filter(cluster)],
+            }],
+            ..match_all_listener(name, addr, cluster)
+        };
+        (listener, cert)
+    }
+
+    /// Two chains, each matching on a different SNI and terminating with its
+    /// own cert.
+    fn tls_dual_sni_listener(
+        name: &str,
+        addr: SocketAddr,
+        host_a: &str,
+        host_b: &str,
+    ) -> (IrListenerConfig, rcgen::Certificate, rcgen::Certificate) {
+        let (cert_a, key_a) = mint_self_signed(host_a);
+        let (cert_b, key_b) = mint_self_signed(host_b);
+        // No cluster backs either chain -- this fixture is only used to check
+        // "which cert got served"/handshake completion, which is settled
+        // before `tcp_proxy` even looks at the (nonexistent) cluster.
+        let listener = IrListenerConfig {
+            listener_filters: vec![proxy_config::ir::ListenerFilterSpec::TlsInspector(
+                proxy_config::ir::TlsInspectorConfig::default(),
+            )],
+            filter_chains: vec![
+                FilterChainSpec {
+                    name: Some("a".to_string()),
+                    match_criteria: FilterChainMatch {
+                        server_names: vec![host_a.to_string()],
+                        ..Default::default()
+                    },
+                    transport_socket: Some(downstream_tls_spec(&cert_a, &key_a)),
+                    filters: vec![tcp_proxy_filter("unused")],
+                },
+                FilterChainSpec {
+                    name: Some("b".to_string()),
+                    match_criteria: FilterChainMatch {
+                        server_names: vec![host_b.to_string()],
+                        ..Default::default()
+                    },
+                    transport_socket: Some(downstream_tls_spec(&cert_b, &key_b)),
+                    filters: vec![tcp_proxy_filter("unused")],
+                },
+            ],
+            ..match_all_listener(name, addr, "unused")
+        };
+        (listener, cert_a, cert_b)
+    }
+
+    /// A bare client-side TLS factory that sends `sni` as its SNI extension
+    /// and does no server-cert validation (these tests check "which cert got
+    /// served"/"did the handshake complete", not chain-of-trust -- that's
+    /// `proxy-core/tests/tls.rs`'s job).
+    fn client_factory_with_sni(sni: &str) -> UpstreamTlsFactory {
+        UpstreamTlsFactory::build(
+            &UpstreamTlsSpec {
+                sni: Some(sni.to_string()),
+                params: tls_params(),
+                alpn_protocols: vec![],
+                client_certificate: None,
+                validation: None,
+            },
+            "test client",
+        )
+        .expect("client factory should build")
+    }
+
+    /// Like [`client_factory_with_sni`], but with an explicit ALPN offer --
+    /// the WP-10 h2 dispatch test below needs to control exactly which
+    /// protocol the client proposes (rather than none at all), unlike every
+    /// pre-h2 TLS test in this module.
+    fn client_factory_with_alpn(sni: &str, alpns: &[&str]) -> UpstreamTlsFactory {
+        UpstreamTlsFactory::build(
+            &UpstreamTlsSpec {
+                sni: Some(sni.to_string()),
+                params: tls_params(),
+                alpn_protocols: alpns.iter().map(|s| s.to_string()).collect(),
+                client_certificate: None,
+                validation: None,
+            },
+            "test client",
+        )
+        .expect("client factory should build")
+    }
+
+    /// An `http_connection_manager` filter whose route table always returns a
+    /// fixed-status `DirectResponse` -- the WP-10 h2 dispatch test below only
+    /// cares "did the right codec (h1 vs h2) serve this connection", not
+    /// about routing, so this is deliberately simpler than
+    /// [`hcm_filter_with_header_mutation`].
+    fn hcm_filter_direct_response(status: u16) -> NetworkFilterSpec {
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: direct_response_route_table(status),
+            http_filters: vec![],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
+            access_logs: vec![],
+        })
+    }
+
+    /// WP-10 h2 -- the ALPN dispatch test, and the regression test for the
+    /// bug [`downstream_codec_for_alpn`]'s doc comment describes: before that
+    /// function existed, this listener unconditionally called `serve_http1`
+    /// regardless of what ALPN negotiated, so an operator configuring
+    /// `alpn_protocols: ["h2", ...]` on a downstream listener got a silent
+    /// protocol violation (h2 negotiated with the client, h1 framing spoken
+    /// on the wire).
+    ///
+    /// Verified at the wire-framing level rather than through a real h2
+    /// client library: `proxy-core` deliberately carries no `hyper`/
+    /// `http-body-util` dependency (see `spawn_http_upstream_chunked_json`'s
+    /// doc comment for the established reasoning, which applies here too),
+    /// so the h2 side of this test hand-writes the client connection preface
+    /// (RFC 7540 S3.5: the `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` magic plus an
+    /// empty SETTINGS frame) and asserts the server's first frame back is
+    /// itself a SETTINGS frame at stream id 0 -- something only a real h2
+    /// codec produces. `serve_http1`'s h1 parser has no notion of that
+    /// framing at all (it would either error out on the `PRI * HTTP/2.0`
+    /// request line or hang waiting for `\r\n\r\n`-terminated headers that
+    /// never come in that shape), so this genuinely discriminates the two
+    /// codecs rather than merely checking a config field was read.
+    #[test]
+    fn alpn_negotiated_protocol_selects_the_serving_codec() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let (cert, key) = mint_self_signed("alpn.example.com");
+            let mut tls_spec = downstream_tls_spec(&cert, &key);
+            tls_spec.alpn_protocols = vec!["h2".to_string(), "http/1.1".to_string()];
+            let listener_ir = IrListenerConfig {
+                filter_chains: vec![FilterChainSpec {
+                    name: Some("tls-hcm".to_string()),
+                    match_criteria: FilterChainMatch::default(),
+                    transport_socket: Some(tls_spec),
+                    filters: vec![hcm_filter_direct_response(200)],
+                }],
+                ..match_all_listener_with_filter("l1", addr, hcm_filter_direct_response(200))
+            };
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // -- h2 side: ALPN offers only "h2".
+            let tcp = TcpStream::connect(addr).await.expect("h2 connect");
+            let client_h2 = client_factory_with_alpn("alpn.example.com", &["h2"]);
+            let mut tls_h2 = client_h2
+                .wrap(tcp, "alpn.example.com")
+                .await
+                .expect("h2 ALPN handshake should complete");
+            assert_eq!(
+                tls_h2.get_ref().1.alpn_protocol(),
+                Some(&b"h2"[..]),
+                "client should have negotiated h2"
+            );
+
+            let mut preface = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
+            // An empty SETTINGS frame: 3-byte length (0), 1-byte type (0x4),
+            // 1-byte flags (0x0), 4-byte stream id (0) -- RFC 7540 S4.1/S6.5.
+            preface.extend_from_slice(&[0, 0, 0, 0x4, 0x0, 0, 0, 0, 0]);
+            tls_h2
+                .write_all(&preface)
+                .await
+                .expect("write h2 client preface");
+
+            let mut frame_header = [0u8; 9];
+            tokio::time::timeout(Duration::from_secs(2), tls_h2.read_exact(&mut frame_header))
+                .await
+                .expect("server should respond with its own frame before the timeout")
+                .expect("read server's first frame header");
+            assert_eq!(
+                frame_header[3], 0x4,
+                "server's first frame should be its own SETTINGS frame (h2 served), got: {frame_header:?}"
+            );
+            assert_eq!(
+                &frame_header[5..9],
+                &[0, 0, 0, 0],
+                "SETTINGS is a connection-level frame (stream id 0), got: {frame_header:?}"
+            );
+
+            // -- h1 side: ALPN offers only "http/1.1".
+            let tcp = TcpStream::connect(addr).await.expect("h1 connect");
+            let client_h1 = client_factory_with_alpn("alpn.example.com", &["http/1.1"]);
+            let mut tls_h1 = client_h1
+                .wrap(tcp, "alpn.example.com")
+                .await
+                .expect("http/1.1 ALPN handshake should complete");
+            assert_eq!(
+                tls_h1.get_ref().1.alpn_protocol(),
+                Some(&b"http/1.1"[..]),
+                "client should have negotiated http/1.1"
+            );
+
+            tls_h1
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), tls_h1.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected an ordinary h1 status line (http/1.1 served), got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tls_termination_handshake_completes_and_holds_connection() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let (listener_ir, _cert) = tls_chain_listener("l1", addr, "server.example.com", "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let tcp = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            let client = client_factory_with_sni("server.example.com");
+            let mut tls = client
+                .wrap(tcp, "server.example.com")
+                .await
+                .expect("TLS handshake should complete");
+
+            tls.write_all(b"hello").await.unwrap();
+
+            // No EOF within ~200ms: the handshake completed and the
+            // connection is held open by the stub handler underneath the
+            // TLS layer, exactly like the plaintext case.
+            let mut buf = [0u8; 8];
+            let result = tokio::time::timeout(Duration::from_millis(200), tls.read(&mut buf)).await;
+            assert!(
+                result.is_err(),
+                "expected read to time out (connection held open after TLS termination), got {result:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn sni_selects_matching_chain_and_serves_its_certificate() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let (listener_ir, cert_a, cert_b) =
+                tls_dual_sni_listener("l1", addr, "host-a.example.com", "host-b.example.com");
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let tcp_a = TcpStream::connect(addr).await.expect("connect (a) failed");
+            let client_a = client_factory_with_sni("host-a.example.com");
+            let tls_a = client_a
+                .wrap(tcp_a, "host-a.example.com")
+                .await
+                .expect("handshake for host-a should complete");
+            let peer_a = tls_a
+                .get_ref()
+                .1
+                .peer_certificates()
+                .expect("peer certs present")[0]
+                .as_ref()
+                .to_vec();
+            assert_eq!(
+                peer_a,
+                cert_a.der().as_ref(),
+                "SNI host-a should be served cert A"
+            );
+
+            let tcp_b = TcpStream::connect(addr).await.expect("connect (b) failed");
+            let client_b = client_factory_with_sni("host-b.example.com");
+            let tls_b = client_b
+                .wrap(tcp_b, "host-b.example.com")
+                .await
+                .expect("handshake for host-b should complete");
+            let peer_b = tls_b
+                .get_ref()
+                .1
+                .peer_certificates()
+                .expect("peer certs present")[0]
+                .as_ref()
+                .to_vec();
+            assert_eq!(
+                peer_b,
+                cert_b.der().as_ref(),
+                "SNI host-b should be served cert B"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn build_listener_tls_fails_for_bad_cert() {
+        let mut listener_ir = match_all_listener(
+            "bad-cert-listener",
+            "127.0.0.1:0".parse().unwrap(),
+            "unused",
+        );
+        listener_ir.filter_chains[0].transport_socket = Some(DownstreamTlsSpec {
+            certificates: vec![TlsCertificateIR {
+                cert_chain: DataSourceIR::Inline("not a certificate".to_string()),
+                private_key: DataSourceIR::Inline("not a key".to_string()),
+            }],
+            params: tls_params(),
+            alpn_protocols: vec![],
+            validation: None,
+            require_client_certificate: false,
+            disable_stateless_session_resumption: false,
+        });
+
+        let err = match build_listener_tls(&listener_ir) {
+            Ok(_) => panic!("garbage PEM must fail to build"),
+            Err(err) => err,
+        };
+        assert!(
+            err.context.contains("bad-cert-listener"),
+            "error should name the listener that failed: {err}"
+        );
+    }
+
+    #[test]
+    fn initial_bind_propagates_a_tls_build_failure_as_fatal() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let mut listener_ir = match_all_listener("l1", addr, "unused");
+            listener_ir.filter_chains[0].transport_socket = Some(DownstreamTlsSpec {
+                certificates: vec![TlsCertificateIR {
+                    cert_chain: DataSourceIR::Inline("garbage".to_string()),
+                    private_key: DataSourceIR::Inline("garbage".to_string()),
+                }],
+                params: tls_params(),
+                alpn_protocols: vec![],
+                validation: None,
+                require_client_certificate: false,
+                disable_stateless_session_resumption: false,
+            });
+
+            let snapshot = snapshot_with(listener_ir, 1);
+            let config = Arc::new(WorkerConfigHandle::new(snapshot.clone()));
+            let registry = ConnectionRegistry::new();
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let cluster_manager = cluster_manager_for(&snapshot).await;
+
+            let result = initial_bind(
+                &snapshot,
+                &config,
+                &registry,
+                &shutdown_rx,
+                &cluster_manager,
+            );
+            match result {
+                Err(err @ InitialBindError::Tls(_)) => {
+                    // Also asserts `Display` works end to end -- this is
+                    // exactly what `crates/proxy`'s startup path prints.
+                    assert!(err.to_string().contains("TLS config error"));
+                }
+                Err(InitialBindError::Bind { .. }) => {
+                    panic!("expected a TLS build failure, got a bind failure instead")
+                }
+                Err(InitialBindError::Http(err)) => {
+                    panic!("expected a TLS build failure, got an HTTP filter chain build failure instead: {err}")
+                }
+                Ok(_) => panic!("a bad cert must fail initial_bind, not silently bind plaintext"),
+            }
+        });
+    }
+
+    // --- WP-09: tcp_proxy runtime ------------------------------------------
+
+    #[test]
+    fn tcp_proxy_bidirectional_round_trip() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_echo_upstream().await;
+            let listener_ir = match_all_listener("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+
+            // A multi-KB payload, larger than a single TCP segment/read, to
+            // exercise the pump across several read/write cycles.
+            let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+            stream.write_all(&payload).await.unwrap();
+
+            let mut echoed = vec![0u8; payload.len()];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+                .await
+                .expect("read should not time out")
+                .expect("read_exact should succeed");
+            assert_eq!(echoed, payload, "echoed bytes should match exactly");
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tcp_proxy_large_bidirectional_transfer_does_not_deadlock() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_echo_upstream().await;
+            let listener_ir = match_all_listener("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+
+            // A payload much larger than any socket send/recv buffer, so BOTH
+            // directions apply backpressure at once (the client is pushing 8
+            // MiB up while the echo pushes 8 MiB back). A pump that serializes
+            // read+write within one direction deadlocks here -- we're parked
+            // writing to the upstream while never draining its echo, and it's
+            // parked writing the echo while never draining us. The client must
+            // therefore also read and write concurrently (split halves), or it
+            // would deadlock itself the same way.
+            let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+            let (mut read_half, mut write_half) = stream.into_split();
+
+            let writer = {
+                let payload = payload.clone();
+                tokio::task::spawn_local(async move {
+                    write_half.write_all(&payload).await.unwrap();
+                    // FIN so the echo upstream sees EOF and stops after the
+                    // last byte comes back.
+                    write_half.shutdown().await.unwrap();
+                })
+            };
+
+            let mut echoed = vec![0u8; payload.len()];
+            // Generous ceiling: a deadlock manifests as this timing out.
+            tokio::time::timeout(Duration::from_secs(20), read_half.read_exact(&mut echoed))
+                .await
+                .expect("large bidirectional transfer should not deadlock")
+                .expect("read_exact should succeed");
+            writer.await.unwrap();
+            assert_eq!(echoed, payload, "all 8 MiB should round-trip byte-exact");
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tcp_proxy_upstream_to_downstream_independent_of_client_writes() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+            // A dedicated upstream that speaks first, unprompted -- proves
+            // the upstream -> downstream direction works on its own, not
+            // just as an echo of what the client sent.
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = listener.local_addr().unwrap();
+            tokio::task::spawn_local(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let _ = stream.write_all(b"hello from upstream").await;
+                    std::future::pending::<()>().await;
+                }
+            });
+
+            let listener_ir = match_all_listener("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+
+            let mut buf = [0u8; 32];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+            assert_eq!(&buf[..n], b"hello from upstream");
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tcp_proxy_half_close_propagates_fin_without_killing_other_direction() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+            let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = listener.local_addr().unwrap();
+            tokio::task::spawn_local(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let mut received = Vec::new();
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => received.extend_from_slice(&buf[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    // Downstream's write half is closed (FIN seen): report
+                    // it, then prove the reverse direction is still usable by
+                    // sending a reply before this end closes too.
+                    let _ = eof_tx.send(received);
+                    let _ = stream.write_all(b"bye").await;
+                }
+            });
+
+            let listener_ir = match_all_listener("l1", addr, "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            stream.write_all(b"hello upstream").await.unwrap();
+            stream.shutdown().await.unwrap();
+
+            let received = tokio::time::timeout(Duration::from_secs(2), eof_rx)
+                .await
+                .expect("upstream should observe EOF promptly")
+                .expect("sender should not be dropped");
+            assert_eq!(received, b"hello upstream");
+
+            // The reverse direction is still open even though downstream's
+            // write half is closed: the client should still receive
+            // upstream's reply.
+            let mut buf = [0u8; 8];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+            assert_eq!(&buf[..n], b"bye");
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tcp_proxy_idle_timeout_closes_connection_after_inactivity() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                tcp_proxy_filter_with_idle("up", Some(Duration::from_millis(200))),
+            );
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+
+            // No traffic at all: the idle timer should close the connection
+            // well within a couple of timeout windows.
+            let mut buf = [0u8; 8];
+            let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+            match result {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => panic!("expected the connection to close after idling, got {other:?}"),
+            }
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tcp_proxy_idle_timeout_does_not_close_connection_with_active_traffic() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_echo_upstream().await;
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                tcp_proxy_filter_with_idle("up", Some(Duration::from_millis(200))),
+            );
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+
+            // Ping-pong well past the idle timeout window; each round trip
+            // resets the idle clock, so the connection must stay open the
+            // whole time.
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                stream.write_all(b"ping").await.unwrap();
+                let mut buf = [0u8; 4];
+                tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut buf))
+                    .await
+                    .expect("read should not time out while traffic is active")
+                    .expect("read_exact should succeed");
+                assert_eq!(&buf, b"ping");
+            }
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tcp_proxy_missing_cluster_closes_connection_promptly() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            // No cluster in the snapshot at all: `nonexistent` never resolves.
+            let listener_ir = match_all_listener("l1", addr, "nonexistent");
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed (the downstream accept happens regardless)");
+
+            let mut buf = [0u8; 8];
+            let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
+            match result {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => panic!("expected a prompt close for a missing cluster, got {other:?}"),
+            }
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn tcp_proxy_over_downstream_tls_round_trips() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_echo_upstream().await;
+            let (listener_ir, _cert) = tls_chain_listener("l1", addr, "server.example.com", "up");
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let tcp = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            let client = client_factory_with_sni("server.example.com");
+            let mut tls = client
+                .wrap(tcp, "server.example.com")
+                .await
+                .expect("TLS handshake should complete");
+
+            let payload = b"hello over tls tcp_proxy";
+            tls.write_all(payload).await.unwrap();
+
+            let mut echoed = vec![0u8; payload.len()];
+            tokio::time::timeout(Duration::from_secs(2), tls.read_exact(&mut echoed))
+                .await
+                .expect("read should not time out")
+                .expect("read_exact should succeed");
+            assert_eq!(echoed, payload);
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-10 deferred chunk: HCM terminal filter wired to the h1 codec ----
+
+    /// Since WP-13, `build_hcm_handler`'s terminal is a real
+    /// `proxy_http::router::RouterHandler`, not a fixed-200 stub -- an empty
+    /// route table (`hcm_filter`) means every request takes the
+    /// `NoVirtualHost` path, a 404. This test now proves HTTP is served over
+    /// the real socket *at all* (request parsed, response written back) --
+    /// see `hcm_filter_chain_mutates_headers_over_the_real_socket` for a
+    /// route that actually matches, and the WP-13 acceptance test below for
+    /// a route that forwards to a real upstream.
+    #[test]
+    fn hcm_terminal_filter_serves_http_over_the_real_socket() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = match_all_listener_with_filter("l1", addr, hcm_filter());
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            // `Connection: close` so the server (keep-alive is on by default)
+            // closes after this response instead of idling open -- lets this
+            // test read to EOF rather than needing to parse a Content-Length.
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 404"),
+                "expected a 404 status line (empty route table -> NoVirtualHost), got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    /// A listener whose HCM `http_filters` chain runs the built-in
+    /// header-mutation filter (in config order, ahead of the terminal
+    /// router) must show that filter's mutation in the actual response
+    /// bytes over a real socket -- proof that `build_hcm_handler` builds a
+    /// real `FilterChainHandler` against the shared `FilterRegistry`, with
+    /// the real `RouterHandler` (not a stub) as its terminal.
+    #[test]
+    fn hcm_filter_chain_mutates_headers_over_the_real_socket() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                hcm_filter_with_header_mutation("x-mutated-by-filter", "yes"),
+            );
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {response:?}"
+            );
+            assert!(
+                response
+                    .to_ascii_lowercase()
+                    .contains("x-mutated-by-filter: yes"),
+                "expected the header-mutation filter's header in the response, got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-13: router terminal + cluster-manager wiring -------------------
+
+    /// A one-vhost, one-route table matching every request (`*` domain,
+    /// empty-prefix path) with a `Forward` action targeting `cluster` --
+    /// the counterpart to [`direct_response_route_table`] that actually
+    /// exercises `RouterHandler::apply_forward`'s cluster-manager/pool path.
+    fn forward_route_table(cluster: &str) -> Arc<proxy_config::ir::RouteTable> {
+        use proxy_config::ir::{
+            ForwardAction, ForwardTarget, PathMatch, RouteActionIR, RouteEntry, RouteMatcher,
+            RouteTable, VirtualHostIR,
+        };
+        Arc::new(
+            RouteTable::new(
+                "test-routes".to_string(),
+                vec![VirtualHostIR {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Arc::new(RouteEntry {
+                        name: None,
+                        matcher: RouteMatcher {
+                            path: PathMatch::Prefix(String::new()),
+                            case_sensitive: true,
+                            headers: vec![],
+                        },
+                        action: RouteActionIR::Forward(ForwardAction {
+                            target: ForwardTarget::Cluster(cluster.to_string()),
+                            timeout: None,
+                            idle_timeout: None,
+                            retry_policy: None,
+                            host_rewrite_literal: None,
+                            prefix_rewrite: None,
+                        }),
+                        request_headers_to_add: vec![],
+                        typed_per_filter_config: BTreeMap::new(),
+                        route_index: 0,
+                    })],
+                    typed_per_filter_config: BTreeMap::new(),
+                }],
+                BTreeMap::new(),
+            )
+            .expect("single vhost can't have duplicate domains"),
+        )
+    }
+
+    /// Same shape as [`hcm_filter_with_header_mutation`], but its route table
+    /// forwards to a real cluster instead of synthesizing a `DirectResponse`
+    /// -- proving the router terminal actually dials an upstream, not just
+    /// that the encode filter chain runs.
+    fn hcm_filter_forward_with_header_mutation(
+        header_name: &str,
+        header_value: &str,
+        cluster: &str,
+    ) -> NetworkFilterSpec {
+        use crate::header_mutation_filter::{header_value_option, TYPE_URL};
+        NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            route_table: forward_route_table(cluster),
+            http_filters: vec![
+                proxy_config::ir::HttpFilterSpec {
+                    name: "llmproxy.header_mutation".to_string(),
+                    type_url: TYPE_URL.to_string(),
+                    config: Some(header_value_option(header_name, header_value)),
+                    is_router: false,
+                },
+                proxy_config::ir::HttpFilterSpec {
+                    name: "envoy.filters.http.router".to_string(),
+                    type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                        .to_string(),
+                    config: None,
+                    is_router: true,
+                },
+            ],
+            generate_request_id: true,
+            use_remote_address: false,
+            xff_num_trusted_hops: 0,
+            access_logs: vec![],
+        })
+    }
+
+    /// Serve a fixed 200 response (a known body, no extra headers) over real
+    /// HTTP/1.1 on a fresh ephemeral-port `TcpListener`, forever -- the "real
+    /// upstream" fixture for the WP-13 acceptance test below. Reuses
+    /// `proxy_http`'s own downstream codec + `FixedResponseHandler` stub
+    /// (exactly what `proxy-http`'s own tests use to fake an origin), so this
+    /// isn't hand-rolled wire parsing.
+    async fn spawn_http_upstream(body: &'static [u8]) -> SocketAddr {
+        use proxy_http::handler::stub::FixedResponseHandler;
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::task::spawn_local(async move {
+                    let handler: Rc<dyn StreamHandler> = Rc::new(FixedResponseHandler {
+                        status: http::StatusCode::OK,
+                        headers: http::HeaderMap::new(),
+                        body: bytes::Bytes::from_static(body),
+                    });
+                    let _ = serve_http1(
+                        stream,
+                        handler,
+                        Http1Options { keep_alive: false },
+                        std::future::pending(),
+                        DownstreamInfo::loopback(),
+                    )
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Like [`spawn_http_upstream`], but hand-writes a **chunked**
+    /// `content-type: application/json` response over the raw socket instead
+    /// of going through `serve_http1`/`FixedResponseHandler`.
+    ///
+    /// Rust note: this exists (rather than reusing `FixedResponseHandler`,
+    /// whose body is an `http_body_util::Full` -- an exact-length body) for a
+    /// load-bearing reason, not style: `Full`'s exact `size_hint()` makes
+    /// hyper stamp an explicit `content-length` on *this* fixture's own
+    /// response, which `RouterHandler` then forwards verbatim onto the
+    /// downstream response. Once that header is on the wire, hyper's h1
+    /// write-dispatcher (`Conn::can_write_body()`) stops polling our
+    /// `StreamingEncoder` the instant it has written that many bytes -- it
+    /// never issues the final empty `end_stream=true` frame the filter
+    /// manager relies on to call `finalize()`. A chunked body (no
+    /// content-length anywhere) doesn't hit that early-stop path, so the
+    /// usage filter's end-of-stream write actually happens, which is the
+    /// thing this whole test exists to observe. Writing raw chunked bytes by
+    /// hand (rather than adding a `hyper`/`http-body` dependency to build a
+    /// custom `Body` impl) keeps this fixture inside `proxy-core`'s existing
+    /// dependency set.
+    async fn spawn_http_upstream_chunked_json(body: &'static [u8]) -> SocketAddr {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::task::spawn_local(async move {
+                    // Drain the request up to the header/body separator --
+                    // we don't care about its contents, just don't want a
+                    // half-read request left sitting in the kernel buffer.
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                        body.len(),
+                        String::from_utf8_lossy(body),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// The WP-13 acceptance test: a real HTTP request is routed (via the
+    /// router terminal + `ClusterManager`) to a real upstream over HTTP/1.1,
+    /// and the response still flows back through the encode filter chain --
+    /// proving all three pieces (route match -> cluster/host pick -> upstream
+    /// codec -> encode filters) work together over real sockets.
+    ///
+    /// Mutation-tested: reverting `build_hcm_handler`'s terminal to
+    /// `FixedResponseHandler` (the pre-WP-13 stub) makes this fail, since the
+    /// stub never contacts `upstream_addr` and never emits its body.
+    #[test]
+    fn router_forwards_a_real_request_to_a_real_upstream_over_http1() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_body: &'static [u8] = b"hello from upstream";
+            let upstream_addr = spawn_http_upstream(upstream_body).await;
+
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                hcm_filter_forward_with_header_mutation("x-mutated-by-filter", "yes", "up"),
+            );
+            let harness = spawn_manager(snapshot_with_cluster(
+                listener_ir,
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(addr)
+                .await
+                .expect("connect should succeed");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {response:?}"
+            );
+            assert!(
+                response.contains("hello from upstream"),
+                "expected the real upstream's body in the response, got: {response:?}"
+            );
+            assert!(
+                response
+                    .to_ascii_lowercase()
+                    .contains("x-mutated-by-filter: yes"),
+                "expected the header-mutation filter's header in the response, got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-33a: usage filter over a real socket ---------------------------
+
+    /// Undo HTTP/1.1 chunked transfer-coding: `<hex-len>\r\n<chunk>\r\n`
+    /// repeated, terminated by a `0\r\n\r\n` end chunk (no trailers in this
+    /// fixture). Just enough of RFC 9112 section 7.1 to unwrap what
+    /// [`spawn_http_upstream_chunked_json`] -- and, transitively, the proxy's
+    /// own re-encoded response -- produce; not a general-purpose decoder.
+    fn dechunk(mut data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let line_end = data
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("chunk size line must end in CRLF");
+            let size_str =
+                std::str::from_utf8(&data[..line_end]).expect("chunk size must be ascii");
+            let size = usize::from_str_radix(size_str.trim(), 16).expect("chunk size must be hex");
+            data = &data[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(&data[..size]);
+            data = &data[size + 2..]; // skip the chunk's trailing CRLF too
+        }
+        out
+    }
+
+    /// The WP-33a acceptance test: a **YAML-shaped** bootstrap (not
+    /// hand-built IR) wires the `type.llmproxy.dev/envoy.config.core.v3.DataSource`
+    /// usage filter and a file access logger into one HCM, `build_snapshot`
+    /// lowers it exactly the way `proxy_config::load_bootstrap_file` would for
+    /// a real deployment, and the whole stack runs over real `TcpStream`s: a
+    /// real upstream emits an OpenAI-shaped JSON body, the proxy forwards it
+    /// unmodified to a real client socket, and the usage filter's extracted
+    /// token counts land in a real rendered access-log line on disk.
+    ///
+    /// Four distinct numbers (`input=20, cached=80, cache_creation=0,
+    /// output=20, total=120`) are asserted so a filter that reads the wrong
+    /// JSON field, or the extractor's cached-tokens-out-of-prompt-tokens
+    /// arithmetic regressing, cannot accidentally pass.
+    ///
+    /// Mutation-tested: see the task notes -- either dropping the
+    /// `UsageFilterFactory` registration or making `classify_body` treat
+    /// `application/json` as `Inert` makes this fail (no line is ever
+    /// written, so the bounded poll below times out).
+    #[test]
+    fn usage_filter_records_tokens_from_a_real_upstream_response() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        run_local(async {
+            let proxy_port = free_port().await;
+            let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+
+            let upstream_body: &'static [u8] = br#"{"id":"x","usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+            let upstream_addr = spawn_http_upstream_chunked_json(upstream_body).await;
+
+            let log_path = std::env::temp_dir().join(format!(
+                "llm-proxy-usage-filter-test-{}-{}.log",
+                std::process::id(),
+                proxy_port
+            ));
+            // Rust note: `Path::display()` (rather than `to_str().unwrap()`)
+            // so this doesn't panic on a hypothetical non-UTF8 temp dir --
+            // the resulting YAML string just needs *a* path, not a lossless
+            // round trip of the OS path type.
+            let log_path_str = log_path.display().to_string();
+
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {proxy_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.usage
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                      inline_string: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: up }}
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: {log_path_str}
+                      log_format:
+                        text_format: "%LLM_INPUT_TOKENS% %LLM_CACHED_TOKENS% %LLM_CACHE_CREATION_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_TOTAL_TOKENS% %LLM_TTFT%\n"
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {upstream_ip}, port_value: {upstream_port} }}
+"#,
+                proxy_port = proxy_port,
+                log_path_str = log_path_str,
+                upstream_ip = upstream_addr.ip(),
+                upstream_port = upstream_addr.port(),
+            );
+
+            let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+                .expect("bootstrap YAML must parse");
+            let snapshot = Arc::new(build_snapshot(&loaded).expect("bootstrap YAML must lower"));
+
+            let harness = spawn_manager(snapshot).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(proxy_addr)
+                .await
+                .expect("connect should succeed");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let header_end = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response must have a header/body separator");
+            let status_line = String::from_utf8(response[..header_end].to_vec())
+                .expect("headers should be valid utf8");
+            assert!(
+                status_line.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {status_line:?}"
+            );
+            let raw_body = &response[header_end + 4..];
+            // The proxy's own response is chunked too (nothing downstream of
+            // the filter chain re-adds a `content-length`, for the same
+            // reason `spawn_http_upstream_chunked_json` sends one upstream),
+            // so unwrap the chunk framing before comparing against the
+            // upstream's raw body.
+            let response_body = dechunk(raw_body);
+            assert_eq!(
+                response_body, upstream_body,
+                "the usage filter observes the body -- it must never alter or truncate it"
+            );
+
+            harness.shutdown().await;
+
+            // FileSink flushes per line, but the write races the harness
+            // shutdown returning, so poll briefly instead of asserting on
+            // the first read.
+            let mut logged = String::new();
+            for attempt in 0..20 {
+                logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if !logged.trim().is_empty() {
+                    break;
+                }
+                assert!(
+                    attempt < 19,
+                    "access-log file at {log_path_str} was never written"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let line = logged.trim();
+            let fields: Vec<&str> = line.split(' ').collect();
+            assert_eq!(
+                fields.len(),
+                6,
+                "expected 6 space-separated fields, got: {line:?}"
+            );
+            // input=20, cached=80, cache_creation=0, output=20, total=120 --
+            // four distinct values, so a wrong-field extraction bug can't
+            // accidentally pass.
+            assert_eq!(&fields[0..5], &["20", "80", "0", "20", "120"]);
+            assert_ne!(
+                fields[5], "-",
+                "time-to-first-byte must be populated for a real streamed response"
+            );
+
+            let _ = std::fs::remove_file(&log_path);
+        });
+    }
+
+    /// WP-33 acceptance criterion 3: an invalid per-route usage dialect must
+    /// be a build error, even when the `typed_per_filter_config` entry is
+    /// wrapped `is_optional: true`. `is_optional` only tolerates a filter
+    /// that has *no* per-route config at all (`ConfigError::Unimplemented`,
+    /// the `HttpFilterFactory::parse_per_route` default) -- see
+    /// `filter_manager::resolve_per_filter_row`. A malformed dialect string
+    /// is a different failure (`ConfigError::InvalidValue`) and must not be
+    /// swallowed, or a typo'd per-route dialect would silently fall back to
+    /// the listener-level one and meter with the wrong dialect.
+    ///
+    /// This test builds the bootstrap YAML with `parse_bootstrap` +
+    /// `build_snapshot` exactly like
+    /// `usage_filter_records_tokens_from_a_real_upstream_response` above --
+    /// `build_snapshot` accepts the config (the dialect string is opaque at
+    /// lowering time; `PerFilterConfig` just carries the decoded `Any`
+    /// verbatim). The rejection only happens when the filter chain is built
+    /// against the real registered factories, so this test drives
+    /// `build_listener_hcm` directly instead of spawning a listener over a
+    /// real socket -- no `run_local`, no network, no upstream, no access log.
+    ///
+    /// Mutation-tested: changing `filter_manager::resolve_per_filter_row`'s
+    /// `Err(ConfigError::Unimplemented { .. }) if cfg.is_optional => continue`
+    /// arm to `Err(_) if cfg.is_optional => continue` turns this test red
+    /// (the build wrongly succeeds instead of erroring) -- see the task notes
+    /// for the exact mutation and restore procedure.
+    #[test]
+    fn an_invalid_per_route_usage_dialect_fails_the_build_even_when_optional() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.usage
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                      inline_string: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: up }
+                          typed_per_filter_config:
+                            llmproxy.usage:
+                              "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
+                              is_optional: true
+                              config:
+                                "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                                inline_string: gemini
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+"#;
+
+        let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+            .expect("bootstrap YAML must parse");
+        let snapshot = build_snapshot(&loaded)
+            .expect("bootstrap YAML must lower -- the dialect string is opaque at this stage");
+
+        let listener_ir = snapshot.listeners.get("l1").expect("listener l1");
+        // No clusters need to be registered for the filter chain to build --
+        // route -> cluster resolution happens per-request, not at build time.
+        let cluster_manager = Arc::new(ClusterManager::new(
+            Arc::new(proxy_cluster::resolver::TokioResolver),
+            crate::tls::transport_socket_builder(),
+        ));
+
+        let err = match build_listener_hcm(listener_ir, &cluster_manager) {
+            Ok(_) => panic!("an invalid per-route dialect must fail the build, is_optional or not"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typed_config.inline_string") || msg.contains("gemini"),
+            "error should name the invalid dialect field/value, got: {msg}"
+        );
+    }
+
+    // --- WP-45 increment 2b: body-rewrite filter over a real socket -----------
+
+    /// A real upstream that reads a raw HTTP/1.1 request by hand, echoes the
+    /// request body back as its own response body, and reports two numbers
+    /// as response headers: the `content-length` the request DECLARED, and
+    /// the number of body bytes it actually READ off the wire. WP-45
+    /// increment 2's whole point is that those two numbers must agree after
+    /// the body-rewrite filter splices bytes in and grows `content-length`
+    /// to match -- a unit test can't observe that, since it never puts real
+    /// bytes on a real socket with real HTTP/1.1 framing.
+    async fn spawn_http_upstream_echoing_request_body() -> SocketAddr {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                tokio::task::spawn_local(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let header_end = loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    break pos;
+                                }
+                            }
+                        }
+                    };
+                    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let declared_content_length: usize = header_str
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .expect(
+                            "this fixture only serves the content-length code path -- \
+                             the request must declare one",
+                        );
+
+                    let mut body = buf[header_end + 4..].to_vec();
+                    while body.len() < declared_content_length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let actual_body_length = body.len();
+
+                    // Per HTTP/1.1 framing this fixture stops reading the
+                    // instant it's read exactly `declared_content_length`
+                    // bytes -- that's the correct, honest behavior of a real
+                    // upstream. If the proxy actually put MORE bytes on the
+                    // wire than it declared (the exact failure mode of
+                    // skipping the content-length fix-up after an
+                    // injection), those extra bytes are still sitting
+                    // unread in the kernel receive buffer right now. A short
+                    // bounded probe surfaces them as `leftover_bytes`; a
+                    // healthy request always has zero.
+                    let mut leftover = Vec::new();
+                    loop {
+                        match tokio::time::timeout(
+                            Duration::from_millis(100),
+                            stream.read(&mut chunk),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(n)) => leftover.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let leftover_bytes = leftover.len();
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nx-received-content-length: {declared_content_length}\r\nx-actual-body-length: {actual_body_length}\r\nx-leftover-bytes: {leftover_bytes}\r\nconnection: close\r\n\r\n",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// The WP-45 increment 2 acceptance test: a bootstrap YAML wires the
+    /// `type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag`
+    /// body-rewrite filter ahead of the router, a streaming OpenAI request
+    /// WITHOUT `stream_options` is sent over a real socket, and the request
+    /// the upstream actually received on the wire is asserted to (a) equal
+    /// the original body with `stream_options` spliced in, byte for byte,
+    /// and (b) leave nothing unread on the wire (`x-leftover-bytes: 0`) --
+    /// proving the splice and the `modify_decoded_headers` content-length
+    /// fix-up landed together, not just that the scanner/splice logic is
+    /// correct in isolation (that's `body_rewrite_filter`'s own unit tests).
+    ///
+    /// Mutation-tested: skipping the `modify_decoded_headers` call (so
+    /// `content-length` stays at the pre-injection length while the actual
+    /// body sent is longer) turns this red -- the fixture, obeying real
+    /// HTTP/1.1 framing, stops reading at the stale (too-small) declared
+    /// length, so the extra injected bytes are left sitting unread
+    /// (`x-leftover-bytes` > 0) and the echoed body no longer matches the
+    /// expected spliced body. A first version of this test only compared
+    /// `x-received-content-length` against how many bytes the fixture itself
+    /// chose to read up to that same declared length -- trivially equal by
+    /// construction, so it never actually caught this mutation; the
+    /// `x-leftover-bytes` probe and the exact-body comparison below are what
+    /// make it load-bearing.
+    #[test]
+    fn body_rewrite_filter_injects_and_fixes_content_length_over_a_real_upstream() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        run_local(async {
+            let proxy_port = free_port().await;
+            let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+
+            let upstream_addr = spawn_http_upstream_echoing_request_body().await;
+
+            let request_body =
+                br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {proxy_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.body_rewrite
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag
+                      default_value: true
+                      runtime_key: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: up }}
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {upstream_ip}, port_value: {upstream_port} }}
+"#,
+                proxy_port = proxy_port,
+                upstream_ip = upstream_addr.ip(),
+                upstream_port = upstream_addr.port(),
+            );
+
+            let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+                .expect("bootstrap YAML must parse");
+            let snapshot = Arc::new(build_snapshot(&loaded).expect("bootstrap YAML must lower"));
+
+            let harness = spawn_manager(snapshot).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut stream = TcpStream::connect(proxy_addr)
+                .await
+                .expect("connect should succeed");
+            let request = format!(
+                "POST / HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                request_body.len(),
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(request_body).await.unwrap();
+
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+
+            let header_end = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response must have a header/body separator");
+            let status_line_and_headers =
+                String::from_utf8(response[..header_end].to_vec()).expect("headers valid utf8");
+            assert!(
+                status_line_and_headers.starts_with("HTTP/1.1 200"),
+                "expected a 200 status line, got: {status_line_and_headers:?}"
+            );
+
+            let header_value = |name: &str| -> usize {
+                status_line_and_headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        if key.trim().eq_ignore_ascii_case(name) {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("upstream must report {name}"))
+            };
+            let received_content_length = header_value("x-received-content-length");
+            let actual_body_length = header_value("x-actual-body-length");
+            let leftover_bytes = header_value("x-leftover-bytes");
+
+            assert_eq!(
+                received_content_length, actual_body_length,
+                "the upstream's declared content-length must match the body bytes it actually read \
+                 up to that length (this alone is true by construction -- see the doc comment on \
+                 why the assertions below are the ones that actually catch a broken fix-up)"
+            );
+            assert_eq!(
+                leftover_bytes, 0,
+                "no bytes should be left unread on the wire past the declared content-length -- \
+                 a nonzero count means the proxy put more bytes on the wire than it declared"
+            );
+
+            let echoed_body = &response[header_end + 4..];
+            let inject = r#""stream_options":{"include_usage":true},"#;
+            let mut expected_body = Vec::with_capacity(request_body.len() + inject.len());
+            expected_body.extend_from_slice(&request_body[..1]);
+            expected_body.extend_from_slice(inject.as_bytes());
+            expected_body.extend_from_slice(&request_body[1..]);
+            assert_eq!(
+                echoed_body, expected_body,
+                "the upstream must have received the original body with stream_options spliced \
+                 in right after the opening `{{`, byte for byte"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    // --- WP-34 increment 2: token limiter over real sockets ------------------
+
+    /// The WP-34 increment 2 acceptance test: a bootstrap wires
+    /// `llmproxy.token_limit` BEFORE `llmproxy.usage` (see
+    /// `token_limit_filter`'s module doc for why the order matters), a real
+    /// upstream reports a fixed, known token usage on every response, and a
+    /// tiny budget (100 tokens) is exhausted by the first request's actual
+    /// 120-token usage. Two sequential requests, each its own real socket:
+    /// the first gets 200 (the budget starts empty), the second gets 429
+    /// with the rate-limit headers -- proving the second is refused *because
+    /// of tokens the first actually spent*, which is the whole feature and
+    /// something no unit test (which drives `BudgetStore` or the filter
+    /// callbacks directly, never a real end-to-end usage->record->check
+    /// loop through two independent HTTP exchanges) can prove.
+    ///
+    /// Mutation-tested: see the task notes -- reordering the two filters (so
+    /// `llmproxy.usage` runs before `llmproxy.token_limit` in config order)
+    /// makes this fail (both requests come back 200, since the limiter's
+    /// encode callback then runs before the usage filter's and never
+    /// observes the usage it's supposed to record).
+    #[test]
+    fn token_limit_filter_denies_the_second_request_after_the_first_spends_its_budget() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        run_local(async {
+            let proxy_port = free_port().await;
+            let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+
+            // input=20 (100 prompt - 80 cached), cached=80, cache_creation=0,
+            // output=20 -- total=120, same fixture shape as
+            // `usage_filter_records_tokens_from_a_real_upstream_response`.
+            let upstream_body: &'static [u8] = br#"{"id":"x","usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+            let upstream_addr = spawn_http_upstream_chunked_json(upstream_body).await;
+
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {proxy_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: test
+                http_filters:
+                  - name: llmproxy.token_limit
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings
+                      max_tokens: 100
+                      fill_rate: 0.001
+                  - name: llmproxy.usage
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                      inline_string: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: up }}
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {upstream_ip}, port_value: {upstream_port} }}
+"#,
+                proxy_port = proxy_port,
+                upstream_ip = upstream_addr.ip(),
+                upstream_port = upstream_addr.port(),
+            );
+
+            let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+                .expect("bootstrap YAML must parse");
+            let snapshot = Arc::new(build_snapshot(&loaded).expect("bootstrap YAML must lower"));
+
+            let harness = spawn_manager(snapshot).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            async fn send_request(proxy_addr: SocketAddr) -> (u16, HashMap<String, String>) {
+                let mut stream = TcpStream::connect(proxy_addr)
+                    .await
+                    .expect("connect should succeed");
+                stream
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sk-e2e\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+
+                let mut response = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                    .await
+                    .expect("read should not time out")
+                    .expect("read should succeed");
+
+                let header_end = response
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .expect("response must have a header/body separator");
+                let head = String::from_utf8(response[..header_end].to_vec())
+                    .expect("headers should be valid utf8");
+                let mut lines = head.lines();
+                let status_line = lines.next().expect("a status line");
+                let status: u16 = status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("status line has a code")
+                    .parse()
+                    .expect("status code is numeric");
+                let headers: HashMap<String, String> = lines
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+                    })
+                    .collect();
+                (status, headers)
+            }
+
+            // First request: the budget starts empty (100 tokens allowed),
+            // so this is admitted. Its response reports 120 actual tokens
+            // used, which is what exhausts the budget for the request after
+            // it -- not this one.
+            let (first_status, _first_headers) = send_request(proxy_addr).await;
+            assert_eq!(
+                first_status, 200,
+                "the first request must be admitted -- the budget starts empty"
+            );
+
+            // FileSink-style eventual consistency isn't a factor here (the
+            // store's `record` is synchronous, in-process), but give the
+            // harness a moment to fully tear down the first connection's
+            // stream state before opening the second.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Second request, same credential/route: the first request's
+            // 120 actual tokens are now recorded against a 100-token
+            // budget, so this one must be denied.
+            let (second_status, second_headers) = send_request(proxy_addr).await;
+            assert_eq!(
+                second_status, 429,
+                "the second request must be denied -- the first request's actual usage (120) \
+                 exceeded the 100-token budget"
+            );
+            for name in [
+                "x-ratelimit-limit",
+                "x-ratelimit-remaining",
+                "x-ratelimit-reset",
+                "retry-after",
+            ] {
+                assert!(
+                    second_headers.contains_key(name),
+                    "expected header `{name}` on the 429, got: {second_headers:?}"
+                );
+            }
+            assert_eq!(
+                second_headers.get("x-ratelimit-limit").map(String::as_str),
+                Some("100")
+            );
+            assert_eq!(
+                second_headers
+                    .get("x-ratelimit-remaining")
+                    .map(String::as_str),
+                Some("0")
+            );
+
+            harness.shutdown().await;
+        });
+    }
+}

@@ -7,7 +7,10 @@
 
 use proxy_config::{ConfigError, ConfigWarning};
 
-use crate::model::{is_valid_provider_name, Listen, ProviderModelRef, SimpleConfig, RESERVED_KEYS};
+use crate::lower::resolved_dialect;
+use crate::model::{
+    is_valid_provider_name, Listen, ModelProviderRef, ProviderModelRef, SimpleConfig, RESERVED_KEYS,
+};
 
 /// Parse dialect YAML from a file.
 pub fn load_simple_config_file(path: &std::path::Path) -> Result<SimpleConfig, ConfigError> {
@@ -183,6 +186,73 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                     field_path: format!("routes[{i}].retries.attempts"),
                     reason: "at most 5 retry attempts are allowed".to_string(),
                 });
+            }
+        }
+    }
+
+    for (name, model) in &config.models {
+        let path = format!("models.{name}");
+        if model.providers.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.providers"),
+                reason: "at least one provider is required".to_string(),
+            });
+        }
+        for (i, entry) in model.providers.iter().enumerate() {
+            // The field path for the entry itself -- there is no
+            // `.provider` sub-path the way `routes[i].provider` has one,
+            // because the entry IS the provider reference, whether it's the
+            // shorthand string or the object form (mirrors how
+            // `check_provider_ref` below points at `routes[i].provider`
+            // as a whole, not deeper).
+            let entry_path = format!("{path}.providers[{i}]");
+            let provider_name = entry.provider();
+            let Some(provider) = config.providers.get(provider_name) else {
+                let known = config
+                    .providers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ConfigError::InvalidValue {
+                    field_path: entry_path,
+                    reason: format!(
+                        "unknown provider `{provider_name}` (defined providers: {known})"
+                    ),
+                });
+            };
+            // `resolved_dialect` returns `None` exactly for "type is
+            // dialect-ambiguous (vertex/bedrock) and no explicit `dialect`
+            // was set" -- the same function `lower.rs` uses to compute the
+            // real dialect, so the two can never drift on what counts as
+            // "resolvable".
+            if resolved_dialect(provider_name, provider, entry.dialect()).is_none() {
+                let type_name = provider.effective_type(provider_name).as_str();
+                let (field_path, reason) = match entry {
+                    // The shorthand string form has no `dialect` field to
+                    // point at -- tell the user which form to switch to
+                    // rather than naming a field that doesn't exist here.
+                    ModelProviderRef::Shorthand(_) => (
+                        entry_path,
+                        format!(
+                            "`{type_name}` providers serve more than one wire format under \
+                             one type (e.g. Vertex hosts Anthropic-, Google-, and \
+                             OpenAI-shaped models), so `dialect` cannot be derived here; the \
+                             shorthand string form cannot carry `dialect` -- use the object \
+                             form ({{ provider, model, dialect }}) and set it explicitly"
+                        ),
+                    ),
+                    ModelProviderRef::Full(_) => (
+                        format!("{entry_path}.dialect"),
+                        format!(
+                            "`{type_name}` providers serve more than one wire format under \
+                             one type (e.g. Vertex hosts Anthropic-, Google-, and \
+                             OpenAI-shaped models), so `dialect` cannot be derived here and \
+                             must be set explicitly"
+                        ),
+                    ),
+                };
+                return Err(ConfigError::InvalidValue { field_path, reason });
             }
         }
     }

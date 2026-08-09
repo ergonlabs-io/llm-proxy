@@ -33,6 +33,14 @@ const REQUIRED_MESSAGES: &[&str] = &[
     "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
     "envoy.extensions.transport_sockets.tls.v3.Secret",
     "envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+    "envoy.config.accesslog.v3.AccessLog",
+    "envoy.config.accesslog.v3.AccessLogFilter",
+    "envoy.config.accesslog.v3.StatusCodeFilter",
+    "envoy.config.accesslog.v3.ResponseFlagFilter",
+    "envoy.config.core.v3.SubstitutionFormatString",
+    "envoy.extensions.access_loggers.file.v3.FileAccessLog",
+    "envoy.extensions.access_loggers.stream.v3.StdoutAccessLog",
+    "envoy.extensions.access_loggers.stream.v3.StderrAccessLog",
 ];
 
 #[test]

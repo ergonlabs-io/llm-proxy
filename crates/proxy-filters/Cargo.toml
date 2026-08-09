@@ -5,7 +5,21 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+proxy-config = { workspace = true }
 proxy-http = { workspace = true }
+# WP-34 (Lane H): usage/token extraction from provider responses.
+bytes = { workspace = true }
+http = { workspace = true }
+prost-reflect = { workspace = true }
+# WP-50 increment 2a: virtual-key authentication (HMAC-SHA256 + constant-time
+# compare). See docs/wp-50-auth-design-brief.md for why a keyed cryptographic
+# hash and NOT `token_limit_filter::hash_credential`'s FNV-1a.
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proxy-api = { workspace = true }
 
 [features]
 # Each non-core filter lands behind a feature flag (default-on set decided in WP-31).

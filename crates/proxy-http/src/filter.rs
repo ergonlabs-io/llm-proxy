@@ -19,11 +19,12 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 use proxy_config::ir::RouteEntry;
 use proxy_config::ConfigError;
 
+use crate::handler::HttpResponseParts;
 use crate::stream_info::StreamInfo;
 
 /// Request head. Pseudo-header data (`:method`, `:path`, `:authority`) is carried
 /// in the typed fields; `headers` holds regular headers only.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestHeaders {
     pub method: Method,
     pub uri: Uri,
@@ -132,14 +133,92 @@ pub trait DecoderCallbacks {
     /// Only legal before any data has been continued past this filter (S2.7).
     fn modify_decoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut));
 
-    /// The cached route (S2.8). Resolved lazily on first access.
-    fn route(&self) -> Option<Arc<RouteEntry>>;
+    /// Mutate request headers that have not yet been forwarded upstream
+    /// (WP-45 increment 2a — the seam a decode filter needs to fix up
+    /// `content-length` after splicing bytes into the body, since that's a
+    /// case `modify_decoding_buffer` alone can't cover).
+    ///
+    /// Applies `f` through a genuine live `&mut RequestHeaders` borrow of the
+    /// real request head — no clone, no splice-back, so it can never
+    /// silently discard a mutation a filter made some other way.
+    ///
+    /// Returns `false` and does nothing if the headers have already been
+    /// sent, so a late caller is a no-op rather than a silent lie. It ALSO
+    /// returns `false` and does nothing when called from **`decode_headers`
+    /// itself** (WP-45 increment 2b): `decode_headers` already hands the
+    /// filter a direct `&mut RequestHeaders` parameter that IS the request
+    /// head, and Rust's aliasing rules mean this callback cannot also hold a
+    /// second live `&mut` to that same value while the filter is still
+    /// holding the first one — there is no clone-free way to give both
+    /// access at once, and a clone-based workaround is exactly what
+    /// reintroduced the increment 2a data-loss bug this increment fixes (see
+    /// `filter_manager::tests::probe_direct_and_seam_mutations_coexist`). A
+    /// filter running in `decode_headers` should mutate its `headers`
+    /// parameter directly instead — it needs no seam there. `decode_data`
+    /// and `decode_trailers` (WP-45's actual case: the decision to splice
+    /// body bytes, and so the need to fix up `content-length`, is only made
+    /// once body bytes have been scanned) have no such parameter and DO get
+    /// the real working borrow.
+    ///
+    /// Mutating routing-relevant headers (`:authority`, `:path`) through this
+    /// does NOT auto-invalidate the S2.8 route cache, same as everywhere
+    /// else a filter can reach the request head — call
+    /// [`Self::clear_route_cache`] afterward if the rewrite should affect
+    /// routing.
+    ///
+    /// Rust note: defaulted to a no-op returning `false` (unlike most of this
+    /// trait, and like [`EncoderCallbacks::per_route_config`]'s default) —
+    /// `DecoderCallbacks` already has test-double implementors outside this
+    /// increment's scope that this change must not force edits onto; the
+    /// real adapter (`filter_manager::DecoderCallbacksAdapter`) overrides
+    /// this with the actual mutation.
+    fn modify_decoded_headers(&mut self, _f: &mut dyn FnMut(&mut RequestHeaders)) -> bool {
+        false
+    }
+
+    /// The cached route (S2.8). Resolved lazily on first access: the manager
+    /// matches against the LIVE `:authority`/`:path` (as of whichever filter
+    /// callback is running) the first time this is called, caches the result,
+    /// and returns the cached `Arc` on every subsequent call until
+    /// `clear_route_cache()` drops it. `&mut self` (not `&self`): resolving is
+    /// the whole point, and that has to write the cache.
+    fn route(&mut self) -> Option<Arc<RouteEntry>>;
 
     /// S2.8: the route cache is NOT auto-invalidated — any filter mutating
     /// routing-relevant headers must call this (differential fixture required).
     fn clear_route_cache(&mut self);
 
-    fn stream_info(&mut self) -> &mut StreamInfo;
+    /// The most specific `typed_per_filter_config` entry that applies to the
+    /// CALLING filter for this stream's route, or `None` (ADR-0004 step 4
+    /// increment 2).
+    ///
+    /// Specificity, most to least (Envoy's `mostSpecificPerFilterConfig`):
+    /// route > virtual host > route configuration. Resolving this resolves
+    /// the route (S2.8), so it is subject to the same cache and the same
+    /// `clear_route_cache()` invalidation — a filter that rewrites
+    /// routing-relevant headers and wants the rewritten route's override
+    /// must call `clear_route_cache()` first, exactly as for [`Self::route`]
+    /// itself.
+    ///
+    /// A filter only ever sees ITS OWN entry: the filter manager resolves
+    /// this against the position of whichever filter is calling right now
+    /// (never another filter's position), so one filter can't read another
+    /// filter's per-route config.
+    fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>>;
+
+    /// The stream's single [`StreamInfo`] (Envoy's model: one per stream,
+    /// owned at the filter-manager level, written by every filter AND by the
+    /// router terminal — see `filter_manager::FilterChainHandler::handle`).
+    ///
+    /// Rust note: `RefMut<'_, T>` implements `DerefMut`, so both
+    /// `cb.stream_info().field = x` and
+    /// `let mut si = cb.stream_info(); si.a = 1; si.b = 2;` still compile
+    /// unchanged — this is a much smaller change at call sites than the
+    /// signature suggests. The guard MUST NOT be held across another call on
+    /// this same callbacks object (e.g. `cb.route()`, `cb.continue_decoding()`)
+    /// or the underlying `RefCell` panics at runtime — drop it (end the
+    /// statement/block) before making another call.
+    fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo>;
 }
 
 /// Callbacks available to encoder (response-path) filters.
@@ -149,7 +228,26 @@ pub trait EncoderCallbacks {
     fn inject_encoded_data_to_filter_chain(&mut self, data: Bytes, end_stream: bool);
     fn encoding_buffer(&self) -> Option<&BufferedBody>;
     fn modify_encoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut));
-    fn stream_info(&mut self) -> &mut StreamInfo;
+
+    /// Encoder-side counterpart to [`DecoderCallbacks::per_route_config`] —
+    /// same specificity order, same route cache, same per-filter isolation;
+    /// see that method's doc.
+    ///
+    /// Rust note: defaulted to `None` (unlike every other method here, and
+    /// unlike [`DecoderCallbacks::per_route_config`], which has no default) —
+    /// `EncoderCallbacks` already has test-double implementors outside this
+    /// increment's scope (`proxy-filters`, `proxy-core`) that this change
+    /// must not force edits onto; the real adapter
+    /// (`filter_manager::EncoderCallbacksAdapter`) overrides this with the
+    /// actual resolution.
+    fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>> {
+        None
+    }
+
+    /// The stream's single [`StreamInfo`] — see [`DecoderCallbacks::stream_info`]
+    /// for the shared-ownership model and the same "don't hold the guard
+    /// across another call" rule.
+    fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo>;
 }
 
 /// A per-stream HTTP filter instance. Decoder callbacks run in config order,
@@ -160,7 +258,13 @@ pub trait EncoderCallbacks {
 /// implements only the callbacks it cares about — the Rust equivalent of Envoy's
 /// `PassThroughFilter` base class. Parameters in defaults are `_`-prefixed to
 /// tell the compiler "unused on purpose".
-pub trait HttpFilter: Send {
+///
+/// Rust note: intentionally NOT `Send` (ADR-0003). A filter instance is created
+/// per stream and lives entirely on one worker's `!Send` runtime, so it may hold
+/// `Rc`/`RefCell` and share worker-local state freely; it never crosses threads.
+/// Only the config-time plumbing that DOES cross threads — [`FilterInstanceFactory`],
+/// [`HttpFilterFactory`], [`PerRouteConfig`] — carries `Send + Sync`.
+pub trait HttpFilter {
     fn decode_headers(
         &mut self,
         _cb: &mut dyn DecoderCallbacks,
@@ -223,10 +327,81 @@ pub trait HttpFilter: Send {
 
     /// Called once when the stream ends or resets; release resources here.
     fn on_destroy(&mut self) {}
+
+    /// Asynchronous continuation, polled by the filter manager after this
+    /// filter has returned a `StopIteration*` status from a decode callback.
+    ///
+    /// `Some(fut)` means "I have work in flight: await it, then re-drive the
+    /// chain from me". `None` — the default — keeps the existing meaning:
+    /// stopped until something calls `continue_decoding()`.
+    ///
+    /// Anything the filter needs from its callbacks must be captured BEFORE
+    /// returning the future: the future borrows only `self`, not the
+    /// callbacks. Results are applied on the next synchronous callback, when
+    /// callbacks are available again. See ADR-0004 for why.
+    ///
+    /// Rust note: a boxed, pinned, `!Send` future — the same shape
+    /// `StreamHandler` already uses (`crate::handler`), and for the same
+    /// reason: an `async fn` in a trait isn't object-safe (its `Future` type
+    /// would have to be part of the trait's vtable, which Rust doesn't
+    /// support), so we return the desugared form by hand. `!Send` is correct
+    /// per ADR-0003 — the whole stream, filters included, lives on one
+    /// worker's `!Send` `LocalSet`, so nothing here ever needs to cross a
+    /// thread. The `'a` lifetime ties the future to the `&mut self` borrow
+    /// that produced it: the borrow checker then guarantees the future can't
+    /// outlive (or be polled after) the filter instance it reads from.
+    fn poll_pending<'a>(
+        &'a mut self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>> {
+        None
+    }
+}
+
+/// ADR-0004 step 3: the terminal filter — Envoy's `Router::Filter`. An
+/// ordinary [`HttpFilter`] for the decode direction (it lives at the LAST
+/// position of the decode chain, created and destroyed exactly like any other
+/// filter instance); once the decode chain reaches it with the complete
+/// request, `respond` produces the response, which the filter manager then
+/// drives into the ENCODE chain — exactly the position Envoy's `Router::Filter`
+/// occupies.
+///
+/// Rust note: same boxed/pinned/`!Send` future shape as
+/// [`HttpFilter::poll_pending`], and for the same reason (object safety —
+/// `async fn` in a trait can't be called through a trait object). The `'a`
+/// lifetime ties the future to both the `&mut self` and `&mut dyn
+/// DecoderCallbacks` borrows that produced it.
+pub trait TerminalHttpFilter: HttpFilter {
+    fn respond<'a>(
+        &'a mut self,
+        cb: &'a mut dyn DecoderCallbacks,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>>;
+}
+
+/// Created once per (filter config, listener); creates the per-stream
+/// terminal instance — the [`TerminalHttpFilter`] counterpart to
+/// [`FilterInstanceFactory`].
+///
+/// `Send + Sync`, exactly like `FilterInstanceFactory` — per ADR-0003,
+/// config-time plumbing (built once from config and shared by every worker)
+/// crosses threads and carries `Send + Sync`; only the per-stream instances
+/// it mints ([`TerminalHttpFilter`]) are deliberately `!Send` (see
+/// [`HttpFilter`]'s doc). Holders of a `dyn TerminalFilterInstanceFactory`
+/// use `Arc`, same as `FilterInstanceFactory`.
+pub trait TerminalFilterInstanceFactory: Send + Sync {
+    fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter>;
 }
 
 /// Marker trait for parsed per-route filter config (`typed_per_filter_config`).
-pub trait PerRouteConfig: Send + Sync {}
+pub trait PerRouteConfig: Send + Sync {
+    /// Rust note: trait objects have no built-in way to recover their
+    /// concrete type; `dyn PerRouteConfig` alone can't be downcast. Each
+    /// implementor forwards this to `self` (`fn as_any(&self) -> &dyn Any {
+    /// self }`) so a filter that receives `Arc<dyn PerRouteConfig>` from
+    /// `per_route_config()` can `downcast_ref::<ItsOwnConcreteType>()` it
+    /// back — the only way it reads what its own `parse_per_route`
+    /// produced.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
 
 /// Context handed to factories at config time. TODO(WP-11): stats scope, runtime.
 pub struct FactoryContext {}

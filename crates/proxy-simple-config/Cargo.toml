@@ -14,6 +14,26 @@ serde_yaml = { workspace = true }
 
 [dev-dependencies]
 proxy-api = { workspace = true }
+# Test-only: pins the usage filter's type URL, which `lower.rs` duplicates as a
+# literal rather than importing (see the comment on `USAGE_FILTER_TYPE_URL`).
+# A dev-dependency keeps the data plane out of the production dependency tree.
+proxy-filters = { workspace = true }
+# Test-only, WP-45 acceptance 5: driving a REAL request through a
+# dialect-lowered config end to end (filter chain + router + cluster
+# manager), so the body-based-routing test exercises the actual join
+# between `MODEL_HEADER` (this crate) and the header `proxy-filters`
+# publishes, rather than asserting on either literal in isolation. See
+# `tests/dialect.rs`'s `body_based_model_routing_reaches_the_right_provider`.
+proxy-http = { workspace = true }
+proxy-cluster = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }
+# Test-only, WP-50 increment 2a-iii: `tests/auth.rs` computes the SAME
+# HMAC-SHA256 digest `auth_filter::parse_config` verifies against, so its
+# fixtures exercise the real filter rather than a value nobody checked.
+ring = { workspace = true }
 
 [lints]
 workspace = true

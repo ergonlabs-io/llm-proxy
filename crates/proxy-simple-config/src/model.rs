@@ -26,9 +26,20 @@ pub struct SimpleConfig {
     pub listen: Option<Listen>,
     #[serde(default)]
     pub admin: Option<String>,
+    /// Downstream authentication (WP-50 increment 2a-iii). Absent means the
+    /// proxy admits every request unauthenticated, same as today. Present,
+    /// even with `keys: []`, switches the listener to fail-closed.
+    #[serde(default)]
+    pub auth: Option<Auth>,
     /// Rust note: `BTreeMap` (not `HashMap`) keeps providers sorted by name,
     /// making the lowered Envoy config deterministic — same input, same output.
     pub providers: BTreeMap<String, Provider>,
+    /// Logical models (WP-49): a client-facing name mapped to an ordered
+    /// list of backends able to serve it. Each entry gets an implicit route
+    /// matching its name exactly, in addition to whatever `routes` express.
+    /// `BTreeMap` for the same determinism reason as `providers`.
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelDef>,
     pub routes: Vec<RouteRule>,
     #[serde(default)]
     pub limits: Vec<Limit>,
@@ -78,12 +89,187 @@ pub struct Provider {
     pub connect_timeout: Option<SimpleDuration>,
 }
 
+/// `auth`: downstream authentication (WP-50 increment 2a-iii). Mirrors the
+/// `api_key`/`api_key_file` shape on [`Provider`] -- exactly one of
+/// `hmac_secret`/`hmac_secret_file` -- for the same reason: a secret belongs
+/// in the environment or a mounted file, never inlined twice with two
+/// conventions for saying so.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    #[serde(default)]
+    pub hmac_secret: Option<String>,
+    #[serde(default)]
+    pub hmac_secret_file: Option<String>,
+    /// The configured virtual keys. May be empty -- legal (fail closed: an
+    /// `auth:` block with no keys authenticates nothing and therefore
+    /// refuses every request), but almost certainly a mistake, so lowering
+    /// warns rather than silently accepting it.
+    #[serde(default)]
+    pub keys: Vec<AuthKey>,
+}
+
+/// One entry in `auth.keys`. The plaintext key never appears in
+/// configuration -- only a keyed digest of it (`digest`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthKey {
+    /// Names this credential in audit logs. Must be unique within `auth.keys`.
+    pub id: String,
+    /// The tenant (account/team) this key authenticates as. Several keys may
+    /// share a tenant; that's the normal case.
+    pub tenant: String,
+    /// Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`, exactly
+    /// 64 characters.
+    pub digest: String,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderType {
     Openai,
     Anthropic,
     OpenaiCompatible,
+    /// OpenAI-shaped API hosted on Azure -- an unambiguous dialect (always
+    /// OpenAI's), but the endpoint needs a deployment-name + `api-version`
+    /// URL template that isn't built yet. Loading one is a hard error; see
+    /// `lower::lower_provider`.
+    AzureOpenai,
+    /// Serves Anthropic-shaped Claude, Google-shaped Gemini, and
+    /// OpenAI-shaped Kimi under one provider type, and needs minted OAuth2
+    /// with a refresh loop -- not built yet. Loading one is a hard error;
+    /// see `lower::lower_provider`. Its dialect cannot be derived from the
+    /// type alone -- see [`Self::dialect_is_ambiguous`].
+    Vertex,
+    /// Serves multiple wire formats like Vertex, and needs per-request
+    /// SigV4 signing over the canonical request (which must run after body
+    /// rewriting, so it cannot be header injection) -- not built yet.
+    /// Loading one is a hard error; see `lower::lower_provider`. Also
+    /// dialect-ambiguous -- see [`Self::dialect_is_ambiguous`].
+    Bedrock,
+}
+
+impl ProviderType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderType::Openai => "openai",
+            ProviderType::Anthropic => "anthropic",
+            ProviderType::OpenaiCompatible => "openai-compatible",
+            ProviderType::AzureOpenai => "azure-openai",
+            ProviderType::Vertex => "vertex",
+            ProviderType::Bedrock => "bedrock",
+        }
+    }
+
+    /// Whether this type serves more than one wire format, so a `models:`
+    /// backend of this type must set `dialect` explicitly instead of
+    /// deriving it (WP-49). Only `vertex` and `bedrock` today.
+    pub fn dialect_is_ambiguous(self) -> bool {
+        matches!(self, ProviderType::Vertex | ProviderType::Bedrock)
+    }
+}
+
+/// `models.<name>`: one logical model and the providers able to serve it
+/// (WP-49). Naming and data model only in this increment -- which entry
+/// actually gets picked (fallback / weighted split / cost-aware) is WP-35.
+/// There is deliberately no separate noun for an entry here: the config
+/// surface has exactly two -- `providers` (the top-level map) and `models`
+/// -- so an entry in this list is just a provider reference, the same
+/// `ProviderModelRef` `routes` already uses, with an object form alongside
+/// it for when `dialect` must be explicit.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDef {
+    /// Tried in priority order. WP-49 increment 1: only `providers[0]` is
+    /// ever selected to serve traffic -- every later entry is still
+    /// validated (a bad one still fails to load, ground rule #1) but gets a
+    /// translate-time warning instead of being used.
+    pub providers: Vec<ModelProviderRef>,
+}
+
+/// One entry in a [`ModelDef`]'s `providers` list: either the shorthand
+/// string form (`provider` or `provider/model`, reusing [`ProviderModelRef`]
+/// exactly as `routes` does), or the object form needed whenever `dialect`
+/// must be set explicitly. Rust note: `#[serde(untagged)]` tries each
+/// variant's `Deserialize` in order and keeps the first that succeeds --
+/// same shape as [`Listen`]'s `Address(String) | Full(ListenerSpec)`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ModelProviderRef {
+    Shorthand(ProviderModelRef),
+    Full(ModelProvider),
+}
+
+impl ModelProviderRef {
+    pub fn provider(&self) -> &str {
+        match self {
+            ModelProviderRef::Shorthand(r) => &r.provider,
+            ModelProviderRef::Full(p) => &p.provider,
+        }
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            ModelProviderRef::Shorthand(r) => r.model.as_deref(),
+            ModelProviderRef::Full(p) => p.model.as_deref(),
+        }
+    }
+
+    /// The shorthand string form has nowhere to put a `dialect` -- it is
+    /// always `None` there, never inferred from anything about the string.
+    pub fn dialect(&self) -> Option<Dialect> {
+        match self {
+            ModelProviderRef::Shorthand(_) => None,
+            ModelProviderRef::Full(p) => p.dialect,
+        }
+    }
+}
+
+/// The object form of a [`ModelProviderRef`]: needed whenever `dialect` must
+/// be explicit, since the shorthand string form cannot carry it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelProvider {
+    /// Key into `providers`.
+    pub provider: String,
+    /// Upstream model ID at this provider, if different from the model's
+    /// own catalogue name (e.g. Anthropic's dated model IDs). Recorded;
+    /// substituting it into the request body needs the request-body
+    /// rewriter (WP-35), so this produces a translate-time warning until
+    /// then and the client's original model name is forwarded as-is.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Wire dialect this provider entry speaks. Optional (and derived from
+    /// the provider's `type`) for `openai`/`anthropic`/`openai-compatible`/
+    /// `azure-openai`, whose wire format the type alone determines.
+    /// REQUIRED for `vertex`/`bedrock` (see
+    /// [`ProviderType::dialect_is_ambiguous`]) -- omitting it there is a
+    /// load error, never a guess. The shorthand string form of
+    /// [`ModelProviderRef`] cannot express this field at all, so an
+    /// ambiguous-type provider used in `models:` must use this object form.
+    #[serde(default)]
+    pub dialect: Option<Dialect>,
+}
+
+/// A provider entry's wire format, for provider types whose dialect the type
+/// alone doesn't determine. Matches the strings `lower::usage_dialect`
+/// derives for the unambiguous provider types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Dialect {
+    Openai,
+    Anthropic,
+}
+
+impl Dialect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dialect::Openai => "openai",
+            Dialect::Anthropic => "anthropic",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +312,23 @@ pub struct Limit {
 pub struct Observability {
     #[serde(default)]
     pub access_logs: Option<AccessLogs>,
+    /// Forces `stream_options.include_usage = true` onto streaming OpenAI-
+    /// dialect requests that didn't already opt in, so the usage filter has
+    /// a final SSE frame to read tokens off of. Defaults to `true`, both when
+    /// this key is absent AND when the whole `observability` block is absent
+    /// -- see `default_force_usage_reporting`.
+    #[serde(default = "default_force_usage_reporting")]
+    pub force_usage_reporting: bool,
+}
+
+/// `pub(crate)`, not private: `lower.rs`'s `force_usage_reporting` needs the
+/// exact same default for the "whole `observability` block is absent" case
+/// -- serde's `#[serde(default = ...)]` only ever fires when the struct
+/// itself is present, so that case has to reuse this function rather than
+/// hardcode `true` a second time (two copies of the same default is exactly
+/// the kind of thing that drifts silently).
+pub(crate) fn default_force_usage_reporting() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,13 +465,18 @@ pub fn is_valid_provider_name(name: &str) -> bool {
     bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// `global`, `client-ip`, or `header:<name>`.
+/// `global`, `client-ip`, `tenant`, or `header:<name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub enum LimitKey {
     Global,
     ClientIp,
     Header(String),
+    /// One bucket per authenticated tenant (WP-50 increment 2a-iii).
+    /// Requires an `auth:` block -- without one, nothing would authenticate
+    /// a tenant, so configuring this key is a load error rather than a
+    /// silent fallback to bucketing on a client-supplied header.
+    Tenant,
 }
 
 impl TryFrom<String> for LimitKey {
@@ -277,6 +485,7 @@ impl TryFrom<String> for LimitKey {
         match s.as_str() {
             "global" => Ok(Self::Global),
             "client-ip" => Ok(Self::ClientIp),
+            "tenant" => Ok(Self::Tenant),
             _ => match s.strip_prefix("header:") {
                 Some(name)
                     if !name.is_empty()
@@ -285,7 +494,8 @@ impl TryFrom<String> for LimitKey {
                     Ok(Self::Header(name.to_string()))
                 }
                 _ => Err(format!(
-                    "`{s}` is not a limit key (expected `global`, `client-ip`, or `header:<name>`)"
+                    "`{s}` is not a limit key (expected `global`, `client-ip`, `tenant`, or \
+                     `header:<name>`)"
                 )),
             },
         }
@@ -308,7 +518,14 @@ impl Provider {
         self.base_url.clone().or(match self.effective_type(name) {
             ProviderType::Openai => Some("https://api.openai.com".to_string()),
             ProviderType::Anthropic => Some("https://api.anthropic.com".to_string()),
-            ProviderType::OpenaiCompatible => None,
+            // No implied URL built yet for these three -- their credential
+            // scheme isn't implemented either (see
+            // `lower::lower_provider`), so an explicit `base_url` here
+            // wouldn't get a config past lowering anyway.
+            ProviderType::OpenaiCompatible
+            | ProviderType::AzureOpenai
+            | ProviderType::Vertex
+            | ProviderType::Bedrock => None,
         })
     }
 }

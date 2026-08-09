@@ -28,10 +28,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/extensions/filters/listener/tls_inspector/v3/tls_inspector.proto",
         "envoy/extensions/transport_sockets/tls/v3/tls.proto",
         "envoy/extensions/upstreams/http/v3/http_protocol_options.proto",
+        // Aggregate clusters (WP-35 provider fallback): the type URL under a
+        // `Cluster.cluster_type.typed_config` must resolve for the surface
+        // walk to see inside it.
+        "envoy/extensions/clusters/aggregate/v3/cluster.proto",
+        // Access logging (WP-24): common AccessLog/AccessLogFilter types plus
+        // the two logger extensions we implement (file, stdout/stderr).
+        "envoy/config/accesslog/v3/accesslog.proto",
+        "envoy/extensions/access_loggers/file/v3/file.proto",
+        "envoy/extensions/access_loggers/stream/v3/stream.proto",
+        // Lane-H (LLM) extensions we define ourselves, rather than borrowing an
+        // unrelated Envoy message -- WP-47 increment 1. Note this is the only
+        // root NOT under `vendor/envoy`: `scripts/vendor-protos.sh` does not
+        // manage it, because it is ours and is not re-fetched on a proto bump.
+        "llmproxy/filters/v0/auth.proto",
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let root_paths: Vec<PathBuf> = roots.iter().map(|r| vendor.join(r)).collect();
+
+    // Tell cargo exactly what this script depends on.
+    //
+    // Without at least one `rerun-if-changed`, cargo falls back to re-running
+    // the build script whenever ANY file in the package changes -- and every
+    // rerun rewrites the generated tree in OUT_DIR with fresh mtimes, which
+    // invalidates `proxy-api` and therefore every crate in the workspace,
+    // since they all depend on it. Declaring the inputs turns that into "rerun
+    // only when a vendored proto or this script actually changes".
+    //
+    // `vendor/` is watched as a directory rather than file-by-file: protoc
+    // pulls transitive imports we never name in `roots`, so listing only the
+    // roots would miss a change to an imported proto and silently serve stale
+    // generated code -- the worse failure of the two.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", vendor.display());
 
     tonic_build::configure()
         .build_client(true)

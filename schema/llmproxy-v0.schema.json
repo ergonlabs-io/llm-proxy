@@ -25,6 +25,10 @@
       "$ref": "#/$defs/HostPort",
       "examples": ["127.0.0.1:9901"]
     },
+    "auth": {
+      "description": "Downstream authentication (WP-50): verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is the opposite axis and defaults OPEN: an authenticated tenant with no configured policy may use every model and provider. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
+      "$ref": "#/$defs/Auth"
+    },
     "providers": {
       "description": "Named upstream LLM API providers. The key is the provider name referenced by `routes` (lowercase letters, digits, hyphens). Names `openai` and `anthropic` infer their `type` and `base_url` automatically — a working OpenAI provider is just `openai: { api_key: ${OPENAI_API_KEY} }`.",
       "type": "object",
@@ -34,14 +38,28 @@
         "^[a-z0-9][a-z0-9-]*$": { "$ref": "#/$defs/Provider" }
       }
     },
+    "models": {
+      "description": "Logical model catalogue (WP-49): a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name exactly, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. WP-49 increment 1 is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a translate-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) lands with WP-35.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/ModelDef" },
+      "examples": [{
+        "claude-sonnet-4-5": {
+          "providers": [
+            "anthropic/claude-sonnet-4-5-20250929",
+            { "provider": "vertex-us", "model": "claude-sonnet-4-5@20250929", "dialect": "anthropic" }
+          ]
+        }
+      }]
+    },
     "routes": {
-      "description": "Ordered routing rules, evaluated top to bottom — the FIRST rule whose `model` pattern matches the request wins (there is no specificity reordering; put specific patterns above broad ones). Requests matching no rule get a 404 with a JSON error body listing known models.",
+      "description": "Ordered routing rules, evaluated top to bottom — the FIRST rule whose `model` pattern matches the request wins (there is no specificity reordering; put specific patterns above broad ones). Requests matching no rule and no `models` entry get a 404 with a JSON error body listing known models.",
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/Route" }
     },
     "limits": {
-      "description": "Rate limits and quotas, enforced before a request is forwarded (over-limit requests get a 429 with `x-ratelimit-*` headers). Token counts are extracted from provider responses (streaming included). NOTE: limits are enforced per proxy instance in v0; fleet-wide limits require the (future) shared budget store.",
+      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a translate-time warning naming the exact field. NOTE: limits are enforced per proxy instance in v0; fleet-wide limits require the (future) shared budget store.",
       "type": "array",
       "items": { "$ref": "#/$defs/Limit" }
     },
@@ -101,14 +119,71 @@
         }
       }
     },
+    "Auth": {
+      "type": "object",
+      "description": "Downstream authentication. Exactly one of `hmac_secret` / `hmac_secret_file` is required -- mirrors the `api_key`/`api_key_file` choice on a `Provider`.",
+      "additionalProperties": false,
+      "properties": {
+        "hmac_secret": {
+          "type": "string",
+          "description": "The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` interpolation rather than inlining it.",
+          "examples": ["${LLMPROXY_AUTH_SECRET}"]
+        },
+        "hmac_secret_file": {
+          "type": "string",
+          "description": "Read the HMAC secret from this file (trailing whitespace trimmed; read once at startup -- hot reload lands with WP-35)."
+        },
+        "keys": {
+          "type": "array",
+          "default": [],
+          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a translate-time warning.",
+          "items": { "$ref": "#/$defs/AuthKey" }
+        }
+      },
+      "oneOf": [
+        { "required": ["hmac_secret"], "not": { "required": ["hmac_secret_file"] } },
+        { "required": ["hmac_secret_file"], "not": { "required": ["hmac_secret"] } }
+      ]
+    },
+    "AuthKey": {
+      "type": "object",
+      "description": "One virtual key. The plaintext key never appears in configuration -- only a keyed digest of it.",
+      "additionalProperties": false,
+      "required": ["id", "tenant", "digest"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Names this credential in audit logs and in the access log's response-code details. Must be unique within `auth.keys`.",
+          "examples": ["alice-laptop"]
+        },
+        "tenant": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The tenant (account/team) this key authenticates as. Several keys may share a tenant; that's the normal case -- revoking one leaked key must not revoke the whole account.",
+          "examples": ["acme"]
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`, exactly 64 characters -- the plaintext is shown to the operator once, at creation, and is never recoverable from configuration. Generate both together with `llm-proxy --mode keygen --tenant <tenant> --key-id <id>` (reads the same secret via `--hmac-secret-file`/`$LLMPROXY_AUTH_SECRET`, and prints a ready-to-paste `id`/`tenant`/`digest` block). If you have no `llm-proxy` binary handy, `openssl` computes the same digest (note `printf %s`, not a here-string -- `<<<` appends a trailing newline that changes the digest): `printf %s \"llmp_yourkey\" | openssl dgst -sha256 -hmac \"$LLMPROXY_AUTH_SECRET\" -hex`",
+          "examples": ["3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a"]
+        },
+        "revoked": {
+          "type": "boolean",
+          "default": false,
+          "description": "A revoked key is refused, distinguished from an unknown key in the access log's response-code details (`auth_revoked_key` vs `auth_unknown_key`) but NOT on the wire -- both produce an identical 401, so a caller can't learn from the response alone whether a key they guessed was ever valid."
+        }
+      }
+    },
     "Provider": {
       "type": "object",
       "description": "One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit both for unauthenticated local backends).",
       "additionalProperties": false,
       "properties": {
         "type": {
-          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise.",
-          "enum": ["openai", "anthropic", "openai-compatible"]
+          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise. `azure-openai`, `vertex`, and `bedrock` are named for the model catalogue (`models`) but not yet loadable as a `providers` entry -- their credential scheme isn't implemented yet (Azure: deployment-name + api-version URL templating; Vertex: minted OAuth2 with refresh; Bedrock: per-request SigV4 signing), and configuring one is a load error naming the gap (WP-49 increment 2).",
+          "enum": ["openai", "anthropic", "openai-compatible", "azure-openai", "vertex", "bedrock"]
         },
         "base_url": {
           "type": "string",
@@ -127,7 +202,7 @@
         },
         "extra_headers": {
           "type": "object",
-          "description": "Additional headers to send on every request to this provider (e.g. `anthropic-version`, org/project headers).",
+          "description": "Additional headers to send on every request to this provider (e.g. org/project headers). Anthropic providers are sent a default `anthropic-version` automatically; setting it here overrides that default (header names are matched case-insensitively).",
           "additionalProperties": { "type": "string" }
         },
         "ca_file": {
@@ -142,6 +217,49 @@
       },
       "not": {
         "required": ["api_key", "api_key_file"]
+      }
+    },
+    "ModelDef": {
+      "type": "object",
+      "description": "One logical model and the providers able to serve it (WP-49).",
+      "additionalProperties": false,
+      "required": ["providers"],
+      "properties": {
+        "providers": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. WP-49 increment 1: only `providers[0]` is used to serve traffic today -- every later entry is validated at load time (a bad one still fails to load) but produces a translate-time warning naming its exact path instead of being selected; choosing among them lands with WP-35.",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/ProviderModelRef" },
+              { "$ref": "#/$defs/ModelProvider" }
+            ]
+          }
+        }
+      }
+    },
+    "ModelProvider": {
+      "type": "object",
+      "description": "The object form of a `models.<name>.providers` entry, needed whenever `dialect` must be explicit -- the shorthand string form (`provider` or `provider/model`) cannot carry it.",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Key into `providers`.",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "examples": ["anthropic", "vertex-us", "nebius"]
+        },
+        "model": {
+          "type": "string",
+          "description": "Upstream model ID at this provider, if different from the model's own catalogue name (e.g. Anthropic's dated model IDs, or a Vertex publisher-model path). Recorded; substituting it into the request body needs the request-body rewriter (WP-35), so this produces a translate-time warning until then and the client's original model name is forwarded as-is.",
+          "examples": ["claude-sonnet-4-5-20250929", "moonshotai/Kimi-K2-Instruct"]
+        },
+        "dialect": {
+          "description": "Wire format this provider entry speaks. Optional (and derived from the provider's `type`) for `openai`/`anthropic`/`openai-compatible`/`azure-openai`, whose wire format the type alone determines. REQUIRED for `vertex`/`bedrock`, which serve more than one wire format under a single provider type -- e.g. Vertex hosts Anthropic-shaped Claude, Google-shaped Gemini, and OpenAI-shaped Kimi. Omitting it there is a load error naming the field, never a guess: the wrong parser can partially match the wrong body shape and bill usage against a number nobody computed. The shorthand string form cannot express this field at all, so an ambiguous-type provider used here must use this object form.",
+          "enum": ["openai", "anthropic"],
+          "examples": ["anthropic"]
+        }
       }
     },
     "Route": {
@@ -188,26 +306,27 @@
       "properties": {
         "key": {
           "type": "string",
-          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas).",
-          "pattern": "^(global|client-ip|header:[A-Za-z0-9-]+)$",
-          "examples": ["global", "client-ip", "header:x-api-key"]
+          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas). `header:authorization` and `tenant` are enforced today (the token limiter's bucket key is hardcoded to the `authorization` header, but automatically prefers the authenticated tenant instead whenever `auth:` is configured -- so a `header:<name>` limit alongside `auth:` produces a not-enforced-as-written warning suggesting `key: tenant`). `global`, `client-ip`, and every other `header:<name>` without `auth:` are recorded but produce a not-enforced warning.",
+          "pattern": "^(global|client-ip|tenant|header:[A-Za-z0-9-]+)$",
+          "examples": ["header:authorization", "tenant", "global", "client-ip", "header:x-api-key"]
         },
         "tokens_per_minute": {
           "$ref": "#/$defs/TokenAmount",
-          "description": "Total (input + output) tokens allowed per minute per bucket. Usage is extracted from provider responses, including streamed ones; enforcement is at request admission (the request that would exceed the budget is rejected — in-flight streams are never truncated)."
+          "description": "Total (input + output) tokens allowed per minute per bucket. Usage is extracted from provider responses, including streamed ones; enforcement is at request admission (the request that would exceed the budget is rejected — in-flight streams are never truncated). Enforced only when paired with `key: header:authorization`; any other key still records this field but produces a not-enforced warning instead."
         },
         "requests_per_minute": {
           "$ref": "#/$defs/TokenAmount",
-          "description": "Requests allowed per minute per bucket."
+          "description": "Requests allowed per minute per bucket. Not enforced yet by any key -- the current limiter enforces total token budgets, not a request-rate cap (a different feature); recorded, and produces a not-enforced warning."
         },
         "concurrent_sessions": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session."
+          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session. Not enforced yet (lands with session limits, WP-37); recorded, and produces a not-enforced warning.",
+          "examples": [10]
         },
         "models": {
           "type": "array",
-          "description": "Restrict this limit to requests whose model matches one of these patterns. Omit to apply to all traffic.",
+          "description": "Restrict this limit to requests whose model matches one of these patterns. Omit to apply to all traffic. Not enforced yet -- the current limiter has no per-model scoping; recorded, and produces a not-enforced warning.",
           "items": { "$ref": "#/$defs/ModelPattern" }
         }
       }
@@ -233,6 +352,12 @@
               "description": "`json` emits one structured object per line (recommended for log pipelines)."
             }
           }
+        },
+        "force_usage_reporting": {
+          "type": "boolean",
+          "description": "Forces `stream_options.include_usage` onto streaming OpenAI-dialect requests that didn't already ask for it, so token usage can be logged/accounted for streamed responses. This makes the provider emit one extra final SSE frame carrying usage; well-behaved SDKs handle it, but a hand-rolled client that iterates `choices[0]` without a guard can trip over that frame. Set to `false` for strict passthrough if that's a concern.",
+          "default": true,
+          "examples": [true, false]
         }
       }
     }

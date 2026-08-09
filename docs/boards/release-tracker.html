@@ -1,0 +1,488 @@
+<!doctype html><html><head><!-- frame-runtime --><script>window.__FRAME_PREAMBLE={"capabilities":{"downloads":"downloads.BABDwU1K.js","mcp":"mcp.hoz5jxDa.js","permissions":"permissions.ByA9Fd8x.js","self":"self.D3u1zjZe.js","user":"user.Cp1-RnjB.js"},"transforms":"_transforms.DYk1Ltlh.js","comments":"_comments.DiwQajF_.js","translate":"_translate.C5leZL2A.js"}</script><script>(function(){"use strict";const Ee="modulepreload",we=function(e){return"/"+e},Se={},ee=function(t,n,l){let i=Promise.resolve();function s(f){const c=new Event("vite:preloadError",{cancelable:!0});if(c.payload=f,window.dispatchEvent(c),!c.defaultPrevented)throw f}return i.then(f=>{for(const c of f||[])c.status==="rejected"&&s(c.reason);return t().catch(s)})},te=["light","dark","system"];function ne(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_init;return t!==null&&typeof t=="object"}function W(e){return e!==null&&typeof e=="object"&&e.__frame_size_poke===!0}function re(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_theme;if(t===null||typeof t!="object")return!1;const n=t.theme;return typeof n=="string"&&te.includes(n)}function se(e){try{typeof reportError=="function"?reportError(e):setTimeout(()=>{throw e},0)}catch{}}const oe=Object.freeze(Object.assign(Object.create(null),{user:Object.freeze(Object.assign(Object.create(null),{id:null,isOwner:!1,canEdit:!1,name:null,avatarUrl:null,email:null}))}));function Y(e){if(window===top||e.type==="auxclick"&&e.button!==1)return;const t=e.composedPath?e.composedPath():[e.target];let n=null;for(let f=0;f<t.length;f++){const c=t[f];if(c&&c.matches&&c.matches("a[href],area[href]")){n=c;break}}if(!n&&e.target&&e.target.closest&&(n=e.target.closest("a[href],area[href]")),!n)return;const l=n.getAttribute("href");if(!l)return;let i,s;try{i=new URL(l,document.baseURI),s=new URL(document.baseURI).origin}catch{return}(i.protocol==="http:"||i.protocol==="https:")&&i.origin!==s&&(e.preventDefault(),parent.postMessage({__frame_nav:!0,url:i.href},"*"))}const K={};function D(e){if(window===top)return;const t=Date.now();t-(K[e]||0)<500||(K[e]=t,parent.postMessage({__frame_engaged:!0,kind:e},"*"))}const ie=2e3,x=["wheel","touchstart","touchmove","keydown","pointerdown"];let J=0;function ae(e){e.isTrusted&&(J=Date.now())}function ce(){addEventListener("click",Y,!0),addEventListener("auxclick",Y,!0)}function le(){for(let e=0;e<x.length;e++)addEventListener(x[e],ae,{capture:!0,passive:!0});addEventListener("scroll",e=>{e.isTrusted&&Date.now()-J<ie&&D("scroll")},{capture:!0,passive:!0}),addEventListener("pointermove",e=>{e.isTrusted&&D("pointer")},{capture:!0,passive:!0}),addEventListener("click",e=>{e.isTrusted&&D("click")},{capture:!0,passive:!0})}const I="__frame_scroll",ue=150,fe=310,de=160,me=3e4;function pe(){let e=0,t=!1,n=!1,l=!1,i=0;const s=a=>{try{sessionStorage.setItem(I,JSON.stringify({y:a}))}catch{}},f=()=>{if(t){t=!1;return}n=!0,clearTimeout(e),e=setTimeout(()=>s(scrollY),ue)};try{addEventListener("scroll",f,{passive:!0}),addEventListener("pagehide",()=>{clearTimeout(e),s(scrollY)})}catch{}const c=()=>{let a;try{a=sessionStorage.getItem(I)}catch{return null}if(a===null)return null;let _;try{_=JSON.parse(a)}catch{_=null}const m=_?.y;if(!(typeof m=="number"&&Number.isFinite(m)&&m>=0)){try{sessionStorage.removeItem(I)}catch{}return null}return m};let g=!1;const p=a=>{try{const _=scrollY;scrollTo({top:a,left:0,behavior:"instant"}),i=a,l=!0,s(a);const m=scrollY;m!==_&&(t=!0),m!==a&&!g&&(g=!0,addEventListener("load",()=>{try{if(scrollY===m){const y=c();p(y!==null?y:i)}}catch{}},{once:!0}))}catch{}},o=()=>{try{return!!location.hash}catch{return!0}};let u=!1;const d=()=>{try{if(u||innerWidth>fe||innerHeight>de)return;u=!0;const a=Date.now(),_=()=>{try{removeEventListener("resize",_)}catch{}if(Date.now()-a>me||n||o())return;const m=c();p(m!==null?m:i)};addEventListener("resize",_)}catch{}};let h=!1,b=!1;return{restore(){if(h||(h=!0,o()))return;const a=c();a!==null&&(p(a),d())},promoted(){if(b||(b=!0,o()))return;const a=c();a!==null?(p(a),d()):l&&p(i)}}}function he(e,t,n){const l=[...t.values()].filter(i=>i.targets.some(s=>s.startsWith(e+".")));return{wrap(i,s){const f=`${e}.${i}`,c=l.filter(g=>g.targets.includes(f));return c.length===0?(...g)=>{try{return s(...g)}catch(p){return Promise.reject(p)}}:(...g)=>{let p=g;for(const u of c){const d=u.module.parameters;if(d)try{p=d(p)}catch{return Promise.reject({code:"transform_error",id:u.id,scope:e,message:"parameters transform failed"})}}let o;try{o=s(...p)}catch(u){o=Promise.reject(u)}return o.then(u=>{for(let d=c.length-1;d>=0;d--){const h=c[d],b=h.module.returns;if(b)try{u=b(u)}catch{return n({id:h.id,scope:e,leg:"returns"}),u}}return u},u=>{for(let d=c.length-1;d>=0;d--){const h=c[d],b=h.module.throws;if(b)try{u=b(u)}catch{return n({id:h.id,scope:e,leg:"throws"}),Promise.reject(u)}}return Promise.reject(u)})}}}}function ge(e,t,n,l=()=>{}){const i=new Set(e.changes??[]),s=new Map;for(const f of i){const c=t[f];c&&s.set(f,c)}return{contract:e.contract,changes:i,flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:s,shellOrigin:n.shellOrigin,mount:n.mount,pipe:f=>he(f,s,l)}}(function(){const e=Object.defineProperty,t=globalThis,n=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let l=0;for(let i=0;i<n.length;i++){const s=n[i];try{e(t,s,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[s]}catch{}try{e(t,s,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[s]=="function"&&l++}if(l&&window!==top)try{parent.postMessage({__frame_rtc_lockdown_failed:l},"*")}catch{}})();const _e=1e4,ye=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function G(e){for(const t of ye)if(t.endsWith(":*"))try{const n=new URL(e);if(`${n.protocol}//${n.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}const R=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities}),U=window.__FRAME_PREAMBLE?.transforms,z=window.__FRAME_PREAMBLE?.comments,$=window.__FRAME_PREAMBLE?.translate,T=/^[\w.-]+\.js$/,be=/^[a-z][a-z0-9_-]{0,63}$/;let V=null,j=null;function q(e,t,n){try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!0,enumerable:!0})}catch{}}}let B=!1;function X(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,B=!0):B&&(delete t.dataset.theme,t.style.colorScheme="",B=!1)}const A=Object.assign(Object.create(null),{mcp:Object.assign(Object.create(null),{watchTool:{handlerArg:3}})}),M=new Map;function Q(e,t){const n=M.get(e);if(!n)return;const l=Object.assign(Object.create(null),t);Object.assign(n.impl,l),n.impl.__settled=()=>Promise.reject({code:"capability_removed",message:`${e}: method not in this runtime`});const i=n.queue;n.queue=[];for(const s of i){const f=l[s.method];if(f)if(A[e]?.[s.method])try{s.resolve(f(...s.args))}catch{k(s,A[e][s.method].handlerArg,{code:"transform_error",message:`${e}.${s.method} rejected its arguments`})}else f(...s.args).then(s.resolve,s.reject);else{const c={code:"capability_removed",message:`${e}.${s.method} is not in this runtime`},g=A[e]?.[s.method];if(g){k(s,g.handlerArg,c);continue}s.reject(c)}}}function ve(e,t){const n=M.get(e);if(!n)return;n.impl.__settled=()=>Promise.reject(t);const l=n.queue;n.queue=[];for(const i of l){const s=A[e]?.[i.method];if(s){k(i,s.handlerArg,t);continue}i.reject(t)}}function N(e,t){const n=oe[e];if(!n){ve(e,t);return}Q(e,Object.fromEntries(Object.entries(n).map(([l,i])=>[l,()=>Promise.resolve(i)])))}function k(e,t,n){if(e.syncState?.dead)return;const l=e.args[t];typeof l=="function"&&queueMicrotask(()=>{if(!e.syncState?.dead)try{l({type:"error",error:n})}catch(i){se(i)}})}const F=Object.getOwnPropertyDescriptor(window,"claude");if(window!==top&&!(F&&F.writable===!1)){ce(),le();let e=null;try{e=pe()}catch{}const t=F?.value??{};q(window,"claude",t);const n=o=>{const u={impl:Object.create(null),queue:[]};M.set(o,u);const d=u.impl,h=new Proxy(d,{get:(b,a)=>{if(typeof a!="string"||a==="then"||a==="toJSON"||a==="valueOf")return;if(a==="toString")return Object.prototype.toString;const _=A[o]?.[a];return _?(...m)=>{if(typeof m[_.handlerArg]!="function")throw new TypeError(`${o}.${a} requires a handler function`);const y=d[a];if(y)return y(...m);if(d.__settled){const v={dead:!1},P={args:[...m],syncState:v};return d.__settled().catch(C=>k(P,_.handlerArg,C)),()=>{v.dead=!0}}let E=null;const S={dead:!1};return u.queue.push({method:a,args:m,resolve:v=>{E=typeof v=="function"?v:null,S.dead&&E?.()},reject:()=>{},syncState:S}),()=>{S.dead=!0,E?.()}}:(...m)=>{const y=d[a]??d.__settled;return y?y(...m):new Promise((E,S)=>{u.queue.push({method:a,args:m,resolve:E,reject:S})})}},set:()=>!1});q(t,o,h)};for(const o of Object.keys(R)){if(t[o]!==void 0){q(t,o,t[o]);continue}n(o)}let l=null,i=null,s=0;const f=o=>{o.source!==parent||!G(o.origin)||ne(o.data)&&(l=o.data.__frame_init,j=o.origin,removeEventListener("message",f),clearTimeout(s),i?.())};addEventListener("message",f),parent.postMessage({__frame_connect:!0},"*");const c=new Promise(o=>{i=o,s=setTimeout(()=>{removeEventListener("message",f),o()},_e)}),g=document.readyState==="loading"?new Promise(o=>document.addEventListener("DOMContentLoaded",()=>o(),{once:!0})):Promise.resolve();g.then(()=>{try{e?.restore()}catch{}});const p=o=>{if(!(o.source!==parent||!G(o.origin))&&W(o.data)){removeEventListener("message",p);try{e?.promoted()}catch{}}};addEventListener("message",p),c.then(async()=>{if(!l||!j){for(const r of M.keys())N(r,{code:"not_granted",message:"frame initialization did not arrive - capability unavailable"});return}X(l.theme);const o=j;let u=!1,d=!1;addEventListener("message",r=>{if(r.source!==parent||r.origin!==o)return;re(r.data)&&X(r.data.__frame_theme.theme);const w=r.data?.__fc_mode;w&&typeof w=="object"&&!u&&z&&T.test(z)&&(u=!0,h(z).then(H=>H.install?.(o,w.on===!0)).catch(()=>{}));const O=r.data?.__ft_cmd;O&&typeof O=="object"&&!d&&$&&T.test($)&&(d=!0,h($).then(H=>H.install?.(o,O)).catch(()=>{}))});const h=r=>ee(()=>import("/_runtime/"+r),void 0),b=Object.keys(l.capabilities??{});for(const r of b)Object.hasOwn(R,r)||be.test(r)&&t[r]===void 0&&(n(r),N(r,{code:"capability_disabled",message:"capability not in this runtime generation"}));const a=b.filter(r=>Object.hasOwn(R,r)).map(r=>[r,R[r]]).filter(r=>typeof r[1]=="string"&&T.test(r[1])),[_,...m]=await Promise.allSettled([U&&T.test(U)?h(U):Promise.resolve({}),...a.map(([,r])=>h(r))]),y=j;V=ge(l,_.status==="fulfilled"&&_.value?.TRANSFORMS||{},{shellOrigin:y,mount:Q},r=>parent.postMessage({__frame_cap_telemetry:r},y));const E=r=>parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:r}},y),S=V;m.forEach((r,w)=>{const O=a[w][0];if(r.status!=="fulfilled"){E(O);return}try{r.value?.install?.(S)}catch{E(O)}});for(const[r,w]of M)if(!(w.queue.length===0&&Object.keys(w.impl).length>0)){if(b.includes(r)){N(r,{code:"capability_disabled",message:"capability not available in this session"});continue}N(r,{code:"not_granted",message:"capability not available in this session"})}await g,parent.postMessage({__frame_ready:!0},j);let v=-1,P=0;const C=()=>{P=0;const r=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);r!==v&&(v=r,parent.postMessage({__frame_size:!0,h:r},y))},L=()=>{P||(P=setTimeout(C,200))},Z=new ResizeObserver(L);Z.observe(document.documentElement),document.body&&Z.observe(document.body),document.addEventListener("load",L,!0),document.fonts?.ready.then(L,()=>{}),addEventListener("beforeprint",()=>{v=-1,C()}),L(),addEventListener("message",r=>{if(!(r.source!==parent||r.origin!==y)&&W(r.data)){try{e?.promoted()}catch{}v=-1,L()}})})}})();</script><!-- /frame-runtime --><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>llm-proxy · release tracker</title>
+<style>
+  :root {
+    --ground: #eceef1; --surface: #ffffff; --sunk: #e2e6ea;
+    --ink: #151d26; --muted: #5d6b7a; --faint: #8a97a4; --line: #d2d9df;
+    --signal: #b4470f; --signal-bg: #fbeade; --signal-line: #e8a575;
+    --shipped: #1a6b40; --shipped-bg: #e0efe6;
+    --future: #6b7684; --future-bg: #e7eaee;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0d1218; --surface: #161d25; --sunk: #111820;
+      --ink: #e6ecf2; --muted: #97a4b2; --faint: #6d7b8a; --line: #26303b;
+      --signal: #f0894a; --signal-bg: #2e1b10; --signal-line: #7a441f;
+      --shipped: #4fb37c; --shipped-bg: #12281c;
+      --future: #8896a4; --future-bg: #1b232c;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #eceef1; --surface: #ffffff; --sunk: #e2e6ea;
+    --ink: #151d26; --muted: #5d6b7a; --faint: #8a97a4; --line: #d2d9df;
+    --signal: #b4470f; --signal-bg: #fbeade; --signal-line: #e8a575;
+    --shipped: #1a6b40; --shipped-bg: #e0efe6;
+    --future: #6b7684; --future-bg: #e7eaee;
+  }
+  :root[data-theme="dark"] {
+    --ground: #0d1218; --surface: #161d25; --sunk: #111820;
+    --ink: #e6ecf2; --muted: #97a4b2; --faint: #6d7b8a; --line: #26303b;
+    --signal: #f0894a; --signal-bg: #2e1b10; --signal-line: #7a441f;
+    --shipped: #4fb37c; --shipped-bg: #12281c;
+    --future: #8896a4; --future-bg: #1b232c;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--sans); font-size: 15px; line-height: 1.55;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 40px 24px 64px; }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--faint); margin: 0 0 10px;
+  }
+  h1 {
+    font-family: var(--mono); font-size: 27px; font-weight: 600;
+    letter-spacing: -.02em; margin: 0 0 8px; text-wrap: balance;
+  }
+  .lede { color: var(--muted); font-size: 15px; max-width: 68ch; margin: 0 0 30px; }
+  .lede strong { color: var(--ink); font-weight: 600; }
+
+  /* --- the ladder ---------------------------------------------------- */
+  .ladder { display: flex; flex-direction: column; gap: 0; }
+  .rel {
+    display: grid; grid-template-columns: 92px 1fr; gap: 20px;
+    position: relative; padding-bottom: 22px;
+  }
+  .rel::before {
+    content: ""; position: absolute; left: 91px; top: 22px; bottom: -4px;
+    width: 2px; background: var(--line);
+  }
+  .rel:last-child::before { display: none; }
+
+  .spine { text-align: right; padding-top: 12px; position: relative; }
+  .ver {
+    font-family: var(--mono); font-size: 14px; font-weight: 700;
+    font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+  }
+  .when { font-family: var(--mono); font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+  .dot {
+    position: absolute; right: -25px; top: 16px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--ground); border: 2px solid var(--line);
+  }
+  .rel.current .dot { border-color: var(--signal); background: var(--signal); box-shadow: 0 0 0 4px var(--signal-bg); }
+  .rel.shipped .dot { border-color: var(--shipped); background: var(--shipped); }
+
+  .body {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 8px; padding: 16px 18px;
+  }
+  .rel.current .body { border-color: var(--signal-line); border-left: 3px solid var(--signal); }
+
+  .head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+  .name { font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
+  .tag {
+    font-family: var(--mono); font-size: 10px; font-weight: 700;
+    padding: 2px 7px; border-radius: 4px; letter-spacing: .05em; text-transform: uppercase;
+  }
+  .tag.now { background: var(--signal-bg); color: var(--signal); }
+  .tag.done { background: var(--shipped-bg); color: var(--shipped); }
+  .tag.later { background: var(--future-bg); color: var(--future); }
+  .theme { color: var(--muted); font-size: 14px; margin: 0 0 12px; }
+
+  .gate {
+    background: var(--sunk); border-radius: 6px; padding: 11px 13px; margin: 0 0 12px;
+    border-left: 2px solid var(--signal);
+  }
+  .gate .lbl {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--signal); font-weight: 700;
+    display: block; margin-bottom: 4px;
+  }
+  .gate p { margin: 0; font-size: 13.5px; line-height: 1.5; }
+  .gate .verify {
+    display: block; margin-top: 7px; font-family: var(--mono);
+    font-size: 11.5px; color: var(--muted);
+  }
+
+  /* --- progress ------------------------------------------------------ */
+  .prog { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+  .bar { flex: 1; height: 7px; border-radius: 4px; background: var(--sunk); overflow: hidden; display: flex; }
+  .bar i { display: block; height: 100%; }
+  .bar .b-done { background: var(--shipped); }
+  .bar .b-open { background: var(--signal); }
+  .count {
+    font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+
+  .subhead {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--faint); margin: 14px 0 7px; font-weight: 700;
+  }
+  ul.items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+  ul.items li { display: grid; grid-template-columns: 62px 1fr; gap: 10px; font-size: 13.5px; align-items: baseline; }
+  ul.items .wp {
+    font-family: var(--mono); font-size: 11.5px; font-weight: 700; color: var(--signal);
+  }
+  .rel.shipped ul.items .wp, .rel.later ul.items .wp { color: var(--muted); }
+  ul.items .what { color: var(--muted); }
+  ul.items .what b { color: var(--ink); font-weight: 600; }
+
+  .risk {
+    margin-top: 13px; padding: 9px 12px; border-radius: 6px;
+    background: var(--signal-bg); border: 1px solid var(--signal-line);
+    font-size: 13px; line-height: 1.5; color: var(--ink);
+  }
+  .risk b { font-family: var(--mono); font-size: 11.5px; letter-spacing: .03em; text-transform: uppercase; color: var(--signal); }
+
+  .scope { font-size: 13px; color: var(--muted); margin: 12px 0 0; }
+  .scope b { color: var(--ink); font-weight: 600; }
+
+  code {
+    font-family: var(--mono); font-size: .88em;
+    background: var(--sunk); padding: 1px 5px; border-radius: 3px;
+  }
+
+  /* --- rules --------------------------------------------------------- */
+  .rules { margin-top: 42px; border-top: 1px solid var(--line); padding-top: 26px; }
+  .rules h2 { font-family: var(--mono); font-size: 16px; font-weight: 650; margin: 0 0 4px; }
+  .rules .sub { color: var(--muted); font-size: 14px; margin: 0 0 18px; max-width: 66ch; }
+  ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  ol.steps li {
+    counter-increment: s; display: grid; grid-template-columns: 26px 1fr; gap: 12px;
+    font-size: 14px; align-items: baseline;
+  }
+  ol.steps li::before {
+    content: counter(s);
+    font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--signal);
+    background: var(--signal-bg); border-radius: 4px; text-align: center;
+    padding: 2px 0; align-self: start; margin-top: 2px;
+  }
+  ol.steps b { font-weight: 650; }
+  ol.steps span { color: var(--muted); }
+  .kicker {
+    margin-top: 20px; padding: 12px 14px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 7px; font-size: 13.5px; line-height: 1.55;
+  }
+  .kicker b { font-weight: 650; }
+
+  footer { margin-top: 34px; font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+
+  @media (max-width: 620px) {
+    .rel { grid-template-columns: 1fr; gap: 8px; }
+    .rel::before { display: none; }
+    .spine { text-align: left; padding-top: 0; display: flex; align-items: baseline; gap: 8px; }
+    .dot { display: none; }
+    .when { margin-top: 0; }
+    ul.items li { grid-template-columns: 1fr; gap: 1px; }
+  }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">llm-proxy · release tracking · 52 work packages · 968 tests green, 21 skipped (cargo nextest, workspace) + black-box QA suite (10 cases) · 2026-08-08</p>
+  <h1>Release tracker</h1>
+  <p class="lede">
+    Six releases, each with exactly one <strong>ship gate</strong>: a single objectively checkable
+    statement. Not "done enough" — checkable. If a gate needs someone to argue that it passed, it
+    isn't a gate. Normative copy lives in <code>docs/MILESTONES.md</code>; this is the view.
+  </p>
+
+  <div class="ladder" id="ladder"></div>
+
+  <section class="rules">
+    <h2>How a ticket earns its slot</h2>
+    <p class="sub">Answer in order. The first question that discriminates wins.</p>
+    <ol class="steps">
+      <li><b>Does it block the current ship gate?</b> <span>Then it is the work. Nothing below matters.</span></li>
+      <li><b>Is it a correctness or security defect on a path we already serve?</b> <span>Ship gates don't protect broken behavior that's already live. The missing-credentials P0, the access-log credential leak, and all four QA-suite findings came in this way — the last of which is why the suite outranks feature work when it reports.</span></li>
+      <li><b>Does it violate a ground rule?</b> <span>A silently ignored config field is a P0 by definition. Usually small, always ahead of feature work in the same milestone.</span></li>
+      <li><b>Otherwise, priority order within the current milestone.</b> <span>P0, then P1, then P2.</span></li>
+      <li><b>Milestone empty?</b> <span>Pull from the next one. Don't pull P2 breadth work forward because it's easy — that's how the LLM layer stayed at "two files" as long as it did.</span></li>
+    </ol>
+    <p class="kicker">
+      <b>A ticket that fits no milestone doesn't get worked.</b> It gets a P3 and a line in the plan.
+      The backlog is allowed to be large; the <i>active</i> set has to be small and named.
+      <br><br>
+      <b>P2 is a commitment, not a graveyard.</b> The 2026-07-26 pivot moved LLM work ahead of parity
+      work <i>in time</i>. It cancelled nothing — xDS, the admin server, the corpus scorecard,
+      ext_authz/ext_proc, and downstream h2 all remain owed, and v1.0.0 depends on them.
+    </p>
+  </section>
+
+  <footer>Board (per-WP status): the build board artifact · Plan (per-WP scope): IMPLEMENTATION_PLAN.md · Gates: docs/MILESTONES.md</footer>
+</div>
+
+<script>
+  const releases = [
+ {
+  "v": "v0.0.1",
+  "name": "First light",
+  "state": "shipped",
+  "when": "2026-08-01",
+  "theme": "One request, all the way through, for real. A client calls the proxy; the proxy routes it, opens TLS to the upstream gateway, forwards with credentials attached, and returns the response intact — streaming included.",
+  "gate": "A chat-completion request, from a single <code>llmproxy</code> config pointed at a real provider endpoint, returns the provider's response unmodified — non-streaming <em>and</em> streamed SSE — for OpenAI and for Anthropic.",
+  "verify": "OPENAI_API_KEY=… ANTHROPIC_API_KEY=… cargo test -p diffrig --test live_smoke -- --ignored — <b>run 2026-08-01 against the real OpenAI and Anthropic endpoints: all 4 cases passed.</b> The tests stay <code>#[ignore]</code>d (they bill real tokens and CI holds no keys), so the gate evidence is a deliberate manual run, not a CI green.",
+  "done": 16,
+  "open": 3,
+  "scope": "Carries <b>everything built to date</b> — config pipeline, L4, TLS, h1/h2, S1 routing, S2 filter chain, S3 retries, S5 breakers, S7 load balancing, access logs, token extraction. The features are not the milestone; the working path through them is.",
+  "left": [
+   {
+    "wp": "WP-26",
+    "what": "<b>Done — this is what closed the gate.</b> 4 cases (OpenAI and Anthropic, streaming and not) run against the real endpoints on 2026-08-01, all passing."
+   },
+   {
+    "wp": "WP-13",
+    "what": "The first real provider round-trip exposed <b>nothing</b> — it passed clean on the first run. Still open for the lifecycle differential suite, which was never part of this gate."
+   },
+   {
+    "wp": "WP-15",
+    "what": "Keep-alive reuse — still connect-per-stream. The gate passed without it; 4 requests cannot surface it, and a sustained real workload will. Still open, not re-slotted."
+   },
+   {
+    "wp": "WP-41",
+    "what": "<b>Black-box QA suite — the new instrument, and it is already paying.</b> Four real bugs on day one; three fixed, and QA-1 now passes fully (per-route token values, no longer skipping). QA-5/7/8 approved and unbuilt."
+   }
+  ],
+  "risk": "A great deal of machinery is finished and green without ever having carried a real request. That gap is the whole point of this gate — and the QA suite has now made it concrete rather than theoretical: on its first run it found that the dialect emitted <b>no access logs at all</b>, that <code>%REQ(:METHOD)%</code> always rendered <code>-</code>, and that a stream killed mid-flight recorded <b>no response flag</b>. All three were invisible from inside the code; one was described as intended in its own doc comment. Expect this list to keep growing — that is the instrument working, not a setback. <b>Closed 2026-08-01:</b> the live smoke test ran against real OpenAI and Anthropic endpoints and passed all four cases on the first attempt — the machinery built without ever carrying a real request turned out to carry one correctly. Worth naming honestly: a clean first run is a weaker signal than a run that found something, because four requests exercise a narrow path. Coverage stays three-tiered (mocks, the local Ollama third-party tier, real providers) for exactly that reason."
+ },
+ {
+  "v": "v0.1.0",
+  "name": "LLM gateway",
+  "state": "current",
+  "when": "in progress",
+  "theme": "The reason this project exists — be a gateway a team chooses <em>because</em> it understands LLM traffic.",
+  "gate": "Per-request token counts (input / cache-read / cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate limit is enforced; and the proxy fails over from one provider to another without the client seeing an error.",
+  "done": 4,
+  "open": 5,
+  "left": [
+   {
+    "wp": "WP-35",
+    "what": "<b>Done 2026-08-07/08 (cb84f83, a2bfef7, d4ac161, 399b954), and VERIFIED END TO END 2026-08-08 (c1314b6) — the gate's third clause is no longer just code-complete.</b> The aggregate cluster (member-order failover via <code>attempted_clusters</code>, a host pick that yields its owning member) is reachable from both front-ends: Envoy-mode <code>cluster_type</code>, and the dialect's <code>fallbacks:</code> key, which now lowers for real instead of warning and dropping. <code>validate_cluster_graph</code> rejects a missing/self/nested/duplicate member at config time with a dotted path. <code>testing/diffrig/tests/failover_e2e.rs</code> now drives the real binary end to end against a mock forced to 429: exact attempt accounting, the credential-isolation negative (standby's key only, primary's key nowhere on the wire), and the standby's own Host header — all three mutation-tested. <b>Scope note: this is SAME-DIALECT fallback only.</b> Cross-dialect (openai → anthropic) is a deliberate hard error, split into new WP-52 (v1.0.0) rather than silently left undone inside this WP."
+   },
+   {
+    "wp": "WP-48",
+    "what": "<b>Done 2026-08-07 (41f1c59), re-scoped by its own audit.</b> No live overflow bug existed outside <code>usage.rs</code>. The real defect: <code>as_u64()</code> returns <code>None</code> for a JSON float, so a provider reporting <code>150.0</code> output tokens billed as zero, silently. Fixed at all 5 call sites through one helper."
+   },
+   {
+    "wp": "WP-46",
+    "what": "Done 2026-08-02 (9b68eac), and the gap that left it unusable through the product's own front door FIXED and VERIFIED 2026-08-08 (b0485e8). <code>%LLM_TPOT%</code>, <code>%LLM_MAX_STALL%</code>, and <code>%LLM_RESPONSE_CHUNKS%</code> existed since 08-02, but <b>neither <code>llmproxy</code> dialect log format (text or JSON) ever emitted them</b> — a completeness gap in this WP's original delivery, found while building the verification for it. Both formats now carry all three. New QA-10 proves it end to end against a mock with known pacing (400ms TTFT / 150ms inter-chunk observed as ttft=402ms, tpot=122.129ms, max_stall=152ms) and caught a live bug in the same pass: <code>%LLM_RESPONSE_CHUNKS%</code> over-counted by exactly one on every response with a body (a synthetic end-of-stream frame timed as a chunk), also fixed."
+   },
+   {
+    "wp": "WP-45",
+    "what": "Done 2026-08-05 (872b7d7) — all 6 acceptance criteria met. Consumer B (body-based model routing) reads <code>model</code> from the real request body instead of a client-controlled header, closing a privilege-escalation surface."
+   },
+   {
+    "wp": "WP-49",
+    "what": "Backend taxonomy. Increment 1 done 2026-08-02 (caccc5f) — the <code>models:</code> catalogue. <b>Remaining:</b> wildcard model names + trie, then the OAuth/SigV4 credential schemes Vertex/Bedrock need — those must run after WP-45's body rewrite and cannot be header injection, and there is no hook for that today."
+   },
+   {
+    "wp": "WP-47",
+    "what": "Vendored Lane-H filter proto. Not started. Three filters currently reuse unrelated Envoy messages for typed_config (a borrowed <code>RateLimitSettings</code> for token-limit config is already documented as \"visibly stretched\") — blocks per-descriptor rate-limit config beyond a single (route, credential) bucket."
+   },
+   {
+    "wp": "WP-34",
+    "what": "<b>Token rate limits — now the ONLY unverified v0.1.0 gate clause (2026-08-08).</b> Extraction is done; the enforcement filter is built and live (429 + <code>x-ratelimit-*</code>, mutation-tested at the unit level); the dialect's <code>limits</code> key lowers to it. But nothing drives the real binary end to end against a real 429-on-limit-exceeded the way WP-35's failover drill or QA-10 now do for the other two clauses — the owner explicitly deferred this verification this session. <b>Remaining, in priority order:</b> an end-to-end drill (QA-11-style, or a diffrig test) proving enforcement against the real binary; then per-descriptor config beyond a single (route, credential) bucket, blocked on WP-47."
+   },
+   {
+    "wp": "WP-33",
+    "what": "Usage filter wired per-route into the llmproxy dialect. <b>Remaining:</b> GenAI metrics per OTel semconv (distinct from WP-46's access-log fields, which are done) and the route-level <code>streaming: strict</code> assertion."
+   },
+   {
+    "wp": "WP-14",
+    "what": "Hedging, S5.2 retry budgets, previously-attempted-host predicate. WP-35's failover shipped on this engine as already built — 429-as-retriable and never-retry-after-first-byte needed no new mechanism here."
+   }
+  ],
+  "risk": "<b>Two of the three gate clauses moved from code-complete to verified this pass (2026-08-08); the third — token-based rate limiting — did not, and that is now the only thing between this release and a defensible ship.</b> Token counts + TTFT/TPOT reaching the access log: closed (WP-33 + WP-45 + WP-46) AND verified — QA-1 has given real black-box evidence for the token-count half since 2026-08-01, and new QA-10 (<code>make qa</code> green x3) now does the same for TTFT/TPOT, catching a live over-count bug in <code>%LLM_RESPONSE_CHUNKS%</code> in the process. <b>Provider failover</b> (WP-35 increments 2a/2b-i/2b-ii/2c, landed 2026-08-07/08) is now ALSO verified — <code>testing/diffrig/tests/failover_e2e.rs</code> drives the real binary against a real dialect config and a mock forced to 429, with attempt accounting, the credential-isolation negative, and the standby's own Host header all mutation-tested. <b>Token-based rate limiting is the one clause left with no end-to-end evidence.</b> WP-34's filter enforces 429s from the dialect's <code>limits</code> key and is mutation-tested at the unit level, but nothing drives the real binary against a real over-limit request the way the other two clauses now do — the owner explicitly deferred this verification this session. v0.0.1 did not ship on code-complete: it shipped on a live smoke run against real OpenAI and Anthropic endpoints, actually executed and recorded. This release needs the rate-limit equivalent of that run (or a QA-11-style scenario / diffrig drill) before it can flip to <code>shipped</code>. <b>Judgment call, stated plainly:</b> holding this release at <code>current</code> rather than flipping it to <code>shipped</code> is this document's call, not something the gate text forces by itself — recorded here so it can be argued with, and it now rests on one clause instead of three. <b>WP-35's own scope closed narrower than its title suggests:</b> same-dialect fallback only. Cross-dialect (openai → anthropic) is a deliberate hard error at config time, not silently unsupported — the translation work it would need is real and un-started, and is now WP-52 (v1.0.0), not a loose end inside this WP. <b>Second risk, named 2026-08-01, unchanged:</b> the LLM layer is stacking on <em>serving</em> foundations that are not finished — no connection pooling (WP-15, still connect-per-stream), no downstream h2 (WP-10), and watermarks aliased to buffering rather than real backpressure (WP-11). None of those three are exercised by the tests that closed this gate's clauses, and all three bite under concurrency, sustained streams, or a slow consumer. <b>Third risk, unchanged:</b> the workspace suite (968 tests, <code>cargo nextest</code>, +3 this pass for the failover drill, not directly comparable to the prior <code>cargo test</code> counts) had 8 tests in <code>diffrig</code> intermittently hanging rather than merely slow, inflating full-run times 656–863s against a healthy ~79s. Mitigated to 2 slow tests via a multi-threaded runtime plus a <code>terminate-after</code> gate that turns a hang into a named failure — not fixed: those tests still carry no request timeouts."
+ },
+ {
+  "v": "v0.2.0",
+  "name": "Production-ready serving",
+  "state": "later",
+  "theme": "Stop claiming “performant” without evidence, and be safe to run unattended.",
+  "gate": "A published capacity report (p99, tokens/sec ceiling, RSS under sustained long-lived streams) from a run that is <em>not</em> harness-bound, plus <code>/config_dump</code> and <code>/stats</code> served by the admin endpoint, plus a config swap under live traffic with zero dropped streams.",
+  "done": 0,
+  "open": 7,
+  "left": [
+   {
+    "wp": "WP-30",
+    "what": "The sweep itself. Phases 1+2 are built; no ceiling has been published, so <b>“performant” is still an untested claim</b>."
+   },
+   {
+    "wp": "WP-23",
+    "what": "Stats registry with Envoy names — also owns the two inert <code>stat_prefix</code> fields the readership guard flags."
+   },
+   {
+    "wp": "WP-50",
+    "what": "<b>Operator control plane — absorbs the old WP-25 slot.</b> Increment 1 landed 2026-08-02 (9df7deb): <code>/ready</code>, <code>/config_dump</code>, <code>/clusters</code>, <code>/server_info</code>, all on the control runtime, with <code>/config_dump</code> redaction structural (the dump type has no field that can hold a live credential) rather than a filter someone could forget to call. <code>/stats</code> 404s naming WP-23 rather than faking an empty 200 — so half this gate's admin clause is real, the other half is still WP-23. <b>Remaining:</b> increment 2 (virtual keys, auth) and increment 3 (tenants/budgets)."
+   },
+   {
+    "wp": "WP-18",
+    "what": "Health checking is built and green (64 tests) but <b>not reachable from config</b> — <code>ClusterConfig</code> has no field for it."
+   },
+   {
+    "wp": "WP-19",
+    "what": "Outlier detection, same story: 78 tests green, no IR wiring."
+   },
+   {
+    "wp": "WP-06",
+    "what": "The swap-under-load gate — the only thing keeping Lane B open."
+   },
+   {
+    "wp": "WP-42",
+    "what": "<b>Spend controls & budgets.</b> New from the 2026-08-01 competitive review — and <i>not</i> WP-34's token rate limits: a tokens/minute cap is a throttle, not a budget. Nothing else in the plan says \"this key may spend $X, then stop.\""
+   }
+  ],
+  "risk": "The loadgen Linux <code>/proc</code> sampler is written to spec but unverified — there is no Linux box in the loop. That is a blocker for this gate, not a footnote."
+ },
+ {
+  "v": "v0.3.0",
+  "name": "Dynamic configuration",
+  "state": "later",
+  "theme": "Be deployable the way Envoy is deployed.",
+  "gate": "The proxy takes its entire configuration from an ADS control plane, ACKs and NACKs correctly per S8, and survives a control-plane reconnect with make-before-break cluster warming.",
+  "verify": "testing/controlplane harness plus a go-control-plane fixture.",
+  "done": 0,
+  "open": 4,
+  "left": [
+   {
+    "wp": "WP-20",
+    "what": "ADS client, state-of-the-world."
+   },
+   {
+    "wp": "WP-21",
+    "what": "Warming, ordering, make-before-break — owns the missing IR <code>Eds</code> discovery variant."
+   },
+   {
+    "wp": "WP-22",
+    "what": "SDS + delta xDS. SDS is what drives WP-08's cert hot-reload seam, which is built and waiting."
+   },
+   {
+    "wp": "WP-28",
+    "what": "Scenario DSL, reconnect/warming coverage in the control-plane harness."
+   }
+  ],
+  "scope": "Deferred deliberately: static config carries v0.0.1 through v0.2.0. This is the largest single block of P2 work and it is <b>genuinely owed</b> — it's the on-ramp that lets a team point an existing bootstrap at us."
+ },
+ {
+  "v": "v0.4.0",
+  "name": "Envoy parity",
+  "state": "later",
+  "theme": "The compatibility moat — widen the set of configs we accept without a migration.",
+  "gate": "The config-corpus scorecard clears 80% accept on real-world Envoy configs (baseline 15%), with zero <em>bug-we-accept</em> results in the differential run against Envoy v1.38.0.",
+  "done": 0,
+  "open": 7,
+  "left": [
+   {
+    "wp": "WP-27",
+    "what": "The scorecard is the honest instrument here — it climbs only when real configs stop being rejected, and <b>cannot be gamed by adding tests</b>."
+   },
+   {
+    "wp": "WP-31",
+    "what": "cors, local_ratelimit."
+   },
+   {
+    "wp": "WP-32",
+    "what": "ext_authz, ratelimit, ext_proc — ext_proc is what v1.0.0 needs."
+   },
+   {
+    "wp": "WP-10",
+    "what": "Downstream h2 and upgrades (S10)."
+   },
+   {
+    "wp": "WP-11",
+    "what": "Watermarks, StopAll resume, 1xx — the S2 remainder."
+   },
+   {
+    "wp": "WP-29",
+    "what": "Fuzzing: h1 parser smuggling vectors, config, routes."
+   },
+   {
+    "wp": "WP-40",
+    "what": "Dependency-tree review and cleanup."
+   }
+  ]
+ },
+ {
+  "v": "v1.0.0",
+  "name": "Full LLM layer",
+  "state": "later",
+  "theme": "The complete inference-gateway surface, on a proven parity base.",
+  "gate": "Gateway API Inference Extension (EPP) support and realtime WebSocket sessions both serving, on top of a green parity scorecard.",
+  "done": 0,
+  "open": 4,
+  "left": [
+   {
+    "wp": "WP-36",
+    "what": "Inference Extension (EPP) — needs <code>ext_proc</code> from v0.4.0."
+   },
+   {
+    "wp": "WP-37",
+    "what": "Realtime WebSocket sessions — needs S10 upgrade support from v0.4.0."
+   },
+   {
+    "wp": "WP-43",
+    "what": "<b>Response caching.</b> New from the competitive review. Streaming is the hard part — a hit must replay <i>as a stream</i>, and the entry can only be written once usage is known at stream end. Semantic caching is a separate decision: a near-miss served as a hit is a wrong answer, not a slow one."
+   },
+   {
+    "wp": "WP-44",
+    "what": "<b>Cost-aware model routing.</b> Extends WP-35 with a price dimension. The chosen model and the reason must reach the access log — a router that silently downgrades a model is indistinguishable from a bug."
+   }
+  ],
+  "scope": "Neither can move earlier, which is why parity is a <b>v1.0.0 dependency</b> rather than optional breadth."
+ }
+];
+
+  const tagFor = { current: ["now", "shipping now"], shipped: ["done", "shipped"], later: ["later", "planned"] };
+
+  document.getElementById("ladder").innerHTML = releases.map(r => {
+    const total = r.done + r.open;
+    const pctDone = total ? (r.done / total) * 100 : 0;
+    const pctOpen = total ? (r.open / total) * 100 : 0;
+    const [tagCls, tagTxt] = tagFor[r.state];
+    return `
+    <article class="rel ${r.state}">
+      <div class="spine">
+        <div class="ver">${r.v}</div>
+        ${r.when ? `<div class="when">${r.when}</div>` : ""}
+        <span class="dot"></span>
+      </div>
+      <div class="body">
+        <div class="head">
+          <span class="name">${r.name}</span>
+          <span class="tag ${tagCls}">${tagTxt}</span>
+        </div>
+        <p class="theme">${r.theme}</p>
+
+        <div class="gate">
+          <span class="lbl">Ship gate</span>
+          <p>${r.gate}</p>
+          ${r.verify ? `<span class="verify">↳ ${r.verify}</span>` : ""}
+        </div>
+
+        <div class="prog">
+          <span class="bar">
+            <i class="b-done" style="width:${pctDone}%"></i><i class="b-open" style="width:${pctOpen}%"></i>
+          </span>
+          <span class="count">${r.done}/${total} WPs closed</span>
+        </div>
+
+        ${r.scope ? `<p class="scope">${r.scope}</p>` : ""}
+
+        <div class="subhead">${r.state === "current" ? "Left to close the gate" : "In scope"}</div>
+        <ul class="items">
+          ${r.left.map(i => `<li><span class="wp">${i.wp}</span><span class="what">${i.what}</span></li>`).join("")}
+        </ul>
+
+        ${r.risk ? `<p class="risk"><b>Risk —</b> ${r.risk}</p>` : ""}
+      </div>
+    </article>`;
+  }).join("");
+</script>
+
+</body></html>

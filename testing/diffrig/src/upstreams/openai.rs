@@ -12,12 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::tls_support::{serve_tls, MockTls, TlsServerHandle};
 use super::{record_request_with_body, serve, RequestLog, ResponseBody, ServerHandle};
 
 /// How the mock upstream should behave for every request it serves.
@@ -43,6 +44,14 @@ pub struct OpenAiConfig {
     /// When set, every request gets this `(status, message)` back instead of
     /// being handled normally — for retry/fallback drills (WP-35).
     pub forced_error: Option<(u16, String)>,
+    /// Cache-read tokens to report as a subset of `prompt_tokens`, under
+    /// `usage.prompt_tokens_details.cached_tokens`. Defaults to 0 in scenario
+    /// files; set nonzero to drive the cached-token cost bucket in metering
+    /// tests (see `crates/proxy-filters/src/usage.rs`, which reads
+    /// `input_tokens` as `prompt_tokens - cached_tokens`). `prompt_tokens`
+    /// itself is inflated by this amount, matching real OpenAI responses
+    /// where `prompt_tokens` is inclusive of the cached portion.
+    pub cached_tokens: u64,
 }
 
 /// Thread-safe, append-only log of parsed `/v1/chat/completions` request
@@ -78,15 +87,39 @@ impl ChatRequestLog {
     }
 }
 
+/// Either a plaintext accept loop (`spawn`) or a TLS-terminating one
+/// (`spawn_tls`) -- see `spawn_tls`'s doc comment for why the TLS variant
+/// carries a bare port rather than a single `SocketAddr` (it listens on both
+/// loopback address families).
+enum Handle {
+    Plain(ServerHandle),
+    Tls(TlsServerHandle),
+}
+
 pub struct OpenAiUpstream {
     pub log: RequestLog,
     pub bodies: ChatRequestLog,
-    handle: ServerHandle,
+    handle: Handle,
 }
 
 impl OpenAiUpstream {
+    /// Only valid for a plaintext (`spawn`) upstream -- a TLS upstream
+    /// listens on two address families at the same port, so callers should
+    /// use [`Self::port`] and dial it by hostname instead.
     pub fn addr(&self) -> SocketAddr {
-        self.handle.addr
+        match &self.handle {
+            Handle::Plain(h) => h.addr,
+            Handle::Tls(_) => {
+                panic!("OpenAiUpstream::addr() is not meaningful for a TLS upstream; use port()")
+            }
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match &self.handle {
+            Handle::Plain(h) => h.addr.port(),
+            Handle::Tls(h) => h.port,
+        }
     }
 
     pub async fn spawn(config: OpenAiConfig) -> anyhow::Result<Self> {
@@ -100,14 +133,48 @@ impl OpenAiUpstream {
         // since we only need uniqueness, not synchronization with anything
         // else.
         let next_id = Arc::new(AtomicU64::new(1));
-        let handle = serve(move |req: Request<Incoming>| {
-            let log = log_for_handler.clone();
-            let bodies = bodies_for_handler.clone();
-            let config = Arc::clone(&config);
-            let next_id = Arc::clone(&next_id);
-            async move { Ok(handle_openai(req, &log, &bodies, &config, &next_id).await) }
+        let handle = Handle::Plain(
+            serve(move |req: Request<Incoming>| {
+                let log = log_for_handler.clone();
+                let bodies = bodies_for_handler.clone();
+                let config = Arc::clone(&config);
+                let next_id = Arc::clone(&next_id);
+                async move { Ok(handle_openai(req, &log, &bodies, &config, &next_id).await) }
+            })
+            .await?,
+        );
+        Ok(Self {
+            log,
+            bodies,
+            handle,
         })
-        .await?;
+    }
+
+    /// The TLS-capable twin of `spawn`: serves the same
+    /// chat-completions/responses handler behind `tls`'s minted certificate,
+    /// for the hermetic upstream-TLS end-to-end test (WP-26). Bound on both
+    /// loopback address families at one port -- see [`TlsServerHandle`]'s
+    /// doc comment for why.
+    pub async fn spawn_tls(config: OpenAiConfig, tls: &MockTls) -> anyhow::Result<Self> {
+        let log = RequestLog::new();
+        let bodies = ChatRequestLog::new();
+        let log_for_handler = log.clone();
+        let bodies_for_handler = bodies.clone();
+        let config = Arc::new(config);
+        let next_id = Arc::new(AtomicU64::new(1));
+        let handle = Handle::Tls(
+            serve_tls(
+                move |req: Request<Incoming>| {
+                    let log = log_for_handler.clone();
+                    let bodies = bodies_for_handler.clone();
+                    let config = Arc::clone(&config);
+                    let next_id = Arc::clone(&next_id);
+                    async move { Ok(handle_openai(req, &log, &bodies, &config, &next_id).await) }
+                },
+                tls,
+            )
+            .await?,
+        );
         Ok(Self {
             log,
             bodies,
@@ -116,7 +183,10 @@ impl OpenAiUpstream {
     }
 
     pub async fn shutdown(self) {
-        self.handle.shutdown().await;
+        match self.handle {
+            Handle::Plain(h) => h.shutdown().await,
+            Handle::Tls(h) => h.shutdown().await,
+        }
     }
 }
 
@@ -191,6 +261,7 @@ async fn handle_openai(
         ("POST", "/v1/chat/completions") => {
             handle_chat_completions(body_bytes, bodies, config, next_id)
         }
+        ("POST", "/v1/responses") => handle_responses(body_bytes, bodies, config, next_id),
         ("GET", "/v1/models") => models_response(config),
         _ => error_response(
             404,
@@ -234,11 +305,16 @@ fn handle_chat_completions(
     let id = format!("chatcmpl-{}", next_id.fetch_add(1, Ordering::Relaxed));
     let created = now_unix();
     let completion_tokens = whitespace_tokens(&config.response_text);
-    let prompt_tokens: usize = parsed
+    // Rust note: `prompt_tokens` mirrors real OpenAI responses, whose
+    // `prompt_tokens` is inclusive of the cached portion (`cached_tokens` is
+    // reported separately as a *subset*, not on top) — so the configured
+    // cache count is added in here rather than kept apart.
+    let base_prompt_tokens: usize = parsed
         .messages
         .iter()
         .map(|m| whitespace_tokens(&m.content))
         .sum();
+    let prompt_tokens = base_prompt_tokens + config.cached_tokens as usize;
 
     if parsed.stream {
         let include_usage = parsed
@@ -270,6 +346,7 @@ fn handle_chat_completions(
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+                "prompt_tokens_details": { "cached_tokens": config.cached_tokens },
             },
         });
         json_response(200, &body)
@@ -289,17 +366,22 @@ fn streaming_response(
     let tokens: Vec<&str> = config.response_text.split_whitespace().collect();
 
     // Rust note: build the whole paced event schedule up front as
-    // `(delay_before_this_frame, already-rendered SSE payload)` pairs, then
-    // hand it to `futures::stream::unfold` below — the seed for `unfold` is
-    // just "how far through this Vec are we", which keeps the async step
-    // closure trivial instead of hand-rolling a state machine per event kind.
+    // `(delay_before_this_frame, already-rendered SSE frame text)` pairs, then
+    // hand it to `super::paced_sse_body` — see that function's doc comment for
+    // why the pacing state machine lives there instead of here.
     let mut frames: Vec<(Duration, String)> = Vec::new();
     // TTFT gates the *first* frame: nothing (not even the role delta) is
     // emitted before it, mirroring a real provider that stays silent until
     // generation starts.
     frames.push((
         config.ttft,
-        chunk_json(id, created, model, json!({ "role": "assistant" }), None),
+        super::sse_data_frame(&chunk_json(
+            id,
+            created,
+            model,
+            json!({ "role": "assistant" }),
+            None,
+        )),
     ));
     for (i, token) in tokens.iter().enumerate() {
         let delay = if i == 0 {
@@ -314,55 +396,270 @@ fn streaming_response(
         };
         frames.push((
             delay,
-            chunk_json(id, created, model, json!({ "content": content }), None),
+            super::sse_data_frame(&chunk_json(
+                id,
+                created,
+                model,
+                json!({ "content": content }),
+                None,
+            )),
         ));
     }
     frames.push((
         Duration::ZERO,
-        chunk_json(id, created, model, json!({}), Some("stop")),
+        super::sse_data_frame(&chunk_json(id, created, model, json!({}), Some("stop"))),
     ));
     if include_usage {
         let usage = json!({
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": { "cached_tokens": config.cached_tokens },
         });
         frames.push((
             Duration::ZERO,
-            json!({
-                "id": id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [],
-                "usage": usage,
-            })
-            .to_string(),
+            super::sse_data_frame(
+                &json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": usage,
+                })
+                .to_string(),
+            ),
         ));
     }
-    frames.push((Duration::ZERO, "[DONE]".to_string()));
-
-    let stream = futures::stream::unfold((0usize, frames), |(i, frames)| async move {
-        let (delay, payload) = frames.get(i)?.clone();
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        let event = Bytes::from(format!("data: {payload}\n\n"));
-        Some((
-            Ok::<_, std::convert::Infallible>(Frame::data(event)),
-            (i + 1, frames),
-        ))
-    });
+    frames.push((Duration::ZERO, super::sse_data_frame("[DONE]")));
 
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        // Rust note: `StreamBody` turns any `Stream` of `Result<Frame<Bytes>,
-        // E>` into a `Body`; hyper polls it frame by frame and writes each
-        // one out as an HTTP/1.1 chunked-encoding chunk as soon as it's
-        // ready, which is what gives us real (not buffered) pacing.
-        .body(StreamBody::new(stream).boxed())
+        .body(super::paced_sse_body(frames))
+        .expect("response built from known-valid parts")
+}
+
+// --- Responses API (`POST /v1/responses`) ----------------------------------
+//
+// Same server, same `OpenAiConfig` knobs as chat completions — just a
+// different request/response envelope, matching real OpenAI's newer
+// "Responses" surface. Note the different usage field names
+// (`input_tokens`/`output_tokens`, not `prompt_tokens`/`completion_tokens`);
+// see the module-level `handle_responses` doc for why that matters for token
+// metering.
+
+/// `input` may be a bare string (the common case for a single-turn prompt) or
+/// a list of role/content items, matching the real Responses API's request
+/// shape.
+///
+/// Rust note: `#[serde(untagged)]` tries each variant in turn against the
+/// incoming JSON; `Text` matches a JSON string, `Items` matches a JSON array.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ResponsesInput {
+    Text(String),
+    Items(Vec<ResponsesInputItem>),
+}
+
+impl Default for ResponsesInput {
+    fn default() -> Self {
+        ResponsesInput::Text(String::new())
+    }
+}
+
+impl ResponsesInput {
+    fn whitespace_tokens(&self) -> usize {
+        match self {
+            ResponsesInput::Text(text) => whitespace_tokens(text),
+            ResponsesInput::Items(items) => items
+                .iter()
+                .map(|item| whitespace_tokens(&item.content))
+                .sum(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesInputItem {
+    #[serde(default)]
+    #[allow(dead_code)]
+    role: String,
+    #[serde(default)]
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesRequest {
+    model: String,
+    #[serde(default)]
+    input: ResponsesInput,
+    #[serde(default)]
+    stream: bool,
+}
+
+/// Handle `POST /v1/responses`.
+///
+/// **The one place this mock deliberately does NOT feed
+/// `crates/proxy-filters/src/usage.rs`'s `Dialect::OpenAi` parser:** the real
+/// Responses API reports usage as `usage.input_tokens`/`usage.output_tokens`
+/// (with `usage.input_tokens_details.cached_tokens`), not the chat-completions
+/// `prompt_tokens`/`completion_tokens` shape that `usage.rs` currently parses.
+/// This mock renders the real wire shape rather than bending it to match
+/// `usage.rs`, since ground rule is "the mock mirrors the provider" — the gap
+/// (no `Dialect` for the Responses API today) is a real one, reported to the
+/// orchestrator rather than silently patched over here.
+fn handle_responses(
+    body_bytes: Bytes,
+    bodies: &ChatRequestLog,
+    config: &OpenAiConfig,
+    next_id: &Arc<AtomicU64>,
+) -> Response<ResponseBody> {
+    let value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(value) => value,
+        Err(e) => {
+            return error_response(
+                400,
+                &format!("Invalid JSON in request body: {e}"),
+                "invalid_request_error",
+                Some("invalid_json"),
+            )
+        }
+    };
+    let parsed: ResponsesRequest = match serde_json::from_value(value.clone()) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return error_response(
+                400,
+                &format!("Invalid responses request: {e}"),
+                "invalid_request_error",
+                Some("invalid_body"),
+            )
+        }
+    };
+    bodies.record(value);
+
+    let id = format!("resp_{}", next_id.fetch_add(1, Ordering::Relaxed));
+    let completion_tokens = whitespace_tokens(&config.response_text);
+    let base_input_tokens = parsed.input.whitespace_tokens();
+    let input_tokens = base_input_tokens + config.cached_tokens as usize;
+
+    if parsed.stream {
+        responses_streaming_response(&id, &parsed.model, config, input_tokens, completion_tokens)
+    } else {
+        let body = json!({
+            "id": id,
+            "object": "response",
+            "created_at": now_unix(),
+            "model": parsed.model,
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": format!("msg_{id}"),
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": config.response_text, "annotations": [] }],
+            }],
+            "usage": {
+                "input_tokens": input_tokens,
+                "input_tokens_details": { "cached_tokens": config.cached_tokens },
+                "output_tokens": completion_tokens,
+                "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": input_tokens + completion_tokens,
+            },
+        });
+        json_response(200, &body)
+    }
+}
+
+/// Paced SSE for the Responses API: `response.created` (gated by `ttft`, like
+/// chat completions gates its role-delta frame), then one
+/// `response.output_text.delta` per token (paced by `inter_token_delay`),
+/// then a `response.completed` frame carrying the final output and usage.
+fn responses_streaming_response(
+    id: &str,
+    model: &str,
+    config: &OpenAiConfig,
+    input_tokens: usize,
+    completion_tokens: usize,
+) -> Response<ResponseBody> {
+    let tokens: Vec<&str> = config.response_text.split_whitespace().collect();
+    let mut frames: Vec<(Duration, String)> = Vec::new();
+
+    frames.push((
+        config.ttft,
+        super::sse_named_frame(
+            "response.created",
+            &json!({
+                "type": "response.created",
+                "response": { "id": id, "object": "response", "status": "in_progress", "model": model },
+            })
+            .to_string(),
+        ),
+    ));
+
+    for (i, token) in tokens.iter().enumerate() {
+        let delay = if i == 0 {
+            Duration::ZERO
+        } else {
+            config.inter_token_delay
+        };
+        let delta = if i == 0 {
+            (*token).to_string()
+        } else {
+            format!(" {token}")
+        };
+        frames.push((
+            delay,
+            super::sse_named_frame(
+                "response.output_text.delta",
+                &json!({
+                    "type": "response.output_text.delta",
+                    "item_id": format!("msg_{id}"),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": delta,
+                })
+                .to_string(),
+            ),
+        ));
+    }
+
+    frames.push((
+        Duration::ZERO,
+        super::sse_named_frame(
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": id,
+                    "object": "response",
+                    "status": "completed",
+                    "model": model,
+                    "output": [{
+                        "type": "message",
+                        "id": format!("msg_{id}"),
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": config.response_text, "annotations": [] }],
+                    }],
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "input_tokens_details": { "cached_tokens": config.cached_tokens },
+                        "output_tokens": completion_tokens,
+                        "output_tokens_details": { "reasoning_tokens": 0 },
+                        "total_tokens": input_tokens + completion_tokens,
+                    },
+                },
+            })
+            .to_string(),
+        ),
+    ));
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(super::paced_sse_body(frames))
         .expect("response built from known-valid parts")
 }
 
@@ -560,6 +857,7 @@ mod tests {
             inter_token_delay: Duration::from_millis(5),
             require_api_key: None,
             forced_error: None,
+            cached_tokens: 0,
         };
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
 
@@ -604,6 +902,7 @@ mod tests {
             inter_token_delay,
             require_api_key: None,
             forced_error: None,
+            cached_tokens: 0,
         };
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
 
@@ -667,6 +966,7 @@ mod tests {
             inter_token_delay: Duration::from_millis(1),
             require_api_key: Some("secret-key".to_string()),
             forced_error: None,
+            cached_tokens: 0,
         };
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
         let body = json!({"model": "mock-gpt", "messages": [{"role": "user", "content": "hi"}]});
@@ -703,6 +1003,7 @@ mod tests {
             inter_token_delay: Duration::from_millis(1),
             require_api_key: None,
             forced_error: Some((503, "upstream overloaded".to_string())),
+            cached_tokens: 0,
         };
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
         let body = json!({"model": "mock-gpt", "messages": []});
@@ -733,6 +1034,7 @@ mod tests {
             inter_token_delay: Duration::from_millis(1),
             require_api_key: None,
             forced_error: None,
+            cached_tokens: 0,
         };
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
 
@@ -779,6 +1081,7 @@ mod tests {
             inter_token_delay: Duration::from_millis(1),
             require_api_key: None,
             forced_error: None,
+            cached_tokens: 0,
         };
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
 
@@ -802,6 +1105,7 @@ mod tests {
             inter_token_delay: Duration::from_millis(1),
             require_api_key: None,
             forced_error: None,
+            cached_tokens: 0,
         };
         let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
 
@@ -811,6 +1115,141 @@ mod tests {
         assert_eq!(res.status, 404);
         let err: serde_json::Value = serde_json::from_str(&res.body).expect("valid json body");
         assert_eq!(err["error"]["type"], "invalid_request_error");
+
+        upstream.shutdown().await;
+    }
+
+    // ---- /v1/responses (Responses API) ------------------------------------
+
+    #[tokio::test]
+    async fn responses_non_streaming_returns_output_text_with_usage_and_records_body() {
+        let config = OpenAiConfig {
+            model: "mock-gpt".to_string(),
+            response_text: "hello there friend".to_string(),
+            ttft: Duration::from_millis(10),
+            inter_token_delay: Duration::from_millis(5),
+            require_api_key: None,
+            forced_error: None,
+            cached_tokens: 0,
+        };
+        let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
+
+        let body = json!({
+            "model": "mock-gpt",
+            "input": "hi there",
+        });
+        let res = test_support::send_json(upstream.addr(), "POST", "/v1/responses", &[], &body)
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(res.status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&res.body).expect("valid json body");
+        assert_eq!(parsed["object"], "response");
+        assert_eq!(parsed["model"], "mock-gpt");
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(parsed["output"][0]["type"], "message");
+        assert_eq!(parsed["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(
+            parsed["output"][0]["content"][0]["text"],
+            "hello there friend"
+        );
+        // Responses API usage field names differ from chat completions:
+        // `input_tokens`/`output_tokens`, not `prompt_tokens`/`completion_tokens`.
+        assert_eq!(parsed["usage"]["input_tokens"], 2);
+        assert_eq!(parsed["usage"]["output_tokens"], 3);
+        assert_eq!(parsed["usage"]["input_tokens_details"]["cached_tokens"], 0);
+
+        let captured = upstream.bodies.bodies();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["model"], "mock-gpt");
+        assert_eq!(captured[0]["input"], "hi there");
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn responses_non_streaming_accepts_item_list_input_and_reports_cached_tokens() {
+        let config = OpenAiConfig {
+            model: "mock-gpt".to_string(),
+            response_text: "ok".to_string(),
+            ttft: Duration::from_millis(1),
+            inter_token_delay: Duration::from_millis(1),
+            require_api_key: None,
+            forced_error: None,
+            cached_tokens: 80,
+        };
+        let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
+
+        let body = json!({
+            "model": "mock-gpt",
+            "input": [{"role": "user", "content": "hi there friend"}],
+        });
+        let res = test_support::send_json(upstream.addr(), "POST", "/v1/responses", &[], &body)
+            .await
+            .expect("request should succeed");
+        assert_eq!(res.status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&res.body).expect("valid json body");
+        // base (3) + configured cached (80), matching real OpenAI where the
+        // headline input count is inclusive of the cached portion.
+        assert_eq!(parsed["usage"]["input_tokens"], 83);
+        assert_eq!(parsed["usage"]["input_tokens_details"]["cached_tokens"], 80);
+
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn responses_streaming_emits_created_deltas_then_completed_with_usage() {
+        let ttft = Duration::from_millis(40);
+        let inter_token_delay = Duration::from_millis(20);
+        let config = OpenAiConfig {
+            model: "mock-gpt".to_string(),
+            response_text: "a b c".to_string(),
+            ttft,
+            inter_token_delay,
+            require_api_key: None,
+            forced_error: None,
+            cached_tokens: 0,
+        };
+        let upstream = OpenAiUpstream::spawn(config).await.expect("spawn openai");
+
+        let body = json!({
+            "model": "mock-gpt",
+            "input": "hi",
+            "stream": true,
+        });
+
+        let (status, events) = test_support::send_json_collect_sse(
+            upstream.addr(),
+            "POST",
+            "/v1/responses",
+            &[],
+            &body,
+        )
+        .await
+        .expect("request should succeed");
+        assert_eq!(status, 200);
+
+        // response.created, 3x response.output_text.delta, response.completed
+        assert_eq!(
+            events.len(),
+            5,
+            "unexpected event count: {:?}",
+            events.iter().map(|e| &e.data).collect::<Vec<_>>()
+        );
+        assert!(events[0].data.contains("event: response.created"));
+        for event in &events[1..=3] {
+            assert!(event.data.contains("event: response.output_text.delta"));
+            assert!(event.data.contains("\"delta\""));
+        }
+        assert!(events[4].data.contains("event: response.completed"));
+        assert!(events[4].data.contains("\"output_tokens\":3"));
+
+        assert!(
+            events[0].at >= ttft,
+            "response.created should not arrive before ttft ({ttft:?}), got {:?}",
+            events[0].at
+        );
+        assert!(events[1].at >= ttft, "first delta gated by ttft too");
 
         upstream.shutdown().await;
     }

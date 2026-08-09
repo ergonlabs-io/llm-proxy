@@ -73,4 +73,45 @@ impl ResponseFlag {
             Self::UpstreamMaxStreamDurationReached => "UMSDR",
         }
     }
+
+    /// Reverse of [`Self::code`] — used to decode
+    /// `ResponseFlagFilter.flags` (WP-24 lowering). `None` for a code Envoy
+    /// defines but we don't model as a distinct flag yet (e.g. `DI`, `FI`);
+    /// the lowering pass turns that into a strict-mode config error rather
+    /// than silently dropping the filter entry (ground rule #1).
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "UH" => Self::NoHealthyUpstream,
+            "UF" => Self::UpstreamConnectionFailure,
+            "UO" => Self::UpstreamOverflow,
+            "NR" => Self::NoRouteFound,
+            "URX" => Self::UpstreamRetryLimitExceeded,
+            "NC" => Self::NoClusterFound,
+            "DC" => Self::DownstreamConnectionTermination,
+            "LH" => Self::FailedLocalHealthCheck,
+            "UT" => Self::UpstreamRequestTimeout,
+            "LR" => Self::LocalReset,
+            "UR" => Self::UpstreamRemoteReset,
+            "UC" => Self::UpstreamConnectionTermination,
+            "RL" => Self::RateLimited,
+            "UAEX" => Self::UnauthorizedExternalService,
+            "RLSE" => Self::RateLimitServiceError,
+            "IH" => Self::InvalidEnvoyRequestHeaders,
+            "SI" => Self::StreamIdleTimeout,
+            "DPE" => Self::DownstreamProtocolError,
+            "UPE" => Self::UpstreamProtocolError,
+            "UMSDR" => Self::UpstreamMaxStreamDurationReached,
+            _ => return None,
+        })
+    }
+}
+
+/// Render `%RESPONSE_FLAGS%`: Envoy joins every flag that fired on a request
+/// with `,`, in the order they were recorded (e.g. `UF,URX`). An empty slice
+/// renders as `-` (no flags fired) — that's the caller's job, not this
+/// function's, since callers also need to special-case "no flags" for the
+/// dash *before* deciding to call this at all in some formatters; here we
+/// just join what's given.
+pub fn render_flags(flags: &[ResponseFlag]) -> String {
+    flags.iter().map(|f| f.code()).collect::<Vec<_>>().join(",")
 }

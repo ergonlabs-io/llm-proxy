@@ -15,10 +15,11 @@ members = [
     "testing/diffrig",
     "testing/corpus",
     "testing/controlplane",
+    "testing/loadgen",
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.78"
@@ -59,8 +60,33 @@ serde_yaml = "0.9"
 serde_path_to_error = "0.1"
 
 # TLS (WP-08)
-rustls = "0.23"
-tokio-rustls = "0.26"
+# Rust note: `ring` (not `aws-lc-rs`) is the crypto provider so builds don't
+# need a cmake/NASM toolchain; `logging` wires rustls into the `log` facade.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+rcgen = "0.13"
+# Rust note: only used to pull Subject Alternative Names out of the raw DER
+# rustls hands our verifiers -- pure Rust, no cmake, so it fits alongside the
+# `ring` crypto provider choice above.
+x509-parser = "0.16"
+# Rust note: only used by the `tls_inspector` listener filter to parse a raw
+# ClientHello (SNI + ALPN) off the wire before the real TLS handshake runs --
+# pure Rust, no cmake, matching the rest of the TLS stack's toolchain choice.
+tls-parser = "0.12"
+
+# WP-50 downstream auth: HMAC-SHA256 for virtual-key verification and
+# `constant_time::verify_slices_are_equal` for the comparison. Already compiled
+# in the tree as rustls's crypto provider, so this is a direct dependency on
+# something that was being built anyway -- and it keeps the same "no cmake/NASM
+# toolchain" property the rustls feature choice above was made for.
+ring = "0.17"
+# WP-50 increment 2a-iv (`llm-proxy --mode keygen`): base64url encoding of the
+# generated virtual key. Already compiled into the tree as a transitive
+# dependency (rcgen, tonic-build, ...), so this promotes an existing build
+# artifact to a direct dependency instead of adding new build cost.
+base64 = "0.22"
 
 # Utilities
 arc-swap = "1"
@@ -72,6 +98,73 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 rand = "0.8"
 core_affinity = "0.8"
+socket2 = "0.5"
+# Load-generator benchmarking (testing/loadgen): percentile histograms with
+# proper multi-thread-friendly recording (`Recorder`/`SyncHistogram`) instead
+# of a hand-rolled percentile calculation.
+hdrhistogram = "7"
+# Access-log `%START_TIME(fmt)%` strftime rendering (WP-24).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# Load-generator benchmarking (testing/loadgen): safe `getrlimit` wrapper so
+# the driver can log its own fd budget without an `unsafe` FFI call in our
+# code -- see `rig.rs`.
+rlimit = "0.10"
+
+# ---------------------------------------------------------------- profiles --
+# This section is a DISK-SIZE measure, not a speed one. Say so plainly,
+# because the obvious assumption is the opposite.
+#
+# Measured 2026-08-07 on the dev machine (8 cores, 16 GB RAM):
+#   - Adding this section moved a warm `cargo test --workspace` from 705s to
+#     675s. That is noise, not a win. On macOS the dev profile defaults to
+#     `split-debuginfo = "unpacked"`, so DWARF lives in separate `.o` files
+#     and was never inside the executables the test run loads -- test binaries
+#     measured ~54 MB before this change and ~52 MB after. Reducing `debug`
+#     therefore cannot speed up loading them, and did not.
+#   - What it does do is shrink `target/`, which matters here for a specific
+#     reason: with 16 GB of RAM and a `target/` that reached 78 GB, the tree
+#     cannot be held in page cache, so every cargo invocation re-reads
+#     fingerprint metadata from disk. Keeping `target/` small is a standing
+#     performance property on this box, not just hygiene.
+#
+# `line-tables-only` keeps panic backtraces resolving to file and line, and
+# drops variable inspection, which nothing on this project has used.
+#
+# Do NOT add `[build] jobs = N` on the strength of the memory-pressure story:
+# it was tried the same day and measured WORSE. Rebuilding after touching
+# `proxy-config/src/lower.rs` took 115.77s at `-j 8` versus 164.69s at `-j 4`.
+# Halving the job count did cut kernel time (146.53s -> 113.58s, consistent
+# with real memory pressure) but cost 42% more wall clock, because the box is
+# not thrashing badly enough for serialization to pay.
+[profile.dev]
+debug = "line-tables-only"
+
+# Measured 2026-08-08: `target/debug/deps` held **1,013,436 `.o` files**, which
+# WERE essentially all of the 46 GB (46G / 1.01M ~= 46 KB average; the 1037
+# `.rlib` + 2982 `.rmeta` + 44 `.dylib` are rounding error). macOS dev builds
+# default to `split-debuginfo = "unpacked"`, so DWARF stays in the object files
+# and the linker only records paths to them -- cargo must retain every one --
+# and dev's default `codegen-units = 256` multiplies that per crate, per stale
+# hash-variant (cargo never GCs those).
+#
+# The file COUNT hurts twice: 46 GB on a box with 16 GB of RAM, and filesystem
+# latency -- a plain `ls -f` of that one directory took ~50 seconds.
+codegen-units = 16
+
+# The generated proto tree is machine-written and nobody sets a breakpoint in
+# it, so it carries no debuginfo at all. This is the single biggest
+# contributor to `target/debug/deps`.
+[profile.dev.package.proxy-api]
+debug = 0
+
+# `cargo test` builds test targets under `profile.test`, which inherits from
+# `dev` but must be set explicitly for the override above to apply to the
+# binaries the test run actually builds.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package.proxy-api]
+debug = 0
 
 [workspace.lints.rust]
 unsafe_code = "deny"

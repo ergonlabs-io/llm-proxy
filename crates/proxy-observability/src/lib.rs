@@ -2,6 +2,8 @@
 //! (WP-24). This crate also owns [`ResponseFlag`] — the contract populated by the
 //! router (WP-13), retry engine (WP-14) and pools (WP-15).
 
+pub mod access_log;
 pub mod flags;
+pub mod sink;
 
 pub use flags::ResponseFlag;

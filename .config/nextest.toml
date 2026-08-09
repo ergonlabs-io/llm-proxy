@@ -1,0 +1,52 @@
+# nextest configuration (https://nexte.st/docs/configuration/).
+#
+# Measured 2026-08-07, and it corrects what the rest of this file used to say.
+# The workspace's slow test runs are NOT spread across the suite and are NOT
+# `cli.rs`:
+#
+#   - `cargo nextest run --workspace` reports 957 tests in **79s** when the run
+#     is healthy.
+#   - The same command, repeated with nothing changed and NOTHING rebuilt, ran
+#     past 600s. Inspecting it found 8 test processes alive holding LISTEN
+#     sockets with no results printed: 6 in `diffrig::mock_e2e` and 2 in
+#     `diffrig::tls_e2e` -- exactly the 8 nextest flags as SLOW.
+#   - Those tests configure 150ms time-to-first-token and 150ms inter-token
+#     delays, so they should finish in ~1-2s. They are HANGING, not slow.
+#
+# That variance is the whole story behind full-run times of 79s / 656s / 675s /
+# 863s: it depends on how many of those 8 hang that run. `cli.rs` measured
+# **0.14s** standalone and 0.18s inside a run -- the "325s / 200x" claim below
+# does not reproduce at all, and five of its six tests already use ephemeral
+# ports via `free_port()`. The fixed-port group is kept because one test
+# (`sigterm_drains_then_exits_cleanly`) does still use `127.0.0.1:10000`, but
+# it is not a performance problem.
+
+[profile.default]
+# `make tq` already passes `--no-fail-fast` so a run cannot undercount by
+# stopping at the first failing crate (CLAUDE.md rule 11). Same intent here.
+fail-fast = false
+
+# Report anything past 60s BY NAME, then kill it at 3 minutes.
+#
+# `terminate-after` is the load-bearing part and it is a bug-surfacing measure,
+# not a speed one: without it a hung `mock_e2e`/`tls_e2e` test blocks the run
+# forever, which is how a 79s suite silently became a 600s+ one with no
+# indication of which test was responsible. Terminating turns that into a named
+# FAILURE. A run that used to hang will now go RED -- that is the point, and
+# those failures are real hangs to fix, not a regression introduced here.
+#
+# 3 periods x 60s leaves generous headroom: the slowest healthy test in this
+# workspace finishes well inside one period.
+#
+# Deliberately no `retries`: retrying a flake hides it, and these hangs are
+# exactly what needs diagnosing rather than papering over.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[test-groups]
+# Tests that bind the example config's fixed port, serialized against each
+# other while the rest of the workspace stays parallel.
+serial-fixed-port = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(proxy::cli)'
+test-group = 'serial-fixed-port'

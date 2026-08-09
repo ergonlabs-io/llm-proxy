@@ -16,17 +16,24 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use prost_reflect::{DynamicMessage, ReflectMessage, Value};
+use proxy_api::envoy::config::accesslog::v3 as accesslog_v3;
 use proxy_api::envoy::config::bootstrap::v3::Bootstrap;
 use proxy_api::envoy::config::cluster::v3 as cluster_v3;
 use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
 use proxy_api::envoy::config::listener::v3 as listener_v3;
 use proxy_api::envoy::config::route::v3 as route_v3;
+use proxy_api::envoy::extensions::access_loggers::file::v3 as access_log_file_v3;
+use proxy_api::envoy::extensions::access_loggers::stream::v3 as access_log_stream_v3;
+use proxy_api::envoy::extensions::clusters::aggregate::v3 as aggregate_cluster_v3;
 use proxy_api::envoy::extensions::filters::listener::tls_inspector::v3 as tls_inspector_v3;
 use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
+use proxy_api::envoy::extensions::upstreams::http::v3 as upstream_http_v3;
 use proxy_api::envoy::r#type::matcher::v3 as matcher_v3;
+use proxy_observability::access_log::{parse_format, FormatString};
+use proxy_observability::ResponseFlag;
 
 use crate::error::ConfigError;
 use crate::ir::*;
@@ -87,6 +94,11 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
             ));
         }
     }
+    // WP-35 increment 2b-ii: aggregate members refer to other clusters by
+    // name, so they can only be checked once the whole map exists -- this
+    // cannot fold into the loop above, because a member may be declared
+    // after the aggregate that names it.
+    validate_cluster_graph(sr, &snapshot)?;
     Ok(snapshot)
 }
 
@@ -136,11 +148,64 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.config.cluster.v3.Cluster" => &[
             "name",
             "type",
+            "cluster_type",
             "connect_timeout",
             "lb_policy",
             "load_assignment",
             "transport_socket",
             "per_connection_buffer_limit_bytes",
+            "circuit_breakers",
+            "typed_extension_protocol_options",
+            "metadata",
+        ],
+        // WP-35 increment 2b-i: the only custom cluster type implemented is
+        // `envoy.clusters.aggregate` (see `convert_cluster`'s
+        // `ClusterDiscoveryType::ClusterType` arm).
+        //
+        // Both entries are forward-compat insurance, and NO test can exercise
+        // either one today -- each message's full field set is already mapped,
+        // so there is no real-but-unlisted field a config could set. Do not
+        // delete them as dead weight: `allowed_fields` returning `None` skips
+        // the field-name check entirely (see `check_supported_surface`), so
+        // the day an Envoy proto bump adds a field to either message, its
+        // absence here is a silent no-op -- ground rule #1's exact failure
+        // mode, arriving with no code change of ours to blame it on.
+        "envoy.config.cluster.v3.Cluster.CustomClusterType" => &["name", "typed_config"],
+        "envoy.extensions.clusters.aggregate.v3.ClusterConfig" => &["clusters"],
+        // WP-50 / WP-47 increment 1: the first proto this project defines
+        // itself rather than borrowing from Envoy. Listed for the same
+        // forward-compat reason as the two entries above -- every field is
+        // mapped today, so no config can trip these -- but with one difference
+        // that makes them likelier to matter: WE add the fields to this
+        // message. An `llmproxy.filters.v0` field added without a matching
+        // entry here would be accepted and ignored, which is ground rule #1's
+        // exact failure mode arriving from our own change rather than an Envoy
+        // bump.
+        "llmproxy.filters.v0.Authentication" => &["hmac_secret", "virtual_keys"],
+        "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
+        // Only the `io.llmproxy.provider_auth` namespace under
+        // `filter_metadata` is understood -- see
+        // `convert_provider_auth_metadata`. `typed_filter_metadata` is not
+        // implemented and stays out of this list so setting it is a strict-
+        // mode error rather than a silent no-op (ground rule #1); Envoy
+        // itself only consults it when the plain map is absent, so no config
+        // that already works today needs it.
+        "envoy.config.core.v3.Metadata" => &["filter_metadata"],
+        // S5 circuit breakers. `per_host_thresholds` is deliberately excluded
+        // (we don't model per-host limits); a config setting it is rejected
+        // by the surface walk with its dotted path (ground rule #1) rather
+        // than silently ignored.
+        "envoy.config.cluster.v3.CircuitBreakers" => &["thresholds"],
+        // `retry_budget`, `track_remaining`, and `max_connection_pools` are
+        // not implemented (no retry-budget engine, no stats publishing, no
+        // per-cluster pool cap yet) and stay out of this list on purpose --
+        // setting them must fail loudly, not vanish.
+        "envoy.config.cluster.v3.CircuitBreakers.Thresholds" => &[
+            "priority",
+            "max_connections",
+            "max_pending_requests",
+            "max_requests",
+            "max_retries",
         ],
         "envoy.config.endpoint.v3.ClusterLoadAssignment" => &["cluster_name", "endpoints"],
         "envoy.config.endpoint.v3.LocalityLbEndpoints" => &["lb_endpoints", "priority"],
@@ -152,15 +217,44 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "idle_timeout",
             "max_connect_attempts",
         ],
-        "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager" => {
-            &["stat_prefix", "route_config", "http_filters"]
-        }
+        "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager" => &[
+            "stat_prefix",
+            "route_config",
+            "http_filters",
+            "generate_request_id",
+            "use_remote_address",
+            "xff_num_trusted_hops",
+            "access_log",
+        ],
         "envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter" => {
             &["name", "typed_config"]
         }
         "envoy.extensions.filters.http.router.v3.Router" => &[],
-        "envoy.config.route.v3.RouteConfiguration" => &["name", "virtual_hosts"],
-        "envoy.config.route.v3.VirtualHost" => &["name", "domains", "routes"],
+        // WP-24: access logging.
+        "envoy.config.accesslog.v3.AccessLog" => &["name", "filter", "typed_config"],
+        "envoy.config.accesslog.v3.AccessLogFilter" => {
+            &["status_code_filter", "response_flag_filter"]
+        }
+        "envoy.config.accesslog.v3.StatusCodeFilter" => &["comparison"],
+        "envoy.config.accesslog.v3.ComparisonFilter" => &["op", "value"],
+        "envoy.config.core.v3.RuntimeUInt32" => &["default_value", "runtime_key"],
+        "envoy.config.accesslog.v3.ResponseFlagFilter" => &["flags"],
+        "envoy.extensions.access_loggers.file.v3.FileAccessLog" => &["path", "log_format"],
+        "envoy.extensions.access_loggers.stream.v3.StdoutAccessLog" => &["log_format"],
+        "envoy.extensions.access_loggers.stream.v3.StderrAccessLog" => &["log_format"],
+        // `formatters`, `json_format_options`, `content_type`, and
+        // `omit_empty_values` are not implemented (no custom formatter
+        // plugins, no JSON-key-omission knob, no content-type override, and
+        // absent values always render `-` regardless of this flag); leaving
+        // them out of this list means setting any of them is a strict-mode
+        // error rather than a silent behavior change.
+        "envoy.config.core.v3.SubstitutionFormatString" => &["text_format", "json_format"],
+        "envoy.config.route.v3.RouteConfiguration" => {
+            &["name", "virtual_hosts", "typed_per_filter_config"]
+        }
+        "envoy.config.route.v3.VirtualHost" => {
+            &["name", "domains", "routes", "typed_per_filter_config"]
+        }
         "envoy.config.route.v3.Route" => &[
             "name",
             "match",
@@ -168,7 +262,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "redirect",
             "direct_response",
             "request_headers_to_add",
+            "typed_per_filter_config",
         ],
+        // ADR-0004 step 4: the `Any` wrapper Envoy allows around a per-route
+        // filter override, carrying `is_optional`/`disabled` alongside the
+        // inner config. See `convert_typed_per_filter_config`.
+        "envoy.config.route.v3.FilterConfig" => &["config", "is_optional", "disabled"],
         "envoy.config.route.v3.RouteMatch" => {
             &["prefix", "path", "safe_regex", "case_sensitive", "headers"]
         }
@@ -199,7 +298,10 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "num_retries",
             "per_try_timeout",
             "retriable_status_codes",
+            "retry_back_off",
+            "host_selection_retry_max_attempts",
         ],
+        "envoy.config.route.v3.RetryPolicy.RetryBackOff" => &["base_interval", "max_interval"],
         "envoy.config.route.v3.RedirectAction" => &[
             "host_redirect",
             "path_redirect",
@@ -242,6 +344,18 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector" => {
             &["max_client_hello_size"]
         }
+        // Upstream HTTP protocol selection (S? / WP-13 h2). Only the explicit
+        // HTTP/1-vs-HTTP/2 selector is implemented; ALPN auto-negotiation and
+        // downstream-protocol passthrough are follow-ups.
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions" => &["explicit_http_config"],
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions.ExplicitHttpConfig" => {
+            &["http_protocol_options", "http2_protocol_options"]
+        }
+        // Bare `{}` selects the protocol; any tuning sub-field must fail
+        // loudly rather than be silently ignored (same rationale as the
+        // Router `&[]` entry above).
+        "envoy.config.core.v3.Http1ProtocolOptions" => &[],
+        "envoy.config.core.v3.Http2ProtocolOptions" => &[],
         _ => return None,
     })
 }
@@ -424,6 +538,104 @@ fn type_name(any: &prost_types::Any) -> &str {
     any.type_url.rsplit('/').next().unwrap_or(&any.type_url)
 }
 
+/// Decode an HTTP filter's `typed_config` into a [`DynamicMessage`], keyed by
+/// its type URL against the compiled descriptor pool — same lookup
+/// [`check_any`] does for the generic surface walk, but returning the message
+/// rather than recursing into it (that recursion already happened during the
+/// surface check; this is the typed-conversion pass reusing the same bytes).
+/// A type URL absent from the pool is a config error naming both the type URL
+/// and the dotted path — an unrecognized HTTP filter is never silently
+/// accepted just because the IR can now hold arbitrary filter config.
+fn decode_http_filter_config(
+    any: &prost_types::Any,
+    path: &str,
+) -> Result<DynamicMessage, ConfigError> {
+    let inner_desc = proxy_api::descriptor_pool()
+        .get_message_by_name(type_name(any))
+        .ok_or_else(|| ConfigError::UnknownTypeUrl {
+            field_path: path.to_string(),
+            type_url: any.type_url.clone(),
+        })?;
+    DynamicMessage::decode(inner_desc, any.value.as_slice())
+        .map_err(|e| ConfigError::Parse(format!("cannot decode `{}`: {e}", any.type_url)))
+}
+
+/// `envoy.config.route.v3.FilterConfig`'s type name -- the optional wrapper
+/// around a `typed_per_filter_config` entry (see
+/// [`convert_typed_per_filter_config`]).
+const FILTER_CONFIG_TYPE: &str = "envoy.config.route.v3.FilterConfig";
+
+/// Lower one level of Envoy's `typed_per_filter_config` map (present on
+/// `Route`, `VirtualHost`, and `RouteConfiguration`) into IR
+/// [`PerFilterConfig`] entries, keyed by filter name. `path` is the dotted
+/// path of the owning `typed_per_filter_config` field itself; each entry's
+/// error path is `{path}[{name}]`, matching ground rule #1.
+///
+/// Rust note: the return type is a [`std::collections::BTreeMap`], not a
+/// `HashMap` -- `m`'s iteration order is unspecified (it's a `HashMap`,
+/// mirroring the proto's `map<string, Any>`), but the IR needs deterministic
+/// `Debug`/iteration order for `/config_dump` and test assertions, so the
+/// entries are collected into a map that sorts itself by key.
+fn convert_typed_per_filter_config(
+    m: &std::collections::HashMap<String, prost_types::Any>,
+    path: &str,
+) -> Result<std::collections::BTreeMap<String, PerFilterConfig>, ConfigError> {
+    let mut out = std::collections::BTreeMap::new();
+    for (name, any) in m {
+        let entry_path = format!("{path}[{name}]");
+        let per = if type_name(any) == FILTER_CONFIG_TYPE {
+            let wrapper: route_v3::FilterConfig = decode_any(any, &entry_path)?;
+            let has_config = wrapper
+                .config
+                .as_ref()
+                .is_some_and(|a| !a.type_url.is_empty());
+            match (has_config, wrapper.disabled) {
+                (true, true) => {
+                    return Err(invalid(
+                        &entry_path,
+                        "cannot set both `config` and `disabled`",
+                    ))
+                }
+                (false, false) => {
+                    return Err(invalid(
+                        &entry_path,
+                        "a FilterConfig must set either `config` or `disabled`",
+                    ))
+                }
+                (true, false) => {
+                    let inner = wrapper.config.as_ref().expect("has_config checked above");
+                    let config = decode_http_filter_config(
+                        inner,
+                        &format!("{entry_path}.config.typed_config"),
+                    )?;
+                    PerFilterConfig {
+                        type_url: inner.type_url.clone(),
+                        config: Some(config),
+                        is_optional: wrapper.is_optional,
+                        disabled: false,
+                    }
+                }
+                (false, true) => PerFilterConfig {
+                    type_url: String::new(),
+                    config: None,
+                    is_optional: wrapper.is_optional,
+                    disabled: true,
+                },
+            }
+        } else {
+            let config = decode_http_filter_config(any, &entry_path)?;
+            PerFilterConfig {
+                type_url: any.type_url.clone(),
+                config: Some(config),
+                is_optional: false,
+                disabled: false,
+            }
+        };
+        out.insert(name.clone(), per);
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- listeners --
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
@@ -433,6 +645,10 @@ const ROUTER_TYPE: &str = "envoy.extensions.filters.http.router.v3.Router";
 const DOWNSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
 const UPSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const TLS_INSPECTOR_TYPE: &str = "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector";
+// WP-24: access logging sinks we implement.
+const FILE_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.file.v3.FileAccessLog";
+const STDOUT_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.stream.v3.StdoutAccessLog";
+const STDERR_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.stream.v3.StderrAccessLog";
 
 /// Envoy default for `per_connection_buffer_limit_bytes`: 1 MiB.
 const DEFAULT_CONN_BUFFER_LIMIT: u32 = 1024 * 1024;
@@ -859,6 +1075,8 @@ fn convert_hcm(
     path: &str,
 ) -> Result<HttpConnectionManagerConfig, ConfigError> {
     use hcm_v3::http_connection_manager::RouteSpecifier;
+    // (see `check_lane_h_filter_order` below for the ordering rules these
+    // three type URLs participate in)
     let route_table = match &hcm.route_specifier {
         Some(RouteSpecifier::RouteConfig(rc)) => {
             convert_route_table(rc, &format!("{path}.route_config"))?
@@ -892,28 +1110,407 @@ fn convert_hcm(
             }
             None => return Err(invalid(&f_path, "http filter requires typed_config")),
         };
-        match type_name(any) {
-            ROUTER_TYPE => http_filters.push(HttpFilterSpec::Router),
-            _ => {
-                return Err(ConfigError::UnknownTypeUrl {
-                    field_path: format!("{f_path}.typed_config"),
-                    type_url: any.type_url.clone(),
-                })
-            }
+        let is_router = type_name(any) == ROUTER_TYPE;
+        // Rust note: the router has no configurable fields (`allowed_fields`
+        // maps its type to `&[]`), so its `config` is always `None`; every
+        // other filter's `typed_config` is decoded reflectively here — the
+        // registry (`proxy-http::FilterRegistry`), not this lowering pass,
+        // is what actually understands the bytes (ground rule #2).
+        let config = if is_router {
+            None
+        } else {
+            Some(decode_http_filter_config(
+                any,
+                &format!("{f_path}.typed_config"),
+            )?)
+        };
+        http_filters.push(HttpFilterSpec {
+            name: f.name.clone(),
+            type_url: any.type_url.clone(),
+            config,
+            is_router,
+        });
+    }
+
+    // Envoy requires exactly one terminal router filter, and it must be last.
+    let router_positions: Vec<usize> = http_filters
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.is_router)
+        .map(|(i, _)| i)
+        .collect();
+    match router_positions.as_slice() {
+        [] => {
+            return Err(invalid(
+                format!("{path}.http_filters"),
+                "the last HTTP filter must be the router (envoy.filters.http.router)",
+            ))
+        }
+        [pos] if *pos == http_filters.len() - 1 => {}
+        [pos] => {
+            return Err(invalid(
+                format!("{path}.http_filters[{pos}]"),
+                "the router filter (envoy.filters.http.router) must be the last HTTP filter",
+            ))
+        }
+        _ => {
+            return Err(invalid(
+                format!("{path}.http_filters"),
+                "the router filter (envoy.filters.http.router) may appear at most once",
+            ))
         }
     }
-    if http_filters.last() != Some(&HttpFilterSpec::Router) {
-        return Err(invalid(
-            format!("{path}.http_filters"),
-            "the last HTTP filter must be the router (envoy.filters.http.router)",
-        ));
-    }
+
+    check_lane_h_filter_order(&http_filters, path)?;
+
+    // Envoy default true; the proto field is a `BoolValue`, so unset means
+    // "generate" and a present value takes precedence, including an explicit
+    // `false`.
+    let generate_request_id = hcm.generate_request_id.unwrap_or(true);
+
+    // Envoy default false: `use_remote_address` is a `BoolValue`, so unset
+    // means "do not mutate XFF/x-forwarded-proto at this HCM".
+    let use_remote_address = hcm.use_remote_address.unwrap_or(false);
+    // Plain `u32` (not wrapped), so the proto zero-value is already the
+    // Envoy default of 0 trusted hops.
+    let xff_num_trusted_hops = hcm.xff_num_trusted_hops;
+
+    let access_logs = convert_access_logs(&hcm.access_log, &format!("{path}.access_log"))?;
 
     Ok(HttpConnectionManagerConfig {
         stat_prefix: hcm.stat_prefix.clone(),
         route_table: Arc::new(route_table),
         http_filters,
+        generate_request_id,
+        use_remote_address,
+        access_logs,
+        xff_num_trusted_hops,
     })
+}
+
+// --------------------------------------------------- Lane-H filter ordering --
+
+// The Lane-H filter type URLs this pass knows about.
+//
+// Duplicated as string literals rather than imported from `proxy-filters`,
+// which is the crate that actually defines them: `proxy-filters` depends on
+// `proxy-config`, so the dependency cannot point this way (ground rule #2).
+// The canonical definitions are `proxy_filters::{auth_filter, usage_filter,
+// token_limit_filter}::TYPE_URL`; `tests::lane_h_type_urls_match_the_filters`
+// in `proxy-filters` pins them equal, so a rename cannot silently disable
+// these checks.
+// `pub` solely so `tests/lane_h_filter_order.rs` can assert THESE constants
+// equal to the filters' own -- pinning a private copy the test re-declares
+// would pin nothing.
+pub const AUTH_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
+pub const TOKEN_LIMIT_FILTER_TYPE: &str =
+    "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
+pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+
+/// Rejects Lane-H filter chains whose order silently disables a filter.
+///
+/// # Why this is a config error and not a doc comment
+///
+/// Both orderings below fail *silently* when they are wrong. Nothing errors at
+/// runtime, no log line appears, and every request succeeds — the affected
+/// filter simply reads `None` out of `StreamInfo` forever and does something
+/// plausible-looking with it. That is ground rule #1's failure mode exactly
+/// (a config that means one thing and does another), and the only place it can
+/// be caught is here, where the whole chain is visible at once. A filter
+/// factory sees only its own `typed_config`; `FactoryContext` carries no view
+/// of its neighbours.
+///
+/// # The two rules run in OPPOSITE directions, and that is not a mistake
+///
+/// S2.1: **decoder** callbacks run in config order, **encoder** callbacks in
+/// *reverse* config order. So "must have already run" means the opposite thing
+/// on each path:
+///
+/// - `llmproxy.auth` before `llmproxy.token_limit` — both are **decode**-side.
+///   The limiter buckets on `StreamInfo::auth.tenant`, which the auth filter
+///   writes. Reversed, the limiter sees `None` and falls back to bucketing on
+///   the client's `authorization` header — which is exactly the spoofable key
+///   WP-50 removed, so the reversed order is a **security** downgrade, not a
+///   cosmetic one.
+/// - `llmproxy.token_limit` before `llmproxy.usage` — the limiter's *record*
+///   is **encode**-side, and reads the usage the usage filter wrote. Because
+///   encode order is reversed, "the usage filter has already run" means it is
+///   **later** in config order. Reversed, every request records **zero**
+///   tokens against its budget: the limit exists and never fires.
+///
+/// Both rules are stated at their own call sites too
+/// (`token_limit_filter`'s module doc); this function is the enforcement.
+fn check_lane_h_filter_order(
+    http_filters: &[HttpFilterSpec],
+    path: &str,
+) -> Result<(), ConfigError> {
+    // Rust note: `position` returns the index of the FIRST match. A duplicate
+    // Lane-H filter is already impossible -- `FilterRegistry` keys on
+    // `type_url` -- so first-match is the only match.
+    let index_of = |type_url: &str| http_filters.iter().position(|f| f.type_url == type_url);
+
+    let rules = [
+        (
+            AUTH_FILTER_TYPE,
+            "llmproxy.auth",
+            TOKEN_LIMIT_FILTER_TYPE,
+            "llmproxy.token_limit",
+            "the token limiter buckets on the tenant the auth filter resolves, and decode \
+             callbacks run in config order; with this order reversed the limiter silently \
+             falls back to bucketing on the client-supplied `authorization` header, which \
+             a caller can change to get a fresh quota",
+        ),
+        (
+            TOKEN_LIMIT_FILTER_TYPE,
+            "llmproxy.token_limit",
+            USAGE_FILTER_TYPE,
+            "llmproxy.usage",
+            "the token limiter records usage on the ENCODE path, which runs in REVERSE \
+             config order, so the usage filter must come LATER in config order for its \
+             report to exist by then; with this order reversed every request silently \
+             records zero tokens against its budget",
+        ),
+    ];
+
+    for (first_type, first_name, second_type, second_name, reason) in rules {
+        // A rule only applies when BOTH filters are present -- either one
+        // alone is a perfectly ordinary chain.
+        if let (Some(first), Some(second)) = (index_of(first_type), index_of(second_type)) {
+            if first > second {
+                return Err(invalid(
+                    format!("{path}.http_filters[{first}]"),
+                    format!(
+                        "`{first_name}` must be configured BEFORE `{second_name}` \
+                         (currently at index {second}): {reason}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ------------------------------------------------------------ access log --
+
+fn convert_access_logs(
+    entries: &[accesslog_v3::AccessLog],
+    path: &str,
+) -> Result<Vec<AccessLogIR>, ConfigError> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| convert_access_log(e, &format!("{path}[{i}]")))
+        .collect()
+}
+
+fn convert_access_log(e: &accesslog_v3::AccessLog, path: &str) -> Result<AccessLogIR, ConfigError> {
+    use accesslog_v3::access_log::ConfigType;
+    let any = match &e.config_type {
+        Some(ConfigType::TypedConfig(any)) => any,
+        None => return Err(invalid(path, "access log requires typed_config")),
+    };
+    let filter = e
+        .filter
+        .as_ref()
+        .map(|f| convert_access_log_filter(f, &format!("{path}.filter")))
+        .transpose()?;
+
+    let cfg_path = format!("{path}.typed_config");
+    let (sink, sfs) = match type_name(any) {
+        FILE_ACCESS_LOG_TYPE => {
+            let file: access_log_file_v3::FileAccessLog = decode_any(any, &cfg_path)?;
+            if file.path.is_empty() {
+                return Err(invalid(format!("{cfg_path}.path"), "path is required"));
+            }
+            use access_log_file_v3::file_access_log::AccessLogFormat as F;
+            let sfs = match file.access_log_format {
+                Some(F::LogFormat(sfs)) => Some(sfs),
+                // Ground rule #1: the deprecated `format`/`json_format`/
+                // `typed_json_format` oneof members aren't in this message's
+                // `allowed_fields` entry, so the surface check already
+                // rejects them before typed conversion runs; this arm is
+                // unreachable in practice but kept explicit rather than
+                // `unreachable!()` so a future allowlist change fails loudly
+                // here too, not with a panic.
+                Some(_) => {
+                    return Err(unsupported(
+                        format!("{cfg_path}.access_log_format"),
+                        "only `log_format` is implemented for the file access logger",
+                    ))
+                }
+                None => None,
+            };
+            (
+                AccessLogSink::File {
+                    path: file.path.clone(),
+                },
+                sfs,
+            )
+        }
+        STDOUT_ACCESS_LOG_TYPE => {
+            let stdout: access_log_stream_v3::StdoutAccessLog = decode_any(any, &cfg_path)?;
+            use access_log_stream_v3::stdout_access_log::AccessLogFormat as F;
+            let sfs = stdout.access_log_format.map(|F::LogFormat(sfs)| sfs);
+            (AccessLogSink::Stdout, sfs)
+        }
+        STDERR_ACCESS_LOG_TYPE => {
+            let stderr: access_log_stream_v3::StderrAccessLog = decode_any(any, &cfg_path)?;
+            use access_log_stream_v3::stderr_access_log::AccessLogFormat as F;
+            let sfs = stderr.access_log_format.map(|F::LogFormat(sfs)| sfs);
+            (AccessLogSink::Stderr, sfs)
+        }
+        _ => {
+            return Err(ConfigError::UnknownTypeUrl {
+                field_path: cfg_path,
+                type_url: any.type_url.clone(),
+            })
+        }
+    };
+
+    let format = match sfs {
+        Some(sfs) => convert_substitution_format(&sfs, &cfg_path)?,
+        // Envoy default when a sink omits `log_format`.
+        None => AccessLogFormat::Text(parse_fmt(DEFAULT_ACCESS_LOG_FORMAT, &cfg_path)?),
+    };
+
+    Ok(AccessLogIR {
+        sink,
+        format,
+        filter,
+    })
+}
+
+fn convert_substitution_format(
+    sfs: &core_v3::SubstitutionFormatString,
+    path: &str,
+) -> Result<AccessLogFormat, ConfigError> {
+    use core_v3::substitution_format_string::Format;
+    match &sfs.format {
+        Some(Format::TextFormat(s)) => {
+            Ok(AccessLogFormat::Text(parse_fmt(s, &format!("{path}.text_format"))?))
+        }
+        Some(Format::JsonFormat(strct)) => {
+            let fields_path = format!("{path}.json_format");
+            let mut fields = Vec::with_capacity(strct.fields.len());
+            for (key, value) in &strct.fields {
+                let value_path = format!("{fields_path}.{key}");
+                let s = match &value.kind {
+                    Some(prost_types::value::Kind::StringValue(s)) => s,
+                    _ => {
+                        return Err(unsupported(
+                            value_path,
+                            "json_format values must be strings (command-operator format \
+                             strings); non-string JSON literals are not implemented",
+                        ))
+                    }
+                };
+                fields.push((key.clone(), parse_fmt(s, &value_path)?));
+            }
+            Ok(AccessLogFormat::Json(fields))
+        }
+        // `text_format_source` (field 5) isn't in `SubstitutionFormatString`'s
+        // `allowed_fields` entry, so this is unreachable via the surface
+        // check for the same reason as the file-logger arm above.
+        Some(Format::TextFormatSource(_)) => Err(unsupported(
+            format!("{path}.text_format_source"),
+            "text_format_source (DataSource-based format strings) is not implemented; use text_format",
+        )),
+        None => Err(invalid(
+            path,
+            "SubstitutionFormatString requires text_format or json_format",
+        )),
+    }
+}
+
+/// Parse a format string, wrapping the formatter's own parse error (which
+/// knows nothing about proto field paths — ground rule #2 keeps that
+/// knowledge in `proxy-config`) into a [`ConfigError`] naming the field.
+fn parse_fmt(s: &str, path: &str) -> Result<FormatString, ConfigError> {
+    parse_format(s).map_err(|e| unsupported(path, e.to_string()))
+}
+
+fn convert_access_log_filter(
+    f: &accesslog_v3::AccessLogFilter,
+    path: &str,
+) -> Result<AccessLogFilterIR, ConfigError> {
+    use accesslog_v3::access_log_filter::FilterSpecifier;
+    match &f.filter_specifier {
+        Some(FilterSpecifier::StatusCodeFilter(scf)) => {
+            let comparison = scf.comparison.as_ref().ok_or_else(|| {
+                invalid(
+                    format!("{path}.status_code_filter.comparison"),
+                    "comparison is required",
+                )
+            })?;
+            let op = convert_comparison_op(
+                comparison.op,
+                &format!("{path}.status_code_filter.comparison.op"),
+            )?;
+            let value_path = format!("{path}.status_code_filter.comparison.value");
+            let value = comparison
+                .value
+                .as_ref()
+                .ok_or_else(|| invalid(&value_path, "value is required"))?
+                .default_value;
+            Ok(AccessLogFilterIR::StatusCode { op, value })
+        }
+        Some(FilterSpecifier::ResponseFlagFilter(rff)) => {
+            let flags_path = format!("{path}.response_flag_filter.flags");
+            let flags = rff
+                .flags
+                .iter()
+                .map(|code| {
+                    ResponseFlag::from_code(code).ok_or_else(|| {
+                        unsupported(
+                            &flags_path,
+                            format!("response flag `{code}` is not implemented"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(AccessLogFilterIR::ResponseFlag(flags))
+        }
+        Some(other) => Err(unsupported(
+            path,
+            format!(
+                "access log filter `{}` is not implemented; only status_code_filter and \
+                 response_flag_filter are supported",
+                access_log_filter_kind(other)
+            ),
+        )),
+        None => Err(invalid(path, "filter requires a filter_specifier")),
+    }
+}
+
+fn access_log_filter_kind(f: &accesslog_v3::access_log_filter::FilterSpecifier) -> &'static str {
+    use accesslog_v3::access_log_filter::FilterSpecifier;
+    match f {
+        FilterSpecifier::StatusCodeFilter(_) => "status_code_filter",
+        FilterSpecifier::DurationFilter(_) => "duration_filter",
+        FilterSpecifier::NotHealthCheckFilter(_) => "not_health_check_filter",
+        FilterSpecifier::TraceableFilter(_) => "traceable_filter",
+        FilterSpecifier::RuntimeFilter(_) => "runtime_filter",
+        FilterSpecifier::AndFilter(_) => "and_filter",
+        FilterSpecifier::OrFilter(_) => "or_filter",
+        FilterSpecifier::HeaderFilter(_) => "header_filter",
+        FilterSpecifier::ResponseFlagFilter(_) => "response_flag_filter",
+        FilterSpecifier::GrpcStatusFilter(_) => "grpc_status_filter",
+        FilterSpecifier::ExtensionFilter(_) => "extension_filter",
+        FilterSpecifier::MetadataFilter(_) => "metadata_filter",
+        FilterSpecifier::LogTypeFilter(_) => "log_type_filter",
+    }
+}
+
+fn convert_comparison_op(op: i32, path: &str) -> Result<ComparisonOp, ConfigError> {
+    use accesslog_v3::comparison_filter::Op;
+    match Op::try_from(op) {
+        Ok(Op::Eq) => Ok(ComparisonOp::Eq),
+        Ok(Op::Ge) => Ok(ComparisonOp::Ge),
+        Ok(Op::Le) => Ok(ComparisonOp::Le),
+        Ok(Op::Ne) => Ok(ComparisonOp::Ne),
+        Err(_) => Err(invalid(path, format!("unknown comparison op `{op}`"))),
+    }
 }
 
 fn convert_downstream_tls(
@@ -1354,17 +1951,30 @@ fn convert_data_source(
 
 // ----------------------------------------------------------------- clusters --
 
+/// `CustomClusterType.name` for the one custom cluster type implemented.
+const AGGREGATE_CLUSTER_TYPE_NAME: &str = "envoy.clusters.aggregate";
+
+/// `CustomClusterType.typed_config`'s expected type name for an aggregate
+/// cluster.
+const AGGREGATE_CLUSTER_CONFIG_TYPE: &str = "envoy.extensions.clusters.aggregate.v3.ClusterConfig";
+
 fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig, ConfigError> {
     use cluster_v3::cluster::{
         ClusterDiscoveryType, DiscoveryType as ProtoDiscovery, LbPolicy as ProtoLb,
     };
 
-    let discovery = match &c.cluster_discovery_type {
-        None => DiscoveryType::Static, // proto default: STATIC
+    // `discovery` and `kind` come out of the same `cluster_discovery_type`
+    // oneof match -- an aggregate cluster (`ClusterType`) has no discovery
+    // mechanism of its own, so the two questions ("how do I turn this
+    // cluster's own endpoints into hosts" vs "does this cluster own hosts at
+    // all") have to be answered together here, even though `ClusterConfig`
+    // keeps them as separate fields (see its `kind` doc for why).
+    let (discovery, kind) = match &c.cluster_discovery_type {
+        None => (DiscoveryType::Static, ClusterKind::Endpoints), // proto default: STATIC
         Some(ClusterDiscoveryType::Type(t)) => match ProtoDiscovery::try_from(*t) {
-            Ok(ProtoDiscovery::Static) => DiscoveryType::Static,
-            Ok(ProtoDiscovery::StrictDns) => DiscoveryType::StrictDns,
-            Ok(ProtoDiscovery::LogicalDns) => DiscoveryType::LogicalDns,
+            Ok(ProtoDiscovery::Static) => (DiscoveryType::Static, ClusterKind::Endpoints),
+            Ok(ProtoDiscovery::StrictDns) => (DiscoveryType::StrictDns, ClusterKind::Endpoints),
+            Ok(ProtoDiscovery::LogicalDns) => (DiscoveryType::LogicalDns, ClusterKind::Endpoints),
             Ok(ProtoDiscovery::Eds) => {
                 return Err(unsupported(
                     format!("{path}.type"),
@@ -1378,20 +1988,85 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
                 ))
             }
         },
-        Some(ClusterDiscoveryType::ClusterType(_)) => {
-            return Err(unsupported(
-                format!("{path}.cluster_type"),
-                "custom cluster types are not implemented",
-            ))
+        Some(ClusterDiscoveryType::ClusterType(ct)) => {
+            if ct.name != AGGREGATE_CLUSTER_TYPE_NAME {
+                return Err(unsupported(
+                    format!("{path}.cluster_type.name"),
+                    format!(
+                        "only `{AGGREGATE_CLUSTER_TYPE_NAME}` custom cluster types are \
+                         implemented, found `{}`",
+                        ct.name
+                    ),
+                ));
+            }
+            let cfg_path = format!("{path}.cluster_type.typed_config");
+            let any = ct
+                .typed_config
+                .as_ref()
+                .ok_or_else(|| invalid(&cfg_path, "typed_config is required"))?;
+            if type_name(any) != AGGREGATE_CLUSTER_CONFIG_TYPE {
+                return Err(ConfigError::UnknownTypeUrl {
+                    field_path: cfg_path,
+                    type_url: any.type_url.clone(),
+                });
+            }
+            let agg: aggregate_cluster_v3::ClusterConfig = decode_any(any, &cfg_path)?;
+            // Belt and suspenders: the proto's own `repeated.min_items = 1`
+            // PGV annotation on `clusters` already rejects this during
+            // `parse_bootstrap` (`validate::validate_message`, WP-04), before
+            // `convert_cluster` ever runs, so this arm is unreachable through
+            // the normal `parse_bootstrap` -> `build_snapshot` pipeline today.
+            // It stays because `build_snapshot`'s own doc only promises it is
+            // "the only door between protobuf-land and the data plane" --
+            // nothing guarantees every future caller of it validated first
+            // (module doc: xDS resources will run PGV too, but haven't yet).
+            if agg.clusters.is_empty() {
+                return Err(invalid(
+                    format!("{cfg_path}.clusters"),
+                    "an aggregate cluster needs at least one member",
+                ));
+            }
+            (
+                // Inert: an aggregate is forbidden from carrying its own
+                // endpoints (rejected below), so `convert_endpoint` never
+                // runs for one and this value is never read.
+                DiscoveryType::Static,
+                ClusterKind::Aggregate {
+                    // Member order IS the failover order (S7 / `ClusterKind`'s
+                    // doc) -- preserve `clusters`' listed order exactly.
+                    members: agg.clusters.clone(),
+                },
+            )
         }
     };
+    let is_aggregate = matches!(kind, ClusterKind::Aggregate { .. });
 
     let lb_policy = match ProtoLb::try_from(c.lb_policy) {
         Ok(ProtoLb::RoundRobin) => LbPolicy::RoundRobin,
         Ok(ProtoLb::LeastRequest) => LbPolicy::LeastRequest,
-        Ok(ProtoLb::RingHash) => LbPolicy::RingHash,
         Ok(ProtoLb::Random) => LbPolicy::Random,
-        Ok(ProtoLb::Maglev) => LbPolicy::Maglev,
+        Ok(ProtoLb::ClusterProvided) => LbPolicy::ClusterProvided,
+        // RING_HASH / MAGLEV: the `LbPolicy` variants exist so the IR can
+        // model them, but WP-17 deliberately does not implement them yet --
+        // a consistent-hash that isn't bit-identical to Envoy's silently
+        // breaks session affinity across a mixed fleet, so it needs an Envoy
+        // differential harness first. Reject at *config* time rather than at
+        // cluster-build time: `proxy-cluster` also refuses to build such a
+        // cluster, but that error surfaces after startup, leaving the cluster
+        // simply absent and every request to it answered 503 with no
+        // explanation. Failing here means `make validate` and startup say
+        // exactly what is wrong, with the full dotted path (ground rule #1).
+        Ok(policy @ (ProtoLb::RingHash | ProtoLb::Maglev)) => {
+            return Err(unsupported(
+                format!("{path}.lb_policy"),
+                format!(
+                    "{} load balancing is not implemented yet (WP-17 follow-up: it requires \
+                     bit-exact parity with Envoy's hashing, verified by a differential test, \
+                     or session affinity breaks across a mixed fleet)",
+                    policy.as_str_name()
+                ),
+            ))
+        }
         _ => {
             return Err(unsupported(
                 format!("{path}.lb_policy"),
@@ -1400,10 +2075,67 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         }
     };
 
+    // Envoy requires `lb_policy: CLUSTER_PROVIDED` on an aggregate cluster
+    // (it has no hosts of its own to run a real policy over) and forbids it
+    // everywhere else (we implement no cluster-provided host-picking for a
+    // cluster that owns hosts) -- see `LbPolicy::ClusterProvided`'s doc.
+    if is_aggregate && lb_policy != LbPolicy::ClusterProvided {
+        return Err(invalid(
+            format!("{path}.lb_policy"),
+            "an aggregate cluster (cluster_type: envoy.clusters.aggregate) requires \
+             lb_policy: CLUSTER_PROVIDED; note the proto default when lb_policy is unset (0) \
+             is ROUND_ROBIN, so it must be set explicitly",
+        ));
+    }
+    if !is_aggregate && lb_policy == LbPolicy::ClusterProvided {
+        return Err(unsupported(
+            format!("{path}.lb_policy"),
+            "CLUSTER_PROVIDED is only implemented for envoy.clusters.aggregate (cluster_type); \
+             this cluster owns its own hosts and needs a real host-picking policy",
+        ));
+    }
+
     let connect_timeout = match &c.connect_timeout {
         Some(d) => to_std_duration(d, &format!("{path}.connect_timeout"))?,
         None => DEFAULT_CONNECT_TIMEOUT,
     };
+
+    // Everything below is inert on an aggregate cluster: the member that
+    // actually serves a request supplies its own endpoints, TLS, upstream
+    // protocol, and (for the dialect) credentials -- ground rule #1 forbids
+    // silently accepting-and-ignoring any of them, so each is a hard error
+    // naming its own dotted path rather than a silent no-op.
+    if is_aggregate {
+        if c.load_assignment.is_some() {
+            return Err(invalid(
+                format!("{path}.load_assignment"),
+                "an aggregate cluster has no endpoints of its own -- hosts come from its \
+                 members",
+            ));
+        }
+        if c.transport_socket.is_some() {
+            return Err(invalid(
+                format!("{path}.transport_socket"),
+                "inert on an aggregate cluster: the member cluster that actually serves a \
+                 request supplies its own TLS",
+            ));
+        }
+        if !c.typed_extension_protocol_options.is_empty() {
+            return Err(invalid(
+                format!("{path}.typed_extension_protocol_options"),
+                "inert on an aggregate cluster: the member cluster that actually serves a \
+                 request supplies the upstream protocol",
+            ));
+        }
+        if c.metadata.is_some() {
+            return Err(invalid(
+                format!("{path}.metadata"),
+                "inert on an aggregate cluster, and dangerous if it carries \
+                 `io.llmproxy.provider_auth`: credentials set here would silently never apply \
+                 -- they belong on the member cluster that actually serves the request",
+            ));
+        }
+    }
 
     let mut endpoints = Vec::new();
     if let Some(la) = &c.load_assignment {
@@ -1422,16 +2154,363 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         .map(|ts| convert_upstream_tls(ts, &format!("{path}.transport_socket")))
         .transpose()?;
 
+    // Circuit breakers stay meaningful on an aggregate: the router applies
+    // the breaker to the *routed* cluster before the host pick, matching
+    // Envoy, so an aggregate's own thresholds do real work even though it
+    // has no hosts of its own.
+    let circuit_breakers = convert_circuit_breakers(&c.circuit_breakers, path)?;
+    let upstream_protocol = convert_upstream_protocol(&c.typed_extension_protocol_options, path)?;
+    // Envoy-mode config has no proto field for per-provider auth headers --
+    // see `ClusterConfig::request_headers_to_add`'s doc comment. The
+    // `llmproxy` dialect lowers through this same Envoy-shaped pipeline
+    // ("one engine, two front-ends"), so it smuggles the headers through
+    // `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
+    // instead; a hand-written Envoy config that never sets this namespace
+    // gets an empty list here, unchanged from before.
+    let request_headers_to_add = convert_provider_auth_metadata(c.metadata.as_ref(), path)?;
+
     Ok(ClusterConfig {
         name: c.name.clone(),
         discovery,
         lb_policy,
         connect_timeout,
         endpoints,
+        kind,
         transport_socket,
         per_connection_buffer_limit_bytes: c
             .per_connection_buffer_limit_bytes
             .unwrap_or(DEFAULT_CONN_BUFFER_LIMIT),
+        circuit_breakers,
+        upstream_protocol,
+        request_headers_to_add,
+    })
+}
+
+/// WP-35 increment 2b-ii: a cross-cluster post-pass over the assembled
+/// cluster map, checking that every aggregate's members are wired correctly.
+/// It cannot run inside `build_snapshot`'s per-cluster loop -- a member
+/// cluster may be declared *after* the aggregate that names it, and
+/// declaration order must not matter, so the whole map has to exist first.
+///
+/// For every `ClusterKind::Aggregate`, walks its `members` in listed order
+/// and rejects the first of:
+/// - the aggregate naming itself (checked before the nested-aggregate check
+///   below, so the error says plainly "names itself" rather than the more
+///   confusing "member `agg` is itself an aggregate")
+/// - a member naming no cluster in the snapshot ("unknown cluster")
+/// - a member whose own `kind` is `Aggregate` -- aggregates cannot nest;
+///   `ClusterHandle::select_aggregate_member` (`proxy-cluster/src/manager.rs`)
+///   deliberately refuses to recurse into one, so that member would be
+///   silently skipped at runtime rather than failing outright
+/// - a duplicate member name within one aggregate -- always a runtime no-op,
+///   since `LoadBalancerContext::attempted_clusters` skips a cluster already
+///   tried this request
+///
+/// Ground rule #1's shape exactly: each of these degrades into a silent
+/// runtime no-op (a 503 with no explanation, or a fallback that never
+/// receives traffic) instead of a config-time error, unless caught here.
+///
+/// Rust note: `sr.clusters` (the original proto list) is re-walked with
+/// `enumerate()` rather than iterating `snapshot.clusters` (a `HashMap`,
+/// keyed by name) so the error path can report the aggregate's original
+/// config index -- the name-keyed IR map has already forgotten it, and a
+/// `HashMap`'s iteration order is unspecified besides.
+fn validate_cluster_graph(
+    sr: &proxy_api::envoy::config::bootstrap::v3::bootstrap::StaticResources,
+    snapshot: &ConfigSnapshot,
+) -> Result<(), ConfigError> {
+    for (i, c) in sr.clusters.iter().enumerate() {
+        let ir = snapshot
+            .clusters
+            .get(&c.name)
+            .expect("build_snapshot just inserted every sr.clusters entry by this same name");
+        let ClusterKind::Aggregate { members } = &ir.kind else {
+            continue;
+        };
+        let path = format!("static_resources.clusters[{i}].cluster_type.typed_config.clusters");
+        let mut seen = std::collections::HashSet::new();
+        for (j, member) in members.iter().enumerate() {
+            let member_path = format!("{path}[{j}]");
+            if member == &c.name {
+                return Err(invalid(
+                    &member_path,
+                    format!("aggregate cluster `{}` names itself as a member", c.name),
+                ));
+            }
+            let Some(member_ir) = snapshot.clusters.get(member) else {
+                return Err(invalid(&member_path, format!("unknown cluster `{member}`")));
+            };
+            if matches!(member_ir.kind, ClusterKind::Aggregate { .. }) {
+                return Err(invalid(
+                    &member_path,
+                    format!(
+                        "member `{member}` is itself an aggregate cluster; aggregates cannot \
+                         nest -- select_aggregate_member refuses to recurse into one, so this \
+                         member would be silently skipped at runtime"
+                    ),
+                ));
+            }
+            if !seen.insert(member.as_str()) {
+                return Err(invalid(
+                    &member_path,
+                    format!(
+                        "duplicate member `{member}` in aggregate cluster `{}`",
+                        c.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Namespace key the `llmproxy` dialect uses to carry provider credentials
+/// through `Cluster.metadata.filter_metadata` -- see
+/// `ClusterConfig::request_headers_to_add`'s doc comment for why credentials
+/// have to live on the cluster rather than the route.
+const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
+
+/// Lower `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
+/// into `ClusterConfig::request_headers_to_add`. The expected shape is
+/// `{ headers: [ { key: "...", value: "..." }, ... ] }`; every entry lowers
+/// to [`HeaderAppendAction::OverwriteIfExistsOrAdd`], matching what the
+/// dialect used to emit at the route level.
+///
+/// `google.protobuf.Struct` is opaque to the reflective surface walk (it is
+/// a well-known type, so `check_supported_surface` stops recursing at its
+/// boundary), so ground rule #1's "every field maps or errors" guarantee has
+/// to be re-implemented by hand here for this one namespace: any shape that
+/// isn't exactly the one above -- wrong types, missing `key`/`value`,
+/// unrecognized sub-keys -- is a hard error with its full dotted path, never
+/// a silent skip. Any *other* `filter_metadata` namespace is left alone; it
+/// belongs to a different (possibly future) consumer.
+fn convert_provider_auth_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<Vec<HeaderMutation>, ConfigError> {
+    let Some(auth) = metadata.and_then(|m| m.filter_metadata.get(PROVIDER_AUTH_METADATA_KEY))
+    else {
+        return Ok(Vec::new());
+    };
+    let auth_path = format!("{path}.metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"]");
+
+    // Rust note: `Struct::fields` is a `HashMap`, so sort keys before
+    // reporting one to keep the error deterministic across runs.
+    let mut unknown: Vec<&String> = auth
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "headers")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{auth_path}.{key}"),
+            format!("`{PROVIDER_AUTH_METADATA_KEY}` only supports a `headers` list"),
+        ));
+    }
+
+    let Some(headers_value) = auth.fields.get("headers") else {
+        return Ok(Vec::new());
+    };
+    let headers_path = format!("{auth_path}.headers");
+    let list = match &headers_value.kind {
+        Some(prost_types::value::Kind::ListValue(l)) => &l.values,
+        _ => return Err(invalid(&headers_path, "must be a list")),
+    };
+
+    let mut out = Vec::with_capacity(list.len());
+    for (i, item) in list.iter().enumerate() {
+        let item_path = format!("{headers_path}[{i}]");
+        let Some(prost_types::value::Kind::StructValue(entry)) = &item.kind else {
+            return Err(invalid(
+                &item_path,
+                "must be an object with `key` and `value` string fields",
+            ));
+        };
+        let mut entry_unknown: Vec<&String> = entry
+            .fields
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "key" | "value"))
+            .collect();
+        entry_unknown.sort();
+        if let Some(key) = entry_unknown.first() {
+            return Err(unsupported(
+                format!("{item_path}.{key}"),
+                "only `key` and `value` are supported",
+            ));
+        }
+        out.push(HeaderMutation {
+            key: provider_auth_string_field(entry, "key", &item_path)?,
+            value: provider_auth_string_field(entry, "value", &item_path)?,
+            action: HeaderAppendAction::OverwriteIfExistsOrAdd,
+        });
+    }
+    Ok(out)
+}
+
+fn provider_auth_string_field(
+    s: &prost_types::Struct,
+    name: &str,
+    path: &str,
+) -> Result<String, ConfigError> {
+    match s.fields.get(name).and_then(|v| v.kind.as_ref()) {
+        Some(prost_types::value::Kind::StringValue(v)) => Ok(v.clone()),
+        Some(_) => Err(invalid(format!("{path}.{name}"), "must be a string")),
+        None => Err(invalid(format!("{path}.{name}"), "is required")),
+    }
+}
+
+/// Type URL key Envoy expects for the one `typed_extension_protocol_options`
+/// entry we implement: HTTP/1-vs-HTTP/2 selection via `explicit_http_config`.
+const HTTP_PROTOCOL_OPTIONS_TYPE: &str = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+
+/// Lower a cluster's `typed_extension_protocol_options` map into the IR's
+/// single-dimension [`UpstreamProtocol`]. Envoy keys this map by extension
+/// name; we only implement the one entry that selects HTTP/1 vs HTTP/2
+/// (`envoy.extensions.upstreams.http.v3.HttpProtocolOptions`), so any other
+/// key -- or any of that message's fields we don't model -- is rejected with
+/// its full dotted path (ground rule #1) rather than silently ignored.
+fn convert_upstream_protocol(
+    opts: &std::collections::HashMap<String, prost_types::Any>,
+    path: &str,
+) -> Result<UpstreamProtocol, ConfigError> {
+    if opts.is_empty() {
+        return Ok(UpstreamProtocol::Http1); // Envoy default: HTTP/1.1.
+    }
+
+    let map_path = format!("{path}.typed_extension_protocol_options");
+
+    // Rust note: `opts` is a `HashMap`, whose iteration order is unspecified;
+    // sort the keys first so which key we complain about (and the resulting
+    // error) is deterministic across runs rather than depending on hashing.
+    let mut keys: Vec<&String> = opts.keys().collect();
+    keys.sort();
+    for key in keys {
+        if key != HTTP_PROTOCOL_OPTIONS_TYPE {
+            return Err(unsupported(
+                format!("{map_path}[\"{key}\"]"),
+                format!("only `{HTTP_PROTOCOL_OPTIONS_TYPE}` is implemented"),
+            ));
+        }
+    }
+
+    let any = &opts[HTTP_PROTOCOL_OPTIONS_TYPE];
+    let entry_path = format!("{map_path}[\"{HTTP_PROTOCOL_OPTIONS_TYPE}\"]");
+    if type_name(any) != HTTP_PROTOCOL_OPTIONS_TYPE {
+        return Err(ConfigError::UnknownTypeUrl {
+            field_path: entry_path,
+            type_url: any.type_url.clone(),
+        });
+    }
+    let options: upstream_http_v3::HttpProtocolOptions = decode_any(any, &entry_path)?;
+    convert_explicit_http_config(&options, &entry_path)
+}
+
+/// Read the `explicit_http_config` oneof out of a decoded `HttpProtocolOptions`
+/// and map its `protocol_config` oneof to [`UpstreamProtocol`]. The other two
+/// top-level oneof branches (`use_downstream_protocol_config`, `auto_config`)
+/// and HTTP/3 are already rejected by the surface walk's allowlist for this
+/// message (see `allowed_fields`); this function only has to handle the one
+/// branch that's on the supported surface.
+fn convert_explicit_http_config(
+    options: &upstream_http_v3::HttpProtocolOptions,
+    path: &str,
+) -> Result<UpstreamProtocol, ConfigError> {
+    use upstream_http_v3::http_protocol_options::explicit_http_config::ProtocolConfig;
+    use upstream_http_v3::http_protocol_options::UpstreamProtocolOptions;
+
+    let explicit = match &options.upstream_protocol_options {
+        Some(UpstreamProtocolOptions::ExplicitHttpConfig(explicit)) => explicit,
+        _ => {
+            return Err(unsupported(
+                format!("{path}.explicit_http_config"),
+                "only `explicit_http_config` is implemented (not \
+                 `use_downstream_protocol_config` or `auto_config`)",
+            ))
+        }
+    };
+
+    match &explicit.protocol_config {
+        Some(ProtocolConfig::HttpProtocolOptions(_)) => Ok(UpstreamProtocol::Http1),
+        Some(ProtocolConfig::Http2ProtocolOptions(_)) => Ok(UpstreamProtocol::Http2),
+        Some(ProtocolConfig::Http3ProtocolOptions(_)) => Err(unsupported(
+            format!("{path}.explicit_http_config.http3_protocol_options"),
+            "HTTP/3 upstreams are not implemented",
+        )),
+        None => Err(invalid(
+            format!("{path}.explicit_http_config"),
+            "explicit_http_config requires one of http_protocol_options or \
+             http2_protocol_options",
+        )),
+    }
+}
+
+/// S5: lower Envoy's repeated, priority-tagged `thresholds` list to the IR's
+/// flat two-bucket shape. A priority absent from the list keeps Envoy's
+/// documented defaults; a bucket with an explicit entry defaults only the
+/// *fields* the entry left unset (Envoy's `UInt32Value` semantics: absent
+/// means "use the default", not zero).
+fn convert_circuit_breakers(
+    cb: &Option<cluster_v3::CircuitBreakers>,
+    path: &str,
+) -> Result<CircuitBreakers, ConfigError> {
+    let Some(cb) = cb else {
+        return Ok(CircuitBreakers::default());
+    };
+
+    // Rust note: `Option<CircuitBreakerThresholds>` per bucket lets us detect
+    // a *second* thresholds entry for the same priority (Envoy takes the
+    // first; we reject the config outright rather than silently pick one).
+    let mut default_bucket: Option<CircuitBreakerThresholds> = None;
+    let mut high_bucket: Option<CircuitBreakerThresholds> = None;
+
+    for (i, t) in cb.thresholds.iter().enumerate() {
+        let t_path = format!("{path}.circuit_breakers.thresholds[{i}]");
+        let thresholds = CircuitBreakerThresholds {
+            max_connections: t
+                .max_connections
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_connections),
+            max_pending_requests: t
+                .max_pending_requests
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_pending_requests),
+            max_requests: t
+                .max_requests
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_requests),
+            max_retries: t
+                .max_retries
+                .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_retries),
+        };
+
+        use core_v3::RoutingPriority;
+        match RoutingPriority::try_from(t.priority) {
+            Ok(RoutingPriority::Default) => {
+                if default_bucket.replace(thresholds).is_some() {
+                    return Err(invalid(
+                        format!("{t_path}.priority"),
+                        "duplicate `DEFAULT` priority circuit breaker thresholds",
+                    ));
+                }
+            }
+            Ok(RoutingPriority::High) => {
+                if high_bucket.replace(thresholds).is_some() {
+                    return Err(invalid(
+                        format!("{t_path}.priority"),
+                        "duplicate `HIGH` priority circuit breaker thresholds",
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(invalid(
+                    format!("{t_path}.priority"),
+                    format!("unknown routing priority `{}`", t.priority),
+                ))
+            }
+        }
+    }
+
+    Ok(CircuitBreakers {
+        default: default_bucket.unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT),
+        high: high_bucket.unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT),
     })
 }
 
@@ -1531,15 +2610,31 @@ fn convert_route_table(
         let vh_path = format!("{path}.virtual_hosts[{i}]");
         let mut routes = Vec::new();
         for (j, r) in vh.routes.iter().enumerate() {
-            routes.push(convert_route(r, &format!("{vh_path}.routes[{j}]"))?);
+            // Rust note: `Arc`'d here (not a bare `RouteEntry`) so the S2.8
+            // route cache in `proxy-http`'s frozen filter API can hand out
+            // `Arc<RouteEntry>` clones (see the field doc on
+            // `VirtualHostIR::routes`).
+            routes.push(Arc::new(convert_route(
+                r,
+                &format!("{vh_path}.routes[{j}]"),
+            )?));
         }
+        let vh_typed_per_filter_config = convert_typed_per_filter_config(
+            &vh.typed_per_filter_config,
+            &format!("{vh_path}.typed_per_filter_config"),
+        )?;
         vhosts.push(VirtualHostIR {
             name: vh.name.clone(),
             domains: vh.domains.clone(),
             routes,
+            typed_per_filter_config: vh_typed_per_filter_config,
         });
     }
-    RouteTable::new(rc.name.clone(), vhosts).map_err(|dup| {
+    let rc_typed_per_filter_config = convert_typed_per_filter_config(
+        &rc.typed_per_filter_config,
+        &format!("{path}.typed_per_filter_config"),
+    )?;
+    RouteTable::new(rc.name.clone(), vhosts, rc_typed_per_filter_config).map_err(|dup| {
         invalid(
             format!("{path}.virtual_hosts"),
             format!("duplicate domain `{}`", dup.0),
@@ -1590,11 +2685,21 @@ fn convert_route(r: &route_v3::Route, path: &str) -> Result<RouteEntry, ConfigEr
         )?);
     }
 
+    let typed_per_filter_config = convert_typed_per_filter_config(
+        &r.typed_per_filter_config,
+        &format!("{path}.typed_per_filter_config"),
+    )?;
+
     Ok(RouteEntry {
         name: (!r.name.is_empty()).then(|| r.name.clone()),
         matcher,
         action,
         request_headers_to_add,
+        typed_per_filter_config,
+        // Rust note: real value assigned in bulk by `RouteTable::new` (via
+        // `Arc::get_mut`) once every route in the table has been built --
+        // this constructor doesn't know the table-wide ordering yet.
+        route_index: 0,
     })
 }
 
@@ -1781,8 +2886,79 @@ fn convert_retry_policy(
             )
         })?);
     }
+    // S3.3: absent message => Envoy's defaults (25ms / 250ms). When present,
+    // `base_interval` is required by the proto and `max_interval` defaults to
+    // 10x the base when unset.
+    let retry_back_off = match &rp.retry_back_off {
+        None => RetryBackOff::ENVOY_DEFAULT,
+        Some(rb) => {
+            let base_path = format!("{path}.retry_back_off.base_interval");
+            let base_interval = rb
+                .base_interval
+                .as_ref()
+                .ok_or_else(|| invalid(&base_path, "base_interval is required"))
+                .and_then(|d| to_std_duration(d, &base_path))?;
+            let max_interval = rb
+                .max_interval
+                .as_ref()
+                .map(|d| to_std_duration(d, &format!("{path}.retry_back_off.max_interval")))
+                .transpose()?
+                .unwrap_or(base_interval * 10);
+            RetryBackOff {
+                base_interval,
+                max_interval,
+            }
+        }
+    };
+
+    // S3.4: proto type is int64 (`host_selection_retry_max_attempts`); Envoy
+    // default is 1. Reject negative/overflowing values loudly rather than
+    // silently truncating.
+    let host_selection_retry_max_attempts = u32::try_from(rp.host_selection_retry_max_attempts)
+        .map_err(|_| {
+            invalid(
+                format!("{path}.host_selection_retry_max_attempts"),
+                "must be a non-negative value that fits in u32",
+            )
+        })?;
+    let host_selection_retry_max_attempts = if host_selection_retry_max_attempts == 0 {
+        1
+    } else {
+        host_selection_retry_max_attempts
+    };
+
+    // Ground rule #1. The router re-runs host selection once per retry, which
+    // *is* the Envoy default (1) -- but it has no notion of "avoid a host this
+    // request already tried", so any explicit value above 1 would parse,
+    // validate, and then do nothing. Refuse it instead of accepting a knob we
+    // silently drop.
+    if host_selection_retry_max_attempts > 1 {
+        return Err(unsupported(
+            format!("{path}.host_selection_retry_max_attempts"),
+            "values above 1 are not implemented yet (WP-14 follow-up: the router re-runs host \
+             selection per retry but cannot yet exclude already-tried hosts, so a higher \
+             attempt count would have no effect)",
+        ));
+    }
+
+    let retry_on = RetryOn::parse(&rp.retry_on);
+
+    // Ground rule #1. `envoy-ratelimited` retries when the response carries
+    // `x-envoy-ratelimited`, a header only a rate-limit filter sets -- and no
+    // such filter exists yet (WP-31/WP-32), so nothing can ever produce the
+    // condition. Accepting the token would mean a config that reads as "retry
+    // rate-limited responses" and never retries anything.
+    if retry_on.envoy_ratelimited {
+        return Err(unsupported(
+            format!("{path}.retry_on"),
+            "the `envoy-ratelimited` retry trigger is not implemented yet (it fires on the \
+             `x-envoy-ratelimited` response header, which no filter sets until WP-31/WP-32 \
+             land the rate-limit filters)",
+        ));
+    }
+
     Ok(RetryPolicyIR {
-        retry_on: RetryOn::parse(&rp.retry_on),
+        retry_on,
         // S3: Envoy default is 1 retry.
         num_retries: rp.num_retries.unwrap_or(1),
         per_try_timeout: rp
@@ -1791,6 +2967,8 @@ fn convert_retry_policy(
             .map(|d| to_std_duration(d, &format!("{path}.per_try_timeout")))
             .transpose()?,
         retriable_status_codes: codes,
+        retry_back_off,
+        host_selection_retry_max_attempts,
     })
 }
 

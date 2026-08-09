@@ -1,0 +1,998 @@
+//! WP-24 chunk 3 (relocated): turns the parsed `AccessLogIR`/`FormatString`
+//! (`proxy_observability::access_log`/`sink`) into real per-request log
+//! lines. Originally lived under `router::logging` and was invoked from
+//! `RouterHandler::handle_and_log` -- moved up to be a peer of
+//! [`crate::filter_manager`] because the router sits INSIDE the encode
+//! filter chain (`filter_manager::StreamingEncoder` wraps the router's
+//! response body, not the other way around). Wrapping the response here,
+//! from *inside* the router, meant [`LoggingBody`] rendered its line the
+//! moment the router's own body hit end-of-stream -- which is BEFORE the
+//! encode filter chain has had a chance to run its own end-of-stream
+//! callback. An encode filter that records something at stream end (the
+//! WP-33/34 usage filter, notably) was therefore invisible to access logs.
+//!
+//! `FilterChainHandler::handle` now wraps the OUTERMOST response body --
+//! i.e. `LoggingBody(StreamingEncoder(router's response))`, not
+//! `StreamingEncoder(LoggingBody(router's response))` -- so a line is only
+//! ever rendered once every encode filter (and the encode chain's own
+//! end-of-stream flush) has already run. See `FilterChainHandler::handle`'s
+//! own doc for exactly where that wrap happens and why it's the single
+//! outermost exit point.
+//!
+//! Two pieces, unchanged from the original module:
+//! - [`AccessLoggerRuntime`]: the resolved, per-HCM-bind runtime form of one
+//!   `AccessLogIR` entry -- its sink already opened (or shared, via
+//!   `SinkRegistry`, with any other logger in the same HCM pointed at the
+//!   same file), so the hot per-request path here only ever renders +
+//!   writes, no I/O setup.
+//! - [`LoggingBody`]: the body combinator that actually calls those loggers,
+//!   once, when a response is fully observed -- see its doc for why that has
+//!   to be at *stream end*, not at header-flush time.
+
+use std::cell::RefCell;
+use std::io;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::task::{Context, Poll};
+use std::time::{Instant, SystemTime};
+
+use bytes::Bytes;
+use http::HeaderMap;
+use hyper::body::{Body, Frame};
+
+use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
+use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
+use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
+use proxy_observability::ResponseFlag;
+
+use crate::handler::{BodyError, StreamBody};
+use crate::router::idle::IdleTimeoutError;
+use crate::stream_info::StreamInfo;
+
+/// One configured logger, resolved at HCM-bind time (mirrors
+/// `proxy-core::listener::build_listener_hcm`'s own "compiled once, rebuilt
+/// only when the snapshot version changes" cadence -- a fresh
+/// `FilterChainHandler`, and so a fresh set of these, is built on every
+/// rebuild).
+pub(crate) struct AccessLoggerRuntime {
+    sink: std::sync::Arc<dyn AccessLogWriter>,
+    format: AccessLogFormat,
+    filter: Option<AccessLogFilterIR>,
+}
+
+impl AccessLoggerRuntime {
+    /// Build the runtime loggers for one HCM's `access_logs`, in configured
+    /// order, sharing sinks by destination via `registry` -- see
+    /// `SinkRegistry`'s own doc for why that matters (two loggers naming the
+    /// same file must not each open their own `BufWriter`, or their lines
+    /// can interleave mid-write).
+    pub(crate) fn build_all(
+        access_logs: &[AccessLogIR],
+        registry: &SinkRegistry,
+    ) -> io::Result<Vec<AccessLoggerRuntime>> {
+        access_logs
+            .iter()
+            .map(|log| {
+                Ok(AccessLoggerRuntime {
+                    sink: registry.build(&log.sink)?,
+                    format: log.format.clone(),
+                    filter: log.filter.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Ground rule #1 note: every `AccessLogFilterIR` variant is matched
+    /// explicitly here, same as `proxy_observability::sink::build_sink`
+    /// matches every `AccessLogSink` variant -- a new filter kind is a
+    /// compile error here, not a silent "always log" default.
+    fn passes(&self, ctx: &LogContext<'_>) -> bool {
+        match &self.filter {
+            None => true,
+            Some(AccessLogFilterIR::StatusCode { op, value }) => {
+                let code = ctx.response_code.unwrap_or(0) as u32;
+                match op {
+                    ComparisonOp::Eq => code == *value,
+                    ComparisonOp::Ge => code >= *value,
+                    ComparisonOp::Le => code <= *value,
+                    ComparisonOp::Ne => code != *value,
+                }
+            }
+            // Envoy: an empty flag list means "log if *any* flag fired", not
+            // "unconditionally pass" -- see `AccessLogFilterIR::ResponseFlag`'s
+            // own doc in `proxy-config`.
+            Some(AccessLogFilterIR::ResponseFlag(flags)) => {
+                if flags.is_empty() {
+                    !ctx.response_flags.is_empty()
+                } else {
+                    ctx.response_flags.iter().any(|f| flags.contains(f))
+                }
+            }
+        }
+    }
+
+    fn render_line(&self, ctx: &LogContext<'_>) -> String {
+        match &self.format {
+            AccessLogFormat::Text(fmt) => render(fmt, ctx),
+            AccessLogFormat::Json(fields) => render_json(fields, ctx),
+        }
+    }
+
+    fn log(&self, ctx: &LogContext<'_>) {
+        if !self.passes(ctx) {
+            return;
+        }
+        self.sink.write_line(&self.render_line(ctx));
+        // `FileSink::write_line` only writes into its `BufWriter` --
+        // stdout/stderr sinks flush themselves per line, but a file sink
+        // doesn't (see its own doc: buffered for throughput). Flushing
+        // here trades a little of that throughput for every access-log
+        // line actually being durable (and readable by anything tailing
+        // the file) as soon as the request it describes finishes, rather
+        // than sitting in an in-process buffer indefinitely -- there's no
+        // periodic-flush component in the data plane yet to do this any
+        // other way.
+        self.sink.flush();
+    }
+}
+
+/// Render Envoy's `json_format`: every field's value is itself a rendered
+/// [`FormatString`] (chunk 1), turned into a JSON string value. Envoy's real
+/// `json_format` supports typed (numeric/bool/nested) values via shortcuts
+/// this IR doesn't carry -- `AccessLogFormat::Json` is
+/// `Vec<(String, FormatString)>`, always string-typed -- so every value
+/// renders as a JSON string here, never a bare number/bool/object. That's a
+/// known, disclosed gap (ground rule #1), not a silent one: nothing in the
+/// IR asks for a typed value today, so there's nothing to drop.
+fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> String {
+    let mut out = String::from("{");
+    for (i, (key, fmt)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        json_escape_into(key, &mut out);
+        out.push_str("\":\"");
+        json_escape_into(&render(fmt, ctx), &mut out);
+        out.push('"');
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn json_escape_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
+/// A snapshot of everything the access-log formatter needs from a request
+/// head, taken at a point in time (see `ChainCtx::request_headers_snapshot`'s
+/// doc in `filter_manager` for exactly when). Carries the four Envoy request
+/// pseudo-headers alongside the header map -- rather than injecting them
+/// into the map under some real header name -- because none of them are
+/// legal `http::HeaderName`s (a colon isn't a valid HTTP field-name
+/// character); `proxy_observability::access_log::LogContext`'s own
+/// `request_method`/`request_path`/`request_authority`/`request_scheme`
+/// fields exist for the same reason, and this struct is what feeds them.
+///
+/// Rust note: owns everything (`String`, not `&str`) rather than borrowing
+/// from the request head -- the snapshot has to outlive the request head it
+/// was taken from (it's read back after `FilterManager::run` returns, by
+/// which point the head has already been consumed into the response path).
+#[derive(Default)]
+pub(crate) struct RequestSnapshot {
+    pub(crate) headers: HeaderMap,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) authority: Option<String>,
+    pub(crate) scheme: Option<String>,
+}
+
+/// Build a [`RequestSnapshot`] from a request head. `authority` prefers the
+/// URI's own `:authority` (`Uri::authority()` -- populated for absolute-form
+/// requests, e.g. CONNECT or an HTTP/2 `:authority` pseudo-header threaded
+/// through) and falls back to the `Host` header real origin-form requests
+/// carry instead. `scheme` comes from the URI alone; an origin-form request
+/// (the common case for a downstream HTTP/1 request line) carries no scheme,
+/// so this is commonly `None` -- rendered as `-`, same as any other absent
+/// pseudo-header.
+///
+/// Rust note: takes `&RequestHeaders` and clones its `HeaderMap` rather than
+/// mutating in place -- every call site needs an independent snapshot (the
+/// caller's own headers keep flowing through the rest of the pipeline
+/// unmodified).
+pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestSnapshot {
+    let authority = head.uri.authority().map(|a| a.to_string()).or_else(|| {
+        head.headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    });
+    RequestSnapshot {
+        headers: head.headers.clone(),
+        method: head.method.to_string(),
+        path: head.uri.path().to_string(),
+        authority,
+        scheme: head.uri.scheme_str().map(|s| s.to_string()),
+    }
+}
+
+/// Everything [`LoggingBody`] needs to render + write a line once the
+/// response stream ends (or is dropped mid-stream) -- assembled once, in
+/// `FilterChainHandler::handle`, before the body starts streaming to the
+/// downstream client.
+pub(crate) struct AccessLogContext {
+    pub(crate) loggers: Rc<Vec<AccessLoggerRuntime>>,
+    pub(crate) stream_info: Rc<RefCell<StreamInfo>>,
+    pub(crate) start_time: SystemTime,
+    pub(crate) start_instant: Instant,
+    pub(crate) request: RequestSnapshot,
+    pub(crate) response_headers: HeaderMap,
+    pub(crate) response_code: u16,
+    pub(crate) downstream_remote_address: String,
+}
+
+/// Wraps a response [`StreamBody`] so that -- regardless of whether the
+/// stream completes normally, errors, or is simply dropped mid-flight (a
+/// disconnecting client, or an outer combinator like `GuardedBody`/
+/// `IdleTimeoutBody` giving up on it) -- exactly one access-log line is
+/// rendered and written per configured logger, using the *final* byte count
+/// and a duration covering the whole stream.
+///
+/// This is the seam WP-24 chunk 3 exists for: logging when *response
+/// headers* are produced (the naive place to hook) is wrong for every
+/// streamed LLM response -- the body (the actual tokens) is what takes the
+/// time and carries the bytes; headers arrive almost immediately. Wrapping
+/// the body itself, the same way `GuardedBody`/`IdleTimeoutBody` already do
+/// for the S5/S4 concerns, is what lets this observe the real end of the
+/// stream.
+///
+/// **Deliberately observe-only: never inject into the stream.** When a
+/// response fails mid-flight this records a `ResponseFlag` and warns, and
+/// the downstream client simply sees the stream end (an unclean EOF, which
+/// is what tells it the response was truncated). It is tempting to instead
+/// synthesize an SSE error event so the client learns *why* -- do not. This
+/// is a transparent proxy: response bytes reach the client exactly as the
+/// provider produced them. A synthetic frame would have to be forged in the
+/// provider's own event schema (OpenAI's and Anthropic's differ), so a
+/// client would either fail to parse it or, far worse, mistake it for
+/// something the model actually said. Failure attribution belongs in the
+/// access log and the operator-facing warning, not in the response body.
+/// (Owner decision, 2026-08-01.)
+///
+/// `LoggingBody` wraps the OUTERMOST response body -- see
+/// `FilterChainHandler::handle`'s doc -- specifically OUTSIDE
+/// `filter_manager::StreamingEncoder`, not nested inside the router's own
+/// response like the pre-relocation design had it. That ordering is the
+/// entire point of this module living here rather than under `router`: a
+/// `StreamingEncoder(LoggingBody(...))` nesting renders the log line the
+/// moment the router's body ends, before the encode filter chain's own
+/// end-of-stream callback has run, which makes anything an encode filter
+/// records at stream end (e.g. the WP-33/34 usage filter's token counts)
+/// invisible to the log. `LoggingBody(StreamingEncoder(...))` fixes that by
+/// only ever observing end-of-stream *after* the whole encode chain -- and
+/// its own end-of-stream flush -- has already run.
+///
+/// Rust note: `ctx` is `Option<AccessLogContext>` purely so `finish` can be
+/// called from either `poll_frame` (the common case: the stream ends or
+/// errors while still being polled) or `Drop` (the stream is abandoned
+/// without ever being polled to completion) and only actually log once,
+/// without a separate "have I already logged" bool.
+pub(crate) struct LoggingBody {
+    inner: StreamBody,
+    bytes_sent: u64,
+    trailers: HeaderMap,
+    ctx: Option<AccessLogContext>,
+}
+
+impl LoggingBody {
+    pub(crate) fn new(inner: StreamBody, ctx: AccessLogContext) -> Self {
+        Self {
+            inner,
+            bytes_sent: 0,
+            trailers: HeaderMap::new(),
+            ctx: Some(ctx),
+        }
+    }
+
+    /// Classifies a body-stream failure into the `ResponseFlag` an operator
+    /// needs to tell the three shapes apart: the client went away
+    /// (`BodyError::Downstream` -> DC), the upstream connection died mid-body
+    /// (`BodyError::Upstream` -> UC), or the upstream just went quiet past
+    /// the S4 idle deadline while still (as far as we know) alive (`SI`).
+    ///
+    /// Rust note: `BodyError::Upstream`'s source is a type-erased
+    /// `Box<dyn Error + Send + Sync>` (`router::idle::IdleTimeoutBody` and
+    /// every other upstream body wrapper share that one variant), so the
+    /// idle-timeout case can't be told apart by matching the `BodyError`
+    /// variant alone -- `downcast_ref` walks the erased box back to its
+    /// concrete type at runtime (this is exactly what `std::error::Error`'s
+    /// inherited `Any`-based downcast exists for).
+    fn classify(err: &BodyError) -> ResponseFlag {
+        match err {
+            BodyError::Downstream(_) => ResponseFlag::DownstreamConnectionTermination,
+            BodyError::Upstream(source) => {
+                if source.downcast_ref::<IdleTimeoutError>().is_some() {
+                    ResponseFlag::StreamIdleTimeout
+                } else {
+                    ResponseFlag::UpstreamConnectionTermination
+                }
+            }
+        }
+    }
+
+    /// Records a mid-stream failure (a `poll_frame` error, or a `Drop`
+    /// before end-of-stream) onto `StreamInfo` and emits the operator-facing
+    /// warning -- both before `finish()` snapshots the flags into the
+    /// rendered line, since `finish()` (via `ctx.take()`) is the point of no
+    /// return for this stream's log line. A no-op if `finish()` already ran
+    /// (`self.ctx` is `None`): `poll_frame` and `Drop` both call this, and
+    /// only the first to observe the failure should record it.
+    fn record_failure(&mut self, flag: ResponseFlag, detail: &dyn std::fmt::Display) {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return;
+        };
+        let (cluster, upstream_host, ttft) = {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.set_response_flag(flag);
+            (
+                info.upstream_cluster.clone(),
+                info.upstream_host.clone(),
+                info.llm.time_to_first_byte,
+            )
+        };
+        tracing::warn!(
+            response_flag = flag.code(),
+            cluster = cluster.as_deref().unwrap_or("-"),
+            upstream_host = upstream_host.as_deref().unwrap_or("-"),
+            bytes_sent = self.bytes_sent,
+            elapsed_ms = ctx.start_instant.elapsed().as_millis() as u64,
+            ttft_ms = ttft.map(|d| d.as_millis() as u64),
+            error = %detail,
+            "response stream failed mid-flight"
+        );
+    }
+
+    fn finish(&mut self) {
+        let Some(ctx) = self.ctx.take() else {
+            // Already logged (`poll_frame` beat `Drop` to it, or vice versa).
+            return;
+        };
+
+        // Rust note: `stream_info`'s snapshot has to be pulled out of the
+        // `RefCell` and its borrow dropped before `LogContext` is built --
+        // `LogContext` only borrows the pieces it's handed, and holding the
+        // `Ref` across that would just add a lifetime knot for no benefit
+        // (nothing else touches `stream_info` concurrently by this point).
+        let (
+            response_flags,
+            upstream_host,
+            upstream_cluster,
+            protocol,
+            bytes_received,
+            llm_tokens,
+            llm_ttft,
+            llm_max_stall,
+            llm_response_chunks,
+        ) = {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.bytes_sent = self.bytes_sent;
+            // WP-33: `LlmTokenUsage` -> `LlmTokens` field-for-field --
+            // `proxy-observability` can't name `proxy_http::LlmTokenUsage`
+            // (crate layering runs the other way), so this is the boundary
+            // conversion; note this is a `Option<LlmTokenUsage>`, not a
+            // struct with zeroed fields, so "no usage reported" stays `None`
+            // all the way through to `render` (`-`, never `0`).
+            let llm_tokens = info.llm.usage.map(|u| LlmTokens {
+                input: u.input_tokens,
+                cached: u.cached_tokens,
+                cache_creation: u.cache_creation_tokens,
+                output: u.output_tokens,
+            });
+            (
+                info.response_flags().to_vec(),
+                info.upstream_host.clone(),
+                info.upstream_cluster.clone(),
+                info.protocol.clone(),
+                info.bytes_received,
+                llm_tokens,
+                info.llm.time_to_first_byte,
+                info.llm.max_inter_chunk,
+                info.llm.response_chunks,
+            )
+        };
+
+        let log_ctx = LogContext {
+            start_time: ctx.start_time,
+            request_headers: &ctx.request.headers,
+            response_headers: &ctx.response_headers,
+            response_trailers: &self.trailers,
+            protocol: protocol.as_deref(),
+            response_code: Some(ctx.response_code),
+            response_flags: &response_flags,
+            duration: Some(ctx.start_instant.elapsed()),
+            bytes_received,
+            bytes_sent: self.bytes_sent,
+            upstream_host: upstream_host.as_deref(),
+            upstream_cluster: upstream_cluster.as_deref(),
+            downstream_remote_address: Some(&ctx.downstream_remote_address),
+            llm_tokens,
+            llm_ttft,
+            llm_max_stall,
+            llm_response_chunks,
+            request_method: Some(&ctx.request.method),
+            request_path: Some(&ctx.request.path),
+            request_authority: ctx.request.authority.as_deref(),
+            request_scheme: ctx.request.scheme.as_deref(),
+        };
+        for logger in ctx.loggers.iter() {
+            logger.log(&log_ctx);
+        }
+    }
+}
+
+impl Body for LoggingBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // Rust note: same "no manual pin projection needed" shape as
+        // `GuardedBody`/`IdleTimeoutBody` -- every field here is `Unpin`.
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_frame(cx);
+        match &poll {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes_sent += data.len() as u64;
+                }
+                if let Some(trailers) = frame.trailers_ref() {
+                    this.trailers = trailers.clone();
+                }
+            }
+            // A clean end-of-stream needs no flag -- see the `Err` arm below
+            // for the failure case.
+            Poll::Ready(None) => this.finish(),
+            // An error is terminal too, but -- unlike a clean end -- it's a
+            // failure an operator needs visible in the access log: classify
+            // it into a `ResponseFlag` and warn *before* `finish()` snapshots
+            // the flags (see `record_failure`'s doc for why the ordering
+            // matters).
+            Poll::Ready(Some(Err(err))) => {
+                let flag = Self::classify(err);
+                this.record_failure(flag, err);
+                this.finish();
+            }
+            Poll::Pending => {}
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for LoggingBody {
+    fn drop(&mut self) {
+        // Covers the abandoned-stream case: a disconnecting client, or an
+        // outer combinator dropping this body before it ever reached
+        // end-of-stream/error through `poll_frame`. `self.ctx` is still
+        // `Some` here exactly when neither `poll_frame` arm above ran to
+        // completion -- i.e. the stream never cleanly ended and never
+        // errored, it was simply given up on. That's a downstream
+        // termination from the operator's point of view (the far end went
+        // away without us ever seeing why), same as Envoy's DC.
+        if self.ctx.is_some() {
+            self.record_failure(
+                ResponseFlag::DownstreamConnectionTermination,
+                &"response body dropped before end-of-stream",
+            );
+        }
+        // `finish` is idempotent (`ctx.take()`), so this is a no-op if
+        // `poll_frame` already logged.
+        self.finish();
+    }
+}
+
+// `CountingRequestBody` (a streaming-body wrapper that incremented
+// `stream_info.bytes_received` frame-by-frame as the downstream request body
+// was forwarded upstream) lived here until ADR-0004 step 3. It's gone now,
+// not orphaned: `router::RouterHandler` no longer streams the request body at
+// all -- decode is always fully buffered before the terminal runs (see
+// `filter_manager`'s module doc), so `router::apply_forward` sets
+// `bytes_received` directly from the already-known buffer length instead
+// (`dcb.stream_info().bytes_received = body_bytes.len() as u64`). Removed
+// (rather than left `#[allow(dead_code)]`) because clippy's `-D warnings`
+// gate is right that nothing constructs it anymore.
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use http::{HeaderMap, StatusCode};
+    use http_body_util::{BodyExt, Full};
+    use proxy_observability::access_log::parse_format;
+    use proxy_observability::sink::AccessLogWriter;
+
+    use super::*;
+    use crate::handler::local_boxed;
+    use crate::stream_info::LlmTokenUsage;
+
+    /// An in-memory sink for asserting on rendered lines, standing in for
+    /// `FileSink`/`StdoutSink` -- same trait, no I/O.
+    ///
+    /// Rust note: `Mutex<Vec<String>>` behind an `Arc` so the test can hold
+    /// its own clone to inspect after the sink has been moved into an
+    /// `AccessLoggerRuntime` as `Arc<dyn AccessLogWriter>`.
+    #[derive(Default)]
+    struct CaptureSink(Mutex<Vec<String>>);
+
+    impl AccessLogWriter for CaptureSink {
+        fn write_line(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+        fn flush(&self) {}
+        fn reopen(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drives one `LoggingBody` (a response body plus its populated
+    /// `StreamInfo::llm`) to completion and returns the single rendered
+    /// line, proving the WP-33 token/TTFT operators reach the real access
+    /// log through the same path as `bytes_sent` -- not just through
+    /// `access_log::render` in isolation.
+    async fn render_one(llm: crate::stream_info::LlmStats) -> String {
+        render_one_fmt(
+            "%LLM_INPUT_TOKENS% %LLM_CACHED_TOKENS% %LLM_CACHE_CREATION_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_TOTAL_TOKENS% %LLM_TTFT%",
+            llm,
+        )
+        .await
+    }
+
+    /// Same as [`render_one`], but with a caller-supplied format string --
+    /// used by the WP-46 tests below to exercise `%LLM_TPOT%`/
+    /// `%LLM_MAX_STALL%`/`%LLM_RESPONSE_CHUNKS%` end-to-end (`StreamInfo` ->
+    /// `AccessLogContext` -> the rendered line), not from a hand-built
+    /// `LogContext`.
+    async fn render_one_fmt(fmt: &str, llm: crate::stream_info::LlmStats) -> String {
+        let capture = Arc::new(CaptureSink::default());
+        let fmt = parse_format(fmt).unwrap();
+        let logger = AccessLoggerRuntime {
+            sink: capture.clone() as Arc<dyn AccessLogWriter>,
+            format: AccessLogFormat::Text(fmt),
+            filter: None,
+        };
+
+        let mut stream_info = StreamInfo::default();
+        stream_info.llm = llm;
+
+        let ctx = AccessLogContext {
+            loggers: Rc::new(vec![logger]),
+            stream_info: Rc::new(RefCell::new(stream_info)),
+            start_time: SystemTime::now(),
+            start_instant: Instant::now(),
+            request: RequestSnapshot {
+                headers: HeaderMap::new(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                authority: None,
+                scheme: None,
+            },
+            response_headers: HeaderMap::new(),
+            response_code: StatusCode::OK.as_u16(),
+            downstream_remote_address: "127.0.0.1:0".to_string(),
+        };
+
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        let logging_body = LoggingBody::new(body, ctx);
+        // Drain to end-of-stream, which is what triggers `finish()`.
+        let _ = logging_body.collect().await.unwrap();
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1, "expected exactly one rendered line");
+        lines.remove(0)
+    }
+
+    #[tokio::test]
+    async fn llm_stats_reach_the_rendered_access_log_line() {
+        let llm = crate::stream_info::LlmStats {
+            usage: Some(LlmTokenUsage {
+                input_tokens: 11,
+                cached_tokens: 22,
+                cache_creation_tokens: 33,
+                output_tokens: 44,
+            }),
+            time_to_first_byte: Some(std::time::Duration::from_millis(250)),
+            max_inter_chunk: None,
+            response_chunks: 1,
+        };
+        assert_eq!(render_one(llm).await, "11 22 33 44 110 250");
+    }
+
+    #[tokio::test]
+    async fn absent_llm_stats_render_dash_not_zero() {
+        // WP-33: a stream that never populated `StreamInfo::llm` (a non-LLM
+        // route, or a provider response with no usage) must log `-`, not a
+        // confident-looking `0` -- these numbers feed billing.
+        assert_eq!(
+            render_one(crate::stream_info::LlmStats::default()).await,
+            "- - - - - -"
+        );
+    }
+
+    // --- WP-46: TPOT / max-stall / response-chunks plumbing ---------------
+    //
+    // These drive the real `StreamInfo` -> `AccessLogContext` -> `LoggingBody`
+    // path (via `render_one_fmt`), not a hand-built `LogContext` -- the
+    // plumbing from `StreamInfo::llm` through to `LogContext` is exactly the
+    // part WP-46 adds, so it's the part worth exercising end-to-end.
+
+    #[tokio::test]
+    async fn llm_max_stall_and_response_chunks_reach_the_rendered_line() {
+        let llm = crate::stream_info::LlmStats {
+            usage: None,
+            time_to_first_byte: None,
+            max_inter_chunk: Some(std::time::Duration::from_millis(150)),
+            response_chunks: 7,
+        };
+        assert_eq!(
+            render_one_fmt("%LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%", llm).await,
+            "150 7"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_max_stall_renders_dash_when_absent_response_chunks_renders_zero() {
+        let llm = crate::stream_info::LlmStats::default();
+        assert_eq!(
+            render_one_fmt("%LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%", llm).await,
+            "- 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_tpot_reaches_the_rendered_line_via_real_stream_info() {
+        // Not a hand-built `LogContext`: `duration` here is the real elapsed
+        // wall time `LoggingBody` measures from `start_instant` to
+        // end-of-stream, so this only proves the plumbing (usage, ttft, and
+        // duration all reach `%LLM_TPOT%` through the real path) -- the exact
+        // formula is proven precisely, against a scripted `LogContext`, in
+        // `proxy_observability::access_log`'s own WP-46 tests.
+        let llm = crate::stream_info::LlmStats {
+            usage: Some(LlmTokenUsage {
+                input_tokens: 1,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 10,
+            }),
+            time_to_first_byte: Some(std::time::Duration::from_millis(0)),
+            max_inter_chunk: None,
+            response_chunks: 1,
+        };
+        let line = render_one_fmt("%LLM_TPOT%", llm).await;
+        assert_ne!(line, "-", "usage + ttft + duration are all present");
+        // TPOT renders fractional milliseconds (`<ms>.<micros>`) so that a
+        // sub-millisecond-per-token stream does not collapse to 0 -- see
+        // `access_log::tests::llm_tpot_keeps_sub_millisecond_precision_for_fast_streams`
+        // for why. This test only proves the value REACHES the line through the
+        // real StreamInfo path; the exact formula is pinned in `access_log.rs`.
+        let (ms, micros) = line
+            .split_once('.')
+            .unwrap_or_else(|| panic!("expected `<ms>.<micros>`, got {line:?}"));
+        ms.parse::<u128>()
+            .unwrap_or_else(|_| panic!("millisecond part not numeric in {line:?}"));
+        assert_eq!(micros.len(), 3, "micros must be zero-padded to 3 digits");
+        micros
+            .parse::<u128>()
+            .unwrap_or_else(|_| panic!("micros part not numeric in {line:?}"));
+    }
+
+    // --- mid-stream body failure visibility -------------------------------
+    //
+    // The gap these tests close: a response body that errors (or is dropped)
+    // *after* headers have already gone downstream used to leave
+    // `StreamInfo::response_flags` empty -- an SSE stream killed by the
+    // network logged byte-identical to a short-but-successful completion.
+    // See `LoggingBody::classify`/`record_failure`.
+
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::Duration;
+
+    use crate::router::idle::IdleTimeoutBody;
+
+    /// A minimal [`tracing::Subscriber`] that only counts WARN-level events
+    /// -- enough to prove "a mid-stream failure warns" and "a clean end does
+    /// not warn" without pulling in a tracing-capture crate as a new
+    /// dev-dependency.
+    struct WarnCounter(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Builds a bare-bones [`AccessLogContext`] rendering just
+    /// `%RESPONSE_FLAGS% %BYTES_SENT%`, wired to `capture`.
+    fn flags_ctx(capture: &Arc<CaptureSink>) -> AccessLogContext {
+        let fmt = parse_format("%RESPONSE_FLAGS% %BYTES_SENT%").unwrap();
+        let logger = AccessLoggerRuntime {
+            sink: capture.clone() as Arc<dyn AccessLogWriter>,
+            format: AccessLogFormat::Text(fmt),
+            filter: None,
+        };
+        AccessLogContext {
+            loggers: Rc::new(vec![logger]),
+            stream_info: Rc::new(RefCell::new(StreamInfo::default())),
+            start_time: SystemTime::now(),
+            start_instant: Instant::now(),
+            request: RequestSnapshot {
+                headers: HeaderMap::new(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                authority: None,
+                scheme: None,
+            },
+            response_headers: HeaderMap::new(),
+            response_code: StatusCode::OK.as_u16(),
+            downstream_remote_address: "127.0.0.1:0".to_string(),
+        }
+    }
+
+    /// A body that yields one `"hi"` data frame, then a configurable error.
+    struct OneFrameThenError {
+        frame: Option<Bytes>,
+        err: Option<BodyError>,
+    }
+
+    impl hyper::body::Body for OneFrameThenError {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(data) = this.frame.take() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+            if let Some(err) = this.err.take() {
+                return Poll::Ready(Some(Err(err)));
+            }
+            Poll::Ready(None)
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.frame.is_none() && self.err.is_none()
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::default()
+        }
+    }
+
+    /// A body that yields one `"hi"` data frame, then goes `Pending` forever
+    /// -- stands in for an SSE stream whose connection dies without ever
+    /// producing another frame or an explicit error, i.e. the "abandoned"
+    /// case `Drop` (not `poll_frame`) has to catch.
+    struct FrameThenPendingForever {
+        frame: Option<Bytes>,
+    }
+
+    impl hyper::body::Body for FrameThenPendingForever {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(data) = this.frame.take() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+            Poll::Pending
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::default()
+        }
+    }
+
+    /// A body that never produces a frame -- the inner body an idle-timeout
+    /// wrapper sits on top of, so the *only* way `IdleTimeoutBody` ever
+    /// resolves is via its own timer, not via this body doing anything.
+    struct NeverBody;
+
+    impl hyper::body::Body for NeverBody {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_body_error_mid_stream_logs_uc() {
+        let capture = Arc::new(CaptureSink::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard = tracing::subscriber::set_default(WarnCounter(counter.clone()));
+
+        let body = local_boxed(OneFrameThenError {
+            frame: Some(Bytes::from_static(b"hi")),
+            err: Some(BodyError::Upstream(Box::new(io::Error::other(
+                "connection reset by peer",
+            )))),
+        });
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+        // The inner error surfaces through `collect()` too -- draining is
+        // exactly what a real response-forwarding loop does.
+        assert!(logging_body.collect().await.is_err());
+
+        drop(guard);
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1, "expected exactly one rendered line");
+        assert_eq!(lines.remove(0), "UC 2");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a mid-stream failure must warn exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_body_error_mid_stream_logs_dc() {
+        let capture = Arc::new(CaptureSink::default());
+        let body = local_boxed(OneFrameThenError {
+            frame: Some(Bytes::from_static(b"hi")),
+            err: Some(BodyError::Downstream(Box::new(io::Error::other(
+                "client disconnected",
+            )))),
+        });
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+        assert!(logging_body.collect().await.is_err());
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.remove(0), "DC 2");
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_body_error_logs_si_not_uc() {
+        // The regression-prone case: `IdleTimeoutBody` reports its timeout
+        // through the same `BodyError::Upstream` variant a dead TCP
+        // connection would use -- classification has to downcast the boxed
+        // source to `IdleTimeoutError` to tell "went quiet" (SI) apart from
+        // "connection died" (UC).
+        let capture = Arc::new(CaptureSink::default());
+        let inner = local_boxed(NeverBody);
+        let body = local_boxed(IdleTimeoutBody::new(inner, Duration::from_millis(5)));
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(logging_body.collect().await.is_err());
+        })
+        .await
+        .expect("idle timeout must fire well within the guard timeout");
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.remove(0), "SI 0");
+    }
+
+    #[test]
+    fn body_dropped_before_end_of_stream_logs_dc() {
+        let capture = Arc::new(CaptureSink::default());
+        let body = local_boxed(FrameThenPendingForever {
+            frame: Some(Bytes::from_static(b"hi")),
+        });
+        let mut logging_body = LoggingBody::new(body, flags_ctx(&capture));
+
+        let waker = futures::task::noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        // First poll: the one real frame -- not terminal, `ctx` stays `Some`.
+        match Pin::new(&mut logging_body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(_))) => {}
+            other => panic!("expected the frame, got {other:?}"),
+        }
+        // Second poll: the body never resolves again from here on (this is
+        // the "abandoned mid-flight" shape -- a client disconnect, or an
+        // outer combinator giving up, neither of which drives this body to
+        // `None`/`Err` through `poll_frame`).
+        assert!(matches!(
+            Pin::new(&mut logging_body).poll_frame(&mut cx),
+            Poll::Pending
+        ));
+
+        // Dropped without ever reaching end-of-stream or an error.
+        drop(logging_body);
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1, "Drop must still render exactly one line");
+        assert_eq!(
+            lines.remove(0),
+            "DC 2",
+            "bytes_sent must reflect the one frame delivered before the drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_end_of_stream_sets_no_flag_and_does_not_warn() {
+        // The negative control: without this, an implementation that always
+        // set UC (or always warned) regardless of outcome would pass every
+        // test above.
+        let capture = Arc::new(CaptureSink::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard = tracing::subscriber::set_default(WarnCounter(counter.clone()));
+
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        let logging_body = LoggingBody::new(body, flags_ctx(&capture));
+        let collected = logging_body.collect().await.unwrap().to_bytes();
+        assert_eq!(collected.as_ref(), b"hi");
+
+        drop(guard);
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.remove(0), "- 2", "no response flag on a clean end");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "a clean end-of-stream must not warn"
+        );
+    }
+}

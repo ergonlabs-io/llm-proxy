@@ -1,0 +1,1257 @@
+<!doctype html><html><head><!-- frame-runtime --><script>window.__FRAME_PREAMBLE={"capabilities":{"downloads":"downloads.BABDwU1K.js","mcp":"mcp.hoz5jxDa.js","permissions":"permissions.ByA9Fd8x.js","self":"self.D3u1zjZe.js","user":"user.Cp1-RnjB.js"},"transforms":"_transforms.DYk1Ltlh.js","comments":"_comments.DiwQajF_.js","translate":"_translate.C5leZL2A.js"}</script><script>(function(){"use strict";const Ee="modulepreload",we=function(e){return"/"+e},Se={},ee=function(t,n,l){let i=Promise.resolve();function s(f){const c=new Event("vite:preloadError",{cancelable:!0});if(c.payload=f,window.dispatchEvent(c),!c.defaultPrevented)throw f}return i.then(f=>{for(const c of f||[])c.status==="rejected"&&s(c.reason);return t().catch(s)})},te=["light","dark","system"];function ne(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_init;return t!==null&&typeof t=="object"}function W(e){return e!==null&&typeof e=="object"&&e.__frame_size_poke===!0}function re(e){if(e===null||typeof e!="object")return!1;const t=e.__frame_theme;if(t===null||typeof t!="object")return!1;const n=t.theme;return typeof n=="string"&&te.includes(n)}function se(e){try{typeof reportError=="function"?reportError(e):setTimeout(()=>{throw e},0)}catch{}}const oe=Object.freeze(Object.assign(Object.create(null),{user:Object.freeze(Object.assign(Object.create(null),{id:null,isOwner:!1,canEdit:!1,name:null,avatarUrl:null,email:null}))}));function Y(e){if(window===top||e.type==="auxclick"&&e.button!==1)return;const t=e.composedPath?e.composedPath():[e.target];let n=null;for(let f=0;f<t.length;f++){const c=t[f];if(c&&c.matches&&c.matches("a[href],area[href]")){n=c;break}}if(!n&&e.target&&e.target.closest&&(n=e.target.closest("a[href],area[href]")),!n)return;const l=n.getAttribute("href");if(!l)return;let i,s;try{i=new URL(l,document.baseURI),s=new URL(document.baseURI).origin}catch{return}(i.protocol==="http:"||i.protocol==="https:")&&i.origin!==s&&(e.preventDefault(),parent.postMessage({__frame_nav:!0,url:i.href},"*"))}const K={};function D(e){if(window===top)return;const t=Date.now();t-(K[e]||0)<500||(K[e]=t,parent.postMessage({__frame_engaged:!0,kind:e},"*"))}const ie=2e3,x=["wheel","touchstart","touchmove","keydown","pointerdown"];let J=0;function ae(e){e.isTrusted&&(J=Date.now())}function ce(){addEventListener("click",Y,!0),addEventListener("auxclick",Y,!0)}function le(){for(let e=0;e<x.length;e++)addEventListener(x[e],ae,{capture:!0,passive:!0});addEventListener("scroll",e=>{e.isTrusted&&Date.now()-J<ie&&D("scroll")},{capture:!0,passive:!0}),addEventListener("pointermove",e=>{e.isTrusted&&D("pointer")},{capture:!0,passive:!0}),addEventListener("click",e=>{e.isTrusted&&D("click")},{capture:!0,passive:!0})}const I="__frame_scroll",ue=150,fe=310,de=160,me=3e4;function pe(){let e=0,t=!1,n=!1,l=!1,i=0;const s=a=>{try{sessionStorage.setItem(I,JSON.stringify({y:a}))}catch{}},f=()=>{if(t){t=!1;return}n=!0,clearTimeout(e),e=setTimeout(()=>s(scrollY),ue)};try{addEventListener("scroll",f,{passive:!0}),addEventListener("pagehide",()=>{clearTimeout(e),s(scrollY)})}catch{}const c=()=>{let a;try{a=sessionStorage.getItem(I)}catch{return null}if(a===null)return null;let _;try{_=JSON.parse(a)}catch{_=null}const m=_?.y;if(!(typeof m=="number"&&Number.isFinite(m)&&m>=0)){try{sessionStorage.removeItem(I)}catch{}return null}return m};let g=!1;const p=a=>{try{const _=scrollY;scrollTo({top:a,left:0,behavior:"instant"}),i=a,l=!0,s(a);const m=scrollY;m!==_&&(t=!0),m!==a&&!g&&(g=!0,addEventListener("load",()=>{try{if(scrollY===m){const y=c();p(y!==null?y:i)}}catch{}},{once:!0}))}catch{}},o=()=>{try{return!!location.hash}catch{return!0}};let u=!1;const d=()=>{try{if(u||innerWidth>fe||innerHeight>de)return;u=!0;const a=Date.now(),_=()=>{try{removeEventListener("resize",_)}catch{}if(Date.now()-a>me||n||o())return;const m=c();p(m!==null?m:i)};addEventListener("resize",_)}catch{}};let h=!1,b=!1;return{restore(){if(h||(h=!0,o()))return;const a=c();a!==null&&(p(a),d())},promoted(){if(b||(b=!0,o()))return;const a=c();a!==null?(p(a),d()):l&&p(i)}}}function he(e,t,n){const l=[...t.values()].filter(i=>i.targets.some(s=>s.startsWith(e+".")));return{wrap(i,s){const f=`${e}.${i}`,c=l.filter(g=>g.targets.includes(f));return c.length===0?(...g)=>{try{return s(...g)}catch(p){return Promise.reject(p)}}:(...g)=>{let p=g;for(const u of c){const d=u.module.parameters;if(d)try{p=d(p)}catch{return Promise.reject({code:"transform_error",id:u.id,scope:e,message:"parameters transform failed"})}}let o;try{o=s(...p)}catch(u){o=Promise.reject(u)}return o.then(u=>{for(let d=c.length-1;d>=0;d--){const h=c[d],b=h.module.returns;if(b)try{u=b(u)}catch{return n({id:h.id,scope:e,leg:"returns"}),u}}return u},u=>{for(let d=c.length-1;d>=0;d--){const h=c[d],b=h.module.throws;if(b)try{u=b(u)}catch{return n({id:h.id,scope:e,leg:"throws"}),Promise.reject(u)}}return Promise.reject(u)})}}}}function ge(e,t,n,l=()=>{}){const i=new Set(e.changes??[]),s=new Map;for(const f of i){const c=t[f];c&&s.set(f,c)}return{contract:e.contract,changes:i,flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:s,shellOrigin:n.shellOrigin,mount:n.mount,pipe:f=>he(f,s,l)}}(function(){const e=Object.defineProperty,t=globalThis,n=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let l=0;for(let i=0;i<n.length;i++){const s=n[i];try{e(t,s,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[s]}catch{}try{e(t,s,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[s]=="function"&&l++}if(l&&window!==top)try{parent.postMessage({__frame_rtc_lockdown_failed:l},"*")}catch{}})();const _e=1e4,ye=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function G(e){for(const t of ye)if(t.endsWith(":*"))try{const n=new URL(e);if(`${n.protocol}//${n.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}const R=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities}),U=window.__FRAME_PREAMBLE?.transforms,z=window.__FRAME_PREAMBLE?.comments,$=window.__FRAME_PREAMBLE?.translate,T=/^[\w.-]+\.js$/,be=/^[a-z][a-z0-9_-]{0,63}$/;let V=null,j=null;function q(e,t,n){try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:n,writable:!1,configurable:!0,enumerable:!0})}catch{}}}let B=!1;function X(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,B=!0):B&&(delete t.dataset.theme,t.style.colorScheme="",B=!1)}const A=Object.assign(Object.create(null),{mcp:Object.assign(Object.create(null),{watchTool:{handlerArg:3}})}),M=new Map;function Q(e,t){const n=M.get(e);if(!n)return;const l=Object.assign(Object.create(null),t);Object.assign(n.impl,l),n.impl.__settled=()=>Promise.reject({code:"capability_removed",message:`${e}: method not in this runtime`});const i=n.queue;n.queue=[];for(const s of i){const f=l[s.method];if(f)if(A[e]?.[s.method])try{s.resolve(f(...s.args))}catch{k(s,A[e][s.method].handlerArg,{code:"transform_error",message:`${e}.${s.method} rejected its arguments`})}else f(...s.args).then(s.resolve,s.reject);else{const c={code:"capability_removed",message:`${e}.${s.method} is not in this runtime`},g=A[e]?.[s.method];if(g){k(s,g.handlerArg,c);continue}s.reject(c)}}}function ve(e,t){const n=M.get(e);if(!n)return;n.impl.__settled=()=>Promise.reject(t);const l=n.queue;n.queue=[];for(const i of l){const s=A[e]?.[i.method];if(s){k(i,s.handlerArg,t);continue}i.reject(t)}}function N(e,t){const n=oe[e];if(!n){ve(e,t);return}Q(e,Object.fromEntries(Object.entries(n).map(([l,i])=>[l,()=>Promise.resolve(i)])))}function k(e,t,n){if(e.syncState?.dead)return;const l=e.args[t];typeof l=="function"&&queueMicrotask(()=>{if(!e.syncState?.dead)try{l({type:"error",error:n})}catch(i){se(i)}})}const F=Object.getOwnPropertyDescriptor(window,"claude");if(window!==top&&!(F&&F.writable===!1)){ce(),le();let e=null;try{e=pe()}catch{}const t=F?.value??{};q(window,"claude",t);const n=o=>{const u={impl:Object.create(null),queue:[]};M.set(o,u);const d=u.impl,h=new Proxy(d,{get:(b,a)=>{if(typeof a!="string"||a==="then"||a==="toJSON"||a==="valueOf")return;if(a==="toString")return Object.prototype.toString;const _=A[o]?.[a];return _?(...m)=>{if(typeof m[_.handlerArg]!="function")throw new TypeError(`${o}.${a} requires a handler function`);const y=d[a];if(y)return y(...m);if(d.__settled){const v={dead:!1},P={args:[...m],syncState:v};return d.__settled().catch(C=>k(P,_.handlerArg,C)),()=>{v.dead=!0}}let E=null;const S={dead:!1};return u.queue.push({method:a,args:m,resolve:v=>{E=typeof v=="function"?v:null,S.dead&&E?.()},reject:()=>{},syncState:S}),()=>{S.dead=!0,E?.()}}:(...m)=>{const y=d[a]??d.__settled;return y?y(...m):new Promise((E,S)=>{u.queue.push({method:a,args:m,resolve:E,reject:S})})}},set:()=>!1});q(t,o,h)};for(const o of Object.keys(R)){if(t[o]!==void 0){q(t,o,t[o]);continue}n(o)}let l=null,i=null,s=0;const f=o=>{o.source!==parent||!G(o.origin)||ne(o.data)&&(l=o.data.__frame_init,j=o.origin,removeEventListener("message",f),clearTimeout(s),i?.())};addEventListener("message",f),parent.postMessage({__frame_connect:!0},"*");const c=new Promise(o=>{i=o,s=setTimeout(()=>{removeEventListener("message",f),o()},_e)}),g=document.readyState==="loading"?new Promise(o=>document.addEventListener("DOMContentLoaded",()=>o(),{once:!0})):Promise.resolve();g.then(()=>{try{e?.restore()}catch{}});const p=o=>{if(!(o.source!==parent||!G(o.origin))&&W(o.data)){removeEventListener("message",p);try{e?.promoted()}catch{}}};addEventListener("message",p),c.then(async()=>{if(!l||!j){for(const r of M.keys())N(r,{code:"not_granted",message:"frame initialization did not arrive - capability unavailable"});return}X(l.theme);const o=j;let u=!1,d=!1;addEventListener("message",r=>{if(r.source!==parent||r.origin!==o)return;re(r.data)&&X(r.data.__frame_theme.theme);const w=r.data?.__fc_mode;w&&typeof w=="object"&&!u&&z&&T.test(z)&&(u=!0,h(z).then(H=>H.install?.(o,w.on===!0)).catch(()=>{}));const O=r.data?.__ft_cmd;O&&typeof O=="object"&&!d&&$&&T.test($)&&(d=!0,h($).then(H=>H.install?.(o,O)).catch(()=>{}))});const h=r=>ee(()=>import("/_runtime/"+r),void 0),b=Object.keys(l.capabilities??{});for(const r of b)Object.hasOwn(R,r)||be.test(r)&&t[r]===void 0&&(n(r),N(r,{code:"capability_disabled",message:"capability not in this runtime generation"}));const a=b.filter(r=>Object.hasOwn(R,r)).map(r=>[r,R[r]]).filter(r=>typeof r[1]=="string"&&T.test(r[1])),[_,...m]=await Promise.allSettled([U&&T.test(U)?h(U):Promise.resolve({}),...a.map(([,r])=>h(r))]),y=j;V=ge(l,_.status==="fulfilled"&&_.value?.TRANSFORMS||{},{shellOrigin:y,mount:Q},r=>parent.postMessage({__frame_cap_telemetry:r},y));const E=r=>parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:r}},y),S=V;m.forEach((r,w)=>{const O=a[w][0];if(r.status!=="fulfilled"){E(O);return}try{r.value?.install?.(S)}catch{E(O)}});for(const[r,w]of M)if(!(w.queue.length===0&&Object.keys(w.impl).length>0)){if(b.includes(r)){N(r,{code:"capability_disabled",message:"capability not available in this session"});continue}N(r,{code:"not_granted",message:"capability not available in this session"})}await g,parent.postMessage({__frame_ready:!0},j);let v=-1,P=0;const C=()=>{P=0;const r=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);r!==v&&(v=r,parent.postMessage({__frame_size:!0,h:r},y))},L=()=>{P||(P=setTimeout(C,200))},Z=new ResizeObserver(L);Z.observe(document.documentElement),document.body&&Z.observe(document.body),document.addEventListener("load",L,!0),document.fonts?.ready.then(L,()=>{}),addEventListener("beforeprint",()=>{v=-1,C()}),L(),addEventListener("message",r=>{if(!(r.source!==parent||r.origin!==y)&&W(r.data)){try{e?.promoted()}catch{}v=-1,L()}})})}})();</script><!-- /frame-runtime --><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>llm-proxy · build board</title>
+<style>
+  :root {
+    --bg: #f2f5f7; --surface: #ffffff; --surface2: #e9eef2;
+    --ink: #1b2430; --muted: #5b6b7a; --line: #d8e0e7;
+    --accent: #0e7490; --accent-ink: #ffffff;
+    --ok: #2e7d4f; --ready: #b45309; --started: #0e7490; --blocked: #93a0ac;
+    --ok-bg: #e3f0e8; --ready-bg: #f6ead9; --started-bg: #dcedf2; --blocked-bg: #eceff2;
+    --lane-a: #6d5bb8; --lane-b: #b0562f; --lane-c: #2e6bb0; --lane-d: #3e7a4e;
+    --lane-e: #a34b7e; --lane-f: #2c7a73; --lane-g: #5b6b7a; --lane-x: #8a6d1f; --lane-h: #b84a4a;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --shadow: 0 1px 2px rgba(20, 30, 40, .06), 0 2px 8px rgba(20, 30, 40, .05);
+    --p0: #b02a37; --p1: #0e7490; --p2: #5b6b7a;
+    --p0-bg: #fbe6e8; --p1-bg: #dcedf2; --p2-bg: #eceff2;
+    --ms-now: #0e7490; --ms-now-bg: #dcedf2; --ms-next: #5b6b7a; --ms-next-bg: #eceff2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10161d; --surface: #1a222b; --surface2: #141b23;
+      --ink: #e4eaf0; --muted: #93a1af; --line: #2a3542;
+      --accent: #2fa8c4; --accent-ink: #08252c;
+      --ok: #57b380; --ready: #d9924a; --started: #2fa8c4; --blocked: #6d7a86;
+      --ok-bg: #1b2f24; --ready-bg: #33271a; --started-bg: #16303a; --blocked-bg: #212a33;
+      --lane-a: #9d8ad9; --lane-b: #d18660; --lane-c: #6d9bd4; --lane-d: #74ac82;
+      --lane-e: #c97fa8; --lane-f: #63aaa3; --lane-g: #8fa0af; --lane-x: #c0a457; --lane-h: #d47f7f;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .35);
+      --p0: #ef7a86; --p1: #2fa8c4; --p2: #8fa0af;
+      --p0-bg: #3a1f24; --p1-bg: #16303a; --p2-bg: #212a33;
+      --ms-now: #2fa8c4; --ms-now-bg: #16303a; --ms-next: #8fa0af; --ms-next-bg: #212a33;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f2f5f7; --surface: #ffffff; --surface2: #e9eef2;
+    --ink: #1b2430; --muted: #5b6b7a; --line: #d8e0e7;
+    --accent: #0e7490; --accent-ink: #ffffff;
+    --ok: #2e7d4f; --ready: #b45309; --started: #0e7490; --blocked: #93a0ac;
+    --ok-bg: #e3f0e8; --ready-bg: #f6ead9; --started-bg: #dcedf2; --blocked-bg: #eceff2;
+    --lane-a: #6d5bb8; --lane-b: #b0562f; --lane-c: #2e6bb0; --lane-d: #3e7a4e;
+    --lane-e: #a34b7e; --lane-f: #2c7a73; --lane-g: #5b6b7a; --lane-x: #8a6d1f; --lane-h: #b84a4a;
+    --shadow: 0 1px 2px rgba(20, 30, 40, .06), 0 2px 8px rgba(20, 30, 40, .05);
+    --p0: #b02a37; --p1: #0e7490; --p2: #5b6b7a;
+    --p0-bg: #fbe6e8; --p1-bg: #dcedf2; --p2-bg: #eceff2;
+    --ms-now: #0e7490; --ms-now-bg: #dcedf2; --ms-next: #5b6b7a; --ms-next-bg: #eceff2;
+  }
+  :root[data-theme="dark"] {
+    --bg: #10161d; --surface: #1a222b; --surface2: #141b23;
+    --ink: #e4eaf0; --muted: #93a1af; --line: #2a3542;
+    --accent: #2fa8c4; --accent-ink: #08252c;
+    --ok: #57b380; --ready: #d9924a; --started: #2fa8c4; --blocked: #6d7a86;
+    --ok-bg: #1b2f24; --ready-bg: #33271a; --started-bg: #16303a; --blocked-bg: #212a33;
+    --lane-a: #9d8ad9; --lane-b: #d18660; --lane-c: #6d9bd4; --lane-d: #74ac82;
+    --lane-e: #c97fa8; --lane-f: #63aaa3; --lane-g: #8fa0af; --lane-x: #c0a457; --lane-h: #d47f7f;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .35);
+    --p0: #ef7a86; --p1: #2fa8c4; --p2: #8fa0af;
+    --p0-bg: #3a1f24; --p1-bg: #16303a; --p2-bg: #212a33;
+    --ms-now: #2fa8c4; --ms-now-bg: #16303a; --ms-next: #8fa0af; --ms-next-bg: #212a33;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); font-size: 14px; line-height: 1.45;
+  }
+
+  header {
+    position: sticky; top: 0; z-index: 5;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+    padding: 18px 22px 14px;
+    /* A sticky header with no cap can grow until it fills the viewport and
+       pushes the board itself off-screen -- which is exactly what happened
+       once the "now" panel accumulated a few batches of prose. The board is
+       the page; the header is context. Cap it and let the context scroll. */
+    max-height: 62vh; overflow-y: auto;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 4px;
+  }
+  h1 {
+    font-family: var(--mono); font-size: 21px; font-weight: 600;
+    margin: 0 0 12px; letter-spacing: -.01em; text-wrap: balance;
+  }
+  h1 .dim { color: var(--muted); font-weight: 400; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .chips .sep { width: 1px; height: 18px; background: var(--line); margin: 0 6px; }
+  .chip {
+    font-family: var(--mono); font-size: 12px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 999px;
+    background: var(--surface); color: var(--ink); padding: 3px 11px;
+  }
+  .chip:hover { border-color: var(--accent); }
+  .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .chip .n { opacity: .65; margin-left: 4px; font-variant-numeric: tabular-nums; }
+  .hint { font-size: 12px; color: var(--muted); margin: 10px 0 0; }
+
+  .now {
+    margin: 12px 0 0; padding: 9px 12px; border-radius: 6px;
+    background: var(--surface); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    font-size: 12.5px; line-height: 1.5; max-width: 82ch;
+  }
+  .now b { font-family: var(--mono); font-size: 12px; }
+  .now .sub { color: var(--muted); }
+  .now code { font-family: var(--mono); font-size: 11.5px; background: var(--surface2); padding: 0 4px; border-radius: 3px; }
+  .gate {
+    display: block; margin: 8px 0 0; padding: 7px 10px; border-radius: 5px;
+    background: var(--surface2); border-left: 2px solid var(--ready);
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  }
+
+  .board-wrap { overflow-x: auto; padding: 18px 22px 30px; }
+  .board { display: flex; gap: 14px; align-items: flex-start; min-width: max-content; }
+
+  .lane { width: 256px; flex: 0 0 auto; }
+  .lane-head {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 2px 4px 8px; border-bottom: 2px solid var(--line);
+    margin-bottom: 10px;
+  }
+  .lane-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; align-self: center; }
+  .lane-name { font-family: var(--mono); font-size: 12.5px; font-weight: 700; letter-spacing: .02em; }
+  .lane-sub { font-size: 11px; color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+  .lane-cards { display: flex; flex-direction: column; gap: 8px; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-left-width: 3px;
+    border-radius: 6px; padding: 9px 11px 9px 10px; box-shadow: var(--shadow);
+    transition: opacity .15s ease;
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  @media (prefers-reduced-motion: reduce) { .card { transition: none; } }
+  .card.dim { opacity: .22; }
+  .card.done   { border-left-color: var(--ok); }
+  .card.ready  { border-left-color: var(--ready); }
+  .card.started{ border-left-color: var(--started); }
+  .card.blocked{ border-left-color: var(--blocked); }
+
+  .card-top { display: flex; align-items: center; gap: 6px; }
+  .card-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .wp { font-family: var(--mono); font-size: 12px; font-weight: 700; }
+  .badge {
+    font-family: var(--mono); font-size: 10px; padding: 1px 6px;
+    border-radius: 4px; letter-spacing: .03em;
+  }
+  .badge.status-done    { background: var(--ok-bg); color: var(--ok); }
+  .badge.status-ready   { background: var(--ready-bg); color: var(--ready); }
+  .badge.status-started { background: var(--started-bg); color: var(--started); }
+  .badge.status-blocked { background: var(--blocked-bg); color: var(--blocked); }
+  .badge.gate { background: var(--surface2); color: var(--muted); }
+  .badge.ms { background: var(--ms-next-bg); color: var(--ms-next); font-weight: 700; }
+  .badge.ms.ms-now { background: var(--ms-now-bg); color: var(--ms-now); border: 1px solid var(--ms-now); }
+  .badge.prio { margin-left: auto; font-weight: 700; border: 1px solid transparent; }
+  .badge.prio-P0 { background: var(--p0-bg); color: var(--p0); border-color: var(--p0); }
+  .badge.prio-P1 { background: var(--p1-bg); color: var(--p1); }
+  .badge.prio-P2 { background: var(--p2-bg); color: var(--p2); }
+  .size { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+
+  .card-title { font-size: 13px; font-weight: 600; line-height: 1.3; text-wrap: balance; }
+  .card-meta {
+    font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+    display: flex; flex-direction: column; gap: 2px;
+    overflow-wrap: anywhere;
+  }
+  .flag { color: var(--ready); font-size: 11px; font-weight: 600; }
+</style>
+
+<header>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 968 tests green, 21 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
+  <div class="chips" id="filters">
+    <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
+    <button class="chip" data-status="ready">ready now<span class="n" id="n-ready"></span></button>
+    <button class="chip" data-status="started">started<span class="n" id="n-started"></span></button>
+    <button class="chip" data-status="blocked">blocked<span class="n" id="n-blocked"></span></button>
+    <span class="sep"></span>
+    <button class="chip" data-ms="v0.0.1">v0.0.1 · first light<span class="n" id="n-v001"></span></button>
+    <button class="chip" data-ms="v0.1.0">v0.1.0 · LLM gateway<span class="n" id="n-v010"></span></button>
+    <button class="chip" data-ms="v0.2.0">v0.2.0 · prod<span class="n" id="n-v020"></span></button>
+    <button class="chip" data-ms="v0.3.0">v0.3.0 · xDS<span class="n" id="n-v030"></span></button>
+    <button class="chip" data-ms="v0.4.0">v0.4.0 · parity<span class="n" id="n-v040"></span></button>
+    <button class="chip" data-ms="v1.0.0">v1.0.0<span class="n" id="n-v100"></span></button>
+    <span class="sep"></span>
+    <button class="chip" data-prio="P0">P0 · LLM product<span class="n" id="n-P0"></span></button>
+    <button class="chip" data-prio="P1">P1 · serving<span class="n" id="n-P1"></span></button>
+    <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
+  </div>
+  <p class="now">
+    <b>Now — v0.1.0 "LLM gateway": be the gateway a team picks <i>because</i> it understands
+    LLM traffic.</b>
+    <b>v0.0.1 shipped 2026-08-01</b> and is tagged: the live smoke test ran against the real
+    OpenAI and Anthropic endpoints and passed all four cases (both providers, streaming and not)
+    on the first attempt. One request, all the way through, for real — that gate is closed.
+    <span class="gate"><b>SHIP GATE —</b> per-request token counts (input / cache-read /
+    cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate
+    limit is enforced; and the proxy fails over from one provider to another mid-request without
+    the client seeing an error. <b>Two of three clauses are now VERIFIED end to end, not just
+    code-complete (2026-08-08).</b> Token counts + TTFT/TPOT: QA-1 backs the token-count half with
+    real black-box evidence since 2026-08-01, and new QA-10 now does the same for TTFT/TPOT —
+    against a mock with known pacing it observed ttft=402ms/tpot=122.129ms/max_stall=152ms in the
+    actual access log, and in writing that test found a real bug (the dialect never emitted TPOT
+    at all despite WP-46 building it, now fixed) plus a live off-by-one in
+    <code>%LLM_RESPONSE_CHUNKS%</code>, also fixed. Provider failover (WP-35): a new
+    <code>testing/diffrig</code> drill drives the real binary against a real dialect config and a
+    mock forced to 429 — exact attempt accounting, the credential-isolation negative (standby's key
+    only), and the standby's own Host header, all mutation-tested. <b>Token-based rate limiting is
+    the one clause left unverified</b> — WP-34's filter enforces 429s from the dialect's
+    <code>limits</code> key and is unit-mutation-tested, but nothing drives it end to end against
+    the real binary yet; the owner explicitly deferred that this session, so this release stays
+    <code>current</code> on that one clause alone. WP-35's scope closed narrower than its title:
+    same-dialect fallback only — cross-dialect (openai → anthropic) is a deliberate hard error,
+    split into new WP-52 rather than left as a silent gap.</span>
+    <span class="sub"><b>The honest read:</b> v0.0.1's clean first run is weaker evidence than a
+    run that found something — four requests exercise a narrow path, and nothing there tested
+    load, concurrency, provider error shapes, or long streams. Coverage stays three-tiered
+    (our mocks, a local Ollama, real providers) for exactly that reason.
+    Second standing gap: <b>"performant" is an untested claim</b> (no capacity sweep published; the
+    v0.2.0 gate).
+    <b>WP-41, the black-box QA suite, found four real bugs on day one, and a fifth on 2026-08-08</b>
+    — no dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode
+    too), no response flag on a mid-stream failure, and (via new QA-10) <code>%LLM_RESPONSE_CHUNKS%</code>
+    over-counting by one on every response with a body. All five fixed. One had been
+    <i>described as intended</i> in its own doc comment — the class of defect an inside view cannot see.
+    <b>Competitive review (Vercel AI Gateway)</b> confirmed the plan and added WP-42/43/44:
+    spend controls (a token/min cap is a throttle, not a budget), caching, cost-aware routing.
+    They are managed-only, so self-hosting, Envoy config and xDS stay ours.
+    <b>WP-45 (shipped 2026-08-05):</b> a real upstream showed OpenAI-dialect streaming emits no usage
+    block without <code>stream_options.include_usage</code> — the request-body rewrite pipeline that
+    forces it also absorbed WP-35's model routing, which now reads the model from the request
+    <i>body</i> rather than a client-supplied header. That closed a privilege-escalation surface:
+    a client could otherwise pick its own provider, credential, and budget.
+    <b>Test-suite note (2026-08-08):</b> full workspace runs took 656–863s; they now take
+    <b>50.8s</b> (968 green, zero slow — the 50.8s figure predates the +3 failover-drill tests
+    and has not been re-measured since). Two causes, found in that order. 8 <code>diffrig</code>
+    tests were intermittently <i>hanging</i> rather than merely slow — mitigated to 2 by a
+    multi-threaded runtime plus a <code>terminate-after</code> gate that turns a hang into a
+    named failure; not fixed, those tests still carry no request timeouts. The larger cause was
+    <code>codegen-units = 256</code>: macOS keeps DWARF in the object files, so
+    <code>target/debug/deps</code> held <b>1,013,436 <code>.o</code> files</b> (46 GB). Setting
+    <code>codegen-units = 16</code> took it to 2,834 files / 2.9 GB and cold-build CPU use from
+    0.31 to 4.7 of 8 cores. The measured "memory pressure" was the symptom, not the cause — which
+    is why throttling jobs had measured 42% <i>worse</i>.</span>
+  </p>
+  <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
+</header>
+
+<div class="board-wrap">
+  <div class="board" id="board"></div>
+</div>
+
+<script>
+  const lanes = [
+    { id: "A", name: "A · Foundations", color: "var(--lane-a)" },
+    { id: "B", name: "B · Runtime / L4", color: "var(--lane-b)" },
+    { id: "C", name: "C · HTTP", color: "var(--lane-c)" },
+    { id: "D", name: "D · Cluster", color: "var(--lane-d)" },
+    { id: "E", name: "E · xDS", color: "var(--lane-e)" },
+    { id: "F", name: "F · Observability", color: "var(--lane-f)" },
+    { id: "G", name: "G · Test infra", color: "var(--lane-g)" },
+    { id: "X", name: "Filters", color: "var(--lane-x)" },
+    { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
+  ];
+
+  const CURRENT_MS = "v0.1.0";
+
+  // status: done | ready | started | blocked ; ms = the release the WP closes in
+  const wps = [
+ {
+  "id": 1,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "A",
+  "size": "S",
+  "gate": "G1",
+  "status": "done",
+  "title": "Repo scaffolding & CI",
+  "meta": [
+   "workspace · toolchain · ADRs"
+  ]
+ },
+ {
+  "id": 2,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "A",
+  "size": "M",
+  "gate": "G1",
+  "status": "done",
+  "title": "Envoy protos + descriptor pool",
+  "meta": [
+   "proxy-api",
+   "pinned v1.38.0 · 5 tests",
+   "+ access-log protos vendored (file / stdout / stderr)"
+  ]
+ },
+ {
+  "id": 3,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "A",
+  "size": "M",
+  "gate": "G1",
+  "status": "done",
+  "title": "Bootstrap loader (YAML→proto)",
+  "meta": [
+   "proxy-config",
+   "field-path errors · --mode validate · 9 tests"
+  ]
+ },
+ {
+  "id": 4,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "A",
+  "size": "M",
+  "gate": "G1",
+  "status": "done",
+  "title": "Validation engine (PGV subset)",
+  "meta": [
+   "proxy-config",
+   "rules from descriptor pool · 14 tests"
+  ]
+ },
+ {
+  "id": 5,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "A",
+  "size": "L",
+  "gate": "G1",
+  "status": "done",
+  "title": "Internal IR + proto→IR conversion",
+  "meta": [
+   "proxy-config",
+   "S1 domain index · surface check · strict mode",
+   "+ upstream_protocol · retry_back_off · access_logs",
+   "✓ typed_per_filter_config now lowered (route / vhost / route-config), incl. the FilterConfig wrapper"
+  ],
+  "note": "▲ FIXED ground rule #1: typed_per_filter_config was silently dropped — the config loaded clean and the override vanished"
+ },
+ {
+  "id": 38,
+  "prio": "P0",
+  "ms": "v0.0.1",
+  "lane": "A",
+  "size": "M",
+  "gate": "G5",
+  "status": "done",
+  "title": "Simple config dialect (lowering)",
+  "meta": [
+   "proxy-simple-config",
+   "--config · --mode translate · providers → clusters + TLS + auth headers",
+   "✓ Anthropic default anthropic-version · api_key_file read+trimmed · x-api-key vs Bearer",
+   "✓ SECURITY: always emits a validation context + a DNS-exact SAN matcher per provider host",
+   "✓ observability.access_logs now REACHES the generated config (stdout/stderr/file · text/json · LLM token + TTFT operators in both)"
+  ],
+  "note": "⚠ FIXED (found by QA-1): the dialect emitted NO access logs at all — lower.rs carried only a stale 'not emitted yet (WP-24)' warning long after WP-24 landed, so a proxy configured the way users actually configure it logged nothing"
+ },
+ {
+  "id": 39,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "A",
+  "size": "S",
+  "gate": "G2",
+  "status": "done",
+  "title": "IR readership guard",
+  "meta": [
+   "proxy-config/tests/ir_readership.rs",
+   "scans ir.rs pub fields, fails when one has no runtime reader",
+   "a 2nd test keeps the allowlist honest, so an entry that gains a reader fails rather than lingering",
+   "each allowlisted field is tagged with the WP that owns it"
+  ],
+  "note": "▲ mutation-verified: passing &[] for request_headers_to_add makes the guard fail, naming that exact field"
+ },
+ {
+  "id": 40,
+  "prio": "P2",
+  "ms": "v0.4.0",
+  "lane": "A",
+  "size": "M",
+  "gate": "G4",
+  "status": "ready",
+  "title": "Dependency-tree review & cleanup",
+  "meta": [
+   "workspace-wide",
+   "owner-requested",
+   "proxy-config → proxy-observability is the edge that constrains log/stat-shaped types",
+   "a real cycle was hit once (unused proxy-core dep in proxy-cluster, masking a transitive rand)",
+   "deliverable: documented graph in docs/ · no unused deps in CI · no duplicated types across a boundary"
+  ]
+ },
+ {
+  "id": 6,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "B",
+  "size": "M",
+  "gate": "G1",
+  "status": "started",
+  "title": "Runtimes + config propagation + drain",
+  "meta": [
+   "proxy-core · crates/proxy",
+   "ADR-0003 ✓ !Send + LocalSet",
+   "chunks A+B+C ✓ pool · drain · serve + SIGTERM + CLI",
+   "✓ shutdown handlers now install BEFORE any worker spawns",
+   "✓ both serve-mode CLI tests now gate on a real TCP connect, never a log line — the log-line helper was deleted outright so the bug can't be reintroduced",
+   "open: swap-under-load gate (needs WP-26 rig) — this is what holds Lane B open"
+  ],
+  "note": "⚠ FIXED: the startup log said 'waiting for SIGTERM/SIGINT' while the handler was installed much later — a signal in that window killed the process outright, no drain, connections dropped. Surfaced as a flaky drain test"
+ },
+ {
+  "id": 7,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "B",
+  "size": "M",
+  "gate": "G1",
+  "status": "done",
+  "title": "Listener mgr + filter-chain match",
+  "meta": [
+   "proxy-config · proxy-core",
+   "IR criteria · 9-step matcher · SO_REUSEPORT bind/accept/RST · initial-bind fatal",
+   "terminal dispatch serves tcp_proxy AND http_connection_manager"
+  ]
+ },
+ {
+  "id": 8,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "B",
+  "size": "L",
+  "gate": "G1",
+  "status": "done",
+  "title": "Transport sockets (TLS) + listener filters",
+  "meta": [
+   "proxy-config · proxy-core · rustls (ring)",
+   "full Downstream/Upstream TLS IR+lowering · factories + dual-cert hot-reload + SAN/mTLS/expired verifiers",
+   "tls_inspector SNI/ALPN peek + bind-time termination (bad cert = fatal startup)",
+   "✓ UPSTREAM TLS runtime — client handshake lives in the WP-15 pool seam"
+  ]
+ },
+ {
+  "id": 9,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "B",
+  "size": "M",
+  "gate": "G1",
+  "status": "done",
+  "title": "Network filter framework + tcp_proxy",
+  "meta": [
+   "proxy-core",
+   "tcp_proxy runtime ✓ — first real end-to-end L4 proxy",
+   "bidi pump w/ half-close FIN + idle timeout + concurrent (no-deadlock) directions",
+   "cluster resolve → connect (timeout/retries) · serves plaintext + TLS-terminated"
+  ]
+ },
+ {
+  "id": 10,
+  "prio": "P1",
+  "ms": "v0.4.0",
+  "lane": "C",
+  "size": "L",
+  "gate": "G2",
+  "status": "started",
+  "title": "h1/h2 codecs + upgrades (S10)",
+  "meta": [
+   "proxy-http · proxy-core",
+   "downstream h1 codec ✓ · WIRED: HCM chain → codec over the real socket (TLS + plaintext)",
+   "✓ upstream h1 (send_upstream_http1) + ✓ upstream h2 (send_upstream_http2), dispatch by config",
+   "v0.0.1 needs only h1/h2 upstream — those are done",
+   "open (v0.4.0): downstream h2 · upgrades (S10)",
+   "▲ downstream h2 is a FOUNDATION gap, not a v0.4.0 nicety — every client must speak h1 to us today. Verified 2026-08-01: there is no h2 server path at all. Anything fronting this with a modern LB, or any multiplexing client, cannot connect over h2",
+   "✓ DOWNSTREAM h2 DONE 2026-08-02 (b0ba6a6) — serve_http2 shares StreamHandler with h1, LocalExec per ADR-0003, ALPN-negotiated dispatch per connection, 3-stream interleaved concurrency test. h2c + h1 upgrades (S10) remain out of scope",
+   "⚠ FIXED, was a LIVE BUG: downstream alpn_protocols accepted `h2`, rustls negotiated it, and the listener then served HTTP/1.1 on that socket — a config field honored at the TLS layer and ignored at the codec"
+  ]
+ },
+ {
+  "id": 11,
+  "prio": "P1",
+  "ms": "v0.4.0",
+  "lane": "C",
+  "size": "L",
+  "gate": "G2",
+  "status": "started",
+  "title": "HTTP filter manager (S2 machine)",
+  "meta": [
+   "proxy-http",
+   "chunk 1 ✓ order/hold/data/buffers/413-500 · chunk 3 ✓ streaming encode + S2.5 local replies + reverse teardown",
+   "chunk 2 ✓ S2 conformance suite — FOUND + FIXED a real S2.5 bug (local reply stops decode iteration)",
+   "✓ S2.7 injection — the unimplemented!() panic under Lane H is gone",
+   "✓ S2.8 ROUTE CACHE (ADR-0004 step 1) — the manager owns resolution; clear_route_cache genuinely invalidates. This unblocked WP-35",
+   "✓ PER-ROUTE FILTER CONFIG (ADR-0004 step 4) — resolved at HCM build time, exposed via DecoderCallbacks::per_route_config(); route > vhost > route-config, through the S2.8 cache",
+   "open (v0.4.0): StopAll resume · 1xx · and WATERMARKS, which today are handled as ALIASES for the buffering variants — a filter asking for watermarks gets bounded buffering that 413s on overflow, NOT a backpressure signal. So there is no flow control, only a cap",
+   "▲ this is a SERVING foundation, not a feature: fast upstream + slow client + long SSE stream is the exact LLM traffic shape, and it is the one the cap-not-backpressure gap mishandles"
+  ],
+  "note": "▲ mutation-verified: shifting decode delivery to from_idx caused an INFINITE LOOP (the injector re-entering itself) — stronger proof of the re-entrance guard than the test aimed for"
+ },
+ {
+  "id": 12,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "C",
+  "size": "M",
+  "gate": "G2",
+  "status": "done",
+  "title": "Route table + matching (S1)",
+  "meta": [
+   "proxy-http",
+   "match_route/select_cluster over the real RouteTable",
+   "domain precedence · first-match-wins · prefix-includes-query vs path/regex stripped · weighted stable pick",
+   "36 tests built through real YAML lowering"
+  ]
+ },
+ {
+  "id": 13,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "C",
+  "size": "L",
+  "gate": "G2",
+  "status": "started",
+  "title": "Router filter + upstream lifecycle (S4/S9)",
+  "meta": [
+   "proxy-http · proxy-core",
+   "proxies real requests end-to-end (match → cluster → host → CB → pool → TLS → codec → encode chain)",
+   "✓ ADR-0004 step 3 — the router is now a terminal HttpFilter in the chain, not a handler behind a seam",
+   "✓ S9 request transforms COMPLETE — XFF/x-request-id/:authority/rewrites + request_headers_to_add (the P0 below)",
+   "✓ S4 route timeout + idle_timeout + per-try — all disarm on headers, LLM-safe",
+   "open (v0.0.1): lifecycle differential suite",
+   "open (v0.4.0): maintenance mode · x-envoy-attempt-count · upgrade routing (S10.1) · redirects (501)"
+  ],
+  "note": "▲ FIXED P0: request_headers_to_add was lowered by both front-ends and read by NOTHING — every request reached its provider with no credentials"
+ },
+ {
+  "id": 14,
+  "prio": "P1",
+  "ms": "v0.1.0",
+  "lane": "C",
+  "size": "M",
+  "gate": "G2",
+  "status": "started",
+  "title": "Retry & hedging engine (S3)",
+  "meta": [
+   "proxy-http · retry.rs + router.rs",
+   "✓ ENGINE BUILT AND WIRED — per-attempt CB permit + host re-pick, outcome classification, S3.3 fully-jittered backoff",
+   "✓ S3.4 body replay buffered ONLY when a policy exists (retry-free routes keep the zero-copy path)",
+   "✓ S4.2 per-try timeout armed fresh per attempt",
+   "✓ 2 knobs the router can't honor are REJECTED at config load, not silently dropped",
+   "open: hedging (half this WP's title) · S5.2 retry budgets · previously-attempted-host predicate"
+  ],
+  "note": "WP-35 provider fallback shipped on this engine AS BUILT — 429-as-retriable and never-retry-after-first-byte needed no new mechanism here, both were already true"
+ },
+ {
+  "id": 15,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "C",
+  "size": "L",
+  "gate": "G2",
+  "status": "started",
+  "title": "Conn pools + circuit breakers (S5)",
+  "meta": [
+   "proxy-cluster",
+   "✓ UpstreamTransportSocket seam: TCP dial → rustls client handshake (SNI + ALPN from upstream_protocol)",
+   "✓ transport_socket with no registered builder = FATAL startup, never a plaintext downgrade",
+   "✓ S5 max_requests CB via GuardedBody — UO + x-envoy-overloaded fire",
+   "open (v0.0.1): keep-alive reuse — still connect-per-stream, which a real provider will notice"
+  ],
+  "note": "▲ pooling is what caps the WP-30 rig at ~8k streams (2 ports/stream) — these two compound"
+ },
+ {
+  "id": 16,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "D",
+  "size": "M",
+  "gate": "G3",
+  "status": "done",
+  "title": "Cluster manager + discovery types",
+  "meta": [
+   "proxy-cluster",
+   "HostSet Arc snapshots + diffing · HostResolver seam (tokio + fake) · STATIC/STRICT_DNS/LOGICAL_DNS",
+   "ClusterManager over ArcSwap · warming = initial_fetch_timeout 'proceed empty'",
+   "+ Host.hostname carries the DNS name for SNI/verification · EDS stub only (→ 21)"
+  ]
+ },
+ {
+  "id": 17,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "D",
+  "size": "M",
+  "gate": "G3",
+  "status": "done",
+  "title": "Load balancers (S7)",
+  "meta": [
+   "proxy-cluster",
+   "RoundRobin (nginx SWRR) · Random · LeastRequest (P2C) · HostPicker (spillover + 50% panic + host_override)",
+   "ring-hash/Maglev REJECTED at config time (need Envoy differential hashing harness) · 38 tests"
+  ]
+ },
+ {
+  "id": 18,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "D",
+  "size": "M",
+  "gate": "G4",
+  "status": "started",
+  "title": "Active health checking",
+  "meta": [
+   "proxy-cluster/src/health_check.rs",
+   "✓ HTTP + TCP checkers, immediate first check, timeout-bounded attempts",
+   "consecutive-count thresholds (NOT ratios) — any opposite result resets the run",
+   "gRPC checks + no_traffic_interval are documented gaps, not stubs · 64 tests",
+   "open: ClusterConfig has no health_checks field — NOT REACHABLE FROM CONFIG yet"
+  ],
+  "note": "⚠ FIXED ON REVIEW: transitions used ArcSwap load/store — one task per host = lost updates, and since the tracker only reports the EDGE a clobbered flip is never re-published (host stays wrongly Healthy forever). Now rcu; reverting loses 44 of 64"
+ },
+ {
+  "id": 19,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "D",
+  "size": "M",
+  "gate": "G4",
+  "status": "started",
+  "title": "Outlier detection (S6)",
+  "meta": [
+   "proxy-cluster/src/outlier.rs",
+   "✓ consecutive-5xx + consecutive-gateway-failure detectors, ejection w/ backoff + un-eject timer",
+   "✓ enforcement percentages · event log w/ enforced/unenforced attribution · 78 tests",
+   "open: IR wiring — OutlierDetectionConfig is not reachable from config yet"
+  ],
+  "note": "⚠ FIXED: a gateway error is a SUBSET of 5xx in Envoy (putHttpResponseCode nests the checks), so it bumps both counters — 5 consecutive 503s DO eject via the 5xx detector. We had built independent counters"
+ },
+ {
+  "id": 20,
+  "prio": "P2",
+  "ms": "v0.3.0",
+  "lane": "E",
+  "size": "L",
+  "gate": "G3",
+  "status": "ready",
+  "title": "ADS client, SotW + ACK/NACK (S8)",
+  "meta": [
+   "proxy-xds",
+   "needs 03–05 ✓ · WP-28 harness ready",
+   "deferred: static config carries v0.0.1 → v0.2.0"
+  ]
+ },
+ {
+  "id": 21,
+  "prio": "P2",
+  "ms": "v0.3.0",
+  "lane": "E",
+  "size": "M",
+  "gate": "G3",
+  "status": "blocked",
+  "title": "Warming, ordering, make-before-break",
+  "meta": [
+   "proxy-xds",
+   "needs 20",
+   "owns the missing IR Eds discovery variant"
+  ]
+ },
+ {
+  "id": 22,
+  "prio": "P2",
+  "ms": "v0.3.0",
+  "lane": "E",
+  "size": "M",
+  "gate": "G3",
+  "status": "blocked",
+  "title": "SDS + delta xDS + file transport",
+  "meta": [
+   "proxy-xds",
+   "needs 21 · SDS drives WP-08's cert hot-reload seam, which is built and waiting"
+  ]
+ },
+ {
+  "id": 23,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "F",
+  "size": "M",
+  "gate": "G2",
+  "status": "blocked",
+  "title": "Stats registry (Envoy names)",
+  "meta": [
+   "proxy-observability",
+   "needs 06",
+   "owns the two inert stat_prefix fields flagged by the WP-39 guard",
+   "OWNER 2026-08-03: the internal model is OTel now — instruments + attribute sets + semconv names — and Envoy's flat dotted /stats names become a RENDERING of the registry, not its own shape (attributes are strictly more expressive; recovering them from a flat mangled name is the harder direction). See WP-51, which this decision was made for"
+  ]
+ },
+ {
+  "id": 24,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "F",
+  "size": "M",
+  "gate": "G2",
+  "status": "done",
+  "title": "Access logs + response flags",
+  "meta": [
+   "proxy-observability · proxy-http/src/router/logging.rs",
+   "✓ IR + lowering + format engine + sinks (logrotate reopen, dedup by canonical path)",
+   "✓ router records response flags; listener builds per-HCM loggers (sink open failure = fatal at bind)",
+   "✓ emits at STREAM END via LoggingBody (incl. Drop) — hooking response headers would log bytes_sent: 0 for every streamed response, i.e. most LLM traffic",
+   "✓ moved above the filter chain (ADR-0004), so filter-chain local replies are logged too",
+   "✓ SECURITY: headers snapshotted BEFORE apply_request_transforms, so provider credentials never reach the log — now guarded by QA-4 end-to-end, in both directions",
+   "✓ pseudo-headers resolve: %REQ(:METHOD)/(:AUTHORITY)/(:SCHEME)% + %RESP(:STATUS)%, via typed LogContext fields (a colon is not a legal HeaderName)",
+   "✓ MID-STREAM FAILURES ARE NOW VISIBLE — UC upstream hung up · DC client left / body abandoned · SI upstream went quiet (S4 idle), plus an operator-facing WARN with host, cluster, bytes, TTFT, elapsed",
+   "✓ transparent proxy: we log the failure, we never inject an error event into the SSE stream (owner decision)"
+  ],
+  "note": "⚠ FIXED TWO (found by QA-1 + QA-6): %REQ(:METHOD)% rendered '-' in EVERY log line including Envoy mode, since Envoy's own default format uses it; and a stream killed mid-flight set NO response flag, making a network death byte-identical to a short completion on the SSE path that is most LLM traffic"
+ },
+ {
+  "id": 25,
+  "prio": "P2",
+  "ms": "v0.2.0",
+  "lane": "F",
+  "size": "M",
+  "gate": "G3",
+  "status": "blocked",
+  "title": "Admin server (/config_dump …)",
+  "meta": [
+   "proxy-admin",
+   "v0.2.0 ship gate names /config_dump + /stats explicitly",
+   "⚑ SUPERSEDED 2026-08-02 — WP-50's own plan text calls its increment 1 \"this is WP-25, absorbed here\", and increment 1 shipped (9df7deb): /config_dump, /ready, /clusters, /server_info. Not independently workable anymore; the remaining endpoints this card named (/stats, /listeners, /drain_listeners, /healthcheck, /logging, /quitquitquit) live under WP-50 or are unclaimed, not here"
+  ],
+  "note": "▲ found on audit 2026-08-03 — this card still read \"ready, unblocked\" after WP-50 had already delivered its scope under a different id; status changed to blocked so it stops double-counting as separate open v0.2.0 work"
+ },
+ {
+  "id": 26,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "G",
+  "size": "L",
+  "gate": "G1",
+  "status": "started",
+  "title": "Differential test rig vs Envoy",
+  "meta": [
+   "testing/diffrig",
+   "✓ upstreams: echo/flaky/slow + OpenAI chat + OpenAI Responses + Anthropic Messages (real SSE pacing + usage)",
+   "✓ config-validate differential vs docker'd Envoy v1.38.0 — 0 bug-we-accept",
+   "✓ HERMETIC TLS E2E — rcgen CA + tokio-rustls mocks, RFC 6761 *.test.localhost DNS, dual-stack binds, wrong-CA negative control",
+   "✓ harness fix: always rebuild the binary (a stale one silently passed a test the code failed)",
+   "✓ LIVE SMOKE TEST RUN AND PASSED 2026-08-01 — tests/live_smoke.rs, 4 #[ignore]d cases (OpenAI + Anthropic, streaming and not) against the REAL endpoints; all green on the first attempt. THIS SHIPPED v0.0.1. A missing key FAILS by name, never skips",
+   "✓ streaming cases assert time-to-first-frame << total duration — the one assertion a buffering regression would trip",
+   "open: HTTP traffic-replay topology (also closes WP-06's swap-under-load gate)"
+  ],
+  "note": "▲ OWNS THE v0.0.1 SHIP GATE — the test now exists but has NEVER BEEN RUN (needs real keys). Running it is what closes v0.0.1"
+ },
+ {
+  "id": 27,
+  "prio": "P2",
+  "ms": "v0.4.0",
+  "lane": "G",
+  "size": "S",
+  "gate": "G1",
+  "status": "started",
+  "title": "Config corpus + scorecard",
+  "meta": [
+   "testing/corpus",
+   "17 real Envoy v1.38 configs w/ provenance · scorecard + report",
+   "baseline 3/20 (15%) · all rejects RejectedWithPath, 0 parse-err",
+   "v0.4.0 ship gate = 80% accept; it cannot be gamed by adding tests"
+  ]
+ },
+ {
+  "id": 28,
+  "prio": "P2",
+  "ms": "v0.3.0",
+  "lane": "G",
+  "size": "M",
+  "gate": "G3",
+  "status": "started",
+  "title": "Control-plane xDS harness",
+  "meta": [
+   "testing/controlplane",
+   "ScriptedAds SotW puppet + ACK/NACK log · 2 tests",
+   "next: scenario DSL · reconnect/warming · go-control-plane fixture"
+  ]
+ },
+ {
+  "id": 29,
+  "prio": "P2",
+  "ms": "v0.4.0",
+  "lane": "G",
+  "size": "M",
+  "gate": "G4",
+  "status": "blocked",
+  "title": "Fuzzing (codecs, config, routes)",
+  "meta": [
+   "needs 10"
+  ]
+ },
+ {
+  "id": 30,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "G",
+  "size": "M",
+  "gate": "G4",
+  "status": "started",
+  "title": "Perf benchmarks + capacity model",
+  "meta": [
+   "testing/loadgen",
+   "✓ phase 1 — open-loop, coordinated-omission-aware driver · SSE parsing · hdrhistogram latency/TTFT/TPOT",
+   "✓ phase 2 — process sampler (RSS/CPU/fds, macOS+Linux, explicit error not zeros) · ramp-hold-bisect sweep w/ multi-clause SLO gate",
+   "✓ capacity table + least-squares cost model (bytes/stream, CPU-ms/request, R² reported)",
+   "open: NO SWEEP PUBLISHED — 'performant' is still an untested claim",
+   "open: Linux /proc path unverified (no Linux box) — a v0.2.0 blocker, not a footnote"
+  ],
+  "note": "detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending there is reported HARNESS-BOUND, never as proxy capacity"
+ },
+ {
+  "id": 41,
+  "prio": "P1",
+  "ms": "v0.0.1",
+  "lane": "G",
+  "size": "M",
+  "gate": "G1",
+  "status": "started",
+  "title": "Black-box QA suite (Go)",
+  "meta": [
+   "testing/qa · zero deps · SCENARIOS.md is the reviewed spec",
+   "boundary is PHYSICAL, not a convention: a Go module cannot import a Rust crate by accident",
+   "spawns the built binary with a config, asserts only what a client sees on the wire",
+   "make ci runs it, skipping LOUDLY if the Go toolchain is absent",
+   "QA-1 ✓ (verified passing 2026-08-01 — asserts real per-route token values, no longer skips) · QA-2 ✓ · QA-3 ✓ · QA-4 ✓ · QA-6 ✓ · QA-5/7/8 approved, unbuilt",
+   "QA-10 (TTFT/TPOT reach the access log with sane values) implemented 2026-08-08, `make qa` green x3 — SCENARIOS.md's own status table still lists it `approved` rather than `passing`; flagging the mismatch here rather than editing that table myself. 10 cases total, QA-9 remains rejected (false premise, already handled elsewhere)",
+   "owner approves every case before a test is written"
+  ],
+  "note": "▲ FOUND 4 REAL BUGS ON DAY ONE, three now fixed — none was visible from inside the code, and one was described as intended in its own doc comment. QA-10 has since found a fifth (WP-46's response_chunks over-count, 2026-08-08)"
+ },
+ {
+  "id": 31,
+  "prio": "P2",
+  "ms": "v0.4.0",
+  "lane": "X",
+  "size": "M",
+  "gate": "G4",
+  "status": "ready",
+  "title": "Batch 1: cors, local_ratelimit",
+  "meta": [
+   "proxy-filters",
+   "needs 11 ✓ — filter callbacks + registry wiring now land configured filters"
+  ]
+ },
+ {
+  "id": 32,
+  "prio": "P2",
+  "ms": "v0.4.0",
+  "lane": "X",
+  "size": "L",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Batch 2: ext_authz, ratelimit, ext_proc",
+  "meta": [
+   "proxy-filters",
+   "needs 31",
+   "ext_proc is what WP-36 needs — this is why parity is a v1.0.0 dependency"
+  ]
+ },
+ {
+  "id": 33,
+  "prio": "P0",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "started",
+  "title": "Streaming-first + GenAI metrics (TTFT/TPOT)",
+  "meta": [
+   "proxy-filters · proxy-simple-config/src/lower.rs",
+   "✓ usage filter now EMITTED from the llmproxy dialect, per route — typed_per_filter_config carries the dialect (openai/anthropic) keyed off the route's provider",
+   "✓ criteria 1,2,4,5,6 met — route override changes dialect, listener default preserved, two-provider HCM carries llmproxy.usage before router, gpt-*/claude-* routes get correct per-route dialects",
+   "✓ criterion 7 (end-to-end) — QA-1 now ASSERTS real per-route token values instead of skipping",
+   "✓ criterion 3 CLOSED 2026-08-01 — an invalid per-route dialect fails the build even under is_optional: true. Pinned twice: the error VARIANT (must be InvalidValue, never Unimplemented — that is the one is_optional swallows) and end-to-end through build_listener_hcm, the same fn the bind path calls. Mutation-tested",
+   "open: GenAI TTFT/TPOT metrics per OTel semconv, and the route-level `streaming: strict` assertion that config-errors if a filter on the route buffers the response"
+  ],
+  "note": "▲ 7/7 acceptance criteria now met; the WP stays open for the GenAI metrics half of its title. The ⚑ built-but-unwired flag is CLEARED (filter is in the dialect's http_filters); that is a different fact from the WP being finished"
+ },
+ {
+  "id": 34,
+  "prio": "P0",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "started",
+  "title": "Token metering + token rate limits",
+  "meta": [
+   "proxy-filters · usage.rs",
+   "✓ EXTRACTION DONE — OpenAI chat completions + OpenAI Responses + Anthropic Messages, streaming and not",
+   "4 non-overlapping cost buckets (input / cache-read / cache-write / output) · Anthropic message_start+delta merge · OpenAI cached-subset normalization",
+   "full acceptance suite runs in CI — 0 ignored",
+   "✓ now reachable on live traffic via WP-33's per-route wiring — the ⚑ built-but-unwired flag that lived here is cleared",
+   "✓ LIMITER INCREMENT 1 DONE 2026-08-01 — token_limit.rs: BudgetStore seam + InProcessBudgetStore (fixed window, per-model cost weights, saturating throughout), 11 tests, mutation-tested 3 ways. Central semantic pinned by test: over-limit rejects the NEXT request, never truncates a stream in flight",
+   "✓ LIMITER INCREMENT 2 DONE 2026-08-01 — token_limit_filter.rs: a real enforcing `llmproxy.token_limit` HttpFilter. Decode-side check + 429 with x-ratelimit-limit/ -remaining/-reset + retry-after; encode-side cost recording from the usage WP-33's filter already wrote to StreamInfo. 16 tests, mutation-tested 3 ways (no-op record, always-Allow check, credential dropped from the key)",
+   "⚠ FIXED en route: TokenUsage::total() summed four provider-supplied u64s with plain `+` — panicked the worker in debug, wrapped silently in release, and access_log.rs calls it for every logged request. Now saturating",
+   "open: reachable ONLY via Envoy-mode config today (typed_config on RateLimitSettings) — the dialect has no `limits` key yet (increment 3, still rejected under strict mode); thin slice is LimitOn::Total keyed on (route, hashed credential) only, no per-descriptor config",
+   "✓ INCREMENT 3 DONE 2026-08-02 — the dialect `limits` key now lowers a tokens_per_minute + key:header:authorization limit to llmproxy.token_limit (before llmproxy.usage, per S2.1). Everything the thin slice cannot enforce warns with its exact dotted path and reason",
+   "open: per-descriptor config (needs WP-47's vendored proto), and richer bucket keys",
+   "▲ NOW THE ONLY v0.1.0 gate clause with no end-to-end evidence (2026-08-08) — the other two (token counts+TTFT/TPOT via QA-10, provider failover via testing/diffrig/failover_e2e.rs) were verified this pass. No QA-N scenario or diffrig drill exercises 429-on-limit-exceeded against the real binary yet. Owner explicitly deferred this session — see releases.yaml risk"
+  ]
+ },
+ {
+  "id": 35,
+  "prio": "P0",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "done",
+  "title": "Model routing + provider fallback",
+  "meta": [
+   "proxy-filters · proxy-config · proxy-cluster · proxy-simple-config",
+   "✓ INCREMENT 1a+1b DONE — provider credentials follow the CLUSTER an attempt actually dialed (ClusterConfig.request_headers_to_add, applied inside the router's retry loop), not the route that matched",
+   "✓ INCREMENT 2 DONE 2026-08-07/08 (cb84f83, a2bfef7, d4ac161, 399b954) — the aggregate cluster (ClusterKind::Aggregate), member-order failover via attempted_clusters, a host pick that yields its owning member; reachable from BOTH front-ends (Envoy cluster_type AND the dialect's fallbacks: key, which now lowers for real instead of warning and dropping); validate_cluster_graph rejects a missing/self/nested/duplicate member at config time with a dotted path",
+   "✓ credential-isolation test asserts the NEGATIVE — a request that fails over from provider A to provider B must not carry A's key, not just that B's key is present (router_aggregate.rs::credential_isolation_across_failover)",
+   "✓ WP-45 consumer B landed (872b7d7) — routing reads `model` from the real request body, so this WP has something real to route on",
+   "✓ VERIFIED END-TO-END 2026-08-08 (c1314b6) — testing/diffrig/tests/failover_e2e.rs drives the real llm-proxy binary against a real llmproxy dialect config with fallbacks:, mock primary forced to 429. Three assertions, each mutation-tested: attempt accounting exact (one request per upstream), standby receives its OWN credential with the primary's key NOWHERE on the wire (negative asserted explicitly), standby receives its OWN Host. This is the v0.1.0 gate's failover clause going from code-complete to verified — see docs/MILESTONES.md",
+   "Scope that closes here: SAME-DIALECT fallback (e.g. openai → an openai-compatible provider). examples/llmproxy.yaml's fallback showcase changed from cross-dialect (gpt-5* → anthropic) to local-vllm as a result",
+   "⚑ NOT in this WP: cross-dialect fallback (openai → anthropic) is a hard config-time error naming routes[i].fallbacks[j], deliberately — the request/response shape translation it needs is real, un-started work. Split into WP-52 (v1.0.0), not silently dropped from scope"
+  ],
+  "note": "historical: the dialect used to WARN AND DROP `fallbacks` (parsed, validated, lowered, then dropped with one stderr line) — corrected in MILESTONES.md 2026-08-03 and again 2026-08-06. Increment 2c (399b954) replaced that with a real lowering, so this note is now history, not the current behavior"
+ },
+ {
+  "id": 45,
+  "prio": "P0",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "done",
+  "title": "Request-body rewrite pipeline",
+  "meta": [
+   "proxy-filters",
+   "NEW 2026-08-01 — bounded PREFIX SCAN (64KiB default), NOT a whole-body buffer and NOT re-serialization: a depth-tracking tokenizer skips nested structures without materializing them, and mutation is a prefix splice just past the top-level `{`. Memory is O(cap), not O(body) — a 40MB multimodal request costs the same as a 2KB one",
+   "over-cap or non-JSON: pass through untouched, never fail the request",
+   "consumer A: forces stream_options.include_usage=true for openai-dialect streaming routes — verified against a real OpenAI-compatible upstream that streaming without it emits NO usage block at all",
+   "consumer B: absorbs WP-35's body-peek model router as a shared consumer of the same buffer",
+   "✓ INCREMENT 1 DONE 2026-08-01 — body_rewrite.rs: scanner + splice policy, 14 tests, mutation-tested (removing the cap turns the multimodal 4b test red; that is the criterion guarding against someone simplifying it back into a full-body buffer)",
+   "✓ INCREMENT 2 DONE 2026-08-01 — 2a: DecoderCallbacks::modify_decoded_headers (works from decode_data/trailers; honest no-op returning false from decode_headers, where a second live &mut is not expressible in safe Rust). 2b: body_rewrite_filter.rs, OpenAI-only, Anthropic byte-identical, content-length corrected, e2e over real sockets. 2c: dialect surface observability.force_usage_reporting (default TRUE)",
+   "⚠ FIXED en route: content-length fix-up used a plain `+` on a CLIENT-supplied header — panicked the worker in debug, wrapped in release. Second instance of this defect class today (see WP-34's TokenUsage::total()); this one is downstream-reachable, which is worse",
+   "▲ real memory bound is O(cap + one chunk), not the O(cap) acceptance 4b is worded as: the tail of whichever chunk crosses the cap still has to be forwarded. Still not O(body)",
+   "✓ CONSUMER B DONE 2026-08-05 (872b7d7) — routes on the model in the request body via the same scan/splice machinery. The header is now DERIVED, never trusted: a client-supplied x-llmproxy-model is overwritten when the body names a model, and removed outright when it doesn't (including the bodyless, non-JSON, and cap-exceeded paths). Acceptance criterion 5's end-to-end test asserts which CLUSTER was actually dialed over a real socket, not a string equality — mutation-tested by diverging the two crates' MODEL_HEADER constants (404 vs 200)",
+   "✓ all 6 acceptance criteria met — real-upstream token extraction (1), pass-through cases (2/3/4), multimodal bounded-memory (4b), and body-based routing (5) are each covered by a named test; streaming non-regression (6) covered by local_openai_smoke.rs's arrival-spread assertion"
+  ],
+  "note": "▲ found 2026-08-01 verifying WP-33/34 against a real upstream: the WP-33 filter runs correctly on this quadrant and finds nothing. Increment 1 (the shared machinery) landed first; WP-35's fallback work now depends on this being done, not the other way around"
+ },
+ {
+  "id": 42,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Spend controls & budgets",
+  "meta": [
+   "proxy-filters",
+   "needs 33 (usage on live traffic); 34's extraction is already done",
+   "cost model over the 4 non-overlapping token buckets, priced per model",
+   "budget scopes: key / user / project, with a period",
+   "exhausted budget REJECTS rather than queues"
+  ],
+  "note": "⚑ NOT the same as WP-34's token rate limits — a tokens/minute cap is a throttle, not a budget. Competitive review 2026-08-01: often the actual reason a team fronts providers with a gateway at all"
+ },
+ {
+  "id": 43,
+  "prio": "P2",
+  "ms": "v1.0.0",
+  "lane": "H",
+  "size": "L",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Response caching",
+  "meta": [
+   "proxy-filters",
+   "needs 33",
+   "exact-match first (prompt + model + params); semantic caching is a SEPARATE decision",
+   "streaming is the hard part: a hit must replay AS A STREAM, and the entry can only be written once usage is known at stream end",
+   "a hit must be visible in the access log"
+  ],
+  "note": "▲ open question first: a semantic near-miss served as a hit is a WRONG ANSWER, not a slow one — don't fold it in silently"
+ },
+ {
+  "id": 44,
+  "prio": "P2",
+  "ms": "v1.0.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Cost-aware model routing",
+  "meta": [
+   "proxy-filters",
+   "needs 35 (model routing) + 42 (cost model)",
+   "route by price as well as availability — cheap requests to a cheap model",
+   "the chosen model AND the reason must reach the access log"
+  ],
+  "note": "⚑ a router that silently downgrades a model is indistinguishable from a bug — explainability is an acceptance criterion, not a nicety"
+ },
+ {
+  "id": 36,
+  "prio": "P2",
+  "ms": "v1.0.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Inference Extension (EPP) support",
+  "meta": [
+   "proxy-filters",
+   "needs 35, 32 (ext_proc)"
+  ]
+ },
+ {
+  "id": 37,
+  "prio": "P2",
+  "ms": "v1.0.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Realtime WebSocket sessions (S10)",
+  "meta": [
+   "proxy-filters",
+   "needs 36 + S10 upgrade support in 10/11/13"
+  ]
+ },
+ {
+  "id": 46,
+  "prio": "P0",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "S",
+  "gate": "G5",
+  "status": "done",
+  "title": "TPOT access-log operator",
+  "meta": [
+   "proxy-observability/src/access_log.rs",
+   "the v0.1.0 gate says token counts AND TTFT/TPOT reach the access log. %LLM_TTFT% exists; there is NO TPOT operator",
+   "the data is ALREADY COMPUTED — usage_filter writes max_inter_chunk and response_chunks into StreamInfo.LlmStats every stream, and nothing can read them",
+   "▲ NOT simply \"render max_inter_chunk\": its own doc defines it as the LARGEST GAP between chunks — \"the tail of the TPOT distribution\", i.e. a stall metric, NOT TPOT. Publishing a max-gap under a TPOT label is worse than the field being absent",
+   "correct build: %LLM_TPOT% = (duration − ttft) / output_tokens, all three already in LogContext, so no new StreamInfo plumbing. Expose max_inter_chunk separately (a real stall metric, also currently unreadable) rather than discarding it",
+   "✓ DONE 2026-08-02 (9b68eac) — %LLM_TPOT% (mean, computed), plus %LLM_MAX_STALL% and %LLM_RESPONSE_CHUNKS% exposing two fields that were computed every stream and unreadable",
+   "⚠ caught on review: TPOT divided in integer ms, rendering 0 for any stream faster than one token/ms — i.e. reading ZERO exactly when a fast provider (Groq/Cerebras) performs best. Divides in micros now, renders fractional ms",
+   "⚠ SECOND completeness gap, found+fixed 2026-08-08 (b0485e8): the operators existed but neither llmproxy dialect access-log format (text or JSON) ever carried them — both formats stopped at %LLM_TTFT%. A user of the dialect could not get TPOT at any setting. Both formats now carry TPOT/MAX_STALL/RESPONSE_CHUNKS. This is a completeness gap in this WP's original delivery, not new scope",
+   "✓ VERIFIED END-TO-END 2026-08-08 — new QA-10 (testing/qa/SCENARIOS.md), against a mock paced at 400ms TTFT / 150ms inter-chunk, observes ttft=402ms tpot=122.129ms max_stall=152ms in the actual access log. Load-bearing assertion is TPOT strictly non-zero, since TPOT already shipped the silent zero-on-fast-provider bug above once",
+   "⚠ THIRD bug, found BY that QA-10 assertion (b0485e8): %LLM_RESPONSE_CHUNKS% over-reported by exactly one on every response with a body — encode_data timed the synthetic empty end-of-stream frame as a chunk, which also fed a phantom gap into %LLM_MAX_STALL%. Fixed; TTFT/TPOT themselves were unaffected"
+  ],
+  "note": "⚠ same class as the request_headers_to_add P0, TWICE — a field populated with no reader (2026-08-01), then a reader with nothing to read from the dialect's own log formats (2026-08-08). Both were invisible to every check the project had except someone asking or a black-box assertion against known pacing, not by unit tests"
+ },
+ {
+  "id": 47,
+  "prio": "P1",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "ready",
+  "title": "Vendored Lane-H filter proto",
+  "meta": [
+   "proxy-api · proxy-filters",
+   "three Lane-H filters now reuse UNRELATED Envoy messages for their typed_config because FilterRegistry keys on type_url and asserts on duplicates",
+   "usage → DataSource(inline_string) · body_rewrite → RuntimeFeatureFlag(default_value + runtime_key) · token_limit → RateLimitSettings(max_tokens + fill_rate), which is really xDS discovery throttling config",
+   "each filter's own module doc independently predicts a vendored proto is the real answer; the token_limit reuse is already documented as \"visibly stretched\"",
+   "blocks: per-descriptor budget config (WP-34), and any filter needing a 4th config shape"
+  ],
+  "note": "▲ the failure mode is not aesthetic — the next filter has to stretch a 4th unrelated message, and a reader cannot tell config INTENT from a borrowed message name"
+ },
+ {
+  "id": 48,
+  "prio": "P1",
+  "ms": "v0.1.0",
+  "lane": "A",
+  "size": "S",
+  "gate": "G2",
+  "status": "done",
+  "title": "Sweep arithmetic on wire-derived numbers",
+  "meta": [
+   "workspace-wide audit",
+   "✓ DONE 2026-08-07 (41f1c59) — RE-SCOPED BY THE AUDIT: no live overflow bug existed outside usage.rs, every other wire-derived site already saturates",
+   "the real defect: serde_json's as_u64() returns None for a JSON FLOAT, so a provider reporting \"output_tokens\": 150.0 silently billed as ZERO — confident wrong number, not a crash, and nothing logged",
+   "all 5 as_u64() call sites now route through one token_count helper: non-negative int passes, non-negative finite float truncates, anything else (negative/non-finite/absent) is None — never 0. None renders absent downstream; 0 is a number someone bills against",
+   "deliberately NOT done: unifying TokenUsage/LlmTokenUsage/LlmTokens — all three total()s already saturate correctly, so merging is a dependency-direction decision, not a correctness fix, and stayed out of scope"
+  ],
+  "note": "⚠ two in one day (this + the content-length fix-up) is a pattern, not a coincidence. Both were found by code review, not by any test — the existing suites stayed green through both"
+ },
+ {
+  "id": 49,
+  "prio": "P0",
+  "ms": "v0.1.0",
+  "lane": "H",
+  "size": "L",
+  "gate": "G5",
+  "status": "started",
+  "title": "Backend taxonomy (providers · models · credentials)",
+  "meta": [
+   "proxy-simple-config · schema",
+   "one logical model served by SEVERAL backends — Claude by Anthropic/Vertex/Bedrock, Kimi-K2 by Nebius/Vertex. The v0 dialect cannot express it: a route names exactly ONE provider",
+   "3 levels — provider TYPE (in code: endpoint shape + credential mechanism + default dialect) → provider INSTANCE (config: credentials + placement, two of one type is first-class) → MODEL (new `models:` block, logical name → ordered providers)",
+   "VOCABULARY (owner 2026-08-02): exactly TWO nouns in the config — `providers` and `models`. Vertex/Groq/Anthropic/Nebius are all providers. \"backend\" is deliberately absent; it would have meant a connection object at one nesting level and a binding at another",
+   "dialect is REQUIRED not derived for vertex/bedrock — Vertex serves Anthropic-shaped Claude, Google-shaped Gemini AND OpenAI-shaped Kimi",
+   "selection semantics (fallback/split/cost) deliberately deferred to WP-35/WP-44",
+   "✓ INCREMENT 1 DONE 2026-08-02 (caccc5f) — the `models:` catalogue, additive so every existing `provider:` route still lowers unchanged. Shorthand and object forms lower to a byte-identical bootstrap (asserted). vertex/bedrock/azure-openai hard-error at load naming the missing credential scheme",
+   "next: wildcard model names + trie (exact > longest prefix > *), then the OAuth/SigV4 schemes"
+  ],
+  "note": "▲ the config shape is the EASY part. Provider today conflates endpoint + credential scheme + wire dialect + model catalogue. Vertex needs minted OAuth w/ refresh, Bedrock needs per-request SigV4 over the canonical request — so it must run AFTER body rewrite (WP-45) and cannot be header injection. Neither has a hook today"
+ },
+ {
+  "id": 50,
+  "prio": "P0",
+  "ms": "v0.2.0",
+  "lane": "D",
+  "size": "L",
+  "gate": "G3",
+  "status": "started",
+  "title": "Operator control plane (admin · keys · tenants)",
+  "meta": [
+   "proxy-admin · new store crate",
+   "OWNER 2026-08-01: build the OPERATOR control plane before the xDS one — non-K8s deployments have no Envoy Gateway to drive xDS, so for them this IS the management plane",
+   "inc 1: read-only surface (absorbs WP-25) — /config_dump /stats /ready /clusters",
+   "inc 2: virtual keys — client presents a proxy-issued key, proxy authenticates it and swaps in the real provider credential. The SWAP half exists (request_headers_to_add); the AUTHENTICATE half does not",
+   "inc 3: tenants, per-tenant model allow-lists, budgets w/ a period, spend history",
+   "state per ADR-0005: embedded (sqlite/sled) default, distributed behind the same trait",
+   "✓ INCREMENT 1 DONE 2026-08-02 (9df7deb) — /ready, /config_dump, /clusters, /server_info on the control runtime. /stats 404s naming WP-23 rather than faking an empty 200",
+   "▲ /config_dump redaction is default-deny AND structural: HeaderMutationDump.value is `&'static str`, so it cannot hold runtime data — leaking needs a type change, not an edit",
+   "⚠ it also disarmed the WP-39 readership guard: rendering an IR field for DISPLAY is not ACTING on it, so proxy-admin was removed from RUNTIME_CRATES. Any future crate that reflects over the IR needs the same exclusion"
+  ],
+  "note": "⚑ closes a real hole: WP-34 enforces budgets keyed on a hashed credential that NOTHING can register, attach to a team, rotate or revoke. Two hazards recorded — do NOT reuse hash_credential (FNV-1a, non-adversarial) for key AUTH; and auth fails CLOSED, the opposite of BudgetStore's fail-open"
+ },
+ {
+  "id": 51,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "F",
+  "size": "L",
+  "gate": "G4",
+  "status": "ready",
+  "title": "OpenTelemetry (traces · metrics · semconv naming)",
+  "meta": [
+   "proxy-observability",
+   "OWNER 2026-08-03: make the project OTel-ready — recorded and scheduled, not worked yet, since v0.1.0's scope stays frozen",
+   "measured 2026-08-03 — logs strong (79 access-log operators, 9 LLM-specific) but ours not semconv-named; traceparent PASSES THROUGH already (nothing strips it) but we emit no spans; metrics is NOTHING (0 otel/prometheus/metrics deps, /stats a deliberate 404)",
+   "inc 1: semconv-name the LLM access-log operators (gen_ai.usage.* etc, old names alias for one release) · inc 2: trace participation (parse traceparent, span per request + per upstream attempt) · inc 3: OTLP export, gated on WP-23",
+   "▲ the !Send collision: ADR-0003 makes the data plane !Send/worker-local, the OTel SDK's providers are Send+Sync. Fix is ADR-0005's shape inverted — workers write local buffers, control side aggregates + exports"
+  ],
+  "note": "this decision is WHY WP-23's registry became OTel-native (see WP-23's card) — Envoy's flat /stats names are now a rendering of this model, not the model itself"
+ },
+ {
+  "id": 52,
+  "prio": "P2",
+  "ms": "v1.0.0",
+  "lane": "H",
+  "size": "L",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Cross-dialect provider fallback (request/response translation table)",
+  "meta": [
+   "proxy-filters · proxy-config · proxy-simple-config",
+   "split out of WP-35 2026-08-08 — same-dialect fallback (WP-35) is done; cross-dialect is not",
+   "needs 35 (done — the aggregate-cluster mechanism this reuses) + 45 (bounded-buffer body pipeline, possible substrate) + 49 (backend taxonomy — needs the PROVIDER TYPE, not just the cluster name)",
+   "an openai-shaped route falling back to anthropic is a HARD config-time error today (routes[i].fallbacks[j]), on purpose — sending an OpenAI-shaped body to Anthropic, or scanning its response with the wrong dialect's usage parser, is the wrong-provider-shape version of WP-48's silent-wrong-billing-number bug",
+   "open design decision this WP owns: bounded-buffer transform (reuse WP-45) vs full reshape — a shape change isn't generally a prefix splice the way include_usage injection is"
+  ],
+  "note": "⚑ rejecting cross-dialect fallback is the SAFE interim state, not a regression — see WP-35's 2026-08-08 note. This WP is what turns the rejection into support"
+ }
+];
+
+  const board = document.getElementById("board");
+  for (const lane of lanes) {
+    const cards = wps.filter(w => w.lane === lane.id);
+    const doneN = cards.filter(w => w.status === "done").length;
+    const col = document.createElement("section");
+    col.className = "lane";
+    col.innerHTML = `
+      <div class="lane-head" style="border-bottom-color:${lane.color}">
+        <span class="lane-dot" style="background:${lane.color}"></span>
+        <span class="lane-name">${lane.name}</span>
+        <span class="lane-sub">${doneN}/${cards.length}</span>
+      </div>
+      <div class="lane-cards"></div>`;
+    const holder = col.querySelector(".lane-cards");
+    for (const w of cards) {
+      const el = document.createElement("article");
+      el.className = `card ${w.status}`;
+      el.dataset.status = w.status;
+      el.dataset.gate = w.gate;
+      el.dataset.prio = w.prio;
+      el.dataset.ms = w.ms;
+      const prioTitle = {
+        P0: "Product-defining — the LLM gateway itself",
+        P1: "Serving-critical — needed to run real traffic",
+        P2: "Envoy parity / breadth — backlog, not dropped",
+      }[w.prio];
+      el.innerHTML = `
+        <div class="card-top">
+          <span class="wp" style="color:${lane.color}">WP-${String(w.id).padStart(2, "0")}</span>
+          <span class="size">${w.size}</span>
+          <span class="badge prio prio-${w.prio}" title="${prioTitle}">${w.prio}</span>
+        </div>
+        <div class="card-title">${w.title}</div>
+        <div class="card-tags">
+          <span class="badge status-${w.status}">${w.status}</span>
+          <span class="badge gate">${w.gate}</span>
+          <span class="badge ms${w.ms === CURRENT_MS ? " ms-now" : ""}" title="Ships in ${w.ms}">${w.ms}</span>
+        </div>
+        <div class="card-meta">${w.meta.map(m => `<span>${m}</span>`).join("")}</div>
+        ${w.note ? `<div class="flag">${w.note}</div>` : ""}`;
+      holder.appendChild(el);
+    }
+    board.appendChild(col);
+  }
+
+  for (const s of ["done", "ready", "started", "blocked"]) {
+    document.getElementById("n-" + s).textContent = wps.filter(w => w.status === s).length;
+  }
+  for (const pr of ["P0", "P1", "P2"]) {
+    document.getElementById("n-" + pr).textContent = wps.filter(w => w.prio === pr).length;
+  }
+  for (const [ms, id] of [["v0.0.1", "n-v001"], ["v0.1.0", "n-v010"], ["v0.2.0", "n-v020"],
+                          ["v0.3.0", "n-v030"], ["v0.4.0", "n-v040"], ["v1.0.0", "n-v100"]]) {
+    document.getElementById(id).textContent = wps.filter(w => w.ms === ms).length;
+  }
+
+  let active = null; // { key: "status" | "prio" | "ms" | "gate", value: string }
+  const chips = document.querySelectorAll(".chip");
+  const keyOf = c => c.dataset.status ? "status" : c.dataset.prio ? "prio" : c.dataset.ms ? "ms" : "gate";
+  const valOf = c => c.dataset.status || c.dataset.prio || c.dataset.ms || c.dataset.gate;
+  chips.forEach(chip => {
+    chip.setAttribute("aria-pressed", "false");
+    chip.addEventListener("click", () => {
+      const key = keyOf(chip), value = valOf(chip);
+      active = (active && active.key === key && active.value === value) ? null : { key, value };
+      chips.forEach(c => {
+        c.setAttribute("aria-pressed", String(!!active && active.key === keyOf(c) && active.value === valOf(c)));
+      });
+      document.querySelectorAll(".card").forEach(card => {
+        card.classList.toggle("dim", !!active && card.dataset[active.key] !== active.value);
+      });
+    });
+  });
+</script>
+
+</body></html>

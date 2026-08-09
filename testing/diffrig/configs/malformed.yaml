@@ -1,0 +1,9 @@
+# Deliberately malformed YAML (unbalanced flow mapping): neither validator
+# should get far enough to talk about field paths -- expected verdict:
+# AgreeReject (both fail before/at parse time).
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901
+
+static_resources:
+  listeners: [this, is, not, closed

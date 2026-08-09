@@ -3,8 +3,14 @@
 //! and the L4 network filter framework (WP-09).
 
 pub mod drain;
+pub mod filter_chain;
+pub mod header_mutation_filter;
+pub mod listener;
 pub mod net_filter;
 pub mod runtime;
+pub mod tcp_proxy;
+pub mod tls;
+pub mod tls_inspector;
 pub mod transport;
 
 use std::sync::Arc;
