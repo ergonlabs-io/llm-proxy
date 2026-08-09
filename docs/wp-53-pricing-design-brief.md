@@ -27,9 +27,10 @@ someone asks. It is wrong for a reason that only shows up after the first price 
 - "Why was I charged this?" becomes unanswerable, because the inputs no longer exist.
 
 So a completed request produces a **cost record**: the four token counts (kept, for
-observability), the **computed cost**, and **the price-list version that computed it**. The
-cost is authoritative for budgets; the tokens are evidence. A later price change moves
-nothing already recorded.
+observability), the **computed list-price cost** (`list_cost_nanodollars` — see "the naming
+consequence" below for why it is not called `cost`), and **the price-list version that
+computed it**. The cost is authoritative for budgets; the tokens are evidence. A later price
+change moves nothing already recorded.
 
 This also makes the enforcement path deterministic, which matters because dollar limiting
 has the same retrospective shape as WP-34's token limiting — cost is unknown until the
