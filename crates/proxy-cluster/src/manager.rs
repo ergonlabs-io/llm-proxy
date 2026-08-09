@@ -102,7 +102,17 @@ struct ManagedCluster {
     /// manager's [`TransportSocketBuilder`]; EDS clusters, which have no
     /// `ClusterConfig`, always get plaintext.
     transport: Arc<dyn UpstreamTransportSocket>,
+    /// `ClusterConfig::connect_timeout` (Envoy default 5s), handed to every
+    /// [`crate::pool::ConnectPool`] built for this cluster. EDS clusters and
+    /// aggregates, which have no `ClusterConfig` of their own to read (the
+    /// aggregate arm's own pool is never actually dialed -- see
+    /// `ClusterHandle::http_pool`), fall back to the same Envoy default.
+    connect_timeout: std::time::Duration,
 }
+
+/// Envoy's own default for `Cluster.connect_timeout` when a config doesn't
+/// set one -- see `ClusterConfig::connect_timeout`'s doc comment in the IR.
+const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl ManagedCluster {
     /// Builds a config-sourced cluster's state. Branches on `config.kind`:
@@ -126,6 +136,7 @@ impl ManagedCluster {
                 // Read + map (IR → runtime enum) before `config` is moved
                 // into `source` below.
                 let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
+                let connect_timeout = config.connect_timeout;
                 Ok(Self {
                     source: ClusterSource::Config(config),
                     host_set: ArcSwap::from_pointee(HostSet::default()),
@@ -135,20 +146,24 @@ impl ManagedCluster {
                     high_cb,
                     upstream_protocol,
                     transport,
+                    connect_timeout,
                 })
             }
             ClusterKind::Aggregate { .. } => {
                 // WP-35 increment 2a: `select_host` never reads this
                 // cluster's own `host_set`/`host_picker`/`transport`/
-                // `upstream_protocol` for an aggregate -- it resolves
-                // straight through to whichever member actually served the
-                // host (see `ClusterHandle::select_aggregate_member`) -- so
-                // `RoundRobin`/`RawTransportSocket`/`Http1` here are inert
-                // placeholders, never real answers, exactly like `eds()`'s
-                // defaults below. `initialized` starts `true`: there is
-                // nothing here to resolve, and leaving it `false` would make
-                // WP-21 warming wait forever on a cluster that never runs
-                // discovery.
+                // `upstream_protocol`/`connect_timeout` for an aggregate --
+                // it resolves straight through to whichever member actually
+                // served the host (see `ClusterHandle::select_aggregate_member`)
+                // -- so `RoundRobin`/`RawTransportSocket`/`Http1` here are
+                // inert placeholders, never real answers, exactly like
+                // `eds()`'s defaults below. `initialized` starts `true`:
+                // there is nothing here to resolve, and leaving it `false`
+                // would make WP-21 warming wait forever on a cluster that
+                // never runs discovery. `connect_timeout` is read from the
+                // real config anyway (it costs nothing and stays correct if
+                // this arm's pool is ever actually dialed).
+                let connect_timeout = config.connect_timeout;
                 Ok(Self {
                     source: ClusterSource::Config(config),
                     host_set: ArcSwap::from_pointee(HostSet::default()),
@@ -161,6 +176,7 @@ impl ManagedCluster {
                     high_cb,
                     upstream_protocol: UpstreamProtocol::Http1,
                     transport: Arc::new(transport::RawTransportSocket),
+                    connect_timeout,
                 })
             }
         }
@@ -168,8 +184,9 @@ impl ManagedCluster {
 
     /// EDS clusters have no `ClusterConfig`/`lb_policy` of their own (see
     /// [`ClusterSource::Eds`]); default to `ROUND_ROBIN`, matching Envoy's
-    /// own cluster-wide default, and to plaintext (there's no
-    /// `transport_socket` field to read).
+    /// own cluster-wide default, to plaintext (there's no
+    /// `transport_socket` field to read), and to Envoy's own
+    /// `connect_timeout` default (there's no field to read that either).
     fn eds() -> Self {
         Self {
             source: ClusterSource::Eds,
@@ -182,6 +199,7 @@ impl ManagedCluster {
             high_cb: CircuitBreakerState::default(),
             upstream_protocol: UpstreamProtocol::Http1,
             transport: Arc::new(transport::RawTransportSocket),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 
@@ -540,6 +558,7 @@ impl ClusterEntry for ClusterHandle {
             host.address,
             Arc::clone(&self.managed.transport),
             server_name,
+            self.managed.connect_timeout,
         ))
     }
 
