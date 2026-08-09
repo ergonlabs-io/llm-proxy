@@ -122,12 +122,34 @@ wildcard route (`model: "*"`) cannot be, which is why the runtime rule above sti
 **Increment 1: operator config**, exactly as virtual keys do today. It is honest, needs no
 network, and works offline.
 
-**Later: a fetched catalogue.** Provider prices change and nobody wants to hand-maintain
+**Increment 2 (added 2026-08-08, after this brief initially missed it): pushed through the
+admin API.** The original ask was support for *updating* versioned pricing, and the first
+draft of this section answered only "edit the config file" and "fetch it from somewhere" —
+skipping the path an operator actually wants, which is posting a new price list to a running
+proxy without a config reload.
+
+This is a **management operation**, and it is the third mutating surface alongside creating a
+virtual key and defining a tenant. All three belong to **WP-50 increment 3** and should be
+specified together rather than growing three different shapes:
+
+- A price list is **immutable once published**. "Updating" means publishing a *new version*
+  with a later `effective_from`, never editing an existing one — otherwise the version
+  stamped on an old cost record no longer describes what priced it, and this brief's central
+  guarantee is gone.
+- Publishing therefore **appends**; there is no `PUT /prices/{version}`.
+- A published list that is already `effective_from` in the past must be rejected, or it would
+  silently change how in-flight and just-completed requests were priced.
+- The endpoint mints money-affecting state, so it needs the admin-surface authentication that
+  WP-50 increment 3 owes — **the admin listener has none today**, which is precisely why
+  mutating endpoints cannot be added to it first and the auth has to land with them.
+
+**Later still: a fetched catalogue.** Provider prices change and nobody wants to hand-maintain
 them. But note before anyone builds it: a proxy that auto-fetches pricing and enforces
 budgets on the result has made a third party able to change what its customers are charged
 and what traffic is refused. That wants pinning, signature or checksum verification, and an
 explicit operator promotion step — it is not a background refresh. Deliberately out of scope
-here, named so it is not slipped in as a convenience.
+here, named so it is not slipped in as a convenience. Note it is the *same* promotion step
+the admin path above provides, which is the argument for building that one first.
 
 The seam is the same one ADR-0005 describes for read-mostly data: a `PriceCatalogue` trait,
 a snapshot published through `ArcSwap`, the hot path doing a lock-free load and **never**
@@ -144,7 +166,11 @@ read-modify-write half, and they belong to WP-42, not here.**
   list version, expose on `StreamInfo` and in access logs. Makes spend *visible* before it is
   *enforceable*, which is the right order — an operator should be able to see what a budget
   would have done before one rejects traffic.
-- **3 — hand off to WP-42.** Dollar budgets, scopes, periods, enforcement. WP-42 owns it and
+- **3 — publishing a new price list at runtime.** Append-only, effective-dated, authenticated.
+  **Owned by WP-50 increment 3**, not built here: it shares a store, an admin surface, and an
+  authentication story with virtual-key and tenant administration, and building a private
+  version of all three for prices alone is how a control plane ends up with three shapes.
+- **4 — hand off to WP-42.** Dollar budgets, scopes, periods, enforcement. WP-42 owns it and
   should be re-scoped to depend on this WP rather than describing its own cost model.
 
 ## What this brief does not decide

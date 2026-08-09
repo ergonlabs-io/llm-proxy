@@ -1975,10 +1975,22 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   result has given a third party the ability to change what its customers are charged and what
   traffic is refused. That needs pinning, checksum/signature verification, and an explicit
   operator promotion step — not a background refresh.
+- **Updating prices is a MANAGEMENT operation, and this WP does not own it.** The brief's
+  first draft answered "how do you update prices?" with only "edit the config" and "fetch it
+  from somewhere", which missed the path an operator actually wants: publishing a new list to
+  a running proxy. That is the third mutating surface alongside creating a virtual key and
+  defining a tenant, it shares a store and an authentication story with both, and it belongs
+  to **WP-50 increment 3**. Two constraints it inherits from this WP: a published list is
+  **immutable** (updating means publishing a new version with a later `effective_from`, never
+  editing one, or the version stamped on an old cost record stops describing what priced it),
+  and publishing is therefore **append-only**. Note also that **the admin listener has no
+  authentication today**, so a money-affecting endpoint cannot be added to it before WP-50
+  increment 3's admin auth lands.
 - **Build:** increment 1, the price model + dialect config surface (strict validation, dotted
   paths); increment 2, cost records computed at response end, stamped with the list version
   and surfaced on `StreamInfo` and in access logs — spend becomes *visible* before it becomes
-  *enforceable*, which is the right order; increment 3 hands enforcement to WP-42.
+  *enforceable*, which is the right order; increment 3 (runtime publishing) is WP-50's;
+  increment 4 hands enforcement to WP-42.
 - **Depends on:** WP-33 ✅ (usage on live traffic), WP-48 ✅ (the saturating-arithmetic
   discipline). **Related:** WP-49 (the catalogue prices attach to), WP-44 (cost-aware routing
   needs this data but is a different feature), WP-34 (dollar limiting has the identical
