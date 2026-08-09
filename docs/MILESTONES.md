@@ -121,7 +121,26 @@ is v0.1.0.
 
 ---
 
-## v0.1.0 — LLM gateway ⬅ **current**
+## v0.1.0 — LLM gateway — **SHIPPED 2026-08-08** (tag `v0.1.0`)
+
+> **Ship decision, 2026-08-08.** Tagged on code-complete plus end-to-end verification
+> against mock upstreams, **without** the live-provider drill having been run. This is a
+> deliberate departure from the standard v0.0.1 set (which shipped on a manual live run,
+> executed and recorded), and it is recorded here as a departure rather than folded into the
+> gate text, because the next person to read this should not infer a precedent that was never
+> established.
+>
+> The drill exists and is one command:
+>
+> ```sh
+> OPENAI_API_KEY=sk-... cargo test -p diffrig --test live_gate_v0_1_0 -- --ignored
+> ```
+>
+> Three billable calls. It covers the two things mocks cannot: a token budget enforced
+> against a **real** provider's usage report, and the credential swap (a real 200 is
+> obtainable only if the proxy substituted the provider credential for the client's virtual
+> key). **If it is ever run and fails, this section is wrong and the tag is premature** — say
+> so here rather than quietly re-tagging.
 
 **Theme:** the reason this project exists — be a gateway a team chooses *because* it
 understands LLM traffic.
@@ -285,6 +304,9 @@ drill against the real binary would close it, but nothing has been written or ap
 that as of this update. Holding the release at `current` on one remaining clause, rather than
 three, is still this document's judgment call and not something the gate text forces by
 itself — recorded here so it can be argued with.
+
+*(Superseded by the ship decision at the top of this section: the drill was written
+(`testing/diffrig/tests/live_gate_v0_1_0.rs`) and the release was tagged without running it.)*
 
 ### Update, 2026-08-08 (end of day): the third clause is verified — and it was not verifiable at all before today
 

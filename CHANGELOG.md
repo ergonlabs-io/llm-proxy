@@ -25,7 +25,10 @@ TTFT/TPOT to the access log, enforces a token-based rate limit, and fails over f
 provider to another mid-request without the client seeing an error.
 
 All three clauses are verified end to end against the real binary over real sockets, not
-merely implemented:
+merely implemented — **against mock upstreams**. Unlike v0.0.1, this release was tagged
+without executing its live-provider drill; that drill exists
+(`testing/diffrig/tests/live_gate_v0_1_0.rs`, one command, three billable calls) and the
+departure from v0.0.1's standard is recorded in `docs/MILESTONES.md`.
 
 - **Token counts + TTFT/TPOT** — QA-10 (`testing/qa/scenarios/qa10_llm_latency_test.go`)
   against a mock paced at 400ms TTFT / 150ms inter-chunk: `ttft=402ms tpot=122.129ms
