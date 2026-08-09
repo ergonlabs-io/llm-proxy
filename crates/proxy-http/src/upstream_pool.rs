@@ -305,7 +305,16 @@ mod tests {
     }
 
     fn plaintext_pool(addr: SocketAddr) -> ConnectPool {
-        ConnectPool::new(addr, Arc::new(RawTransportSocket), addr.ip().to_string())
+        // Generous on purpose: these tests exercise the CACHE, not the dial
+        // budget. `connect_timeout` has its own tests in `proxy-cluster`, and
+        // a tight value here would only add timing flake to tests that are
+        // about connection reuse.
+        ConnectPool::new(
+            addr,
+            Arc::new(RawTransportSocket),
+            addr.ip().to_string(),
+            std::time::Duration::from_secs(30),
+        )
     }
 
     fn get_request() -> HttpRequestParts {
