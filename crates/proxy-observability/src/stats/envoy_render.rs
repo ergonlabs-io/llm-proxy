@@ -38,69 +38,97 @@
 //! sorted, and an unstable order would make every diff-based test against
 //! this one worthless.
 //!
-//! # The histogram line format — UNVERIFIED, isolated in [`render_histogram_line`]
+//! # The histogram line format — CONFIRMED against Envoy's own source, 2026-08-09
 //!
-//! Counters are unambiguous: `name: value`. Envoy's text `/stats`
-//! histogram line is not, and **this module could not verify its exact
-//! shape.** Before writing [`render_histogram_line`], this repo was
-//! searched for an authoritative source, in the order the WP-23 increment-3
-//! task asked for:
+//! Increment 3 shipped this as an unverified recollection (`P<n>(a,b)`
+//! space-separated pairs) because nothing in this repo could confirm or
+//! refute it. Increment 4's research had network access to
+//! `envoyproxy/envoy` itself, so this is now settled rather than guessed:
+//! fetched directly from `source/common/stats/histogram_impl.cc` and
+//! `source/server/admin/stats_render.cc` at commit
+//! `d57118924c85fcaa07758dddbb9c5da4e89045af` (`main`, fetched 2026-08-09).
 //!
-//! 1. **Vendored protos** (`crates/proxy-api/vendor/envoy/**`): the closest
-//!    thing is `envoy/config/metrics/v3/stats.proto`'s
-//!    `HistogramBucketSettings`, which is where
-//!    [`super::ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS`] is vendored from — but
-//!    that message describes bucket *boundaries* for a **sink config**, not
-//!    the admin `/stats` **text rendering**. The admin endpoint's text
-//!    output has never been a proto message; it's C++ admin-handler
-//!    formatting code, outside anything xDS vendors here.
-//! 2. **`testing/corpus`**: no stats fixtures of any kind (searched for
-//!    `histogram` and for the literal `P0(`; no hits).
-//! 3. **`testing/diffrig`**: runs a real Envoy (v1.38.0, docker-gated), but
-//!    its comparisons are all against **config parsing** output
-//!    (`configs/*.yaml` diffed against Envoy's own parsed config), never
-//!    against the admin surface. No `/stats` output has ever been captured
-//!    into this repo, in `testing/diffrig` or anywhere else (searched
-//!    repo-wide for `P0(`; no hits).
-//! 4. **Any other recorded Envoy output**: none found.
+//! `StatsTextRender::generate(..., const Stats::ParentHistogram&)` (in
+//! `stats_render.cc`) is the function that decides what a plain `/stats`
+//! request (no `histogram_buckets` query parameter — which this proxy does
+//! not implement either, so this is the only mode that applies here) prints
+//! for a histogram:
 //!
-//! **No authoritative reference exists in this repo**, and this module does
-//! not invent one by asserting a format from memory either.
-//! [`render_histogram_line`] implements a best-effort shape —
-//! `P<percentile>(<a>,<b>)` pairs, one per
-//! [`ENVOY_STATS_TEXT_PERCENTILES`], each pair nominally
-//! `(interval, cumulative)` — but that shape is a recollection, not a
-//! confirmed fact, and three things about it are recorded here so a future
-//! reader does not have to rediscover them:
+//! ```text
+//! response.addFragments({name, ": ", histogram.quantileSummary(), "\n"});
+//! ```
 //!
-//! 1. **The percentile *set* is a clearly-named constant**
-//!    ([`ENVOY_STATS_TEXT_PERCENTILES`]), not inlined, so it can be
-//!    corrected in one place if it turns out wrong.
-//! 2. **The whole line format lives in one named function.** Nothing else
-//!    in this module, or in [`render`], knows or assumes anything about a
-//!    histogram's rendered shape — an unverified format spread through the
-//!    renderer would be a defect that looks right in every test written
-//!    against it and fails against real tooling; isolating it here is the
-//!    mitigation.
-//! 3. Because [`Registry`] has no periodic-flush concept (one running,
-//!    cumulative accumulation, not a windowed "since the last flush"
-//!    figure), the two numbers in each `P<n>(a,b)` pair are currently
-//!    **the same computed percentile value** — a second, deliberate
-//!    simplification layered on top of the already-unverified pair format
-//!    itself, recorded here rather than silently guessed at.
+//! The argument is a **`ParentHistogram`**, and that is the whole subtlety:
+//! Envoy has TWO `quantileSummary()` implementations and they produce
+//! different strings.
 //!
-//! **Nothing in this file proves this format correct.** WP-23 increment
-//! 4's Grafana-dashboard conformance test is what will actually exercise
-//! real tooling against this output; until that lands, treat this as a
-//! labelled, isolated guess, not a fact.
+//! - `HistogramStatisticsImpl::quantileSummary()` (in `histogram_impl.cc`)
+//!   formats `"P{:g}: {:g}"` and joins with `", "`.
+//! - `ParentHistogramImpl::quantileSummary()` (in
+//!   `source/common/stats/thread_local_store.cc`) formats
+//!   `"P{:g}({},{})"` — the *interval* and *cumulative* quantiles as a pair —
+//!   and joins with `" "`.
+//!
+//! **The admin endpoint calls the second one.** `/stats` renders parent
+//! histograms, so the wire format is the parenthesized pair, space-joined:
+//!
+//! ```text
+//! summary.push_back(fmt::format("P{:g}({},{})", 100 * supported_quantiles_ref[i],
+//!                               interval_statistics_.computedQuantiles()[i],
+//!                               cumulative_statistics_.computedQuantiles()[i]));
+//! return absl::StrJoin(summary, " ");
+//! ```
+//!
+//! over the fixed quantile set `{0, 0.25, 0.5, 0.75, 0.90, 0.95, 0.99,
+//! 0.995, 0.999, 1}` — i.e. exactly [`ENVOY_STATS_TEXT_PERCENTILES`].
+//!
+//! **So increment 3's recollection was RIGHT**, both in the pair shape and in
+//! the space-joining, and it is confirmed here rather than replaced. An
+//! earlier pass at this section read `histogram_impl.cc` alone, concluded the
+//! pair shape was wrong, rewrote [`render_histogram_line`] to
+//! `P<n>: <value>`, and marked it confirmed — reading a real function in the
+//! real repo, just not the one the admin endpoint calls. That is the failure
+//! mode worth naming: "checked against the source" is only as good as having
+//! checked the right symbol, and a plausible near-miss reads exactly like a
+//! confirmation.
+//!
+//! This registry has no "interval since last flush" figure, only the lifetime
+//! one, so both halves of each pair carry the same value. That is a real
+//! divergence from Envoy and it is deliberate; a scraper reading the second
+//! element gets the right number.
+//!
+//! One thing the same research DID settle, and it is kept: Envoy's
+//! `used() == false` case prints `No recorded values` instead of a percentile
+//! line. [`render_histogram_line`] matches it, using this registry's
+//! `count == 0` as the equivalent of `!used()`.
+//!
+//! **One narrower thing remains unconfirmed**, isolated the same way the
+//! whole shape used to be: Envoy formats each individual number with C++'s
+//! `fmt::format("{:g}", ...)`, which is `printf`'s `%g` — roughly six
+//! significant digits, switching to scientific notation outside a threshold
+//! range, always trimming trailing zeros. Rust's default `f64` `Display`
+//! (used here) instead prints the *shortest string that round-trips exactly*
+//! back to the same `f64`, which is a different rule and can disagree with
+//! `%g` on values with more than ~6 significant digits (small integers and
+//! "nice" decimals like the ones in [`ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS`]
+//! agree under both rules, which is why the existing tests don't catch the
+//! difference). Replicating `%g` exactly was judged out of scope for this
+//! WP; this is the whole remaining gap, and it is far narrower than "the
+//! entire shape might be wrong".
 
 use super::{HistogramHandle, Instrument, Registry};
 
-/// Percentiles Envoy's `/stats` text endpoint is believed to report per
-/// histogram, in rendering order. **Part of what this module could not
-/// verify** — see the module doc's "UNVERIFIED" section. If a future
-/// increment confirms a different set (or drops the `(a,b)` pairing
-/// entirely), this is the one place that needs to change.
+/// Percentiles Envoy's `/stats` text endpoint reports per histogram, in
+/// rendering order. The quantile *set* is confirmed against
+/// `HistogramStatisticsImpl::supportedQuantiles()` in Envoy's own
+/// `source/common/stats/histogram_impl.cc` — both of Envoy's
+/// `quantileSummary()` implementations share this same fixed set. The *line
+/// format* this set is rendered into is a different symbol,
+/// `ParentHistogramImpl::quantileSummary()` in
+/// `source/common/stats/thread_local_store.cc` — see the module doc's
+/// "CONFIRMED" section for why that one, specifically, is the one the admin
+/// endpoint calls, and for the near-miss with the other `quantileSummary()`
+/// that this file's history records.
 const ENVOY_STATS_TEXT_PERCENTILES: [(&str, f64); 10] = [
     ("P0", 0.0),
     ("P25", 25.0),
@@ -204,17 +232,24 @@ fn envoy_histogram_name(instrument: &Instrument, attrs: &[(String, String)]) -> 
 }
 
 /// Renders one histogram handle's `/stats` text line body (everything
-/// after `"name: "`). **UNVERIFIED format — read the module doc before
-/// trusting this function.** Isolated here, and only here, so correcting
-/// it later (once increment 4's Grafana conformance test has actually
-/// exercised real tooling against it) touches exactly one function.
+/// after `"name: "`). **Confirmed shape** — see the module doc's "CONFIRMED"
+/// section for the exact Envoy source this was checked against. Still
+/// isolated here, and only here, so the one remaining unconfirmed detail
+/// (the module doc's `%g`-vs-`Display` note) stays contained to one
+/// function if it's ever tightened up further.
 fn render_histogram_line(registry: &Registry, handle: HistogramHandle) -> String {
+    let snapshot = registry.histogram_snapshot(handle);
+    if snapshot.count == 0 {
+        // Envoy's own `!used()` branch, in `ParentHistogramImpl`.
+        return "No recorded values".to_string();
+    }
     ENVOY_STATS_TEXT_PERCENTILES
         .iter()
         .map(|(label, p)| {
-            // Rendered as (value, value) -- see the module doc's point 3:
-            // this registry has no separate "interval since last flush"
-            // figure, only the cumulative one.
+            // `P<n>(interval,cumulative)`, space-joined. This registry has no
+            // separate "interval since last flush" figure, only the lifetime
+            // one, so both fields carry the same value -- a named divergence,
+            // not an accident.
             let value = registry.percentile(handle, *p);
             format!("{label}({value},{value})")
         })
@@ -336,7 +371,7 @@ mod tests {
     // ---- 5: the histogram line, in its own focused test --------------------
 
     #[test]
-    fn histogram_line_renders_the_chosen_unverified_format() {
+    fn histogram_line_renders_the_confirmed_pair_format() {
         let control = StatsControl::new(1);
         let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
         let registry = control.registry();
@@ -345,19 +380,33 @@ mod tests {
 
         let line = render_histogram_line(&registry, h);
 
-        // Structure only -- see the module doc for why the exact numbers
-        // are not, and cannot yet be, asserted against any external
-        // authority.
-        for (label, _) in ENVOY_STATS_TEXT_PERCENTILES {
+        // "P<n>(interval,cumulative)" entries, space-joined -- confirmed
+        // against `ParentHistogramImpl::quantileSummary()` in Envoy's own
+        // `source/common/stats/thread_local_store.cc`, the symbol the admin
+        // endpoint actually calls (see the module doc's "CONFIRMED"
+        // section). This registry has no separate interval figure, so both
+        // halves of each pair carry the same (percentile) value.
+        for (label, p) in ENVOY_STATS_TEXT_PERCENTILES {
+            let value = registry.percentile(h, p);
             assert!(
-                line.contains(&format!("{label}(")),
-                "missing {label} in histogram line: {line}"
+                line.contains(&format!("{label}({value},{value})")),
+                "missing {label}({value},{value}) in histogram line: {line}"
             );
         }
         assert_eq!(
             line.matches('(').count(),
             ENVOY_STATS_TEXT_PERCENTILES.len(),
-            "exactly one (a,b) pair per percentile: {line}"
+            "exactly one (interval,cumulative) pair per percentile: {line}"
+        );
+        assert_eq!(
+            line.matches(' ').count(),
+            ENVOY_STATS_TEXT_PERCENTILES.len() - 1,
+            "entries must be joined by a single space, not \", \": {line}"
+        );
+        assert!(
+            !line.contains(": "),
+            "the OTHER (HistogramStatisticsImpl) colon-joined shape must not appear -- \
+             that symbol is not the one /stats actually calls: {line}"
         );
 
         // Wired end to end through render() too, under its Envoy name.
@@ -365,6 +414,19 @@ mod tests {
         assert!(
             output.starts_with("cluster.x.upstream_rq_time: "),
             "output: {output}"
+        );
+    }
+
+    #[test]
+    fn histogram_with_no_observations_renders_no_recorded_values() {
+        let control = StatsControl::new(1);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
+
+        let line = render_histogram_line(&registry, h);
+        assert_eq!(
+            line, "No recorded values",
+            "matches Envoy's own !histogram.used() branch -- see the module doc"
         );
     }
 

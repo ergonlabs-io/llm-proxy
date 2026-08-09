@@ -19,7 +19,9 @@ use proxy_config::ir::{
     UpstreamProtocol, VirtualHostIR,
 };
 use proxy_core::WorkerConfigHandle;
-use proxy_observability::stats::{instruments, Registry, StatsControl, WorkerId};
+use proxy_observability::stats::{
+    instruments, prometheus_render, Registry, StatsControl, WorkerId,
+};
 use tokio::net::TcpStream;
 
 use crate::server::{serve, AdminServer};
@@ -159,6 +161,14 @@ async fn start_with_registry(
 /// A minimal hyper/1 client request over a fresh connection -- returns
 /// (status, body).
 async fn get(addr: SocketAddr, path: &str) -> (StatusCode, String) {
+    let (status, _content_type, body) = get_with_content_type(addr, path).await;
+    (status, body)
+}
+
+/// [`get`], but also returns the response's `content-type` header (empty
+/// string if absent) -- what the `/stats/prometheus` tests need to pin the
+/// exposition-format content type.
+async fn get_with_content_type(addr: SocketAddr, path: &str) -> (StatusCode, String, String) {
     let stream = TcpStream::connect(addr).await.expect("connect");
     let io = TokioIo::new(stream);
     let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
@@ -174,8 +184,17 @@ async fn get(addr: SocketAddr, path: &str) -> (StatusCode, String) {
         .unwrap();
     let resp = sender.send_request(req).await.expect("send_request");
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().expect("ascii header value").to_string())
+        .unwrap_or_default();
     let body = resp.into_body().collect().await.expect("body").to_bytes();
-    (status, String::from_utf8(body.to_vec()).expect("utf8 body"))
+    (
+        status,
+        content_type,
+        String::from_utf8(body.to_vec()).expect("utf8 body"),
+    )
 }
 
 #[tokio::test]
@@ -307,6 +326,60 @@ async fn stats_body_is_the_summed_value_across_workers() {
     assert_eq!(
         body, "cluster.openai.upstream_rq_total: 35\n",
         "must be the SUM (35), not either worker's own figure (10 or 25)"
+    );
+}
+
+/// WP-23 increment 4: same honest-404 rule as `/stats` itself when no
+/// registry is wired.
+#[tokio::test]
+async fn stats_prometheus_is_404_when_no_registry_is_wired() {
+    let (_server, addr) = start(snapshot_with_secret()).await;
+    let (status, body) = get(addr, "/stats/prometheus").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("WP-23"));
+}
+
+/// WP-23 increment 4: once a registry is wired, `/stats/prometheus` renders
+/// Prometheus text exposition format with the confirmed `envoy_`-prefixed
+/// name, and the response's `content-type` must be exactly
+/// `prometheus_render::CONTENT_TYPE` -- tying the two together so they can't
+/// drift independently.
+#[tokio::test]
+async fn stats_prometheus_returns_200_with_content_type_and_rendered_body() {
+    let control = StatsControl::new(1);
+    let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    let registry = control.registry();
+    registry.incr(WorkerId(0), h, 7);
+
+    let (_server, addr) = start_with_registry(snapshot_with_secret(), Some(registry)).await;
+    let (status, content_type, body) = get_with_content_type(addr, "/stats/prometheus").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, prometheus_render::CONTENT_TYPE);
+    assert!(
+        body.contains("# TYPE envoy_upstream_rq counter\n"),
+        "body: {body}"
+    );
+    assert!(
+        body.contains(r#"envoy_upstream_rq{cluster="openai"} 7"#),
+        "body: {body}"
+    );
+}
+
+/// The ADR-0005 trap, one more layer out for the Prometheus route too.
+#[tokio::test]
+async fn stats_prometheus_body_is_the_summed_value_across_workers() {
+    let control = StatsControl::new(2);
+    let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    let registry = control.registry();
+    registry.incr(WorkerId(0), h, 10);
+    registry.incr(WorkerId(1), h, 25);
+
+    let (_server, addr) = start_with_registry(snapshot_with_secret(), Some(registry)).await;
+    let (status, body) = get(addr, "/stats/prometheus").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(r#"envoy_upstream_rq{cluster="openai"} 35"#),
+        "must be the SUM (35), not either worker's own figure (10 or 25): {body}"
     );
 }
 
