@@ -1,8 +1,9 @@
-//! WP-23 increment 1 — the stats registry core: instruments, [`Handle`]
-//! resolution, and sharded, summed counters. Pure library: no HTTP, no
-//! `/stats` rendering, no Prometheus, no histograms, no instrumentation call
-//! sites — those are increments 2–5 (`docs/wp-23-stats-design-brief.md`,
-//! which is normative for every decision below).
+//! WP-23 increments 1–2 — the stats registry core: instruments, [`Handle`]/
+//! [`HistogramHandle`] resolution, and sharded, summed counters and
+//! histograms. Pure library: no HTTP, no `/stats` rendering, no Prometheus,
+//! no instrumentation call sites — those are increments 3–5
+//! (`docs/wp-23-stats-design-brief.md`, which is normative for every
+//! decision below).
 //!
 //! # Decision 1 — the hot path increments an index, not a name
 //!
@@ -35,7 +36,9 @@
 //! story). [`Registry`] lays out one contiguous shard per worker, indexed by
 //! [`WorkerId`], each shard holding one slot per handle. A worker only ever
 //! touches its own shard, so two workers never write the same cache line and
-//! `Relaxed` increments never contend.
+//! `Relaxed` increments never contend. Histograms (below) use exactly the
+//! same layout and the same summed-read rule — nothing about sharding
+//! changes for bucketed data.
 //!
 //! ```text
 //! value(handle) = Σ over workers of shard[worker][handle]
@@ -44,7 +47,9 @@
 //! **No public accessor returns a single shard's slot.** [`Registry::value`]
 //! sums; that is the only read. [`Registry::shard_values_for_debugging`]
 //! exists for tests only — the name is the friction, so a reviewer sees
-//! immediately when someone reaches for the un-summed figure.
+//! immediately when someone reaches for the un-summed figure. Histograms get
+//! the equivalent pair: [`Registry::histogram_snapshot`] (summed, the only
+//! read) and [`Registry::histogram_shard_snapshots_for_debugging`].
 //!
 //! `Relaxed` ordering, on both increment and read: these are counters, not
 //! synchronization. Nothing else is published through them, and a scrape
@@ -67,7 +72,8 @@
 //! config swap publishes a whole new `Registry` (the same lifecycle
 //! `ClusterManager` already uses via `ArcSwap`) rather than mutating a shared
 //! one in place — this increment does not build that publishing path, only
-//! the type that makes it safe to build.
+//! the type that makes it safe to build. [`Registry::resolve_histogram`]
+//! follows the identical rule (`&mut self`, control-side only).
 //!
 //! # Decision 3 — this is not ADR-0005's distributed case
 //!
@@ -87,6 +93,103 @@
 //! this constant is a breaking change to the metric surface** — for anyone
 //! with a dashboard built on these names, it is exactly that — and belongs
 //! in the CHANGELOG under a heading that says so.
+//!
+//! # Increment 2 — histograms
+//!
+//! ## Storage: non-cumulative bucket counts, `sum`, and `count`
+//!
+//! Each `(handle, worker)` slot stores a fixed array of **non-cumulative**
+//! per-bucket counts (bucket `i` holds only the observations that landed in
+//! bucket `i`, not "bucket `i` and below"), plus a running `sum` and a
+//! running `count`. An observation is therefore "find the bucket, bump one
+//! slot" — O(1) and allocation-free — rather than walking or rewriting every
+//! bucket >= the observed value on every call. The opposite choice (storing
+//! cumulative counts so a bucket bump touches every following bucket) is
+//! tempting because it makes rendering trivial, but it moves O(n) work onto
+//! the hot path to save O(n) work in the renderer, which runs orders of
+//! magnitude less often. Cumulative (`le`) counts are a prefix-sum over
+//! `bucket_counts`, computed where they're needed — [`Registry::percentile`]
+//! here, the increment-3/4 renderers later — never stored.
+//!
+//! ## The overflow bucket
+//!
+//! Nineteen boundaries means **twenty** slots: one bucket per boundary for
+//! `value <= boundary[i]`, plus one overflow bucket (Prometheus's `+Inf`)
+//! for anything above the last boundary. `bucket_counts.len() ==
+//! boundaries.len() + 1` throughout this module — getting that off by one
+//! is the classic histogram bug, and [`ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS`]'s
+//! test pins the count explicitly for exactly that reason.
+//!
+//! Boundaries are **inclusive** (Prometheus `le` semantics: a value exactly
+//! equal to `boundary[i]` lands in bucket `i`, not `i + 1`) — see
+//! [`Registry::observe`].
+//!
+//! ## Why not `hdrhistogram`
+//!
+//! It is already a workspace dependency (`testing/loadgen`), so it is worth
+//! writing down why it doesn't belong here rather than leaving that as an
+//! unasked question:
+//!
+//! - OTel explicit-bucket histograms and Prometheus both want **fixed,
+//!   declared boundaries** that every scrape/export can rely on staying the
+//!   same. `hdrhistogram`'s dynamic-precision buckets don't map onto a fixed
+//!   boundary set without re-bucketing on every render — which reintroduces
+//!   the O(n)-per-render cost this design avoids, just moved to a different
+//!   place.
+//! - Merging `hdrhistogram`s across worker shards is real, non-trivial work
+//!   (it has its own merge algorithm and allocates). Summing twenty `u64`s,
+//!   as this module does, is not.
+//! - The hot path must not allocate. A fixed array satisfies that trivially;
+//!   `hdrhistogram`'s dynamic structures do not offer the same guarantee.
+//!
+//! ## Percentiles live here, not in the `/stats` renderer
+//!
+//! Envoy's text `/stats` format reports **interpolated percentiles** (P0,
+//! P25, P50, P75, P90, P95, P99, P99.5, P99.9, P100), not raw buckets. The
+//! interpolation arithmetic is a pure function of bucket counts and belongs
+//! next to the data structure that owns them — [`Registry::percentile`] —
+//! rather than being reinvented inside increment 3's string formatting.
+//!
+//! ## The handle-space question: histogram handles are their own type
+//!
+//! [`HistogramHandle`] is a distinct type from [`Handle`], not the same
+//! `usize` space reused. Concretely, that means a `Handle` returned by
+//! [`Registry::resolve`] **cannot be passed to** [`Registry::observe`], and a
+//! `HistogramHandle` returned by [`Registry::resolve_histogram`] **cannot be
+//! passed to** [`Registry::incr`]/[`Registry::add`]/[`Registry::value`] —
+//! not "rejected at runtime", but a compile error, because the two types are
+//! unrelated as far as the type checker is concerned. See
+//! [`HistogramHandle`]'s doc for a `compile_fail` example proving this.
+//!
+//! This is the same argument as the `&mut self`/`&self` split above: making
+//! a mistake *impossible* is strictly better than making it *loud*, when the
+//! type system can carry the whole cost at zero runtime price (a
+//! `HistogramHandle` is exactly as cheap as a `Handle` — one `usize`). A
+//! shared handle space was the other defensible option (it would mean one
+//! index space and a runtime `kind` check inside `incr`/`observe`), but it
+//! trades a compile-time guarantee for a runtime one for no benefit, since
+//! nothing needs `Handle` and `HistogramHandle` to be interchangeable. As a
+//! second line of defense — because a *kind* mismatch is still possible even
+//! with separate handle types, e.g. calling `resolve` on a `Histogram`
+//! instrument — both `resolve` and `resolve_histogram` assert the
+//! instrument's `InstrumentKind` up front and panic loudly (control-side
+//! only, so this can never fire on the request path) rather than silently
+//! handing back a handle that the wrong storage shape backs.
+//!
+//! ## One unit mismatch, recorded but not solved here
+//!
+//! Envoy's `rq_time` is **milliseconds**; OTel's semconv duration
+//! instruments (e.g. `http.client.request.duration`) are **seconds**
+//! (float). Both are legitimate — an [`Instrument`] declares its own `unit`
+//! and its own bucket boundaries together (see
+//! [`instruments::UPSTREAM_RQ_TIME`], which carries Envoy's millisecond
+//! buckets), so nothing here assumes one global unit. **This module never
+//! converts between them.** A future seconds-based semconv histogram would
+//! carry OTel's own default boundaries under its own `unit`, unconverted.
+//! Reconciling the two into one rendered number (if increments 3/4 ever need
+//! to) is the *renderer's* problem, not the registry's — this comment is
+//! here so whoever writes that renderer finds the warning instead of
+//! rediscovering the bug.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,9 +200,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// be called out in the CHANGELOG, not just bumped in passing.
 pub const SEMCONV_VERSION: &str = "1.27.0";
 
-/// Which OTel instrument shape a metric follows. `Gauge` and `Histogram` are
-/// increment 2 (bucketed data is its own compatibility question — see the
-/// design brief).
+/// Envoy's default `rq_time`-family histogram bucket boundaries, in
+/// **milliseconds**. Vendored verbatim from
+/// `crates/proxy-api/vendor/envoy/config/metrics/v3/stats.proto`, lines
+/// 86–104 (the `histogram_bucket_settings` field's doc comment, "the
+/// following default buckets are used"). Nineteen boundaries, so any
+/// histogram using this set has **twenty** bucket slots — see the module
+/// doc's "overflow bucket" section.
+///
+/// Changing these values is a breaking change to anyone's dashboard, the
+/// same standing this module gives [`SEMCONV_VERSION`] — a bucket boundary
+/// changing shifts every rate/percentile query built against the old edges.
+/// `tests::envoy_default_histogram_buckets_are_pinned` pins all nineteen.
+pub const ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS: [f64; 19] = [
+    0.5, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,
+    60000.0, 300000.0, 600000.0, 1800000.0, 3600000.0,
+];
+
+/// Which OTel instrument shape a metric follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstrumentKind {
     /// Monotonically increasing. [`Registry::incr`] is the only way to move
@@ -109,14 +227,19 @@ pub enum InstrumentKind {
     /// May move in either direction. [`Registry::incr`] (always up) and
     /// [`Registry::add`] (signed delta, either direction) both work.
     UpDownCounter,
+    /// Bucketed observations. [`Registry::resolve_histogram`] and
+    /// [`Registry::observe`] are the only ways to build and move one — see
+    /// the module doc's "Increment 2" section for the storage and handle-
+    /// space design.
+    Histogram,
 }
 
 /// One OTel instrument's identity and shape: a name, a unit, and the set of
 /// attribute keys every measurement against it must supply — no more, no
-/// fewer. [`Registry::resolve`] checks a caller's attributes against
-/// `attribute_keys`, order-insensitively, and panics loudly on a mismatch
-/// rather than silently starting a second, parallel time series for a
-/// typo'd key.
+/// fewer. [`Registry::resolve`]/[`Registry::resolve_histogram`] check a
+/// caller's attributes against `attribute_keys`, order-insensitively, and
+/// panic loudly on a mismatch rather than silently starting a second,
+/// parallel time series for a typo'd key.
 #[derive(Debug)]
 pub struct Instrument {
     /// OTel semantic-conventions name (or this proxy's own gateway-metrics
@@ -124,20 +247,31 @@ pub struct Instrument {
     /// says which).
     pub name: &'static str,
     pub kind: InstrumentKind,
-    /// UCUM-style unit string (`"{request}"`, `"{token}"`, ...), following
-    /// OTel's own convention for instrument units.
+    /// UCUM-style unit string (`"{request}"`, `"{token}"`, `"ms"`, ...),
+    /// following OTel's own convention for instrument units. See the module
+    /// doc's "unit mismatch" note: a millisecond instrument and a
+    /// seconds-based instrument can coexist, unconverted, each carrying its
+    /// own `unit` and its own `buckets`.
     pub unit: &'static str,
     /// The attribute keys a measurement against this instrument must supply
     /// — exactly these, in any order. See [`Registry::resolve`].
     pub attribute_keys: &'static [&'static str],
+    /// Histogram bucket boundaries, in `unit`, ascending, exclusive of the
+    /// implicit overflow bucket. `Some` if and only if `kind` is
+    /// [`InstrumentKind::Histogram`] — [`Registry::resolve_histogram`] and
+    /// [`Registry::observe`] both rely on that invariant and panic loudly if
+    /// it doesn't hold (a `Histogram` instrument with `None` here is a
+    /// programming error in the instrument's own `const` definition, not
+    /// something a caller can trigger).
+    pub buckets: Option<&'static [f64]>,
 }
 
 /// A small starter set of instruments — enough to exercise the resolve/incr/
-/// value model end to end, not the full Envoy stats surface (that is
+/// value/observe model end to end, not the full Envoy stats surface (that is
 /// increment 5). Named `instruments` so call sites read as
 /// `instruments::UPSTREAM_RQ`, matching the design brief's own examples.
 pub mod instruments {
-    use super::{Instrument, InstrumentKind};
+    use super::{Instrument, InstrumentKind, ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS};
 
     /// Upstream requests issued to a cluster, one per request.
     ///
@@ -153,6 +287,7 @@ pub mod instruments {
         kind: InstrumentKind::Counter,
         unit: "{request}",
         attribute_keys: &["cluster"],
+        buckets: None,
     };
 
     /// Downstream connections accepted on a listener.
@@ -165,6 +300,7 @@ pub mod instruments {
         kind: InstrumentKind::Counter,
         unit: "{connection}",
         attribute_keys: &["listener"],
+        buckets: None,
     };
 
     /// Tokens consumed by a GenAI request/response exchange. **Has no Envoy
@@ -174,23 +310,44 @@ pub mod instruments {
     ///
     /// The real OTel GenAI semantic conventions define
     /// `gen_ai.client.token.usage` as a *histogram* (a per-request token
-    /// count distribution), not a counter. Until increment 2 adds histogram
-    /// support this starter models it as a running-total `Counter` instead
-    /// — same name and identity, coarser aggregation — so the model can be
-    /// exercised before buckets exist. Attribute keys (`provider`, `type`)
-    /// match the design brief's own table rather than the semconv's fully
-    /// qualified `gen_ai.provider.name` / `gen_ai.token.type`; the
-    /// increment-4 Prometheus renderer is where full key names matter.
+    /// count distribution), not a counter. This starter still models it as a
+    /// running-total `Counter` rather than switching it to a `Histogram` now
+    /// that increment 2 has landed — that switch needs its own bucket
+    /// boundaries (OTel doesn't mandate Envoy's millisecond `rq_time` set
+    /// for a token count) and is increment 5's call, not this one's. Keeping
+    /// it a `Counter` here avoids guessing at that number now. Attribute
+    /// keys (`provider`, `type`) match the design brief's own table rather
+    /// than the semconv's fully qualified `gen_ai.provider.name` /
+    /// `gen_ai.token.type`; the increment-4 Prometheus renderer is where
+    /// full key names matter.
     pub const GEN_AI_CLIENT_TOKEN_USAGE: Instrument = Instrument {
         name: "gen_ai.client.token.usage",
         kind: InstrumentKind::Counter,
         unit: "{token}",
         attribute_keys: &["provider", "type"],
+        buckets: None,
+    };
+
+    /// Upstream request duration, per cluster, in **milliseconds**.
+    ///
+    /// Mirrors Envoy's own `upstream_rq_time` stat family directly (see the
+    /// design brief, Decision 4), carrying Envoy's default `rq_time` bucket
+    /// boundaries so the increment-3 `/stats` renderer's percentile output
+    /// (`cluster.<name>.upstream_rq_time` P50/P90/P99/...) matches what
+    /// Envoy itself would report for the same distribution. See the module
+    /// doc's "unit mismatch" note: this is milliseconds, not the OTel
+    /// semconv seconds convention, and nothing here converts between them.
+    pub const UPSTREAM_RQ_TIME: Instrument = Instrument {
+        name: "upstream_rq_time",
+        kind: InstrumentKind::Histogram,
+        unit: "ms",
+        attribute_keys: &["cluster"],
+        buckets: Some(&ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS),
     };
 }
 
 /// Identifies a worker thread/runtime for [`Registry::incr`]/
-/// [`Registry::add`]'s shard indexing.
+/// [`Registry::add`]/[`Registry::observe`]'s shard indexing.
 ///
 /// Rust note: this deliberately mirrors `proxy_core::runtime::WorkerId`'s
 /// shape (`WorkerId(pub usize)`) rather than reusing it. `proxy-core`
@@ -203,26 +360,154 @@ pub mod instruments {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkerId(pub usize);
 
-/// An opaque handle to one resolved `(instrument, attribute set)` pair.
-/// Returned by [`Registry::resolve`]; carries no name, no attributes — that
-/// is the point (see the module doc's Decision 1). The inner `usize` is
-/// private to this module: outside it, a `Handle` can only be obtained from
-/// `resolve` and only used by handing it back to `incr`/`add`/`value`.
+/// An opaque handle to one resolved `(counter/up-down-counter instrument,
+/// attribute set)` pair. Returned by [`Registry::resolve`]; carries no name,
+/// no attributes — that is the point (see the module doc's Decision 1). The
+/// inner `usize` is private to this module: outside it, a `Handle` can only
+/// be obtained from `resolve` and only used by handing it back to
+/// `incr`/`add`/`value`.
+///
+/// **Not the same type as [`HistogramHandle`]** — see the module doc's
+/// "handle-space question" section for why they are deliberately distinct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Handle(usize);
 
-/// Dedup key for [`Registry::resolve`]: an instrument's name plus its
-/// attributes, sorted into a stable order. Named as a `type` alias (rather
-/// than inlined into `Registry`'s field) purely to keep that field
-/// declaration readable — clippy's `type_complexity` lint flagged the
-/// inline form.
+/// An opaque handle to one resolved `(histogram instrument, attribute set)`
+/// pair. Returned by [`Registry::resolve_histogram`]; used only with
+/// [`Registry::observe`].
+///
+/// A **distinct type from [`Handle`]**, occupying its own index space, so
+/// this and `Handle` can never be confused for one another — passing one
+/// where the other is expected is a compile error, not a runtime check:
+///
+/// ```compile_fail
+/// use proxy_observability::stats::{instruments, Registry, WorkerId};
+///
+/// let mut registry = Registry::new(1);
+/// let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+/// // ERROR: expected `HistogramHandle`, found `Handle`.
+/// registry.observe(WorkerId(0), h, 1.0);
+/// ```
+///
+/// and the mirror image:
+///
+/// ```compile_fail
+/// use proxy_observability::stats::{instruments, Registry, WorkerId};
+///
+/// let mut registry = Registry::new(1);
+/// let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "openai")]);
+/// // ERROR: expected `Handle`, found `HistogramHandle`.
+/// registry.incr(WorkerId(0), h, 1);
+/// ```
+///
+/// See the module doc's "handle-space question" section for why this was
+/// chosen over a shared index space with a runtime `kind` check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistogramHandle(usize);
+
+/// Dedup key for [`Registry::resolve`]/[`Registry::resolve_histogram`]: an
+/// instrument's name plus its attributes, sorted into a stable order. Named
+/// as a `type` alias (rather than inlined into `Registry`'s field) purely to
+/// keep that field declaration readable — clippy's `type_complexity` lint
+/// flagged the inline form.
 type ResolveKey = (&'static str, Vec<(String, String)>);
 
-/// The stats registry: resolves `(instrument, attrs)` into [`Handle`]s at
-/// config-lowering time, and stores per-worker, per-handle counters that
-/// [`Registry::value`] sums on read. See the module doc for the full design
-/// — in particular why `resolve` takes `&mut self` while every hot-path
-/// method takes `&self`.
+/// One worker shard's histogram state for one handle. Bucket counts are
+/// **non-cumulative** (see the module doc); `sum` and `count` are running
+/// totals updated alongside the bucket bump on every [`Registry::observe`]
+/// call. [`Registry::histogram_snapshot`] sums this across every worker
+/// shard, the same summed-read rule counters use.
+struct HistogramShard {
+    /// `bucket_counts[i]` is the count of observations that landed in
+    /// bucket `i` — `(boundary[i-1], boundary[i]]` for `i > 0`, `(-inf,
+    /// boundary[0]]` for `i == 0`, with `boundary` from the owning
+    /// instrument's `buckets`. Index `boundaries.len()` (the last slot) is
+    /// the overflow bucket, Prometheus's `+Inf`, for anything above the
+    /// last boundary — so this `Vec` always has `boundaries.len() + 1`
+    /// entries, never `boundaries.len()`.
+    bucket_counts: Vec<AtomicU64>,
+    /// Sum of every observed value, in the instrument's declared `unit`,
+    /// stored as the raw bit pattern of an `f64` inside an `AtomicU64`.
+    ///
+    /// Rust note: `std` has no `AtomicF64` (only integer atomics), so this
+    /// is the standard bit-cast CAS-loop technique — see
+    /// [`atomic_add_f64`]'s doc for the loop itself. The bits are never
+    /// interpreted as an integer; `AtomicU64` here is purely a box that
+    /// happens to be atomic and 64 bits wide.
+    sum_bits: AtomicU64,
+    /// Total observation count for this shard — equal to the sum of
+    /// `bucket_counts`, but kept as its own atomic so a reader doesn't have
+    /// to walk every bucket just to get the count.
+    count: AtomicU64,
+}
+
+impl HistogramShard {
+    /// Builds a fresh, all-zero shard with `num_buckets` slots
+    /// (`boundaries.len() + 1` — see [`Self::bucket_counts`]'s doc).
+    fn new(num_buckets: usize) -> Self {
+        Self {
+            // Rust note: same reason as `Registry::new`'s shard construction
+            // below -- `AtomicU64` isn't `Clone`, so `vec![AtomicU64::new(0);
+            // n]` doesn't typecheck; building each slot from a fresh
+            // constructor call sidesteps that.
+            bucket_counts: (0..num_buckets).map(|_| AtomicU64::new(0)).collect(),
+            // 0.0f64.to_bits() == 0, so this is "no observations yet" both
+            // as bits and as the f64 they represent.
+            sum_bits: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Atomically adds `delta` to the `f64` value stored, bit-for-bit, inside
+/// `atomic`.
+///
+/// Rust note: `std::sync::atomic` has no `AtomicF64` (floats have no
+/// hardware fetch-add instruction the way integers do), so this is the
+/// standard compare-and-swap loop for atomic float accumulation: load the
+/// current bits, reinterpret them as `f64`, add `delta`, reinterpret the
+/// result back to bits, and try to swap it in — retrying with whatever the
+/// racing thread actually left behind if the swap loses the race.
+/// `compare_exchange_weak` (not the non-`_weak` form) is correct here
+/// because a spurious failure just means "loop again with a fresh load",
+/// which the loop already does. `Relaxed` throughout for the same reason
+/// every other counter/histogram field in this module uses it: nothing else
+/// is published through this value.
+fn atomic_add_f64(atomic: &AtomicU64, delta: f64) {
+    let mut current = atomic.load(Ordering::Relaxed);
+    loop {
+        let next = (f64::from_bits(current) + delta).to_bits();
+        match atomic.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// A summed-across-shards view of one histogram handle's state: the same
+/// three fields [`HistogramShard`] stores per shard, after
+/// [`Registry::histogram_snapshot`]/[`Registry::histogram_shard_snapshots_for_debugging`]
+/// have added them up (or, for the debugging accessor, left them as one
+/// shard's own figures).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSnapshot {
+    /// Non-cumulative bucket counts, `boundaries.len() + 1` entries — see
+    /// [`HistogramShard::bucket_counts`]'s doc for the indexing and the
+    /// overflow bucket.
+    pub bucket_counts: Vec<u64>,
+    /// Sum of every observed value.
+    pub sum: f64,
+    /// Total observation count (`== bucket_counts.iter().sum()`).
+    pub count: u64,
+}
+
+/// The stats registry: resolves `(instrument, attrs)` into [`Handle`]s (for
+/// counters/up-down-counters) or [`HistogramHandle`]s (for histograms) at
+/// config-lowering time, and stores per-worker, per-handle data that
+/// [`Registry::value`]/[`Registry::histogram_snapshot`] sum on read. See the
+/// module doc for the full design — in particular why `resolve`/
+/// `resolve_histogram` take `&mut self` while every hot-path method takes
+/// `&self`.
 pub struct Registry {
     /// Indexed by `Handle`'s inner `usize`. Kept so `incr`/`add` can look up
     /// an instrument's kind (to enforce "Counters don't decrement") and a
@@ -244,6 +529,16 @@ pub struct Registry {
     /// exists has a slot in every shard — see the module doc for why that
     /// growth can't race a concurrent `incr`/`value`.
     shards: Vec<Vec<AtomicU64>>,
+    /// Same role as `resolved`, for [`HistogramHandle`]s. A separate `Vec`
+    /// in its own index space — see the module doc's "handle-space
+    /// question".
+    resolved_histograms: Vec<&'static Instrument>,
+    /// Same role as `lookup`, for histograms.
+    histogram_lookup: HashMap<ResolveKey, HistogramHandle>,
+    /// `histogram_shards[worker.0][handle.0]` is that worker's
+    /// [`HistogramShard`] for that histogram handle. Grown in lockstep by
+    /// `resolve_histogram`, same invariant as `shards`.
+    histogram_shards: Vec<Vec<HistogramShard>>,
 }
 
 impl Registry {
@@ -261,6 +556,9 @@ impl Registry {
             // would silently split one counter into two). Building each
             // shard from a fresh closure call sidesteps the bound entirely.
             shards: (0..num_workers).map(|_| Vec::new()).collect(),
+            resolved_histograms: Vec::new(),
+            histogram_lookup: HashMap::new(),
+            histogram_shards: (0..num_workers).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -275,16 +573,22 @@ impl Registry {
     ///
     /// Panics if `attrs`' keys don't exactly match `instrument.attribute_keys`
     /// (missing or unexpected) — loudly, on purpose: a typo'd attribute key
-    /// must not silently start a second, parallel time series.
+    /// must not silently start a second, parallel time series. Also panics
+    /// if `instrument.kind` is [`InstrumentKind::Histogram`] — use
+    /// [`Self::resolve_histogram`] for those; see the module doc's
+    /// "handle-space question" for why this is checked here rather than
+    /// left to produce a `Handle` that `incr`/`add` would then have to
+    /// reject.
     pub fn resolve(&mut self, instrument: &'static Instrument, attrs: &[(&str, &str)]) -> Handle {
+        assert_ne!(
+            instrument.kind,
+            InstrumentKind::Histogram,
+            "stats::Registry::resolve: {} is a Histogram -- use resolve_histogram()",
+            instrument.name
+        );
         Self::validate_attrs(instrument, attrs);
 
-        let mut pairs: Vec<(String, String)> = attrs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        pairs.sort();
-        let key = (instrument.name, pairs);
+        let key = Self::resolve_key(instrument, attrs);
 
         if let Some(&handle) = self.lookup.get(&key) {
             return handle;
@@ -299,10 +603,73 @@ impl Registry {
         handle
     }
 
+    /// The histogram counterpart of [`Self::resolve`] — same identity,
+    /// dedup, and `&mut self` rules, but returns a [`HistogramHandle`] in
+    /// its own index space and allocates a [`HistogramShard`] (sized off
+    /// `instrument.buckets`) per worker instead of a single `AtomicU64`.
+    ///
+    /// Panics if `attrs`' keys don't match `instrument.attribute_keys`, same
+    /// as `resolve`. Panics if `instrument.kind` is not
+    /// [`InstrumentKind::Histogram`], or if a `Histogram` instrument's
+    /// `buckets` is `None` (a malformed `const` definition, not something a
+    /// caller can cause) — both loudly, both control-side only.
+    pub fn resolve_histogram(
+        &mut self,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+    ) -> HistogramHandle {
+        assert_eq!(
+            instrument.kind,
+            InstrumentKind::Histogram,
+            "stats::Registry::resolve_histogram: {} is not a Histogram -- use resolve()",
+            instrument.name
+        );
+        let num_boundaries = instrument
+            .buckets
+            .unwrap_or_else(|| {
+                panic!(
+                    "stats::Registry::resolve_histogram: {} is a Histogram instrument with no \
+                     bucket boundaries -- this is a bug in the instrument's own definition",
+                    instrument.name
+                )
+            })
+            .len();
+        Self::validate_attrs(instrument, attrs);
+
+        let key = Self::resolve_key(instrument, attrs);
+
+        if let Some(&handle) = self.histogram_lookup.get(&key) {
+            return handle;
+        }
+
+        let handle = HistogramHandle(self.resolved_histograms.len());
+        self.resolved_histograms.push(instrument);
+        // Nineteen boundaries means twenty slots -- see the module doc's
+        // "overflow bucket" section.
+        let num_buckets = num_boundaries + 1;
+        for shard in &mut self.histogram_shards {
+            shard.push(HistogramShard::new(num_buckets));
+        }
+        self.histogram_lookup.insert(key, handle);
+        handle
+    }
+
+    /// Builds the sorted `(instrument.name, attrs)` dedup key shared by
+    /// `resolve` and `resolve_histogram`. Attribute order must not affect
+    /// identity, hence the sort.
+    fn resolve_key(instrument: &Instrument, attrs: &[(&str, &str)]) -> ResolveKey {
+        let mut pairs: Vec<(String, String)> = attrs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        pairs.sort();
+        (instrument.name, pairs)
+    }
+
     /// Checks `attrs`' keys against `instrument.attribute_keys` as sets
-    /// (order-insensitive, exact match). Called only from `resolve`, which
-    /// is control-side, so panicking here is fine — it can never fire on
-    /// the request path.
+    /// (order-insensitive, exact match). Called only from `resolve`/
+    /// `resolve_histogram`, which are control-side, so panicking here is
+    /// fine — it can never fire on the request path.
     fn validate_attrs(instrument: &Instrument, attrs: &[(&str, &str)]) {
         let mut given: Vec<&str> = attrs.iter().map(|(k, _)| *k).collect();
         given.sort_unstable();
@@ -381,6 +748,164 @@ impl Registry {
             .iter()
             .map(|shard| shard[handle.0].load(Ordering::Relaxed))
             .collect()
+    }
+
+    /// Hot path. Records one observation of `value` (in the instrument's
+    /// declared `unit`) against `handle`: finds `value`'s bucket and bumps
+    /// its non-cumulative count, adds `value` into the running `sum`, and
+    /// bumps the running `count` — three atomic ops, no allocation, no
+    /// walking every bucket.
+    ///
+    /// Bucket boundaries are **inclusive**: `value` lands in the first
+    /// bucket `i` with `value <= boundaries[i]` (Prometheus `le` semantics),
+    /// or the overflow bucket (index `boundaries.len()`) if `value` exceeds
+    /// every boundary.
+    ///
+    /// Panics if `worker` is out of range, same as `incr`/`add`.
+    pub fn observe(&self, worker: WorkerId, handle: HistogramHandle, value: f64) {
+        let instrument = self.resolved_histograms[handle.0];
+        let boundaries = instrument.buckets.expect(
+            "stats::Registry::observe: instrument has no bucket boundaries -- \
+             resolve_histogram should have rejected this at resolve time",
+        );
+        let bucket_index = boundaries
+            .iter()
+            .position(|&boundary| value <= boundary)
+            .unwrap_or(boundaries.len());
+
+        let shard = &self.histogram_shards[worker.0][handle.0];
+        shard.bucket_counts[bucket_index].fetch_add(1, Ordering::Relaxed);
+        atomic_add_f64(&shard.sum_bits, value);
+        shard.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Summed across every worker shard. **The only read** for histogram
+    /// data — see [`Self::histogram_shard_snapshots_for_debugging`] for the
+    /// debug-only, unsummed per-shard view. `Relaxed` loads throughout, same
+    /// justification as `value`.
+    pub fn histogram_snapshot(&self, handle: HistogramHandle) -> HistogramSnapshot {
+        let num_buckets = self.resolved_histograms[handle.0]
+            .buckets
+            .expect("stats::Registry::histogram_snapshot: instrument has no bucket boundaries")
+            .len()
+            + 1;
+
+        let mut bucket_counts = vec![0u64; num_buckets];
+        let mut sum = 0.0f64;
+        let mut count = 0u64;
+        for worker_shards in &self.histogram_shards {
+            let shard = &worker_shards[handle.0];
+            for (i, bucket) in shard.bucket_counts.iter().enumerate() {
+                bucket_counts[i] = bucket_counts[i].wrapping_add(bucket.load(Ordering::Relaxed));
+            }
+            sum += f64::from_bits(shard.sum_bits.load(Ordering::Relaxed));
+            count = count.wrapping_add(shard.count.load(Ordering::Relaxed));
+        }
+        HistogramSnapshot {
+            bucket_counts,
+            sum,
+            count,
+        }
+    }
+
+    /// Per-worker snapshots, **unsummed**. Exists for tests only — same
+    /// deliberate-friction naming as [`Self::shard_values_for_debugging`].
+    pub fn histogram_shard_snapshots_for_debugging(
+        &self,
+        handle: HistogramHandle,
+    ) -> Vec<HistogramSnapshot> {
+        self.histogram_shards
+            .iter()
+            .map(|worker_shards| {
+                let shard = &worker_shards[handle.0];
+                HistogramSnapshot {
+                    bucket_counts: shard
+                        .bucket_counts
+                        .iter()
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .collect(),
+                    sum: f64::from_bits(shard.sum_bits.load(Ordering::Relaxed)),
+                    count: shard.count.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    /// The `p`-th percentile (`p` in `[0, 100]`) of `handle`'s observations,
+    /// summed across every worker shard, using **linear interpolation
+    /// within the landing bucket** — what Envoy's `/stats` text format
+    /// reports for P0/P25/.../P100, and increment 3's job to *render*, not
+    /// to compute (see the module doc).
+    ///
+    /// Defined edge cases, so none of them are an accidental `NaN` or panic:
+    /// - **Empty histogram** (`count == 0`): returns `0.0`. There is no
+    ///   observation to derive a percentile from; `0.0` is a deliberate,
+    ///   documented choice, not a fallen-through default.
+    /// - **P0**: the lower edge of the first (lowest-boundary) bucket that
+    ///   has any observations.
+    /// - **P100**: the upper edge of the last (highest-boundary) bucket
+    ///   that has any observations.
+    /// - **All observations in one bucket**: interpolates linearly between
+    ///   that bucket's lower and upper edge as `p` moves from 0 to 100 —
+    ///   it does not snap to the bucket's boundary value regardless of `p`.
+    /// - **Target falls in the overflow bucket**: the overflow bucket has
+    ///   no declared upper edge (nothing above the last boundary is
+    ///   tracked more precisely than "some value above it"), so this
+    ///   returns that bucket's *lower* edge (the last real boundary) —
+    ///   the same convention Prometheus's own `histogram_quantile` uses for
+    ///   its `+Inf` bucket, for the same reason: interpolating towards an
+    ///   upper bound we have no data for would be inventing precision.
+    ///
+    /// Panics if `p` is outside `[0, 100]` — a caller bug, not a data
+    /// condition.
+    pub fn percentile(&self, handle: HistogramHandle, p: f64) -> f64 {
+        assert!(
+            (0.0..=100.0).contains(&p),
+            "stats::Registry::percentile: p must be in [0, 100], got {p}"
+        );
+
+        let snapshot = self.histogram_snapshot(handle);
+        if snapshot.count == 0 {
+            return 0.0;
+        }
+
+        let instrument = self.resolved_histograms[handle.0];
+        let boundaries = instrument
+            .buckets
+            .expect("stats::Registry::percentile: instrument has no bucket boundaries");
+
+        let last_nonzero = snapshot
+            .bucket_counts
+            .iter()
+            .rposition(|&c| c > 0)
+            .expect("count > 0 implies at least one non-empty bucket");
+
+        let target = (p / 100.0) * snapshot.count as f64;
+        let mut cumulative_before = 0u64;
+        for (i, &count) in snapshot.bucket_counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let cumulative_after = cumulative_before + count;
+            let lower = if i == 0 { 0.0 } else { boundaries[i - 1] };
+            // Overflow bucket (i == boundaries.len()): no declared upper
+            // edge, so fall back to its lower edge -- see the doc above.
+            let upper = if i < boundaries.len() {
+                boundaries[i]
+            } else {
+                lower
+            };
+
+            if target <= cumulative_after as f64 || i == last_nonzero {
+                let fraction = ((target - cumulative_before as f64) / count as f64).clamp(0.0, 1.0);
+                return lower + fraction * (upper - lower);
+            }
+            cumulative_before = cumulative_after;
+        }
+        // Unreachable given count > 0 (the loop above always returns from
+        // the `last_nonzero` bucket at the latest), but a defensible
+        // fallback rather than a panic if it's ever reached.
+        *boundaries.last().unwrap_or(&0.0)
     }
 }
 
@@ -528,6 +1053,7 @@ mod tests {
             kind: InstrumentKind::UpDownCounter,
             unit: "{connection}",
             attribute_keys: &["listener"],
+            buckets: None,
         };
 
         let mut registry = Registry::new(1);
@@ -566,5 +1092,234 @@ mod tests {
         // exists so bumping the literal without doing that is at least a
         // deliberate, visible edit to this assertion, not a drive-by.
         assert_eq!(SEMCONV_VERSION, "1.27.0");
+    }
+
+    // ==== Increment 2: histograms ==========================================
+
+    // ---- 9: all nineteen Envoy default boundaries are pinned -------------
+
+    #[test]
+    fn envoy_default_histogram_buckets_are_pinned() {
+        // Vendored from
+        // crates/proxy-api/vendor/envoy/config/metrics/v3/stats.proto,
+        // lines 86-104. Changing any of these values is a breaking change
+        // to anyone's dashboard -- the same standing this module gives
+        // SEMCONV_VERSION -- so a change here must be a deliberate, visible
+        // edit to this assertion, not a drive-by.
+        assert_eq!(
+            ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS,
+            [
+                0.5, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+                10000.0, 30000.0, 60000.0, 300000.0, 600000.0, 1800000.0, 3600000.0,
+            ]
+        );
+        assert_eq!(
+            ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS.len(),
+            19,
+            "nineteen boundaries -- twenty bucket slots once the overflow bucket is added"
+        );
+    }
+
+    // ---- 10: an observation lands in the correct bucket, table-driven ----
+
+    #[test]
+    fn observation_lands_in_the_correct_bucket() {
+        // (observed value, expected bucket index). Boundaries are
+        // ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS:
+        //   [0]=0.5 [1]=1 [2]=5 [3]=10 [4]=25 ... [18]=3_600_000
+        // Boundaries are INCLUSIVE (Prometheus `le`): a value exactly on a
+        // boundary lands in that boundary's own bucket, not the next one.
+        let cases: &[(f64, usize)] = &[
+            (0.0, 0), // below the first boundary
+            (0.5, 0), // exactly on the first boundary -- inclusive
+            (0.4, 0),
+            (0.6, 1), // just above 0.5, below 1
+            (1.0, 1), // exactly on the second boundary -- inclusive
+            (5.0, 2), // exactly on a middle boundary -- inclusive
+            (7.0, 3), // strictly between two boundaries (5, 10]
+            (3_600_000.0, 18), // exactly on the LAST boundary -- inclusive,
+                      // still lands in the last real bucket, not overflow
+        ];
+
+        for &(value, expected_bucket) in cases {
+            let mut registry = Registry::new(1);
+            let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+            registry.observe(WorkerId(0), h, value);
+
+            let snapshot = registry.histogram_snapshot(h);
+            assert_eq!(
+                snapshot.bucket_counts[expected_bucket], 1,
+                "value {value} expected in bucket {expected_bucket}, got counts {:?}",
+                snapshot.bucket_counts
+            );
+            assert_eq!(
+                snapshot.bucket_counts.iter().sum::<u64>(),
+                1,
+                "value {value} must land in exactly one bucket"
+            );
+        }
+    }
+
+    // ---- 11: an observation above the last boundary lands in overflow ----
+
+    #[test]
+    fn observation_above_last_boundary_lands_in_overflow_bucket() {
+        let mut registry = Registry::new(1);
+        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+
+        // Strictly greater than the last boundary, 3_600_000.
+        registry.observe(WorkerId(0), h, 3_600_000.1);
+        registry.observe(WorkerId(0), h, 10_000_000.0);
+
+        let snapshot = registry.histogram_snapshot(h);
+        assert_eq!(
+            snapshot.bucket_counts.len(),
+            20,
+            "19 boundaries -> 20 bucket slots (19 boundary buckets + 1 overflow)"
+        );
+        let overflow_index = snapshot.bucket_counts.len() - 1;
+        assert_eq!(
+            snapshot.bucket_counts[overflow_index], 2,
+            "both above-last-boundary observations must land in the overflow bucket"
+        );
+        // Nothing leaked into the last *finite* boundary's bucket.
+        assert_eq!(snapshot.bucket_counts[18], 0);
+        assert_eq!(snapshot.count, 2);
+    }
+
+    // ---- 12: bucket counts, sum, and count all sum across worker shards --
+
+    #[test]
+    fn histogram_bucket_counts_sum_and_count_sum_across_worker_shards() {
+        let mut registry = Registry::new(3);
+        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+
+        // Worker 0: two observations in the (5, 10] bucket (index 3).
+        registry.observe(WorkerId(0), h, 7.0);
+        registry.observe(WorkerId(0), h, 8.0);
+        // Worker 1: one observation in the same bucket, one in overflow.
+        registry.observe(WorkerId(1), h, 9.0);
+        registry.observe(WorkerId(1), h, 5_000_000.0);
+        // Worker 2: nothing.
+
+        let snapshot = registry.histogram_snapshot(h);
+        assert_eq!(snapshot.bucket_counts[3], 3, "3 observations in (5, 10]");
+        assert_eq!(snapshot.bucket_counts[19], 1, "1 observation in overflow");
+        assert_eq!(snapshot.count, 4);
+        assert_eq!(snapshot.sum, 7.0 + 8.0 + 9.0 + 5_000_000.0);
+
+        // The ADR-0005 trap again, for histograms: the summed snapshot must
+        // differ from any single shard's own figures.
+        let per_shard = registry.histogram_shard_snapshots_for_debugging(h);
+        assert_eq!(per_shard.len(), 3);
+        for shard_snapshot in &per_shard {
+            assert_ne!(
+                shard_snapshot.count, snapshot.count,
+                "no single shard recorded all 4 observations"
+            );
+            assert_ne!(
+                shard_snapshot.sum, snapshot.sum,
+                "no single shard's sum equals the cross-shard total"
+            );
+            assert_ne!(
+                *shard_snapshot, snapshot,
+                "no single shard's full snapshot equals the summed one"
+            );
+        }
+        // And the pieces really do add up: summing every per-shard bucket
+        // count equals the registry's own summed snapshot.
+        let bucket_total: u64 = per_shard
+            .iter()
+            .flat_map(|s| s.bucket_counts.iter())
+            .sum::<u64>();
+        assert_eq!(bucket_total, snapshot.bucket_counts.iter().sum::<u64>());
+    }
+
+    // ---- 13: percentile edges: P0, P100, empty, all-in-one-bucket --------
+
+    #[test]
+    fn percentile_of_empty_histogram_is_documented_zero_not_nan_or_panic() {
+        let mut registry = Registry::new(1);
+        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+
+        for p in [0.0, 50.0, 99.9, 100.0] {
+            let result = registry.percentile(h, p);
+            assert_eq!(
+                result, 0.0,
+                "empty histogram's P{p} must be the documented 0.0"
+            );
+            assert!(!result.is_nan());
+        }
+    }
+
+    #[test]
+    fn percentile_edges_of_all_observations_in_one_bucket() {
+        // All four observations land in the (5, 10] bucket (index 3):
+        // boundaries[2] = 5 (lower edge), boundaries[3] = 10 (upper edge).
+        let mut registry = Registry::new(1);
+        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        for value in [6.0, 7.0, 8.0, 9.0] {
+            registry.observe(WorkerId(0), h, value);
+        }
+
+        assert_eq!(
+            registry.percentile(h, 0.0),
+            5.0,
+            "P0 is the bucket's lower edge"
+        );
+        assert_eq!(
+            registry.percentile(h, 100.0),
+            10.0,
+            "P100 is the bucket's upper edge"
+        );
+        // Interpolated midpoint -- NOT snapped to either boundary, and not
+        // equal to any of the four actual observed values (this is bucket-
+        // count-based interpolation, not exact-value ranking).
+        let p50 = registry.percentile(h, 50.0);
+        assert_eq!(p50, 7.5, "P50 within a single bucket interpolates linearly");
+        assert_ne!(p50, 5.0);
+        assert_ne!(p50, 10.0);
+    }
+
+    // ---- 14: a percentile between two boundaries interpolates ------------
+
+    #[test]
+    fn percentile_spanning_two_buckets_interpolates_rather_than_snapping() {
+        let mut registry = Registry::new(1);
+        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+
+        // One observation in (1, 5] (index 2), one in (5, 10] (index 3).
+        registry.observe(WorkerId(0), h, 3.0);
+        registry.observe(WorkerId(0), h, 8.0);
+
+        // target = 0.75 * 2 = 1.5, which falls inside the second bucket
+        // (cumulative after bucket 2 is 1, after bucket 3 is 2):
+        // fraction = (1.5 - 1) / 1 = 0.5 -> 5 + 0.5 * (10 - 5) = 7.5.
+        let p75 = registry.percentile(h, 75.0);
+        assert_eq!(p75, 7.5);
+        assert_ne!(p75, 5.0, "must not snap to the lower boundary");
+        assert_ne!(p75, 10.0, "must not snap to the upper boundary");
+    }
+
+    // ---- 15: a counter handle used with observe (or vice versa) does not
+    //          compile -- see HistogramHandle's `compile_fail` doctests for
+    //          the machine-checked proof. What remains for a runtime test is
+    //          the *kind* mismatch a shared handle-space check would also
+    //          need to reject: passing the wrong kind of instrument to
+    //          resolve/resolve_histogram, which is checked at resolve time
+    //          rather than deferred to incr/observe.
+
+    #[test]
+    #[should_panic(expected = "is a Histogram")]
+    fn resolve_rejects_a_histogram_instrument() {
+        let mut registry = Registry::new(1);
+        registry.resolve(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a Histogram")]
+    fn resolve_histogram_rejects_a_counter_instrument() {
+        let mut registry = Registry::new(1);
+        registry.resolve_histogram(&instruments::UPSTREAM_RQ, &[("cluster", "x")]);
     }
 }
