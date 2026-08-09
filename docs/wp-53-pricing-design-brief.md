@@ -122,28 +122,52 @@ wildcard route (`model: "*"`) cannot be, which is why the runtime rule above sti
 **Increment 1: operator config**, exactly as virtual keys do today. It is honest, needs no
 network, and works offline.
 
-**Increment 2 (added 2026-08-08, after this brief initially missed it): pushed through the
-admin API.** The original ask was support for *updating* versioned pricing, and the first
-draft of this section answered only "edit the config file" and "fetch it from somewhere" —
-skipping the path an operator actually wants, which is posting a new price list to a running
-proxy without a config reload.
+### Owner decision, 2026-08-08: config or file, and that is the whole update path
 
-This is a **management operation**, and it is the third mutating surface alongside creating a
-virtual key and defining a tenant. All three belong to **WP-50 increment 3** and should be
-specified together rather than growing three different shapes:
+> *"I will keep providing you costs as part of config or file."*
 
-- A price list is **immutable once published**. "Updating" means publishing a *new version*
-  with a later `effective_from`, never editing an existing one — otherwise the version
-  stamped on an old cost record no longer describes what priced it, and this brief's central
-  guarantee is gone.
-- Publishing therefore **appends**; there is no `PUT /prices/{version}`.
-- A published list that is already `effective_from` in the past must be rejected, or it would
-  silently change how in-flight and just-completed requests were priced.
-- The endpoint mints money-affecting state, so it needs the admin-surface authentication that
-  WP-50 increment 3 owes — **the admin listener has none today**, which is precisely why
-  mutating endpoints cannot be added to it first and the auth has to land with them.
+**A runtime publishing API is therefore out of scope for this WP and is not deferred to
+WP-50 increment 3 either — it is simply not wanted.** That is a real simplification, and it
+has one consequence worth stating plainly: **WP-53 no longer blocks on anything.** It does
+not need the control-plane store, the admin endpoints, or admin-surface authentication. It
+can be built as soon as the current milestone's gate allows.
 
-**Later still: a fetched catalogue.** Provider prices change and nobody wants to hand-maintain
+A `price_list_file:` pointing at a JSON/YAML document is the expected shape, mirroring
+`hmac_secret_file` — a price table is large and machine-generated, and nobody wants it inline
+in `llmproxy.yaml`. Like `api_key_file`, it is **read once at startup**, so updating prices
+means a config reload; say so in the field's documentation rather than letting an operator
+discover that edits are inert.
+
+### Two things this decision does NOT remove
+
+**1. Cost is still recorded at request time, stamped with a version.** This has nothing to do
+with how prices arrive. Edit the file, reload, and every already-recorded cost must stay
+exactly what it was. Re-pricing on read is wrong whether the new prices came from an API or
+from `vim`.
+
+**2. Effective-dating still earns its place, because of fleets.** It looks like ceremony when
+one process reads one file. It is not, as soon as there is more than one replica: a config
+rollout takes minutes, and during it some replicas have the new file and some have the old.
+Without an effective date, the *same request* prices differently depending on which replica
+served it, and the difference is invisible. With one, every replica agrees on when the new
+prices start regardless of when each got the file.
+
+### The trap this decision creates: a version that lies
+
+A file-supplied list carries an operator-written `version` string. The failure is obvious
+once named and easy to miss until it bites: **someone edits the prices and forgets to bump
+the version.** Now two different price tables have both claimed to be `2026-08-08.1`, cost
+records stamped with that version are no longer reconstructable, and the audit guarantee this
+brief is built on is quietly gone — with nothing anywhere reporting a problem.
+
+So the version must be **derived, not trusted**: compute a content hash of the normalised
+price entries at load, and make the recorded version `<operator-label>+<short-hash>` (or the
+hash alone if no label is given). An operator-meaningful label stays useful for humans, and
+the hash makes "same version, different content" unrepresentable. This is cheap — it happens
+once at config load — and it is the only mechanism here that survives an operator's mistake
+rather than assuming they will not make one.
+
+**Later, if ever: a fetched catalogue.** Provider prices change and nobody wants to hand-maintain
 them. But note before anyone builds it: a proxy that auto-fetches pricing and enforces
 budgets on the result has made a third party able to change what its customers are charged
 and what traffic is refused. That wants pinning, signature or checksum verification, and an
@@ -166,12 +190,12 @@ read-modify-write half, and they belong to WP-42, not here.**
   list version, expose on `StreamInfo` and in access logs. Makes spend *visible* before it is
   *enforceable*, which is the right order — an operator should be able to see what a budget
   would have done before one rejects traffic.
-- **3 — publishing a new price list at runtime.** Append-only, effective-dated, authenticated.
-  **Owned by WP-50 increment 3**, not built here: it shares a store, an admin surface, and an
-  authentication story with virtual-key and tenant administration, and building a private
-  version of all three for prices alone is how a control plane ends up with three shapes.
-- **4 — hand off to WP-42.** Dollar budgets, scopes, periods, enforcement. WP-42 owns it and
+- **3 — hand off to WP-42.** Dollar budgets, scopes, periods, enforcement. WP-42 owns it and
   should be re-scoped to depend on this WP rather than describing its own cost model.
+
+*(A runtime price-publishing API was briefly increment 3 and was removed by the owner
+decision above — prices arrive as config or a file. Recorded rather than deleted so the
+absence reads as a decision instead of an oversight.)*
 
 ## What this brief does not decide
 

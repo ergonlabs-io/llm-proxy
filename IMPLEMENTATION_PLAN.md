@@ -1975,22 +1975,28 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   result has given a third party the ability to change what its customers are charged and what
   traffic is refused. That needs pinning, checksum/signature verification, and an explicit
   operator promotion step — not a background refresh.
-- **Updating prices is a MANAGEMENT operation, and this WP does not own it.** The brief's
-  first draft answered "how do you update prices?" with only "edit the config" and "fetch it
-  from somewhere", which missed the path an operator actually wants: publishing a new list to
-  a running proxy. That is the third mutating surface alongside creating a virtual key and
-  defining a tenant, it shares a store and an authentication story with both, and it belongs
-  to **WP-50 increment 3**. Two constraints it inherits from this WP: a published list is
-  **immutable** (updating means publishing a new version with a later `effective_from`, never
-  editing one, or the version stamped on an old cost record stops describing what priced it),
-  and publishing is therefore **append-only**. Note also that **the admin listener has no
-  authentication today**, so a money-affecting endpoint cannot be added to it before WP-50
-  increment 3's admin auth lands.
+- **Owner decision 2026-08-08: prices arrive as config or a file, and that is the whole
+  update path.** A runtime publishing API is not deferred, it is not wanted. Consequence
+  worth naming: **this WP blocks on nothing** — no control-plane store, no admin endpoints,
+  no admin authentication. A `price_list_file:` mirrors `hmac_secret_file` and is read once
+  at startup, so updating means a config reload; document that on the field rather than
+  letting an operator find out that edits are inert.
+- **The decision creates one trap, and the fix is cheap.** A file-supplied list carries an
+  operator-written `version`, and sooner or later someone edits prices and forgets to bump
+  it — two different tables both claiming `2026-08-08.1`, cost records that can no longer be
+  reconstructed, and no error anywhere. So the version is **derived, not trusted**: hash the
+  normalised entries at load and record `<label>+<short-hash>`. The label stays useful to
+  humans; the hash makes "same version, different content" unrepresentable. It is the only
+  mechanism here that survives an operator mistake instead of assuming none.
+- **Effective-dating survives the simplification, because of fleets.** It looks like ceremony
+  for one process reading one file, and stops looking like it the moment there are two
+  replicas: a rollout takes minutes, and during it the same request prices differently
+  depending on which replica served it, invisibly. An effective date makes every replica
+  agree on when new prices start regardless of when each got the file.
 - **Build:** increment 1, the price model + dialect config surface (strict validation, dotted
   paths); increment 2, cost records computed at response end, stamped with the list version
   and surfaced on `StreamInfo` and in access logs — spend becomes *visible* before it becomes
-  *enforceable*, which is the right order; increment 3 (runtime publishing) is WP-50's;
-  increment 4 hands enforcement to WP-42.
+  *enforceable*, which is the right order; increment 3 hands enforcement to WP-42.
 - **Depends on:** WP-33 ✅ (usage on live traffic), WP-48 ✅ (the saturating-arithmetic
   discipline). **Related:** WP-49 (the catalogue prices attach to), WP-44 (cost-aware routing
   needs this data but is a different feature), WP-34 (dollar limiting has the identical
