@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 proxy-config = { workspace = true }
 proxy-observability = { workspace = true }
+arc-swap = { workspace = true }
 # WP-13: the router (router.rs) picks a host/pool through the cluster
 # manager; pools live in proxy-cluster, their interface is consumed here.
 proxy-cluster = { workspace = true }
