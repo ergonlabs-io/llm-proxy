@@ -92,6 +92,84 @@ Two properties matter:
    check. This is the pricing equivalent of the audit requirement that made `KeyId` separate
    from `TenantId`.
 
+## Tiered rates: the rate is not a scalar (owner, 2026-08-08)
+
+> *"claude opus 4.8 can be priced at x dollars but will get a price cut after opus 5 is
+> released. Similarly some might charge x dollar when tokens is below x tokens and y dollar
+> when token is above x tokens."*
+
+Those are two different mechanisms and only the first was designed for.
+
+**The price cut is effective-dating, and it already works.** Opus 4.8 at one rate today and a
+lower rate once Opus 5 ships is exactly a new price list with a later `effective_from`.
+Nothing changes — and note this is also the case that makes "never re-price history"
+load-bearing rather than pedantic: after the cut, last month's requests must still cost what
+they cost.
+
+**Volume thresholds are new, and they make a rate a function of quantity.** A price entry
+therefore carries a **list of tiers**, not four scalars:
+
+```yaml
+- provider_type: google
+  model: gemini-2.5-pro
+  tier_basis: input_tokens        # which quantity the thresholds are measured against
+  tier_mode: whole_request        # or `graduated` -- see below, no default
+  tiers:
+    - up_to: 200000               # omitted on the last tier = "and above"
+      input_nanodollars_per_token: 1250
+      cached_input_nanodollars_per_token: 125
+      cache_write_nanodollars_per_token: 1560
+      output_nanodollars_per_token: 10000
+    - input_nanodollars_per_token: 2500
+      cached_input_nanodollars_per_token: 250
+      cache_write_nanodollars_per_token: 3120
+      output_nanodollars_per_token: 15000
+```
+
+Three things here are decisions, not formatting.
+
+**1. A tier supplies all four rates, and the threshold is measured against its own quantity.**
+Real long-context pricing raises the *output* rate based on the *input* size — the request is
+more expensive to serve, not just bigger. So `tier_basis` names the measured quantity
+(normally input tokens) and each tier carries the full set of four rates. Per-bucket
+independent tiers would not express the common case and would express nonsense ones.
+
+**2. `tier_mode` has no default, because guessing it silently produces wrong money.**
+
+- `whole_request` — cross the threshold and the **entire** request prices at the higher tier.
+- `graduated` — the first 200k tokens price at tier 1 and only the remainder at tier 2, the
+  way income tax brackets work.
+
+These give **different numbers for the same request**, both are real in the market, and
+neither is more "natural" than the other. A default would be a coin flip applied to every
+invoice, so the field is required and a config omitting it is a load error with its dotted
+path. This is ground rule #1 applied to arithmetic rather than to a field name.
+
+**3. Tiers must be validated at load, not trusted.** Ascending `up_to`, no duplicates,
+exactly one open-ended final tier, at least one tier. A malformed ladder is a config error —
+never a silent fallback to the first tier, which would look like it worked and under-bill
+every large request.
+
+### Cumulative volume discounts are NOT this, and they break the design
+
+"First 1M tokens this month at X, thereafter at Y" looks like the same feature and is not. It
+makes cost depend on **accumulated usage across requests**, which breaks three properties
+this brief is built on:
+
+- **Cost stops being a function of the request.** It becomes a function of the request *and*
+  every request before it, so two concurrent requests can both observe "under the threshold"
+  and both price low. The total then depends on scheduling.
+- **It couples pricing to the spend counter** — the read-modify-write half this brief
+  explicitly left to WP-42 — and puts that dependency on the pricing path.
+- **Retroactive tiers re-price history outright.** Some real volume pricing is retroactive
+  ("exceed 1M and *all* of this month's tokens bill at the lower rate"). That directly
+  contradicts the central guarantee: a cost record could no longer be final when written.
+
+So cumulative discounts are **explicitly out of scope**, and if they are ever wanted they
+need their own design — most likely as a *reconciliation* pass over immutable cost records
+rather than as a change to how a request is priced. Recorded here so the resemblance to
+per-request tiers does not get someone to implement one while thinking about the other.
+
 ## An unpriced model must be `None`, never `$0`
 
 This is the same trap WP-48 found in `token_count`, and it is worse here.

@@ -1964,6 +1964,27 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   non-overlapping buckets exist *because* they are priced differently (cache reads at a steep
   discount, cache writes at a premium). A cost model over `input + output` cannot be made
   correct for a cache-heavy workload later; it can only be replaced.
+- **Rates are tiered, not scalar (owner, 2026-08-08).** Two mechanisms, and only the first
+  was already covered. A *price cut over time* (Opus 4.8 repriced once Opus 5 ships) is
+  effective-dating and needs nothing new — it is also the case that makes "never re-price
+  history" load-bearing rather than pedantic. A *volume threshold* ("x dollars below N
+  tokens, y above") makes the rate a function of quantity, so a price entry carries a list of
+  tiers, each supplying all four bucket rates, with `tier_basis` naming the measured quantity
+  — real long-context pricing raises the OUTPUT rate based on the INPUT size, so per-bucket
+  independent tiers cannot express the common case.
+- **`tier_mode` is required and has no default**, because guessing it silently produces wrong
+  money: `whole_request` (cross the threshold and the entire request prices at the higher
+  tier) and `graduated` (only the excess prices higher, like tax brackets) give **different
+  numbers for the same request**, both exist in the market, and neither is more natural. A
+  default would be a coin flip applied to every invoice. Ground rule #1 applied to arithmetic
+  rather than to a field name.
+- **Cumulative volume discounts are explicitly OUT of scope** and are not the same feature
+  despite looking like it. "First 1M tokens this month at X" makes cost depend on every
+  earlier request, so two concurrent requests can both price low and the total depends on
+  scheduling; it couples pricing to WP-42's read-modify-write spend counter; and retroactive
+  forms ("exceed 1M and *all* this month bills lower") re-price history outright, which is
+  the one thing this WP guarantees never happens. If ever wanted, it wants its own design as
+  a reconciliation pass over immutable cost records — not a change to how a request is priced.
 - **An unpriced model is `None`, never `$0`.** Same trap WP-48 found in `token_count`, and
   worse: zero is a number a budget subtracts from, so an unpriced model becomes a free,
   unlimited hole through any dollar cap, discovered via a bill. Strictness follows reliance —
