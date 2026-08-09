@@ -11,6 +11,11 @@ http = { workspace = true }
 chrono = { workspace = true }
 # WP-24 chunk 2: rate-limited warnings when an access-log sink fails to write.
 tracing = { workspace = true }
+# WP-23 increment 5: `stats::Registry` publishes its per-handle metadata and
+# shard storage through `ArcSwap<Snapshot>` so resolution can grow the
+# registry under `&self`, surviving a config swap -- the same pattern
+# `ClusterManager` uses for host sets and the auth filter uses for key sets.
+arc-swap = { workspace = true }
 
 [lints]
 workspace = true

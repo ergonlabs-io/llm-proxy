@@ -1468,6 +1468,7 @@ dependencies = [
 name = "proxy-observability"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "http",
  "thiserror 2.0.18",

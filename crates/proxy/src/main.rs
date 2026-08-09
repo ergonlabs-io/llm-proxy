@@ -564,16 +564,24 @@ async fn wait_for_initial_binds(
 /// the snapshot the process booted with -- true for the whole process
 /// lifetime today, but stated here rather than left to be discovered.
 ///
-/// `concurrency` sizes the WP-23 stats [`Registry`](proxy_observability::stats::Registry)
-/// this hands to the admin server for `/stats` -- the same worker count
-/// `WorkerPoolConfig` uses, since a registry's shard count is fixed at
-/// construction (see the registry's own module doc). No instrument is
-/// resolved against it here: WP-23 increment 5 (the cluster/listener/HTTP
-/// call sites that actually record traffic) hasn't landed yet, so `/stats`
-/// answers `200` with a correctly-rendered but empty body until it does --
-/// not a fabricated non-empty reading, and not the honest-404 case, which is
-/// reserved for a server that was never handed a registry at all (see
-/// `proxy-admin::server`'s `/stats` route).
+/// `concurrency` sizes the WP-23 stats
+/// [`StatsControl`](proxy_observability::stats::StatsControl) built here --
+/// the same worker count `WorkerPoolConfig` uses, since a registry's shard
+/// count is fixed at construction (see the registry's own module doc). No
+/// instrument is resolved against it here: WP-23 increment 6 (the
+/// cluster/listener/HTTP call sites that actually record traffic) hasn't
+/// landed yet, so `/stats` answers `200` with a correctly-rendered but empty
+/// body until it does -- not a fabricated non-empty reading, and not the
+/// honest-404 case, which is reserved for a server that was never handed a
+/// registry at all (see `proxy-admin::server`'s `/stats` route).
+///
+/// Only `StatsControl::registry()`'s `Arc<Registry>` is handed to the admin
+/// server -- the `StatsControl` value itself (the only thing that can
+/// `resolve` new handles) stays here, in the function that built it. Nothing
+/// re-resolves against it yet (that is increment 6's job, once config
+/// reload actually swaps snapshots); see `proxy_observability::stats`'s
+/// module doc, "Increment 5", for why resolution and the shared, per-request
+/// `Registry` had to be split into two types in the first place.
 ///
 /// A bind failure is returned as an `Err`, not swallowed: `run_serve` turns
 /// it into a startup failure, holding the admin port to the same standard
@@ -588,7 +596,15 @@ async fn start_admin(
         return Ok(None);
     };
     let config = Arc::new(WorkerConfigHandle::new(snapshot));
-    let registry = Arc::new(proxy_observability::stats::Registry::new(concurrency));
+    // Rust note: `StatsControl` (not `Registry` directly) is the WP-23
+    // increment 5 constructor -- it is the only thing that can `resolve` a
+    // handle, and `.registry()` is a plain `Arc<Registry>` clone with no way
+    // to reach that. Nothing here calls `resolve` yet (increment 6's job),
+    // so `control` itself doesn't need to outlive this function; the
+    // `Arc<Registry>` handed to `proxy_admin::serve` keeps the shared state
+    // alive regardless.
+    let control = proxy_observability::stats::StatsControl::new(concurrency);
+    let registry = control.registry();
     let server = proxy_admin::serve(addr, config, Some(registry), started_at)
         .await
         .map_err(|err| err.to_string())?;
