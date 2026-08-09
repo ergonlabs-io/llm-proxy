@@ -1394,10 +1394,19 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   spending limits as a first-class feature, and it is often the actual reason a team puts a gateway
   in front of providers at all. WP-34's token rate limits are **not** this: a tokens/minute cap is a
   throttle, not a budget. Nothing else in this plan says "this key may spend $X, then stop."
-- **Build:** a cost model over WP-34's four non-overlapping token buckets (input / cache-read /
-  cache-write / output) priced per model; budget scopes (key, user, project) with a period; and an
-  enforcement point that rejects rather than queues once a budget is exhausted.
-- **Depends on:** WP-33 (usage on live traffic) and WP-34 (extraction — already done).
+- **Build:** budget scopes (key, user, project) with a period, and an enforcement point that
+  rejects rather than queues once a budget is exhausted.
+- **Re-scoped 2026-08-08: the cost model is no longer this WP's.** This bullet used to say
+  "a cost model over WP-34's four non-overlapping token buckets priced per model". That model
+  needs prices, and nothing owned where prices come from, how they are updated, or what
+  happens to recorded spend when one changes — so it became **WP-53**, and this WP consumes
+  its cost records rather than computing its own. Two consequences worth carrying: budgets
+  subtract from an **already-computed, version-stamped** cost (never re-priced on read), and
+  an **unpriced** model is `None`, not `$0`, so it must be rejected here rather than silently
+  drawn as free.
+- **Depends on:** WP-33 (usage on live traffic), WP-34 (extraction — already done), and
+  **WP-53 (versioned pricing)**, which is a hard prerequisite: a spend ceiling built on a
+  price list nobody can update is not a shippable feature.
 - **Acceptance:** a request that would exceed a configured budget is rejected with a distinguishable
   status and response flag; spend accounting survives a streamed response (usage arrives at stream
   end, so a naive header-time hook under-counts every stream).
@@ -1929,6 +1938,55 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   span under the same server span; `traceparent` from a synthetic upstream caller is joined, not
   replaced; token counts appear under pinned semconv names; and the Envoy-name `/stats` adapter
   still passes WP-23's own conformance tests unchanged.
+
+#### WP-53 — Versioned model pricing  (Size: M)  — **Priority: P1** · **Milestone: v0.2.0**
+> **Design brief: `docs/wp-53-pricing-design-brief.md` (2026-08-08), normative for the seams.**
+> Owner direction the same day: support updating versioned pricing so rate limiting can be
+> done on dollar values as well.
+- **Why this is not part of WP-42.** WP-42 already owns the cost *model*, budget scopes, and
+  the enforcement point. What nothing owns is the **prices themselves** — where they come
+  from, how an operator updates them, what "versioned" means, and what happens to spend
+  already recorded when a price changes. WP-42 cannot be built on a price list nobody can
+  update, so this is its prerequisite, and WP-42 should be re-scoped to depend on it rather
+  than describing a cost model of its own.
+- **The decision everything follows from: record computed cost at request time, never store
+  tokens and price them later.** Re-pricing on read means a tenant's spend for last Tuesday
+  changes when a price list lands on Friday, a budget becomes retroactively exceeded (or
+  un-exceeded), and "why was I charged this?" is unanswerable because the inputs are gone. A
+  completed request produces a cost record: the four token counts (evidence), the computed
+  cost (authoritative), and **the price-list version that computed it** (auditability — the
+  same reasoning that keeps `KeyId` separate from `TenantId`).
+- **Money is integer arithmetic.** Nanodollars per token as `u64`, saturating throughout
+  (WP-48's class: a wire-derived token count multiplied by a config-derived price). `f64`
+  dollars accumulated over millions of requests produces a number nobody can reconcile
+  against an invoice.
+- **Prices are per token bucket — four rates, not one.** `LlmTokenUsage`'s four
+  non-overlapping buckets exist *because* they are priced differently (cache reads at a steep
+  discount, cache writes at a premium). A cost model over `input + output` cannot be made
+  correct for a cache-heavy workload later; it can only be replaced.
+- **An unpriced model is `None`, never `$0`.** Same trap WP-48 found in `token_count`, and
+  worse: zero is a number a budget subtracts from, so an unpriced model becomes a free,
+  unlimited hole through any dollar cap, discovered via a bill. Strictness follows reliance —
+  with no dollar budget configured it is an observability gap; with one configured, an
+  unpriced model is a rejection; a malformed price list is a load-time config error with its
+  dotted path.
+- **Fetched price catalogues are deliberately out of scope**, and named so they are not
+  slipped in as a convenience: a proxy that auto-fetches pricing *and* enforces budgets on the
+  result has given a third party the ability to change what its customers are charged and what
+  traffic is refused. That needs pinning, checksum/signature verification, and an explicit
+  operator promotion step — not a background refresh.
+- **Build:** increment 1, the price model + dialect config surface (strict validation, dotted
+  paths); increment 2, cost records computed at response end, stamped with the list version
+  and surfaced on `StreamInfo` and in access logs — spend becomes *visible* before it becomes
+  *enforceable*, which is the right order; increment 3 hands enforcement to WP-42.
+- **Depends on:** WP-33 ✅ (usage on live traffic), WP-48 ✅ (the saturating-arithmetic
+  discipline). **Related:** WP-49 (the catalogue prices attach to), WP-44 (cost-aware routing
+  needs this data but is a different feature), WP-34 (dollar limiting has the identical
+  retrospective check-before/record-after shape).
+- **Acceptance:** a price list update does not change any already-recorded cost; a request's
+  cost record names the version that priced it; an unpriced model with a dollar budget
+  configured is rejected rather than recorded as zero; per-bucket rates are exercised by a
+  cache-heavy fixture whose cost differs from the naive `input + output` figure.
 
 #### WP-52 — Cross-dialect provider fallback: request/response translation table  (Size: L)  — **Priority: P2** · **Milestone: v1.0.0**
 - **Why (split out of WP-35, 2026-08-08).** WP-35 closes same-dialect provider fallback
