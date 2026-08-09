@@ -1,7 +1,9 @@
-//! WP-23 increments 1–2 — the stats registry core: instruments, [`Handle`]/
-//! [`HistogramHandle`] resolution, and sharded, summed counters and
-//! histograms. Pure library: no HTTP, no `/stats` rendering, no Prometheus,
-//! no instrumentation call sites — those are increments 3–5
+//! WP-23 increments 1–2 and 5 — the stats registry core: instruments,
+//! [`Handle`]/[`HistogramHandle`] resolution, sharded, summed counters and
+//! histograms, and the [`Registry`]/[`StatsControl`] split that lets
+//! resolution survive a config swap. Pure library: no HTTP, no `/stats`
+//! rendering, no Prometheus, no instrumentation call sites — rendering is
+//! increment 3 (`envoy_render`, this crate), and call sites are increment 6
 //! (`docs/wp-23-stats-design-brief.md`, which is normative for every
 //! decision below).
 //!
@@ -12,14 +14,17 @@
 //! proxy cannot afford. So resolution and increment are split:
 //!
 //! ```
-//! use proxy_observability::stats::{instruments, Registry, WorkerId};
+//! use proxy_observability::stats::{instruments, StatsControl, WorkerId};
 //!
 //! // Control side, once, when a cluster/listener/route enters the config
-//! // snapshot:
-//! let mut registry = Registry::new(1);
-//! let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "provider:openai")]);
+//! // snapshot. `StatsControl` is the only thing that can `resolve` -- see
+//! // "Increment 5" below for why that is a type, not a receiver, split.
+//! let control = StatsControl::new(1);
+//! let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "provider:openai")]);
 //!
-//! // Hot path, per request: no hashing, no allocation, no string.
+//! // Hot path, per request: no hashing, no allocation, no string. Workers
+//! // only ever hold the `Arc<Registry>` `StatsControl::registry` hands out.
+//! let registry = control.registry();
 //! registry.incr(WorkerId(0), h, 1);
 //! ```
 //!
@@ -56,24 +61,117 @@
 //! landing mid-increment is allowed to observe either the old or the new
 //! value — it must not be a fence on the request path.
 //!
-//! # `resolve` takes `&mut self`; `incr`/`value` take `&self`
+//! # Increment 5 — resolution survives a config swap: split the API by TYPE
 //!
-//! Rust note: this split is not decorative — it is what makes "growing a
-//! shard while a worker increments it" a thing the compiler forbids rather
-//! than a race we have to reason about at runtime. [`Registry::resolve`]
-//! needs `&mut self` because it appends a new slot to every shard; a worker's
-//! [`Registry::incr`]/[`Registry::value`] only ever need `&self`. Once a
-//! `Registry` is shared across worker threads (e.g. behind an `Arc`), the
-//! only references any thread can hold are `&self` — there is no safe way to
-//! reach `&mut self` through an `Arc` while other clones exist, so `resolve`
-//! is simply unreachable at that point. In this increment that means: build
-//! the `Registry` and call `resolve` for every handle a config snapshot
-//! needs, *then* hand it out for concurrent `incr`/`value` calls. A future
-//! config swap publishes a whole new `Registry` (the same lifecycle
-//! `ClusterManager` already uses via `ArcSwap`) rather than mutating a shared
-//! one in place — this increment does not build that publishing path, only
-//! the type that makes it safe to build. [`Registry::resolve_histogram`]
-//! follows the identical rule (`&mut self`, control-side only).
+//! Increment 1's `Registry::resolve` took `&mut self`, on the theory that
+//! "resolution cannot race an increment" should be a compiler-checked
+//! property. That reasoning was sound and the conclusion was still wrong: the
+//! registry is shared as `Arc<Registry>` from process start
+//! (`crates/proxy/src/main.rs`), so `&mut self` becomes unobtainable the
+//! moment it is shared. Handles could only ever be resolved at boot, and a
+//! config swap that introduced a new cluster could never register its
+//! counters — the new cluster would serve traffic and report nothing,
+//! silently, forever. See `docs/wp-23-stats-design-brief.md`'s "Correction,
+//! 2026-08-09" section for the full argument.
+//!
+//! The fix keeps the compile-time guarantee, but moves it from a *receiver*
+//! split (`&mut self` vs `&self`) to a *type* split:
+//!
+//! - [`Registry`] is the shared, hot-path type. Every method takes `&self`.
+//!   **It has no public `resolve` method at all** — a worker holding only
+//!   `Arc<Registry>` cannot reach resolution, full stop, and that is checked
+//!   by the compiler rather than by a debug assertion or a comment.
+//! - [`StatsControl`] is the control-side owner: it is the *only* type
+//!   exposing [`StatsControl::resolve`]/[`StatsControl::resolve_histogram`].
+//!   It is deliberately not `Clone` — there is exactly one control side per
+//!   process. [`StatsControl::registry`] is what gets handed to workers.
+//!
+//! The real resolution logic lives in private `Registry` methods that only
+//! `StatsControl` (defined in this same module) can call; the methods simply
+//! aren't `pub`, so they don't exist as far as any other crate — including a
+//! worker holding `Arc<Registry>` — is concerned.
+//!
+//! ## Interior mutability: one `ArcSwap` snapshot, a `Mutex` only on the control side
+//!
+//! Resolution now takes `&self` and reaches its state through interior
+//! mutability, split into exactly the pieces each side needs:
+//!
+//! ```text
+//! struct Registry {
+//!     published: ArcSwap<Snapshot>,   // hot path: lock-free load
+//!     control: Mutex<ControlState>,   // touched ONLY by resolve/resolve_histogram
+//! }
+//! ```
+//!
+//! `Snapshot` (private) is an immutable, versioned bundle of *everything* a
+//! reader needs: the per-handle instrument metadata (`resolved`,
+//! `resolved_attrs`, `resolved_histograms`, `resolved_histogram_attrs`) and
+//! the shard storage itself. Bundling both together means a `Snapshot` a
+//! worker loads is always internally consistent — it can never see a new
+//! handle's metadata without also seeing that handle's shard slot, or vice
+//! versa. Growth builds a whole new `Snapshot` and swaps it in;
+//! `incr`/`value`/`observe`/etc. do one lock-free `published.load()` and read
+//! everything out of the `Arc<Snapshot>` they get back. `ControlState`
+//! (private) holds only the dedup maps (`lookup`, `histogram_lookup`) —
+//! nothing on the request path ever takes that lock.
+//!
+//! This is the same "control computes, workers `load`" shape
+//! `proxy_cluster::manager::ClusterManager` already uses for `HostSet`, and
+//! the auth filter uses for its key set — not a new mechanism, a pattern this
+//! codebase already reads fluently.
+//!
+//! ## Growth must not move or copy a live atomic — the crux of the whole design
+//!
+//! Rebuilding the registry on every config swap and copying counter values
+//! across was considered and rejected: any increment landing between the old
+//! snapshot's read and the new registry's publish is lost, which shows up as
+//! a dip in `rate()` at every reload — a metrics bug that gets blamed on the
+//! traffic, not the reload. But a naive `ArcSwap<Vec<AtomicU64>>` has the
+//! *identical* bug: a `Vec` that reallocates on push moves every element,
+//! including the ones concurrent writers are mid-`fetch_add` on.
+//!
+//! The fix is that growth never moves an atomic that already has a handle —
+//! it only ever *appends*, and only ever behind another layer of `Arc` so
+//! that "appending" is "cloning a `Vec` of pointers", not "reallocating the
+//! things the pointers point to":
+//!
+//! - **Counters are worker-major and block-chunked**
+//!   (`counter_shards: Vec<Vec<Arc<Vec<AtomicU64>>>>`, indexed
+//!   `[worker][block]`, each block exactly [`COUNTER_BLOCK_LEN`] slots wide).
+//!   A [`Handle`] indexes as `block = handle.0 / COUNTER_BLOCK_LEN`,
+//!   `slot = handle.0 % COUNTER_BLOCK_LEN`. Growing by one handle clones the
+//!   outer `Vec<Vec<Arc<..>>>` (copying only `Arc` pointers — every existing
+//!   `AtomicU64` stays at the exact address it was at, still receiving
+//!   increments from any thread holding the old `Snapshot`) and, only when
+//!   the new handle starts a fresh block, appends one freshly-allocated
+//!   `Arc<Vec<AtomicU64>>` block per worker. Blocks, not one `Arc<AtomicU64>`
+//!   per slot, because Decision 2 above depends on per-worker
+//!   *contiguity* — one `Arc` per slot would allocate worker 0's and worker
+//!   1's slot for the same handle back-to-back in the growth loop, putting
+//!   two different workers' counters on one cache line, exactly the false
+//!   sharing Decision 2 exists to avoid. A block keeps one worker's counters
+//!   contiguous within it and puts different workers in entirely separate
+//!   allocations.
+//! - **Histograms are one `Arc<HistogramShard>` per `(worker, handle)`**
+//!   (`histogram_shards: Vec<Vec<Arc<HistogramShard>>>`, indexed
+//!   `[worker][handle]`, no blocking). A histogram's bucket count varies per
+//!   instrument (see [`ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS`] vs. a
+//!   differently-bucketed instrument), so a fixed-size block scheme doesn't
+//!   apply the way it does for the single-`AtomicU64` counter case. A
+//!   [`HistogramShard`] is already north of 176 bytes (twenty-plus
+//!   `AtomicU64` buckets, a sum, a count), so distinct per-handle allocations
+//!   rarely share a cache line even without blocking, and [`Registry::observe`]
+//!   is already three atomic operations — the false-sharing cost blocks avoid
+//!   for a single `u64` counter matters much less against that backdrop.
+//!
+//! Handle values are stable across growth either way: a [`Handle`]/
+//! [`HistogramHandle`] resolved before a swap indexes the exact same logical
+//! counter/histogram after it, because growth only ever appends past the end
+//! of what already existed.
+//!
+//! `Relaxed` ordering is unchanged everywhere on the increment/read path —
+//! growth publishing a new `Snapshot` doesn't change what a plain counter
+//! increment needs to synchronize with.
 //!
 //! # Decision 3 — this is not ADR-0005's distributed case
 //!
@@ -154,17 +252,19 @@
 //!
 //! [`HistogramHandle`] is a distinct type from [`Handle`], not the same
 //! `usize` space reused. Concretely, that means a `Handle` returned by
-//! [`Registry::resolve`] **cannot be passed to** [`Registry::observe`], and a
-//! `HistogramHandle` returned by [`Registry::resolve_histogram`] **cannot be
-//! passed to** [`Registry::incr`]/[`Registry::add`]/[`Registry::value`] —
-//! not "rejected at runtime", but a compile error, because the two types are
-//! unrelated as far as the type checker is concerned. See
-//! [`HistogramHandle`]'s doc for a `compile_fail` example proving this.
+//! [`StatsControl::resolve`] **cannot be passed to** [`Registry::observe`],
+//! and a `HistogramHandle` returned by [`StatsControl::resolve_histogram`]
+//! **cannot be passed to** [`Registry::incr`]/[`Registry::add`]/
+//! [`Registry::value`] — not "rejected at runtime", but a compile error,
+//! because the two types are unrelated as far as the type checker is
+//! concerned. See [`HistogramHandle`]'s doc for a `compile_fail` example
+//! proving this.
 //!
-//! This is the same argument as the `&mut self`/`&self` split above: making
-//! a mistake *impossible* is strictly better than making it *loud*, when the
-//! type system can carry the whole cost at zero runtime price (a
-//! `HistogramHandle` is exactly as cheap as a `Handle` — one `usize`). A
+//! This is the same argument as the `Registry`/`StatsControl` type split
+//! above: making a mistake *impossible* is strictly better than making it
+//! *loud*, when the type system can carry the whole cost at zero runtime
+//! price (a `HistogramHandle` is exactly as cheap as a `Handle` — one
+//! `usize`). A
 //! shared handle space was the other defensible option (it would mean one
 //! index space and a runtime `kind` check inside `incr`/`observe`), but it
 //! trades a compile-time guarantee for a runtime one for no benefit, since
@@ -193,6 +293,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+// Rust note: `ArcSwap<Snapshot>` is the same "control computes, workers
+// `load`" pattern `proxy_cluster::manager::ClusterManager` uses for
+// `HostSet`, and the auth filter uses for its key set -- see the module
+// doc's "Increment 5" section for why plain `&mut self` couldn't survive a
+// config swap once this registry is shared as `Arc<Registry>`.
+use arc_swap::ArcSwap;
 
 /// WP-23 increment 3: renders a [`Registry`] into Envoy's flat `/stats` text
 /// format. See the module's own doc comment for what is and is not verified
@@ -241,8 +349,8 @@ pub enum InstrumentKind {
 
 /// One OTel instrument's identity and shape: a name, a unit, and the set of
 /// attribute keys every measurement against it must supply — no more, no
-/// fewer. [`Registry::resolve`]/[`Registry::resolve_histogram`] check a
-/// caller's attributes against `attribute_keys`, order-insensitively, and
+/// fewer. [`StatsControl::resolve`]/[`StatsControl::resolve_histogram`] check
+/// a caller's attributes against `attribute_keys`, order-insensitively, and
 /// panic loudly on a mismatch rather than silently starting a second,
 /// parallel time series for a typo'd key.
 #[derive(Debug)]
@@ -259,11 +367,11 @@ pub struct Instrument {
     /// own `unit` and its own `buckets`.
     pub unit: &'static str,
     /// The attribute keys a measurement against this instrument must supply
-    /// — exactly these, in any order. See [`Registry::resolve`].
+    /// — exactly these, in any order. See [`StatsControl::resolve`].
     pub attribute_keys: &'static [&'static str],
     /// Histogram bucket boundaries, in `unit`, ascending, exclusive of the
     /// implicit overflow bucket. `Some` if and only if `kind` is
-    /// [`InstrumentKind::Histogram`] — [`Registry::resolve_histogram`] and
+    /// [`InstrumentKind::Histogram`] — [`StatsControl::resolve_histogram`] and
     /// [`Registry::observe`] both rely on that invariant and panic loudly if
     /// it doesn't hold (a `Histogram` instrument with `None` here is a
     /// programming error in the instrument's own `const` definition, not
@@ -366,10 +474,10 @@ pub mod instruments {
 pub struct WorkerId(pub usize);
 
 /// An opaque handle to one resolved `(counter/up-down-counter instrument,
-/// attribute set)` pair. Returned by [`Registry::resolve`]; carries no name,
-/// no attributes — that is the point (see the module doc's Decision 1). The
-/// inner `usize` is private to this module: outside it, a `Handle` can only
-/// be obtained from `resolve` and only used by handing it back to
+/// attribute set)` pair. Returned by [`StatsControl::resolve`]; carries no
+/// name, no attributes — that is the point (see the module doc's Decision
+/// 1). The inner `usize` is private to this module: outside it, a `Handle`
+/// can only be obtained from `resolve` and only used by handing it back to
 /// `incr`/`add`/`value`.
 ///
 /// **Not the same type as [`HistogramHandle`]** — see the module doc's
@@ -378,7 +486,7 @@ pub struct WorkerId(pub usize);
 pub struct Handle(usize);
 
 /// An opaque handle to one resolved `(histogram instrument, attribute set)`
-/// pair. Returned by [`Registry::resolve_histogram`]; used only with
+/// pair. Returned by [`StatsControl::resolve_histogram`]; used only with
 /// [`Registry::observe`].
 ///
 /// A **distinct type from [`Handle`]**, occupying its own index space, so
@@ -386,10 +494,11 @@ pub struct Handle(usize);
 /// where the other is expected is a compile error, not a runtime check:
 ///
 /// ```compile_fail
-/// use proxy_observability::stats::{instruments, Registry, WorkerId};
+/// use proxy_observability::stats::{instruments, StatsControl, WorkerId};
 ///
-/// let mut registry = Registry::new(1);
-/// let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+/// let control = StatsControl::new(1);
+/// let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+/// let registry = control.registry();
 /// // ERROR: expected `HistogramHandle`, found `Handle`.
 /// registry.observe(WorkerId(0), h, 1.0);
 /// ```
@@ -397,10 +506,11 @@ pub struct Handle(usize);
 /// and the mirror image:
 ///
 /// ```compile_fail
-/// use proxy_observability::stats::{instruments, Registry, WorkerId};
+/// use proxy_observability::stats::{instruments, StatsControl, WorkerId};
 ///
-/// let mut registry = Registry::new(1);
-/// let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "openai")]);
+/// let control = StatsControl::new(1);
+/// let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "openai")]);
+/// let registry = control.registry();
 /// // ERROR: expected `Handle`, found `HistogramHandle`.
 /// registry.incr(WorkerId(0), h, 1);
 /// ```
@@ -412,10 +522,18 @@ pub struct HistogramHandle(usize);
 
 /// Dedup key for [`Registry::resolve`]/[`Registry::resolve_histogram`]: an
 /// instrument's name plus its attributes, sorted into a stable order. Named
-/// as a `type` alias (rather than inlined into `Registry`'s field) purely to
-/// keep that field declaration readable — clippy's `type_complexity` lint
+/// as a `type` alias (rather than inlined into `ControlState`'s field) purely
+/// to keep that field declaration readable — clippy's `type_complexity` lint
 /// flagged the inline form.
 type ResolveKey = (&'static str, Vec<(String, String)>);
+
+/// Width, in slots, of one counter growth block — see the module doc's
+/// "Growth must not move or copy a live atomic" section (Increment 5) for why
+/// counters grow in fixed-size blocks rather than one `AtomicU64` at a time.
+/// A round power of two comfortably larger than a cache line (64 `u64`s = 512
+/// bytes), so a block amortizes its allocation over many handles without
+/// wasting much unused space behind a rarely-resolved instrument.
+const COUNTER_BLOCK_LEN: usize = 64;
 
 /// One worker shard's histogram state for one handle. Bucket counts are
 /// **non-cumulative** (see the module doc); `sum` and `count` are running
@@ -451,8 +569,7 @@ impl HistogramShard {
     /// (`boundaries.len() + 1` — see [`Self::bucket_counts`]'s doc).
     fn new(num_buckets: usize) -> Self {
         Self {
-            // Rust note: same reason as `Registry::new`'s shard construction
-            // below -- `AtomicU64` isn't `Clone`, so `vec![AtomicU64::new(0);
+            // Rust note: `AtomicU64` isn't `Clone`, so `vec![AtomicU64::new(0);
             // n]` doesn't typecheck; building each slot from a fresh
             // constructor call sidesteps that.
             bucket_counts: (0..num_buckets).map(|_| AtomicU64::new(0)).collect(),
@@ -506,24 +623,79 @@ pub struct HistogramSnapshot {
     pub count: u64,
 }
 
-/// The stats registry: resolves `(instrument, attrs)` into [`Handle`]s (for
-/// counters/up-down-counters) or [`HistogramHandle`]s (for histograms) at
-/// config-lowering time, and stores per-worker, per-handle data that
-/// [`Registry::value`]/[`Registry::histogram_snapshot`] sum on read. See the
-/// module doc for the full design — in particular why `resolve`/
-/// `resolve_histogram` take `&mut self` while every hot-path method takes
-/// `&self`.
-pub struct Registry {
+/// The immutable, versioned bundle [`Registry::published`] hands out to every
+/// reader — see the module doc's "Increment 5" section. Metadata (`resolved`,
+/// `resolved_attrs`, ...) and shard storage live in the same struct
+/// deliberately: a `Snapshot` a worker `load()`s always describes one
+/// consistent generation, so it can never show a new handle's metadata
+/// without also showing that handle's freshly-grown shard slot, or vice
+/// versa.
+///
+/// Rust note: growth (in [`Registry::resolve`]/[`Registry::resolve_histogram`])
+/// builds a whole new `Snapshot` by cloning these `Vec`s -- which clones only
+/// `&'static Instrument` references, `String`s, and `Arc` pointers, never an
+/// `AtomicU64`/[`HistogramShard`] itself -- and `ArcSwap::store`s it. Every
+/// atomic that already had a handle before the clone keeps living at the same
+/// address afterwards, still receiving increments from any thread still
+/// holding the *old* `Snapshot`.
+struct Snapshot {
     /// Indexed by `Handle`'s inner `usize`. Kept so `incr`/`add` can look up
-    /// an instrument's kind (to enforce "Counters don't decrement") and a
-    /// future increment can look up name/unit/attrs for rendering.
+    /// an instrument's kind (to enforce "Counters don't decrement") and
+    /// `envoy_render` can look up name/unit/attrs for rendering.
     resolved: Vec<&'static Instrument>,
     /// Indexed in lockstep with `resolved`: the sorted `(key, value)` attrs
-    /// each handle was resolved with. WP-23 increment 3 (`envoy_render`)
-    /// reads this to expand attribute values into Envoy `/stats` name
-    /// segments (e.g. a `status_class` attribute becomes
-    /// `..._2xx`/`..._5xx`) -- see [`Self::counters`].
+    /// each handle was resolved with. `envoy_render` reads this to expand
+    /// attribute values into Envoy `/stats` name segments (e.g. a
+    /// `status_class` attribute becomes `..._2xx`/`..._5xx`) -- see
+    /// [`Registry::counters`].
     resolved_attrs: Vec<Vec<(String, String)>>,
+    /// `counter_shards[worker.0][block]` is that worker's block for that
+    /// block index; `counter_shards[worker.0][block][slot]` is one
+    /// [`Handle`]'s `AtomicU64`, where `block = handle.0 /
+    /// COUNTER_BLOCK_LEN` and `slot = handle.0 % COUNTER_BLOCK_LEN` -- see
+    /// the module doc's "Growth must not move or copy a live atomic" section
+    /// for why counters are block-chunked rather than one `Arc` per slot.
+    counter_shards: Vec<Vec<Arc<Vec<AtomicU64>>>>,
+    /// Same role as `resolved`, for [`HistogramHandle`]s. A separate `Vec`
+    /// in its own index space — see the module doc's "handle-space
+    /// question".
+    resolved_histograms: Vec<&'static Instrument>,
+    /// Same role as `resolved_attrs`, for [`HistogramHandle`]s.
+    resolved_histogram_attrs: Vec<Vec<(String, String)>>,
+    /// `histogram_shards[worker.0][handle.0]` is that worker's
+    /// [`HistogramShard`] for that histogram handle -- one `Arc` per
+    /// `(worker, handle)` pair, unblocked (see the module doc for why
+    /// histograms don't share the counter's block scheme).
+    histogram_shards: Vec<Vec<Arc<HistogramShard>>>,
+}
+
+impl Snapshot {
+    /// An empty snapshot sized for `num_workers` shards -- zero handles of
+    /// either kind resolved yet.
+    fn empty(num_workers: usize) -> Self {
+        Self {
+            resolved: Vec::new(),
+            resolved_attrs: Vec::new(),
+            // Rust note: `vec![x; n]` needs `x: Clone`. `Vec<Arc<..>>` is
+            // `Clone` even though the `Arc`'s payload (`Vec<AtomicU64>` /
+            // `HistogramShard`) is not, because `Arc<T>: Clone` holds for
+            // every `T` -- cloning an `Arc` bumps a refcount, it never
+            // touches what it points to. That is exactly the property the
+            // rest of this module leans on for lock-free growth.
+            counter_shards: vec![Vec::new(); num_workers],
+            resolved_histograms: Vec::new(),
+            resolved_histogram_attrs: Vec::new(),
+            histogram_shards: vec![Vec::new(); num_workers],
+        }
+    }
+}
+
+/// Control-side-only state behind [`Registry::control`]'s `Mutex`: the dedup
+/// maps [`Registry::resolve`]/[`Registry::resolve_histogram`] check before
+/// growing anything. Nothing on the request path ever locks this -- see the
+/// module doc's "Increment 5" section.
+#[derive(Default)]
+struct ControlState {
     /// Dedup key -> already-resolved `Handle`, so resolving the same
     /// `(instrument, attrs)` twice returns the same handle instead of
     /// growing a second, parallel time series.
@@ -535,56 +707,58 @@ pub struct Registry {
     /// itself identifies an instrument by name, so keying on `name` matches
     /// the actual data model instead of an implementation accident.
     lookup: HashMap<ResolveKey, Handle>,
-    /// `shards[worker.0][handle.0]` is that worker's slot for that handle.
-    /// Every shard is grown in lockstep by `resolve`, so any handle that
-    /// exists has a slot in every shard — see the module doc for why that
-    /// growth can't race a concurrent `incr`/`value`.
-    shards: Vec<Vec<AtomicU64>>,
-    /// Same role as `resolved`, for [`HistogramHandle`]s. A separate `Vec`
-    /// in its own index space — see the module doc's "handle-space
-    /// question".
-    resolved_histograms: Vec<&'static Instrument>,
-    /// Same role as `resolved_attrs`, for [`HistogramHandle`]s.
-    resolved_histogram_attrs: Vec<Vec<(String, String)>>,
     /// Same role as `lookup`, for histograms.
     histogram_lookup: HashMap<ResolveKey, HistogramHandle>,
-    /// `histogram_shards[worker.0][handle.0]` is that worker's
-    /// [`HistogramShard`] for that histogram handle. Grown in lockstep by
-    /// `resolve_histogram`, same invariant as `shards`.
-    histogram_shards: Vec<Vec<HistogramShard>>,
+}
+
+/// The stats registry: the shared, hot-path type every worker holds as
+/// `Arc<Registry>`. Every method here takes `&self`, and **there is no
+/// public `resolve`** -- see the module doc's "Increment 5" section for why
+/// that is a type-level guarantee (a worker holding only `Arc<Registry>`
+/// cannot reach resolution, full stop) rather than a runtime check.
+/// [`StatsControl`] is the only way to grow one.
+pub struct Registry {
+    /// The current, immutable view every hot-path method `load()`s. Growth
+    /// (control-side only, via the private `resolve`/`resolve_histogram`
+    /// below) builds a new `Snapshot` and stores it here -- the same
+    /// "control computes, workers `load`" pattern
+    /// `proxy_cluster::manager::ClusterManager` uses for `HostSet`, and the
+    /// auth filter uses for its key set.
+    published: ArcSwap<Snapshot>,
+    /// Control-side-only dedup state. A `Mutex`, not an atomic or another
+    /// `ArcSwap`, because resolution needs to check-then-insert atomically
+    /// with respect to *other resolutions* -- two concurrent `resolve` calls
+    /// for the same new `(instrument, attrs)` must not both grow a slot.
+    /// This lock is never taken on the request path.
+    control: Mutex<ControlState>,
 }
 
 impl Registry {
-    /// Build an empty registry sized for `num_workers` shards. `num_workers`
-    /// is a config-time constant (`WorkerPoolConfig::concurrency`, in
-    /// `proxy-core`) — this increment does not support growing the worker
-    /// count after construction.
-    pub fn new(num_workers: usize) -> Self {
+    /// Build an empty registry sized for `num_workers` shards. Private:
+    /// [`StatsControl::new`] is the only public constructor -- building a
+    /// bare `Registry` from outside this module would hand out the shared
+    /// type without the control-side gate, defeating the point of the
+    /// `Registry`/`StatsControl` split (module doc, "Increment 5").
+    /// `num_workers` is a config-time constant (`WorkerPoolConfig::concurrency`,
+    /// in `proxy-core`) -- this increment does not support growing the
+    /// worker count after construction.
+    fn empty(num_workers: usize) -> Self {
         Self {
-            resolved: Vec::new(),
-            resolved_attrs: Vec::new(),
-            lookup: HashMap::new(),
-            // Rust note: not `vec![Vec::new(); num_workers]` -- that macro
-            // needs `Vec<AtomicU64>: Clone`, which needs `AtomicU64: Clone`,
-            // which atomics deliberately don't implement (cloning an atomic
-            // would silently split one counter into two). Building each
-            // shard from a fresh closure call sidesteps the bound entirely.
-            shards: (0..num_workers).map(|_| Vec::new()).collect(),
-            resolved_histograms: Vec::new(),
-            resolved_histogram_attrs: Vec::new(),
-            histogram_lookup: HashMap::new(),
-            histogram_shards: (0..num_workers).map(|_| Vec::new()).collect(),
+            published: ArcSwap::from_pointee(Snapshot::empty(num_workers)),
+            control: Mutex::new(ControlState::default()),
         }
     }
 
     /// How many worker shards this registry was built with.
     pub fn num_workers(&self) -> usize {
-        self.shards.len()
+        self.published.load().counter_shards.len()
     }
 
-    /// Control side only, at config-lowering time — see the module doc for
-    /// why this takes `&mut self`. Resolving the same `(instrument, attrs)`
-    /// twice (attribute order does not matter) returns the same [`Handle`].
+    /// Control side only -- reachable exclusively through
+    /// [`StatsControl::resolve`] (defined in this same module; see the
+    /// module doc's "Increment 5" section for why this method itself is not
+    /// `pub`). Resolving the same `(instrument, attrs)` twice (attribute
+    /// order does not matter) returns the same [`Handle`].
     ///
     /// Panics if `attrs`' keys don't exactly match `instrument.attribute_keys`
     /// (missing or unexpected) — loudly, on purpose: a typo'd attribute key
@@ -594,7 +768,7 @@ impl Registry {
     /// "handle-space question" for why this is checked here rather than
     /// left to produce a `Handle` that `incr`/`add` would then have to
     /// reject.
-    pub fn resolve(&mut self, instrument: &'static Instrument, attrs: &[(&str, &str)]) -> Handle {
+    fn resolve(&self, instrument: &'static Instrument, attrs: &[(&str, &str)]) -> Handle {
         assert_ne!(
             instrument.kind,
             InstrumentKind::Histogram,
@@ -605,32 +779,74 @@ impl Registry {
 
         let key = Self::resolve_key(instrument, attrs);
 
-        if let Some(&handle) = self.lookup.get(&key) {
+        // Rust note: this lock guards the dedup map AND the check-then-grow
+        // sequence below as one atomic unit with respect to other
+        // resolve/resolve_histogram calls; it is never taken by
+        // incr/value/observe, so it can never be held by, or block, a
+        // request. `unwrap_or_else(PoisonError::into_inner)` rather than
+        // `.unwrap()`: a panic while holding this lock (e.g. inside
+        // `validate_attrs`, above) must not poison every future resolve --
+        // the dedup map itself is still perfectly valid data.
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(&handle) = control.lookup.get(&key) {
             return handle;
         }
 
-        let handle = Handle(self.resolved.len());
-        self.resolved.push(instrument);
-        self.resolved_attrs.push(key.1.clone());
-        for shard in &mut self.shards {
-            shard.push(AtomicU64::new(0));
+        let old = self.published.load();
+        let handle = Handle(old.resolved.len());
+
+        let mut resolved = old.resolved.clone();
+        resolved.push(instrument);
+        let mut resolved_attrs = old.resolved_attrs.clone();
+        resolved_attrs.push(key.1.clone());
+
+        // Growth: clone the outer Vec<Vec<Arc<..>>> (copies only Arc
+        // pointers -- every existing AtomicU64 stays exactly where it is,
+        // still receiving increments from any thread holding the OLD
+        // Snapshot) and append one fresh block per worker only when this
+        // handle is the first slot of a new block -- see the module doc's
+        // "Growth must not move or copy a live atomic" section. This is
+        // also the rejected-alternative pin: copying counter VALUES across
+        // instead of sharing the same atomics would lose any increment that
+        // landed between the read and the swap, below.
+        let mut counter_shards = old.counter_shards.clone();
+        if handle.0.is_multiple_of(COUNTER_BLOCK_LEN) {
+            for worker_blocks in &mut counter_shards {
+                worker_blocks.push(Arc::new(
+                    (0..COUNTER_BLOCK_LEN).map(|_| AtomicU64::new(0)).collect(),
+                ));
+            }
         }
-        self.lookup.insert(key, handle);
+
+        self.published.store(Arc::new(Snapshot {
+            resolved,
+            resolved_attrs,
+            counter_shards,
+            resolved_histograms: old.resolved_histograms.clone(),
+            resolved_histogram_attrs: old.resolved_histogram_attrs.clone(),
+            histogram_shards: old.histogram_shards.clone(),
+        }));
+        control.lookup.insert(key, handle);
         handle
     }
 
     /// The histogram counterpart of [`Self::resolve`] — same identity,
-    /// dedup, and `&mut self` rules, but returns a [`HistogramHandle`] in
-    /// its own index space and allocates a [`HistogramShard`] (sized off
-    /// `instrument.buckets`) per worker instead of a single `AtomicU64`.
+    /// dedup, and control-side-only rules, but returns a [`HistogramHandle`]
+    /// in its own index space and grows one [`HistogramShard`] per worker
+    /// (unblocked -- see the module doc) instead of extending a shared
+    /// block.
     ///
     /// Panics if `attrs`' keys don't match `instrument.attribute_keys`, same
     /// as `resolve`. Panics if `instrument.kind` is not
     /// [`InstrumentKind::Histogram`], or if a `Histogram` instrument's
     /// `buckets` is `None` (a malformed `const` definition, not something a
     /// caller can cause) — both loudly, both control-side only.
-    pub fn resolve_histogram(
-        &mut self,
+    fn resolve_histogram(
+        &self,
         instrument: &'static Instrument,
         attrs: &[(&str, &str)],
     ) -> HistogramHandle {
@@ -654,20 +870,42 @@ impl Registry {
 
         let key = Self::resolve_key(instrument, attrs);
 
-        if let Some(&handle) = self.histogram_lookup.get(&key) {
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(&handle) = control.histogram_lookup.get(&key) {
             return handle;
         }
 
-        let handle = HistogramHandle(self.resolved_histograms.len());
-        self.resolved_histograms.push(instrument);
-        self.resolved_histogram_attrs.push(key.1.clone());
+        let old = self.published.load();
+        let handle = HistogramHandle(old.resolved_histograms.len());
+
+        let mut resolved_histograms = old.resolved_histograms.clone();
+        resolved_histograms.push(instrument);
+        let mut resolved_histogram_attrs = old.resolved_histogram_attrs.clone();
+        resolved_histogram_attrs.push(key.1.clone());
+
         // Nineteen boundaries means twenty slots -- see the module doc's
-        // "overflow bucket" section.
+        // "overflow bucket" section. One freshly-allocated
+        // Arc<HistogramShard> per worker, appended -- never resizing a
+        // shard that already has a handle.
         let num_buckets = num_boundaries + 1;
-        for shard in &mut self.histogram_shards {
-            shard.push(HistogramShard::new(num_buckets));
+        let mut histogram_shards = old.histogram_shards.clone();
+        for worker_shards in &mut histogram_shards {
+            worker_shards.push(Arc::new(HistogramShard::new(num_buckets)));
         }
-        self.histogram_lookup.insert(key, handle);
+
+        self.published.store(Arc::new(Snapshot {
+            resolved: old.resolved.clone(),
+            resolved_attrs: old.resolved_attrs.clone(),
+            counter_shards: old.counter_shards.clone(),
+            resolved_histograms,
+            resolved_histogram_attrs,
+            histogram_shards,
+        }));
+        control.histogram_lookup.insert(key, handle);
         handle
     }
 
@@ -706,7 +944,8 @@ impl Registry {
     }
 
     /// Hot path. No hashing, no allocation, no string — `handle` and
-    /// `worker` are both already-resolved indices. Always moves `handle`'s
+    /// `worker` are both already-resolved indices, and reading the current
+    /// [`Snapshot`] is one lock-free `ArcSwap::load`. Always moves `handle`'s
     /// counter up; valid for both [`InstrumentKind::Counter`] and
     /// [`InstrumentKind::UpDownCounter`] handles. See [`Self::add`] for the
     /// signed-delta counterpart `UpDownCounter` handles also get.
@@ -714,7 +953,10 @@ impl Registry {
     /// Panics if `worker` is out of range for this registry's `num_workers`
     /// — a config-time invariant, not something a real request can trigger.
     pub fn incr(&self, worker: WorkerId, handle: Handle, delta: u64) {
-        self.shards[worker.0][handle.0].fetch_add(delta, Ordering::Relaxed);
+        let state = self.published.load();
+        let block = handle.0 / COUNTER_BLOCK_LEN;
+        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        state.counter_shards[worker.0][block][slot].fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Hot path, `UpDownCounter` handles only: `delta` may be negative.
@@ -730,14 +972,17 @@ impl Registry {
     /// every legitimate use of an `UpDownCounter` here (e.g. "connections
     /// currently open" never truly goes negative).
     pub fn add(&self, worker: WorkerId, handle: Handle, delta: i64) {
-        let instrument = self.resolved[handle.0];
+        let state = self.published.load();
+        let instrument = state.resolved[handle.0];
         assert_eq!(
             instrument.kind,
             InstrumentKind::UpDownCounter,
             "stats::Registry::add: {} is a Counter, which has no decrement -- use incr()",
             instrument.name
         );
-        self.shards[worker.0][handle.0].fetch_add(delta as u64, Ordering::Relaxed);
+        let block = handle.0 / COUNTER_BLOCK_LEN;
+        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        state.counter_shards[worker.0][block][slot].fetch_add(delta as u64, Ordering::Relaxed);
     }
 
     /// Summed across every worker shard. **The only read.** No public
@@ -748,9 +993,13 @@ impl Registry {
     /// be a fence on the request path, and observing a slightly-stale value
     /// mid-increment is fine for a counter.
     pub fn value(&self, handle: Handle) -> u64 {
-        self.shards
+        let state = self.published.load();
+        let block = handle.0 / COUNTER_BLOCK_LEN;
+        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        state
+            .counter_shards
             .iter()
-            .map(|shard| shard[handle.0].load(Ordering::Relaxed))
+            .map(|worker_blocks| worker_blocks[block][slot].load(Ordering::Relaxed))
             .fold(0u64, u64::wrapping_add)
     }
 
@@ -761,9 +1010,13 @@ impl Registry {
     /// [`Self::value`]. Nothing outside `#[cfg(test)]` in this crate calls
     /// it, and nothing outside this crate should either.
     pub fn shard_values_for_debugging(&self, handle: Handle) -> Vec<u64> {
-        self.shards
+        let state = self.published.load();
+        let block = handle.0 / COUNTER_BLOCK_LEN;
+        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        state
+            .counter_shards
             .iter()
-            .map(|shard| shard[handle.0].load(Ordering::Relaxed))
+            .map(|worker_blocks| worker_blocks[block][slot].load(Ordering::Relaxed))
             .collect()
     }
 
@@ -775,23 +1028,31 @@ impl Registry {
     /// module doc's Decision 1/2). Control-side/scrape-side use only, same
     /// as [`Self::value`] itself, which this calls once per handle.
     ///
-    /// Rust note: `impl Iterator<..> + '_` borrows `self` for the
-    /// iterator's lifetime rather than collecting into a `Vec` up front —
-    /// there's no reason to allocate a second copy of `resolved`/
-    /// `resolved_attrs` just to hand it back out.
+    /// Rust note: returns owned `Vec<(String, String)>` attrs rather than a
+    /// `&self`-borrowed slice. Before this increment the underlying data
+    /// lived directly on `Registry`, so a borrow tied to `&self` was safe;
+    /// now it lives behind an `ArcSwap`-published `Snapshot` that a
+    /// concurrent `resolve` could replace the instant this call returns, so
+    /// there is no `&self`-scoped slice left to hand back. `load_full`
+    /// clones the `Arc<Snapshot>` itself (a refcount bump, not a deep copy)
+    /// so the returned iterator owns its own consistent view independent of
+    /// `&self`'s lifetime and independent of any growth that happens after
+    /// it was created.
     pub fn counters(
         &self,
-    ) -> impl Iterator<Item = (&'static Instrument, &'_ [(String, String)], u64)> + '_ {
-        self.resolved
-            .iter()
-            .enumerate()
-            .map(move |(i, instrument)| {
-                (
-                    *instrument,
-                    self.resolved_attrs[i].as_slice(),
-                    self.value(Handle(i)),
-                )
-            })
+    ) -> impl Iterator<Item = (&'static Instrument, Vec<(String, String)>, u64)> {
+        let state = self.published.load_full();
+        let n = state.resolved.len();
+        (0..n).map(move |i| {
+            let block = i / COUNTER_BLOCK_LEN;
+            let slot = i % COUNTER_BLOCK_LEN;
+            let value = state
+                .counter_shards
+                .iter()
+                .map(|worker_blocks| worker_blocks[block][slot].load(Ordering::Relaxed))
+                .fold(0u64, u64::wrapping_add);
+            (state.resolved[i], state.resolved_attrs[i].clone(), value)
+        })
     }
 
     /// Hot path. Records one observation of `value` (in the instrument's
@@ -807,7 +1068,8 @@ impl Registry {
     ///
     /// Panics if `worker` is out of range, same as `incr`/`add`.
     pub fn observe(&self, worker: WorkerId, handle: HistogramHandle, value: f64) {
-        let instrument = self.resolved_histograms[handle.0];
+        let state = self.published.load();
+        let instrument = state.resolved_histograms[handle.0];
         let boundaries = instrument.buckets.expect(
             "stats::Registry::observe: instrument has no bucket boundaries -- \
              resolve_histogram should have rejected this at resolve time",
@@ -817,7 +1079,7 @@ impl Registry {
             .position(|&boundary| value <= boundary)
             .unwrap_or(boundaries.len());
 
-        let shard = &self.histogram_shards[worker.0][handle.0];
+        let shard = &state.histogram_shards[worker.0][handle.0];
         shard.bucket_counts[bucket_index].fetch_add(1, Ordering::Relaxed);
         atomic_add_f64(&shard.sum_bits, value);
         shard.count.fetch_add(1, Ordering::Relaxed);
@@ -828,7 +1090,8 @@ impl Registry {
     /// debug-only, unsummed per-shard view. `Relaxed` loads throughout, same
     /// justification as `value`.
     pub fn histogram_snapshot(&self, handle: HistogramHandle) -> HistogramSnapshot {
-        let num_buckets = self.resolved_histograms[handle.0]
+        let state = self.published.load();
+        let num_buckets = state.resolved_histograms[handle.0]
             .buckets
             .expect("stats::Registry::histogram_snapshot: instrument has no bucket boundaries")
             .len()
@@ -837,7 +1100,7 @@ impl Registry {
         let mut bucket_counts = vec![0u64; num_buckets];
         let mut sum = 0.0f64;
         let mut count = 0u64;
-        for worker_shards in &self.histogram_shards {
+        for worker_shards in &state.histogram_shards {
             let shard = &worker_shards[handle.0];
             for (i, bucket) in shard.bucket_counts.iter().enumerate() {
                 bucket_counts[i] = bucket_counts[i].wrapping_add(bucket.load(Ordering::Relaxed));
@@ -858,7 +1121,9 @@ impl Registry {
         &self,
         handle: HistogramHandle,
     ) -> Vec<HistogramSnapshot> {
-        self.histogram_shards
+        let state = self.published.load();
+        state
+            .histogram_shards
             .iter()
             .map(|worker_shards| {
                 let shard = &worker_shards[handle.0];
@@ -882,21 +1147,20 @@ impl Registry {
     /// histogram's exporter-facing value is a *set* of percentiles (see
     /// [`Self::percentile`]), not one number, so the caller needs the
     /// handle to ask for each one. Control-side/scrape-side use only, same
-    /// as [`Self::counters`].
+    /// as [`Self::counters`] -- and, for the same reason, returns owned
+    /// attrs rather than a `&self`-borrowed slice.
     pub fn histograms(
         &self,
-    ) -> impl Iterator<Item = (HistogramHandle, &'static Instrument, &'_ [(String, String)])> + '_
-    {
-        self.resolved_histograms
-            .iter()
-            .enumerate()
-            .map(move |(i, instrument)| {
-                (
-                    HistogramHandle(i),
-                    *instrument,
-                    self.resolved_histogram_attrs[i].as_slice(),
-                )
-            })
+    ) -> impl Iterator<Item = (HistogramHandle, &'static Instrument, Vec<(String, String)>)> {
+        let state = self.published.load_full();
+        let n = state.resolved_histograms.len();
+        (0..n).map(move |i| {
+            (
+                HistogramHandle(i),
+                state.resolved_histograms[i],
+                state.resolved_histogram_attrs[i].clone(),
+            )
+        })
     }
 
     /// The `p`-th percentile (`p` in `[0, 100]`) of `handle`'s observations,
@@ -937,7 +1201,8 @@ impl Registry {
             return 0.0;
         }
 
-        let instrument = self.resolved_histograms[handle.0];
+        let state = self.published.load();
+        let instrument = state.resolved_histograms[handle.0];
         let boundaries = instrument
             .buckets
             .expect("stats::Registry::percentile: instrument has no bucket boundaries");
@@ -977,25 +1242,77 @@ impl Registry {
     }
 }
 
+/// The control-side owner of a [`Registry`]: the only type able to
+/// [`resolve`](StatsControl::resolve)/
+/// [`resolve_histogram`](StatsControl::resolve_histogram) new handles — see
+/// the module doc's "Increment 5" section for why that is worth a whole
+/// second type rather than a flag or a debug assertion.
+///
+/// Deliberately **not `Clone`**: there is exactly one control side per
+/// process (config-lowering runs on one control runtime), and giving out
+/// clones would just recreate the "who can resolve" ambiguity this type
+/// exists to remove. [`Self::registry`] is what workers get instead — an
+/// `Arc<Registry>` clone, which can resolve nothing.
+pub struct StatsControl {
+    registry: Arc<Registry>,
+}
+
+impl StatsControl {
+    /// Build a fresh control side, and the empty [`Registry`] it owns, sized
+    /// for `num_workers` shards. See [`Registry::empty`]'s doc for why
+    /// `num_workers` is fixed here and not growable later.
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            registry: Arc::new(Registry::empty(num_workers)),
+        }
+    }
+
+    /// A clone of the `Arc<Registry>` this control side owns — what gets
+    /// handed to workers (and to `/stats` scrape handlers). The clone can
+    /// `incr`/`value`/`observe`/etc., but has no way to reach `resolve`: see
+    /// the module doc's "Increment 5" section.
+    pub fn registry(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry)
+    }
+
+    /// Resolves `(instrument, attrs)` into a [`Handle`], growing the
+    /// underlying [`Registry`]'s published state if this is the first time
+    /// this pair has been seen. See [`Registry::resolve`]'s doc for the
+    /// dedup/validation/panic rules this forwards to unchanged.
+    pub fn resolve(&self, instrument: &'static Instrument, attrs: &[(&str, &str)]) -> Handle {
+        self.registry.resolve(instrument, attrs)
+    }
+
+    /// The histogram counterpart of [`Self::resolve`]. See
+    /// [`Registry::resolve_histogram`]'s doc for the dedup/validation/panic
+    /// rules this forwards to unchanged.
+    pub fn resolve_histogram(
+        &self,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+    ) -> HistogramHandle {
+        self.registry.resolve_histogram(instrument, attrs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::thread;
 
     // ---- 1: resolve identity -------------------------------------------
 
     #[test]
     fn resolving_same_instrument_and_attrs_twice_yields_same_handle() {
-        let mut registry = Registry::new(1);
-        let a = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
-        let b = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let control = StatsControl::new(1);
+        let a = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let b = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
         assert_eq!(
             a, b,
             "same (instrument, attrs) must resolve to the same handle"
         );
 
-        let c = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "anthropic")]);
+        let c = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "anthropic")]);
         assert_ne!(
             a, c,
             "different attribute values must resolve to different handles"
@@ -1007,9 +1324,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "attribute keys don't match")]
     fn unexpected_attribute_key_is_rejected_loudly() {
-        let mut registry = Registry::new(1);
+        let control = StatsControl::new(1);
         // "region" is not in UPSTREAM_RQ's attribute_keys (["cluster"]).
-        registry.resolve(
+        control.resolve(
             &instruments::UPSTREAM_RQ,
             &[("cluster", "openai"), ("region", "us-east-1")],
         );
@@ -1018,9 +1335,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "attribute keys don't match")]
     fn missing_expected_attribute_key_is_rejected_loudly() {
-        let mut registry = Registry::new(1);
+        let control = StatsControl::new(1);
         // GEN_AI_CLIENT_TOKEN_USAGE expects both "provider" and "type".
-        registry.resolve(
+        control.resolve(
             &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
             &[("provider", "openai")],
         );
@@ -1030,12 +1347,12 @@ mod tests {
 
     #[test]
     fn attribute_order_does_not_affect_handle_identity() {
-        let mut registry = Registry::new(1);
-        let a = registry.resolve(
+        let control = StatsControl::new(1);
+        let a = control.resolve(
             &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
             &[("provider", "openai"), ("type", "input")],
         );
-        let b = registry.resolve(
+        let b = control.resolve(
             &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
             &[("type", "input"), ("provider", "openai")],
         );
@@ -1052,8 +1369,9 @@ mod tests {
     /// it would if this only asserted `== total` with N == 1).
     #[test]
     fn increments_from_several_workers_sum_not_a_single_shards_figure() {
-        let mut registry = Registry::new(3);
-        let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let control = StatsControl::new(3);
+        let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
 
         registry.incr(WorkerId(0), h, 10);
         registry.incr(WorkerId(1), h, 20);
@@ -1085,9 +1403,9 @@ mod tests {
         const WORKERS: usize = 4;
         const INCREMENTS_PER_WORKER: u64 = 10_000;
 
-        let mut registry = Registry::new(WORKERS);
-        let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
-        let registry = Arc::new(registry);
+        let control = StatsControl::new(WORKERS);
+        let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
 
         let handles: Vec<_> = (0..WORKERS)
             .map(|w| {
@@ -1124,8 +1442,9 @@ mod tests {
             buckets: None,
         };
 
-        let mut registry = Registry::new(1);
-        let h = registry.resolve(&CX_ACTIVE, &[("listener", "ingress")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve(&CX_ACTIVE, &[("listener", "ingress")]);
+        let registry = control.registry();
 
         registry.add(WorkerId(0), h, 5);
         registry.add(WorkerId(0), h, 5);
@@ -1146,8 +1465,9 @@ mod tests {
         // that can carry a negative delta) is refused outright for a
         // Counter handle -- there is no way to move UPSTREAM_RQ down, full
         // stop, not "moving it down happens to leave it unchanged".
-        let mut registry = Registry::new(1);
-        let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
         registry.add(WorkerId(0), h, -1);
     }
 
@@ -1210,8 +1530,9 @@ mod tests {
         ];
 
         for &(value, expected_bucket) in cases {
-            let mut registry = Registry::new(1);
-            let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+            let control = StatsControl::new(1);
+            let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+            let registry = control.registry();
             registry.observe(WorkerId(0), h, value);
 
             let snapshot = registry.histogram_snapshot(h);
@@ -1232,8 +1553,9 @@ mod tests {
 
     #[test]
     fn observation_above_last_boundary_lands_in_overflow_bucket() {
-        let mut registry = Registry::new(1);
-        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
 
         // Strictly greater than the last boundary, 3_600_000.
         registry.observe(WorkerId(0), h, 3_600_000.1);
@@ -1259,8 +1581,9 @@ mod tests {
 
     #[test]
     fn histogram_bucket_counts_sum_and_count_sum_across_worker_shards() {
-        let mut registry = Registry::new(3);
-        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let control = StatsControl::new(3);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
 
         // Worker 0: two observations in the (5, 10] bucket (index 3).
         registry.observe(WorkerId(0), h, 7.0);
@@ -1307,8 +1630,9 @@ mod tests {
 
     #[test]
     fn percentile_of_empty_histogram_is_documented_zero_not_nan_or_panic() {
-        let mut registry = Registry::new(1);
-        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
 
         for p in [0.0, 50.0, 99.9, 100.0] {
             let result = registry.percentile(h, p);
@@ -1324,8 +1648,9 @@ mod tests {
     fn percentile_edges_of_all_observations_in_one_bucket() {
         // All four observations land in the (5, 10] bucket (index 3):
         // boundaries[2] = 5 (lower edge), boundaries[3] = 10 (upper edge).
-        let mut registry = Registry::new(1);
-        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
         for value in [6.0, 7.0, 8.0, 9.0] {
             registry.observe(WorkerId(0), h, value);
         }
@@ -1353,8 +1678,9 @@ mod tests {
 
     #[test]
     fn percentile_spanning_two_buckets_interpolates_rather_than_snapping() {
-        let mut registry = Registry::new(1);
-        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
 
         // One observation in (1, 5] (index 2), one in (5, 10] (index 3).
         registry.observe(WorkerId(0), h, 3.0);
@@ -1380,14 +1706,255 @@ mod tests {
     #[test]
     #[should_panic(expected = "is a Histogram")]
     fn resolve_rejects_a_histogram_instrument() {
-        let mut registry = Registry::new(1);
-        registry.resolve(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let control = StatsControl::new(1);
+        control.resolve(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
     }
 
     #[test]
     #[should_panic(expected = "is not a Histogram")]
     fn resolve_histogram_rejects_a_counter_instrument() {
-        let mut registry = Registry::new(1);
-        registry.resolve_histogram(&instruments::UPSTREAM_RQ, &[("cluster", "x")]);
+        let control = StatsControl::new(1);
+        control.resolve_histogram(&instruments::UPSTREAM_RQ, &[("cluster", "x")]);
+    }
+
+    // ==== Increment 5: resolution survives a config swap ===================
+    //
+    // Before this increment, `Registry::resolve` took `&mut self`, which
+    // simply would not compile once `registry` below is shared as
+    // `Arc<Registry>` and moved into a worker thread -- there would be no
+    // way to reach `&mut self` through it. The tests in this section are
+    // the ones that could not even be written, let alone pass, before the
+    // `Registry`/`StatsControl` split.
+
+    // ---- 16: the gate test -- resolution survives sharing -----------------
+
+    #[test]
+    fn resolution_survives_sharing_a_new_handle_resolves_while_a_worker_holds_the_registry() {
+        let control = StatsControl::new(1);
+        let existing = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
+
+        // A worker holds only `Arc<Registry>` -- exactly what
+        // `crates/proxy/src/main.rs` hands to a worker thread -- and
+        // increments an ALREADY-resolved handle from there while the
+        // control side is still live.
+        let worker_registry = Arc::clone(&registry);
+        let worker = thread::spawn(move || {
+            worker_registry.incr(WorkerId(0), existing, 5);
+        });
+        worker.join().unwrap();
+
+        // The control side resolves a NEW handle -- the exact scenario that
+        // could never happen once the registry was shared, before this
+        // increment (WP-23's ship-gate: a config swap that introduces a new
+        // cluster must be able to register its counters).
+        let fresh = control.resolve(
+            &instruments::DOWNSTREAM_CX_TOTAL,
+            &[("listener", "ingress")],
+        );
+        registry.incr(WorkerId(0), fresh, 7);
+
+        assert_eq!(
+            registry.value(existing),
+            5,
+            "a handle resolved before sharing must keep working after a later resolve grows \
+             the registry"
+        );
+        assert_eq!(
+            registry.value(fresh),
+            7,
+            "a handle resolved AFTER the registry was already shared with a worker must work \
+             -- this is the exact case increment 5 exists to fix"
+        );
+    }
+
+    // ---- 17: no lost increments across growth ------------------------------
+
+    /// Pins the design brief's explicitly REJECTED alternative as wrong:
+    /// rebuilding the registry and copying counter VALUES across loses any
+    /// increment landing between the read and the swap -- a metrics bug
+    /// that would show up as a dip in `rate()` at every config reload. A
+    /// naive `Vec` that reallocates on push has the identical bug for the
+    /// same reason (it moves the atomics a concurrent writer is touching).
+    /// This test hammers `incr` on an already-resolved handle from several
+    /// threads while the control side concurrently resolves 200 new
+    /// handles -- enough to cross several `COUNTER_BLOCK_LEN` boundaries --
+    /// then asserts the total is EXACTLY the number of increments issued,
+    /// not off by even one.
+    #[test]
+    fn no_lost_increments_while_resolving_new_handles_concurrently() {
+        const INCR_THREADS: usize = 4;
+        const INCREMENTS_PER_THREAD: u64 = 20_000;
+        const NEW_HANDLES_TO_RESOLVE: usize = 200;
+
+        let control = StatsControl::new(INCR_THREADS);
+        let target = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
+
+        let incrementers: Vec<_> = (0..INCR_THREADS)
+            .map(|w| {
+                let registry = Arc::clone(&registry);
+                thread::spawn(move || {
+                    for _ in 0..INCREMENTS_PER_THREAD {
+                        registry.incr(WorkerId(w), target, 1);
+                    }
+                })
+            })
+            .collect();
+
+        // Growth, concurrently with the increments above: each resolve
+        // clones the shard `Vec`s and swaps a new `Snapshot` in -- exactly
+        // the operation that would race a concurrent `incr` under a naive
+        // "reallocate the shard storage in place" implementation, and the
+        // operation the rejected "copy counter values across" design (see
+        // the module doc) would lose an in-flight increment against.
+        let resolver = thread::spawn(move || {
+            for i in 0..NEW_HANDLES_TO_RESOLVE {
+                let cluster = format!("provider-{i}");
+                control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", cluster.as_str())]);
+            }
+        });
+
+        for t in incrementers {
+            t.join().unwrap();
+        }
+        resolver.join().unwrap();
+
+        assert_eq!(
+            registry.value(target),
+            INCR_THREADS as u64 * INCREMENTS_PER_THREAD,
+            "every increment issued must be reflected exactly -- a lost increment here is \
+             the rejected 'copy counter values across' bug, or the 'Vec reallocates on push' \
+             bug, actually reproducing"
+        );
+    }
+
+    // ---- 18: existing handles keep their values and indices across growth -
+
+    #[test]
+    fn existing_handles_keep_their_values_and_indices_across_a_block_boundary() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+
+        // Resolve handle 0 first and give it a distinctive value before
+        // growing well past it.
+        let first = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "block-0-handle")]);
+        registry.incr(WorkerId(0), first, 42);
+
+        // Resolve 70 handles total (>= COUNTER_BLOCK_LEN + 1), so growth
+        // crosses a block boundary and a second block exists. Checked at
+        // compile time (both sides are `const`) rather than a runtime
+        // `assert!`, which clippy correctly flags as always-true.
+        const NUM_HANDLES: usize = 70;
+        const _: () = assert!(
+            NUM_HANDLES > COUNTER_BLOCK_LEN,
+            "test setup: need at least two blocks' worth of handles"
+        );
+        let mut last = first;
+        for i in 1..NUM_HANDLES {
+            let cluster = format!("cluster-{i}");
+            last = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", cluster.as_str())]);
+        }
+
+        // `first`'s value and identity must be unaffected by every growth
+        // that happened after it, including the block-boundary crossing.
+        assert_eq!(
+            registry.value(first),
+            42,
+            "a handle resolved before growth must keep its value after a block boundary"
+        );
+
+        // A handle resolved from the new block works too, independently.
+        registry.incr(WorkerId(0), last, 99);
+        assert_eq!(registry.value(last), 99);
+        assert_eq!(
+            registry.value(first),
+            42,
+            "incrementing a handle from the new block must not disturb block 0's handle"
+        );
+    }
+
+    // ---- 19/20: histogram equivalents of 16 and 17 -------------------------
+
+    #[test]
+    fn histogram_resolution_survives_sharing_a_new_handle_resolves_while_a_worker_holds_the_registry(
+    ) {
+        let control = StatsControl::new(1);
+        let existing =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "openai")]);
+        let registry = control.registry();
+
+        let worker_registry = Arc::clone(&registry);
+        let worker = thread::spawn(move || {
+            worker_registry.observe(WorkerId(0), existing, 7.0);
+        });
+        worker.join().unwrap();
+
+        let fresh =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "anthropic")]);
+        registry.observe(WorkerId(0), fresh, 3.0);
+
+        assert_eq!(
+            registry.histogram_snapshot(existing).count,
+            1,
+            "a histogram handle resolved before sharing must keep working after a later \
+             resolve grows the registry"
+        );
+        assert_eq!(
+            registry.histogram_snapshot(fresh).count,
+            1,
+            "a histogram handle resolved AFTER the registry was already shared must work"
+        );
+    }
+
+    /// The histogram counterpart of test 17: hammers `observe` on an
+    /// already-resolved histogram handle from several threads while the
+    /// control side concurrently resolves 50 new histogram handles (each
+    /// growth appends one fresh `Arc<HistogramShard>` per worker -- see the
+    /// module doc for why histograms are unblocked, unlike counters).
+    #[test]
+    fn no_lost_histogram_observations_while_resolving_new_handles_concurrently() {
+        const OBS_THREADS: usize = 4;
+        const OBSERVATIONS_PER_THREAD: u64 = 5_000;
+        const NEW_HANDLES_TO_RESOLVE: usize = 50;
+
+        let control = StatsControl::new(OBS_THREADS);
+        let target =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "openai")]);
+        let registry = control.registry();
+
+        let observers: Vec<_> = (0..OBS_THREADS)
+            .map(|w| {
+                let registry = Arc::clone(&registry);
+                thread::spawn(move || {
+                    for _ in 0..OBSERVATIONS_PER_THREAD {
+                        registry.observe(WorkerId(w), target, 7.0);
+                    }
+                })
+            })
+            .collect();
+
+        let resolver = thread::spawn(move || {
+            for i in 0..NEW_HANDLES_TO_RESOLVE {
+                let cluster = format!("provider-{i}");
+                control.resolve_histogram(
+                    &instruments::UPSTREAM_RQ_TIME,
+                    &[("cluster", cluster.as_str())],
+                );
+            }
+        });
+
+        for t in observers {
+            t.join().unwrap();
+        }
+        resolver.join().unwrap();
+
+        let snapshot = registry.histogram_snapshot(target);
+        assert_eq!(
+            snapshot.count,
+            OBS_THREADS as u64 * OBSERVATIONS_PER_THREAD,
+            "every observation issued must be reflected exactly, same claim as test 17 but \
+             for histograms"
+        );
     }
 }

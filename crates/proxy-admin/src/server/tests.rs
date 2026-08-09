@@ -19,7 +19,7 @@ use proxy_config::ir::{
     UpstreamProtocol, VirtualHostIR,
 };
 use proxy_core::WorkerConfigHandle;
-use proxy_observability::stats::{instruments, Registry, WorkerId};
+use proxy_observability::stats::{instruments, Registry, StatsControl, WorkerId};
 use tokio::net::TcpStream;
 
 use crate::server::{serve, AdminServer};
@@ -277,12 +277,12 @@ async fn stats_is_404_when_no_registry_is_wired() {
 /// produces.
 #[tokio::test]
 async fn stats_returns_200_with_the_rendered_body_when_a_registry_is_wired() {
-    let mut registry = Registry::new(1);
-    let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    let control = StatsControl::new(1);
+    let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    let registry = control.registry();
     registry.incr(WorkerId(0), h, 7);
 
-    let (_server, addr) =
-        start_with_registry(snapshot_with_secret(), Some(Arc::new(registry))).await;
+    let (_server, addr) = start_with_registry(snapshot_with_secret(), Some(registry)).await;
     let (status, body) = get(addr, "/stats").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "cluster.openai.upstream_rq_total: 7\n");
@@ -295,13 +295,13 @@ async fn stats_returns_200_with_the_rendered_body_when_a_registry_is_wired() {
 /// summed read would pass every test above this one.
 #[tokio::test]
 async fn stats_body_is_the_summed_value_across_workers() {
-    let mut registry = Registry::new(2);
-    let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    let control = StatsControl::new(2);
+    let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    let registry = control.registry();
     registry.incr(WorkerId(0), h, 10);
     registry.incr(WorkerId(1), h, 25);
 
-    let (_server, addr) =
-        start_with_registry(snapshot_with_secret(), Some(Arc::new(registry))).await;
+    let (_server, addr) = start_with_registry(snapshot_with_secret(), Some(registry)).await;
     let (status, body) = get(addr, "/stats").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(

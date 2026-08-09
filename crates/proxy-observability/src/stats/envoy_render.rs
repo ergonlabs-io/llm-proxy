@@ -130,13 +130,18 @@ const ENVOY_STATS_TEXT_PERCENTILES: [(&str, f64); 10] = [
 pub fn render(registry: &Registry) -> String {
     let mut lines: Vec<(String, String)> = Vec::new();
 
+    // Rust note: `counters()`/`histograms()` now hand back owned
+    // `Vec<(String, String)>` attrs rather than a slice borrowed from
+    // `registry` (see their doc comments -- the underlying data lives
+    // behind an `ArcSwap` a concurrent `resolve` could replace), so `&attrs`
+    // below is a plain reference to a local, not a reborrow of `registry`.
     for (instrument, attrs, value) in registry.counters() {
-        if let Some(name) = envoy_counter_name(instrument, attrs) {
+        if let Some(name) = envoy_counter_name(instrument, &attrs) {
             lines.push((name, value.to_string()));
         }
     }
     for (handle, instrument, attrs) in registry.histograms() {
-        if let Some(name) = envoy_histogram_name(instrument, attrs) {
+        if let Some(name) = envoy_histogram_name(instrument, &attrs) {
             lines.push((name, render_histogram_line(registry, handle)));
         }
     }
@@ -220,14 +225,15 @@ fn render_histogram_line(registry: &Registry, handle: HistogramHandle) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::{instruments, InstrumentKind, WorkerId};
+    use crate::stats::{instruments, InstrumentKind, StatsControl, WorkerId};
 
     // ---- 1: a counter renders as `name: value` under its Envoy name ------
 
     #[test]
     fn counter_renders_as_name_colon_value() {
-        let mut registry = Registry::new(1);
-        let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
         registry.incr(WorkerId(0), h, 5);
 
         let output = render(&registry);
@@ -240,7 +246,7 @@ mod tests {
     fn attribute_expansion_produces_one_to_many_envoy_names() {
         // The production UPSTREAM_RQ const (stats.rs) only carries
         // `cluster` today (no call site resolves it with `status_class`
-        // yet — that's increment 5's job). Rendering only depends on
+        // yet — that's increment 6's job). Rendering only depends on
         // instrument.name and the attrs actually present on a handle (see
         // this module's doc), so a locally-defined instrument sharing the
         // same OTel name is enough to exercise the status_class expansion
@@ -253,15 +259,16 @@ mod tests {
             buckets: None,
         };
 
-        let mut registry = Registry::new(1);
-        let ok = registry.resolve(
+        let control = StatsControl::new(1);
+        let ok = control.resolve(
             &UPSTREAM_RQ_BY_CLASS,
             &[("cluster", "x"), ("status_class", "2xx")],
         );
-        let err = registry.resolve(
+        let err = control.resolve(
             &UPSTREAM_RQ_BY_CLASS,
             &[("cluster", "x"), ("status_class", "5xx")],
         );
+        let registry = control.registry();
         registry.incr(WorkerId(0), ok, 3);
         registry.incr(WorkerId(0), err, 1);
 
@@ -280,11 +287,12 @@ mod tests {
 
     #[test]
     fn instrument_with_no_envoy_template_is_absent() {
-        let mut registry = Registry::new(1);
-        let h = registry.resolve(
+        let control = StatsControl::new(1);
+        let h = control.resolve(
             &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
             &[("provider", "openai"), ("type", "input")],
         );
+        let registry = control.registry();
         registry.incr(WorkerId(0), h, 42);
 
         let output = render(&registry);
@@ -303,9 +311,10 @@ mod tests {
 
     #[test]
     fn output_is_sorted_and_stable_across_repeated_renders() {
-        let mut registry = Registry::new(1);
-        let zeta = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "zeta")]);
-        let alpha = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "alpha")]);
+        let control = StatsControl::new(1);
+        let zeta = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "zeta")]);
+        let alpha = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "alpha")]);
+        let registry = control.registry();
         registry.incr(WorkerId(0), zeta, 1);
         registry.incr(WorkerId(0), alpha, 1);
 
@@ -328,8 +337,9 @@ mod tests {
 
     #[test]
     fn histogram_line_renders_the_chosen_unverified_format() {
-        let mut registry = Registry::new(1);
-        let h = registry.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let control = StatsControl::new(1);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
         registry.observe(WorkerId(0), h, 7.0);
         registry.observe(WorkerId(0), h, 800.0);
 
@@ -366,8 +376,9 @@ mod tests {
     /// above this one.
     #[test]
     fn rendered_value_is_summed_across_workers_not_a_single_shard() {
-        let mut registry = Registry::new(2);
-        let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let control = StatsControl::new(2);
+        let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
         registry.incr(WorkerId(0), h, 10);
         registry.incr(WorkerId(1), h, 25);
 
