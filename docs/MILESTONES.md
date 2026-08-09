@@ -358,6 +358,27 @@ the ceiling is unpublished), WP-06's swap-under-load gate, IR wiring for WP-18/W
 (health checking and outlier detection are both built and green but neither is reachable
 from config yet), WP-15 remainder, WP-14 retry budgets, and **WP-51 (OpenTelemetry)**.
 
+**Found 2026-08-09 — the swap clause has a prerequisite nobody had written down: a running
+proxy cannot be told to swap its config.** The machinery is all there and all tested —
+`ConfigPublisher::publish` stores the new snapshot into every worker's handle and pings
+`config_ping`; `run_listener_manager` wakes on that ping and calls `reconcile`. What is
+missing is the *trigger*. In `crates/proxy/src/main.rs` the `publisher` binding is used for
+exactly two things, `shutdown()` and `join()`; **`publish()` is never called after boot.**
+There is no SIGHUP handler, no admin reload endpoint, and no file watcher, and the startup
+log line says so out loud — "waiting for SIGTERM/SIGINT". The only callers of `publish` in
+the tree are the unit tests in `listener.rs`, through a test harness.
+
+This is easy to misread in both directions, so state it precisely: the swap path is not
+vapor — it is built, and `reconcile` is covered. But *"a config swap under live traffic
+with zero dropped streams"* cannot be demonstrated against the shipped binary today,
+because nothing outside a test can cause a swap. The clause therefore needs two pieces of
+work, not one, and the first is a small feature rather than a test: **(1)** a reload
+trigger in the binary (SIGHUP re-reads the config file and publishes the new snapshot,
+with a parse failure keeping the old snapshot and logging, never taking the proxy down),
+and **(2)** the under-load differential test on WP-26's traffic topology. Sequencing them
+the other way round produces a test that can only drive the harness, which is what the
+gate was written to avoid.
+
 **Added 2026-08-03 — WP-51, and a decision that reshapes WP-23.** Owner direction: make the
 project OTel-ready, because it is the standard. Recorded and scheduled here rather than worked
 now — v0.1.0's scope is frozen and its one open gate clause is still provider failover.
