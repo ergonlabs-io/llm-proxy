@@ -405,6 +405,13 @@ do not participate in them. WP-51 is additive, not a defect fix.
 Envoy's default buckets, and the Envoy text renderer. `/stats` now returns `200` instead of
 the honest 404.
 
+**CLOSED 2026-08-09 — increments 4, 5 and 6a landed and this clause is now met.** `/stats`
+reports real traffic, proven end to end by `crates/proxy/tests/stats_e2e.rs`: the real
+binary, a mock upstream, two real requests, then a real HTTP scrape asserting the **rendered**
+body contains `cluster.backend.upstream_rq_total: 2`. Verified by mutation — remove the
+router's increment and it fails with `upstream_rq_total: 0`. `/stats/prometheus` is served
+too. The warning below is kept because it is what the clause was measured against.
+
 **That is NOT this gate's `/stats` clause being met, and the difference is easy to miss.**
 The instrumentation call sites are WP-23 increment 5 and have not landed, so `/stats` today
 returns `200` with an **empty body** — a correctly-rendered view of a registry against which
