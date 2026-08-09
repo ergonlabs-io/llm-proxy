@@ -19,6 +19,7 @@ use proxy_config::ir::{
     UpstreamProtocol, VirtualHostIR,
 };
 use proxy_core::WorkerConfigHandle;
+use proxy_observability::stats::{instruments, Registry, WorkerId};
 use tokio::net::TcpStream;
 
 use crate::server::{serve, AdminServer};
@@ -126,13 +127,31 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
     })
 }
 
-/// Starts an admin server on port 0 over `snapshot`; returns the server
-/// (kept alive for the caller) and its bound address.
+/// Starts an admin server on port 0 over `snapshot`, with no WP-23 stats
+/// registry wired -- the default for every test that isn't specifically
+/// about `/stats`. See [`start_with_registry`] for the `/stats`-focused
+/// tests. Returns the server (kept alive for the caller) and its bound
+/// address.
 async fn start(snapshot: Arc<ConfigSnapshot>) -> (AdminServer, SocketAddr) {
+    start_with_registry(snapshot, None).await
+}
+
+/// [`start`], but with an explicit (possibly `Some`) WP-23 stats registry --
+/// what `/stats`'s own tests need to exercise both the wired and unwired
+/// cases.
+async fn start_with_registry(
+    snapshot: Arc<ConfigSnapshot>,
+    registry: Option<Arc<Registry>>,
+) -> (AdminServer, SocketAddr) {
     let config = Arc::new(WorkerConfigHandle::new(snapshot));
-    let server = serve("127.0.0.1:0".parse().unwrap(), config, Instant::now())
-        .await
-        .expect("admin server bind");
+    let server = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+        registry,
+        Instant::now(),
+    )
+    .await
+    .expect("admin server bind");
     let addr = server.local_addr();
     (server, addr)
 }
@@ -239,14 +258,56 @@ async fn unknown_path_is_404_and_names_available_endpoints() {
     assert!(body.contains("/server_info"));
 }
 
-/// `/stats` needs the WP-23 registry, which doesn't exist. Pin that we 404
-/// honestly instead of faking an empty `200`.
+/// When this admin server instance was never handed a WP-23 stats registry
+/// (`start`'s default -- most tests in this file don't care about `/stats`),
+/// the route must 404 honestly rather than fabricate an empty `200`: an
+/// operator who trusts an empty `/stats` believes there is no traffic. Also
+/// pins that this is a documented `404`, not a panic -- reaching this
+/// `assert_eq!` at all is already proof the handler didn't panic.
 #[tokio::test]
-async fn stats_is_404_and_mentions_wp23() {
+async fn stats_is_404_when_no_registry_is_wired() {
     let (_server, addr) = start(snapshot_with_secret()).await;
     let (status, body) = get(addr, "/stats").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.contains("WP-23"));
+}
+
+/// WP-23 increment 3: once a registry *is* wired, `/stats` renders it --
+/// `200`, with the Envoy-named, `name: value` body `envoy_render::render`
+/// produces.
+#[tokio::test]
+async fn stats_returns_200_with_the_rendered_body_when_a_registry_is_wired() {
+    let mut registry = Registry::new(1);
+    let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    registry.incr(WorkerId(0), h, 7);
+
+    let (_server, addr) =
+        start_with_registry(snapshot_with_secret(), Some(Arc::new(registry))).await;
+    let (status, body) = get(addr, "/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "cluster.openai.upstream_rq_total: 7\n");
+}
+
+/// The ADR-0005 trap, exercised one more layer out (through a real admin
+/// HTTP request, not just a direct `render()` call): the rendered figure
+/// must be the SUM across worker shards, not one worker's own figure --
+/// a scrape handler that reached for a shard instead of the registry's
+/// summed read would pass every test above this one.
+#[tokio::test]
+async fn stats_body_is_the_summed_value_across_workers() {
+    let mut registry = Registry::new(2);
+    let h = registry.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+    registry.incr(WorkerId(0), h, 10);
+    registry.incr(WorkerId(1), h, 25);
+
+    let (_server, addr) =
+        start_with_registry(snapshot_with_secret(), Some(Arc::new(registry))).await;
+    let (status, body) = get(addr, "/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "cluster.openai.upstream_rq_total: 35\n",
+        "must be the SUM (35), not either worker's own figure (10 or 25)"
+    );
 }
 
 /// The mutating endpoints are explicitly out of scope for this increment;

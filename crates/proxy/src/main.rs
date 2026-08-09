@@ -440,7 +440,14 @@ async fn run_serve(
     // skip (see `start_admin`'s doc comment). Started before the worker pool
     // so a bad admin port fails fast instead of after workers are already
     // accepting traffic.
-    let admin_server = match start_admin(snapshot.admin, snapshot.clone(), Instant::now()).await {
+    let admin_server = match start_admin(
+        snapshot.admin,
+        snapshot.clone(),
+        concurrency,
+        Instant::now(),
+    )
+    .await
+    {
         Ok(server) => server,
         Err(err) => {
             eprintln!("failed to start admin server: {err}");
@@ -557,19 +564,32 @@ async fn wait_for_initial_binds(
 /// the snapshot the process booted with -- true for the whole process
 /// lifetime today, but stated here rather than left to be discovered.
 ///
+/// `concurrency` sizes the WP-23 stats [`Registry`](proxy_observability::stats::Registry)
+/// this hands to the admin server for `/stats` -- the same worker count
+/// `WorkerPoolConfig` uses, since a registry's shard count is fixed at
+/// construction (see the registry's own module doc). No instrument is
+/// resolved against it here: WP-23 increment 5 (the cluster/listener/HTTP
+/// call sites that actually record traffic) hasn't landed yet, so `/stats`
+/// answers `200` with a correctly-rendered but empty body until it does --
+/// not a fabricated non-empty reading, and not the honest-404 case, which is
+/// reserved for a server that was never handed a registry at all (see
+/// `proxy-admin::server`'s `/stats` route).
+///
 /// A bind failure is returned as an `Err`, not swallowed: `run_serve` turns
 /// it into a startup failure, holding the admin port to the same standard
 /// `initial_bind` holds every listener port to.
 async fn start_admin(
     admin: Option<SocketAddr>,
     snapshot: Arc<ConfigSnapshot>,
+    concurrency: usize,
     started_at: Instant,
 ) -> Result<Option<proxy_admin::AdminServer>, String> {
     let Some(addr) = admin else {
         return Ok(None);
     };
     let config = Arc::new(WorkerConfigHandle::new(snapshot));
-    let server = proxy_admin::serve(addr, config, started_at)
+    let registry = Arc::new(proxy_observability::stats::Registry::new(concurrency));
+    let server = proxy_admin::serve(addr, config, Some(registry), started_at)
         .await
         .map_err(|err| err.to_string())?;
     Ok(Some(server))
@@ -704,7 +724,7 @@ mod tests {
         let port = probe.local_addr().expect("local_addr").port();
         drop(probe);
 
-        let result = start_admin(None, empty_snapshot(), Instant::now())
+        let result = start_admin(None, empty_snapshot(), 1, Instant::now())
             .await
             .expect("start_admin(None, ..) must not fail");
         assert!(
@@ -722,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn admin_some_binds_and_serves() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = start_admin(Some(addr), empty_snapshot(), Instant::now())
+        let server = start_admin(Some(addr), empty_snapshot(), 1, Instant::now())
             .await
             .expect("start_admin should succeed on an available port")
             .expect("admin: Some(_) must start a server");

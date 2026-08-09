@@ -194,6 +194,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// WP-23 increment 3: renders a [`Registry`] into Envoy's flat `/stats` text
+/// format. See the module's own doc comment for what is and is not verified
+/// about that format.
+pub mod envoy_render;
+
 /// The OTel semantic-conventions revision this module's instrument names and
 /// attribute keys were written against. See the module doc's "Decision 5" —
 /// changing this value is a breaking change to the metric surface and must
@@ -513,6 +518,12 @@ pub struct Registry {
     /// an instrument's kind (to enforce "Counters don't decrement") and a
     /// future increment can look up name/unit/attrs for rendering.
     resolved: Vec<&'static Instrument>,
+    /// Indexed in lockstep with `resolved`: the sorted `(key, value)` attrs
+    /// each handle was resolved with. WP-23 increment 3 (`envoy_render`)
+    /// reads this to expand attribute values into Envoy `/stats` name
+    /// segments (e.g. a `status_class` attribute becomes
+    /// `..._2xx`/`..._5xx`) -- see [`Self::counters`].
+    resolved_attrs: Vec<Vec<(String, String)>>,
     /// Dedup key -> already-resolved `Handle`, so resolving the same
     /// `(instrument, attrs)` twice returns the same handle instead of
     /// growing a second, parallel time series.
@@ -533,6 +544,8 @@ pub struct Registry {
     /// in its own index space — see the module doc's "handle-space
     /// question".
     resolved_histograms: Vec<&'static Instrument>,
+    /// Same role as `resolved_attrs`, for [`HistogramHandle`]s.
+    resolved_histogram_attrs: Vec<Vec<(String, String)>>,
     /// Same role as `lookup`, for histograms.
     histogram_lookup: HashMap<ResolveKey, HistogramHandle>,
     /// `histogram_shards[worker.0][handle.0]` is that worker's
@@ -549,6 +562,7 @@ impl Registry {
     pub fn new(num_workers: usize) -> Self {
         Self {
             resolved: Vec::new(),
+            resolved_attrs: Vec::new(),
             lookup: HashMap::new(),
             // Rust note: not `vec![Vec::new(); num_workers]` -- that macro
             // needs `Vec<AtomicU64>: Clone`, which needs `AtomicU64: Clone`,
@@ -557,6 +571,7 @@ impl Registry {
             // shard from a fresh closure call sidesteps the bound entirely.
             shards: (0..num_workers).map(|_| Vec::new()).collect(),
             resolved_histograms: Vec::new(),
+            resolved_histogram_attrs: Vec::new(),
             histogram_lookup: HashMap::new(),
             histogram_shards: (0..num_workers).map(|_| Vec::new()).collect(),
         }
@@ -596,6 +611,7 @@ impl Registry {
 
         let handle = Handle(self.resolved.len());
         self.resolved.push(instrument);
+        self.resolved_attrs.push(key.1.clone());
         for shard in &mut self.shards {
             shard.push(AtomicU64::new(0));
         }
@@ -644,6 +660,7 @@ impl Registry {
 
         let handle = HistogramHandle(self.resolved_histograms.len());
         self.resolved_histograms.push(instrument);
+        self.resolved_histogram_attrs.push(key.1.clone());
         // Nineteen boundaries means twenty slots -- see the module doc's
         // "overflow bucket" section.
         let num_buckets = num_boundaries + 1;
@@ -750,6 +767,33 @@ impl Registry {
             .collect()
     }
 
+    /// Every resolved counter/up-down-counter handle, paired with its
+    /// instrument identity, resolved attributes, and already-summed value —
+    /// everything an exporter (WP-23 increment 3's `/stats` text renderer,
+    /// increment 4's Prometheus renderer) needs to render one line, and
+    /// nothing more: no by-name lookup, no shard-level figure (see the
+    /// module doc's Decision 1/2). Control-side/scrape-side use only, same
+    /// as [`Self::value`] itself, which this calls once per handle.
+    ///
+    /// Rust note: `impl Iterator<..> + '_` borrows `self` for the
+    /// iterator's lifetime rather than collecting into a `Vec` up front —
+    /// there's no reason to allocate a second copy of `resolved`/
+    /// `resolved_attrs` just to hand it back out.
+    pub fn counters(
+        &self,
+    ) -> impl Iterator<Item = (&'static Instrument, &'_ [(String, String)], u64)> + '_ {
+        self.resolved
+            .iter()
+            .enumerate()
+            .map(move |(i, instrument)| {
+                (
+                    *instrument,
+                    self.resolved_attrs[i].as_slice(),
+                    self.value(Handle(i)),
+                )
+            })
+    }
+
     /// Hot path. Records one observation of `value` (in the instrument's
     /// declared `unit`) against `handle`: finds `value`'s bucket and bumps
     /// its non-cumulative count, adds `value` into the running `sum`, and
@@ -829,6 +873,30 @@ impl Registry {
                 }
             })
             .collect()
+    }
+
+    /// Every resolved histogram handle, paired with its instrument identity
+    /// and resolved attributes — the histogram counterpart of
+    /// [`Self::counters`]. Deliberately returns the [`HistogramHandle`]
+    /// itself rather than a pre-summed figure: unlike a counter, a
+    /// histogram's exporter-facing value is a *set* of percentiles (see
+    /// [`Self::percentile`]), not one number, so the caller needs the
+    /// handle to ask for each one. Control-side/scrape-side use only, same
+    /// as [`Self::counters`].
+    pub fn histograms(
+        &self,
+    ) -> impl Iterator<Item = (HistogramHandle, &'static Instrument, &'_ [(String, String)])> + '_
+    {
+        self.resolved_histograms
+            .iter()
+            .enumerate()
+            .map(move |(i, instrument)| {
+                (
+                    HistogramHandle(i),
+                    *instrument,
+                    self.resolved_histogram_attrs[i].as_slice(),
+                )
+            })
     }
 
     /// The `p`-th percentile (`p` in `[0, 100]`) of `handle`'s observations,

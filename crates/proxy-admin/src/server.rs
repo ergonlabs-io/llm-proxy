@@ -11,6 +11,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy_core::WorkerConfigHandle;
+use proxy_observability::stats::{envoy_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -58,7 +59,9 @@ impl AdminServer {
 /// `config` is read (never owned) per request via `load()` -- an `Arc`
 /// clone of whatever the control side last published, per ADR-0005's
 /// "control computes, workers read" split applied to this reader too.
-/// `started_at` backs `/server_info`'s uptime.
+/// `registry` is the WP-23 stats registry, `Some` once a caller has one to
+/// offer -- see `/stats`'s route in [`handle`] for what happens when it
+/// doesn't. `started_at` backs `/server_info`'s uptime.
 ///
 /// Rust note: `TcpListener::accept` runs in a loop inside a `tokio::spawn`led
 /// task; each accepted connection gets its own further-spawned task running
@@ -68,6 +71,7 @@ impl AdminServer {
 pub async fn serve(
     addr: SocketAddr,
     config: Arc<WorkerConfigHandle>,
+    registry: Option<Arc<Registry>>,
     started_at: Instant,
 ) -> Result<AdminServer, AdminError> {
     let listener = TcpListener::bind(addr)
@@ -88,10 +92,19 @@ pub async fn serve(
             };
             let io = TokioIo::new(stream);
             let config = config.clone();
+            let registry = registry.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let config = config.clone();
-                    async move { Ok::<_, std::convert::Infallible>(handle(req, &config, started_at)) }
+                    let registry = registry.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(handle(
+                            req,
+                            &config,
+                            registry.as_deref(),
+                            started_at,
+                        ))
+                    }
                 });
                 if let Err(err) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
@@ -112,6 +125,7 @@ pub async fn serve(
 fn handle(
     req: Request<Incoming>,
     config: &WorkerConfigHandle,
+    registry: Option<&Registry>,
     started_at: Instant,
 ) -> Response<Full<Bytes>> {
     match req.uri().path() {
@@ -140,10 +154,22 @@ fn handle(
                 },
             )
         }
-        "/stats" => text(
-            StatusCode::NOT_FOUND,
-            "not implemented yet (WP-23: stats registry); this proxy does not fake an empty /stats",
-        ),
+        // WP-23 increment 3: rendering is `envoy_render::render`, which only
+        // reads atomics already resolved/incremented elsewhere and formats
+        // a string -- no I/O, no blocking, safe on this request path (see
+        // `envoy_render::render`'s own doc). When no registry has been
+        // wired for this server instance (e.g. a test standing up `serve`
+        // without one), this deliberately keeps the pre-existing honest
+        // 404 rather than fabricating an empty `200` -- an operator who
+        // trusts an empty `/stats` believes there is no traffic.
+        "/stats" => match registry {
+            Some(registry) => text(StatusCode::OK, &envoy_render::render(registry)),
+            None => text(
+                StatusCode::NOT_FOUND,
+                "the stats registry (WP-23) is not configured for this admin server instance; \
+                 this proxy does not fake an empty /stats",
+            ),
+        },
         other => text(
             StatusCode::NOT_FOUND,
             &format!(
