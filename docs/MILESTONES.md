@@ -404,8 +404,18 @@ labelled as an unconfirmed recollection. The Grafana conformance test is what wi
 
 **Named gaps:**
 
-- The loadgen Linux `/proc` sampler is written to spec but unverified — no Linux box in
-  the loop. That is a blocker for this gate, not a footnote.
+- ~~The loadgen Linux `/proc` sampler is written to spec but unverified — no Linux box in
+  the loop. That is a blocker for this gate, not a footnote.~~ — **owner decision
+  2026-08-09: set aside, and it was never the blocker this bullet claimed.**
+
+  The gate asks for a run that is **not harness-bound**; it does not ask for Linux. The
+  macOS sampler path is the verified one, so the capacity report ships from macOS and the
+  Linux `/proc` path stays labelled unverified and out of scope for v0.2.0. Nothing about
+  the report's honesty depends on which of the two platforms produced it, as long as the
+  run is not harness-bound — which is the clause that *is* still open, and it is open on
+  **WP-15 connection reuse**, not on this. Connect-per-stream burns two ephemeral ports per
+  stream and caps the rig at ~8k streams, and the rig correctly marks such a run
+  harness-bound rather than passing it off as proxy capacity.
 - ~~`sigterm_drains_then_exits_cleanly` (`crates/proxy/tests/cli.rs`) is **flaky on
   timing**~~ — **closed 2026-08-08, and the diagnosis in this bullet was wrong twice over.**
 
