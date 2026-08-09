@@ -82,5 +82,28 @@ between a request and its response belongs on the control side of that boundary.
 | Subsystem | Trait | Embedded impl | Distributed |
 |---|---|---|---|
 | Token budgets (WP-34) | `BudgetStore` ✅ | `InProcessBudgetStore` ✅ | not built — seam ready |
-| Stats (WP-23) | not built | not built | — |
-| Control plane (WP-50) | not built | not built | — |
+| Stats (WP-23) | **n/a — see below** | registry ✅ (increment 1, 2026-08-08) | **never** |
+| Control plane (WP-50) | `Authenticator` ✅ (2026-08-08) | in-memory `KeySet` ✅ | not built — seam ready |
+
+### Amendment 2026-08-08 — stats are not a distributed subsystem, and this table used to imply they were
+
+Stats sat in the row above for the same reason as budgets, and that was wrong. The two are
+**opposites**, and the distinction is worth stating because the row as written invites
+someone to build a `StatsStore` and cite this ADR while doing it:
+
+- A **budget** must be shared across replicas, or a configured limit of X becomes an
+  effective limit of N·X. That is this ADR's founding example.
+- **Stats must NOT be shared across replicas.** Each replica reports its own counters and
+  the time-series database sums them. Pre-aggregating inside the proxy would produce numbers
+  nobody could attribute to a replica, break `rate()` across restarts, and put a network
+  dependency inside a scrape.
+
+What this ADR *does* correctly demand of stats is the **intra-process** half: aggregation
+across **workers**, where the per-worker trap named at the top of this document applies with
+full force — a per-worker counter exposed as if it were the metric is wrong by the worker
+count, exactly as a per-worker budget was. WP-23 increment 1 handles that with per-worker
+shards whose un-summed values are unreachable through the public API.
+
+The trait-shaped seam stats actually owe is the **exporter** (`/stats` text,
+`/stats/prometheus`, later OTLP push for WP-51) — not a store. Full reasoning in
+`docs/wp-23-stats-design-brief.md`.
