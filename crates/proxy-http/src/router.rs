@@ -85,6 +85,7 @@ use crate::handler::{
 };
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, select_cluster};
+use crate::stat_handles::RouterStats;
 use crate::upstream_pool::{ConnKey, UpstreamConnCache};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
@@ -121,21 +122,33 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 /// ADR-0004 step 3: the router's own [`TerminalFilterInstanceFactory`] --
 /// mints a fresh [`RouterHandler`] per stream, exactly like every other
 /// filter's factory. `Send + Sync` (required by `TerminalFilterInstanceFactory`,
-/// see its doc) because it only holds an `Arc<ClusterManager>` -- thread-safe
-/// config-time state, same shape as `FilterInstanceFactory` implementors.
+/// see its doc) because it only holds `Arc`s -- thread-safe config-time
+/// state, same shape as `FilterInstanceFactory` implementors.
+///
+/// WP-23 increment 6a: `stats` is built once per worker (a fresh
+/// [`RouterStats`] carrying that worker's own `WorkerId` -- see
+/// `crates/proxy/src/main.rs`'s `worker_main`) and handed in here alongside
+/// `clusters`, the same way every other piece of shared, worker-scoped state
+/// reaches the router: through the factory that `proxy-core`'s listener
+/// wiring builds once per (worker, config version), not through anything
+/// resolved per request.
 pub struct RouterFilterFactory {
     clusters: Arc<ClusterManager>,
+    stats: Arc<RouterStats>,
 }
 
 impl RouterFilterFactory {
-    pub fn new(clusters: Arc<ClusterManager>) -> Self {
-        Self { clusters }
+    pub fn new(clusters: Arc<ClusterManager>, stats: Arc<RouterStats>) -> Self {
+        Self { clusters, stats }
     }
 }
 
 impl TerminalFilterInstanceFactory for RouterFilterFactory {
     fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter> {
-        Box::new(RouterHandler::new(self.clusters.clone()))
+        Box::new(RouterHandler::new(
+            self.clusters.clone(),
+            self.stats.clone(),
+        ))
     }
 }
 
@@ -153,6 +166,10 @@ impl TerminalFilterInstanceFactory for RouterFilterFactory {
 /// across a seam.
 pub struct RouterHandler {
     clusters: Arc<ClusterManager>,
+    /// WP-23 increment 6a: this worker's `upstream_rq`/`upstream_rq_time`
+    /// recorder -- see `apply_forward`'s attempt loop for where it's called
+    /// and why.
+    stats: Arc<RouterStats>,
     /// WP-15 slice A: this worker's h2 connection-reuse cache. `Rc`, not a
     /// field on `RouterFilterFactory` -- see `upstream_pool::worker_conn_cache`'s
     /// doc for why the factory (which must stay `Send + Sync`) can't hold
@@ -173,9 +190,10 @@ pub struct RouterHandler {
 }
 
 impl RouterHandler {
-    pub fn new(clusters: Arc<ClusterManager>) -> Self {
+    pub fn new(clusters: Arc<ClusterManager>, stats: Arc<RouterStats>) -> Self {
         Self {
             clusters,
+            stats,
             conn_cache: crate::upstream_pool::worker_conn_cache(),
             captured_head: None,
             captured_body: Bytes::new(),
@@ -436,6 +454,27 @@ impl RouterHandler {
                 // `attempt_cluster` still being read below.
                 ctx.attempted_clusters.push(attempt_cluster.to_string());
 
+                // WP-23 increment 6a: this is "the attempt is actually
+                // dispatched" -- past the S5 circuit breaker and host
+                // selection above, so this is exactly one increment per
+                // upstream attempt (a retry is a second, later iteration of
+                // this same loop, so it increments again), against the
+                // cluster this attempt is actually sent to (`attempt_cluster`
+                // -- the member on a failover, never the routed aggregate
+                // `cluster_name`). A circuit-breaker rejection returns before
+                // this point and so never increments at all, matching
+                // Envoy's own `upstream_rq_total` (a `max_requests` rejection
+                // shows up as `upstream_rq_pending_overflow`/
+                // `upstream_rq_overflow`, not as a request issued to the
+                // cluster). `attempt_dispatched_at` is this same attempt's
+                // clock start for `upstream_rq_time` below -- every exit from
+                // this iteration past this point (`continue` or `return`)
+                // pairs with exactly one `record_attempt_duration_ms`/
+                // `record_attempt_duration_since` call, so the two
+                // instruments stay in lockstep per attempt.
+                self.stats.record_attempt(attempt_cluster);
+                let attempt_dispatched_at = std::time::Instant::now();
+
                 let proto = attempt_entry.upstream_protocol();
                 // WP-24: both known right here, at the dial site -- recorded
                 // onto `StreamInfo` for `%UPSTREAM_HOST%`/`%UPSTREAM_CLUSTER%`/
@@ -481,6 +520,8 @@ impl RouterHandler {
                 let connected = match connect_result {
                     Ok(connected) => connected,
                     Err(err) => {
+                        self.stats
+                            .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         let outcome = AttemptOutcome::from_pool_error(&err);
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome) {
@@ -634,6 +675,10 @@ impl RouterHandler {
                     Some(d) => match tokio::time::timeout(d, send).await {
                         Ok(result) => result,
                         Err(_elapsed) => {
+                            self.stats.record_attempt_duration_since(
+                                attempt_cluster,
+                                attempt_dispatched_at,
+                            );
                             let outcome = AttemptOutcome::PerTryTimeout;
                             if let Some(state) = &mut retry_state {
                                 if state.should_retry(&outcome) {
@@ -660,6 +705,8 @@ impl RouterHandler {
 
                 match attempt_result {
                     Ok(mut resp) => {
+                        self.stats
+                            .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         let outcome = AttemptOutcome::Response(resp.head.status.as_u16());
                         let retriable = retry_state
                             .as_ref()
@@ -692,6 +739,8 @@ impl RouterHandler {
                         return resp;
                     }
                     Err(err) => {
+                        self.stats
+                            .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         // WP-15 slice A, hazard 2: a send failure on a cached
                         // h2 sender means it's suspect (e.g. the peer closed
                         // right as we sent) -- evict it so the next
@@ -983,6 +1032,19 @@ mod tests {
     use crate::filter::{FilterInstanceFactory, RequestHeaders};
     use crate::filter_manager::FilterChainHandler;
     use crate::handler::{DownstreamInfo, StreamHandler};
+    use crate::stat_handles::StatHandles;
+    use proxy_observability::stats::{StatsControl, WorkerId};
+
+    /// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved
+    /// for exactly `cluster_names` -- what every `build_router*` helper below
+    /// hands to [`RouterFilterFactory::new`], mirroring how
+    /// `crates/proxy/src/main.rs` builds the real one from the boot config
+    /// snapshot's cluster names.
+    fn test_router_stats(cluster_names: &[&str]) -> Arc<RouterStats> {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(StatHandles::build(&control, cluster_names.iter().copied()));
+        Arc::new(RouterStats::new(control.registry(), handles, WorkerId(0)))
+    }
 
     /// A one-shot "reflecting" upstream: accepts a single connection, reads
     /// until the request's header terminator (`\r\n\r\n`), hands the raw
@@ -1270,6 +1332,49 @@ mod tests {
         fwd: ForwardAction,
         circuit_breakers: CircuitBreakers,
     ) -> FilterChainHandler {
+        build_router_with_circuit_breakers_and_stats(addr, matcher, fwd, circuit_breakers)
+            .await
+            .0
+    }
+
+    /// Like [`build_router_with_circuit_breakers`], but also hands back the
+    /// [`RouterStats`] (and, through it, the
+    /// [`proxy_observability::stats::Registry`]) the router was built with --
+    /// for the WP-23 increment 6a tests that need to assert on recorded
+    /// traffic, not just the response the router returns. Builds a
+    /// [`RouterStats`] resolved for cluster `"up"` (the only cluster this
+    /// helper's `ClusterManager` ever registers) -- see
+    /// [`build_router_with_stats_table`] for the tests that need a
+    /// *different* stats table (e.g. one missing `"up"` entirely, to prove
+    /// the unknown-cluster no-op path).
+    async fn build_router_with_circuit_breakers_and_stats(
+        addr: SocketAddr,
+        matcher: RouteMatcher,
+        fwd: ForwardAction,
+        circuit_breakers: CircuitBreakers,
+    ) -> (FilterChainHandler, Arc<RouterStats>) {
+        let stats = test_router_stats(&["up"]);
+        let handler =
+            build_router_with_stats_table(addr, matcher, fwd, circuit_breakers, stats.clone())
+                .await;
+        (handler, stats)
+    }
+
+    /// The common builder every `build_router*` helper above bottoms out in:
+    /// same one-cluster (`"up"`), one-route `ClusterManager`/`RouteTable` as
+    /// [`build_router`], but takes the [`RouterStats`] to build the
+    /// [`RouterFilterFactory`] with directly, rather than always resolving a
+    /// fresh one for `"up"` -- what lets a test hand in a `RouterStats` that
+    /// deliberately does NOT know about `"up"`, to exercise the "unknown
+    /// cluster is a no-op, not a panic" path end to end through the real
+    /// dispatch code, not just at the `stat_handles` unit-test level.
+    async fn build_router_with_stats_table(
+        addr: SocketAddr,
+        matcher: RouteMatcher,
+        fwd: ForwardAction,
+        circuit_breakers: CircuitBreakers,
+        stats: Arc<RouterStats>,
+    ) -> FilterChainHandler {
         let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
         let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
         snapshot.insert(
@@ -1315,7 +1420,7 @@ mod tests {
         .unwrap();
 
         let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-            Arc::new(RouterFilterFactory::new(Arc::new(manager)));
+            Arc::new(RouterFilterFactory::new(Arc::new(manager), stats));
         FilterChainHandler::new(
             Vec::new(),
             terminal_factory,
@@ -1379,8 +1484,9 @@ mod tests {
         )
         .unwrap();
 
-        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-            Arc::new(RouterFilterFactory::new(Arc::new(manager)));
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
+            RouterFilterFactory::new(Arc::new(manager), test_router_stats(&["up"])),
+        );
         FilterChainHandler::new(
             Vec::new(),
             terminal_factory,
@@ -1770,6 +1876,130 @@ mod tests {
         .expect("should complete well within the test's own guard timeout");
     }
 
+    /// WP-23 increment 6a: the S5 circuit breaker rejects the second attempt
+    /// before host selection ever runs, so that attempt was never dialed --
+    /// it must not add an `upstream_rq_time` observation (a zero-duration
+    /// entry for an attempt that never reached the upstream would corrupt
+    /// the P50), and, symmetrically, must not increment `upstream_rq` either
+    /// (matching Envoy: a `max_requests` rejection is
+    /// `upstream_rq_pending_overflow`/`upstream_rq_overflow`, never
+    /// `upstream_rq_total`). Only the first (accepted) attempt should be
+    /// reflected in either instrument.
+    #[tokio::test(flavor = "current_thread")]
+    async fn circuit_breaker_rejection_does_not_add_a_histogram_observation() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            LocalSet::new()
+                .run_until(async {
+                    let addr = spawn_upstream_that_stalls_mid_body().await;
+                    let (router, stats) = build_router_with_circuit_breakers_and_stats(
+                        addr,
+                        prefix_matcher("/v1/"),
+                        forward_to_up(None, None, None),
+                        circuit_breakers_with_max_requests(1),
+                    )
+                    .await;
+
+                    let first = router.handle(request("/v1/chat/completions")).await;
+                    assert_eq!(first.head.status, StatusCode::OK);
+
+                    let second = router.handle(request("/v1/chat/completions")).await;
+                    assert_eq!(second.head.status, StatusCode::SERVICE_UNAVAILABLE);
+
+                    let registry = stats.registry();
+                    let rendered = proxy_observability::stats::envoy_render::render(&registry);
+                    assert!(
+                        rendered.contains("cluster.up.upstream_rq_total: 1"),
+                        "the shed second attempt must not count against upstream_rq, got:\n{rendered}"
+                    );
+                    assert_eq!(
+                        stats.rq_time_observation_count("up"),
+                        Some(1),
+                        "the shed second attempt (never dialed) must not add an \
+                         upstream_rq_time observation"
+                    );
+
+                    drop(first.body);
+                })
+                .await;
+        })
+        .await
+        .expect("should complete well within the test's own guard timeout");
+    }
+
+    /// WP-23 increment 6a: a served request's `upstream_rq_time` observation
+    /// must be a real, plausible duration -- not zero, not absent. Bounded
+    /// loosely (a few hundred milliseconds is generous for a loopback
+    /// reflecting upstream) so this doesn't flake on a slow CI box while
+    /// still catching "recorded nothing" or "recorded a bogus huge value"
+    /// regressions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn upstream_rq_time_records_a_plausible_duration_for_a_served_request() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, _rx) = spawn_reflecting_upstream().await;
+                let (router, stats) = build_router_with_circuit_breakers_and_stats(
+                    addr,
+                    prefix_matcher("/v1/"),
+                    forward_to_up(None, None, None),
+                    CircuitBreakers::default(),
+                )
+                .await;
+
+                let resp = router.handle(request("/v1/chat/completions")).await;
+                assert_eq!(resp.head.status, StatusCode::OK);
+
+                assert_eq!(
+                    stats.rq_time_observation_count("up"),
+                    Some(1),
+                    "exactly one attempt was dispatched and completed"
+                );
+                let sum_ms = stats
+                    .rq_time_sum_ms("up")
+                    .expect("\"up\" has a resolved upstream_rq_time handle");
+                assert!(
+                    sum_ms > 0.0 && sum_ms < 500.0,
+                    "expected a plausible loopback request duration in (0, 500) ms, got {sum_ms}"
+                );
+
+                let rendered = proxy_observability::stats::envoy_render::render(&stats.registry());
+                assert!(
+                    rendered.contains("cluster.up.upstream_rq_time:"),
+                    "the served request's duration should render under upstream_rq_time, got:\n{rendered}"
+                );
+            })
+            .await;
+    }
+
+    /// WP-23 increment 6a: `ClusterManager` (routing/dialing) knows about
+    /// `"up"`, but the stats handle table this router was built with does
+    /// NOT (a config-shaped mismatch this table's boot-time construction
+    /// makes possible in principle -- see `stat_handles`'s module doc). The
+    /// request must still be served normally: stats recording is a no-op for
+    /// an unresolved cluster, never a panic, never a failed request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_attempt_against_a_cluster_missing_from_the_stats_table_does_not_panic() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, _rx) = spawn_reflecting_upstream().await;
+                let router = build_router_with_stats_table(
+                    addr,
+                    prefix_matcher("/v1/"),
+                    forward_to_up(None, None, None),
+                    CircuitBreakers::default(),
+                    test_router_stats(&[]),
+                )
+                .await;
+
+                let resp = router.handle(request("/v1/chat/completions")).await;
+                assert_eq!(
+                    resp.head.status,
+                    StatusCode::OK,
+                    "an unresolved stats handle must not fail the request"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn max_requests_permit_is_released_when_the_response_body_completes() {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1897,8 +2127,9 @@ mod tests {
             .run_until(async {
                 let route_table = direct_response_route_table();
                 let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
-                let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-                    Arc::new(RouterFilterFactory::new(Arc::new(manager)));
+                let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
+                    RouterFilterFactory::new(Arc::new(manager), test_router_stats(&[])),
+                );
                 let rewrite_factory: Arc<dyn FilterInstanceFactory> =
                     Arc::new(RewriteToFilterFactory { to: "/b/x" });
                 let handler = FilterChainHandler::new(

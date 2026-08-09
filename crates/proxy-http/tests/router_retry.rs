@@ -28,6 +28,8 @@ use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
+use proxy_http::stat_handles::{RouterStats, StatHandles};
+use proxy_observability::stats::{StatsControl, WorkerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::LocalSet;
@@ -72,10 +74,31 @@ fn prefix_matcher(prefix: &str) -> RouteMatcher {
     }
 }
 
+/// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved for
+/// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
+/// mirroring how `crates/proxy/src/main.rs` builds the real one from the
+/// boot config snapshot's cluster names.
+fn test_router_stats(cluster_names: &[&str]) -> Arc<RouterStats> {
+    let control = StatsControl::new(1);
+    let handles = Arc::new(StatHandles::build(&control, cluster_names.iter().copied()));
+    Arc::new(RouterStats::new(control.registry(), handles, WorkerId(0)))
+}
+
 /// Build a one-cluster, one-route [`FilterChainHandler`] (no configured
 /// filters, just the router terminal) forwarding to `addr` under cluster name
 /// `"up"` -- mirrors `router.rs`'s own `build_router` test helper.
 async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandler {
+    build_router_with_stats(addr, fwd).await.0
+}
+
+/// Like [`build_router`], but also hands back the [`RouterStats`] (and,
+/// through it, the [`proxy_observability::stats::Registry`]) the router was
+/// built with -- for tests that need to assert on recorded traffic, not just
+/// the response the router returns.
+async fn build_router_with_stats(
+    addr: SocketAddr,
+    fwd: ForwardAction,
+) -> (FilterChainHandler, Arc<RouterStats>) {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
     snapshot.insert(
@@ -120,15 +143,19 @@ async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandle
     )
     .unwrap();
 
+    let stats = test_router_stats(&["up"]);
     let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-        Arc::new(RouterFilterFactory::new(Arc::new(manager)));
-    FilterChainHandler::new(
-        Vec::new(),
-        terminal_factory,
-        Arc::new(route_table),
-        false,
-        false,
-        0,
+        Arc::new(RouterFilterFactory::new(Arc::new(manager), stats.clone()));
+    (
+        FilterChainHandler::new(
+            Vec::new(),
+            terminal_factory,
+            Arc::new(route_table),
+            false,
+            false,
+            0,
+        ),
+        stats,
     )
 }
 
@@ -250,6 +277,39 @@ async fn a_503_is_retried_and_the_second_attempts_200_is_returned() {
         .await;
 }
 
+/// WP-23 increment 6a: a retried request is TWO upstream attempts against
+/// the same cluster, so `upstream_rq` must count 2, not 1 -- Envoy's
+/// `upstream_rq_total` counts requests issued to a cluster, not downstream
+/// requests, and undercounting a retry as one attempt would make the retry
+/// rate invisible. Asserted against the *rendered* `/stats` text
+/// (`proxy_observability::stats::envoy_render::render`), not just
+/// `Registry::value`, so this fails if the renderer ever stops seeing what
+/// the router records -- see the WP-23 increment 6a task brief.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retried_request_counts_twice_against_upstream_rq() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, count, _rx) = spawn_upstream_fails_then_succeeds(1, 503).await;
+            let (router, stats) =
+                build_router_with_stats(addr, forward_to_up(Some(retry_policy("5xx", 1)))).await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                2,
+                "expected exactly 2 attempts"
+            );
+
+            let rendered = proxy_observability::stats::envoy_render::render(&stats.registry());
+            assert!(
+                rendered.contains("cluster.up.upstream_rq_total: 2"),
+                "expected the retried request to count 2 against upstream_rq, got:\n{rendered}"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn retries_stop_at_num_retries_and_return_the_last_failure() {
     LocalSet::new()
@@ -338,8 +398,9 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                 BTreeMap::new(),
             )
             .unwrap();
-            let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-                Arc::new(RouterFilterFactory::new(Arc::new(manager)));
+            let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
+                RouterFilterFactory::new(Arc::new(manager), test_router_stats(&["up"])),
+            );
             let router = FilterChainHandler::new(
                 Vec::new(),
                 terminal_factory,

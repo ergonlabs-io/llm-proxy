@@ -30,6 +30,8 @@ use proxy_core::WorkerConfigHandle;
 use proxy_http::codec::{serve_http1, Http1Options};
 use proxy_http::handler::stub::FixedResponseHandler;
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
+use proxy_http::stat_handles::{RouterStats, StatHandles};
+use proxy_observability::stats::{StatsControl, WorkerId};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
@@ -261,12 +263,28 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         cluster_manager.force_initialize(name);
     }
 
+    // WP-23 increment 6a: `crates/proxy/src/main.rs` builds this once, at
+    // boot, from the real config snapshot's cluster names -- mirrored here
+    // rather than skipped, since `initial_bind` now requires it to build
+    // `RouterFilterFactory`.
+    let stats_control = StatsControl::new(1);
+    let stat_handles = Arc::new(StatHandles::build(
+        &stats_control,
+        snapshot.clusters.keys().map(String::as_str),
+    ));
+    let router_stats = Arc::new(RouterStats::new(
+        stats_control.registry(),
+        stat_handles,
+        WorkerId(0),
+    ));
+
     let bound = initial_bind(
         &snapshot,
         &config,
         &registry,
         &shutdown_rx,
         &cluster_manager,
+        &router_stats,
     )
     .expect("initial_bind should succeed in tests");
 
@@ -277,6 +295,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         shutdown_rx,
         registry,
         cluster_manager,
+        router_stats,
     ));
 
     Harness {

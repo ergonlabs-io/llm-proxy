@@ -31,6 +31,7 @@ pub mod headers;
 pub mod retry;
 pub mod route;
 pub mod router;
+pub mod stat_handles;
 pub mod stream_info;
 pub mod upstream_pool;
 

@@ -26,6 +26,10 @@ proxy-filters = { workspace = true }
 # `tests/dialect.rs`'s `body_based_model_routing_reaches_the_right_provider`.
 proxy-http = { workspace = true }
 proxy-cluster = { workspace = true }
+# Test-only, WP-23 increment 6a: `RouterFilterFactory` now requires a
+# `RouterStats`, built here the same way `crates/proxy/src/main.rs` does at
+# boot.
+proxy-observability = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }

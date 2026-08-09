@@ -434,6 +434,25 @@ async fn run_serve(
         return ExitCode::FAILURE;
     }
 
+    // WP-23 increment 6a: one `StatsControl`/`Registry` shared across every
+    // worker, same "control computes, workers `load`" shape as
+    // `cluster_manager` above -- and a `StatHandles` table resolved, once,
+    // for every cluster this boot snapshot names. `StatsControl` itself
+    // (the only thing that can `resolve` a NEW handle) never leaves this
+    // function: `registry` (a plain `Arc<Registry>` clone) is what both the
+    // admin server and every worker's `RouterStats` actually hold. See
+    // `proxy_observability::stats`'s module doc, "Increment 5", for why the
+    // two are split, and `proxy_http::stat_handles`'s module doc for why a
+    // cluster added by a config reload after this point isn't in the table
+    // yet (dynamic config updates aren't wired into this binary at all --
+    // WP-20/21/22).
+    let stats_control = proxy_observability::stats::StatsControl::new(concurrency);
+    let stat_handles = Arc::new(proxy_http::stat_handles::StatHandles::build(
+        &stats_control,
+        snapshot.clusters.keys().map(String::as_str),
+    ));
+    let registry = stats_control.registry();
+
     // WP-50 increment 1: the read-only admin surface. Opt-in -- only binds
     // when the config names an `admin` address -- and, like a listener's
     // `initial_bind`, a bind failure here is a startup error, not a silent
@@ -443,7 +462,7 @@ async fn run_serve(
     let admin_server = match start_admin(
         snapshot.admin,
         snapshot.clone(),
-        concurrency,
+        registry.clone(),
         Instant::now(),
     )
     .await
@@ -489,7 +508,13 @@ async fn run_serve(
         snapshot,
         move |ctx: WorkerContext| {
             let bind_tx = bind_tx.clone();
-            worker_main(ctx, bind_tx, cluster_manager.clone())
+            worker_main(
+                ctx,
+                bind_tx,
+                cluster_manager.clone(),
+                registry.clone(),
+                stat_handles.clone(),
+            )
         },
     );
 
@@ -564,24 +589,17 @@ async fn wait_for_initial_binds(
 /// the snapshot the process booted with -- true for the whole process
 /// lifetime today, but stated here rather than left to be discovered.
 ///
-/// `concurrency` sizes the WP-23 stats
-/// [`StatsControl`](proxy_observability::stats::StatsControl) built here --
-/// the same worker count `WorkerPoolConfig` uses, since a registry's shard
-/// count is fixed at construction (see the registry's own module doc). No
-/// instrument is resolved against it here: WP-23 increment 6 (the
-/// cluster/listener/HTTP call sites that actually record traffic) hasn't
-/// landed yet, so `/stats` answers `200` with a correctly-rendered but empty
-/// body until it does -- not a fabricated non-empty reading, and not the
-/// honest-404 case, which is reserved for a server that was never handed a
-/// registry at all (see `proxy-admin::server`'s `/stats` route).
-///
-/// Only `StatsControl::registry()`'s `Arc<Registry>` is handed to the admin
-/// server -- the `StatsControl` value itself (the only thing that can
-/// `resolve` new handles) stays here, in the function that built it. Nothing
-/// re-resolves against it yet (that is increment 6's job, once config
-/// reload actually swaps snapshots); see `proxy_observability::stats`'s
-/// module doc, "Increment 5", for why resolution and the shared, per-request
-/// `Registry` had to be split into two types in the first place.
+/// `registry` is the same [`proxy_observability::stats::Registry`]
+/// `run_serve` hands to every worker's [`RouterStats`](proxy_http::stat_handles::RouterStats)
+/// -- built once, from a single [`StatsControl`](proxy_observability::stats::StatsControl),
+/// in `run_serve` itself (not here any more, since increment 6a's workers
+/// need the exact same registry, not a second, disconnected one). As of
+/// WP-23 increment 6a, `/stats` reports real `upstream_rq`/`upstream_rq_time`
+/// traffic for every cluster the boot snapshot named -- see
+/// `proxy_http::stat_handles`'s module doc for the two instruments' call
+/// sites and for why a cluster added by a config reload after boot isn't
+/// reflected here yet (dynamic config updates aren't wired into this binary
+/// at all).
 ///
 /// A bind failure is returned as an `Err`, not swallowed: `run_serve` turns
 /// it into a startup failure, holding the admin port to the same standard
@@ -589,22 +607,13 @@ async fn wait_for_initial_binds(
 async fn start_admin(
     admin: Option<SocketAddr>,
     snapshot: Arc<ConfigSnapshot>,
-    concurrency: usize,
+    registry: Arc<proxy_observability::stats::Registry>,
     started_at: Instant,
 ) -> Result<Option<proxy_admin::AdminServer>, String> {
     let Some(addr) = admin else {
         return Ok(None);
     };
     let config = Arc::new(WorkerConfigHandle::new(snapshot));
-    // Rust note: `StatsControl` (not `Registry` directly) is the WP-23
-    // increment 5 constructor -- it is the only thing that can `resolve` a
-    // handle, and `.registry()` is a plain `Arc<Registry>` clone with no way
-    // to reach that. Nothing here calls `resolve` yet (increment 6's job),
-    // so `control` itself doesn't need to outlive this function; the
-    // `Arc<Registry>` handed to `proxy_admin::serve` keeps the shared state
-    // alive regardless.
-    let control = proxy_observability::stats::StatsControl::new(concurrency);
-    let registry = control.registry();
     let server = proxy_admin::serve(addr, config, Some(registry), started_at)
         .await
         .map_err(|err| err.to_string())?;
@@ -629,8 +638,26 @@ async fn worker_main(
     ctx: WorkerContext,
     bind_tx: mpsc::UnboundedSender<(WorkerId, Result<(), String>)>,
     cluster_manager: Arc<proxy_cluster::manager::ClusterManager>,
+    stats_registry: Arc<proxy_observability::stats::Registry>,
+    stat_handles: Arc<proxy_http::stat_handles::StatHandles>,
 ) {
     let registry = ConnectionRegistry::new();
+    // WP-23 increment 6a: built fresh per worker -- `stats_registry`/
+    // `stat_handles` are the SAME shared, config-scoped state every worker
+    // gets (plain `Arc` clones), but `WorkerId` is this worker's own, so
+    // `RouterStats` (which bakes a `WorkerId` in at construction, see its
+    // doc) can't be shared across workers the way `cluster_manager` is.
+    //
+    // Rust note: `proxy_core::runtime::WorkerId` and
+    // `proxy_observability::stats::WorkerId` are deliberately two distinct
+    // types (see the latter's doc comment for why reusing one would close a
+    // dependency cycle) -- `.0` is the conversion at this boundary, exactly
+    // where that comment says it belongs.
+    let router_stats = Arc::new(proxy_http::stat_handles::RouterStats::new(
+        stats_registry,
+        stat_handles,
+        proxy_observability::stats::WorkerId(ctx.id.0),
+    ));
 
     let bound = match initial_bind(
         &ctx.config.load(),
@@ -638,6 +665,7 @@ async fn worker_main(
         &registry,
         &ctx.shutdown,
         &cluster_manager,
+        &router_stats,
     ) {
         Ok(bound) => {
             let _ = bind_tx.send((ctx.id, Ok(())));
@@ -662,6 +690,7 @@ async fn worker_main(
         ctx.shutdown.clone(),
         registry.clone(),
         cluster_manager.clone(),
+        router_stats,
     ));
 
     drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
@@ -730,6 +759,10 @@ mod tests {
         Arc::new(ConfigSnapshot::default())
     }
 
+    fn test_registry() -> Arc<proxy_observability::stats::Registry> {
+        proxy_observability::stats::StatsControl::new(1).registry()
+    }
+
     #[tokio::test]
     async fn admin_none_binds_nothing() {
         // Reserve a port, release it, then prove `start_admin(None, ..)`
@@ -740,7 +773,7 @@ mod tests {
         let port = probe.local_addr().expect("local_addr").port();
         drop(probe);
 
-        let result = start_admin(None, empty_snapshot(), 1, Instant::now())
+        let result = start_admin(None, empty_snapshot(), test_registry(), Instant::now())
             .await
             .expect("start_admin(None, ..) must not fail");
         assert!(
@@ -758,10 +791,15 @@ mod tests {
     #[tokio::test]
     async fn admin_some_binds_and_serves() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = start_admin(Some(addr), empty_snapshot(), 1, Instant::now())
-            .await
-            .expect("start_admin should succeed on an available port")
-            .expect("admin: Some(_) must start a server");
+        let server = start_admin(
+            Some(addr),
+            empty_snapshot(),
+            test_registry(),
+            Instant::now(),
+        )
+        .await
+        .expect("start_admin should succeed on an available port")
+        .expect("admin: Some(_) must start a server");
 
         let bound = server.local_addr();
         tokio::net::TcpStream::connect(bound)

@@ -35,6 +35,7 @@ use proxy_http::filter::{FactoryContext, FilterRegistry, TerminalFilterInstanceF
 use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
+use proxy_http::stat_handles::RouterStats;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -211,13 +212,19 @@ impl ListenerHcm {
 fn build_listener_hcm(
     listener: &ListenerConfig,
     cluster_manager: &Arc<ClusterManager>,
+    router_stats: &Arc<RouterStats>,
 ) -> Result<ListenerHcm, HttpFilterChainBuildError> {
     let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
     for (i, chain) in listener.filter_chains.iter().enumerate() {
         let handler = match chain.filters.last() {
             Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
                 let context = format!("listener '{}' filter_chains[{i}]", listener.name);
-                Some(build_hcm_handler(hcm, &context, cluster_manager)?)
+                Some(build_hcm_handler(
+                    hcm,
+                    &context,
+                    cluster_manager,
+                    router_stats,
+                )?)
             }
             _ => None,
         };
@@ -230,7 +237,12 @@ fn build_listener_hcm(
     {
         Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
             let context = format!("listener '{}' default_filter_chain", listener.name);
-            Some(build_hcm_handler(hcm, &context, cluster_manager)?)
+            Some(build_hcm_handler(
+                hcm,
+                &context,
+                cluster_manager,
+                router_stats,
+            )?)
         }
         _ => None,
     };
@@ -313,18 +325,24 @@ fn bind_listener(listener: &ListenerConfig) -> io::Result<TcpListener> {
 /// `spawn_accept_loop` together; [`initial_bind`] and reconcile-time binding
 /// (`bind_and_spawn`) each decide what to do with the `Err` case differently.
 /// Bundles the per-worker state every bind/accept function below needs
-/// (config handle, connection registry, drain signal, cluster manager) --
-/// purely to keep `spawn_bound`/`bind_and_spawn`'s argument count under
-/// clippy's `too_many_arguments` threshold, the same motivation
-/// [`ListenerCaches`] documents for the per-listener build outputs.
-/// [`initial_bind`]/[`reconcile`] (the public-ish entry points) keep their
-/// four separate parameters -- this bundle is purely an internal plumbing
-/// convenience built once at their top and threaded down by reference.
+/// (config handle, connection registry, drain signal, cluster manager,
+/// WP-23 increment 6a's stats recorder) -- purely to keep
+/// `spawn_bound`/`bind_and_spawn`'s argument count under clippy's
+/// `too_many_arguments` threshold, the same motivation [`ListenerCaches`]
+/// documents for the per-listener build outputs. [`initial_bind`]/[`reconcile`]
+/// (the public-ish entry points) keep their separate parameters -- this
+/// bundle is purely an internal plumbing convenience built once at their top
+/// and threaded down by reference.
 struct WorkerShared<'a> {
     config: &'a Arc<WorkerConfigHandle>,
     registry: &'a ConnectionRegistry,
     shutdown: &'a watch::Receiver<bool>,
     cluster_manager: &'a Arc<ClusterManager>,
+    /// This worker's `upstream_rq`/`upstream_rq_time` recorder -- built once
+    /// per worker (it carries that worker's own `WorkerId`) in
+    /// `crates/proxy/src/main.rs`'s `worker_main`, threaded down to
+    /// [`RouterFilterFactory`] exactly like `cluster_manager` is.
+    router_stats: &'a Arc<RouterStats>,
 }
 
 fn spawn_bound(
@@ -337,7 +355,7 @@ fn spawn_bound(
     // filter chain whose certs won't load, or whose HTTP filter chain
     // references an unregistered filter.
     let tls = build_listener_tls(listener_ir)?;
-    let hcm = build_listener_hcm(listener_ir, shared.cluster_manager)?;
+    let hcm = build_listener_hcm(listener_ir, shared.cluster_manager, shared.router_stats)?;
     let tcp_listener = bind_listener(listener_ir).map_err(|source| InitialBindError::Bind {
         name: name.clone(),
         addr: listener_ir.address,
@@ -355,6 +373,7 @@ fn spawn_bound(
             registry: shared.registry.clone(),
             shutdown: shared.shutdown.clone(),
             cluster_manager: shared.cluster_manager.clone(),
+            router_stats: shared.router_stats.clone(),
         },
     );
     Ok(BoundListener { addr, task })
@@ -401,12 +420,14 @@ pub fn initial_bind(
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
     cluster_manager: &Arc<ClusterManager>,
+    router_stats: &Arc<RouterStats>,
 ) -> Result<HashMap<ListenerName, BoundListener>, InitialBindError> {
     let shared = WorkerShared {
         config,
         registry,
         shutdown,
         cluster_manager,
+        router_stats,
     };
     let mut bound: HashMap<ListenerName, BoundListener> = HashMap::new();
     for (name, listener_ir) in snapshot.listeners.iter() {
@@ -447,6 +468,7 @@ struct AcceptLoopShared {
     registry: ConnectionRegistry,
     shutdown: watch::Receiver<bool>,
     cluster_manager: Arc<ClusterManager>,
+    router_stats: Arc<RouterStats>,
 }
 
 /// One accept loop per bound listener, spawned with `spawn_local` (this
@@ -468,6 +490,7 @@ fn spawn_accept_loop(
         registry,
         mut shutdown,
         cluster_manager,
+        router_stats,
     } = shared;
     tokio::task::spawn_local(async move {
         // Rust note: `mut` locals, not behind a lock -- this whole task is
@@ -529,7 +552,7 @@ fn spawn_accept_loop(
                     // Same rebuild cadence and same "whole-listener fallback"
                     // tradeoff as the TLS cache just above, for the HTTP
                     // filter-chain handlers.
-                    match build_listener_hcm(l, &cluster_manager) {
+                    match build_listener_hcm(l, &cluster_manager, &router_stats) {
                         Ok(rebuilt) => hcm_cache = Rc::new(rebuilt),
                         Err(err) => {
                             tracing::warn!(listener = %name, error = %err, "failed to rebuild HTTP filter chain after config change; HCM chains on this listener will reset connections until fixed");
@@ -866,6 +889,7 @@ fn build_hcm_handler(
     hcm: &HttpConnectionManagerConfig,
     context: &str,
     cluster_manager: &Arc<ClusterManager>,
+    router_stats: &Arc<RouterStats>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
     let factory_ctx = FactoryContext {};
@@ -910,8 +934,9 @@ fn build_hcm_handler(
         });
     }
 
-    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-        Arc::new(RouterFilterFactory::new(cluster_manager.clone()));
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
+        RouterFilterFactory::new(cluster_manager.clone(), router_stats.clone()),
+    );
 
     // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
     // bind/rebuild cadence as everything else in this function (a fresh
@@ -1063,12 +1088,14 @@ fn reconcile(
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
     cluster_manager: &Arc<ClusterManager>,
+    router_stats: &Arc<RouterStats>,
 ) {
     let shared = WorkerShared {
         config,
         registry,
         shutdown,
         cluster_manager,
+        router_stats,
     };
     // Removed: present in `bound`, absent from the new snapshot. Stop
     // accepting; established connections under the old listener keep their
@@ -1137,6 +1164,7 @@ pub async fn run_listener_manager(
     mut shutdown: watch::Receiver<bool>,
     registry: ConnectionRegistry,
     cluster_manager: Arc<ClusterManager>,
+    router_stats: Arc<RouterStats>,
 ) {
     loop {
         tokio::select! {
@@ -1145,7 +1173,15 @@ pub async fn run_listener_manager(
                     break;
                 }
                 let snapshot = config.load();
-                reconcile(&snapshot, &mut bound, &config, &registry, &shutdown, &cluster_manager);
+                reconcile(
+                    &snapshot,
+                    &mut bound,
+                    &config,
+                    &registry,
+                    &shutdown,
+                    &cluster_manager,
+                    &router_stats,
+                );
             }
             _ = shutdown.changed() => {
                 break;
@@ -1518,15 +1554,41 @@ mod tests {
         manager
     }
 
+    /// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved
+    /// for every cluster in `snapshot` -- what `crates/proxy/src/main.rs`
+    /// builds once at boot from the real config snapshot; these tests need
+    /// the same shape so `RouterFilterFactory` (built deep inside
+    /// `initial_bind`/`build_listener_hcm`) has somewhere to record into.
+    fn router_stats_for(snapshot: &ConfigSnapshot) -> Arc<RouterStats> {
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let handles = Arc::new(proxy_http::stat_handles::StatHandles::build(
+            &control,
+            snapshot.clusters.keys().map(String::as_str),
+        ));
+        Arc::new(RouterStats::new(
+            control.registry(),
+            handles,
+            proxy_observability::stats::WorkerId(0),
+        ))
+    }
+
     async fn spawn_manager(initial: Arc<ConfigSnapshot>) -> Harness {
         let config = Arc::new(WorkerConfigHandle::new(initial.clone()));
         let (config_tx, config_rx) = watch::channel(initial.version);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let registry = ConnectionRegistry::new();
         let cluster_manager = cluster_manager_for(&initial).await;
+        let router_stats = router_stats_for(&initial);
 
-        let bound = initial_bind(&initial, &config, &registry, &shutdown_rx, &cluster_manager)
-            .expect("initial_bind should succeed in tests");
+        let bound = initial_bind(
+            &initial,
+            &config,
+            &registry,
+            &shutdown_rx,
+            &cluster_manager,
+            &router_stats,
+        )
+        .expect("initial_bind should succeed in tests");
 
         let manager = tokio::task::spawn_local(run_listener_manager(
             bound,
@@ -1535,6 +1597,7 @@ mod tests {
             shutdown_rx,
             registry.clone(),
             cluster_manager,
+            router_stats,
         ));
 
         Harness {
@@ -2272,6 +2335,7 @@ mod tests {
             let registry = ConnectionRegistry::new();
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
             let cluster_manager = cluster_manager_for(&snapshot).await;
+            let router_stats = router_stats_for(&snapshot);
 
             let result = initial_bind(
                 &snapshot,
@@ -2279,6 +2343,7 @@ mod tests {
                 &registry,
                 &shutdown_rx,
                 &cluster_manager,
+                &router_stats,
             );
             match result {
                 Err(err @ InitialBindError::Tls(_)) => {
@@ -3268,8 +3333,9 @@ static_resources:
             Arc::new(proxy_cluster::resolver::TokioResolver),
             crate::tls::transport_socket_builder(),
         ));
+        let router_stats = router_stats_for(&snapshot);
 
-        let err = match build_listener_hcm(listener_ir, &cluster_manager) {
+        let err = match build_listener_hcm(listener_ir, &cluster_manager, &router_stats) {
             Ok(_) => panic!("an invalid per-route dialect must fail the build, is_optional or not"),
             Err(err) => err,
         };

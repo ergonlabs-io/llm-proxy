@@ -44,7 +44,9 @@ use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
+use proxy_http::stat_handles::{RouterStats, StatHandles};
 use proxy_observability::access_log::parse_format;
+use proxy_observability::stats::{StatsControl, WorkerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::LocalSet;
@@ -98,6 +100,16 @@ fn forward_to(cluster: &str) -> ForwardAction {
         host_rewrite_literal: None,
         prefix_rewrite: None,
     }
+}
+
+/// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved for
+/// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
+/// mirroring how `crates/proxy/src/main.rs` builds the real one from the
+/// boot config snapshot's cluster names.
+fn test_router_stats(cluster_names: &[&str]) -> Arc<RouterStats> {
+    let control = StatsControl::new(1);
+    let handles = Arc::new(StatHandles::build(&control, cluster_names.iter().copied()));
+    Arc::new(RouterStats::new(control.registry(), handles, WorkerId(0)))
 }
 
 /// Build a one-route `FilterChainHandler` (no configured HTTP filters, a
@@ -158,8 +170,9 @@ async fn build_router(
     .unwrap();
 
     let route_table = Arc::new(route_table);
-    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-        Arc::new(RouterFilterFactory::new(Arc::new(manager)));
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
+        RouterFilterFactory::new(Arc::new(manager), test_router_stats(&["up"])),
+    );
     FilterChainHandler::new_with_access_logs(
         Vec::new(),
         terminal_factory,

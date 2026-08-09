@@ -32,6 +32,11 @@ x509-parser = { workspace = true }
 
 [dev-dependencies]
 proxy-api = { workspace = true }
+# WP-23 increment 6a: test helpers build a `StatsControl` to resolve the
+# `RouterStats` `initial_bind`/`build_listener_hcm` now require -- production
+# code only ever consumes `proxy_http::stat_handles::RouterStats`, already
+# reachable via the `proxy-http` dependency above, so this stays dev-only.
+proxy-observability = { workspace = true }
 rcgen = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "io-util"] }

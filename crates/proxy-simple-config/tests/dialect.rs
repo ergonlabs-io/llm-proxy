@@ -1988,6 +1988,8 @@ mod body_routing_e2e {
     use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
     use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
     use proxy_http::router::RouterFilterFactory;
+    use proxy_http::stat_handles::{RouterStats, StatHandles};
+    use proxy_observability::stats::{StatsControl, WorkerId};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2083,8 +2085,21 @@ mod body_routing_e2e {
             });
         }
 
+        // WP-23 increment 6a: `RouterFilterFactory` now needs a `RouterStats`
+        // to record into -- mirrors `crates/proxy/src/main.rs`'s boot-time
+        // construction, resolved for every cluster in this snapshot.
+        let stats_control = StatsControl::new(1);
+        let stat_handles = Arc::new(StatHandles::build(
+            &stats_control,
+            snapshot.clusters.keys().map(String::as_str),
+        ));
+        let router_stats = Arc::new(RouterStats::new(
+            stats_control.registry(),
+            stat_handles,
+            WorkerId(0),
+        ));
         let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-            Arc::new(RouterFilterFactory::new(cluster_manager));
+            Arc::new(RouterFilterFactory::new(cluster_manager, router_stats));
         FilterChainHandler::new_with_filters(
             filters,
             terminal_factory,
