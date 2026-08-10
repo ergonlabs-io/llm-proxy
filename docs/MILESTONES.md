@@ -472,17 +472,34 @@ it should be replaced, not extended, if an authoritative dashboard appears.
 
 **Named gaps:**
 
-- **`loadgen` cannot see SSE truncation, and that undermines the capacity report.** Found
-  2026-08-09 while building the swap test. `loadgen::driver::execute` classifies a
-  streaming request as successful once the body ends without a transport error; it never
-  checks that the terminal `[DONE]` frame arrived. So a run in which the proxy truncated
-  every stream would be reported as a clean run with a 0% error rate. The swap test
-  therefore drives its streaming half with explicit client code rather than the driver.
-  **This blocks the capacity clause as much as any throughput number does** — a published
-  p99 from an instrument that cannot detect the primary LLM-proxy failure mode is not
-  evidence. Fix the driver before the capacity run, and treat the measurement as suspect
-  until then. This is the same lesson as the timing-instrument one recorded in CLAUDE.md
-  rule 14: validate the instrument before reasoning from its output.
+- ~~**`loadgen` cannot see SSE truncation.**~~ — **FIXED 2026-08-09, and it turned out to
+  be two defects, not one.** Both would have invalidated a published capacity number, so
+  they are recorded rather than merely closed.
+
+  **(a) Truncation was invisible.** `driver::execute` counted a streaming request as
+  successful once the body ended without a transport error, never checking for the
+  dialect's terminal frame — so a run where the proxy truncated every stream reported a 0%
+  error rate. Now `ExecError::Truncated`, kept deliberately distinct from `Transport` (a
+  cut-short stream and a broken connection are different bugs), and classified generically
+  so Anthropic's `message_stop` behaves like OpenAI's `[DONE]`.
+
+  **(b) The larger one, which (a)'s test only happened to expose: every failed request was
+  in the latency percentiles.** `Aggregator::record` fed `total_from_scheduled`/
+  `total_from_send` into the histograms for every outcome. `ttft_from_*` was safe only
+  because a failure's `Option` is `None`; `total_from_*` is a plain `Duration` that
+  `failed_result` fills with time-to-failure. **It skewed in the dangerous direction — a
+  fast failure LOWERS p99, so a proxy collapsing under load would have looked like it was
+  getting faster.** Percentiles now describe successful requests only. That is a definition
+  change, noted on `RunSummary` and printed beside the percentiles, because anyone
+  comparing against an older run needs to know the meaning moved.
+
+  Both mutation-verified. The general-case test — covering HttpError, TransportError,
+  Timeout and Truncated across all four latency fields — matters more than the truncation
+  one, because truncation is not where (b) lived.
+
+  The transferable point is CLAUDE.md rule 14's, again: **validate the instrument before
+  reasoning from its output.** Two of this project's measurement instruments have now been
+  caught lying — the hand-rolled timing sweep, and this one.
 
 - ~~The loadgen Linux `/proc` sampler is written to spec but unverified — no Linux box in
   the loop. That is a blocker for this gate, not a footnote.~~ — **owner decision
