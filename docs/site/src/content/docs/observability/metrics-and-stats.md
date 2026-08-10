@@ -5,7 +5,7 @@ summary: What the admin server's /stats and /stats/prometheus endpoints
   never incremented.
 last_updated: 2026-08-09
 related:
-  - /configuration/the-llmproxy-dialect/
+  - /configuration/configuration-file/
   - /operations/config-reload/
 ---
 
@@ -34,7 +34,7 @@ Two instruments are wired to real traffic, both per cluster:
   `crates/proxy-http/src/stat_handles.rs:143`).
 
 The cluster label is the proxy's internal cluster name, not the bare
-provider name from the config — a dialect provider named `ollama` shows up
+provider name from the config — a provider named `ollama` shows up
 as `provider:ollama`. Both instruments are resolved once per cluster at
 startup, from the boot config snapshot, and again for any cluster a `SIGHUP`
 reload introduces (`crates/proxy/src/main.rs`'s `reload` function calls

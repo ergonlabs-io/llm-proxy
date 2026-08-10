@@ -1,19 +1,20 @@
 ---
-title: The llmproxy configuration dialect
-summary: Field-by-field reference for the llmproxy dialect (--config), derived
-  from schema/llmproxy-v0.schema.json, the normative source. Covers what each
-  field does, its default, and whether it is enforced yet.
+title: Configuration file reference
+summary: Field-by-field reference for the llm-proxy configuration file
+  (--config), derived from schema/llmproxy-v0.schema.json, the normative
+  source. Covers what each field does, its default, and whether it is
+  enforced yet.
 last_updated: 2026-08-09
 related:
   - /getting-started/introduction/
   - /getting-started/quickstart/
 ---
 
-# The `llmproxy` configuration dialect
+# Configuration file reference
 
 This page documents `schema/llmproxy-v0.schema.json` — the normative schema
-for the `--config` dialect. If this page and the schema disagree, the schema
-is right; report the difference.
+for the file passed with `--config`. If this page and the schema disagree,
+the schema is right; report the difference.
 
 ## Strict parsing
 
@@ -188,7 +189,7 @@ on a filesystem change today — there is no file watcher wired up, and the
 repository has no file-watching dependency at all. `update_certificates` is
 exercised only by a test (`crates/proxy-core/tests/tls.rs`). In practice, a
 renewed certificate needs a process restart, the same as every other file
-this dialect reads once at startup.
+this configuration reads once at startup.
 
 ## A schema/code note worth knowing
 
@@ -199,5 +200,5 @@ per-cluster request counts and latencies, but not every metric a reader might
 expect from that sentence exists yet — see
 [Metrics and /stats](/observability/metrics-and-stats/) for exactly which
 counters are wired to real traffic and which are defined but never
-incremented. Both endpoints are read-only and take no configuration from this
-dialect beyond the `admin` bind address itself.
+incremented. Both endpoints are read-only and take no configuration beyond
+the `admin` bind address itself.

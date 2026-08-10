@@ -4,7 +4,7 @@ summary: The format-string engine behind observability.access_logs, the
   operators it supports, and when a line is actually written.
 last_updated: 2026-08-09
 related:
-  - /configuration/the-llmproxy-dialect/
+  - /configuration/configuration-file/
   - /observability/metrics-and-stats/
 ---
 
@@ -44,7 +44,7 @@ in observability, not in the response body.
 ## Text format
 
 The default. One line per request, in a fixed format built from the
-operators below — the dialect does not yet expose a way to supply your own
+operators below — llm-proxy does not yet expose a way to supply your own
 format string:
 
 ```text
@@ -85,8 +85,8 @@ line and field list.
 ## The operator set
 
 The table below documents every operator the engine understands — useful
-for reading the two fixed formats above field by field, even though the
-dialect does not yet let you assemble your own format string from them.
+for reading the two fixed formats above field by field, even though
+llm-proxy does not yet let you assemble your own format string from them.
 Every operator is resolved once, at config-load time, into a
 pre-built list — nothing is re-parsed per request
 (`crates/proxy-observability/src/access_log.rs`). An unknown `%OPERATOR%`

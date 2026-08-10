@@ -5,7 +5,7 @@ summary: SIGHUP re-reads the config file a running proxy booted with and
   the proxy serving the previous snapshot and logs the full error.
 last_updated: 2026-08-09
 related:
-  - /configuration/the-llmproxy-dialect/
+  - /configuration/configuration-file/
   - /observability/metrics-and-stats/
   - /operations/draining-and-shutdown/
 ---
