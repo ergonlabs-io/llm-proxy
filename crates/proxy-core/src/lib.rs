@@ -25,10 +25,35 @@ use proxy_config::ConfigSnapshot;
 /// In-flight connections keep their `Arc<ConfigSnapshot>` clone, which is what
 /// gives Envoy-style drain semantics: old config lives exactly as long as the
 /// connections created under it.
+///
+/// The only way to obtain one from outside this crate is
+/// [`runtime::SnapshotHandles::register`], which enrolls it so
+/// [`runtime::ConfigPublisher::publish`] can find it again -- a handle built
+/// any other way would silently stop seeing config reloads (this is exactly
+/// how the admin server's `/config_dump` went stale after a SIGHUP reload).
+/// `WorkerConfigHandle::new` is `pub(crate)`, so this isn't just documented,
+/// it doesn't compile:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use proxy_config::ConfigSnapshot;
+/// use proxy_core::WorkerConfigHandle;
+///
+/// // ERROR: associated function `new` is private.
+/// let handle = WorkerConfigHandle::new(Arc::new(ConfigSnapshot::default()));
+/// ```
 pub struct WorkerConfigHandle(ArcSwap<ConfigSnapshot>);
 
 impl WorkerConfigHandle {
-    pub fn new(initial: Arc<ConfigSnapshot>) -> Self {
+    // Rust note: `pub(crate)` rather than `pub` on purpose. A handle that
+    // isn't enrolled in `runtime::SnapshotHandles` is exactly the bug this
+    // type exists to prevent -- it silently stops seeing `publish()`s (the
+    // admin server's `/config_dump` did precisely this after a SIGHUP
+    // reload). Keeping `new` crate-visible means `SnapshotHandles::register`
+    // (the only place that both builds a handle and enrolls it) is the only
+    // way anything outside `proxy-core` can obtain one; the compiler refuses
+    // the shortcut instead of a doc comment merely discouraging it.
+    pub(crate) fn new(initial: Arc<ConfigSnapshot>) -> Self {
         Self(ArcSwap::new(initial))
     }
 

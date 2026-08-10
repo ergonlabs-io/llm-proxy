@@ -25,8 +25,8 @@ use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, ConfigSnapshot
 use proxy_core::drain::ConnectionRegistry;
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::run_local;
+use proxy_core::runtime::SnapshotHandles;
 use proxy_core::tls::DownstreamTlsFactory;
-use proxy_core::WorkerConfigHandle;
 use proxy_http::codec::{serve_http1, Http1Options};
 use proxy_http::handler::stub::FixedResponseHandler;
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
@@ -243,7 +243,10 @@ impl Harness {
 /// wired to the real `transport_socket_builder()` -- the same call
 /// `crates/proxy`'s `serve()` makes, not a test-only stand-in.
 async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
-    let config = Arc::new(WorkerConfigHandle::new(snapshot.clone()));
+    // Same registration path production code uses -- see
+    // `runtime::SnapshotHandles` for why a bare `WorkerConfigHandle::new` is
+    // no longer reachable from outside `proxy-core`.
+    let config = SnapshotHandles::new().register(snapshot.clone());
     let (config_tx, config_rx) = watch::channel(snapshot.version);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let registry = ConnectionRegistry::new();
