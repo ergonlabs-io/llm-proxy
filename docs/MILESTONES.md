@@ -379,6 +379,26 @@ and **(2)** the under-load differential test on WP-26's traffic topology. Sequen
 the other way round produces a test that can only drive the harness, which is what the
 gate was written to avoid.
 
+**CLOSED 2026-08-09 — both pieces landed the same day.** SIGHUP reload is in the binary
+(a bad config logs with full dotted-path detail and keeps serving the previous snapshot;
+listeners and clusters both reconcile; stats handles resolve for new clusters first, or a
+new cluster would serve traffic reporting nothing). The acceptance test is
+`testing/diffrig/tests/swap_under_load.rs`: 6 streams in flight at the moment of the swap,
+12 paced SSE streams all reaching `[DONE]`, 50 non-streaming requests, zero transport
+errors, zero non-2xx, and the second upstream serving 48 requests afterwards — which is
+what proves the swap took effect rather than silently doing nothing.
+
+**Correction to the prediction above: this did NOT need WP-26's traffic topology.** Three
+existing pieces composed — `loadgen` is a library with a public open-loop driver, diffrig
+already owns SSE-paced mock upstreams, and the SIGHUP work produced a
+spawn/rewrite/signal/await-log harness. WP-26's replay topology is still owed for the
+WP-13 lifecycle differential suite; it was simply never a prerequisite for this clause.
+
+The load-bearing assertion is the terminal `[DONE]` frame, not request counts: this proxy
+never injects into SSE streams, so a truncated stream is silent and a count-based check
+cannot see it. Mutation-verified — drop the mock's final frame and the test fails with
+"12 of 12 streams ended without the terminal frame".
+
 **Added 2026-08-03 — WP-51, and a decision that reshapes WP-23.** Owner direction: make the
 project OTel-ready, because it is the standard. Recorded and scheduled here rather than worked
 now — v0.1.0's scope is frozen and its one open gate clause is still provider failover.
@@ -451,6 +471,18 @@ therefore pins the metric families the registry defines and says in its own doc 
 it should be replaced, not extended, if an authoritative dashboard appears.
 
 **Named gaps:**
+
+- **`loadgen` cannot see SSE truncation, and that undermines the capacity report.** Found
+  2026-08-09 while building the swap test. `loadgen::driver::execute` classifies a
+  streaming request as successful once the body ends without a transport error; it never
+  checks that the terminal `[DONE]` frame arrived. So a run in which the proxy truncated
+  every stream would be reported as a clean run with a 0% error rate. The swap test
+  therefore drives its streaming half with explicit client code rather than the driver.
+  **This blocks the capacity clause as much as any throughput number does** — a published
+  p99 from an instrument that cannot detect the primary LLM-proxy failure mode is not
+  evidence. Fix the driver before the capacity run, and treat the measurement as suspect
+  until then. This is the same lesson as the timing-instrument one recorded in CLAUDE.md
+  rule 14: validate the instrument before reasoning from its output.
 
 - ~~The loadgen Linux `/proc` sampler is written to spec but unverified — no Linux box in
   the loop. That is a blocker for this gate, not a footnote.~~ — **owner decision
