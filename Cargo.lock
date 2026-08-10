@@ -434,6 +434,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "loadgen",
  "rcgen",
  "ring",
  "rustls",
