@@ -12,8 +12,7 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'llm-proxy',
-			description:
-				'A high-performance proxy for LLM inference APIs. Speaks standard Envoy configuration and xDS.',
+			description: 'A high-performance proxy for LLM inference APIs.',
 			// No `social` entry: `git remote -v` in this repo has no configured
 			// remote to link to. Add one here once the repo has a GitHub home.
 			plugins: [
@@ -22,35 +21,31 @@ export default defineConfig({
 				// doc generator. See docs/site/README.md.
 				starlightLlmsTxt(),
 			],
-			// The sidebar spine is specified (WP doc-scaffold) as nine groups,
-			// but none of them have real pages yet -- another lane is drafting
-			// content separately under docs/user/, not here. A sidebar entry
-			// that points at a page that doesn't exist fails the build, so
-			// every group below is commented out until its first real page
-			// lands. Uncomment a group (and add its pages under
-			// src/content/docs/<slug>/) as content arrives; keep the group
-			// order and item labels as specified.
+			// The sidebar spine is specified (WP doc-scaffold) as nine groups.
+			// A sidebar entry that points at a page that doesn't exist fails the
+			// build, so a group (or an item within it) stays commented out until
+			// its page lands. Uncomment an item (and add its page under
+			// src/content/docs/<slug>/) as content arrives; keep the group order
+			// and item labels as specified.
 			sidebar: [
-				// {
-				// 	label: 'Getting started',
-				// 	items: [
-				// 		{ label: 'Introduction', slug: 'getting-started/introduction' },
-				// 		{ label: 'Quickstart', slug: 'getting-started/quickstart' },
-				// 		{
-				// 			label: 'Choosing a config front-end',
-				// 			slug: 'getting-started/choosing-a-config-front-end',
-				// 		},
-				// 	],
-				// },
-				// {
-				// 	label: 'Configuration',
-				// 	items: [
-				// 		{ label: 'The llmproxy dialect', slug: 'configuration/the-llmproxy-dialect' },
-				// 		{ label: 'Envoy mode', slug: 'configuration/envoy-mode' },
-				// 		{ label: 'Translating between them', slug: 'configuration/translating-between-them' },
-				// 		{ label: 'Strict config mode', slug: 'configuration/strict-config-mode' },
-				// 	],
-				// },
+				{
+					label: 'Getting started',
+					items: [
+						{ label: 'Introduction', slug: 'getting-started/introduction' },
+						{ label: 'Quickstart', slug: 'getting-started/quickstart' },
+						// {
+						// 	label: 'Choosing a config front-end',
+						// 	slug: 'getting-started/choosing-a-config-front-end',
+						// },
+					],
+				},
+				{
+					label: 'Configuration',
+					items: [
+						{ label: 'The llmproxy dialect', slug: 'configuration/the-llmproxy-dialect' },
+						// { label: 'Strict config mode', slug: 'configuration/strict-config-mode' },
+					],
+				},
 				// {
 				// 	label: 'Providers and routing',
 				// 	items: [
@@ -82,31 +77,31 @@ export default defineConfig({
 				// 		{ label: 'Tenants', slug: 'limits-and-budgets/tenants' },
 				// 	],
 				// },
-				// {
-				// 	label: 'Observability',
-				// 	items: [
-				// 		{ label: 'Access logs', slug: 'observability/access-logs' },
-				// 		{ label: 'Metrics and /stats', slug: 'observability/metrics-and-stats' },
-				// 		{ label: 'Admin endpoints', slug: 'observability/admin-endpoints' },
-				// 	],
-				// },
-				// {
-				// 	label: 'Operations',
-				// 	items: [
-				// 		{ label: 'Running in production', slug: 'operations/running-in-production' },
-				// 		{ label: 'Draining and shutdown', slug: 'operations/draining-and-shutdown' },
-				// 		{ label: 'TLS', slug: 'operations/tls' },
-				// 	],
-				// },
-				// {
-				// 	label: 'Reference',
-				// 	items: [
-				// 		{ label: 'CLI', slug: 'reference/cli' },
-				// 		{ label: 'Config schema', slug: 'reference/config-schema' },
-				// 		{ label: 'Response flags', slug: 'reference/response-flags' },
-				// 		{ label: 'Envoy compatibility', slug: 'reference/envoy-compatibility' },
-				// 	],
-				// },
+				{
+					label: 'Observability',
+					items: [
+						{ label: 'Access logs', slug: 'observability/access-logs' },
+						{ label: 'Metrics and /stats', slug: 'observability/metrics-and-stats' },
+						// { label: 'Admin endpoints', slug: 'observability/admin-endpoints' },
+					],
+				},
+				{
+					label: 'Operations',
+					items: [
+						// { label: 'Running in production', slug: 'operations/running-in-production' },
+						{ label: 'Config reload', slug: 'operations/config-reload' },
+						{ label: 'Draining and shutdown', slug: 'operations/draining-and-shutdown' },
+						// { label: 'TLS', slug: 'operations/tls' },
+					],
+				},
+				{
+					label: 'Reference',
+					items: [
+						{ label: 'CLI', slug: 'reference/cli' },
+						// { label: 'Config schema', slug: 'reference/config-schema' },
+						// { label: 'Response flags', slug: 'reference/response-flags' },
+					],
+				},
 			],
 		}),
 	],

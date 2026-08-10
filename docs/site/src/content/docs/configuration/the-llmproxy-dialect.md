@@ -5,8 +5,8 @@ summary: Field-by-field reference for the llmproxy dialect (--config), derived
   field does, its default, and whether it is enforced yet.
 last_updated: 2026-08-09
 related:
-  - introduction.md
-  - getting-started.md
+  - /getting-started/introduction/
+  - /getting-started/quickstart/
 ---
 
 # The `llmproxy` configuration dialect
@@ -20,8 +20,8 @@ is right; report the difference.
 Parsing is strict. An unknown or misspelled field is a load error naming its
 full dotted path (for example `routes[0].fallback` if you typo `fallbacks`),
 never a silent ignore. This applies to every file loaded with `--config`; it
-is not configurable. The top-level keys `envoy`, `tracing`, and `clusters`
-are reserved for future schema versions and rejected in v0.
+is not configurable. A handful of top-level keys are reserved for future
+schema versions and rejected in v0.
 
 Every string field accepts `${VAR_NAME}` environment-variable interpolation,
 applied before parsing.
@@ -50,7 +50,7 @@ JSON error body listing known models.
 | `type` | enum: `openai`, `anthropic`, `openai-compatible`, `azure-openai`, `vertex`, `bedrock` | no | `openai-compatible`, unless the provider's name is `openai` or `anthropic` | The wire shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. `azure-openai`/`vertex`/`bedrock` are named for the model catalogue but are not yet loadable as a `providers` entry — their credential scheme is not implemented, and configuring one is a load error naming the gap. |
 | `base_url` | string (URI) | only if the name/type does not imply one | `https://api.openai.com` for `openai`, `https://api.anthropic.com` for `anthropic` | The API base URL. Host and port only — a path prefix (e.g. `/openai` for Groq) is a load error in this schema version, not a silent truncation. |
 | `api_key` | string | no (mutually exclusive with `api_key_file`) | none | The API key, sent as `Authorization: Bearer` for OpenAI-shaped APIs or `x-api-key` for Anthropic. Omit both `api_key` and `api_key_file` for an unauthenticated local backend. |
-| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup — despite the schema's own field description, this is **not** watched or hot-reloaded yet; the lowering step emits a translate-time warning on `providers.<name>.api_key_file` saying so, naming WP-35 as the increment that adds it. |
+| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup — despite the schema's own field description, this is **not** watched or hot-reloaded automatically; the lowering step emits a load-time warning on `providers.<name>.api_key_file` saying so. A `SIGHUP` config reload does re-read it, since a reload re-parses the whole config file from scratch — see [Config reload](/operations/config-reload/). |
 | `extra_headers` | object of string | no | `{}` | Extra headers sent on every request to this provider. An Anthropic provider also gets a default `anthropic-version` header; setting it here overrides that default. |
 | `ca_file` | string (path) | no | system roots | PEM CA bundle for verifying this provider's TLS certificate. Only needed for a self-hosted backend with a private CA. |
 | `connect_timeout` | `Duration` | no | `5s` | TCP/TLS connection establishment timeout for this provider. |
@@ -70,7 +70,7 @@ A `Provider` config rejects setting both `api_key` and `api_key_file`.
 The model-rewrite form (`provider/model`) is recorded but not yet applied:
 substituting the rewritten name into the request body needs a body rewriter
 not yet built, so a route or fallback using this form produces a
-translate-time warning naming its exact path, and the client's original model
+load-time warning naming its exact path, and the client's original model
 name is forwarded unchanged.
 
 ## `auth` (`Auth`) and `auth.keys[]` (`AuthKey`)
@@ -81,8 +81,8 @@ present at all.
 | Field | Type | Required | Default | What it does |
 |---|---|---|---|---|
 | `hmac_secret` | string | one of `hmac_secret`/`hmac_secret_file` | — | The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` rather than inlining it. |
-| `hmac_secret_file` | string (path) | one of `hmac_secret`/`hmac_secret_file` | — | Read the HMAC secret from a file, trimmed of trailing whitespace, read once at startup (no hot reload yet). |
-| `keys` | array of `AuthKey` | no | `[]` | Configured virtual keys. An empty list authenticates nothing, so `auth` present with no keys refuses every request — legal, and almost certainly a mistake, so it produces a translate-time warning. |
+| `hmac_secret_file` | string (path) | one of `hmac_secret`/`hmac_secret_file` | — | Read the HMAC secret from a file, trimmed of trailing whitespace. Not watched automatically, but re-read on a `SIGHUP` config reload, same as `providers.<name>.api_key_file` above. |
+| `keys` | array of `AuthKey` | no | `[]` | Configured virtual keys. An empty list authenticates nothing, so `auth` present with no keys refuses every request — legal, and almost certainly a mistake, so it produces a load-time warning. |
 
 | `AuthKey` field | Type | Required | Default | What it does |
 |---|---|---|---|---|
@@ -115,7 +115,7 @@ automatically prefers the authenticated tenant instead of the raw header
 value, so `key: tenant` is the form to use alongside `auth:`.
 
 Every other combination is accepted, recorded, and produces a
-translate-time warning naming the exact field: `key: global`, `key:
+load-time warning naming the exact field: `key: global`, `key:
 client-ip`, any other `header:<name>`, `requests_per_minute`,
 `concurrent_sessions`, and per-model scoping via `models`. A config using
 one of these still loads and serves traffic — it is not rejected — but the
@@ -133,8 +133,9 @@ limits need a shared budget store, which does not exist yet.
 | `force_usage_reporting` | boolean | no | `true` | Forces `stream_options.include_usage` onto streaming OpenAI-dialect requests that did not already ask for it, so streamed responses still report token usage. Set `false` for strict passthrough if a hand-rolled client trips over the extra frame. |
 
 A streamed response and a realtime session are both logged once, at stream
-end, with usage totals — not per chunk. See `getting-started.md` for what one
-line actually contains.
+end, with usage totals — not per chunk. See
+[Getting started](/getting-started/quickstart/) for what one line actually
+contains.
 
 ## The `models` catalogue
 
@@ -148,7 +149,7 @@ name exactly, evaluated after `routes` and before the 404 backstop.
 
 **Only `providers[0]` is used to serve traffic in this schema version.**
 Every later entry is still validated at load time — a bad one still fails to
-load — but produces a translate-time warning naming its exact path instead
+load — but produces a load-time warning naming its exact path instead
 of being selected. Picking among them (fallback, weighted split, cost-aware
 routing) is not implemented yet.
 
@@ -158,7 +159,7 @@ explicitly — the shorthand string form cannot carry it:
 | `ModelProvider` field | Type | Required | Default | What it does |
 |---|---|---|---|---|
 | `provider` | string, key into `providers` | yes | — | Which provider serves this entry. |
-| `model` | string | no | the catalogue's own name | The upstream model ID at this provider, if different (e.g. Anthropic's dated model IDs). Recorded but not yet substituted into the request body — the client's original model name is forwarded as-is, and this produces a translate-time warning. |
+| `model` | string | no | the catalogue's own name | The upstream model ID at this provider, if different (e.g. Anthropic's dated model IDs). Recorded but not yet substituted into the request body — the client's original model name is forwarded as-is, and this produces a load-time warning. |
 | `dialect` | enum: `openai`, `anthropic` | required for `vertex`/`bedrock`; derived otherwise | derived from the provider's `type` | The wire format this provider entry speaks. Required for `vertex`/`bedrock` because a single provider type there can serve more than one wire format (e.g. Vertex hosts Anthropic-shaped Claude and OpenAI-shaped Kimi under one provider). Omitting it where required is a load error, never a guess. |
 
 ## Shared value shapes
@@ -191,25 +192,12 @@ this dialect reads once at startup.
 
 ## A schema/code note worth knowing
 
-Two of the schema's descriptions are ahead of what the code does today, and
-both concern the same admin endpoint:
-
-- The `admin` field's description names `/stats/prometheus` as one of the
-  endpoints the admin server answers. As implemented today, the admin server
-  answers `/ready`, `/config_dump`, `/clusters`, `/server_info`, and `/stats`
-  — and `/stats` renders Envoy's own stats text format, not Prometheus
-  format. `/stats/prometheus` does not exist yet
-  (`crates/proxy-observability/src/lib.rs`'s module doc calls Prometheus
-  rendering out explicitly as landing in a later increment).
-- The `observability` field's description says metrics "are always computed
-  and exposed on the admin endpoint when `admin` is configured." As
-  implemented today, `/stats` answers `200` but with an **empty body**: the
-  registry exists and renders correctly, but nothing in the running proxy
-  resolves an instrument against it yet — no cluster, listener, or HTTP call
-  site records traffic into it. This is documented in the proxy binary
-  itself (`crates/proxy/src/main.rs`'s `start_admin` doc comment) as a known,
-  deliberate gap rather than a fabricated empty reading, but it means the
-  schema's "always computed" is not true yet for request-traffic metrics.
-
-Both endpoints are read-only and take no configuration from this dialect
-beyond the `admin` bind address itself.
+The `observability` field's schema description says metrics "are always
+computed and exposed on the admin endpoint when `admin` is configured." As
+implemented today, `/stats` and `/stats/prometheus` both report real
+per-cluster request counts and latencies, but not every metric a reader might
+expect from that sentence exists yet — see
+[Metrics and /stats](/observability/metrics-and-stats/) for exactly which
+counters are wired to real traffic and which are defined but never
+incremented. Both endpoints are read-only and take no configuration from this
+dialect beyond the `admin` bind address itself.
