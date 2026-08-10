@@ -14,7 +14,10 @@ pub mod loader;
 pub mod lower;
 pub mod validate;
 
-pub use error::{ConfigError, ConfigWarning};
+pub use error::{
+    ConfigError, ConfigFrontEnd, ConfigWarning, UNKNOWN_FIELD_BOOTSTRAP_HINT,
+    UNKNOWN_FIELD_DIALECT_HINT,
+};
 pub use ir::ConfigSnapshot;
 pub use loader::{load_bootstrap_file, parse_bootstrap, ConfigFormat, LoadedBootstrap};
 pub use lower::build_snapshot;

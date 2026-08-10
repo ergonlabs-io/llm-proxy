@@ -29,7 +29,7 @@ fn err_path(err: &ConfigError) -> &str {
         // `unknown_field_inside_aggregate_typed_config_is_rejected`: the
         // reflective surface walk also runs before typed lowering, from
         // `build_snapshot`'s very first line.
-        ConfigError::UnknownField { field_path } => field_path,
+        ConfigError::UnknownField { field_path, .. } => field_path,
         other => panic!("expected a field-scoped error, got: {other}"),
     }
 }

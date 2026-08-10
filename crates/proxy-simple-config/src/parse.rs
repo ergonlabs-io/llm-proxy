@@ -5,7 +5,7 @@
 //! Same error-quality bar as Envoy mode: every failure names a field path or
 //! the offending value; unknown fields are always errors.
 
-use proxy_config::{ConfigError, ConfigWarning};
+use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
 use crate::lower::resolved_dialect;
 use crate::model::{
@@ -64,7 +64,10 @@ fn map_serde_error(err: serde_path_to_error::Error<serde_yaml::Error>) -> Config
                 ),
             };
         }
-        return ConfigError::UnknownField { field_path };
+        return ConfigError::UnknownField {
+            field_path,
+            front_end: ConfigFrontEnd::Dialect,
+        };
     }
     ConfigError::InvalidValue {
         field_path: if path == "." || path.is_empty() {

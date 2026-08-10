@@ -1,6 +1,9 @@
 //! WP-03 acceptance tests: bootstrap loading with field-path-precise errors.
 
-use proxy_config::{parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
+use proxy_config::{
+    parse_bootstrap, ConfigError, ConfigFormat, ConfigFrontEnd, StrictMode,
+    UNKNOWN_FIELD_BOOTSTRAP_HINT,
+};
 
 /// The Phase-1 example config, parsed with typed field spot-checks.
 #[test]
@@ -86,13 +89,27 @@ static_resources:
 "#;
     let err = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
         .expect_err("unknown nested field must fail");
-    let ConfigError::UnknownField { field_path } = &err else {
+    let ConfigError::UnknownField {
+        field_path,
+        front_end,
+    } = &err
+    else {
         panic!("expected UnknownField, got: {err}");
     };
     assert_eq!(
         field_path,
         "static_resources.listeners[0].filter_chains[0].filters[0].definitely_not_a_field"
     );
+    assert_eq!(*front_end, ConfigFrontEnd::Bootstrap);
+    // The bootstrap front end genuinely honors `--permissive`, so the hint
+    // recommending it must survive -- pinned against the real constant, not
+    // a retyped copy of the string.
+    assert_eq!(
+        err.to_string(),
+        format!("unknown field at `{field_path}`: {UNKNOWN_FIELD_BOOTSTRAP_HINT}")
+    );
+    assert!(err.to_string().contains("--permissive"));
+    assert!(!err.to_string().contains("Envoy"));
 }
 
 /// Permissive mode: same config loads, and every ignored field is reported

@@ -2,7 +2,7 @@
 //! validation, and lowering through the full Envoy-mode pipeline
 //! (strict parse + PGV validation + IR build).
 
-use proxy_config::ConfigError;
+use proxy_config::{ConfigError, ConfigFrontEnd, UNKNOWN_FIELD_DIALECT_HINT};
 use proxy_simple_config::{
     lower_to_loaded, parse_simple_config_with_env, to_envoy_yaml, MODEL_HEADER,
 };
@@ -436,10 +436,25 @@ routes:
 "#,
     )
     .expect_err("unknown field must fail");
-    let ConfigError::UnknownField { field_path } = &err else {
+    let ConfigError::UnknownField {
+        field_path,
+        front_end,
+    } = &err
+    else {
         panic!("expected UnknownField, got: {err}");
     };
     assert_eq!(field_path, "providers.openai.api_keyy");
+    assert_eq!(*front_end, ConfigFrontEnd::Dialect);
+    // The dialect is always strict -- `--permissive` does nothing here, so
+    // the message must not send the user to try it, and must not name the
+    // format it didn't write. Pinned against the real constant.
+    assert_eq!(
+        err.to_string(),
+        format!("unknown field at `{field_path}`: {UNKNOWN_FIELD_DIALECT_HINT}")
+    );
+    assert!(!err.to_string().contains("--permissive"));
+    assert!(!err.to_string().contains("Envoy"));
+    assert!(err.to_string().contains("llmproxy-v0.schema.json"));
 }
 
 /// Reserved top-level keys get a dedicated forward-compat error.
@@ -1124,7 +1139,7 @@ fn unknown_observability_key_still_errors_with_path() {
         "{BASIC_CONFIG}observability:\n  force_usage_reportingg: false\n"
     ))
     .expect_err("unknown field must fail");
-    let ConfigError::UnknownField { field_path } = &err else {
+    let ConfigError::UnknownField { field_path, .. } = &err else {
         panic!("expected UnknownField, got: {err}");
     };
     assert_eq!(field_path, "observability.force_usage_reportingg");
