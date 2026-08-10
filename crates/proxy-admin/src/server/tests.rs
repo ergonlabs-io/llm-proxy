@@ -18,7 +18,7 @@ use proxy_config::ir::{
     PathMatch, RouteActionIR, RouteEntry, RouteMatcher, RouteTable, SnapshotVersion,
     UpstreamProtocol, VirtualHostIR,
 };
-use proxy_core::WorkerConfigHandle;
+use proxy_core::runtime::SnapshotHandles;
 use proxy_observability::stats::{
     instruments, prometheus_render, Registry, StatsControl, WorkerId,
 };
@@ -145,7 +145,11 @@ async fn start_with_registry(
     snapshot: Arc<ConfigSnapshot>,
     registry: Option<Arc<Registry>>,
 ) -> (AdminServer, SocketAddr) {
-    let config = Arc::new(WorkerConfigHandle::new(snapshot));
+    // Rust note: `SnapshotHandles::register` both builds the handle and
+    // enrolls it, the same path production code (`WorkerPool::spawn`, and
+    // `start_admin` in `crates/proxy/src/main.rs`) goes through -- there is
+    // no other way to obtain a `WorkerConfigHandle` from outside `proxy-core`.
+    let config = SnapshotHandles::new().register(snapshot);
     let server = serve(
         "127.0.0.1:0".parse().unwrap(),
         config,

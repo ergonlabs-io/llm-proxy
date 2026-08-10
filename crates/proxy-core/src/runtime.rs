@@ -76,11 +76,15 @@ pub struct WorkerContext {
 /// `Vec` assembled once inside `WorkerPool::spawn` -- that used to be exactly
 /// how the admin server's handle went stale after a SIGHUP reload: it built
 /// its own `WorkerConfigHandle` outside `spawn`'s loop, so nothing about
-/// `publish` ever touched it. [`SnapshotHandles::register`] is now the only
-/// way to obtain a handle, and it always enrolls the handle it hands back --
-/// a new consumer (a second admin listener, a future control-plane reader,
-/// whatever comes next) is registered by construction rather than by an
-/// author remembering a second call site.
+/// `publish` ever touched it. `WorkerConfigHandle::new` is `pub(crate)`, so
+/// [`SnapshotHandles::register`] is the only way anything outside
+/// `proxy-core` can obtain a handle, and it always enrolls the handle it
+/// hands back -- a new consumer (a second admin listener, a future
+/// control-plane reader, whatever comes next) is registered by construction
+/// rather than by an author remembering a second call site. (A handful of
+/// unit tests inside this crate still call `WorkerConfigHandle::new`
+/// directly, which visibility can't prevent; they aren't production
+/// consumers of `publish`, so that isn't the gap this type closes.)
 ///
 /// Rust note: `Mutex<Vec<_>>`, not a `Vec` behind `&mut self`, because
 /// registration happens from two independent call sites on the control
@@ -101,10 +105,12 @@ impl SnapshotHandles {
     }
 
     /// Build a [`WorkerConfigHandle`] seeded with `initial`, enroll it in
-    /// this registry, and hand it back. There is no other way to get a
-    /// `WorkerConfigHandle` out of this type -- constructing one directly
-    /// (as `start_admin` used to) is exactly the bug this closes, so the only
-    /// path back to a caller is one that also registers.
+    /// this registry, and hand it back. `WorkerConfigHandle::new` is
+    /// `pub(crate)`, so this is the only way a caller outside `proxy-core`
+    /// can get one -- constructing one directly and skipping registration
+    /// (as `start_admin` used to) is exactly the bug this closes, and now the
+    /// compiler refuses the shortcut instead of a doc comment discouraging
+    /// it.
     pub fn register(&self, initial: Arc<ConfigSnapshot>) -> Arc<WorkerConfigHandle> {
         let handle = Arc::new(WorkerConfigHandle::new(initial));
         self.handles
