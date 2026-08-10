@@ -18,6 +18,12 @@ testing/diffrig/captures/
 !CLAUDE.md
 # The release record. Cited by docs/MILESTONES.md and by the v0.0.1 tag.
 !CHANGELOG.md
+# The security policy. Needs an entry here for the same reason everything else
+# in this list does -- `*.md` denies by default, so a new root-level Markdown
+# file is untracked and silent unless allowed. A SECURITY.md that is not in the
+# repository is worse than none: it looks present locally and is invisible to
+# the people it exists for.
+!SECURITY.md
 !.claude/**/*.md
 !testing/corpus/fixtures/**/SOURCES.md
 # The spec the Go QA suite is written from — reviewable alongside the tests

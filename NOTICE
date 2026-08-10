@@ -1,0 +1,55 @@
+llm-proxy
+Copyright 2026 Vignesh Aigal
+
+This product includes software developed by the llm-proxy authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY SOFTWARE
+--------------------------------------------------------------------------------
+
+llm-proxy links 242 third-party Rust crates. Every one is under a permissive
+licence; there is no copyleft (no GPL, LGPL, AGPL, MPL, or SSPL) anywhere in the
+dependency tree. Audited 2026-08-09 with `cargo-license` over the non-dev,
+non-build dependency graph:
+
+    156  Apache-2.0 OR MIT
+     48  MIT
+     19  Apache-2.0
+     19  other permissive (ISC, BSD-2-Clause, BSD-3-Clause, Unlicense, Zlib,
+         BSL-1.0, 0BSD, Unicode-3.0, Apache-2.0 WITH LLVM-exception)
+
+Most of those are dual-licensed `Apache-2.0 OR MIT`, which llm-proxy takes under
+Apache-2.0. The crates below are different: their licences apply conjunctively
+(`AND`) or are ISC/BSD, all of which require the copyright notice and disclaimer
+to be reproduced in redistributions, including binary ones. Their notices are
+therefore reproduced in full here.
+
+    matchit          0.7.3     BSD-3-Clause AND MIT
+    ring             0.17.14   Apache-2.0 AND ISC
+    rustls-webpki    0.103.13  ISC
+    subtle           2.6.1     BSD-3-Clause
+    unicode-ident    1.0.24    (Apache-2.0 OR MIT) AND Unicode-3.0
+    untrusted        0.9.0     ISC
+
+The full licence text for each is in that crate's source distribution, under
+`~/.cargo/registry/src/*/<crate>-<version>/`. **Before publishing a binary
+release, those texts must be copied into this file or into an accompanying
+THIRD-PARTY-LICENSES file** — a list of crate names is not sufficient to satisfy
+a BSD or ISC notice requirement. This file records the audit and the obligation;
+it does not yet discharge it, and saying so is the point.
+
+Re-run the audit when the dependency tree changes:
+
+    cargo-license --avoid-dev-deps --avoid-build-deps -t
