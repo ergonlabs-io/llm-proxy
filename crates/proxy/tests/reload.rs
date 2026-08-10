@@ -16,8 +16,8 @@
 //! real binary, since `crates/proxy` has no `[lib]` target an integration
 //! test could link against directly.
 
-use std::io::{BufRead, BufReader};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -240,6 +240,70 @@ static_resources:
                     socket_address: {{ address: 127.0.0.1, port_value: 8081 }}
 "#
     )
+}
+
+/// A single `tcp_proxy` listener on `port`, routed to a cluster named
+/// `cluster_name`, plus an `admin` bind on `admin_port` -- the fixture for
+/// the `/config_dump`/`/clusters` reload tests below, where the changing
+/// piece across a reload is `cluster_name` itself so the admin surface's
+/// response body is byte-different before and after, not merely re-served
+/// from the same file.
+fn config_with_admin(admin_port: u16, port: u16, cluster_name: &str) -> String {
+    format!(
+        r#"
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: {admin_port} }}
+
+static_resources:
+  listeners:
+    - name: ingress_tcp
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: {cluster_name}
+
+  clusters:
+    - name: {cluster_name}
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: {cluster_name}
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 8081 }}
+"#
+    )
+}
+
+/// Sends a plain `GET <path> HTTP/1.1` with `Connection: close` to `addr` and
+/// returns the full response (status line + headers + body) read up to EOF --
+/// same technique as `tests/stats_e2e.rs`'s own `get` (each `tests/*.rs` file
+/// is its own compiled crate, so this is duplicated rather than shared).
+fn get(addr: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set_read_timeout");
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: admin.local\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("write request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read response to EOF");
+    String::from_utf8_lossy(&response).to_string()
 }
 
 struct Harness {
@@ -535,6 +599,77 @@ fn sigterm_after_a_reload_still_drains_and_exits_cleanly() {
     );
 
     let _ = std::fs::remove_file(&harness.config_path);
+}
+
+/// Defect 1 (found writing user documentation, 2026-08-09): `/config_dump`
+/// and `/clusters` used to keep serving the BOOT snapshot forever, because
+/// `start_admin` built its own `WorkerConfigHandle` outside the registry
+/// `ConfigPublisher::publish` walks. This is the load-bearing end-to-end
+/// proof the fix (`SnapshotHandles`, `crates/proxy-core/src/runtime.rs`) is
+/// actually wired all the way through the real binary: start the process,
+/// read both admin endpoints, SIGHUP a config that renames the cluster, wait
+/// for the reload-success log, then read both endpoints again and assert the
+/// NEW cluster name shows up and the OLD one is gone. A unit test that only
+/// checks a handle got `store`d would not catch a regression where the admin
+/// server's HTTP handler itself stopped reading through that handle.
+#[test]
+fn sighup_reload_is_reflected_in_config_dump_and_clusters() {
+    let port = free_port();
+    let admin_port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-reload-admin-dump-{}-{}.yaml",
+        std::process::id(),
+        port
+    ));
+    std::fs::write(
+        &config_path,
+        config_with_admin(admin_port, port, "backend_v1"),
+    )
+    .expect("write initial config");
+
+    let mut harness = Harness::spawn(config_path, port);
+    let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    assert!(
+        wait_for_connectable(("127.0.0.1", admin_port), STARTUP_TIMEOUT),
+        "admin server at {admin_addr} did not become connectable in time; \
+         stderr so far: {:?}",
+        harness.log
+    );
+
+    let dump_before = get(admin_addr, "/config_dump");
+    assert!(
+        dump_before.contains("backend_v1") && !dump_before.contains("backend_v2"),
+        "expected /config_dump to show the boot config's cluster before any reload, got:\n\
+         {dump_before}"
+    );
+    let clusters_before = get(admin_addr, "/clusters");
+    assert!(
+        clusters_before.contains("backend_v1") && !clusters_before.contains("backend_v2"),
+        "expected /clusters to show the boot config's cluster before any reload, got:\n\
+         {clusters_before}"
+    );
+
+    harness.rewrite_config(&config_with_admin(admin_port, port, "backend_v2"));
+    harness.sighup();
+    assert!(
+        harness.wait_for_log("SIGHUP: config reload succeeded", RELOAD_TIMEOUT),
+        "expected a successful-reload log line; stderr so far: {:?}",
+        harness.log
+    );
+
+    let dump_after = get(admin_addr, "/config_dump");
+    assert!(
+        dump_after.contains("backend_v2") && !dump_after.contains("backend_v1"),
+        "/config_dump must reflect the SIGHUP reload (the admin server's own handle must be \
+         republished into, not just the workers'), got:\n{dump_after}"
+    );
+    let clusters_after = get(admin_addr, "/clusters");
+    assert!(
+        clusters_after.contains("backend_v2") && !clusters_after.contains("backend_v1"),
+        "/clusters must reflect the SIGHUP reload, got:\n{clusters_after}"
+    );
+
+    harness.finish();
 }
 
 /// Sanity check on the ANSI stripper itself, since two tests above depend on

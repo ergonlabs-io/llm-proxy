@@ -334,7 +334,7 @@ pub async fn graceful_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{run_local, WorkerContext, WorkerPool, WorkerPoolConfig};
+    use crate::runtime::{run_local, SnapshotHandles, WorkerContext, WorkerPool, WorkerPoolConfig};
     use proxy_config::ir::SnapshotVersion;
     use proxy_config::ConfigSnapshot;
     use std::sync::Arc;
@@ -344,6 +344,10 @@ mod tests {
             version: SnapshotVersion(version),
             ..Default::default()
         })
+    }
+
+    fn handles() -> Arc<SnapshotHandles> {
+        Arc::new(SnapshotHandles::new())
     }
 
     #[test]
@@ -458,6 +462,7 @@ mod tests {
                 pin_cores: false,
             },
             snapshot(0),
+            handles(),
             move |ctx: WorkerContext| async move {
                 let registry = ConnectionRegistry::new();
                 let guard = registry.register();
@@ -494,6 +499,7 @@ mod tests {
                 pin_cores: false,
             },
             snapshot(0),
+            handles(),
             move |ctx: WorkerContext| async move {
                 let registry = ConnectionRegistry::new();
                 if ctx.id.0 == 0 {
@@ -539,6 +545,7 @@ mod tests {
                 pin_cores: false,
             },
             snapshot(0),
+            handles(),
             move |ctx: WorkerContext| async move {
                 let registry = ConnectionRegistry::new();
                 drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
