@@ -15,7 +15,7 @@ use std::path::Path;
 use prost_reflect::{DeserializeOptions, DynamicMessage, MessageDescriptor};
 use proxy_api::envoy::config::bootstrap::v3::Bootstrap;
 
-use crate::error::{ConfigError, ConfigWarning};
+use crate::error::{ConfigError, ConfigFrontEnd, ConfigWarning};
 use crate::StrictMode;
 
 /// Fully-qualified name of the bootstrap root message.
@@ -168,6 +168,7 @@ fn parse_json_value(
                     _ if unknown_field.is_some() => {
                         return Err(ConfigError::UnknownField {
                             field_path: full_path,
+                            front_end: ConfigFrontEnd::Bootstrap,
                         });
                     }
                     _ => {

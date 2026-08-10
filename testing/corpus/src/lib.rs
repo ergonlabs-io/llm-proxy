@@ -51,7 +51,7 @@ impl Outcome {
         // immutable borrow of the whole value at the same time.
         let message = err.to_string();
         match err {
-            ConfigError::UnknownField { field_path }
+            ConfigError::UnknownField { field_path, .. }
             | ConfigError::UnsupportedField { field_path, .. }
             | ConfigError::InvalidValue { field_path, .. }
             | ConfigError::Validation { field_path, .. }

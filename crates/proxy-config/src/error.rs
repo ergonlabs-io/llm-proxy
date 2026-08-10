@@ -10,8 +10,19 @@
 /// `Display` of this type.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("unknown field at `{field_path}`: not a recognized Envoy field at this position (strict mode; run with --permissive to ignore)")]
-    UnknownField { field_path: String },
+    // Rust note: thiserror's `#[error(...)]` accepts any expression that's
+    // valid inside `write!`'s argument list, not just bare field
+    // interpolation -- `front_end.unknown_field_hint()` is a method call on
+    // one of this variant's own fields, in scope because thiserror
+    // destructures the variant before running the format string. That's how
+    // one variant renders two genuinely different messages depending on
+    // which front end (bootstrap vs. dialect) hit it, without a hand-written
+    // `Display` impl for the whole enum.
+    #[error("unknown field at `{field_path}`: {}", front_end.unknown_field_hint())]
+    UnknownField {
+        field_path: String,
+        front_end: ConfigFrontEnd,
+    },
 
     #[error(
         "unsupported field `{field_path}`: {reason} (strict mode; see docs/envoy-divergences.md)"
@@ -38,6 +49,47 @@ pub enum ConfigError {
 
     #[error("not yet implemented at `{field_path}`: {reason}")]
     Unimplemented { field_path: String, reason: String },
+}
+
+/// Which config front end produced an [`ConfigError::UnknownField`] — the
+/// two need genuinely different advice, not just a relabeled brand name:
+/// `--permissive` is a real escape hatch on one and a no-op on the other, and
+/// the authority for "what's valid here" is a different document. User-facing
+/// text must not say "Envoy" (owner decision 2026-08-09); this is what lets
+/// the bootstrap message stay accurate without using the word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFrontEnd {
+    /// `-c`/`--config-path`: the bootstrap configuration format. Loaded with
+    /// `deny_unknown_fields`, but `--permissive` (WP-03) genuinely relaxes
+    /// that at boot, so the hint pointing at it is true here.
+    Bootstrap,
+    /// `--config`: the llm-proxy dialect (`schema/llmproxy-v0.schema.json`).
+    /// Always strict — `--permissive` has no effect on it, so the message
+    /// must not suggest it.
+    Dialect,
+}
+
+/// Fixed tail of the bootstrap front end's unknown-field message. Public so
+/// tests pin the real string instead of retyping it (a retyped copy proves
+/// nothing about what the code actually emits).
+pub const UNKNOWN_FIELD_BOOTSTRAP_HINT: &str =
+    "not a recognized field in the bootstrap configuration at this position \
+     (strict mode; run with --permissive to ignore)";
+
+/// Fixed tail of the dialect front end's unknown-field message. Names the
+/// schema instead of a flag, because the flag does nothing here.
+pub const UNKNOWN_FIELD_DIALECT_HINT: &str =
+    "not a recognized llm-proxy configuration field at this position \
+     (the configuration is always strict; see schema/llmproxy-v0.schema.json for valid fields)";
+
+impl ConfigFrontEnd {
+    /// The fixed tail of this front end's unknown-field message.
+    pub fn unknown_field_hint(self) -> &'static str {
+        match self {
+            ConfigFrontEnd::Bootstrap => UNKNOWN_FIELD_BOOTSTRAP_HINT,
+            ConfigFrontEnd::Dialect => UNKNOWN_FIELD_DIALECT_HINT,
+        }
+    }
 }
 
 /// A non-fatal finding from permissive-mode loading, surfaced on stderr and
