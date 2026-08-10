@@ -23,6 +23,12 @@ pub enum Outcome {
     HttpError(u16),
     TransportError,
     Timeout,
+    /// The body ended without the dialect's terminal SSE frame ever
+    /// arriving -- kept distinct from `TransportError` (see `driver.rs`'s
+    /// `ExecError::Truncated`): a broken connection and a stream the proxy
+    /// cut short are different bugs, and a capacity report that merges them
+    /// sends someone hunting the wrong one.
+    Truncated,
 }
 
 /// Everything measured about one stream. Built by `driver.rs` as the stream
@@ -57,6 +63,14 @@ pub struct StreamResult {
 }
 
 /// One run's fully aggregated stats, ready to serialize.
+///
+/// **Every `*_us` percentile field below describes successful requests
+/// only.** A failed stream (`HttpError`/`TransportError`/`Timeout`/
+/// `Truncated`) contributes to its count and to `error_rate`, never to a
+/// latency histogram -- see the guard in `Aggregator::record`. This is a
+/// behavior change from earlier runs, where `total_from_*_us` silently
+/// included failures' time-to-failure: if you're diffing a new run's
+/// percentiles against an old one, the definition moved, not just the data.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
     pub streams_started: u64,
@@ -66,6 +80,7 @@ pub struct RunSummary {
     pub http_errors: BTreeMap<u16, u64>,
     pub transport_errors: u64,
     pub timeouts: u64,
+    pub truncated: u64,
     pub error_rate: f64,
     pub tokens_received: u64,
     pub bytes_received: u64,
@@ -111,6 +126,7 @@ pub struct Aggregator {
     http_errors: BTreeMap<u16, u64>,
     transport_errors: u64,
     timeouts: u64,
+    truncated: u64,
     tokens_received: u64,
     bytes_received: u64,
     ttft_from_scheduled: Histogram<u64>,
@@ -140,6 +156,7 @@ impl Aggregator {
             http_errors: BTreeMap::new(),
             transport_errors: 0,
             timeouts: 0,
+            truncated: 0,
             tokens_received: 0,
             bytes_received: 0,
             ttft_from_scheduled: make(),
@@ -164,10 +181,32 @@ impl Aggregator {
             }
             Outcome::TransportError => self.transport_errors += 1,
             Outcome::Timeout => self.timeouts += 1,
+            Outcome::Truncated => self.truncated += 1,
         }
 
         self.tokens_received += result.tokens_received;
         self.bytes_received += result.bytes_received;
+
+        // Rust note: every latency histogram below describes SUCCESSFUL
+        // requests only, never a failure. `ttft_from_*` was already
+        // effectively guarded (a failure's `Option` is `None`), but
+        // `total_from_*` is a plain `Duration` that `failed_result` always
+        // populates with *time-to-failure* -- an HTTP error, a transport
+        // error, a timeout, or (as of the truncation fix) a truncated
+        // stream all used to feed that time straight into the same
+        // histogram as real completions. That skews in the dangerous
+        // direction: a fast failure *lowers* p99, so a proxy falling over
+        // under load would look like it got faster. `inter_token_gaps` is
+        // included in this gate too even though `failed_result` already
+        // always hands back an empty `Vec` for it (so today this is a
+        // no-op for that field) -- gating explicitly here means a future
+        // outcome that *does* carry partial gaps (e.g. a truncated stream
+        // that measured some real inter-token time before cutting off)
+        // doesn't silently start leaking into the success distribution
+        // just because nobody revisited this function.
+        if result.outcome != Outcome::Success {
+            return;
+        }
 
         if let Some(ttft) = result.ttft_from_scheduled {
             record_duration(&mut self.ttft_from_scheduled, ttft);
@@ -184,8 +223,10 @@ impl Aggregator {
 
     pub fn finish(self) -> RunSummary {
         let streams_counted = self.streams_started - self.warmup_excluded;
-        let errored =
-            self.http_errors.values().sum::<u64>() + self.transport_errors + self.timeouts;
+        let errored = self.http_errors.values().sum::<u64>()
+            + self.transport_errors
+            + self.timeouts
+            + self.truncated;
         let error_rate = if streams_counted == 0 {
             0.0
         } else {
@@ -200,6 +241,7 @@ impl Aggregator {
             http_errors: self.http_errors,
             transport_errors: self.transport_errors,
             timeouts: self.timeouts,
+            truncated: self.truncated,
             error_rate,
             tokens_received: self.tokens_received,
             bytes_received: self.bytes_received,
@@ -292,12 +334,59 @@ mod tests {
         let mut timeout = base_result(now, now);
         timeout.outcome = Outcome::Timeout;
         agg.record(timeout);
+        let mut truncated = base_result(now, now);
+        truncated.outcome = Outcome::Truncated;
+        agg.record(truncated);
         let summary = agg.finish();
-        assert_eq!(summary.streams_counted, 3);
+        assert_eq!(summary.streams_counted, 4);
         assert_eq!(summary.success, 1);
         assert_eq!(*summary.http_errors.get(&500).unwrap(), 1);
         assert_eq!(summary.timeouts, 1);
-        assert!((summary.error_rate - (2.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(summary.truncated, 1);
+        assert!((summary.error_rate - (3.0 / 4.0)).abs() < 1e-9);
+    }
+
+    /// The general form of the bug the truncation test happened to expose:
+    /// `total_from_scheduled`/`total_from_send` used to be recorded for
+    /// EVERY outcome, not just `Success`, because those two fields are plain
+    /// `Duration`s (unlike `ttft_from_*`, which failures already set to
+    /// `None`). `failed_result` in `driver.rs` always populates them with
+    /// time-to-failure, so an HTTP error or a transport error was silently
+    /// *lowering* the reported p99 -- exactly backwards for a capacity
+    /// report. `base_result` carries nonzero, distinguishable latencies for
+    /// every field, so this fails loudly if any non-`Success` outcome ever
+    /// leaks back into a histogram.
+    #[test]
+    fn only_successful_outcomes_contribute_latency_samples() {
+        let now = Instant::now();
+        for outcome in [
+            Outcome::HttpError(500),
+            Outcome::TransportError,
+            Outcome::Timeout,
+            Outcome::Truncated,
+        ] {
+            let mut agg = Aggregator::new(now - Duration::from_secs(1));
+            let mut result = base_result(now, now);
+            result.outcome = outcome;
+            agg.record(result);
+            let summary = agg.finish();
+            assert!(
+                summary.total_from_scheduled_us.is_none(),
+                "{outcome:?} must not contribute a total_from_scheduled sample"
+            );
+            assert!(
+                summary.total_from_send_us.is_none(),
+                "{outcome:?} must not contribute a total_from_send sample"
+            );
+            assert!(
+                summary.inter_token_us.is_none(),
+                "{outcome:?} must not contribute inter-token-gap samples"
+            );
+            assert!(
+                summary.ttft_from_scheduled_us.is_none(),
+                "{outcome:?} must not contribute a ttft_from_scheduled sample"
+            );
+        }
     }
 
     #[test]

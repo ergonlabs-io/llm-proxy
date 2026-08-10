@@ -99,6 +99,13 @@ fn pick_target<'a>(cfg: &'a RunConfig, idx: &AtomicUsize) -> &'a Target {
 enum ExecError {
     Http(u16),
     Transport,
+    /// The body ended (cleanly, no transport error) without ever producing a
+    /// `FrameKind::Terminal` frame -- the proxy (or upstream) cut the stream
+    /// short. Kept distinct from `Transport`: "the connection broke" and
+    /// "the connection was fine but the stream never finished" are different
+    /// bugs, and folding them together would send someone chasing the wrong
+    /// one from a capacity report.
+    Truncated,
 }
 
 /// What one successful (2xx, fully read) stream measured.
@@ -184,6 +191,11 @@ async fn execute(cfg: &RunConfig, target: &Target) -> Result<Measured, ExecError
     let mut gaps = Vec::new();
     let mut tokens_received = 0u64;
     let mut bytes_received = 0u64;
+    // Rust note: this is the whole fix -- `FrameKind::Terminal` used to be
+    // matched and discarded (`FrameKind::Terminal | FrameKind::Other => {}`).
+    // Recording whether we ever saw one lets the `None => break` arm below
+    // tell "the stream finished" apart from "the body just stopped".
+    let mut terminal_seen = false;
 
     loop {
         let frame = match body.frame().await {
@@ -208,9 +220,19 @@ async fn execute(cfg: &RunConfig, target: &Target) -> Result<Measured, ExecError
                     last_token_at = Some(now);
                     tokens_received += 1;
                 }
-                FrameKind::Terminal | FrameKind::Other => {}
+                FrameKind::Terminal => terminal_seen = true,
+                FrameKind::Other => {}
             }
         }
+    }
+
+    if !terminal_seen {
+        // The body closed cleanly (no transport error) but never delivered
+        // the dialect's terminal frame -- a truncated stream, not a
+        // successful one. `cfg.endpoint.classify` already knows the
+        // dialect's terminal shape ([DONE], `response.completed`,
+        // `message_stop`, ...), so this check stays generic across dialects.
+        return Err(ExecError::Truncated);
     }
 
     Ok(Measured {
@@ -278,6 +300,9 @@ async fn run_one_stream(
         }
         Ok(Err(ExecError::Transport)) => {
             failed_result(scheduled_start, send_start, Outcome::TransportError)
+        }
+        Ok(Err(ExecError::Truncated)) => {
+            failed_result(scheduled_start, send_start, Outcome::Truncated)
         }
         Err(_elapsed) => failed_result(scheduled_start, send_start, Outcome::Timeout),
     }

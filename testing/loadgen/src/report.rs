@@ -107,10 +107,18 @@ pub fn print_summary(report: &RunReport) {
     if r.error_rate > 0.0 {
         println!(
             "!!! nonzero error rate: http_errors={:?} transport_errors={} timeouts={} \
-             -- latency percentiles below only cover successful streams, do not read them \
-             as representative of the whole run",
-            r.http_errors, r.transport_errors, r.timeouts
+             truncated={} -- latency percentiles below only cover successful streams, do not \
+             read them as representative of the whole run",
+            r.http_errors, r.transport_errors, r.timeouts, r.truncated
         );
+        if r.truncated > 0 {
+            println!(
+                "!!! {} stream(s) ended without the dialect's terminal SSE frame -- the proxy \
+                 (or upstream) truncated the response; this is a distinct failure from a \
+                 transport error and must be investigated separately",
+                r.truncated
+            );
+        }
     }
     if let Some(p) = &r.ttft_from_scheduled_us {
         println!(
