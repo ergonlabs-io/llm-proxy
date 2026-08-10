@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 1045 tests green, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-09 · 1130 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -216,17 +216,31 @@
     <span class="gate"><b>v0.2.0's SHIP GATE —</b> a published capacity report (p99, tokens/sec
     ceiling, RSS under sustained long-lived streams) from a run that is not harness-bound, plus
     <code>/config_dump</code> and <code>/stats</code> on the admin endpoint, plus a config swap
-    under live traffic with zero dropped streams. <b>Stated honestly, none of the three is closed
-    and each is at a different stage.</b> <code>/config_dump</code> works today (WP-50 increment 1,
-    redaction structural — the dump type has no field that can hold a live credential).
-    <code>/stats</code> still 404s, explicitly naming the reason
-    (<code>"not implemented yet (WP-23: stats registry); this proxy does not fake an empty
-    /stats"</code>) rather than faking an empty 200 — WP-23 got a design brief 2026-08-08
-    (OTel-native model, index-not-name on the hot path) but no registry code yet, and it still
-    needs WP-06. No capacity ceiling is published (WP-30 phases 1+2 only). The config-swap clause
-    has no evidence either way. The loadgen Linux <code>/proc</code> sampler is written to spec but
-    <b>unverified — no Linux box in the loop</b>, and that is a blocker for this gate, not a
-    footnote.</span>
+    under live traffic with zero dropped streams. <b>Two of the three clauses CLOSED 2026-08-09;
+    the capacity report is now the only one open, and it has a named blocker.</b>
+    <code>/config_dump</code> and <code>/stats</code> — closed: <code>/config_dump</code>'s
+    redaction is structural (WP-50 increment 1), and <code>/stats</code> now reports <b>real
+    traffic</b>, not merely a correctly-rendered empty registry — WP-23 increments 4/5/6a landed
+    the Prometheus renderer, a registry that survives a config swap, and cluster stat call sites,
+    proven end to end by <code>crates/proxy/tests/stats_e2e.rs</code> and mutation-verified.
+    Increment 6b (listener stats, LLM-token stats) remains open but doesn't reopen this clause,
+    which was written against cluster traffic. Config swap under live traffic — closed: SIGHUP
+    now triggers a real reload (a bad config keeps the old snapshot and logs, never taking the
+    proxy down), and <code>testing/diffrig/tests/swap_under_load.rs</code> proves zero dropped
+    streams under 6 concurrent SSE/non-streaming requests during the swap, asserting the SSE
+    terminal frame rather than a request count (this proxy never injects into a truncated
+    stream, so a count-based check would miss a silent truncation). <b>The capacity report is
+    the one open clause, and it cannot be produced honestly yet:</b> found 2026-08-09 while
+    building the swap test, <code>loadgen::driver::execute</code> classifies a streaming
+    request as successful once the body ends without a transport error — it never checks for
+    the terminal frame, so a run in which the proxy truncated every stream would report a 0%
+    error rate. A p99 from that instrument is not evidence. A fix is written but
+    <b>uncommitted, sitting in an agent worktree, not on <code>main</code></b>. The Linux
+    <code>/proc</code> sampler is unverified but is <b>no longer a blocker</b> (owner decision
+    2026-08-09) — the gate asks for a run that isn't harness-bound, not specifically Linux, and
+    the macOS sampler path is the verified one; what IS still open on that clause is WP-15 h1
+    connection reuse (h2 got a per-worker multiplexed cache today; h1 still burns two ephemeral
+    ports per request and caps the rig near ~8k streams).</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -258,7 +272,19 @@
     at the drain assertion. Fixed by giving it its own ephemeral port; 12/12 clean re-runs, 3/3 with
     both old fixed ports deliberately held by another process. The <code>diffrig</code> hang
     mitigation (multi-threaded runtime + <code>terminate-after</code>) holds; those tests still
-    carry no request timeouts, unchanged.</span>
+    carry no request timeouts, unchanged.
+    <b>Re-measured again 2026-08-09 via <code>make tq-count</code>: 1130 tests passed, 24 skipped</b>
+    — the skip count is unchanged and the increase is explained by today's new test files
+    (<code>reload.rs</code>, <code>stats_e2e.rs</code>, <code>swap_under_load.rs</code>, an
+    expanded <code>router_retry.rs</code>); doctests re-run clean via <code>make tq-doc</code>.
+    <b>WP-24 (access logs) corrected 2026-08-09:</b> this board had it as <code>done</code>; its
+    own machinery (response flags, mid-stream failure visibility, credential-safe logging) has
+    been complete for a while, but the differential acceptance gate against the WP-13 lifecycle
+    suite is genuinely still open, so the card moved back to <code>started</code> rather than
+    staying <code>done</code> on a technicality. <b>New, unscoped work landed today:</b> an Astro
+    Starlight docs-site scaffold (<code>docs/site/</code>) plus three user-facing pages
+    (<code>docs/user/</code>) — real and useful, but there is no work package behind it, so it
+    does not move any card here.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
@@ -416,7 +442,7 @@
   "lane": "B",
   "size": "M",
   "gate": "G1",
-  "status": "started",
+  "status": "done",
   "title": "Runtimes + config propagation + drain",
   "meta": [
    "proxy-core · crates/proxy",
@@ -424,9 +450,10 @@
    "chunks A+B+C ✓ pool · drain · serve + SIGTERM + CLI",
    "✓ shutdown handlers now install BEFORE any worker spawns",
    "✓ both serve-mode CLI tests now gate on a real TCP connect, never a log line — the log-line helper was deleted outright so the bug can't be reintroduced",
-   "open: swap-under-load gate (needs WP-26 rig) — this is what holds Lane B open"
+   "✓ CLOSED 2026-08-09 — SIGHUP now re-reads the config file and publishes a new snapshot (a bad config keeps the old snapshot and logs the dotted-path error, never taking the proxy down); listeners and clusters both reconcile",
+   "✓ swap-under-load acceptance test landed same day: testing/diffrig/tests/swap_under_load.rs — 6 in-flight streams at the moment of swap, 12 paced SSE streams all reaching the terminal frame, 50 non-streaming requests, zero transport errors, zero non-2xx, second upstream serves 48 requests after — the load-bearing assertion is the terminal frame, not a count, since this proxy never injects into a truncated SSE stream"
   ],
-  "note": "⚠ FIXED: the startup log said 'waiting for SIGTERM/SIGINT' while the handler was installed much later — a signal in that window killed the process outright, no drain, connections dropped. Surfaced as a flaky drain test"
+  "note": "all three acceptance clauses now met (validate exit codes, zero-dropped swap under load, SIGTERM drain) — this WP no longer holds Lane B open"
  },
  {
   "id": 7,
@@ -581,13 +608,15 @@
   "status": "started",
   "title": "Conn pools + circuit breakers (S5)",
   "meta": [
-   "proxy-cluster",
+   "proxy-cluster · proxy-http/src/upstream_pool.rs",
    "✓ UpstreamTransportSocket seam: TCP dial → rustls client handshake (SNI + ALPN from upstream_protocol)",
    "✓ transport_socket with no registered builder = FATAL startup, never a plaintext downgrade",
    "✓ S5 max_requests CB via GuardedBody — UO + x-envoy-overloaded fire",
-   "open (v0.0.1): keep-alive reuse — still connect-per-stream, which a real provider will notice"
+   "✓ SLICE A landed 2026-08-09 — per-worker cache of live h2 connections, so N concurrent requests to a provider now share one connection/handshake instead of dialling per stream. ConnKey includes the CLUSTER name, not just the address — two clusters can share an address with different transport sockets/credentials, so keying on address alone would leak one provider's TLS identity and credentials to another's requests",
+   "✓ connect_timeout now ENFORCED on the dial (TCP connect + TLS handshake as one shared budget) — PoolError::ConnectTimeout was already handled by the router/retry engine but had never actually been produced before this landed",
+   "open: h1 is still connect-per-stream (slice B — keep-alive reuse has its own hazards: draining the body before reuse, Connection: close) · connection-level circuit breakers (max_connections, max_pending_requests — slice D)"
   ],
-  "note": "▲ pooling is what caps the WP-30 rig at ~8k streams (2 ports/stream) — these two compound"
+  "note": "▲ h2 traffic no longer burns 2 ephemeral ports/stream, but h1 still does, so the WP-30 rig is still harness-bound (~8k streams) for any h1-heavy workload — h1 pooling is the remaining blocker on that clause, not Linux"
  },
  {
   "id": 16,
@@ -706,15 +735,18 @@
   "lane": "F",
   "size": "M",
   "gate": "G2",
-  "status": "blocked",
+  "status": "started",
   "title": "Stats registry (Envoy names)",
   "meta": [
    "proxy-observability",
-   "needs 06",
    "owns the two inert stat_prefix fields flagged by the WP-39 guard",
    "OWNER 2026-08-03: the internal model is OTel now — instruments + attribute sets + semconv names — and Envoy's flat dotted /stats names become a RENDERING of the registry, not its own shape (attributes are strictly more expressive; recovering them from a flat mangled name is the harder direction). See WP-51, which this decision was made for",
-   "✓ DESIGN BRIEF landed 2026-08-08 (83c778f, docs/wp-23-stats-design-brief.md) — hot path increments an opaque Handle (index), never a name, so no attribute-set hashing on the request path; stats explicitly NOT ADR-0005's distributed case (a budget must be shared across replicas or the quota multiplies, a stat must NOT be, or the TSDB double-counts) — this WP owes the trait-shaped exporter seam, not a shared store. Design only: no registry code yet, still blocked on WP-06"
-  ]
+   "✓ inc 1-3 (registry core, histograms w/ Envoy default buckets, Envoy text renderer) then inc 4 (/stats/prometheus + label mangling) — the histogram line format P<n>(interval,cumulative), space-joined, confirmed against Envoy's own source (two different quantileSummary() impls exist; the admin path calls the ParentHistogram one). Grafana conformance test is deliberately PROVISIONAL — the Envoy repo vendors no dashboard at all",
+   "✓ inc 5 (2026-08-09) — registry survives a config swap: API split into Registry (shared, hot path, no public resolve) vs StatsControl (non-Clone, owns resolution), an ArcSwap published snapshot, block-chunked counter shards. This is what makes a new cluster appearing on a SIGHUP reload get counters instead of panicking or silently dropping",
+   "✓ inc 6a (2026-08-09) — cluster stat call sites wired in; /stats now reports REAL traffic, not an empty rendering of an untouched registry. crates/proxy/tests/stats_e2e.rs proves it: real binary, real requests, real scrape asserting the rendered body, mutation-verified (remove the router's increment and it fails with upstream_rq_total: 0). CLOSES the v0.2.0 /stats gate clause",
+   "open: inc 6b — DOWNSTREAM_CX_TOTAL (listener) and GEN_AI_CLIENT_TOKEN_USAGE (usage filter) have instruments defined but NO production call site yet (checked: only referenced from a unit test and the renderer/conformance test, never incremented from proxy-core or proxy-filters) — so listener-level and LLM-token stats are still silently absent from a live scrape"
+  ],
+  "note": "the /stats gate clause is closed on cluster traffic; it is not yet complete across every stat family the registry defines names for"
  },
  {
   "id": 24,
@@ -723,7 +755,7 @@
   "lane": "F",
   "size": "M",
   "gate": "G2",
-  "status": "done",
+  "status": "started",
   "title": "Access logs + response flags",
   "meta": [
    "proxy-observability · proxy-http/src/router/logging.rs",
@@ -734,7 +766,8 @@
    "✓ SECURITY: headers snapshotted BEFORE apply_request_transforms, so provider credentials never reach the log — now guarded by QA-4 end-to-end, in both directions",
    "✓ pseudo-headers resolve: %REQ(:METHOD)/(:AUTHORITY)/(:SCHEME)% + %RESP(:STATUS)%, via typed LogContext fields (a colon is not a legal HeaderName)",
    "✓ MID-STREAM FAILURES ARE NOW VISIBLE — UC upstream hung up · DC client left / body abandoned · SI upstream went quiet (S4 idle), plus an operator-facing WARN with host, cluster, bytes, TTFT, elapsed",
-   "✓ transparent proxy: we log the failure, we never inject an error event into the SSE stream (owner decision)"
+   "✓ transparent proxy: we log the failure, we never inject an error event into the SSE stream (owner decision)",
+   "open: the acceptance gate itself — field-by-field differential log-line comparison against the WP-13 lifecycle suite, plus \"every response flag reachable by at least one test\". This row read \"nothing emits\" long after the above had landed; corrected 2026-08-09 to functionally-done rather than done, because the gate is real work, not paperwork"
   ],
   "note": "⚠ FIXED TWO (found by QA-1 + QA-6): %REQ(:METHOD)% rendered '-' in EVERY log line including Envoy mode, since Envoy's own default format uses it; and a stream killed mid-flight set NO response flag, making a network death byte-identical to a short completion on the SSE path that is most LLM traffic"
  },
@@ -834,7 +867,8 @@
    "✓ phase 2 — process sampler (RSS/CPU/fds, macOS+Linux, explicit error not zeros) · ramp-hold-bisect sweep w/ multi-clause SLO gate",
    "✓ capacity table + least-squares cost model (bytes/stream, CPU-ms/request, R² reported)",
    "open: NO SWEEP PUBLISHED — 'performant' is still an untested claim",
-   "open: Linux /proc path unverified (no Linux box) — a v0.2.0 blocker, not a footnote"
+   "⚑ FOUND 2026-08-09 (while building the swap test) — loadgen cannot detect SSE stream truncation. driver::execute classifies a streaming request as successful once the body ends without a transport error; it never checks for the terminal frame, so a run in which the proxy truncated EVERY stream would report a 0% error rate. A published p99 from this instrument is not evidence until this is fixed — this blocks the capacity clause as much as any throughput number does. A fix exists (uncommitted, in an agent worktree, NOT on main) — do not treat this as done until it lands and is verified",
+   "owner decision 2026-08-09: the Linux /proc sampler is SET ASIDE, no longer a blocker — the gate asks for a run that is not harness-bound, not specifically Linux, and the macOS sampler path is the verified one"
   ],
   "note": "detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending there is reported HARNESS-BOUND, never as proxy capacity"
  },
@@ -987,6 +1021,7 @@
   "meta": [
    "proxy-filters",
    "needs 33 (usage on live traffic); 34's extraction is already done",
+   "needs 53 (rate card) — this WP cannot enforce a dollar budget against a price list nobody can update; 53 is now its own card (design brief only, no code merged)",
    "cost model over the 4 non-overlapping token buckets, priced per model",
    "budget scopes: key / user / project, with a period",
    "exhausted budget REJECTS rather than queues"
@@ -1200,6 +1235,26 @@
    "open design decision this WP owns: bounded-buffer transform (reuse WP-45) vs full reshape — a shape change isn't generally a prefix splice the way include_usage injection is"
   ],
   "note": "⚑ rejecting cross-dialect fallback is the SAFE interim state, not a regression — see WP-35's 2026-08-08 note. This WP is what turns the rejection into support"
+ },
+ {
+  "id": 53,
+  "prio": "P1",
+  "ms": "v0.2.0",
+  "lane": "H",
+  "size": "M",
+  "gate": "G5",
+  "status": "ready",
+  "title": "Versioned model pricing (rate card)",
+  "meta": [
+   "proxy-filters · proxy-simple-config",
+   "needs 33 (done — usage on live traffic) + 48 (done — saturating-arithmetic discipline); owner decision means it blocks on nothing else — no control-plane store, no admin endpoints, prices arrive as config or a file only",
+   "DESIGN BRIEF landed 2026-08-08 (docs/wp-53-pricing-design-brief.md) — no registry/filter code merged on main yet",
+   "core decision: record computed cost AT REQUEST TIME, never store tokens and re-price on read — a price update must never change an already-completed request's recorded cost",
+   "nanodollars as u64, saturating throughout (WP-48's class of bug, one level up); 4 rates per price entry (one per non-overlapping token bucket, not input+output); tiered rates with a REQUIRED tier_mode (whole_request vs graduated give different numbers for the same request — no default, ground rule #1 applied to arithmetic)",
+   "an unpriced model is None, never $0 — same trap WP-48 found, worse here because $0 is a hole through a dollar budget",
+   "this WP is the LIST price only — field is list_cost_nanodollars / %LLM_LIST_COST%, not `cost`, so a downstream discount system can't be mistaken for having already been applied"
+  ],
+  "note": "this is WP-42's (spend controls) hard prerequisite — WP-42 cannot enforce a dollar budget on a price list nobody can update. No code landed on main; do not read the design brief as progress on the card"
  }
 ];
 

@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 52 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-08 · 1045 tests green, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-09 · 1130 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -216,17 +216,31 @@
     <span class="gate"><b>v0.2.0's SHIP GATE —</b> a published capacity report (p99, tokens/sec
     ceiling, RSS under sustained long-lived streams) from a run that is not harness-bound, plus
     <code>/config_dump</code> and <code>/stats</code> on the admin endpoint, plus a config swap
-    under live traffic with zero dropped streams. <b>Stated honestly, none of the three is closed
-    and each is at a different stage.</b> <code>/config_dump</code> works today (WP-50 increment 1,
-    redaction structural — the dump type has no field that can hold a live credential).
-    <code>/stats</code> still 404s, explicitly naming the reason
-    (<code>"not implemented yet (WP-23: stats registry); this proxy does not fake an empty
-    /stats"</code>) rather than faking an empty 200 — WP-23 got a design brief 2026-08-08
-    (OTel-native model, index-not-name on the hot path) but no registry code yet, and it still
-    needs WP-06. No capacity ceiling is published (WP-30 phases 1+2 only). The config-swap clause
-    has no evidence either way. The loadgen Linux <code>/proc</code> sampler is written to spec but
-    <b>unverified — no Linux box in the loop</b>, and that is a blocker for this gate, not a
-    footnote.</span>
+    under live traffic with zero dropped streams. <b>Two of the three clauses CLOSED 2026-08-09;
+    the capacity report is now the only one open, and it has a named blocker.</b>
+    <code>/config_dump</code> and <code>/stats</code> — closed: <code>/config_dump</code>'s
+    redaction is structural (WP-50 increment 1), and <code>/stats</code> now reports <b>real
+    traffic</b>, not merely a correctly-rendered empty registry — WP-23 increments 4/5/6a landed
+    the Prometheus renderer, a registry that survives a config swap, and cluster stat call sites,
+    proven end to end by <code>crates/proxy/tests/stats_e2e.rs</code> and mutation-verified.
+    Increment 6b (listener stats, LLM-token stats) remains open but doesn't reopen this clause,
+    which was written against cluster traffic. Config swap under live traffic — closed: SIGHUP
+    now triggers a real reload (a bad config keeps the old snapshot and logs, never taking the
+    proxy down), and <code>testing/diffrig/tests/swap_under_load.rs</code> proves zero dropped
+    streams under 6 concurrent SSE/non-streaming requests during the swap, asserting the SSE
+    terminal frame rather than a request count (this proxy never injects into a truncated
+    stream, so a count-based check would miss a silent truncation). <b>The capacity report is
+    the one open clause, and it cannot be produced honestly yet:</b> found 2026-08-09 while
+    building the swap test, <code>loadgen::driver::execute</code> classifies a streaming
+    request as successful once the body ends without a transport error — it never checks for
+    the terminal frame, so a run in which the proxy truncated every stream would report a 0%
+    error rate. A p99 from that instrument is not evidence. A fix is written but
+    <b>uncommitted, sitting in an agent worktree, not on <code>main</code></b>. The Linux
+    <code>/proc</code> sampler is unverified but is <b>no longer a blocker</b> (owner decision
+    2026-08-09) — the gate asks for a run that isn't harness-bound, not specifically Linux, and
+    the macOS sampler path is the verified one; what IS still open on that clause is WP-15 h1
+    connection reuse (h2 got a per-worker multiplexed cache today; h1 still burns two ephemeral
+    ports per request and caps the rig near ~8k streams).</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -258,7 +272,19 @@
     at the drain assertion. Fixed by giving it its own ephemeral port; 12/12 clean re-runs, 3/3 with
     both old fixed ports deliberately held by another process. The <code>diffrig</code> hang
     mitigation (multi-threaded runtime + <code>terminate-after</code>) holds; those tests still
-    carry no request timeouts, unchanged.</span>
+    carry no request timeouts, unchanged.
+    <b>Re-measured again 2026-08-09 via <code>make tq-count</code>: 1130 tests passed, 24 skipped</b>
+    — the skip count is unchanged and the increase is explained by today's new test files
+    (<code>reload.rs</code>, <code>stats_e2e.rs</code>, <code>swap_under_load.rs</code>, an
+    expanded <code>router_retry.rs</code>); doctests re-run clean via <code>make tq-doc</code>.
+    <b>WP-24 (access logs) corrected 2026-08-09:</b> this board had it as <code>done</code>; its
+    own machinery (response flags, mid-stream failure visibility, credential-safe logging) has
+    been complete for a while, but the differential acceptance gate against the WP-13 lifecycle
+    suite is genuinely still open, so the card moved back to <code>started</code> rather than
+    staying <code>done</code> on a technicality. <b>New, unscoped work landed today:</b> an Astro
+    Starlight docs-site scaffold (<code>docs/site/</code>) plus three user-facing pages
+    (<code>docs/user/</code>) — real and useful, but there is no work package behind it, so it
+    does not move any card here.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
