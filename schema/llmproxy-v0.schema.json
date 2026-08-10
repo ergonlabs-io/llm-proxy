@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://llmproxy.dev/schema/llmproxy-v0.schema.json",
   "title": "llm-proxy configuration (v0)",
-  "description": "The simple, LLM-native configuration dialect for llm-proxy. This file is the single source of truth for the v0 schema: user-facing documentation, editor autocomplete (yaml-language-server), and the config validator are all generated from it. The dialect is a front-end: it compiles ('lowers') to standard Envoy resources and runs through the exact same validation pipeline as Envoy bootstrap config — `llm-proxy config translate` shows the generated Envoy configuration. Strings support environment-variable interpolation with `${VAR_NAME}`, applied before parsing. Parsing is strict: unknown fields are errors, never ignored. Advanced needs beyond this dialect: use Envoy bootstrap mode (`-c bootstrap.yaml`). The top-level keys `envoy`, `tracing`, and `clusters` are RESERVED for future versions and rejected in v0.",
+  "description": "The configuration format for llm-proxy. This file is the single source of truth for the v0 schema: user-facing documentation, editor autocomplete (yaml-language-server), and the config validator are all generated from it. Strings support environment-variable interpolation with `${VAR_NAME}`, applied before parsing. Parsing is strict: unknown fields are errors, never ignored. The top-level keys `envoy`, `tracing`, and `clusters` are RESERVED for future versions and rejected in v0.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "providers", "routes"],
@@ -21,7 +21,7 @@
       "examples": ["0.0.0.0:8080", { "address": "0.0.0.0:8443", "tls": { "cert_file": "/etc/llmproxy/tls.crt", "key_file": "/etc/llmproxy/tls.key" } }]
     },
     "admin": {
-      "description": "Admin/observability endpoint (`/ready`, `/config_dump`, `/clusters`, `/server_info`, `/stats`). `/stats` renders Envoy's text format. Disabled when omitted. Bind to loopback unless you know why not.",
+      "description": "Admin/observability endpoint (`/ready`, `/config_dump`, `/clusters`, `/server_info`, `/stats`). `/stats` renders a flat text format, one `name: value` line per counter or histogram. Disabled when omitted. Bind to loopback unless you know why not.",
       "$ref": "#/$defs/HostPort",
       "examples": ["127.0.0.1:9901"]
     },
@@ -39,7 +39,7 @@
       }
     },
     "models": {
-      "description": "Logical model catalogue (WP-49): a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name exactly, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. WP-49 increment 1 is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a translate-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) lands with WP-35.",
+      "description": "Logical model catalogue (WP-49): a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name exactly, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. WP-49 increment 1 is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a load-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) lands with WP-35.",
       "default": {},
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/ModelDef" },
@@ -59,7 +59,7 @@
       "items": { "$ref": "#/$defs/Route" }
     },
     "limits": {
-      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a translate-time warning naming the exact field. NOTE: limits are enforced per proxy instance in v0; fleet-wide limits require the (future) shared budget store.",
+      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a load-time warning naming the exact field. NOTE: limits are enforced per proxy instance in v0; fleet-wide limits require the (future) shared budget store.",
       "type": "array",
       "items": { "$ref": "#/$defs/Limit" }
     },
@@ -136,7 +136,7 @@
         "keys": {
           "type": "array",
           "default": [],
-          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a translate-time warning.",
+          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning.",
           "items": { "$ref": "#/$defs/AuthKey" }
         }
       },
@@ -228,7 +228,7 @@
         "providers": {
           "type": "array",
           "minItems": 1,
-          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. WP-49 increment 1: only `providers[0]` is used to serve traffic today -- every later entry is validated at load time (a bad one still fails to load) but produces a translate-time warning naming its exact path instead of being selected; choosing among them lands with WP-35.",
+          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. WP-49 increment 1: only `providers[0]` is used to serve traffic today -- every later entry is validated at load time (a bad one still fails to load) but produces a load-time warning naming its exact path instead of being selected; choosing among them lands with WP-35.",
           "items": {
             "oneOf": [
               { "$ref": "#/$defs/ProviderModelRef" },
@@ -252,7 +252,7 @@
         },
         "model": {
           "type": "string",
-          "description": "Upstream model ID at this provider, if different from the model's own catalogue name (e.g. Anthropic's dated model IDs, or a Vertex publisher-model path). Recorded; substituting it into the request body needs the request-body rewriter (WP-35), so this produces a translate-time warning until then and the client's original model name is forwarded as-is.",
+          "description": "Upstream model ID at this provider, if different from the model's own catalogue name (e.g. Anthropic's dated model IDs, or a Vertex publisher-model path). Recorded; substituting it into the request body needs the request-body rewriter (WP-35), so this produces a load-time warning until then and the client's original model name is forwarded as-is.",
           "examples": ["claude-sonnet-4-5-20250929", "moonshotai/Kimi-K2-Instruct"]
         },
         "dialect": {

@@ -1,13 +1,13 @@
 ---
 title: Introduction to llm-proxy
-summary: llm-proxy is a Rust proxy for LLM inference APIs, configured with the
-  llmproxy dialect (schema/llmproxy-v0.schema.json). It meters tokens,
+summary: llm-proxy is a Rust proxy for LLM inference APIs, configured with a
+  single YAML file (schema/llmproxy-v0.schema.json). It meters tokens,
   enforces token-based rate limits, fails over between same-dialect
   providers, and authenticates callers.
 last_updated: 2026-08-09
 related:
   - /getting-started/quickstart/
-  - /configuration/the-llmproxy-dialect/
+  - /configuration/configuration-file/
 ---
 
 # Introduction to llm-proxy
@@ -20,11 +20,11 @@ providers, and enforce per-caller budgets.
 
 ## Configuration
 
-llm-proxy is configured with the `llmproxy` dialect: a single YAML file,
-normatively defined by `schema/llmproxy-v0.schema.json`. You name providers
-and routes by model pattern; llm-proxy handles the rest. Parsing is strict —
-an unknown or misspelled field is a load error naming its exact dotted path,
-never a silent ignore. [The `llmproxy` configuration dialect](/configuration/the-llmproxy-dialect/)
+llm-proxy is configured with a single YAML file, normatively defined by
+`schema/llmproxy-v0.schema.json`. You name providers and routes by model
+pattern; llm-proxy handles the rest. Parsing is strict — an unknown or
+misspelled field is a load error naming its exact dotted path, never a
+silent ignore. [Configuration file reference](/configuration/configuration-file/)
 is the field-by-field reference.
 
 ## What ships today
@@ -68,8 +68,8 @@ the process.
 
 Provider fallback is scoped to same-dialect chains, as described above — it
 is not yet a general "try any provider on failure" mechanism. And the
-`models` catalogue in the dialect (a named model mapped to an ordered list of
-providers) records every provider you list but, in this schema version, only
-ever routes to the first one; see
-[The `llmproxy` configuration dialect](/configuration/the-llmproxy-dialect/)
+`models` catalogue in the configuration (a named model mapped to an ordered
+list of providers) records every provider you list but, in this schema
+version, only ever routes to the first one; see
+[Configuration file reference](/configuration/configuration-file/)
 for the exact field-by-field behavior.

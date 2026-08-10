@@ -42,7 +42,7 @@ export default defineConfig({
 				{
 					label: 'Configuration',
 					items: [
-						{ label: 'The llmproxy dialect', slug: 'configuration/the-llmproxy-dialect' },
+						{ label: 'Configuration file', slug: 'configuration/configuration-file' },
 						// { label: 'Strict config mode', slug: 'configuration/strict-config-mode' },
 					],
 				},

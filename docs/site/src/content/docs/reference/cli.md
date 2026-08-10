@@ -46,7 +46,7 @@ here entirely rather than described vaguely.
 ## `--mode keygen`
 
 Generates a fresh virtual key and the digest that goes in `auth.keys[]` —
-see [The `llmproxy` configuration dialect](/configuration/the-llmproxy-dialect/)
+see [Configuration file reference](/configuration/configuration-file/)
 for the `auth` block this feeds.
 
 | Flag | Required | Default | What it does |
