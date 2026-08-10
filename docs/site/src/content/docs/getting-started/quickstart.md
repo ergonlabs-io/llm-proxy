@@ -1,12 +1,12 @@
 ---
 title: Getting started with llm-proxy
-summary: Build the llm-proxy binary, validate a dialect config, serve it
-  against an OpenAI-compatible provider, and read the access log line it
-  writes for the request.
+summary: Build the llm-proxy binary, validate a config, serve it against an
+  OpenAI-compatible provider, and read the access log line it writes for the
+  request.
 last_updated: 2026-08-09
 related:
-  - introduction.md
-  - configuration-dialect.md
+  - /getting-started/introduction/
+  - /configuration/the-llmproxy-dialect/
 ---
 
 # Getting started
@@ -16,8 +16,8 @@ below was run against this repository; the exact output follows each one.
 
 ## Prerequisites
 
-Install `protoc` before you build. llm-proxy vendors Envoy's protobuf
-definitions, and `proxy-api` compiles them at build time.
+Install `protoc` before you build. llm-proxy compiles bundled protobuf
+definitions at build time, in the `proxy-api` crate.
 
 ```sh
 brew install protobuf        # macOS
@@ -37,25 +37,22 @@ workspace instead, which is slower and not required just to run the proxy.
 
 ## Step 2: Check the CLI
 
-`llm-proxy` has four modes: `serve`, `validate`, `translate`, and `keygen`.
 Run `--help` to see the full flag list.
 
 ```sh
 ./target/debug/llm-proxy --help
 ```
 
-`serve` is the default mode. `validate` and `translate` both take a config
-and exit without binding a listener; `validate` reports whether the config
-loads, and `translate` (dialect configs only) prints the Envoy bootstrap the
-dialect lowers to. `keygen` generates a virtual key for downstream
-authentication and needs no config at all — see `configuration-dialect.md`.
+`serve` is the default mode. `validate` takes a config and exits without
+binding a listener, reporting whether the config loads. `keygen` generates a
+virtual key for downstream authentication and needs no config at all — see
+[The `llmproxy` configuration dialect](/configuration/the-llmproxy-dialect/).
 
 ## Step 3: Validate a config
 
-Use `--config` for a dialect file (`schema/llmproxy-v0.schema.json`), or
-`-c`/`--config-path` for an Envoy bootstrap file. `examples/llmproxy-ollama.yaml`
-is the smallest dialect example in the repository: one provider, one route,
-no API key.
+`--config` takes a path to a config file
+(`schema/llmproxy-v0.schema.json`). `examples/llmproxy-ollama.yaml` is the
+smallest example in the repository: one provider, one route, no API key.
 
 ```sh
 cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode validate
@@ -63,13 +60,6 @@ cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode validate
 
 ```text
 configuration 'examples/llmproxy-ollama.yaml' OK (1 listener(s), 1 cluster(s), 0 warning(s))
-```
-
-To see the Envoy configuration the dialect actually produces, run the same
-config through `--mode translate`:
-
-```sh
-cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode translate
 ```
 
 ## Step 4: Serve it and send a request
@@ -110,7 +100,7 @@ Save it as `llmproxy-local.yaml`, start your OpenAI-compatible server on
 
 ```text
 INFO llm_proxy: admin server listening addr=127.0.0.1:19901
-INFO llm_proxy: llm-proxy started, waiting for SIGTERM/SIGINT workers=8 ... listeners=llmproxy_listener@127.0.0.1:18080
+INFO llm_proxy: llm-proxy started, waiting for SIGTERM/SIGINT/SIGHUP workers=8 ... listeners=llmproxy_listener@127.0.0.1:18080
 INFO proxy_core::listener: listener bound listener=llmproxy_listener addr=127.0.0.1:18080
 ```
 
@@ -165,13 +155,15 @@ access log is written at all.
 
 ## Two likely failure points
 
-**You passed a dialect file to `-c`/`--config-path`.** llm-proxy prints:
+**A provider sets both `api_key` and `api_key_file`.** llm-proxy refuses to
+load the config:
 
 ```text
-this looks like a simple llm-proxy config; use --config instead of -c
+configuration 'llmproxy-local.yaml' INVALID
+  invalid value at `providers.ollama`: set either api_key or api_key_file, not both
 ```
 
-Use `--config` instead.
+Pick one.
 
 **A `fallbacks` entry speaks a different wire dialect than the route's
 primary provider** (for example, an `anthropic` fallback under an `openai`

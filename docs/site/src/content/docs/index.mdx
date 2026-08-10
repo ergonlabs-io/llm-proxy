@@ -1,21 +1,26 @@
 ---
 title: llm-proxy
-description: A high-performance proxy for LLM inference APIs. Speaks standard Envoy configuration and xDS.
+description: A high-performance proxy for LLM inference APIs.
 template: splash
 ---
 
-A high-performance proxy for LLM inference APIs. Speaks standard Envoy
-configuration and xDS.
+A high-performance proxy for LLM inference APIs. It meters tokens, enforces
+token-based rate limits, fails over between providers, and authenticates
+callers -- configured with a single, LLM-native YAML dialect.
 
 This site is being built out section by section. The sections below will
 fill in as their content lands:
 
-- Getting started
-- Configuration
+- **[Getting started](/getting-started/introduction/)**: install the binary,
+  validate a config, and serve your first request.
+- **[Configuration](/configuration/the-llmproxy-dialect/)**: the field-by-field
+  reference for the config format.
 - Providers and routing
 - API compatibility
 - Authentication
 - Limits and budgets
-- Observability
-- Operations
-- Reference
+- **[Observability](/observability/metrics-and-stats/)**: access logs and the
+  `/stats`/`/stats/prometheus` admin endpoints.
+- **[Operations](/operations/config-reload/)**: reloading config and draining
+  connections on shutdown.
+- **[Reference](/reference/cli/)**: the full CLI.
