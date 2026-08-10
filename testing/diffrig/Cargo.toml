@@ -39,6 +39,10 @@ tokio-rustls = { workspace = true }
 # `proxy-filters::auth_filter`'s own derivation -- never hardcode a digest,
 # see that test file's module doc for why.
 ring = { workspace = true }
+# swap_under_load.rs: the open-loop, coordinated-omission-aware driver, for
+# the non-streaming half of that test's traffic mix (see its module doc for
+# why the streaming half is not driven through it).
+loadgen = { path = "../loadgen" }
 
 [lints]
 workspace = true
