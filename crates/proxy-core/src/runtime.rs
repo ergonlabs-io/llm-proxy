@@ -5,10 +5,13 @@
 //! on a dedicated OS thread driving a `LocalSet` (optionally core-pinned).
 //! Config crosses threads only as an immutable `Arc<ConfigSnapshot>`,
 //! published into each worker's [`WorkerConfigHandle`] and followed by a
-//! `watch` ping that wakes the worker to reload.
+//! `watch` ping that wakes the worker to reload. Any other snapshot consumer
+//! (the admin server, today) enrolls its handle in the same
+//! [`SnapshotHandles`] registry so [`ConfigPublisher::publish`] cannot leave
+//! it behind -- see that type's doc comment.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use proxy_config::ir::SnapshotVersion;
@@ -67,6 +70,67 @@ pub struct WorkerContext {
     pub drain_done: mpsc::UnboundedSender<WorkerId>,
 }
 
+/// Every live [`WorkerConfigHandle`] that must observe a republished
+/// snapshot: one per worker, plus, when the admin server is running, its own.
+/// [`ConfigPublisher::publish`] walks this registry instead of a private
+/// `Vec` assembled once inside `WorkerPool::spawn` -- that used to be exactly
+/// how the admin server's handle went stale after a SIGHUP reload: it built
+/// its own `WorkerConfigHandle` outside `spawn`'s loop, so nothing about
+/// `publish` ever touched it. [`SnapshotHandles::register`] is now the only
+/// way to obtain a handle, and it always enrolls the handle it hands back --
+/// a new consumer (a second admin listener, a future control-plane reader,
+/// whatever comes next) is registered by construction rather than by an
+/// author remembering a second call site.
+///
+/// Rust note: `Mutex<Vec<_>>`, not a `Vec` behind `&mut self`, because
+/// registration happens from two independent call sites on the control
+/// runtime -- `WorkerPool::spawn` (one call per worker) and `start_admin` in
+/// `crates/proxy/src/main.rs` (a separate, earlier call) -- both of which
+/// need to add to the *same* registry through a shared `Arc`. Contention is a
+/// non-issue: registration only happens at startup, and `store_all` only runs
+/// on the rare SIGHUP-triggered `publish`, never on the per-connection hot
+/// path.
+#[derive(Default)]
+pub struct SnapshotHandles {
+    handles: Mutex<Vec<Arc<WorkerConfigHandle>>>,
+}
+
+impl SnapshotHandles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a [`WorkerConfigHandle`] seeded with `initial`, enroll it in
+    /// this registry, and hand it back. There is no other way to get a
+    /// `WorkerConfigHandle` out of this type -- constructing one directly
+    /// (as `start_admin` used to) is exactly the bug this closes, so the only
+    /// path back to a caller is one that also registers.
+    pub fn register(&self, initial: Arc<ConfigSnapshot>) -> Arc<WorkerConfigHandle> {
+        let handle = Arc::new(WorkerConfigHandle::new(initial));
+        self.handles
+            .lock()
+            .expect("snapshot handle registry poisoned")
+            .push(handle.clone());
+        handle
+    }
+
+    /// Store `snapshot` into every registered handle. [`ConfigPublisher::publish`]
+    /// calls this (see that method's doc for the store-before-ping ordering
+    /// it preserves) -- exposed as `pub` rather than crate-private so a test
+    /// can drive a registry directly without needing a full `ConfigPublisher`
+    /// (which only `WorkerPool::spawn` can build).
+    pub fn store_all(&self, snapshot: &Arc<ConfigSnapshot>) {
+        for handle in self
+            .handles
+            .lock()
+            .expect("snapshot handle registry poisoned")
+            .iter()
+        {
+            handle.store(snapshot.clone());
+        }
+    }
+}
+
 /// Owns nothing after `spawn` returns; it only exists to give `spawn` a
 /// natural home (`WorkerPool::spawn(...)`). The real handles a caller needs
 /// -- to publish config, to shut down, to join -- live on [`ConfigPublisher`].
@@ -82,6 +146,12 @@ impl WorkerPool {
     /// `LocalSet`. It has to run there: the `!Send` future it returns could
     /// not be moved onto the worker thread after the fact.
     ///
+    /// `snapshot_handles` is the registry every worker's [`WorkerConfigHandle`]
+    /// is enrolled into (see [`SnapshotHandles`]'s doc for why); pass the same
+    /// registry a caller already handed to any other snapshot consumer (e.g.
+    /// the admin server's `start_admin`) so [`ConfigPublisher::publish`] keeps
+    /// all of them current, not just the workers spawned here.
+    ///
     /// Rust note: the bound is deliberately asymmetric. `worker_main` (the
     /// closure *factory*) must be `Send + Clone + 'static` so a copy of it
     /// can move into each new `std::thread::spawn`. But the future `F` it
@@ -92,6 +162,7 @@ impl WorkerPool {
     pub fn spawn<F, W>(
         config: WorkerPoolConfig,
         initial_snapshot: Arc<ConfigSnapshot>,
+        snapshot_handles: Arc<SnapshotHandles>,
         worker_main: W,
     ) -> ConfigPublisher
     where
@@ -107,7 +178,6 @@ impl WorkerPool {
         };
 
         let mut threads = Vec::with_capacity(config.concurrency);
-        let mut handles = Vec::with_capacity(config.concurrency);
         let mut config_txs = Vec::with_capacity(config.concurrency);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // Rust note: `DrainCoordinator::new` hands back one `watch::Receiver`
@@ -119,13 +189,16 @@ impl WorkerPool {
 
         for i in 0..config.concurrency {
             let id = WorkerId(i);
-            let handle = Arc::new(WorkerConfigHandle::new(initial_snapshot.clone()));
+            // `register` both builds this worker's handle AND enrolls it in
+            // `snapshot_handles` -- no separate `handles.push(..)` needed
+            // (or possible to forget) the way a bare `WorkerConfigHandle::new`
+            // used to require.
+            let handle_for_thread = snapshot_handles.register(initial_snapshot.clone());
             let (config_tx, config_rx) = watch::channel(initial_snapshot.version);
             let shutdown_rx = shutdown_rx.clone();
             let drain_rx = drain_rx.clone();
             let drain_done_tx = drain_done_tx.clone();
             let worker_main = worker_main.clone();
-            let handle_for_thread = handle.clone();
 
             let core_id = core_ids.as_ref().and_then(|ids| ids.get(i).copied());
             if config.pin_cores && core_id.is_none() {
@@ -172,12 +245,11 @@ impl WorkerPool {
                 .expect("failed to spawn worker thread");
 
             threads.push(thread);
-            handles.push(handle);
             config_txs.push(config_tx);
         }
 
         ConfigPublisher {
-            handles,
+            handles: snapshot_handles,
             config_txs,
             shutdown_tx,
             threads,
@@ -189,7 +261,13 @@ impl WorkerPool {
 /// Control-plane handle to a running [`WorkerPool`]: publishes config
 /// snapshots, signals shutdown, and joins the worker threads.
 pub struct ConfigPublisher {
-    handles: Vec<Arc<WorkerConfigHandle>>,
+    /// Every consumer `publish` must keep current -- see [`SnapshotHandles`]'s
+    /// doc for why this is a shared registry rather than a `Vec` this type
+    /// assembles privately: the admin server's handle lives in the SAME
+    /// registry, registered by `crates/proxy/src/main.rs`'s `start_admin`
+    /// before `WorkerPool::spawn` (which built this `ConfigPublisher`) even
+    /// ran.
+    handles: Arc<SnapshotHandles>,
     config_txs: Vec<watch::Sender<SnapshotVersion>>,
     shutdown_tx: watch::Sender<bool>,
     threads: Vec<JoinHandle<()>>,
@@ -200,17 +278,18 @@ pub struct ConfigPublisher {
 }
 
 impl ConfigPublisher {
-    /// Publish a new snapshot to every worker.
+    /// Publish a new snapshot to every registered [`WorkerConfigHandle`] --
+    /// every worker's, plus any other consumer (e.g. the admin server) that
+    /// was registered into the same [`SnapshotHandles`] this publisher holds.
     ///
-    /// Ordering matters: this stores into every worker's
-    /// [`WorkerConfigHandle`] *before* sending the `watch` ping. That way a
-    /// worker woken by the ping is guaranteed to observe the new snapshot the
-    /// moment it calls `config.load()` -- it can never race ahead of the
-    /// store and see a stale one.
+    /// Ordering matters: this stores into every handle *before* sending the
+    /// `watch` ping. That way a worker woken by the ping is guaranteed to
+    /// observe the new snapshot the moment it calls `config.load()` -- it can
+    /// never race ahead of the store and see a stale one. A non-worker
+    /// consumer like the admin server has no ping to race; it simply sees the
+    /// new snapshot on its next `load()` after this returns.
     pub fn publish(&self, snapshot: Arc<ConfigSnapshot>) {
-        for handle in &self.handles {
-            handle.store(snapshot.clone());
-        }
+        self.handles.store_all(&snapshot);
         for tx in &self.config_txs {
             // Rust note: `send` only errors if every receiver was dropped
             // (i.e. the worker thread is gone); that's not our problem to
@@ -276,6 +355,10 @@ mod tests {
         })
     }
 
+    fn handles() -> Arc<SnapshotHandles> {
+        Arc::new(SnapshotHandles::new())
+    }
+
     #[test]
     fn publish_updates_every_worker_snapshot() {
         let initial = snapshot(0);
@@ -287,6 +370,7 @@ mod tests {
                 pin_cores: false,
             },
             initial,
+            handles(),
             move |mut ctx: WorkerContext| {
                 let result_tx = result_tx.clone();
                 async move {
@@ -329,6 +413,7 @@ mod tests {
                 pin_cores: false,
             },
             snapshot(0),
+            handles(),
             move |_ctx: WorkerContext| {
                 let result_tx = result_tx.clone();
                 async move {
@@ -370,6 +455,7 @@ mod tests {
                 pin_cores: false,
             },
             snapshot(0),
+            handles(),
             move |ctx: WorkerContext| {
                 let done = done_for_worker.clone();
                 async move {
@@ -403,6 +489,7 @@ mod tests {
                 pin_cores: false,
             },
             snapshot(0),
+            handles(),
             |mut ctx: WorkerContext| async move {
                 let _ = ctx.shutdown.changed().await;
             },
@@ -422,5 +509,43 @@ mod tests {
             *rc
         });
         assert_eq!(value, 5);
+    }
+
+    /// Defect 1's regression guard at the unit level: a handle registered
+    /// into the SAME [`SnapshotHandles`] a `ConfigPublisher` was built with,
+    /// but *not* created by `WorkerPool::spawn` -- exactly the shape of the
+    /// admin server's handle in `crates/proxy/src/main.rs` -- must still see
+    /// a `publish()`. Before this fix, `ConfigPublisher` built its own
+    /// private `Vec` inside `spawn`, so a handle registered from outside that
+    /// call (like the admin server's) was never touched by `publish`.
+    #[test]
+    fn publish_updates_a_handle_registered_outside_spawn() {
+        let registry = handles();
+        // Stands in for `start_admin`'s handle: registered into the shared
+        // registry BEFORE `WorkerPool::spawn` runs, exactly like `main.rs`
+        // registers the admin handle before the worker pool exists.
+        let external_handle = registry.register(snapshot(0));
+
+        let publisher = WorkerPool::spawn(
+            WorkerPoolConfig {
+                concurrency: 1,
+                pin_cores: false,
+            },
+            snapshot(0),
+            registry,
+            |mut ctx: WorkerContext| async move {
+                let _ = ctx.shutdown.changed().await;
+            },
+        );
+
+        publisher.publish(snapshot(9));
+        assert_eq!(
+            external_handle.load().version.0,
+            9,
+            "a handle registered outside WorkerPool::spawn must still be updated by publish()"
+        );
+
+        publisher.shutdown();
+        publisher.join();
     }
 }

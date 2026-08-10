@@ -24,8 +24,7 @@ use proxy_core::drain::{
     drain_worker, graceful_shutdown, ConnectionRegistry, DrainStrategy as CoreDrainStrategy,
 };
 use proxy_core::listener::{initial_bind, run_listener_manager};
-use proxy_core::runtime::{WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
-use proxy_core::WorkerConfigHandle;
+use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
 use tokio::sync::mpsc;
 
 mod keygen;
@@ -441,6 +440,25 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     let drain_time = Duration::from_secs(args.drain_time_s);
     let strategy: CoreDrainStrategy = args.drain_strategy.into();
 
+    // `DrainState::drain_close_probability` (proxy-core's `drain.rs`) is the
+    // seam a per-response close decision was BUILT to consult, but nothing
+    // calls it: the drain sequence (`graceful_shutdown`) only ever waits for
+    // the connection registry to empty or the drain deadline to pass, then
+    // flips the plain shutdown signal hyper's `graceful_shutdown()` reacts
+    // to. Neither step reads `strategy` at all, so `gradual` and `immediate`
+    // are byte-identical today. The CLI flag policy
+    // (`docs/envoy-divergences.md`) requires that to be loud rather than
+    // silently accepted -- wiring it properly means teaching the HTTP codecs
+    // (`proxy-http`) to consult a per-response close probability, which is
+    // its own work package, not a one-line fix here.
+    tracing::warn!(
+        drain_strategy = ?strategy,
+        "--drain-strategy is accepted but not enforced during drain: connections are not \
+         proactively closed until the drain deadline passes or every connection ends on its \
+         own, regardless of `gradual` vs `immediate` (see docs/envoy-divergences.md, \
+         \"Drain strategy\")"
+    );
+
     // Rust note: the control runtime is a separate, ordinary multi-thread
     // tokio runtime (2 worker threads per WP-06) -- distinct from the
     // per-worker `current_thread` runtimes `WorkerPool::spawn` builds. Only
@@ -535,6 +553,16 @@ async fn run_serve(
     ));
     let registry = stats_control.registry();
 
+    // Every consumer that must observe a SIGHUP-published snapshot registers
+    // its `WorkerConfigHandle` into this ONE registry -- the admin server
+    // just below, and every worker `WorkerPool::spawn` creates further down.
+    // Created here, before either, precisely so it can be handed to both
+    // without reordering when they start (see `start_admin`'s doc comment for
+    // why the admin server still has to come first). `ConfigPublisher::publish`
+    // (via `SnapshotHandles::store_all`) is what makes registering here enough
+    // -- see that type's doc in `proxy-core`'s `runtime.rs`.
+    let snapshot_handles = Arc::new(SnapshotHandles::new());
+
     // WP-50 increment 1: the read-only admin surface. Opt-in -- only binds
     // when the config names an `admin` address -- and, like a listener's
     // `initial_bind`, a bind failure here is a startup error, not a silent
@@ -546,6 +574,7 @@ async fn run_serve(
         snapshot.clone(),
         registry.clone(),
         Instant::now(),
+        &snapshot_handles,
     )
     .await
     {
@@ -597,6 +626,7 @@ async fn run_serve(
             pin_cores: true,
         },
         snapshot,
+        snapshot_handles,
         move |ctx: WorkerContext| {
             let bind_tx = bind_tx.clone();
             worker_main(
@@ -783,12 +813,16 @@ async fn wait_for_initial_binds(
 /// `admin` names a bind address; binds nothing and returns `Ok(None)`
 /// otherwise -- the admin surface is opt-in, never automatic.
 ///
-/// The admin server gets its own [`WorkerConfigHandle`], separate from the
-/// ones [`WorkerPool::spawn`] hands to workers: it reads `snapshot` as it
-/// was at startup. Nothing in this binary republishes into it today (dynamic
-/// config updates are WP-20/21/22, not yet wired), so `/config_dump` shows
-/// the snapshot the process booted with -- true for the whole process
-/// lifetime today, but stated here rather than left to be discovered.
+/// The admin server's [`WorkerConfigHandle`](proxy_core::WorkerConfigHandle) is obtained from
+/// `snapshot_handles` -- the SAME [`SnapshotHandles`] registry
+/// [`WorkerPool::spawn`] enrolls every worker's handle into, further down in
+/// `run_serve`. That is what makes `/config_dump` and `/clusters` track a
+/// SIGHUP reload: `reload`'s call to `ConfigPublisher::publish` walks the
+/// registry, not a hand-picked list of workers, so the admin handle gets the
+/// new snapshot in the same store as everyone else's. (Before this, the admin
+/// server built its own private `WorkerConfigHandle` here, outside that
+/// registry entirely -- `publish` had no way to reach it, so `/config_dump`
+/// kept serving the boot snapshot forever.)
 ///
 /// `registry` is the same [`proxy_observability::stats::Registry`]
 /// `run_serve` hands to every worker's [`RouterStats`](proxy_http::stat_handles::RouterStats)
@@ -796,11 +830,10 @@ async fn wait_for_initial_binds(
 /// in `run_serve` itself (not here any more, since increment 6a's workers
 /// need the exact same registry, not a second, disconnected one). As of
 /// WP-23 increment 6a, `/stats` reports real `upstream_rq`/`upstream_rq_time`
-/// traffic for every cluster the boot snapshot named -- see
-/// `proxy_http::stat_handles`'s module doc for the two instruments' call
-/// sites and for why a cluster added by a config reload after boot isn't
-/// reflected here yet (dynamic config updates aren't wired into this binary
-/// at all).
+/// traffic for every cluster the boot snapshot named, and `reload`'s call to
+/// `StatHandles::resolve_missing` keeps that true for a cluster a later
+/// config reload introduces too -- see `proxy_http::stat_handles`'s module
+/// doc for the two instruments' call sites.
 ///
 /// A bind failure is returned as an `Err`, not swallowed: `run_serve` turns
 /// it into a startup failure, holding the admin port to the same standard
@@ -810,11 +843,12 @@ async fn start_admin(
     snapshot: Arc<ConfigSnapshot>,
     registry: Arc<proxy_observability::stats::Registry>,
     started_at: Instant,
+    snapshot_handles: &SnapshotHandles,
 ) -> Result<Option<proxy_admin::AdminServer>, String> {
     let Some(addr) = admin else {
         return Ok(None);
     };
-    let config = Arc::new(WorkerConfigHandle::new(snapshot));
+    let config = snapshot_handles.register(snapshot);
     let server = proxy_admin::serve(addr, config, Some(registry), started_at)
         .await
         .map_err(|err| err.to_string())?;
@@ -989,9 +1023,15 @@ mod tests {
         let port = probe.local_addr().expect("local_addr").port();
         drop(probe);
 
-        let result = start_admin(None, empty_snapshot(), test_registry(), Instant::now())
-            .await
-            .expect("start_admin(None, ..) must not fail");
+        let result = start_admin(
+            None,
+            empty_snapshot(),
+            test_registry(),
+            Instant::now(),
+            &SnapshotHandles::new(),
+        )
+        .await
+        .expect("start_admin(None, ..) must not fail");
         assert!(
             result.is_none(),
             "admin: None must not start a server (bind-only-when-configured)"
@@ -1012,6 +1052,7 @@ mod tests {
             empty_snapshot(),
             test_registry(),
             Instant::now(),
+            &SnapshotHandles::new(),
         )
         .await
         .expect("start_admin should succeed on an available port")
@@ -1021,6 +1062,60 @@ mod tests {
         tokio::net::TcpStream::connect(bound)
             .await
             .expect("the admin port should be connectable once start_admin has bound it");
+    }
+
+    /// Defect 1's regression guard, one level up from `runtime.rs`'s own
+    /// `publish_updates_a_handle_registered_outside_spawn`: `start_admin`
+    /// itself must obtain its handle through `SnapshotHandles::register`
+    /// (not build one directly), so a snapshot published later into the same
+    /// registry reaches the admin server too. Exercised via the registry
+    /// directly rather than a real reload, since `run_serve`'s SIGHUP path is
+    /// what `tests/reload.rs` already drives end to end against the real
+    /// binary.
+    #[tokio::test]
+    async fn start_admin_registers_its_handle_into_the_shared_registry() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let snapshot_handles = SnapshotHandles::new();
+        let server = start_admin(
+            Some(addr),
+            empty_snapshot(),
+            test_registry(),
+            Instant::now(),
+            &snapshot_handles,
+        )
+        .await
+        .expect("start_admin should succeed on an available port")
+        .expect("admin: Some(_) must start a server");
+
+        // A snapshot with a distinct version, published straight through the
+        // registry `start_admin` was handed -- exactly what
+        // `ConfigPublisher::publish` does on a real SIGHUP -- must be visible
+        // over the admin server's own HTTP surface afterward.
+        let updated = Arc::new(ConfigSnapshot {
+            version: SnapshotVersion(7),
+            ..ConfigSnapshot::default()
+        });
+        snapshot_handles.store_all(&updated);
+
+        let mut stream = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .expect("connect to admin server");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"GET /config_dump HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response to EOF");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.contains("\"version\":7"),
+            "expected /config_dump to reflect the snapshot published through the shared \
+             registry, got:\n{response}"
+        );
     }
 
     // ---- ConfigSource: front-end pinning (requirement 2) ------------------
