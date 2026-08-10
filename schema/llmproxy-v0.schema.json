@@ -64,7 +64,7 @@
       "items": { "$ref": "#/$defs/Limit" }
     },
     "observability": {
-      "description": "Metrics and access logging. Access logging is fully implemented, including token counts and TTFT/TPOT. Metrics are NOT yet recorded: the registry and the `/stats` renderer exist, but no call site writes to them, so `/stats` answers 200 with an empty body until WP-23 increment 6 lands. Do not build alerting on it yet.",
+      "description": "Metrics and access logging. Access logging is fully implemented, including token counts and TTFT/TPOT. Metrics are recorded and served on the admin endpoint at `/stats` and `/stats/prometheus`: per-cluster upstream request counts and an upstream request-time histogram. Two instruments are defined but NOT yet recorded and so never appear -- downstream connection counts, and GenAI token usage -- so do not build alerting on those two.",
       "$ref": "#/$defs/Observability"
     }
   },
