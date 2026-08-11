@@ -1,162 +1,144 @@
 # llm-proxy
 
-A high-performance proxy for LLM inference APIs, written in Rust: native token metering
-and token-based rate limiting, SSE-first streaming, model-aware routing and provider
-fallback, and Gateway API Inference Extension support — without ext_proc sidecar hops.
-Runs identically in Kubernetes and non-Kubernetes environments: one static binary, one
-YAML file. Speaks standard Envoy configuration and xDS, so it also drops into existing
-Envoy/Istio/Envoy Gateway estates unchanged.
+A proxy for LLM inference APIs, written in Rust. One static binary and one YAML
+file sit between your applications and your model providers, so token metering,
+rate limiting, authentication, failover and access logging happen in one place
+instead of in every service that calls a model.
 
-**Status: config plane working, data plane not yet.** Both config styles load
-end to end — strict parsing with full field-path errors (WP-03), PGV constraint
-validation (WP-04), and lowering to the internal IR (WP-05) — for Envoy
-bootstrap files (`-c`) and the simple LLM-native dialect (`--config`, WP-38).
-`--mode validate` checks a config; `--mode translate` prints the Envoy
-bootstrap generated from a dialect file. Serve mode lands with WP-06.
+**Status: pre-1.0 and moving quickly.** The data plane serves real traffic and
+is covered by 1141 tests. Interfaces may still change between releases, and
+there are no backports to earlier tags. Read [What is not built yet](#what-is-not-built-yet)
+before you depend on it — that section is deliberately specific.
 
-## Documents (local, untracked for now)
+## What it does today
 
-- `PLAN.md` — research, architecture, Envoy pain points addressed, scaling model,
-  deployment model, product model.
-- `IMPLEMENTATION_PLAN.md` — the build broken into work packages (WP-01…WP-36) sized
-  for individual devs/subagents, plus the normative Envoy semantics specs (S1–S9:
-  route-match precedence, filter iteration, retry timing, resilience defaults).
+**Speaks your provider's API.** OpenAI Chat Completions, OpenAI Responses, and
+Anthropic Messages. Point an existing client at llm-proxy by changing its base
+URL; requests and responses pass through unchanged.
 
-Read `IMPLEMENTATION_PLAN.md` Part 0 (ground rules) before picking up any work package.
+**Streams properly.** Server-sent events are forwarded as they arrive, and the
+proxy never injects frames of its own into a stream. An unclean end of stream
+stays unclean, because inventing a well-formed ending would hide a real failure
+from the client.
 
-## Workspace layout
+**Meters tokens.** Input, output, and separately-priced buckets are read from
+provider responses, for streaming and non-streaming requests alike, and land in
+the access log.
 
-```
-crates/
-  proxy-api            WP-02   generated Envoy v3 protos + descriptor pool
-  proxy-config         WP-03..05  bootstrap loading, validation, proto -> internal IR
-  proxy-core           WP-06..09  runtimes, listeners, transport sockets, L4 filters
-  proxy-http           WP-10..15  codecs, HTTP filter manager, routing, router, retries
-  proxy-cluster        WP-15..19  cluster manager, LB, health checks, outlier, pools
-  proxy-xds            WP-20..22  ADS client, warming, SDS, delta + file transports
-  proxy-observability  WP-23/24   stats (Envoy naming), access logs, response flags
-  proxy-admin          WP-25   admin server (/config_dump, /stats, /ready, ...)
-  proxy-filters        WP-31..36  non-core filters + the LLM lane (Lane H)
-  proxy-simple-config  WP-38   the LLM-native dialect -> Envoy resources lowering
-  proxy                          the llm-proxy binary
-testing/
-  diffrig              WP-26   side-by-side differential harness vs pinned Envoy
-  corpus               WP-27   Envoy config corpus + compatibility scorecard
-  controlplane         WP-28   scriptable xDS server for integration tests
-```
+**Enforces token budgets.** A tenant over its limit gets a 429 with
+`x-ratelimit-*` headers before the request reaches a provider. A request already
+in flight is never cut short. Limits are keyed to the authenticated tenant, so
+changing a header does not buy a fresh quota.
 
-## Life of a request
+**Authenticates callers.** Virtual keys verified with HMAC-SHA256 in constant
+time. Authentication fails closed: with an `auth` block configured, a request
+with no recognised credential is refused rather than admitted anonymously.
 
-Every stage is annotated with the owning crate, work package (WP), and normative
-spec section (S*) from `IMPLEMENTATION_PLAN.md` — use it to track implementation
-progress and to find where a behavior lives.
+**Fails over between providers.** A route can name an ordered list; if the
+primary fails, the next is tried. Every provider in a chain must speak the same
+wire format, and a chain that mixes formats is rejected when the configuration
+loads rather than at request time.
 
-```text
- ┌────────┐
- │ client │
- └───┬────┘
-     │ 1. TCP connect — kernel picks a worker via SO_REUSEPORT;
-     │    the connection is PINNED to that worker for life        proxy-core   WP-06
- ┌───▼──────────────────────────────────────────────────────┐
- │ LISTENER (per-worker)                                     │  proxy-core   WP-07
- │  2. listener filters: tls_inspector (SNI/ALPN peek),      │  proxy-core   WP-08
- │     proxy_protocol, original_dst                          │
- │  3. filter-chain match: port → dst IP → SNI → transport   │  proxy-core   WP-07
- │     protocol → ALPN → source (8-step, most-specific-first)│
- └───┬──────────────────────────────────────────────────────┘
-     │
- ┌───▼──────────────────────────┐
- │ TRANSPORT SOCKET             │  4. TLS handshake + decrypt  proxy-core   WP-08
- └───┬──────────────────────────┘     (rustls; certs hot-swap via SDS, WP-22)
-     │ plaintext byte stream
- ┌───▼──────────────────────────────────────────────────────┐
- │ NETWORK (L4) FILTER CHAIN                                 │  proxy-core   WP-09
- │  5. terminal filter = tcp_proxy (stop here for L4)        │
- │     …or HTTP CONNECTION MANAGER ↓                         │
- └───┬──────────────────────────────────────────────────────┘
-     │
- ┌───▼──────────────────────────────────────────────────────┐
- │ HTTP CONNECTION MANAGER                                   │  proxy-http   WP-10
- │  6. h1/h2 codec: bytes → independent HTTP streams         │
- │  7. DECODER FILTER CHAIN (config order)              S2   │  proxy-http   WP-11
- │     e.g. auth / rate limit (WP-31/32),                    │
- │     model router: bounded body peek → cluster        S2.8 │  proxy-filters WP-35
- │  8. ROUTER FILTER (terminal decoder filter)               │  proxy-http   WP-13
- │     route match: vhost domain precedence →           S1   │  proxy-http   WP-12
- │     first-matching route → action (cluster/redirect/      │
- │     direct response), timeouts armed                 S4   │
- └───┬──────────────────────────────────────────────────────┘
-     │ cluster name (+ hash policy, priority)
- ┌───▼──────────────────────────────────────────────────────┐
- │ CLUSTER SUBSYSTEM                                         │  proxy-cluster WP-16
- │  9. circuit breakers (open → 503 UO,                 S5   │  proxy-cluster WP-15
- │     x-envoy-overloaded)                                   │
- │ 10. load-balancer host pick                          S7   │  proxy-cluster WP-17
- │     (RR/least-request/ring-hash/Maglev; panic             │
- │      threshold; outlier-ejected hosts excluded S6,        │  proxy-cluster WP-19
- │      health-checked hosts only               WP-18)       │  proxy-cluster WP-18
- │     — or endpoint-picker override (EPP)                   │  proxy-filters WP-36
- │ 11. per-worker conn pool: reuse or connect                │  proxy-cluster WP-15
- │     every attempt wrapped by the RETRY/HEDGE      S3/S4   │  proxy-http   WP-14
- │     engine (jittered backoff, per-try timeouts,           │
- │     never retry after first streamed byte)                │
- └───┬──────────────────────────────────────────────────────┘
-     │ upstream codec (WP-10) + upstream TLS (WP-08)
- ┌───▼──────────────────────┐
- │ upstream / LLM provider  │
- └───┬──────────────────────┘
-     │ response (often a long-lived SSE stream)
- ┌───▼──────────────────────────────────────────────────────┐
- │ RESPONSE PATH                                             │
- │ 12. ENCODER FILTER CHAIN (REVERSE config order)      S2   │  proxy-http   WP-11
- │     SSE flush-through — no buffering on streamed          │  proxy-filters WP-33
- │     routes; token usage extraction (tail-parse)           │  proxy-filters WP-34
- │ 13. downstream codec writes to client                     │  proxy-http   WP-10
- └───┬──────────────────────────────────────────────────────┘
-     │
- 14. stream end: stats (Envoy names)                           proxy-observability WP-23
-     access log + response flags, TTFT/TPOT GenAI metrics      proxy-observability WP-24 / WP-33
+**Tells you what it is doing.** Access logs with token counts, time-to-first-token
+and time-per-output-token. An admin endpoint serving `/ready`, `/config_dump`,
+`/clusters`, `/server_info`, `/stats` and `/stats/prometheus`.
+
+**Survives operations.** Configuration reloads on SIGHUP — and a configuration
+that fails to parse leaves the previous one serving, with the error logged
+against its exact field path. SIGTERM drains connections instead of dropping
+them. Configuration parsing is strict: an unknown or misspelled field is an
+error carrying its full dotted path, never a silent no-op.
+
+## Build
+
+Requires a Rust toolchain and `protoc` (`brew install protobuf`, or
+`apt install protobuf-compiler`).
+
+```sh
+cargo build --workspace
 ```
 
-WebSocket / realtime sessions follow the same path with three differences (spec S10,
-WP-37): the router validates the upgrade and returns 101 (step 8), retries/hedging are
-off after 101, and the upgraded byte stream keeps flowing through the filter chain as
-data — where the realtime layer does frame-aware token metering and session accounting.
-Toward h2 upstreams the upgrade travels as extended CONNECT (RFC 8441).
+## Try it
 
-Configuration reaches the data plane out-of-band (never on the hot path):
+`examples/llmproxy-ollama.yaml` runs against a local Ollama and needs no API
+keys or environment variables:
 
-```text
- xDS server (gRPC ADS) ─┐
-                        ├─► proxy-xds (subscribe, ACK/NACK, warming  S8)   WP-20..22
- watched config files ──┘         │ validated protos
-                                  ▼
-                        proxy-config (validate → internal IR)              WP-03..05
-                                  │ immutable Arc<ConfigSnapshot>
-                                  ▼
-                        workers swap snapshots atomically (arc-swap);      WP-06
-                        in-flight connections keep the old snapshot
-                        until they finish — that IS drain semantics
+```sh
+# Check the configuration without starting anything.
+cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode validate
+# configuration 'examples/llmproxy-ollama.yaml' OK (1 listener(s), 1 cluster(s), 0 warning(s))
+
+# Serve.
+cargo run -p proxy -- --config examples/llmproxy-ollama.yaml
 ```
 
-## Building
+Then send it an ordinary OpenAI-shaped request on the port the file lists.
+`examples/` also has multi-provider and OpenAI/Anthropic configurations; those
+read API keys from the environment.
 
-`make help` lists every developer target. The common ones:
+A minimal configuration is small:
 
+```yaml
+version: 0
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+
+routes:
+  - model: "*"
+    provider: openai
 ```
-make build                   # debug build of everything
-make test                    # run all tests
-make ci                      # what CI enforces: fmt check, clippy -D warnings, tests
-make validate                # validate examples/tcp-proxy.yaml through the real loader
-make validate CONFIG=x.yaml  # validate your own config
-make test-proxy-config       # per-crate pattern: build-/check-/test-<crate>
-```
 
-Dialect mode (see `examples/llmproxy.yaml` and `schema/llmproxy-v0.schema.json`):
+`schema/llmproxy-v0.schema.json` is the authority on every field, and editors
+that understand `yaml-language-server` will autocomplete against it.
 
-```
-llm-proxy --config llmproxy.yaml --mode validate    # check a dialect config
-llm-proxy --config llmproxy.yaml --mode translate   # print the generated Envoy bootstrap
-```
+## Modes
 
-Building `proxy-api` requires `protoc` (`brew install protobuf` / `apt install protobuf-compiler`).
+| Command | What it does |
+|---|---|
+| `--mode serve` | Run the proxy. The default. |
+| `--mode validate` | Check a configuration and exit. |
+| `--mode keygen` | Print a fresh virtual key and its digest. Needs `--tenant` and `--hmac-secret-file`; touches no configuration file. |
+
+## Documentation
+
+Full documentation lives in `docs/site/` — an Astro Starlight site covering
+getting started, the configuration reference, observability and operations.
+Build it with `make docs-build`, or run it locally with `make docs-dev`. It is
+not published to a public URL yet.
+
+## What is not built yet
+
+Stated plainly, because a feature list without this is not much use:
+
+- **HTTP/1.1 upstream connections are not pooled.** HTTP/2 upstreams are
+  multiplexed over one connection; HTTP/1.1 still dials per request.
+- **Credential and certificate files are read once at startup.** A rotated key
+  or renewed certificate takes effect after a restart or a configuration reload,
+  not automatically — nothing watches the files.
+- **No credential revocation store.** Virtual keys come from configuration, so
+  revoking one means editing the configuration and reloading.
+- **Authorization defaults open.** Authentication fails closed, but an
+  authenticated tenant with no configured policy may use every model and
+  provider.
+- **Two metrics are defined but never recorded** — downstream connection counts
+  and GenAI token usage — so they never appear in `/stats`. Do not build
+  alerting on those two.
+- **`--drain-strategy` has no effect.** It is accepted and warns at startup.
+- **No performance numbers are published.** The benchmark harness exists; the
+  capacity report does not, so treat any performance expectation as unverified.
+- **No dynamic configuration**, no Kubernetes controller or CRDs, and no
+  realtime WebSocket sessions.
+
+## Contributing and security
+
+Vulnerability reports: see [SECURITY.md](SECURITY.md). Please report privately
+rather than in a public issue — note that the private contact is not filled in
+yet.
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
