@@ -2,8 +2,6 @@
 #
 # llm-proxy simple config — the 2-minute experience.
 # Run:       llm-proxy --config llmproxy.yaml
-# Inspect:   llm-proxy config translate llmproxy.yaml   (prints the generated
-#            Envoy bootstrap — the dialect is a front-end over Envoy config)
 version: 0
 
 listen: 0.0.0.0:8080

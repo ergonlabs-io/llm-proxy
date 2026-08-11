@@ -39,7 +39,7 @@ mod keygen;
 // requirement already is.
 #[command(group(clap::ArgGroup::new("input").args(["config_path", "config"])))]
 struct Args {
-    /// Path to an Envoy bootstrap config (.yaml / .yml / .json / .pb).
+    /// Path to a bootstrap configuration (.yaml / .yml / .json / .pb).
     /// Required for `serve`/`validate`/`translate`; unused by `keygen`.
     #[arg(short = 'c', long = "config-path", value_name = "PATH")]
     config_path: Option<PathBuf>,
@@ -49,9 +49,9 @@ struct Args {
     #[arg(long = "config", value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// `validate` checks the config and exits; `translate` prints the Envoy
-    /// bootstrap generated from a `--config` dialect file; `serve` runs;
-    /// `keygen` prints a fresh virtual key and its digest and needs no
+    /// `validate` checks the config and exits; `translate` prints the
+    /// bootstrap configuration generated from a `--config` file; `serve`
+    /// runs; `keygen` prints a fresh virtual key and its digest and needs no
     /// config at all -- see `--tenant`/`--key-id`/`--hmac-secret-file`.
     #[arg(long, value_enum, default_value_t = Mode::Serve)]
     mode: Mode,
@@ -68,25 +68,24 @@ struct Args {
     key_id: String,
 
     /// `--mode keygen`: derive the digest's HMAC secret from this file
-    /// (matches the dialect's `auth.hmac_secret_file`). Takes precedence
-    /// over `$LLMPROXY_AUTH_SECRET` if both are set.
+    /// (matches `auth.hmac_secret_file` in the configuration). Takes
+    /// precedence over `$LLMPROXY_AUTH_SECRET` if both are set.
     #[arg(long = "hmac-secret-file", value_name = "PATH")]
     hmac_secret_file: Option<PathBuf>,
 
-    /// Warn on unknown Envoy config fields instead of failing (default:
-    /// strict). Has no effect on `--config` dialect files, which are always
-    /// strict.
+    /// Warn on unknown fields in the bootstrap configuration instead of
+    /// failing (default: strict). Has no effect on `--config` files, which
+    /// are always strict.
     #[arg(long)]
     permissive: bool,
 
-    /// Number of worker runtimes (serve mode only). Envoy calls this
-    /// `--concurrency`; default is the number of available cores.
+    /// Number of worker runtimes (serve mode only); default is the number
+    /// of available cores.
     #[arg(long, value_name = "N", default_value_t = default_concurrency())]
     concurrency: usize,
 
     /// How long the drain sequence waits for connections to close before
-    /// forcing worker shutdown (serve mode only). Matches Envoy's
-    /// `--drain-time-s`.
+    /// forcing worker shutdown (serve mode only).
     #[arg(
         long = "drain-time-s",
         value_name = "SECS",
@@ -95,25 +94,27 @@ struct Args {
     drain_time_s: u64,
 
     /// How aggressively in-flight requests are encouraged to close during a
-    /// drain. Matches Envoy's `--drain-strategy`.
+    /// drain.
     #[arg(long = "drain-strategy", value_enum, default_value_t = DrainStrategyArg::Gradual)]
     drain_strategy: DrainStrategyArg,
 
-    /// Envoy hot-restart base id. Accepted for CLI compatibility only: we
-    /// have no hot-restart implementation, so this is parsed and ignored.
+    /// Hot-restart base id. Accepted for CLI compatibility only: we have no
+    /// hot-restart implementation, so this is parsed and ignored.
     #[arg(long = "base-id", value_name = "N")]
     base_id: Option<u32>,
 
-    /// Log verbosity. Matches Envoy's levels; `critical` is mapped to `error`
-    /// (we don't distinguish the two).
+    /// Log verbosity; `critical` is mapped to `error` (we don't distinguish
+    /// the two).
     #[arg(short = 'l', long = "log-level", value_enum, default_value_t = LogLevel::Info)]
     log_level: LogLevel,
 
-    /// xDS node id (carried into the `Node` proto once WP-20 lands).
+    /// Identifies this instance to an xDS control plane. Accepted but not
+    /// yet used: dynamic configuration is not implemented.
     #[arg(long = "service-node", value_name = "NAME")]
     service_node: Option<String>,
 
-    /// xDS node cluster (carried into the `Node` proto once WP-20 lands).
+    /// Identifies this instance's cluster to an xDS control plane. Accepted
+    /// but not yet used: dynamic configuration is not implemented.
     #[arg(long = "service-cluster", value_name = "NAME")]
     service_cluster: Option<String>,
 }
@@ -132,8 +133,8 @@ enum Mode {
     Serve,
     Validate,
     Translate,
-    /// WP-50 increment 2a-iv: generate a virtual key + digest. The one mode
-    /// that touches no config at all -- see `run_keygen`.
+    /// Generates a fresh virtual key and its digest for downstream
+    /// authentication. The one mode that touches no config at all.
     Keygen,
 }
 
