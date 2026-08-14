@@ -1557,7 +1557,7 @@ async fn encode_headers_phase(
 /// header" and "present but not a plain non-negative integer" (a malformed
 /// header some upstream sent) — either way there's nothing to count down, so
 /// the caller falls back to the ordinary post-`None` flush.
-fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
+pub(crate) fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(http::header::CONTENT_LENGTH)?
         .to_str()
