@@ -292,15 +292,72 @@ pub(crate) struct LoggingBody {
     bytes_sent: u64,
     trailers: HeaderMap,
     ctx: Option<AccessLogContext>,
+    /// Bytes remaining per the response's own `content-length` header (the
+    /// one actually going to the downstream client), decremented as each
+    /// data frame is delivered. `None` means either there was no
+    /// `content-length` header, or the running total has already overshot it
+    /// (a filter mutated the body after headers were forwarded, so the
+    /// header is stale) -- either way that's a permanent fallback to the
+    /// ordinary post-`None` end-of-stream path below. See
+    /// [`Self::note_frame_len`] for why this field exists at all: without
+    /// it, a `content-length`-framed response was misclassified `DC` on
+    /// every single request.
+    remaining_content_length: Option<u64>,
 }
 
 impl LoggingBody {
     pub(crate) fn new(inner: StreamBody, ctx: AccessLogContext) -> Self {
+        let remaining_content_length =
+            crate::filter_manager::parse_content_length(&ctx.response_headers);
         Self {
             inner,
             bytes_sent: 0,
             trailers: HeaderMap::new(),
             ctx: Some(ctx),
+            remaining_content_length,
+        }
+    }
+
+    /// Count `len` bytes of a just-arrived data frame against
+    /// [`Self::remaining_content_length`], returning `true` exactly when
+    /// this frame is the one that exhausts it. Mirrors
+    /// `filter_manager::StreamingEncoder::note_frame_len` and exists for the
+    /// identical reason, one layer further out: hyper's HTTP/1 write
+    /// dispatcher stops polling the response body the moment it has written
+    /// exactly `content-length` bytes, so `poll_frame` never gets the
+    /// terminal `None` this body's clean-end path (below) waits for.
+    /// `StreamingEncoder`'s own version of this fix (WP-24-adjacent, already
+    /// in place) solves that problem for the ENCODE FILTER CHAIN -- it makes
+    /// sure an encode filter's end-of-stream logic (e.g. the WP-33 usage
+    /// filter's token-usage write) still runs. It does nothing for
+    /// `LoggingBody`, which wraps `StreamingEncoder` from the OUTSIDE and is
+    /// what hyper's write dispatcher actually holds: without this, a
+    /// `content-length`-framed response (every non-streaming LLM reply)
+    /// never observed its own clean end, `Drop` fired instead, and a fully
+    /// successful `200` was logged `response_flags: DC` -- as if the
+    /// downstream client had disconnected mid-response, when in fact every
+    /// byte had already reached it.
+    fn note_frame_len(&mut self, len: usize) -> bool {
+        match self.remaining_content_length {
+            Some(remaining) => match remaining.checked_sub(len as u64) {
+                Some(0) => {
+                    self.remaining_content_length = Some(0);
+                    true
+                }
+                Some(new_remaining) => {
+                    self.remaining_content_length = Some(new_remaining);
+                    false
+                }
+                None => {
+                    // Overshoot: the running total no longer agrees with the
+                    // declared header, so the header was stale before we got
+                    // here. Not ours to fix -- fall back to the ordinary
+                    // post-`None` flush for the rest of the stream.
+                    self.remaining_content_length = None;
+                    false
+                }
+            },
+            None => false,
         }
     }
 
@@ -454,11 +511,20 @@ impl Body for LoggingBody {
         let poll = Pin::new(&mut this.inner).poll_frame(cx);
         match &poll {
             Poll::Ready(Some(Ok(frame))) => {
+                let mut finished_by_length = false;
                 if let Some(data) = frame.data_ref() {
                     this.bytes_sent += data.len() as u64;
+                    finished_by_length = this.note_frame_len(data.len());
                 }
                 if let Some(trailers) = frame.trailers_ref() {
                     this.trailers = trailers.clone();
+                }
+                // See `note_frame_len`'s doc: this frame is the one hyper's
+                // write dispatcher will never poll past, so treat it as the
+                // clean end right here rather than waiting for a `None` that
+                // is never coming.
+                if finished_by_length {
+                    this.finish();
                 }
             }
             // A clean end-of-stream needs no flag -- see the `Err` arm below
@@ -965,6 +1031,81 @@ mod tests {
             lines.remove(0),
             "DC 2",
             "bytes_sent must reflect the one frame delivered before the drop"
+        );
+    }
+
+    /// The defect this file's `note_frame_len`/`remaining_content_length`
+    /// exist to fix: a `content-length`-framed response whose body NEVER
+    /// gets polled again once the declared length is satisfied -- exactly
+    /// what hyper's real HTTP/1 write dispatcher does, and exactly what
+    /// `FrameThenPendingForever` stands in for above (it goes `Pending`
+    /// forever after its one frame, same as `body_dropped_before_end_of_
+    /// stream_logs_dc`) -- must still log a CLEAN end, not `DC`.
+    ///
+    /// Without the fix, this is byte-for-byte the same shape as
+    /// `body_dropped_before_end_of_stream_logs_dc` above (one frame, then
+    /// `Pending` forever, then dropped) and asserted `DC 2` there on
+    /// purpose. The only difference here is a `content-length: 2` response
+    /// header that exactly matches the one frame -- which is precisely what
+    /// tells `LoggingBody` the stream is actually, successfully done, not
+    /// abandoned mid-flight.
+    #[test]
+    fn content_length_exhausted_with_no_further_poll_logs_no_flag_not_dc() {
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        ctx.response_headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("2"),
+        );
+        let body = local_boxed(FrameThenPendingForever {
+            frame: Some(Bytes::from_static(b"hi")),
+        });
+        let mut logging_body = LoggingBody::new(body, ctx);
+
+        let waker = futures::task::noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        // The one real frame -- this exhausts `content-length: 2` exactly,
+        // so the fix must finish() right here, inside this very poll.
+        match Pin::new(&mut logging_body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(_))) => {}
+            other => panic!("expected the frame, got {other:?}"),
+        }
+
+        // The line must already be rendered -- not deferred to `Drop` -- and
+        // it must carry no response flag, since nothing actually failed.
+        //
+        // Rust note: the lock is taken into a local and dropped BEFORE the
+        // assertion, rather than inline inside `assert_eq!` -- a `MutexGuard`
+        // produced as a temporary inside that macro lives until the end of
+        // the whole statement (temporary lifetime extension), which is AFTER
+        // the `panic!` a failing assertion raises. A panic while still
+        // holding the guard poisons the mutex, and this test's own
+        // `logging_body` unwinds (calling `Drop` -> `finish()` ->
+        // `capture.0.lock()`) right after -- a second panic on a poisoned
+        // lock during unwind is an abort, not a normal test failure. Binding
+        // first sidesteps that entirely.
+        let rendered_before_drop = capture.0.lock().unwrap().len();
+        assert_eq!(
+            rendered_before_drop, 1,
+            "content-length exhaustion must finish() inside poll_frame, not wait for Drop"
+        );
+
+        // Never polled again after this (matches hyper's real write
+        // dispatcher) and then dropped -- must NOT render a second line or
+        // retroactively tag DC; `finish()` is already idempotent via
+        // `ctx.take()`.
+        drop(logging_body);
+
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "Drop after an already-clean finish must be a no-op, not a second line"
+        );
+        assert_eq!(
+            lines.remove(0),
+            "- 2",
+            "a fully-delivered content-length response must log no flag, not DC"
         );
     }
 
