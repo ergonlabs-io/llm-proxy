@@ -6,9 +6,11 @@ import starlightLlmsTxt from 'starlight-llms-txt';
 // https://astro.build/config
 export default defineConfig({
 	// `starlight-llms-txt` needs an absolute `site` to build the URLs it lists
-	// in llms.txt/llms-full.txt (Astro also uses it for the sitemap). No real
-	// domain is chosen yet -- update this when the docs site is deployed.
-	site: 'https://llm-proxy.example.com',
+	// in llms.txt/llms-full.txt (Astro also uses it for the sitemap).
+	// The docs are served from the ergonlabs marketing site, one path segment
+	// per product, so `base` has to match where the built `dist/` is copied to.
+	site: 'https://ergonlabs.io',
+	base: '/docs/llm-proxy',
 	integrations: [
 		starlight({
 			title: 'llm-proxy',
