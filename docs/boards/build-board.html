@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-09 · 1130 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-18 · 1146 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -229,18 +229,31 @@
     proxy down), and <code>testing/diffrig/tests/swap_under_load.rs</code> proves zero dropped
     streams under 6 concurrent SSE/non-streaming requests during the swap, asserting the SSE
     terminal frame rather than a request count (this proxy never injects into a truncated
-    stream, so a count-based check would miss a silent truncation). <b>The capacity report is
-    the one open clause, and it cannot be produced honestly yet:</b> found 2026-08-09 while
-    building the swap test, <code>loadgen::driver::execute</code> classifies a streaming
-    request as successful once the body ends without a transport error — it never checks for
-    the terminal frame, so a run in which the proxy truncated every stream would report a 0%
-    error rate. A p99 from that instrument is not evidence. A fix is written but
-    <b>uncommitted, sitting in an agent worktree, not on <code>main</code></b>. The Linux
-    <code>/proc</code> sampler is unverified but is <b>no longer a blocker</b> (owner decision
-    2026-08-09) — the gate asks for a run that isn't harness-bound, not specifically Linux, and
-    the macOS sampler path is the verified one; what IS still open on that clause is WP-15 h1
-    connection reuse (h2 got a per-worker multiplexed cache today; h1 still burns two ephemeral
-    ports per request and caps the rig near ~8k streams).</span>
+    stream, so a count-based check would miss a silent truncation). <b>A defect then surfaced
+    IN the already-closed <code>/config_dump</code> clause and is worth naming plainly:</b>
+    found 2026-08-09 by writing user documentation against the code, not by a test — the admin
+    server's own config handle was never enrolled where a SIGHUP reload actually publishes, so
+    <code>/config_dump</code>/<code>/clusters</code> kept serving the BOOT snapshot forever,
+    including after a real reload. Fixed structurally (a registry that enrolls a handle the same
+    step it hands one out) and verified end to end: real binary, real SIGHUP, HTTP response bytes
+    asserted to change; a follow-up made the original mistake not just discouraged but
+    uncompilable. <b>The capacity report is the one open clause, and its blocker is now
+    cleared — but the report itself still does not exist.</b> Found 2026-08-09 while building
+    the swap test: <code>loadgen::driver::execute</code> could not detect SSE stream
+    truncation — it classified a streaming request as successful once the body ended without a
+    transport error, never checking for the terminal frame, so a run in which the proxy
+    truncated every stream would have reported a 0% error rate. <b>Fixed and merged the same
+    day, on <code>main</code>, inside this board's 1146</b> — and a second, larger defect found
+    alongside it: every failed request's time-to-failure was feeding the latency percentiles, so
+    a proxy collapsing under load would have measured as getting <i>faster</i>. Both
+    mutation-verified; percentiles now cover successful requests only. What remains is
+    unglamorous: <b>no sweep has actually been run</b> against the fixed instrument, so zero
+    p99/tokens-per-sec/RSS numbers are published. The Linux <code>/proc</code> sampler is
+    unverified but is <b>no longer a blocker</b> (owner decision 2026-08-09) — the gate asks for
+    a run that isn't harness-bound, not specifically Linux, and the macOS sampler path is the
+    verified one; what IS still open on that clause is WP-15 h1 connection reuse (h2 got a
+    per-worker multiplexed cache today; h1 still burns two ephemeral ports per request and caps
+    the rig near ~8k streams).</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -273,18 +286,48 @@
     both old fixed ports deliberately held by another process. The <code>diffrig</code> hang
     mitigation (multi-threaded runtime + <code>terminate-after</code>) holds; those tests still
     carry no request timeouts, unchanged.
-    <b>Re-measured again 2026-08-09 via <code>make tq-count</code>: 1130 tests passed, 24 skipped</b>
-    — the skip count is unchanged and the increase is explained by today's new test files
+    <b>Re-measured 2026-08-09 via <code>make tq-count</code>: 1130 tests passed, 24 skipped</b>
+    — the skip count is unchanged and the increase is explained by that day's new test files
     (<code>reload.rs</code>, <code>stats_e2e.rs</code>, <code>swap_under_load.rs</code>, an
     expanded <code>router_retry.rs</code>); doctests re-run clean via <code>make tq-doc</code>.
     <b>WP-24 (access logs) corrected 2026-08-09:</b> this board had it as <code>done</code>; its
     own machinery (response flags, mid-stream failure visibility, credential-safe logging) has
     been complete for a while, but the differential acceptance gate against the WP-13 lifecycle
     suite is genuinely still open, so the card moved back to <code>started</code> rather than
-    staying <code>done</code> on a technicality. <b>New, unscoped work landed today:</b> an Astro
-    Starlight docs-site scaffold (<code>docs/site/</code>) plus three user-facing pages
-    (<code>docs/user/</code>) — real and useful, but there is no work package behind it, so it
-    does not move any card here.</span>
+    staying <code>done</code> on a technicality.
+    <b>A live run against a local Ollama (2026-08-14) found two real defects that 1141 passing
+    tests had not</b> — the same lesson WP-41's QA suite already taught, found again outside it.
+    One is fixed: a successful content-length-framed 200 was logged
+    <code>response_flags: DC</code>, because hyper stops polling the body once the declared
+    length is written and <code>LoggingBody</code> never saw its own clean end — traced to
+    <code>mock_e2e.rs</code> never configuring <code>access_logs</code> at all, so no mock test
+    had ever inspected a rendered log line. The other is a <b>confirmed quota bypass, now
+    visible but still open by design</b>: a 20-token/minute budget survived six ~16-token
+    requests with zero 429s because the limiter read no usage and said nothing; now warns loudly
+    (at most once per budget key per minute) but still admits the request uncharged — an owner
+    decision, not a partial fix. Root cause is architectural: <code>body_rewrite</code>'s
+    anti-spoofing rewrite can re-route a request onto a route whose usage dialect no longer
+    matches the response shape, and <code>IMPLEMENTATION_PLAN.md</code>'s WP-35 section now
+    carries the prerequisite this forces — the usage dialect must move from the route to the
+    cluster before WP-52 makes cross-dialect fallback legal, see WP-34/WP-35/WP-52's cards.
+    Re-run directly this refresh: 4 of 7 <code>local_openai_smoke.rs</code> cases pass, 3
+    correctly fail on that same reason.
+    <b>Landed since, not gate-moving:</b> Apache-2.0 licensing (<code>LICENSE</code>,
+    <code>NOTICE</code> with a 242-crate dependency audit, <code>SECURITY.md</code>), a README
+    rewritten against the running code, and every user-facing Envoy reference removed — the docs
+    site (now nine pages, up from three), the JSON schema, strict-mode error messages, and
+    <code>--help</code> — with the configuration now called <i>the configuration</i> rather than
+    a dialect. That work also surfaces a distinct punch list for an actual public release, not
+    tracked as a WP: no git remote yet, no release workflow or published binaries, six
+    dependencies' license texts recorded as owed but not bundled, and
+    <code>SECURITY.md</code>'s reporting contact still unfilled.
+    <b>Test count reconciled this refresh: 1146 tests passed, 24 skipped</b> — re-run directly
+    via <code>make tq-count</code>, plus <code>cargo fmt --check</code>,
+    <code>cargo clippy -D warnings</code>, <code>make tq-doc</code>, and <code>make qa</code> all
+    independently green. The +16 over the 1130 above reconciles exactly against every landing
+    commit's own reported delta: +6 (loadgen truncation tests), +5
+    (<code>reload.rs</code>/<code>drain_strategy_warning.rs</code>), +1 (the DC-on-200
+    regression test), +4 (the token-budget warning tests).</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
@@ -451,9 +494,12 @@
    "✓ shutdown handlers now install BEFORE any worker spawns",
    "✓ both serve-mode CLI tests now gate on a real TCP connect, never a log line — the log-line helper was deleted outright so the bug can't be reintroduced",
    "✓ CLOSED 2026-08-09 — SIGHUP now re-reads the config file and publishes a new snapshot (a bad config keeps the old snapshot and logs the dotted-path error, never taking the proxy down); listeners and clusters both reconcile",
-   "✓ swap-under-load acceptance test landed same day: testing/diffrig/tests/swap_under_load.rs — 6 in-flight streams at the moment of swap, 12 paced SSE streams all reaching the terminal frame, 50 non-streaming requests, zero transport errors, zero non-2xx, second upstream serves 48 requests after — the load-bearing assertion is the terminal frame, not a count, since this proxy never injects into a truncated SSE stream"
+   "✓ swap-under-load acceptance test landed same day: testing/diffrig/tests/swap_under_load.rs — 6 in-flight streams at the moment of swap, 12 paced SSE streams all reaching the terminal frame, 50 non-streaming requests, zero transport errors, zero non-2xx, second upstream serves 48 requests after — the load-bearing assertion is the terminal frame, not a count, since this proxy never injects into a truncated SSE stream",
+   "⚠ FOUND AND FIXED 2026-08-09 (ddbda3c) — found by writing user docs against the code, not by a test. The admin server built its OWN WorkerConfigHandle outside ConfigPublisher's walked list, so /config_dump and /clusters kept serving the BOOT snapshot forever, even across a real SIGHUP reload — the one endpoint an operator uses to confirm a reload took effect was silently confirming the wrong thing, on a clause this board had already marked closed. Fixed structurally: a SnapshotHandles registry whose register() both builds AND enrolls a handle, walked by publish(). Load-bearing test drives the real binary, reads both admin endpoints, SIGHUPs a config that renames a cluster, asserts the HTTP RESPONSE BYTES change; mutation- verified (restore the untracked handle, get the exact original symptom back)",
+   "✓ (b936a7f) that bug is now unconstructible, not just discouraged — WorkerConfigHandle::new is pub(crate) with a compile_fail doctest pinning it, so an unregistered handle no longer compiles from outside proxy-core",
+   "✓ --drain-strategy was inert (drain_close_probability had no call site — gradual and immediate behaved identically); ground rule 1 doesn't allow silence, so it now warns loudly at startup and is recorded in docs/envoy-divergences.md as honorable-later, inert today"
   ],
-  "note": "all three acceptance clauses now met (validate exit codes, zero-dropped swap under load, SIGTERM drain) — this WP no longer holds Lane B open"
+  "note": "all three acceptance clauses now met (validate exit codes, zero-dropped swap under load, SIGTERM drain) — this WP no longer holds Lane B open. The 2026-08-09 /config_dump finding is a reminder that \"gate clause closed\" needs re-checking when its own machinery changes shape"
  },
  {
   "id": 7,
@@ -767,6 +813,8 @@
    "✓ pseudo-headers resolve: %REQ(:METHOD)/(:AUTHORITY)/(:SCHEME)% + %RESP(:STATUS)%, via typed LogContext fields (a colon is not a legal HeaderName)",
    "✓ MID-STREAM FAILURES ARE NOW VISIBLE — UC upstream hung up · DC client left / body abandoned · SI upstream went quiet (S4 idle), plus an operator-facing WARN with host, cluster, bytes, TTFT, elapsed",
    "✓ transparent proxy: we log the failure, we never inject an error event into the SSE stream (owner decision)",
+   "⚠ FOUND AND FIXED 2026-08-14, by a live Ollama run, not by any mock — a successful content-length-framed 200 was logged response_flags: DC (DownstreamConnectionTermination). hyper's h1 write dispatcher stops polling the body the instant it has written exactly the declared length, so LoggingBody's terminal Ready(None) never arrived and Drop fired instead. Fixed by giving LoggingBody the same content-length fix-up StreamingEncoder already had. Verified before/after against real Ollama: same request, DC → \"-\"",
+   "⚠ WHY NO MOCK CAUGHT IT: mock_e2e.rs never configures access_logs at all, so no test in that suite has ever inspected a rendered log line. The only place real access logging and real per-route dialect resolution meet is testing/diffrig/tests/local_openai_smoke.rs, which is #[ignore]d behind a local Ollama and had evidently not run since WP-45 landed — a whole observability surface was untested end to end while the suite stayed green",
    "open: the acceptance gate itself — field-by-field differential log-line comparison against the WP-13 lifecycle suite, plus \"every response flag reachable by at least one test\". This row read \"nothing emits\" long after the above had landed; corrected 2026-08-09 to functionally-done rather than done, because the gate is real work, not paperwork"
   ],
   "note": "⚠ FIXED TWO (found by QA-1 + QA-6): %REQ(:METHOD)% rendered '-' in EVERY log line including Envoy mode, since Envoy's own default format uses it; and a stream killed mid-flight set NO response flag, making a network death byte-identical to a short completion on the SSE path that is most LLM traffic"
@@ -867,7 +915,9 @@
    "✓ phase 2 — process sampler (RSS/CPU/fds, macOS+Linux, explicit error not zeros) · ramp-hold-bisect sweep w/ multi-clause SLO gate",
    "✓ capacity table + least-squares cost model (bytes/stream, CPU-ms/request, R² reported)",
    "open: NO SWEEP PUBLISHED — 'performant' is still an untested claim",
-   "⚑ FOUND 2026-08-09 (while building the swap test) — loadgen cannot detect SSE stream truncation. driver::execute classifies a streaming request as successful once the body ends without a transport error; it never checks for the terminal frame, so a run in which the proxy truncated EVERY stream would report a 0% error rate. A published p99 from this instrument is not evidence until this is fixed — this blocks the capacity clause as much as any throughput number does. A fix exists (uncommitted, in an agent worktree, NOT on main) — do not treat this as done until it lands and is verified",
+   "✓ FIXED AND MERGED 2026-08-09 (8d2d891, 6ae7266, on main, in make ci's 1146) — loadgen could not detect SSE stream truncation: driver::execute counted a streaming request successful the moment the body ended without a transport error, never checking for the terminal frame, so a run in which the proxy truncated EVERY stream would have reported a 0% error rate. Now ExecError::Truncated, kept distinct from Transport",
+   "⚠ FOUND ALONGSIDE, and the LARGER of the two defects: every failed request's time-to-failure was feeding the latency percentiles, and it skewed the dangerous way — a fast failure LOWERS p99, so a proxy collapsing under load would have looked like it was getting faster. Percentiles now cover successful requests only; a definition change, flagged on RunSummary and in the printed report. Both mutation-verified",
+   "open, unchanged: the fix makes the instrument trustworthy, but NO SWEEP HAS BEEN RUN — no p99/tokens-per-sec/RSS number is published yet. This remains the only open v0.2.0 gate clause",
    "owner decision 2026-08-09: the Linux /proc sampler is SET ASIDE, no longer a blocker — the gate asks for a run that is not harness-bound, not specifically Linux, and the macOS sampler path is the verified one"
   ],
   "note": "detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending there is reported HARNESS-BOUND, never as proxy capacity"
@@ -961,7 +1011,9 @@
    "open: reachable ONLY via Envoy-mode config today (typed_config on RateLimitSettings) — the dialect has no `limits` key yet (increment 3, still rejected under strict mode); thin slice is LimitOn::Total keyed on (route, hashed credential) only, no per-descriptor config",
    "✓ INCREMENT 3 DONE 2026-08-02 — the dialect `limits` key now lowers a tokens_per_minute + key:header:authorization limit to llmproxy.token_limit (before llmproxy.usage, per S2.1). Everything the thin slice cannot enforce warns with its exact dotted path and reason",
    "open: per-descriptor config (needs WP-47's vendored proto), and richer bucket keys",
-   "▲ NOW THE ONLY v0.1.0 gate clause with no end-to-end evidence (2026-08-08) — the other two (token counts+TTFT/TPOT via QA-10, provider failover via testing/diffrig/failover_e2e.rs) were verified this pass. No QA-N scenario or diffrig drill exercises 429-on-limit-exceeded against the real binary yet. Owner explicitly deferred this session — see releases.yaml risk"
+   "▲ NOW THE ONLY v0.1.0 gate clause with no end-to-end evidence (2026-08-08) — the other two (token counts+TTFT/TPOT via QA-10, provider failover via testing/diffrig/failover_e2e.rs) were verified this pass. No QA-N scenario or diffrig drill exercises 429-on-limit-exceeded against the real binary yet. Owner explicitly deferred this session — see releases.yaml risk",
+   "⚠ CONFIRMED LIVE 2026-08-14 (Ollama run) — A REAL QUOTA BYPASS: a 20-token/minute budget, six requests of ~16 tokens each, ZERO 429s. record_if_present returned early whenever StreamInfo::llm.usage was None — no error, no log, nothing an operator could ever see. Root cause is WP-35's ordering hazard (see that card): the request re-routes onto a route whose dialect no longer matches the response's actual wire format, so usage extraction returns nothing and the budget silently charges zero",
+   "✓ FIXED 2026-08-18 (a3a8c14, 1146 tests) — owner decision: warn loudly, do NOT fail closed (a metering hiccup must not start refusing traffic). Names the budget key, states plainly the budget was NOT enforced, suppressed to once per key per minute, kept off the healthy hot path. THE BYPASS IS NOW VISIBLE, NOT CLOSED — the request is still admitted uncharged. Mutation-verified; recorded in SECURITY.md's known-gaps section and the config reference"
   ]
  },
  {
@@ -981,7 +1033,8 @@
    "✓ WP-45 consumer B landed (872b7d7) — routing reads `model` from the real request body, so this WP has something real to route on",
    "✓ VERIFIED END-TO-END 2026-08-08 (c1314b6) — testing/diffrig/tests/failover_e2e.rs drives the real llm-proxy binary against a real llmproxy dialect config with fallbacks:, mock primary forced to 429. Three assertions, each mutation-tested: attempt accounting exact (one request per upstream), standby receives its OWN credential with the primary's key NOWHERE on the wire (negative asserted explicitly), standby receives its OWN Host. This is the v0.1.0 gate's failover clause going from code-complete to verified — see docs/MILESTONES.md",
    "Scope that closes here: SAME-DIALECT fallback (e.g. openai → an openai-compatible provider). examples/llmproxy.yaml's fallback showcase changed from cross-dialect (gpt-5* → anthropic) to local-vllm as a result",
-   "⚑ NOT in this WP: cross-dialect fallback (openai → anthropic) is a hard config-time error naming routes[i].fallbacks[j], deliberately — the request/response shape translation it needs is real, un-started work. Split into WP-52 (v1.0.0), not silently dropped from scope"
+   "⚑ NOT in this WP: cross-dialect fallback (openai → anthropic) is a hard config-time error naming routes[i].fallbacks[j], deliberately — the request/response shape translation it needs is real, un-started work. Split into WP-52 (v1.0.0), not silently dropped from scope",
+   "▲ ORDERING PREREQUISITE recorded 2026-08-14 in IMPLEMENTATION_PLAN.md, read before WP-52 starts: the usage dialect still lives on the ROUTE, safe today only because cross-dialect fallback is rejected at load. WP-52's translation work is what makes cross-dialect fallback legal — the dialect MUST move to the CLUSTER first, or this reproduces the shape of the two prior P0s (credentials, host_rewrite_literal), except the symptom is silently wrong billing. Live evidence already exists: three tests in local_openai_smoke.rs fail today because a same-dialect alias reroute already hits this (see WP-34's card)"
   ],
   "note": "historical: the dialect used to WARN AND DROP `fallbacks` (parsed, validated, lowered, then dropped with one stderr line) — corrected in MILESTONES.md 2026-08-03 and again 2026-08-06. Increment 2c (399b954) replaced that with a real lowering, so this note is now history, not the current behavior"
  },
@@ -1191,6 +1244,7 @@
    "state per ADR-0005: embedded (sqlite/sled) default, distributed behind the same trait",
    "✓ INCREMENT 1 DONE 2026-08-02 (9df7deb) — /ready, /config_dump, /clusters, /server_info on the control runtime. /stats 404s naming WP-23 rather than faking an empty 200",
    "▲ /config_dump redaction is default-deny AND structural: HeaderMutationDump.value is `&'static str`, so it cannot hold runtime data — leaking needs a type change, not an edit",
+   "⚠ /config_dump (this WP's own increment 1 deliverable) was found 2026-08-09 serving the BOOT snapshot forever, even after a real SIGHUP reload — the admin server's handle was never enrolled in the registry publish() walks. See WP-6's card for the fix (SnapshotHandles); confirmed fixed end-to-end (real binary, real SIGHUP renaming a cluster, HTTP response bytes asserted to change)",
    "⚠ it also disarmed the WP-39 readership guard: rendering an IR field for DISPLAY is not ACTING on it, so proxy-admin was removed from RUNTIME_CRATES. Any future crate that reflects over the IR needs the same exclusion",
    "✓ INCREMENT 2a DONE 2026-08-08 (cb1c066, 120ad78, 0dfe3a1, f4efd48 + design brief 9dc3ad0) — Authenticator trait + AuthenticatorChain + Principal; VirtualKeyAuthenticator verifying keyed HMAC-SHA-256 in constant time; llmproxy.auth filter (WP-47's new proto) enforcing under strict mode, fails CLOSED; identity on StreamInfo::auth; WP-34's token limiter RE-KEYED onto it (mutation-verified: reverting the read to None lets a caller reset its own budget); an `auth:` block in the dialect; `llm-proxy --mode keygen`",
    "⚑ this is what closed v0.1.0's rate-limit gate clause — WP-34 previously bucketed on hash_credential(<client's own Authorization header>), which nothing verified, so any caller could get a fresh quota by changing one string. Not planned as v0.1.0 scope; became the precondition once that gap was found",
@@ -1232,7 +1286,8 @@
    "split out of WP-35 2026-08-08 — same-dialect fallback (WP-35) is done; cross-dialect is not",
    "needs 35 (done — the aggregate-cluster mechanism this reuses) + 45 (bounded-buffer body pipeline, possible substrate) + 49 (backend taxonomy — needs the PROVIDER TYPE, not just the cluster name)",
    "an openai-shaped route falling back to anthropic is a HARD config-time error today (routes[i].fallbacks[j]), on purpose — sending an OpenAI-shaped body to Anthropic, or scanning its response with the wrong dialect's usage parser, is the wrong-provider-shape version of WP-48's silent-wrong-billing-number bug",
-   "open design decision this WP owns: bounded-buffer transform (reuse WP-45) vs full reshape — a shape change isn't generally a prefix splice the way include_usage injection is"
+   "open design decision this WP owns: bounded-buffer transform (reuse WP-45) vs full reshape — a shape change isn't generally a prefix splice the way include_usage injection is",
+   "▲ inherits WP-35's 2026-08-14 ordering prerequisite directly: this WP's translation work is what makes cross-dialect fallback legal, and the usage dialect must move from the route onto the cluster BEFORE that happens — see WP-35's card. Skipping that step reproduces the credentials/host_rewrite_literal P0 shape with silently wrong billing as the symptom"
   ],
   "note": "⚑ rejecting cross-dialect fallback is the SAFE interim state, not a regression — see WP-35's 2026-08-08 note. This WP is what turns the rejection into support"
  },

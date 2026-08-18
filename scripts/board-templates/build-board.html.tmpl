@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-09 · 1130 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-18 · 1146 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -229,18 +229,31 @@
     proxy down), and <code>testing/diffrig/tests/swap_under_load.rs</code> proves zero dropped
     streams under 6 concurrent SSE/non-streaming requests during the swap, asserting the SSE
     terminal frame rather than a request count (this proxy never injects into a truncated
-    stream, so a count-based check would miss a silent truncation). <b>The capacity report is
-    the one open clause, and it cannot be produced honestly yet:</b> found 2026-08-09 while
-    building the swap test, <code>loadgen::driver::execute</code> classifies a streaming
-    request as successful once the body ends without a transport error — it never checks for
-    the terminal frame, so a run in which the proxy truncated every stream would report a 0%
-    error rate. A p99 from that instrument is not evidence. A fix is written but
-    <b>uncommitted, sitting in an agent worktree, not on <code>main</code></b>. The Linux
-    <code>/proc</code> sampler is unverified but is <b>no longer a blocker</b> (owner decision
-    2026-08-09) — the gate asks for a run that isn't harness-bound, not specifically Linux, and
-    the macOS sampler path is the verified one; what IS still open on that clause is WP-15 h1
-    connection reuse (h2 got a per-worker multiplexed cache today; h1 still burns two ephemeral
-    ports per request and caps the rig near ~8k streams).</span>
+    stream, so a count-based check would miss a silent truncation). <b>A defect then surfaced
+    IN the already-closed <code>/config_dump</code> clause and is worth naming plainly:</b>
+    found 2026-08-09 by writing user documentation against the code, not by a test — the admin
+    server's own config handle was never enrolled where a SIGHUP reload actually publishes, so
+    <code>/config_dump</code>/<code>/clusters</code> kept serving the BOOT snapshot forever,
+    including after a real reload. Fixed structurally (a registry that enrolls a handle the same
+    step it hands one out) and verified end to end: real binary, real SIGHUP, HTTP response bytes
+    asserted to change; a follow-up made the original mistake not just discouraged but
+    uncompilable. <b>The capacity report is the one open clause, and its blocker is now
+    cleared — but the report itself still does not exist.</b> Found 2026-08-09 while building
+    the swap test: <code>loadgen::driver::execute</code> could not detect SSE stream
+    truncation — it classified a streaming request as successful once the body ended without a
+    transport error, never checking for the terminal frame, so a run in which the proxy
+    truncated every stream would have reported a 0% error rate. <b>Fixed and merged the same
+    day, on <code>main</code>, inside this board's 1146</b> — and a second, larger defect found
+    alongside it: every failed request's time-to-failure was feeding the latency percentiles, so
+    a proxy collapsing under load would have measured as getting <i>faster</i>. Both
+    mutation-verified; percentiles now cover successful requests only. What remains is
+    unglamorous: <b>no sweep has actually been run</b> against the fixed instrument, so zero
+    p99/tokens-per-sec/RSS numbers are published. The Linux <code>/proc</code> sampler is
+    unverified but is <b>no longer a blocker</b> (owner decision 2026-08-09) — the gate asks for
+    a run that isn't harness-bound, not specifically Linux, and the macOS sampler path is the
+    verified one; what IS still open on that clause is WP-15 h1 connection reuse (h2 got a
+    per-worker multiplexed cache today; h1 still burns two ephemeral ports per request and caps
+    the rig near ~8k streams).</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -273,18 +286,48 @@
     both old fixed ports deliberately held by another process. The <code>diffrig</code> hang
     mitigation (multi-threaded runtime + <code>terminate-after</code>) holds; those tests still
     carry no request timeouts, unchanged.
-    <b>Re-measured again 2026-08-09 via <code>make tq-count</code>: 1130 tests passed, 24 skipped</b>
-    — the skip count is unchanged and the increase is explained by today's new test files
+    <b>Re-measured 2026-08-09 via <code>make tq-count</code>: 1130 tests passed, 24 skipped</b>
+    — the skip count is unchanged and the increase is explained by that day's new test files
     (<code>reload.rs</code>, <code>stats_e2e.rs</code>, <code>swap_under_load.rs</code>, an
     expanded <code>router_retry.rs</code>); doctests re-run clean via <code>make tq-doc</code>.
     <b>WP-24 (access logs) corrected 2026-08-09:</b> this board had it as <code>done</code>; its
     own machinery (response flags, mid-stream failure visibility, credential-safe logging) has
     been complete for a while, but the differential acceptance gate against the WP-13 lifecycle
     suite is genuinely still open, so the card moved back to <code>started</code> rather than
-    staying <code>done</code> on a technicality. <b>New, unscoped work landed today:</b> an Astro
-    Starlight docs-site scaffold (<code>docs/site/</code>) plus three user-facing pages
-    (<code>docs/user/</code>) — real and useful, but there is no work package behind it, so it
-    does not move any card here.</span>
+    staying <code>done</code> on a technicality.
+    <b>A live run against a local Ollama (2026-08-14) found two real defects that 1141 passing
+    tests had not</b> — the same lesson WP-41's QA suite already taught, found again outside it.
+    One is fixed: a successful content-length-framed 200 was logged
+    <code>response_flags: DC</code>, because hyper stops polling the body once the declared
+    length is written and <code>LoggingBody</code> never saw its own clean end — traced to
+    <code>mock_e2e.rs</code> never configuring <code>access_logs</code> at all, so no mock test
+    had ever inspected a rendered log line. The other is a <b>confirmed quota bypass, now
+    visible but still open by design</b>: a 20-token/minute budget survived six ~16-token
+    requests with zero 429s because the limiter read no usage and said nothing; now warns loudly
+    (at most once per budget key per minute) but still admits the request uncharged — an owner
+    decision, not a partial fix. Root cause is architectural: <code>body_rewrite</code>'s
+    anti-spoofing rewrite can re-route a request onto a route whose usage dialect no longer
+    matches the response shape, and <code>IMPLEMENTATION_PLAN.md</code>'s WP-35 section now
+    carries the prerequisite this forces — the usage dialect must move from the route to the
+    cluster before WP-52 makes cross-dialect fallback legal, see WP-34/WP-35/WP-52's cards.
+    Re-run directly this refresh: 4 of 7 <code>local_openai_smoke.rs</code> cases pass, 3
+    correctly fail on that same reason.
+    <b>Landed since, not gate-moving:</b> Apache-2.0 licensing (<code>LICENSE</code>,
+    <code>NOTICE</code> with a 242-crate dependency audit, <code>SECURITY.md</code>), a README
+    rewritten against the running code, and every user-facing Envoy reference removed — the docs
+    site (now nine pages, up from three), the JSON schema, strict-mode error messages, and
+    <code>--help</code> — with the configuration now called <i>the configuration</i> rather than
+    a dialect. That work also surfaces a distinct punch list for an actual public release, not
+    tracked as a WP: no git remote yet, no release workflow or published binaries, six
+    dependencies' license texts recorded as owed but not bundled, and
+    <code>SECURITY.md</code>'s reporting contact still unfilled.
+    <b>Test count reconciled this refresh: 1146 tests passed, 24 skipped</b> — re-run directly
+    via <code>make tq-count</code>, plus <code>cargo fmt --check</code>,
+    <code>cargo clippy -D warnings</code>, <code>make tq-doc</code>, and <code>make qa</code> all
+    independently green. The +16 over the 1130 above reconciles exactly against every landing
+    commit's own reported delta: +6 (loadgen truncation tests), +5
+    (<code>reload.rs</code>/<code>drain_strategy_warning.rs</code>), +1 (the DC-on-200
+    regression test), +4 (the token-budget warning tests).</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
