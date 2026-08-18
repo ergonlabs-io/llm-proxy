@@ -143,6 +143,17 @@ impl LimitKey {
     }
 }
 
+impl std::fmt::Display for LimitKey {
+    /// Renders the same descriptor string [`Self::from_descriptors`] built
+    /// (`route=r1|tenant=t1`, say) -- see that method's doc for why this is
+    /// safe to put in a log line: any credential feeding a `cred=` descriptor
+    /// was already hashed by `token_limit_filter::hash_credential` before it
+    /// ever reached here, so this is never cleartext.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Which bucket of [`TokenUsage`] a [`LimitRule`] is measured against.
 ///
 /// `Total` is not simply "the sum of `Input` and `Output`" as a matter of
