@@ -857,6 +857,34 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
   counter values, exact 429 onset); streaming path adds zero buffering (WP-33 invariant test).
 
 #### WP-35 — Model routing & provider fallback  (Size: M)  — **Priority: P0**
+
+> **ORDERING PREREQUISITE, found 2026-08-14 — read before starting.** The usage
+> dialect currently lives on the **route** (`typed_per_filter_config`), which
+> ground rule 6 already flags as the known remaining per-provider-value-on-a-route
+> instance. It is safe today only because `lower.rs` **rejects cross-dialect
+> fallback chains at config load**. That prohibition is the sole thing preventing
+> the route/cluster mismatch from becoming a live bug via failover.
+>
+> **The moment this WP's request/response translation makes cross-dialect
+> fallback legal, that protection disappears.** A route picks an aggregate; the
+> member is what gets dialled; a dialect on the route would then follow the
+> routing decision while the connection went elsewhere — reproducing exactly the
+> shape of the two prior P0s (credentials, `host_rewrite_literal`), except the
+> symptom is silently wrong billing rather than a visible failure.
+>
+> **So: move the usage dialect onto the cluster BEFORE enabling cross-dialect
+> fallback.** It is a prerequisite, not a cleanup.
+>
+> Related and already observable: because `body_rewrite` overwrites the model
+> header from the body and calls `clear_route_cache()` (WP-45 decision 4,
+> deliberate anti-spoofing), a request can land on a different route than the one
+> that first matched, and the dialect silently follows. That is why three tests in
+> `testing/diffrig/tests/local_openai_smoke.rs` fail today: they route by a
+> `claude-*` alias to a backend serving a differently-named model. Those tests are
+> correct and are blocked on **this WP's per-route `provider/model` rewrite**
+> (`lower.rs` currently warns that the original model name is forwarded). Do not
+> "fix" them by weakening the anti-spoofing rule.
+
 - Body-peek model router: **moved to WP-45**, which owns the shared bounded-buffer /
   parse / rewrite pipeline. Two features needed the same machinery (the other is forced
   `include_usage` injection) and building it twice would mean two disagreeing buffer caps.
