@@ -70,6 +70,15 @@ spends time reporting them, and so operators can judge the risk themselves:
   authorization does not.
 - Sending a request with no recognized credential is refused, but there is no
   rate limiting on authentication attempts themselves.
+- **A token budget is not charged if usage cannot be read from the response.**
+  On a route with a budget configured, if the provider's response usage
+  cannot be extracted (most commonly a usage-filter `dialect` mismatch for
+  that provider), the request is allowed and nothing is charged against the
+  budget — the proxy fails open rather than refusing traffic on a metering
+  hiccup. This now warns (`token_limit: the token budget for this request was
+  NOT enforced...`, at most once per budget key per minute) so the gap is
+  visible in logs; it does not deny the request or retroactively correct the
+  budget.
 
 ## Supported versions
 

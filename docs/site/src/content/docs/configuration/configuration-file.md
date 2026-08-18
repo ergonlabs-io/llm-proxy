@@ -115,6 +115,15 @@ their usage to the budget. When `auth:` is configured, the bucket key
 automatically prefers the authenticated tenant instead of the raw header
 value, so `key: tenant` is the form to use alongside `auth:`.
 
+If a request's usage cannot be read from the provider's response — most
+commonly because the configured `dialect` does not match that provider's
+actual response shape — the request is still allowed and nothing is charged
+against the budget for it: the proxy fails open on a metering gap rather
+than refusing traffic. This is logged as a warning (at most once per budget
+key per minute, so a busy route does not flood the log) rather than
+happening silently, so it is visible to an operator even though it does not
+change the request's outcome.
+
 Every other combination is accepted, recorded, and produces a
 load-time warning naming the exact field: `key: global`, `key:
 client-ip`, any other `header:<name>`, `requests_per_minute`,

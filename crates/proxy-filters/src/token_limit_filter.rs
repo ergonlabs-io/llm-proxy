@@ -17,11 +17,35 @@
 //! end — but that only exists if the usage filter's own encode callback has
 //! *already run* by the time this filter's does. Reverse order means "already
 //! run" = "later in config order". So this filter MUST be configured BEFORE
-//! `llmproxy.usage` in `http_filters`. Get this backwards and nothing errors:
+//! `llmproxy.usage` in `http_filters`. Get this backwards and
 //! `StreamInfo::llm.usage` simply reads `None` forever (see
 //! [`TokenLimitFilterInstance::record_if_present`]'s "absent usage" case),
-//! silently recording zero cost for every request. There is no code assertion
-//! for this — the module doc is the only guard.
+//! recording zero cost for every request that should have been charged. This
+//! used to be silent; it no longer is — see "Loud on unreadable usage" below.
+//! There is still no code assertion for the ordering itself — the module doc
+//! remains the only guard for *that* — but the symptom is no longer invisible.
+//!
+//! # Loud on unreadable usage, but never fail-closed
+//!
+//! A budget that applies to a request (`self.key` is `Some`, i.e. this
+//! request was actually bucketed) but whose usage reads `None` is exactly
+//! the "confirmed live" defect this section exists to close: a metering gap
+//! that silently charged nothing and never showed up anywhere an operator
+//! would look. [`TokenLimitFilterInstance::record_if_present`] now calls
+//! [`UsageMissingWarner::warn_if_due`] on that path — `warn!`, never an
+//! error and never a denial, because the request itself succeeded and the
+//! proxy behaved exactly as designed (see the module doc's "Fail open on a
+//! store error" section for the same philosophy applied to the store side).
+//! A route with no configured limit (`self.key` is `None`) never reaches
+//! this call at all, so an unlimited route stays silent — warning there
+//! would just be a second, noisier outage.
+//!
+//! Suppression is once-per-key-per-minute, not once-per-process: see
+//! [`UsageMissingWarner`]'s doc for why a periodic repeat was chosen over
+//! "warn once, ever" (an operator who starts reading logs after the first
+//! occurrence must still be able to see it), and why that repeat is cheap
+//! enough to keep on the same rare path rather than needing a background
+//! task.
 //!
 //! # Fail open on a store error
 //!
@@ -132,7 +156,8 @@
 //! (non-cryptographic) hash is sufficient here. A tenant id needs no such
 //! treatment — it is an identifier the operator chose, not a secret.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use http::header::AUTHORIZATION;
@@ -263,18 +288,26 @@ impl HttpFilterFactory for TokenLimitFilterFactory {
         // rather than per-stream (see `InProcessBudgetStore`'s doc for why
         // that requires `Send + Sync` + `Mutex`, not worker-local state).
         let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new(rule));
-        Ok(Box::new(TokenLimitInstanceFactory { store }))
+        // One warner per (filter config, listener), same lifetime and same
+        // reason as `store` above -- see `UsageMissingWarner`'s doc.
+        let usage_missing_warner = Arc::new(UsageMissingWarner::new());
+        Ok(Box::new(TokenLimitInstanceFactory {
+            store,
+            usage_missing_warner,
+        }))
     }
 }
 
 struct TokenLimitInstanceFactory {
     store: Arc<dyn BudgetStore>,
+    usage_missing_warner: Arc<UsageMissingWarner>,
 }
 
 impl FilterInstanceFactory for TokenLimitInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(TokenLimitFilterInstance {
             store: Arc::clone(&self.store),
+            usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             key: None,
             recorded: false,
         })
@@ -324,12 +357,109 @@ fn hash_credential(value: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Warns, at most once per [`LimitKey`] per [`Self::REPEAT_INTERVAL`], when a
+/// budget applied to a request but its usage could not be read — see the
+/// module doc's "Loud on unreadable usage" section for what this is
+/// answering and [`TokenLimitFilterInstance::record_if_present`] for the one
+/// call site.
+///
+/// # Why a `Mutex<HashMap<..>>`, following `RouterStats`
+///
+/// Mirrors `proxy_http::stat_handles::RouterStats::warned_unknown_clusters`:
+/// a `Mutex`-guarded dedup structure touched only on the rare path (here,
+/// "usage came back `None`"), never on a request that had usage to record.
+/// One instance is shared, via `Arc`, across every per-stream
+/// `TokenLimitFilterInstance` `TokenLimitInstanceFactory::create_filter`
+/// hands out — same lifetime as `store`, and for the same reason: the
+/// dedup state has to outlive any single stream to mean anything.
+///
+/// # Once per key, but not once ever
+///
+/// `RouterStats` warns once per unknown cluster name for the life of the
+/// process — right for a config-shaped fact that cannot change without a
+/// restart. This is different: usage can come back `None` for the whole
+/// life of a long-running process (a provider that never changed its
+/// response shape, or a usage-filter dialect misconfigured at boot and never
+/// fixed), and an operator who starts reading logs an hour in must still be
+/// able to see it. So this repeats — capped at once per key per
+/// [`Self::REPEAT_INTERVAL`] — rather than going silent again after the
+/// first occurrence.
+///
+/// The repeat costs one extra `Instant` read and comparison, on the same
+/// rare, already-locked path the dedup check itself is on — not a
+/// background task or a timer, both of which the brief for this change
+/// rules out. That is cheap enough to keep here; a plain "once ever" set
+/// (like `RouterStats`'s) would have been simpler still but would trade away
+/// exactly the visibility this exists to provide.
+struct UsageMissingWarner {
+    last_warned: Mutex<HashMap<LimitKey, Instant>>,
+}
+
+impl UsageMissingWarner {
+    /// How long a key's warning is suppressed before it may fire again. Not
+    /// configurable — this is an operability aid, not a tunable knob, and a
+    /// fixed value keeps this doc's "at most once per key per minute" claim
+    /// actually true.
+    const REPEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+    fn new() -> Self {
+        UsageMissingWarner {
+            last_warned: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Warns for `key` if this is the first time it has been seen on this
+    /// path, or if [`Self::REPEAT_INTERVAL`] has elapsed since the last time
+    /// it warned. Never called from a request that had usage to record (see
+    /// the call site in `record_if_present`), so this `Mutex` is never
+    /// contended by the healthy path.
+    fn warn_if_due(&self, key: &LimitKey, now: Instant) {
+        // Rust note: `unwrap_or_else(PoisonError::into_inner)` recovers the
+        // guard from a poisoned `Mutex` rather than panicking -- same
+        // convention as `RouterStats::warn_unknown_cluster_once`. A panic
+        // while holding this lock elsewhere would otherwise turn "we
+        // couldn't warn about a metering gap" into "the whole filter now
+        // panics on every request", which is a worse outage than the one
+        // this section exists to make visible.
+        let mut last_warned = self
+            .last_warned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let due = match last_warned.get(key) {
+            Some(&last) => now.saturating_duration_since(last) >= Self::REPEAT_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        last_warned.insert(key.clone(), now);
+        // Rust note: drop the guard before logging -- nothing below needs
+        // it, and holding a lock across a macro call some future edit might
+        // extend (e.g. to format something expensive) is worth avoiding on
+        // principle even though `tracing::warn!` itself doesn't block.
+        drop(last_warned);
+
+        tracing::warn!(
+            budget_key = %key,
+            "token_limit: the token budget for this request was NOT enforced and the \
+             request was allowed uncharged -- usage could not be extracted from the \
+             response (StreamInfo::llm.usage was None), so there was nothing to charge \
+             against this budget. The most likely cause is that the llmproxy.usage \
+             filter's configured `dialect` does not match this provider's actual response \
+             shape for this route; check that first."
+        );
+    }
+}
+
 /// Per-stream instance. Plain fields, no `Rc`/`RefCell` (this never leaves
 /// the worker thread that owns the stream) -- only `store` is the
 /// cross-thread-shared piece, and it's an `Arc` clone, not shared interior
 /// state of this struct itself.
 struct TokenLimitFilterInstance {
     store: Arc<dyn BudgetStore>,
+    /// Shared across every stream this listener serves -- see
+    /// [`UsageMissingWarner`]'s doc for why it needs to outlive one stream.
+    usage_missing_warner: Arc<UsageMissingWarner>,
     /// Set in `decode_headers`, from the route + hashed credential. `None`
     /// only if `decode_headers` never ran (can't happen in practice for an
     /// HTTP filter, but this makes `record_if_present` total rather than
@@ -354,6 +484,10 @@ impl TokenLimitFilterInstance {
     /// happen), a missing usage (no usage was ever reported for this
     /// stream), and a successful record are all handled without
     /// propagating anything back to the caller.
+    ///
+    /// A missing usage on a request a budget actually applies to (`self.key`
+    /// is `Some`) is no longer silent: see the module doc's "Loud on
+    /// unreadable usage" section and [`UsageMissingWarner`].
     fn record_if_present(&mut self, cb: &mut dyn EncoderCallbacks) {
         if self.recorded {
             return;
@@ -374,7 +508,11 @@ impl TokenLimitFilterInstance {
         // `None` must stay unrecorded -- inventing a zero-cost record would
         // be wrong (nothing happened) and a nonzero guess would be worse
         // (this feeds a real budget). See `token_limit`'s central semantic.
+        // A budget applies here (`key` is `Some`, checked above), so this is
+        // exactly the case that must not stay invisible -- see the module
+        // doc's "Loud on unreadable usage" section.
         let Some(usage) = usage else {
+            self.usage_missing_warner.warn_if_due(key, Instant::now());
             return;
         };
 
@@ -531,6 +669,7 @@ mod tests {
     use super::*;
 
     use std::cell::{RefCell, RefMut};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, Uri};
@@ -805,6 +944,7 @@ mod tests {
     fn filter_with(store: Arc<dyn BudgetStore>) -> TokenLimitFilterInstance {
         TokenLimitFilterInstance {
             store,
+            usage_missing_warner: Arc::new(UsageMissingWarner::new()),
             key: None,
             recorded: false,
         }
@@ -990,6 +1130,224 @@ mod tests {
                 reset_after: Duration::from_secs(60),
             }),
             "recording nothing must leave the budget untouched"
+        );
+    }
+
+    // --- loud on unreadable usage (was silent; see the module doc) ----------
+
+    /// A minimal `tracing::Subscriber` that counts WARN-level events and
+    /// captures each one's rendered `message` field -- enough to assert both
+    /// the noise (how many fired) and the content (does the text say what it
+    /// should). Mirrors `proxy_http::access_logging`'s test-only
+    /// `WarnCounter`, extended with message capture since these tests need
+    /// to check what the warning says, not just that one fired.
+    struct WarnCapture {
+        count: AtomicUsize,
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl WarnCapture {
+        fn new() -> Self {
+            WarnCapture {
+                count: AtomicUsize::new(0),
+                messages: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    /// Rust note: `tracing::Subscriber` is the trait that receives every
+    /// emitted event; a real process installs one (`tracing_subscriber`)
+    /// that renders to a writer, but a test can install a small one that
+    /// just records what it saw, via `tracing::subscriber::set_default`
+    /// (dropped -- see the `guard` pattern below -- to un-install it before
+    /// the next test runs).
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            self.count.fetch_add(1, Ordering::SeqCst);
+
+            // Rust note: a `Visit` implementor is how `tracing` hands field
+            // values back out -- `event.record` calls it once per field.
+            // Every field type here (the formatted message, and the
+            // `%key`-displayed `budget_key`) routes through `record_debug`
+            // (only the handful of primitive types tracing special-cases,
+            // e.g. `record_str`/`record_u64`, get their own callback).
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.messages
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// As [`run_request`], but the caller supplies (and can reuse across
+    /// calls) the [`UsageMissingWarner`] -- production shares one via
+    /// `TokenLimitInstanceFactory` across every stream on a listener (see
+    /// its doc); `run_request` builds a fresh one per call, which is right
+    /// for every test except the ones in this section that need to observe
+    /// suppression *across* requests.
+    fn run_request_with_shared_warner(
+        store: &Arc<dyn BudgetStore>,
+        warner: &Arc<UsageMissingWarner>,
+        route: &str,
+        credential: Option<&str>,
+        usage: Option<LlmTokenUsage>,
+    ) -> Option<(StatusCode, HeaderMap)> {
+        let mut filter = TokenLimitFilterInstance {
+            store: Arc::clone(store),
+            usage_missing_warner: Arc::clone(warner),
+            key: None,
+            recorded: false,
+        };
+        let mut cb = TestCallbacks::new(Some(route_named(route)));
+        let mut head = request_headers(credential);
+        filter.decode_headers(&mut cb, &mut head, true);
+
+        if cb.local_reply.is_none() {
+            if let Some(usage) = usage {
+                cb.set_usage(usage);
+            }
+            let mut headers = response_headers();
+            filter.encode_headers(&mut cb, &mut headers, false);
+            let mut data = Bytes::new();
+            filter.encode_data(&mut cb, &mut data, true);
+        }
+
+        cb.local_reply
+    }
+
+    #[test]
+    fn a_budget_that_applies_with_unreadable_usage_warns_and_still_admits_the_request() {
+        let store = store_with(10, Duration::from_secs(60));
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+
+        let reply = run_request(&store, "r1", Some("Bearer sk-1"), None);
+
+        drop(guard);
+        assert!(
+            reply.is_none(),
+            "usage being unreadable must fail OPEN -- the request must still succeed"
+        );
+        assert_eq!(
+            capture.count.load(Ordering::SeqCst),
+            1,
+            "exactly one warning must fire for the one request"
+        );
+        let messages = capture
+            .messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            messages[0].contains("NOT enforced"),
+            "the message must say plainly that the budget was not enforced, got: {:?}",
+            messages[0]
+        );
+        assert!(
+            messages[0].contains("dialect"),
+            "the message must point at the likely cause (a usage-filter dialect mismatch), \
+             got: {:?}",
+            messages[0]
+        );
+    }
+
+    #[test]
+    fn a_route_with_no_budget_applied_never_warns_even_with_unreadable_usage() {
+        // Mirrors `record_if_present`'s "missing key (shouldn't happen)"
+        // case: a filter instance whose `decode_headers` never ran, so no
+        // budget was ever bucketed for this stream -- the precise condition
+        // the module doc requires to stay silent (an unlimited route must
+        // never warn on every request).
+        let store = store_with(10, Duration::from_secs(60));
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+
+        let mut filter = filter_with(store);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut headers = response_headers();
+        filter.encode_headers(&mut cb, &mut headers, false);
+        let mut data = Bytes::new();
+        filter.encode_data(&mut cb, &mut data, true);
+
+        drop(guard);
+        assert_eq!(
+            capture.count.load(Ordering::SeqCst),
+            0,
+            "no budget applied to this stream -- it must stay completely silent"
+        );
+    }
+
+    #[test]
+    fn readable_usage_never_warns_and_still_charges_the_budget_normally() {
+        let store = store_with(10, Duration::from_secs(60));
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+
+        run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(10)));
+
+        drop(guard);
+        assert_eq!(
+            capture.count.load(Ordering::SeqCst),
+            0,
+            "usage was readable -- this is the healthy path and must stay silent"
+        );
+
+        // The budget from the first (warning-free) request must actually
+        // have been charged, exactly as before this change.
+        let denied = run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(0)));
+        assert!(
+            denied.is_some(),
+            "the successfully-recorded usage above must have exhausted the budget"
+        );
+    }
+
+    #[test]
+    fn repeated_unreadable_usage_on_one_key_warns_once_not_per_request() {
+        let store = store_with(10, Duration::from_secs(60));
+        let warner = Arc::new(UsageMissingWarner::new());
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+
+        for i in 1..=5 {
+            let reply =
+                run_request_with_shared_warner(&store, &warner, "r1", Some("Bearer sk-1"), None);
+            assert!(
+                reply.is_none(),
+                "request {i} with unreadable usage must not be denied"
+            );
+        }
+
+        drop(guard);
+        assert_eq!(
+            capture.count.load(Ordering::SeqCst),
+            1,
+            "5 requests with unreadable usage on the SAME key must warn exactly once, not 5 \
+             times -- repeats within the suppression window must be swallowed"
         );
     }
 
