@@ -5,8 +5,8 @@ summary: What the admin server's /stats and /stats/prometheus endpoints
   never incremented.
 last_updated: 2026-08-09
 related:
-  - /configuration/configuration-file/
-  - /operations/config-reload/
+  - ../configuration/configuration-file/
+  - ../operations/config-reload/
 ---
 
 # Metrics and `/stats`
@@ -39,7 +39,7 @@ as `provider:ollama`. Both instruments are resolved once per cluster at
 startup, from the boot config snapshot, and again for any cluster a `SIGHUP`
 reload introduces (`crates/proxy/src/main.rs`'s `reload` function calls
 `StatHandles::resolve_missing`) — see
-[Config reload](/operations/config-reload/). A cluster the stats table has
+[Config reload](../operations/config-reload/). A cluster the stats table has
 never seen is a silent no-op, not a panic or an error: it simply does not
 appear in either endpoint's output until a reload (or restart) introduces
 it.
@@ -110,7 +110,7 @@ this crate's own tests:
 - **`gen_ai.client.token.usage`** — token counts by provider and type.
   Defined with `provider`/`type` attribute keys, but nothing in the usage
   filter or the router increments it — token counts today reach only the
-  access log (see [Access logs](/observability/access-logs/)), not `/stats`
+  access log (see [Access logs](../observability/access-logs/)), not `/stats`
   or `/stats/prometheus` (`crates/proxy-observability/src/stats.rs`, the
   `GEN_AI_CLIENT_TOKEN_USAGE` constant).
 

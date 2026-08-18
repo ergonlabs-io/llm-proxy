@@ -4,9 +4,9 @@ summary: Every llm-proxy flag documented on this site, verified against
   --help and the real argument parser.
 last_updated: 2026-08-09
 related:
-  - /getting-started/quickstart/
-  - /operations/draining-and-shutdown/
-  - /operations/config-reload/
+  - ../getting-started/quickstart/
+  - ../operations/draining-and-shutdown/
+  - ../operations/config-reload/
 ---
 
 # CLI reference
@@ -46,7 +46,7 @@ here entirely rather than described vaguely.
 ## `--mode keygen`
 
 Generates a fresh virtual key and the digest that goes in `auth.keys[]` —
-see [Configuration file reference](/configuration/configuration-file/)
+see [Configuration file reference](../configuration/configuration-file/)
 for the `auth` block this feeds.
 
 | Flag | Required | Default | What it does |
@@ -85,15 +85,15 @@ digest. Store it immediately.
 |---|---|---|
 | `--config <PATH>` | — | Path to the config file. Required. |
 | `--concurrency <N>` | number of available CPU cores | Number of worker runtimes. |
-| `--drain-time-s <SECS>` | `600` | Seconds to wait for connections to close during shutdown — see [Draining and shutdown](/operations/draining-and-shutdown/). |
-| `--drain-strategy <gradual\|immediate>` | `gradual` | How shutdown encourages connections to close. See [Draining and shutdown](/operations/draining-and-shutdown/) for what these do and do not affect today. |
+| `--drain-time-s <SECS>` | `600` | Seconds to wait for connections to close during shutdown — see [Draining and shutdown](../operations/draining-and-shutdown/). |
+| `--drain-strategy <gradual\|immediate>` | `gradual` | How shutdown encourages connections to close. See [Draining and shutdown](../operations/draining-and-shutdown/) for what these do and do not affect today. |
 | `--base-id <N>` | — | Accepted for compatibility with tooling that always passes it. llm-proxy has no hot-restart implementation, so this is parsed and ignored. |
 | `-l`, `--log-level <LEVEL>` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `critical`, or `off`. `critical` maps to `error`. |
 | `--service-node <NAME>` | — | Reserved for future dynamic-configuration support; not consumed by anything today. |
 | `--service-cluster <NAME>` | — | Reserved for future dynamic-configuration support; not consumed by anything today. |
 
 A running `serve` process also responds to `SIGHUP` (config reload — see
-[Config reload](/operations/config-reload/)) and `SIGTERM`/`SIGINT`
+[Config reload](../operations/config-reload/)) and `SIGTERM`/`SIGINT`
 (graceful shutdown).
 
 ## Every mode

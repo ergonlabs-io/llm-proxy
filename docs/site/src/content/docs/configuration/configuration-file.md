@@ -6,8 +6,8 @@ summary: Field-by-field reference for the llm-proxy configuration file
   enforced yet.
 last_updated: 2026-08-09
 related:
-  - /getting-started/introduction/
-  - /getting-started/quickstart/
+  - ../getting-started/introduction/
+  - ../getting-started/quickstart/
 ---
 
 # Configuration file reference
@@ -51,7 +51,7 @@ JSON error body listing known models.
 | `type` | enum: `openai`, `anthropic`, `openai-compatible`, `azure-openai`, `vertex`, `bedrock` | no | `openai-compatible`, unless the provider's name is `openai` or `anthropic` | The wire shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. `azure-openai`/`vertex`/`bedrock` are named for the model catalogue but are not yet loadable as a `providers` entry — their credential scheme is not implemented, and configuring one is a load error naming the gap. |
 | `base_url` | string (URI) | only if the name/type does not imply one | `https://api.openai.com` for `openai`, `https://api.anthropic.com` for `anthropic` | The API base URL. Host and port only — a path prefix (e.g. `/openai` for Groq) is a load error in this schema version, not a silent truncation. |
 | `api_key` | string | no (mutually exclusive with `api_key_file`) | none | The API key, sent as `Authorization: Bearer` for OpenAI-shaped APIs or `x-api-key` for Anthropic. Omit both `api_key` and `api_key_file` for an unauthenticated local backend. |
-| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup — despite the schema's own field description, this is **not** watched or hot-reloaded automatically; the lowering step emits a load-time warning on `providers.<name>.api_key_file` saying so. A `SIGHUP` config reload does re-read it, since a reload re-parses the whole config file from scratch — see [Config reload](/operations/config-reload/). |
+| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup — despite the schema's own field description, this is **not** watched or hot-reloaded automatically; the lowering step emits a load-time warning on `providers.<name>.api_key_file` saying so. A `SIGHUP` config reload does re-read it, since a reload re-parses the whole config file from scratch — see [Config reload](../operations/config-reload/). |
 | `extra_headers` | object of string | no | `{}` | Extra headers sent on every request to this provider. An Anthropic provider also gets a default `anthropic-version` header; setting it here overrides that default. |
 | `ca_file` | string (path) | no | system roots | PEM CA bundle for verifying this provider's TLS certificate. Only needed for a self-hosted backend with a private CA. |
 | `connect_timeout` | `Duration` | no | `5s` | TCP/TLS connection establishment timeout for this provider. |
@@ -144,7 +144,7 @@ limits need a shared budget store, which does not exist yet.
 
 A streamed response and a realtime session are both logged once, at stream
 end, with usage totals — not per chunk. See
-[Getting started](/getting-started/quickstart/) for what one line actually
+[Getting started](../getting-started/quickstart/) for what one line actually
 contains.
 
 ## The `models` catalogue
@@ -207,7 +207,7 @@ computed and exposed on the admin endpoint when `admin` is configured." As
 implemented today, `/stats` and `/stats/prometheus` both report real
 per-cluster request counts and latencies, but not every metric a reader might
 expect from that sentence exists yet — see
-[Metrics and /stats](/observability/metrics-and-stats/) for exactly which
+[Metrics and /stats](../observability/metrics-and-stats/) for exactly which
 counters are wired to real traffic and which are defined but never
 incremented. Both endpoints are read-only and take no configuration beyond
 the `admin` bind address itself.

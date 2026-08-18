@@ -4,8 +4,8 @@ summary: SIGTERM/SIGINT trigger a drain window before the process exits. What
   the drain deadline actually bounds, and what it does not.
 last_updated: 2026-08-09
 related:
-  - /operations/config-reload/
-  - /reference/cli/
+  - ../operations/config-reload/
+  - ../reference/cli/
 ---
 
 # Draining and shutdown
@@ -72,4 +72,4 @@ connection so the strategies actually diverge in practice is not done yet.
 | `--drain-time-s` | `600` | Seconds to wait for connections to close before forcing every remaining one into graceful protocol shutdown. |
 | `--drain-strategy` | `gradual` | `gradual` or `immediate` — see the note above for what these do and do not affect today. |
 
-See [CLI reference](/reference/cli/) for the full flag list.
+See [CLI reference](../reference/cli/) for the full flag list.
