@@ -5,8 +5,8 @@ summary: Build the llm-proxy binary, validate a config, serve it against an
   request.
 last_updated: 2026-08-09
 related:
-  - /getting-started/introduction/
-  - /configuration/configuration-file/
+  - ../getting-started/introduction/
+  - ../configuration/configuration-file/
 ---
 
 # Getting started
@@ -46,7 +46,7 @@ Run `--help` to see the full flag list.
 `serve` is the default mode. `validate` takes a config and exits without
 binding a listener, reporting whether the config loads. `keygen` generates a
 virtual key for downstream authentication and needs no config at all — see
-[Configuration file reference](/configuration/configuration-file/).
+[Configuration file reference](../configuration/configuration-file/).
 
 ## Step 3: Validate a config
 

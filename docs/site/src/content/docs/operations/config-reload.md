@@ -5,9 +5,9 @@ summary: SIGHUP re-reads the config file a running proxy booted with and
   the proxy serving the previous snapshot and logs the full error.
 last_updated: 2026-08-09
 related:
-  - /configuration/configuration-file/
-  - /observability/metrics-and-stats/
-  - /operations/draining-and-shutdown/
+  - ../configuration/configuration-file/
+  - ../observability/metrics-and-stats/
+  - ../operations/draining-and-shutdown/
 ---
 
 # Config reload
@@ -47,7 +47,7 @@ booted with, then applies the result in this order
 1. Resolve stats handles for any cluster the new snapshot names that the
    running process has never seen before, so traffic to a brand-new cluster
    is counted in `/stats` from its first request — see
-   [Metrics and /stats](/observability/metrics-and-stats/).
+   [Metrics and /stats](../observability/metrics-and-stats/).
 2. Update the shared cluster manager with the new cluster set. A cluster
    that fails to build (an unimplemented load-balancing policy, a bad TLS
    config) is logged at `error` and left out of the live cluster set —
@@ -96,5 +96,5 @@ A `SIGHUP` reload does not disturb the shutdown/drain sequence: a `SIGTERM`
 sent after one or more reloads still drains and exits cleanly, proven by
 `sigterm_after_a_reload_still_drains_and_exits_cleanly` in
 `crates/proxy/tests/reload.rs`. See
-[Draining and shutdown](/operations/draining-and-shutdown/) for what that
+[Draining and shutdown](../operations/draining-and-shutdown/) for what that
 sequence does.

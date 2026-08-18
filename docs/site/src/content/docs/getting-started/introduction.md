@@ -6,8 +6,8 @@ summary: llm-proxy is a Rust proxy for LLM inference APIs, configured with a
   providers, and authenticates callers.
 last_updated: 2026-08-09
 related:
-  - /getting-started/quickstart/
-  - /configuration/configuration-file/
+  - ../getting-started/quickstart/
+  - ../configuration/configuration-file/
 ---
 
 # Introduction to llm-proxy
@@ -24,7 +24,7 @@ llm-proxy is configured with a single YAML file, normatively defined by
 `schema/llmproxy-v0.schema.json`. You name providers and routes by model
 pattern; llm-proxy handles the rest. Parsing is strict — an unknown or
 misspelled field is a load error naming its exact dotted path, never a
-silent ignore. [Configuration file reference](/configuration/configuration-file/)
+silent ignore. [Configuration file reference](../configuration/configuration-file/)
 is the field-by-field reference.
 
 ## What ships today
@@ -62,7 +62,7 @@ Four LLM-specific behaviors are implemented and exercised by tests:
 
 llm-proxy does not watch its config file for changes. A running process
 re-reads its config only on `SIGHUP` — see
-[Config reload](/operations/config-reload/) — never automatically. Changing a
+[Config reload](../operations/config-reload/) — never automatically. Changing a
 config file on disk has no effect until you either send `SIGHUP` or restart
 the process.
 
@@ -71,5 +71,5 @@ is not yet a general "try any provider on failure" mechanism. And the
 `models` catalogue in the configuration (a named model mapped to an ordered
 list of providers) records every provider you list but, in this schema
 version, only ever routes to the first one; see
-[Configuration file reference](/configuration/configuration-file/)
+[Configuration file reference](../configuration/configuration-file/)
 for the exact field-by-field behavior.

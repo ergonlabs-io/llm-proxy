@@ -4,8 +4,8 @@ summary: The format-string engine behind observability.access_logs, the
   operators it supports, and when a line is actually written.
 last_updated: 2026-08-09
 related:
-  - /configuration/configuration-file/
-  - /observability/metrics-and-stats/
+  - ../configuration/configuration-file/
+  - ../observability/metrics-and-stats/
 ---
 
 # Access logs
@@ -79,7 +79,7 @@ value renders as a JSON string — including numbers — because the field
 values are all rendered through the same format-string engine as the text
 format; `AccessLogFormat::Json` carries no typed (numeric/boolean) value
 today (`crates/proxy-http/src/access_logging.rs`'s `render_json`). See
-[Getting started](/getting-started/quickstart/) for a full real example
+[Getting started](../getting-started/quickstart/) for a full real example
 line and field list.
 
 ## The operator set
