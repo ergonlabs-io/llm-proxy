@@ -1967,6 +1967,76 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   replaced; token counts appear under pinned semconv names; and the Envoy-name `/stats` adapter
   still passes WP-23's own conformance tests unchanged.
 
+#### WP-54 — Tenant self-service usage API  (Size: S)  — **Priority: P1**
+
+> Scoped 2026-08-21 from the owner's question: "how do we serve the management and
+> observability pieces — an admin portal and a regular user portal for token usage?"
+> The answer that survived contact with the code is that those are **two different
+> products**, and only one of them is ours to build. This WP is that one.
+
+**The starting position, measured rather than assumed:**
+
+- **`/stats` has no tenant dimension at all.** `grep tenant` in
+  `proxy-observability/src/stats.rs` returns nothing; every counter is keyed by
+  `cluster` or `listener`. What we have is operator-shaped observability, and a user
+  portal needs it user-shaped.
+- **The only per-tenant state that exists is `InProcessBudgetStore`** — a
+  `Mutex<HashMap<LimitKey, Window>>` holding the *current fixed window only*.
+  In-process, lost on restart, not shared across replicas.
+- **There is no storage.** Nothing can answer "tokens used last Tuesday". Access logs
+  carry per-request usage, but a log stream is not a queryable store.
+- **The admin endpoint is unauthenticated by design** and serves `/config_dump`;
+  `SECURITY.md` declares findings against it out of scope when it is exposed.
+
+**Scope — a read-only endpoint that adds NO storage.** `GET /v1/usage` on the data
+plane, authenticated by the caller's own virtual key, returning current-window
+`used`/`limit`/`remaining`/`reset`. This is close to free: `InProcessBudgetStore`
+already computes exactly this, and the 429 path already emits `x-ratelimit-limit`,
+`-remaining` and `-reset` (`token_limit_filter.rs:596`). We compute this state today
+and then discard it.
+
+**The security property is the design, not a detail: the key authenticates AND
+scopes.** There is no tenant-id parameter, ever — a caller can read only the key it
+presented. Retrofitting that later is how cross-tenant leaks happen; holding it now
+costs nothing. Note also what the response must NOT echo: `LimitKey` can carry a
+credential descriptor, and it is safe to log today only because the single production
+site that builds one hashes first (ground rule: verify that in the code, not in the
+comment claiming it).
+
+**Explicitly out of scope**, and each for a reason:
+- *Historical usage.* Needs a store; see WP-55.
+- *Cost, rather than tokens.* Needs **WP-53**'s rate card. "What did it cost" and
+  "should WP-53 land" are the same question.
+- *Anything on the admin listener.* If a management surface becomes network-reachable,
+  admin authn/authz lands FIRST, on its own listener, and `SECURITY.md`'s scope
+  statement changes with it. That is a precondition, not a follow-up.
+
+**Acceptance:** a tenant reading its own usage gets its own numbers; a tenant
+presenting key A can obtain no information about tenant B by any parameter,
+header, or path; an unauthenticated request is refused; the endpoint never appears
+on a listener that has no `auth` block configured.
+
+#### WP-55 — Usage history: export, or own it  (Size: L)  — **Priority: P2** · **DECISION REQUIRED**
+
+The decision that changes what this project is, deliberately separated from WP-54 so
+the cheap useful half is not held hostage to it.
+
+- **(a) Export-only.** Record `GEN_AI_CLIENT_TOKEN_USAGE` (defined in
+  `stats.rs:447`, **never recorded** — it is in the README's known gaps) with
+  tenant/model/provider attributes, ship it over OTel (**WP-51**), and let operators
+  point Grafana at it. Proxy stays stateless: one binary, no database in the request
+  path's blast radius. Operators get per-tenant dashboards without us writing UI.
+  Hazards: metric label **cardinality**, and the tenant label must be the tenant id,
+  never the key.
+- **(b) Own a datastore and serve a UI.** More valuable to end users, and what
+  comparable gateways do. Costs: a stateful dependency welded into a data-plane proxy,
+  and a new authenticated web surface to defend.
+
+**Recommendation: (a) first, keep (b) open.** A stateless proxy that emits well can
+always have a portal built beside it; a proxy with a database welded in cannot be
+un-welded. (a) is also what makes (b) cheap later, so this is sequencing rather than
+a fork.
+
 #### WP-53 — Versioned model pricing  (Size: M)  — **Priority: P1** · **Milestone: v0.2.0**
 > **Design brief: `docs/wp-53-pricing-design-brief.md` (2026-08-08), normative for the seams.**
 > Owner direction the same day: support updating versioned pricing so rate limiting can be
