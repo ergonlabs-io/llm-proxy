@@ -189,6 +189,13 @@ fn fmt_delta(v: Option<i64>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
+/// Render a capacity-row latency: `None` (no successful streams at this
+/// level) prints as an unmistakable `-`, never a fabricated `0.0` or (the
+/// Defect 1 bug) `Duration::MAX` rendered as `1.8e+22`.
+fn fmt_ms(v: Option<f64>) -> String {
+    v.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into())
+}
+
 // ---------------------------------------------------------------------
 // Capacity report (WP-30 phase 2): renders a `sweep::SweepReport` into a
 // concurrency -> throughput/latency/resource-usage table, plus the derived
@@ -205,9 +212,15 @@ pub struct CapacityRow {
     pub passed: bool,
     pub violations: Vec<SloViolation>,
     pub throughput_rps: f64,
-    pub p50_latency_ms: f64,
-    pub p99_latency_ms: f64,
-    pub ttft_p99_ms: f64,
+    /// `None` (serializes as JSON `null`, rendered as `-` in the text table)
+    /// when the level had no successful streams to measure -- never a
+    /// fabricated number. See `sweep::LevelStats` and Defect 1's fix: this
+    /// used to be a plain `f64` fed by `Duration::MAX`, which rendered as
+    /// `1.8446744073709552e+22` and made the SLO gate misreport a 100%
+    /// error-rate level as a p99-latency violation.
+    pub p50_latency_ms: Option<f64>,
+    pub p99_latency_ms: Option<f64>,
+    pub ttft_p99_ms: Option<f64>,
     pub error_rate: f64,
     pub peak_rss_bytes: Option<u64>,
     pub mean_cpu_percent: Option<f64>,
@@ -331,9 +344,9 @@ pub fn build_capacity_report(
             passed: l.passed(),
             violations: l.violations.clone(),
             throughput_rps: l.stats.throughput_rps,
-            p50_latency_ms: l.stats.p50_latency.as_secs_f64() * 1000.0,
-            p99_latency_ms: l.stats.p99_latency.as_secs_f64() * 1000.0,
-            ttft_p99_ms: l.stats.ttft_p99.as_secs_f64() * 1000.0,
+            p50_latency_ms: l.stats.p50_latency.map(|d| d.as_secs_f64() * 1000.0),
+            p99_latency_ms: l.stats.p99_latency.map(|d| d.as_secs_f64() * 1000.0),
+            ttft_p99_ms: l.stats.ttft_p99.map(|d| d.as_secs_f64() * 1000.0),
             error_rate: l.stats.error_rate,
             peak_rss_bytes: l.stats.peak_rss_bytes,
             mean_cpu_percent: l.stats.mean_cpu_percent,
@@ -353,7 +366,17 @@ pub fn build_capacity_report(
         .map(|l| l.concurrency)
         .max()
         .unwrap_or(0);
-    let harness_bound = rig::harness_bound(reached, rig_info, 10);
+    // The other axis (see `rig`'s module doc): the highest observed
+    // connects/sec across every level driven, regardless of concurrency.
+    // `throughput_rps` (streams completed / elapsed) is a direct connect
+    // rate here -- loadgen is connect-per-stream (`driver.rs`), so one
+    // completed stream is one connect from loadgen's side.
+    let peak_connect_rate = sweep_report
+        .levels
+        .iter()
+        .map(|l| l.stats.throughput_rps)
+        .fold(0.0_f64, f64::max);
+    let harness_bound = rig::harness_bound(reached, peak_connect_rate, rig_info, 10);
 
     CapacityReport {
         rows,
@@ -382,13 +405,13 @@ pub fn print_capacity_report(report: &CapacityReport) {
     );
     for row in &report.rows {
         println!(
-            "{:>12} {:>6} {:>12.1} {:>10.1} {:>10.1} {:>10.1} {:>9.2} {:>12} {:>9} {:>9}",
+            "{:>12} {:>6} {:>12.1} {:>10} {:>10} {:>10} {:>9.2} {:>12} {:>9} {:>9}",
             row.concurrency,
             if row.passed { "ok" } else { "FAIL" },
             row.throughput_rps,
-            row.p50_latency_ms,
-            row.p99_latency_ms,
-            row.ttft_p99_ms,
+            fmt_ms(row.p50_latency_ms),
+            fmt_ms(row.p99_latency_ms),
+            fmt_ms(row.ttft_p99_ms),
             row.error_rate,
             row.peak_rss_bytes
                 .map(|b| format!("{:.1}MB", b as f64 / 1_048_576.0))
@@ -488,9 +511,9 @@ mod capacity_tests {
             concurrency,
             stats: sweep::LevelStats {
                 throughput_rps: requests as f64 / 10.0,
-                p50_latency: std::time::Duration::from_millis(10),
-                p99_latency: std::time::Duration::from_millis(50),
-                ttft_p99: std::time::Duration::from_millis(20),
+                p50_latency: Some(std::time::Duration::from_millis(10)),
+                p99_latency: Some(std::time::Duration::from_millis(50)),
+                ttft_p99: Some(std::time::Duration::from_millis(20)),
                 error_rate: 0.0,
                 requests_completed: requests,
                 steady_state_secs: 10.0,
@@ -537,6 +560,9 @@ mod capacity_tests {
             port_budget: 100,
             fd_budget: Some(1_000),
             estimated_max_concurrency: 100,
+            time_wait: std::time::Duration::from_secs(60),
+            time_wait_is_measured: false,
+            connect_rate_budget: 0.0,
         };
         let report = build_capacity_report(&sweep_report, &rig_info);
         assert!(
@@ -561,8 +587,78 @@ mod capacity_tests {
             port_budget: 8_000,
             fd_budget: Some(500_000),
             estimated_max_concurrency: 8_000,
+            time_wait: std::time::Duration::from_secs(60),
+            time_wait_is_measured: false,
+            connect_rate_budget: 0.0,
         };
         let report = build_capacity_report(&sweep_report, &rig_info);
         assert!(report.harness_bound.is_none());
+    }
+
+    /// Defect 1, end to end: a level where EVERY stream fails has no
+    /// latency data at all -- `LevelStats::p50_latency`/`p99_latency`/
+    /// `ttft_p99` must come back `None`, not `Duration::MAX` (which used to
+    /// render as the JSON number `1.8446744073709552e+22` and get
+    /// misreported as a `P99Latency`/`TtftP99` SLO violation riding along
+    /// with the real cause). The gate must name `ErrorRate` alone.
+    #[test]
+    fn build_capacity_report_all_failures_yields_no_fabricated_latency_and_error_rate_only_violation(
+    ) {
+        let slo = sweep::SloConfig {
+            p99_ceiling: std::time::Duration::from_millis(500),
+            ttft_p99_ceiling: std::time::Duration::from_millis(200),
+            max_error_rate: 0.01,
+        };
+        let stats = sweep::LevelStats {
+            throughput_rps: 0.0,
+            p50_latency: None,
+            p99_latency: None,
+            ttft_p99: None,
+            error_rate: 1.0,
+            requests_completed: 0,
+            steady_state_secs: 10.0,
+            peak_rss_bytes: None,
+            mean_cpu_percent: None,
+            peak_fds: None,
+        };
+        let violations = slo.evaluate(&stats);
+        assert_eq!(violations, vec![sweep::SloViolation::ErrorRate]);
+
+        let sweep_report = sweep::SweepReport {
+            levels: vec![sweep::LevelResult {
+                concurrency: 4,
+                stats,
+                violations,
+                driver_error: None,
+            }],
+            max_sustainable: None,
+            first_failing: Some(4),
+        };
+        let rig_info = RigInfo {
+            fd_soft_limit: Some(1_000),
+            ephemeral_port_range: (49152, 65535),
+            ephemeral_port_range_is_measured: true,
+            somaxconn: Some(128),
+            sockets_per_stream: rig::DEFAULT_SOCKETS_PER_STREAM,
+            port_budget: 8_000,
+            fd_budget: Some(500_000),
+            estimated_max_concurrency: 8_000,
+            time_wait: std::time::Duration::from_secs(60),
+            time_wait_is_measured: false,
+            connect_rate_budget: 0.0,
+        };
+        let report = build_capacity_report(&sweep_report, &rig_info);
+        let row = &report.rows[0];
+        assert!(row.p50_latency_ms.is_none());
+        assert!(row.p99_latency_ms.is_none());
+        assert!(row.ttft_p99_ms.is_none());
+        assert_eq!(row.violations, vec![sweep::SloViolation::ErrorRate]);
+        assert!(!row.passed);
+
+        // The wire-level check: JSON `null`, never a fabricated number.
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(json["p50_latency_ms"], serde_json::Value::Null);
+        assert_eq!(json["p99_latency_ms"], serde_json::Value::Null);
+        assert_eq!(json["ttft_p99_ms"], serde_json::Value::Null);
     }
 }

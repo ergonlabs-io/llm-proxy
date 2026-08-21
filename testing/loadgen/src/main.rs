@@ -350,9 +350,18 @@ async fn run_sweep(
 
 /// Turn one level's [`loadgen::metrics::RunSummary`] (already warm-up
 /// excluded by `driver::run_closed_loop`) plus its process-sampler summary
-/// into the [`sweep::LevelStats`] the search/SLO logic consumes. Missing
-/// percentiles (no successful streams at all) map to `Duration::MAX` so an
-/// empty/degenerate level fails the SLO instead of silently passing it.
+/// into the [`sweep::LevelStats`] the search/SLO logic consumes.
+///
+/// Missing percentiles (no successful streams at all -- every request in
+/// the level errored) map to `None`, not a sentinel duration. This used to
+/// be `Duration::MAX`, which `report::build_capacity_report` then rendered
+/// as the JSON number `1.8446744073709552e+22` and `SloConfig::evaluate`
+/// read as a genuine (astronomically large) p99/ttft measurement, so a
+/// level that failed purely on error rate was ALSO reported as failing its
+/// latency SLO -- the wrong cause, riding along with the right one. A level
+/// with no data still fails via `SloViolation::ErrorRate` (see
+/// `sweep::SloConfig::evaluate`), it just no longer fabricates a latency
+/// number to go with it.
 fn level_stats(
     summary: &loadgen::metrics::RunSummary,
     steady_state_secs: f64,
@@ -361,18 +370,15 @@ fn level_stats(
     let p50_latency = summary
         .total_from_scheduled_us
         .as_ref()
-        .map(|p| Duration::from_micros(p.p50))
-        .unwrap_or(Duration::MAX);
+        .map(|p| Duration::from_micros(p.p50));
     let p99_latency = summary
         .total_from_scheduled_us
         .as_ref()
-        .map(|p| Duration::from_micros(p.p99))
-        .unwrap_or(Duration::MAX);
+        .map(|p| Duration::from_micros(p.p99));
     let ttft_p99 = summary
         .ttft_from_scheduled_us
         .as_ref()
-        .map(|p| Duration::from_micros(p.p99))
-        .unwrap_or(Duration::MAX);
+        .map(|p| Duration::from_micros(p.p99));
     let throughput_rps = if steady_state_secs > 0.0 {
         summary.streams_counted as f64 / steady_state_secs
     } else {
@@ -408,5 +414,65 @@ async fn run_mode(
             let (summary, stats) = driver::run_open_loop(cfg, rate, duration, warmup).await;
             (summary, Some(stats))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loadgen::metrics::{Aggregator, Outcome, StreamResult};
+    use std::time::Instant;
+
+    fn failed_result(now: Instant) -> StreamResult {
+        StreamResult {
+            scheduled_start: now,
+            send_start: now,
+            outcome: Outcome::HttpError(500),
+            ttft_from_scheduled: None,
+            ttft_from_send: None,
+            // `failed_result`-shaped: a real failure still carries a
+            // time-to-failure, but `Aggregator::record` never lets it reach
+            // a latency histogram (see `metrics.rs`) -- that's what makes
+            // the histograms genuinely empty below, not just zeroed.
+            total_from_scheduled: Duration::from_millis(5),
+            total_from_send: Duration::from_millis(5),
+            inter_token_gaps: Vec::new(),
+            tokens_received: 0,
+            bytes_received: 0,
+        }
+    }
+
+    /// Defect 1: a level where every stream fails must not fabricate a
+    /// latency figure. Before the fix, `level_stats` mapped the empty
+    /// histograms' missing percentiles to `Duration::MAX`, which
+    /// `report::build_capacity_report` rendered as the JSON number
+    /// `1.8446744073709552e+22` and the SLO gate then misread as a real
+    /// (enormous) p99/ttft measurement -- so a level that failed on error
+    /// rate alone was also reported as failing its latency SLO.
+    #[test]
+    fn level_stats_carries_no_fabricated_latency_when_every_stream_in_the_level_fails() {
+        let now = Instant::now();
+        let mut agg = Aggregator::new(now - Duration::from_secs(1));
+        for _ in 0..5 {
+            agg.record(failed_result(now));
+        }
+        let summary = agg.finish();
+        assert_eq!(summary.error_rate, 1.0);
+        assert!(summary.total_from_scheduled_us.is_none());
+        assert!(summary.ttft_from_scheduled_us.is_none());
+
+        let stats = level_stats(&summary, 10.0, None);
+        assert!(stats.p50_latency.is_none());
+        assert!(stats.p99_latency.is_none());
+        assert!(stats.ttft_p99.is_none());
+        assert_eq!(stats.error_rate, 1.0);
+
+        // And the SLO gate must name the real cause alone.
+        let slo = SloConfig {
+            p99_ceiling: Duration::from_millis(500),
+            ttft_p99_ceiling: Duration::from_millis(200),
+            max_error_rate: 0.01,
+        };
+        assert_eq!(slo.evaluate(&stats), vec![sweep::SloViolation::ErrorRate]);
     }
 }
