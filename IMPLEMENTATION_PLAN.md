@@ -1923,11 +1923,14 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
 |---|---|---|
 | Logs | Strong. 79 access-log command operators, 9 LLM-specific, structured sinks with rotation. | Names are ours, not semconv. |
 | Traces | `traceparent` **passes through** — headers are cloned per attempt and mutations only add, so we never strip it. But we emit no spans and never join the trace. | Nothing. Additive. |
-| Metrics | **Nothing exists.** `/stats` is a deliberate 404. Zero `opentelemetry`/`prometheus`/`metrics` dependencies in any `Cargo.toml`. | WP-23. |
+| Metrics | **Superseded 2026-08-21 — WP-23 landed.** There IS a registry (`proxy-observability/src/stats.rs` plus `stats/{envoy_render,prometheus_render,prometheus_conformance}.rs`), `/stats` and `/stats/prometheus` both serve, and a sweep drove `upstream_rq_total` to 16,721 through the real admin endpoint. Still true and still relevant to increment 3: **zero `opentelemetry`/`prometheus`/`metrics` crate dependencies** — the Prometheus text format is rendered by hand, so OTLP export means adding the first such dependency, not swapping one out. | Increment 3 only. |
 
-Note `proxy-observability/src/lib.rs`'s own first line calls the crate a "Stats registry with
-Envoy-exact naming (WP-23)" — there is no registry module. Aspirational doc comment, same class
-as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when this WP lands.
+~~Note `proxy-observability/src/lib.rs`'s own first line calls the crate a "Stats registry
+with Envoy-exact naming (WP-23)" — there is no registry module. Aspirational doc comment.~~
+**Resolved 2026-08-21**: the registry exists and that sentence is now simply accurate. Left
+here rather than deleted, because "the doc comment described the intent and the code caught
+up" is a different and much less alarming story than the one this note originally told, and a
+reader who finds the old note elsewhere should be able to see it was closed.
 
 - **Increment 1 — semconv naming for the LLM access-log operators.** Align `%LLM_INPUT_TOKENS%`,
   `%LLM_OUTPUT_TOKENS%`, `%LLM_CACHED_TOKENS%`, `%LLM_CACHE_CREATION_TOKENS%`, `%LLM_TTFT%`,
