@@ -5,9 +5,21 @@
 //!
 //! The environment this was designed against (see the crate's task brief):
 //! 8 cores / 16 GB, ephemeral range 49152-65535 (16,384 ports), `somaxconn`
-//! 128. With connect-per-stream, a single-box run (loadgen -> proxy -> mock)
-//! burns two ephemeral ports per logical stream, so port space -- not fds or
-//! CPU -- caps out first, around ~8k concurrent streams.
+//! 128. With connect-per-stream on both hops, a single-box run (loadgen ->
+//! proxy -> mock) burns two ephemeral ports per logical stream, so port
+//! space -- not fds or CPU -- caps out first, around ~8k concurrent streams.
+//! Against a pooled (HTTP/2) upstream the proxy->mock hop is nearly free of
+//! new ports, so the honest divisor there is 1, not 2 -- see
+//! `RigInfo::sockets_per_stream`.
+//!
+//! Both budgets below describe *this process* (loadgen) alone. `fd_budget`
+//! in particular must not be halved to "account for the proxy": the proxy is
+//! a separate process with its own independent `RLIMIT_NOFILE` that this
+//! crate cannot read from here and does not try to -- it is instead
+//! *observed*, directly, by `sampler.rs` sampling the `--sweep-pid` process's
+//! own open-fd count (`peak_fds` in `SamplerSummary`) during a sweep. Baking
+//! a guess about the proxy's fd pressure into loadgen's own budget would
+//! just be a second, worse guess sitting next to a real measurement.
 
 use serde::Serialize;
 
@@ -25,13 +37,25 @@ pub struct RigInfo {
     /// concurrency, but a sweep that fails immediately at low concurrency
     /// with connection-refused errors should have this in view.
     pub somaxconn: Option<u64>,
-    /// Streams the ephemeral port range alone could sustain: two ephemeral
-    /// ports are consumed per logical stream on a single-box run
-    /// (loadgen->proxy, proxy->mock with no upstream connection reuse), so
-    /// this is `range / 2`.
+    /// How many ephemeral ports one logical stream is assumed to burn,
+    /// end to end. `2` is connect-per-stream on both hops (loadgen->proxy,
+    /// proxy->upstream) -- the correct assumption for an HTTP/1.1 upstream
+    /// with no connection reuse, and the default so every existing
+    /// invocation keeps its current behavior. `1` is the honest number once
+    /// the upstream hop is pooled: `crates/proxy-http/src/upstream_pool.rs`
+    /// keeps one connection per (cluster, address, protocol) and multiplexes
+    /// every concurrent stream over it for an HTTP/2 upstream, so that hop
+    /// costs approximately zero new ports per stream and only the
+    /// loadgen->proxy hop remains. Set via `--rig-sockets-per-stream`.
+    pub sockets_per_stream: u64,
+    /// Streams the ephemeral port range alone could sustain:
+    /// `range / sockets_per_stream`.
     pub port_budget: u64,
     /// Streams the fd soft limit alone could sustain, if the limit could be
-    /// read (`None` otherwise -- never a fabricated budget).
+    /// read (`None` otherwise -- never a fabricated budget). This is
+    /// loadgen's OWN fd budget (one fd per in-flight stream, its client
+    /// socket to the proxy) -- not an estimate of the proxy's, which is a
+    /// different process's rlimit; see the module doc.
     pub fd_budget: Option<u64>,
     /// Rough ceiling on concurrent streams *this rig* can sustain, ignoring
     /// the proxy/target entirely: `min(fd_budget, port_budget)`.
@@ -49,16 +73,31 @@ const FALLBACK_EPHEMERAL_RANGE: (u16, u16) = (49152, 65535);
 /// Leave headroom for stdio, the listening/admin sockets, and whatever else
 /// the process already has open -- an estimate, not a hard guarantee.
 const FD_RESERVE: u64 = 64;
+/// Connect-per-stream on both hops -- the default so every existing
+/// invocation of `--rig-sockets-per-stream` keeps its current behavior
+/// exactly. See `RigInfo::sockets_per_stream`.
+pub const DEFAULT_SOCKETS_PER_STREAM: u64 = 2;
 
-pub fn detect() -> RigInfo {
+/// `sockets_per_stream` is the caller's assumption about how many ephemeral
+/// ports one logical stream burns end to end -- see `RigInfo::sockets_per_stream`
+/// for what `1` vs `2` mean. Callers that don't care (tests, anything not
+/// touching `port_budget`) can pass the crate's own default,
+/// [`DEFAULT_SOCKETS_PER_STREAM`].
+pub fn detect(sockets_per_stream: u64) -> RigInfo {
     let fd_soft_limit = fd_soft_limit();
     let (ephemeral_port_range, ephemeral_port_range_is_measured) = ephemeral_port_range()
         .map(|r| (r, true))
         .unwrap_or((FALLBACK_EPHEMERAL_RANGE, false));
     let somaxconn = somaxconn();
 
-    let port_budget = (ephemeral_port_range.1 as u64 - ephemeral_port_range.0 as u64).div_ceil(2);
-    let fd_budget = fd_soft_limit.map(|limit| limit.saturating_sub(FD_RESERVE) / 2);
+    let port_range = ephemeral_port_range.1 as u64 - ephemeral_port_range.0 as u64;
+    let port_budget = port_range.div_ceil(sockets_per_stream.max(1));
+    // Rust note: no `/ 2` here -- `fd_soft_limit` is *this process's* rlimit
+    // (loadgen holds exactly one fd per in-flight stream: its socket to the
+    // proxy), so it isn't shared with anything else that needs dividing out.
+    // See the module doc for why the proxy's own fd pressure belongs to
+    // `sampler.rs`'s `peak_fds`, not a guess here.
+    let fd_budget = fd_soft_limit.map(|limit| limit.saturating_sub(FD_RESERVE));
     let estimated_max_concurrency = match fd_budget {
         Some(fd_budget) => port_budget.min(fd_budget),
         None => port_budget,
@@ -69,6 +108,7 @@ pub fn detect() -> RigInfo {
         ephemeral_port_range,
         ephemeral_port_range_is_measured,
         somaxconn,
+        sockets_per_stream,
         port_budget,
         fd_budget,
         estimated_max_concurrency,
@@ -79,8 +119,10 @@ pub fn detect() -> RigInfo {
 /// output -- this is meant to be read by a human before they trust a number.
 pub fn log_summary(info: &RigInfo) {
     eprintln!(
-        "rig: fd_soft_limit={} ephemeral_ports={}-{}{} somaxconn={} -> estimated max \
-         concurrency this rig can sustain (independent of the target under test): ~{}",
+        "rig: fd_soft_limit={} ephemeral_ports={}-{}{} somaxconn={} sockets_per_stream={} \
+         (assumed ephemeral ports burned per logical stream; 2=connect-per-stream both hops, \
+         1=pooled HTTP/2 upstream) -> estimated max concurrency this rig can sustain \
+         (independent of the target under test): ~{}",
         info.fd_soft_limit
             .map(|l| l.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
@@ -94,6 +136,7 @@ pub fn log_summary(info: &RigInfo) {
         info.somaxconn
             .map(|l| l.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
+        info.sockets_per_stream,
         info.estimated_max_concurrency,
     );
 }
@@ -116,10 +159,22 @@ pub fn print_self_check(info: &RigInfo) {
     );
     println!("somaxconn               = {}", fmt_opt(info.somaxconn));
     println!(
-        "port_budget (streams)   = {}  (connect-per-stream burns ~2 ports/stream)",
+        "sockets_per_stream      = {}  (assumed ephemeral ports burned per logical stream: \
+         2=connect-per-stream on both hops [HTTP/1.1 upstream, today's default], \
+         1=proxy->upstream hop pools [HTTP/2 upstream reaching the connection cache] -- \
+         set via --rig-sockets-per-stream)",
+        info.sockets_per_stream
+    );
+    println!(
+        "port_budget (streams)   = {}  (ephemeral range / sockets_per_stream)",
         info.port_budget
     );
-    println!("fd_budget (streams)     = {}", fmt_opt(info.fd_budget));
+    println!(
+        "fd_budget (streams)     = {}  (this process's own fd limit -- the proxy's fd \
+         pressure is a different process's rlimit; it is measured, not guessed, via \
+         --sweep-pid sampling, see sampler.rs)",
+        fmt_opt(info.fd_budget)
+    );
     println!(
         "estimated_max_concurrency = {}  <- the ceiling THIS RIG imposes, independent of the \
          proxy under test; a sweep that terminates at or near this number is HARNESS-BOUND, \
@@ -146,8 +201,17 @@ pub fn harness_bound(reached: usize, rig: &RigInfo, slack_percent: u64) -> Optio
     let fd_budget = rig.fd_budget.unwrap_or(u64::MAX);
     if rig.port_budget <= fd_budget {
         if near(rig.port_budget) {
+            // Rust note: `limit_name` is `&'static str`, so the label picks
+            // between two pre-written strings by `sockets_per_stream` rather
+            // than formatting the number in -- cheaper than a `String` and
+            // there are only the two assumptions this crate models.
+            let limit_name = if rig.sockets_per_stream <= 1 {
+                "ephemeral port range (pooled upstream hop, ~1 port/stream)"
+            } else {
+                "ephemeral port range (connect-per-stream, ~2 ports/stream)"
+            };
             return Some(HarnessBound {
-                limit_name: "ephemeral port range (connect-per-stream, ~2 ports/stream)",
+                limit_name,
                 limit_value: rig.port_budget,
             });
         }
@@ -243,17 +307,45 @@ mod tests {
 
     #[test]
     fn detect_returns_a_nonzero_estimate() {
-        let info = detect();
+        let info = detect(DEFAULT_SOCKETS_PER_STREAM);
         assert!(info.estimated_max_concurrency > 0);
         assert!(info.ephemeral_port_range.1 > info.ephemeral_port_range.0);
     }
 
+    #[test]
+    fn fd_budget_no_longer_halves_the_soft_limit() {
+        // Defect 1: `fd_budget` used to be `(limit - reserve) / 2`, modelling
+        // a second process's descriptors that this crate can't read. It must
+        // now be exactly `limit - reserve` -- loadgen holds one fd per
+        // in-flight stream, nothing to divide out.
+        let info = detect(DEFAULT_SOCKETS_PER_STREAM);
+        if let (Some(soft_limit), Some(fd_budget)) = (info.fd_soft_limit, info.fd_budget) {
+            assert_eq!(fd_budget, soft_limit.saturating_sub(FD_RESERVE));
+        }
+    }
+
+    #[test]
+    fn port_budget_halves_with_two_sockets_per_stream_and_matches_the_range_with_one() {
+        // Defect 2: the divisor must come from `sockets_per_stream`, not a
+        // hardcoded `2`.
+        let info_pooled = detect(1);
+        let info_unpooled = detect(2);
+        let range = (info_pooled.ephemeral_port_range.1 as u64
+            - info_pooled.ephemeral_port_range.0 as u64)
+            .div_ceil(1);
+        assert_eq!(info_pooled.port_budget, range);
+        assert_eq!(info_unpooled.port_budget, range.div_ceil(2));
+        assert_eq!(info_pooled.sockets_per_stream, 1);
+        assert_eq!(info_unpooled.sockets_per_stream, 2);
+    }
+
     fn info_with_budgets(port_budget: u64, fd_budget: Option<u64>) -> RigInfo {
         RigInfo {
-            fd_soft_limit: fd_budget.map(|b| b * 2 + FD_RESERVE),
+            fd_soft_limit: fd_budget.map(|b| b + FD_RESERVE),
             ephemeral_port_range: FALLBACK_EPHEMERAL_RANGE,
             ephemeral_port_range_is_measured: false,
             somaxconn: None,
+            sockets_per_stream: DEFAULT_SOCKETS_PER_STREAM,
             port_budget,
             fd_budget,
             estimated_max_concurrency: fd_budget.unwrap_or(port_budget).min(port_budget),
