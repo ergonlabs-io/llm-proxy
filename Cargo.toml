@@ -16,6 +16,7 @@ members = [
     "testing/corpus",
     "testing/controlplane",
     "testing/loadgen",
+    "testing/mockupstream",
 ]
 
 [workspace.package]

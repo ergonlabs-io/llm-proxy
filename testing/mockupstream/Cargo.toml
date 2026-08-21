@@ -1,0 +1,34 @@
+[package]
+name = "mockupstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "mockupstream"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mock-upstream"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+# WP-30: this crate is the only one in the workspace that needs the `auto`
+# protocol-detecting server builder (h2c prior-knowledge over plaintext --
+# see `--protocol` in `main.rs`), so the extra features are additive here
+# rather than promoted onto the workspace default.
+hyper-util = { workspace = true, features = ["server", "server-auto"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "signal"] }
+
+[lints]
+workspace = true
