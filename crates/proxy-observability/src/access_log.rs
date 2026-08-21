@@ -53,6 +53,53 @@ pub enum FormatOp {
     UpstreamHost,
     UpstreamCluster,
     DownstreamRemoteAddress,
+    // WP-51 increment 1 was scoped to add OTel-GenAI-semconv-aligned aliases
+    // for these nine operators (e.g. `%GEN_AI_USAGE_INPUT_TOKENS%` next to
+    // `%LLM_INPUT_TOKENS%`). Investigated 2026-08-21 and deliberately NOT
+    // done -- decision recorded here so the next attempt starts from the
+    // analysis instead of redoing it and landing the bug this avoided.
+    //
+    // The mismatch is not one field, it's the family relationship. Our
+    // `TokenUsage` (`proxy-filters/src/usage.rs:45`) models disjoint buckets
+    // that sum to a total: `input_tokens` deliberately EXCLUDES the cached
+    // portion. OTel's registry says of `gen_ai.usage.cache_read.input_tokens`
+    // and `gen_ai.usage.cache_creation.input_tokens`: "The value SHOULD be
+    // included in `gen_ai.usage.input_tokens`" -- i.e. semconv's
+    // `input_tokens` is INCLUSIVE of both cache buckets. A plain alias from
+    // `%LLM_INPUT_TOKENS%` to a `%GEN_AI_USAGE_INPUT_TOKENS%` operator would
+    // therefore emit a standard name carrying non-standard arithmetic --
+    // under-counting billed input by exactly the cached portion, silently,
+    // under a name that looks standard. That is ground rule #1's hazard
+    // wearing a naming disguise.
+    //
+    // A subset (`output_tokens`, the two cache buckets individually) COULD
+    // be mapped one at a time with correct semantics. Rejected anyway: a
+    // surface that is standard-named for some fields and proprietary for
+    // others, with the standard names not composing the way the standard
+    // says they should (`input_tokens` here still excludes cache even where
+    // the cache fields themselves are correctly aliased), is harder to
+    // reason about than a wholly proprietary one -- a reader can't tell
+    // which names mean what they say without reading this comment anyway.
+    //
+    // If this is revisited, the registry attributes that exist today and
+    // would be the mapping targets: `gen_ai.usage.input_tokens` (inclusive
+    // semantics, see above -- NOT a plain alias of `LLM_INPUT_TOKENS`),
+    // `gen_ai.usage.output_tokens` (a plain alias IS correct here -- output
+    // isn't split into sub-buckets), `gen_ai.usage.cache_read.input_tokens`
+    // (`LLM_CACHED_TOKENS`), `gen_ai.usage.cache_creation.input_tokens`
+    // (`LLM_CACHE_CREATION_TOKENS`), and `gen_ai.response.time_to_first_chunk`
+    // (`LLM_TTFT` -- note the unit mismatch too: ours renders milliseconds,
+    // the registry attribute is a `double` in SECONDS, so an alias would need
+    // a unit conversion at the render site, not just a name change).
+    // `gen_ai.usage.reasoning.output_tokens` also exists in the registry;
+    // we don't extract reasoning tokens today (`TokenUsage` has no such
+    // field), so there is nothing to alias yet -- worth remembering when
+    // reasoning-token support lands. There is no per-output-token timing
+    // attribute in the registry at all, so `LLM_TPOT` has no counterpart
+    // regardless of how this decision goes; nor do `LLM_TOTAL_TOKENS`,
+    // `LLM_MAX_STALL`, or `LLM_RESPONSE_CHUNKS`, which are proprietary to
+    // this proxy.
+    //
     /// WP-33: `%LLM_INPUT_TOKENS%`.
     LlmInputTokens,
     /// WP-33: `%LLM_CACHED_TOKENS%`.
