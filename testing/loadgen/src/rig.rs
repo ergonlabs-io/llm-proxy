@@ -20,6 +20,25 @@
 //! own open-fd count (`peak_fds` in `SamplerSummary`) during a sweep. Baking
 //! a guess about the proxy's fd pressure into loadgen's own budget would
 //! just be a second, worse guess sitting next to a real measurement.
+//!
+//! **Concurrency is not the only axis a rig can run out of.**
+//! `estimated_max_concurrency` above bounds how many streams can be held
+//! open *at once*; it says nothing about how fast new connections can be
+//! opened and torn down. Those only coincide when responses are slow enough
+//! that few connects happen per second. loadgen is deliberately
+//! connect-per-stream (see `driver.rs`'s module doc, no connection reuse),
+//! so against a fast upstream the CHURN rate -- connects/sec -- can exhaust
+//! the ephemeral port range long before concurrency does: a closed socket's
+//! port sits in `TIME_WAIT` for a while before the OS will reuse it, so the
+//! sustainable churn rate is bounded by `port range / TIME_WAIT`, not by
+//! concurrency at all. This was found the hard way: an upstream answering in
+//! 0.1ms drove ~5,800 connects/sec at concurrency ONE, against a box that
+//! sustains ~546/sec (16,383 ephemeral ports over a 30s `TIME_WAIT`, macOS
+//! `net.inet.tcp.msl=15000`ms) -- a 10.6x overload that the
+//! concurrency-only guard could not see, because concurrency never got
+//! above 1. `connect_rate_budget` below is the missing axis.
+
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -60,6 +79,22 @@ pub struct RigInfo {
     /// Rough ceiling on concurrent streams *this rig* can sustain, ignoring
     /// the proxy/target entirely: `min(fd_budget, port_budget)`.
     pub estimated_max_concurrency: u64,
+    /// How long a closed socket holds its local port in `TIME_WAIT` before
+    /// the OS allows reuse. Read from the OS where possible
+    /// (`net.inet.tcp.msl` on macOS -- which is HALF of `TIME_WAIT`, hence
+    /// the 2x in `time_wait_duration` -- or `/proc/sys/net/ipv4/tcp_fin_timeout`
+    /// as a rough Linux analogue; see that function's doc for why it's only
+    /// a rough one) and falling back to a documented constant otherwise --
+    /// see `time_wait_is_measured`, following the same pattern as
+    /// `ephemeral_port_range_is_measured` above.
+    pub time_wait: Duration,
+    pub time_wait_is_measured: bool,
+    /// Sustainable steady-state CONNECT rate (connects/sec) this rig's
+    /// ephemeral port range can support: `port range width / time_wait`.
+    /// This is the CHURN axis, distinct from `estimated_max_concurrency` --
+    /// see the module doc for why they only coincide when responses are
+    /// slow, and for the 10.6x overload this axis exists to catch.
+    pub connect_rate_budget: f64,
 }
 
 /// Which harness ceiling a sweep landed on, if any -- see [`harness_bound`].
@@ -77,6 +112,13 @@ const FD_RESERVE: u64 = 64;
 /// invocation of `--rig-sockets-per-stream` keeps its current behavior
 /// exactly. See `RigInfo::sockets_per_stream`.
 pub const DEFAULT_SOCKETS_PER_STREAM: u64 = 2;
+/// Used when the OS's `TIME_WAIT` duration can't be read (see
+/// `time_wait_duration`) -- 60s is the classic BSD/Linux default
+/// (`2*MSL` with the historical 30s MSL) and Linux hardcodes exactly this
+/// value with no runtime knob to read it back from, so it's the least
+/// surprising fallback across platforms. Never presented as measured --
+/// see `RigInfo::time_wait_is_measured`.
+const FALLBACK_TIME_WAIT: Duration = Duration::from_secs(60);
 
 /// `sockets_per_stream` is the caller's assumption about how many ephemeral
 /// ports one logical stream burns end to end -- see `RigInfo::sockets_per_stream`
@@ -89,6 +131,9 @@ pub fn detect(sockets_per_stream: u64) -> RigInfo {
         .map(|r| (r, true))
         .unwrap_or((FALLBACK_EPHEMERAL_RANGE, false));
     let somaxconn = somaxconn();
+    let (time_wait, time_wait_is_measured) = time_wait_duration()
+        .map(|d| (d, true))
+        .unwrap_or((FALLBACK_TIME_WAIT, false));
 
     let port_range = ephemeral_port_range.1 as u64 - ephemeral_port_range.0 as u64;
     let port_budget = port_range.div_ceil(sockets_per_stream.max(1));
@@ -102,6 +147,14 @@ pub fn detect(sockets_per_stream: u64) -> RigInfo {
         Some(fd_budget) => port_budget.min(fd_budget),
         None => port_budget,
     };
+    // Rust note: the CHURN budget deliberately uses the raw port-range width,
+    // not `port_budget` (which already divides by `sockets_per_stream`) --
+    // see the module doc. It describes the box's own ephemeral-port supply,
+    // a single shared OS resource, and the caller compares it against an
+    // OBSERVED connects/sec that's already counted the same way (one
+    // completed stream ~= one connect from loadgen's side; see
+    // `harness_bound` and `report::build_capacity_report`).
+    let connect_rate_budget = port_range as f64 / time_wait.as_secs_f64();
 
     RigInfo {
         fd_soft_limit,
@@ -112,6 +165,9 @@ pub fn detect(sockets_per_stream: u64) -> RigInfo {
         port_budget,
         fd_budget,
         estimated_max_concurrency,
+        time_wait,
+        time_wait_is_measured,
+        connect_rate_budget,
     }
 }
 
@@ -138,6 +194,17 @@ pub fn log_summary(info: &RigInfo) {
             .unwrap_or_else(|| "unknown".to_string()),
         info.sockets_per_stream,
         info.estimated_max_concurrency,
+    );
+    eprintln!(
+        "rig: time_wait={:.1}s{} -> sustainable ephemeral-port CHURN rate (connects/sec, a \
+         DIFFERENT axis from concurrency -- see rig.rs module doc): ~{:.0}/s",
+        info.time_wait.as_secs_f64(),
+        if info.time_wait_is_measured {
+            ""
+        } else {
+            " (assumed, could not read OS TIME_WAIT)"
+        },
+        info.connect_rate_budget,
     );
 }
 
@@ -181,6 +248,25 @@ pub fn print_self_check(info: &RigInfo) {
          not a proxy capacity result",
         info.estimated_max_concurrency
     );
+    println!(
+        "time_wait               = {:.1}s{}  (how long a closed socket holds its port before \
+         reuse; macOS reads 2x net.inet.tcp.msl, Linux reads tcp_fin_timeout as a rough \
+         analogue, see rig.rs module doc)",
+        info.time_wait.as_secs_f64(),
+        if info.time_wait_is_measured {
+            " (measured)"
+        } else {
+            " (assumed -- could not read the OS TIME_WAIT)"
+        }
+    );
+    println!(
+        "connect_rate_budget     = ~{:.0}/s  (sustainable CONNECT rate = ephemeral range width \
+         / time_wait -- a DIFFERENT axis from estimated_max_concurrency above: loadgen is \
+         connect-per-stream with no reuse, so a fast upstream can exhaust this budget through \
+         port CHURN at concurrency as low as 1, well before concurrency itself is the \
+         constraint)",
+        info.connect_rate_budget
+    );
 }
 
 fn fmt_opt(v: Option<u64>) -> String {
@@ -191,9 +277,39 @@ fn fmt_opt(v: Option<u64>) -> String {
 /// If a sweep's furthest-reached concurrency landed at or within
 /// `slack_percent` of a harness ceiling, name which ceiling -- so a report
 /// never presents a harness limit as a proxy capacity result (see the
-/// module doc). Checks whichever of the port/fd budgets is *tighter*
-/// first, since that's the one that would actually have been hit.
-pub fn harness_bound(reached: usize, rig: &RigInfo, slack_percent: u64) -> Option<HarnessBound> {
+/// module doc).
+///
+/// `peak_connect_rate` is the highest observed connects/sec across the
+/// sweep's levels (see `report::build_capacity_report`, which derives it
+/// from completed streams over elapsed time -- loadgen is
+/// connect-per-stream, so that's a direct connect-rate measurement, not an
+/// estimate). The CHURN check runs first and independently of `reached`:
+/// the whole point of this axis (see the module doc's 10.6x incident) is
+/// that a run can be badly churn-bound while `reached` still looks tiny --
+/// checking concurrency first would misreport it as under-loaded or, worse,
+/// silently let the concurrency checks below miss it entirely. Only once
+/// churn is clear do the port/fd concurrency budgets get checked, tighter
+/// one first, since that's the one that would actually have been hit.
+pub fn harness_bound(
+    reached: usize,
+    peak_connect_rate: f64,
+    rig: &RigInfo,
+    slack_percent: u64,
+) -> Option<HarnessBound> {
+    if rig.connect_rate_budget > 0.0
+        && peak_connect_rate * 100.0
+            >= rig.connect_rate_budget * (100 - slack_percent.min(100)) as f64
+    {
+        return Some(HarnessBound {
+            limit_name: "ephemeral port churn rate (connects/sec, TIME_WAIT-bound -- a \
+                         different axis from concurrency, see rig.rs module doc)",
+            // Rust note: `round()` before the `as u64` cast -- straight
+            // truncation would always report a value at or below the true
+            // budget, understating it by up to 1/sec for no reason.
+            limit_value: rig.connect_rate_budget.round() as u64,
+        });
+    }
+
     let reached = reached as u64;
     let near =
         |limit: u64| limit > 0 && reached.saturating_mul(100) >= limit * (100 - slack_percent);
@@ -301,6 +417,42 @@ fn somaxconn() -> Option<u64> {
     None
 }
 
+/// Best-effort OS lookup of how long a closed socket holds its local port in
+/// `TIME_WAIT`. `None` (never a fabricated duration) if the lookup fails or
+/// the platform isn't supported -- see `FALLBACK_TIME_WAIT`.
+///
+/// Neither platform exposes `TIME_WAIT` itself as a runtime-readable value,
+/// so both readings here are indirect:
+/// - **macOS**: `net.inet.tcp.msl` is the Maximum Segment Lifetime in
+///   milliseconds, and the BSD network stack defines `TIME_WAIT` as exactly
+///   `2*MSL` -- so this doubles the sysctl value. This one is exact, not an
+///   approximation.
+/// - **Linux**: the kernel hardcodes `TIME_WAIT` at 60s (`2*MSL` with the
+///   historical 30s MSL) and does not expose a knob for it at all.
+///   `/proc/sys/net/ipv4/tcp_fin_timeout` is a DIFFERENT timer (how long a
+///   locally-initiated close waits in `FIN_WAIT_2` for the peer's FIN) that
+///   happens to be readable and roughly the same order of magnitude, so it's
+///   used here as a documented rough analogue rather than leaving Linux with
+///   no OS signal at all -- callers should not treat it as exact.
+fn time_wait_duration() -> Option<Duration> {
+    #[cfg(target_os = "linux")]
+    {
+        let secs: u64 = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fin_timeout")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        return Some(Duration::from_secs(secs));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let msl_ms = sysctl_u64("net.inet.tcp.msl")?;
+        return Some(Duration::from_millis(msl_ms.saturating_mul(2)));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +462,22 @@ mod tests {
         let info = detect(DEFAULT_SOCKETS_PER_STREAM);
         assert!(info.estimated_max_concurrency > 0);
         assert!(info.ephemeral_port_range.1 > info.ephemeral_port_range.0);
+    }
+
+    #[test]
+    fn detect_computes_a_nonzero_connect_rate_budget_from_the_port_range_and_time_wait() {
+        let info = detect(DEFAULT_SOCKETS_PER_STREAM);
+        assert!(info.time_wait > Duration::ZERO);
+        assert!(info.connect_rate_budget > 0.0);
+        let port_range =
+            (info.ephemeral_port_range.1 as u64 - info.ephemeral_port_range.0 as u64) as f64;
+        let expected = port_range / info.time_wait.as_secs_f64();
+        assert!(
+            (info.connect_rate_budget - expected).abs() < 1e-6,
+            "expected connect_rate_budget {} to equal port_range/time_wait {}",
+            info.connect_rate_budget,
+            expected
+        );
     }
 
     #[test]
@@ -349,6 +517,12 @@ mod tests {
             port_budget,
             fd_budget,
             estimated_max_concurrency: fd_budget.unwrap_or(port_budget).min(port_budget),
+            time_wait: FALLBACK_TIME_WAIT,
+            time_wait_is_measured: false,
+            // 0.0 means "no churn budget configured" -- `harness_bound`'s
+            // churn check is a no-op, so these concurrency-only tests below
+            // aren't affected by the new axis.
+            connect_rate_budget: 0.0,
         }
     }
 
@@ -356,20 +530,65 @@ mod tests {
     fn harness_bound_names_the_tighter_of_port_and_fd_budget() {
         let info = info_with_budgets(100, Some(1_000));
         // Reached 95/100 of the (tighter) port budget -> port-bound.
-        let bound = harness_bound(95, &info, 10).expect("should be harness-bound");
+        let bound = harness_bound(95, 0.0, &info, 10).expect("should be harness-bound");
         assert!(bound.limit_name.contains("ephemeral port"));
         assert_eq!(bound.limit_value, 100);
 
         let info = info_with_budgets(1_000, Some(100));
         // Reached 95/100 of the (tighter) fd budget -> fd-bound.
-        let bound = harness_bound(95, &info, 10).expect("should be harness-bound");
+        let bound = harness_bound(95, 0.0, &info, 10).expect("should be harness-bound");
         assert!(bound.limit_name.contains("file-descriptor"));
         assert_eq!(bound.limit_value, 100);
+    }
+
+    /// Defect 2: the churn-rate axis. A run that never reaches meaningful
+    /// CONCURRENCY (`reached` stays tiny) but drives an observed connect
+    /// rate past what the ephemeral-port/TIME_WAIT budget can sustain must
+    /// be reported as churn-bound, naming the churn limit -- not silently
+    /// passed through the concurrency-only checks, and not mislabeled as a
+    /// concurrency bound. Numbers match the real incident recorded in the
+    /// module doc: 16,383 ports / 30s TIME_WAIT =~ 546/s budget, observed
+    /// ~5,800/s at concurrency 1.
+    #[test]
+    fn harness_bound_names_the_churn_rate_limit_even_when_concurrency_reached_is_tiny() {
+        let mut info = info_with_budgets(8_000, Some(500_000));
+        info.time_wait = Duration::from_secs(30);
+        info.connect_rate_budget = 16_383.0 / 30.0; // ~546.1/s
+
+        let bound = harness_bound(1, 5_800.0, &info, 10).expect("should be churn-bound");
+        assert!(
+            bound.limit_name.contains("churn"),
+            "expected the churn-rate limit to be named, got {:?}",
+            bound.limit_name
+        );
+        assert_eq!(bound.limit_value, 546);
+    }
+
+    #[test]
+    fn harness_bound_is_not_churn_bound_when_observed_rate_is_well_under_the_budget() {
+        let mut info = info_with_budgets(8_000, Some(500_000));
+        info.time_wait = Duration::from_secs(30);
+        info.connect_rate_budget = 16_383.0 / 30.0; // ~546.1/s
+
+        // Observed rate well clear of the budget, and concurrency well
+        // clear of its own budgets too -> no bound at all.
+        assert!(harness_bound(1, 50.0, &info, 10).is_none());
+    }
+
+    #[test]
+    fn harness_bound_prefers_churn_over_concurrency_when_both_are_in_view() {
+        // Concurrency `reached` is ALSO near its own port budget here, so
+        // this proves churn is checked (and reported) ahead of it, not that
+        // concurrency merely stayed clear.
+        let mut info = info_with_budgets(100, Some(1_000));
+        info.connect_rate_budget = 546.0;
+        let bound = harness_bound(95, 600.0, &info, 10).expect("should be harness-bound");
+        assert!(bound.limit_name.contains("churn"));
     }
 
     #[test]
     fn harness_bound_is_none_when_reached_is_well_under_every_budget() {
         let info = info_with_budgets(10_000, Some(10_000));
-        assert!(harness_bound(50, &info, 10).is_none());
+        assert!(harness_bound(50, 0.0, &info, 10).is_none());
     }
 }

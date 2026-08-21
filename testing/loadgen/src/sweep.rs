@@ -43,12 +43,20 @@ pub struct SloConfig {
 impl SloConfig {
     /// All SLO clauses that `stats` violates, in a fixed order. Empty means
     /// the level passed.
+    ///
+    /// Rust note: `stats.p99_latency`/`ttft_p99` are `Option<Duration>` --
+    /// `None` means the level had no successful streams to measure latency
+    /// from (every request failed), not "0ms" or "infinitely slow". A `None`
+    /// clause is skipped here rather than treated as a violation: a level
+    /// with a 100% error rate must fail on `ErrorRate` alone, so the report
+    /// names the real cause instead of a fabricated latency number riding
+    /// along with it (see `report.rs`'s `CapacityRow`).
     pub fn evaluate(&self, stats: &LevelStats) -> Vec<SloViolation> {
         let mut violations = Vec::new();
-        if stats.p99_latency > self.p99_ceiling {
+        if stats.p99_latency.is_some_and(|d| d > self.p99_ceiling) {
             violations.push(SloViolation::P99Latency);
         }
-        if stats.ttft_p99 > self.ttft_p99_ceiling {
+        if stats.ttft_p99.is_some_and(|d| d > self.ttft_p99_ceiling) {
             violations.push(SloViolation::TtftP99);
         }
         if stats.error_rate > self.max_error_rate {
@@ -64,9 +72,12 @@ impl SloConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct LevelStats {
     pub throughput_rps: f64,
-    pub p50_latency: Duration,
-    pub p99_latency: Duration,
-    pub ttft_p99: Duration,
+    /// `None` when the level had no successful streams to compute a
+    /// percentile from (e.g. every request errored) -- never a sentinel
+    /// duration. See `SloConfig::evaluate` and `report::CapacityRow`.
+    pub p50_latency: Option<Duration>,
+    pub p99_latency: Option<Duration>,
+    pub ttft_p99: Option<Duration>,
     pub error_rate: f64,
     /// Requests actually counted in the steady-state window (post-warmup).
     /// Used, alongside `steady_state_secs`, by the capacity report's
@@ -222,9 +233,9 @@ where
             // failed level rather than silently vanishing from the sweep.
             stats: LevelStats {
                 throughput_rps: 0.0,
-                p50_latency: Duration::ZERO,
-                p99_latency: Duration::ZERO,
-                ttft_p99: Duration::ZERO,
+                p50_latency: None,
+                p99_latency: None,
+                ttft_p99: None,
                 error_rate: 1.0,
                 requests_completed: 0,
                 steady_state_secs: 0.0,
@@ -253,9 +264,9 @@ mod tests {
     fn passing_stats(n: usize) -> LevelStats {
         LevelStats {
             throughput_rps: n as f64,
-            p50_latency: Duration::from_millis(10),
-            p99_latency: Duration::from_millis(100),
-            ttft_p99: Duration::from_millis(50),
+            p50_latency: Some(Duration::from_millis(10)),
+            p99_latency: Some(Duration::from_millis(100)),
+            ttft_p99: Some(Duration::from_millis(50)),
             error_rate: 0.0,
             requests_completed: n as u64 * 10,
             steady_state_secs: 10.0,
@@ -267,7 +278,7 @@ mod tests {
 
     fn failing_stats(n: usize) -> LevelStats {
         let mut s = passing_stats(n);
-        s.p99_latency = Duration::from_millis(9_999);
+        s.p99_latency = Some(Duration::from_millis(9_999));
         s
     }
 
@@ -293,7 +304,7 @@ mod tests {
         let mut stats = passing_stats(1);
         assert!(slo.evaluate(&stats).is_empty());
 
-        stats.p99_latency = Duration::from_secs(1);
+        stats.p99_latency = Some(Duration::from_secs(1));
         stats.error_rate = 0.5;
         let violations = slo.evaluate(&stats);
         assert_eq!(
@@ -306,7 +317,7 @@ mod tests {
     fn slo_evaluate_flags_ttft_independently() {
         let slo = default_slo();
         let mut stats = passing_stats(1);
-        stats.ttft_p99 = Duration::from_secs(1);
+        stats.ttft_p99 = Some(Duration::from_secs(1));
         assert_eq!(slo.evaluate(&stats), vec![SloViolation::TtftP99]);
     }
 
