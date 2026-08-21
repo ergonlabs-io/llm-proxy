@@ -1967,7 +1967,7 @@ as the `fallbacks` claim corrected in `docs/MILESTONES.md` today. Fix it when th
   replaced; token counts appear under pinned semconv names; and the Envoy-name `/stats` adapter
   still passes WP-23's own conformance tests unchanged.
 
-#### WP-54 — Tenant self-service usage API  (Size: S)  — **Priority: P1**
+#### WP-54 — Tenant self-service usage API  (Size: S→M, resized 2026-08-21)  — **Priority: P1**
 
 > Scoped 2026-08-21 from the owner's question: "how do we serve the management and
 > observability pieces — an admin portal and a regular user portal for token usage?"
@@ -2010,6 +2010,39 @@ comment claiming it).
 - *Anything on the admin listener.* If a management surface becomes network-reachable,
   admin authn/authz lands FIRST, on its own listener, and `SECURITY.md`'s scope
   statement changes with it. That is a precondition, not a follow-up.
+
+**Design pass 2026-08-21 — and a correction to my own sizing.** This was scoped **S**
+on the strength of "the limiter already computes this". That is true of *one* window and
+false of the *query*, which is what an API actually needs.
+
+What the code seam gives us for free:
+- `auth_filter.rs:351` already writes the resolved tenant onto `StreamInfo`, so the
+  scoping property is **structural, not enforced** — the tenant comes from the key the
+  caller presented and there is no code path that accepts a caller-supplied tenant.
+- `auth_filter.rs:321` shows a filter can terminate a request with `send_local_reply`,
+  so no new listener, route type, or server is needed.
+- Implement this **inside `token_limit_filter`**, not as a new filter. That filter already
+  owns `InProcessBudgetStore` and the key derivation; a separate filter would have to
+  share that state across a filter boundary for no benefit.
+
+What it does not give us, and this is the resize:
+- `LimitKey` is an **opaque `String`** built by `LimitKey::from_descriptors(&[("route", ..),
+  ("tenant", ..)])` (`token_limit_filter.rs:556`). Usage is per-(route, tenant), so
+  "this tenant's usage" means enumerating across routes, and
+  `Mutex<HashMap<LimitKey, Window>>` cannot answer that without parsing its own keys
+  back out — which would be a parser over a format that exists only by accident.
+- **Decision needed before implementing:** either give `LimitKey` named fields (a struct
+  rather than a flattened `String`) or add a secondary tenant→keys index. The struct is
+  the better change: it also makes the credential-descriptor hazard visible at the type
+  level rather than resting on a comment. It touches every `from_descriptors` call site.
+- Do NOT ship a narrower "current route only" version to keep the S label. A usage API
+  that silently reports one route's window while the tenant has budgets on several is
+  wrong in the direction users cannot detect.
+
+**Never echo `LimitKey` (or any descriptor built from a credential) into the response
+body.** It is safe to *log* today only because the single production site that builds one
+hashes first — that property is about the logging site, not about the type, and an API
+response is a new site with no such guarantee.
 
 **Acceptance:** a tenant reading its own usage gets its own numbers; a tenant
 presenting key A can obtain no information about tenant B by any parameter,
