@@ -229,12 +229,22 @@ curl -fsS --max-time 5 "http://127.0.0.1:$ADMIN_PORT/stats" 2>/dev/null \
 
 echo
 echo "=== sweep ==="
+# Tie the rig's port-budget assumption to the topology that actually
+# produced it, rather than leaving the operator to remember. An h2 upstream
+# reaches the connection cache, so the proxy->mock hop costs ~0 new ports per
+# stream and only the loadgen->proxy hop counts; h1 is connect-per-request on
+# both hops. Getting this wrong in the safe-looking direction is what makes a
+# good run report itself harness-bound.
+SOCKETS_PER_STREAM=2
+[[ "$UPSTREAM_PROTOCOL" == "http2" ]] && SOCKETS_PER_STREAM=1
+
 SWEEP_ARGS=(
     --sweep
     --sweep-pid "$PROXY_PID"
     --target "http://127.0.0.1:$PROXY_PORT"
     --endpoint "$ENDPOINT"
     --model mock-model
+    --rig-sockets-per-stream "$SOCKETS_PER_STREAM"
     --sweep-hold-secs "$HOLD_SECS"
     --sweep-warmup-secs "$WARMUP_SECS"
     --out "$REPORT"
