@@ -1932,7 +1932,41 @@ here rather than deleted, because "the doc comment described the intent and the 
 up" is a different and much less alarming story than the one this note originally told, and a
 reader who finds the old note elsewhere should be able to see it was closed.
 
-- **Increment 1 — semconv naming for the LLM access-log operators.** Align `%LLM_INPUT_TOKENS%`,
+- **Increment 1 — semconv naming for the LLM access-log operators. DECLINED by the owner,
+  2026-08-21. Do not re-propose without reading this first.**
+
+  Implemented, reviewed, and reverted the same day. The blocker is not naming, it is
+  arithmetic. Our `TokenUsage` models **disjoint buckets that sum to a total**:
+  `input_tokens` deliberately *excludes* the cached portion (`proxy-filters/src/usage.rs:45`
+  — OpenAI's `prompt_tokens` is inclusive, so we subtract; Anthropic's already excludes).
+  The OTel registry defines `gen_ai.usage.input_tokens` as **inclusive** of its sub-buckets:
+  *"The value SHOULD be included in `gen_ai.usage.input_tokens`"* appears on both
+  `gen_ai.usage.cache_read.input_tokens` and `gen_ai.usage.cache_creation.input_tokens`.
+
+  So a plain alias would have emitted a standard name carrying a non-standard meaning,
+  under-counting input by exactly the cached portion, silently, on the field people bill
+  from. Individual operators could be mapped one at a time, but the surface would then carry
+  standard names whose *relationships* differ from the standard's — and a partially-standard
+  surface is harder to reason about than a wholly proprietary one, because a reader cannot
+  tell which names mean what they say. Owner's call: keep the `LLM_*` names, which at least
+  do not claim to be something they are not.
+
+  **This does not settle the OTLP export question (increment 3).** Log format operators and
+  exported metric/span attributes are different surfaces. If we ever emit OTLP we will have
+  to speak semconv on the wire, and at that point the inclusive-vs-disjoint conversion is a
+  real, explicit mapping step — not an alias. Do that conversion once, at the export
+  boundary, rather than reopening this.
+
+  Registry attributes that DO exist, verified against the live registry 2026-08-21, recorded
+  so nobody re-derives them: `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
+  `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens`,
+  `gen_ai.usage.reasoning.output_tokens`, `gen_ai.response.time_to_first_chunk` (an
+  attribute, in **seconds**). There is **no** per-output-token timing attribute, so
+  `%LLM_TPOT%` has no counterpart regardless. Also note there are **9** LLM operators, not
+  the 6 usually listed: the three routinely forgotten are `%LLM_TOTAL_TOKENS%`,
+  `%LLM_MAX_STALL%` and `%LLM_RESPONSE_CHUNKS%`.
+
+- ~~**Increment 1 (original text) — semconv naming for the LLM access-log operators.**~~ Align `%LLM_INPUT_TOKENS%`,
   `%LLM_OUTPUT_TOKENS%`, `%LLM_CACHED_TOKENS%`, `%LLM_CACHE_CREATION_TOKENS%`, `%LLM_TTFT%`,
   `%LLM_TPOT%` to the OTel GenAI conventions (`gen_ai.usage.input_tokens`, etc.), keeping the
   existing operator names as accepted aliases for one release.
