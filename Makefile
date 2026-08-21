@@ -267,3 +267,17 @@ docs-dev: ## Run the docs site dev server (docs/site), http://localhost:4321
 .PHONY: docs-build
 docs-build: ## Production build of the docs site to docs/site/dist/
 	cd docs/site && npm run build
+
+# ------------------------------------------------------------------- sweep --
+# WP-30 phase 3. These start real processes and bind real ports -- never run
+# them concurrently with the test suite (CLAUDE.md rule 15). The script tears
+# down and reports a pgrep check on every exit path, including failure.
+
+.PHONY: sweep
+sweep: ## Capacity sweep against the mock upstream: make sweep [ARGS="--upstream-protocol http1"]
+	./scripts/capacity-sweep.sh $(ARGS)
+
+.PHONY: sweep-compare
+sweep-compare: ## Run the sweep twice, h1 vs h2 upstream, to price connection reuse
+	./scripts/capacity-sweep.sh --upstream-protocol http1
+	./scripts/capacity-sweep.sh --upstream-protocol http2
