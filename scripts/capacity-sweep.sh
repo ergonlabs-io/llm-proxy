@@ -20,6 +20,22 @@
 # stream multiplexed over it. Running both and diffing them is what turns
 # "h1 pooling is missing" from an assertion into a number.
 #
+# The mock's default timings are LLM-shaped ON PURPOSE and must not be
+# tuned to zero to "go faster". Measured 2026-08-21: with a mock that
+# answers in 0.1ms, loadgen drives ~5,800 connects/sec at concurrency 1,
+# against a box whose sustainable rate is ~546/sec (16,383 ephemeral ports /
+# 30s TIME_WAIT, macOS net.inet.tcp.msl=15000). Ports are exhausted inside
+# the first level, every later level inherits the wreckage, and the sweep
+# reports a proxy capacity of 1 while the proxy logs nothing wrong at all.
+#
+# That is worth stating as a rule rather than a war story: when responses
+# are fast, the binding harness constraint is connection CHURN RATE, not
+# concurrent streams -- and rig.rs's ceiling models only the latter, so it
+# does not catch this. Realistic per-stream duration is what keeps the
+# connect rate under budget, and it is also the traffic shape the whole
+# exercise is supposed to measure (IMPLEMENTATION_PLAN.md: "Include the LLM
+# traffic shape, not just RPC-shaped load").
+#
 # Rule 15 of CLAUDE.md applies to this script as much as to an agent: it
 # binds ports and starts long-lived processes. Do not run it concurrently
 # with the test suite, and check the teardown reported at the end.
@@ -27,13 +43,15 @@ set -euo pipefail
 
 UPSTREAM_PROTOCOL=http2
 ENDPOINT=chat
-TOKENS=64
-TTFT_MS=0
-INTER_TOKEN_MS=0
-HOLD_SECS=10
+TOKENS=128
+TTFT_MS=250
+INTER_TOKEN_MS=25
+HOLD_SECS=30
 WARMUP_SECS=3
 MAX_CONCURRENCY=""
 ACCESS_LOGS=off
+SLO_P99_MS=""
+SLO_TTFT_P99_MS=""
 OUT_DIR="target/capacity"
 PROFILE=release
 
@@ -44,12 +62,15 @@ usage() {
 Options:
   --upstream-protocol http1|http2   How the proxy dials the mock (default: http2)
   --endpoint chat|responses|messages  Wire shape to drive (default: chat)
-  --tokens N                        Streamed content chunks per response (default: 64)
-  --ttft-ms N                       Mock's time-to-first-token (default: 0)
-  --inter-token-ms N                Mock's inter-token delay (default: 0)
-  --hold-secs N                     Seconds held at each sweep level (default: 10)
+  --tokens N                        Streamed content chunks per response (default: 128)
+  --ttft-ms N                       Mock's time-to-first-token (default: 250)
+  --inter-token-ms N                Mock's inter-token delay (default: 25)
+  --hold-secs N                     Seconds held at each sweep level (default: 30)
   --warmup-secs N                   Warm-up prefix discarded per level (default: 3)
   --max-concurrency N               Cap the sweep (default: loadgen's rig estimate)
+  --slo-p99-ms N                    Total-latency SLO (default: 2x the mock's own
+                                    generation time -- see the note below)
+  --slo-ttft-p99-ms N               TTFT SLO (default: 2x the mock's own TTFT + 500ms)
   --access-logs on|off              Enable proxy access logging (default: off)
   --out-dir DIR                     Where the report lands (default: target/capacity)
 USAGE
@@ -65,6 +86,8 @@ while [[ $# -gt 0 ]]; do
         --hold-secs)         HOLD_SECS="$2"; shift 2 ;;
         --warmup-secs)       WARMUP_SECS="$2"; shift 2 ;;
         --max-concurrency)   MAX_CONCURRENCY="$2"; shift 2 ;;
+        --slo-p99-ms)        SLO_P99_MS="$2"; shift 2 ;;
+        --slo-ttft-p99-ms)   SLO_TTFT_P99_MS="$2"; shift 2 ;;
         --access-logs)       ACCESS_LOGS="$2"; shift 2 ;;
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
         -h|--help)           usage; exit 0 ;;
@@ -238,6 +261,28 @@ echo "=== sweep ==="
 SOCKETS_PER_STREAM=2
 [[ "$UPSTREAM_PROTOCOL" == "http2" ]] && SOCKETS_PER_STREAM=1
 
+# The SLO must be expressed relative to how long the mock takes to generate a
+# response, or the sweep fails at concurrency 1 forever and reports "no
+# sustainable level" -- which is what happened on the first LLM-shaped run
+# here (a 3,450ms stream against loadgen's stock 2,000ms total-latency
+# default). Total latency for a streamed completion INCLUDES generation; it
+# is not a service time the proxy controls.
+#
+# So saturation is defined as a RATIO, not an absolute: the proxy is
+# saturated when it has doubled the response time the upstream would have
+# delivered on its own. That is a claim about proxy overhead, which is the
+# thing under test, rather than a claim about how fast an LLM ought to be.
+INTRINSIC_MS=$(( TTFT_MS + TOKENS * INTER_TOKEN_MS ))
+[[ -z "$SLO_P99_MS" ]] && SLO_P99_MS=$(( INTRINSIC_MS * 2 ))
+[[ -z "$SLO_TTFT_P99_MS" ]] && SLO_TTFT_P99_MS=$(( TTFT_MS * 2 + 500 ))
+echo "intrinsic stream time: ${INTRINSIC_MS}ms  ->  SLO p99=${SLO_P99_MS}ms ttft_p99=${SLO_TTFT_P99_MS}ms"
+
+# A level must observe enough completed streams for a p99 to mean anything.
+if (( HOLD_SECS * 1000 < INTRINSIC_MS * 10 )); then
+    echo "WARNING: --hold-secs ${HOLD_SECS} is under 10 stream-times (${INTRINSIC_MS}ms each);" \
+         "low levels will report percentiles computed from a handful of samples." >&2
+fi
+
 SWEEP_ARGS=(
     --sweep
     --sweep-pid "$PROXY_PID"
@@ -245,6 +290,8 @@ SWEEP_ARGS=(
     --endpoint "$ENDPOINT"
     --model mock-model
     --rig-sockets-per-stream "$SOCKETS_PER_STREAM"
+    --slo-p99-ms "$SLO_P99_MS"
+    --slo-ttft-p99-ms "$SLO_TTFT_P99_MS"
     --sweep-hold-secs "$HOLD_SECS"
     --sweep-warmup-secs "$WARMUP_SECS"
     --out "$REPORT"

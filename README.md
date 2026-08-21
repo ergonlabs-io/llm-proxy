@@ -114,8 +114,15 @@ not published to a public URL yet.
 
 Stated plainly, because a feature list without this is not much use:
 
-- **HTTP/1.1 upstream connections are not pooled.** HTTP/2 upstreams are
-  multiplexed over one connection; HTTP/1.1 still dials per request.
+- **HTTP/1.1 upstream connections are not pooled**, and HTTP/1.1 is the
+  default. Set `protocol: http2` on a provider to multiplex every concurrent
+  request over one reused connection instead of dialling — and a full TLS
+  handshake — per request. Two caveats before you flip it. There is no
+  fallback: an HTTP/2 provider is offered `h2` and nothing else, so a backend
+  that cannot speak it fails the TLS handshake rather than downgrading, which
+  rules out most local plaintext servers. And the connection cache is not yet
+  aware of a server's concurrent-stream limit, so past that limit (commonly
+  100–250) requests queue on the one connection rather than opening a second.
 - **Credential and certificate files are read once at startup.** A rotated key
   or renewed certificate takes effect after a restart or a configuration reload,
   not automatically — nothing watches the files.
@@ -128,8 +135,10 @@ Stated plainly, because a feature list without this is not much use:
   and GenAI token usage — so they never appear in `/stats`. Do not build
   alerting on those two.
 - **`--drain-strategy` has no effect.** It is accepted and warns at startup.
-- **No performance numbers are published.** The benchmark harness exists; the
-  capacity report does not, so treat any performance expectation as unverified.
+- **No performance numbers are published.** The benchmark harness and a
+  single-box sweep driver both exist (`make sweep`); no capacity report has
+  been published from them yet, so treat any performance expectation as
+  unverified.
 - **No dynamic configuration**, no Kubernetes controller or CRDs, and no
   realtime WebSocket sessions.
 
