@@ -213,6 +213,11 @@
           "$ref": "#/$defs/Duration",
           "description": "TCP/TLS connection establishment timeout for this provider.",
           "default": "5s"
+        },
+        "protocol": {
+          "description": "Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse: the proxy keeps one multiplexed connection per worker to this provider instead of connecting fresh on every request. Most hosted providers (OpenAI, Anthropic, and most OpenAI-compatible APIs) support it; many local/self-hosted plaintext servers do not. Defaults to `http1`.",
+          "enum": ["http1", "http2"],
+          "default": "http1"
         }
       },
       "not": {

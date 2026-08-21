@@ -238,3 +238,48 @@ fn fallback_config_lowers_through_the_real_loader_to_an_aggregate() {
         other => panic!("expected ClusterKind::Aggregate, got {other:?}"),
     }
 }
+
+/// Ground rule #6 regression guard: `protocol: http2` on the PRIMARY and the
+/// FALLBACK provider must still lower cleanly through the real loader even
+/// though the route itself targets an `envoy.clusters.aggregate` cluster --
+/// `typed_extension_protocol_options` belongs on each MEMBER provider
+/// cluster (which is what actually gets dialled), never on the aggregate
+/// (a hard load error there; see
+/// `crates/proxy-config/tests/aggregate_cluster.rs`'s
+/// `typed_extension_protocol_options_on_an_aggregate_is_rejected`). Both
+/// members must independently end up `Http2` in the IR, and the aggregate
+/// itself must have none of this option at all.
+#[test]
+fn fallback_members_with_protocol_http2_still_load() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY}, protocol: http2 }
+  fb1: { type: openai-compatible, base_url: http://fb1.internal:8000, protocol: http2 }
+routes:
+  - model: "*"
+    provider: openai
+    fallbacks: [fb1]
+"#,
+    )
+    .expect("must parse");
+    let loaded =
+        lower_to_loaded(&config).expect("fallback members with protocol: http2 must lower");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    assert_eq!(
+        snapshot.clusters["provider:openai"].upstream_protocol,
+        proxy_config::ir::UpstreamProtocol::Http2,
+    );
+    assert_eq!(
+        snapshot.clusters["provider:fb1"].upstream_protocol,
+        proxy_config::ir::UpstreamProtocol::Http2,
+    );
+    // The aggregate itself never carries a protocol -- it isn't dialled
+    // directly, and this is the field that's a hard error there.
+    assert_eq!(
+        snapshot.clusters["fallback:route-0"].upstream_protocol,
+        proxy_config::ir::UpstreamProtocol::Http1,
+    );
+}
