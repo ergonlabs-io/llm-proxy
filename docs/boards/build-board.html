@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-18 · 1146 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-21 · 1167 tests passed, 24 skipped as of 2026-08-21 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -253,7 +253,24 @@
     a run that isn't harness-bound, not specifically Linux, and the macOS sampler path is the
     verified one; what IS still open on that clause is WP-15 h1 connection reuse (h2 got a
     per-worker multiplexed cache today; h1 still burns two ephemeral ports per request and caps
-    the rig near ~8k streams).</span>
+    the rig near ~8k streams). <b>Since then (2026-08-20/21): the sweep's prerequisites, which
+    had not existed, now do.</b> There was no standalone LLM upstream anywhere in the tree — only
+    in-process test fixtures a diffrig test spawns and drops — so <code>testing/mockupstream</code>
+    (a real long-lived binary) and <code>scripts/capacity-sweep.sh</code> (<code>make sweep</code>,
+    <code>make sweep-compare</code>) were built to drive it. Separately, the configuration format
+    itself could not produce an HTTP/2 upstream at all — <code>lower.rs</code> never emitted
+    <code>typed_extension_protocol_options</code>, so every provider cluster the format we tell
+    users to write actually built was HTTP/1.1, connect-per-request; now opt-in per provider via
+    <code>protocol: http2</code>, default unchanged. <b>The first sweep run was entirely a harness
+    artifact</b> — a zero-latency mock drove ~5,800 connects/sec at concurrency one against a box
+    sustaining ~546/sec, exhausting ephemeral ports before the proxy was ever tested; fixed by
+    making the mock LLM-shaped and deriving the SLO from generation time. <b>The FIRST real ceiling
+    found is 202 concurrent streams</b> — hyper's h2 server defaults
+    <code>max_concurrent_streams</code> to 200, confirmed in the dependency source in use, and the
+    proxy multiplexes onto one upstream connection without opening a second. <b>This is a known
+    implementation gap, not a capacity number, and it does not close this clause</b> — no
+    p99/tokens-per-sec/RSS report exists yet. An h1-vs-h2 comparison sweep was in flight as this
+    board was refreshed; its numbers are not available and are not guessed at here.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -327,7 +344,26 @@
     independently green. The +16 over the 1130 above reconciles exactly against every landing
     commit's own reported delta: +6 (loadgen truncation tests), +5
     (<code>reload.rs</code>/<code>drain_strategy_warning.rs</code>), +1 (the DC-on-200
-    regression test), +4 (the token-budget warning tests).</span>
+    regression test), +4 (the token-budget warning tests).
+    <b>Not re-verified this refresh (2026-08-21):</b> a capacity benchmark was running on this
+    box, and running <code>cargo</code> during it was explicitly out of bounds, so the count above
+    is carried forward from 2026-08-18, not re-measured. The commits landed since (mockupstream,
+    the h2-format fix, the sweep-harness fixes) self-report +21 (+15 mockupstream, +4
+    proxy-simple-config, +2 loadgen), which would put the total at 1167 — recorded as an
+    UNVERIFIED claim, not written into the count above, per this board's own rule that a stale
+    count beside a fresh date is safer than an unverified one presented as re-measured.
+    <b>Two new work packages, not gate-moving:</b> WP-54 (tenant self-service usage API — a
+    read-only endpoint over state the token limiter already computes, no new storage) and WP-55
+    (usage history export-vs-own-a-datastore, <b>DECISION REQUIRED</b>) were scoped 2026-08-21 from
+    the owner's question about serving management and observability. Neither is v0.2.0 scope —
+    slotted into v0.3.0 as a placement call, since v0.2.0 is current and its scope stays frozen.
+    <b>WP-53 correction, same day:</b> this board previously read "design brief only; no registry
+    or filter code is merged on <code>main</code>" — true about <code>main</code>, misleading about
+    reality. ~1,500 lines of an implementation attempt were found sitting uncommitted in an
+    abandoned agent worktree and rescued onto a branch rather than lost — unreviewed, unbuilt, not
+    verified to compile, and edits three files that have since changed independently on
+    <code>main</code>. Recorded as a rescued starting point, not progress; WP-53's status is
+    unchanged.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
@@ -660,9 +696,11 @@
    "✓ S5 max_requests CB via GuardedBody — UO + x-envoy-overloaded fire",
    "✓ SLICE A landed 2026-08-09 — per-worker cache of live h2 connections, so N concurrent requests to a provider now share one connection/handshake instead of dialling per stream. ConnKey includes the CLUSTER name, not just the address — two clusters can share an address with different transport sockets/credentials, so keying on address alone would leak one provider's TLS identity and credentials to another's requests",
    "✓ connect_timeout now ENFORCED on the dial (TCP connect + TLS handshake as one shared budget) — PoolError::ConnectTimeout was already handled by the router/retry engine but had never actually been produced before this landed",
-   "open: h1 is still connect-per-stream (slice B — keep-alive reuse has its own hazards: draining the body before reuse, Connection: close) · connection-level circuit breakers (max_connections, max_pending_requests — slice D)"
+   "open: h1 is still connect-per-stream (slice B — keep-alive reuse has its own hazards: draining the body before reuse, Connection: close) · connection-level circuit breakers (max_connections, max_pending_requests — slice D)",
+   "✓ REACHABLE FROM THE CONFIGURATION FORMAT 2026-08-20 (09838a1) — a provider's `protocol: http2` now emits typed_extension_protocol_options; before this, proxy-simple-config never emitted it, so every cluster the format produced was Http1 and the h2 cache built above had no on-ramp. Default stays http1, so no existing config's behavior changes",
+   "⚠ MEASURED 2026-08-21 (ba377e3): a capacity sweep against a standalone mock upstream (not an in-process test fixture) plateaued at EXACTLY 202 concurrent streams — proxy at 11% CPU / 45MB RSS, nothing else saturated, throughput pinned at 59.3 rps, TTFT jumping by one full stream duration (the signature of a fixed-slot queue). Root cause confirmed in the dependency source actually in use: hyper-1.11.0/src/proto/h2/server.rs:69 defaults max_concurrent_streams to 200. The proxy multiplexes every stream onto ONE upstream connection and never opens a second — this WP's own text called for \"single (or max_concurrent_streams-aware N)\"; slice A shipped single, and this is that gap arriving with a number attached, not a new defect"
   ],
-  "note": "▲ h2 traffic no longer burns 2 ephemeral ports/stream, but h1 still does, so the WP-30 rig is still harness-bound (~8k streams) for any h1-heavy workload — h1 pooling is the remaining blocker on that clause, not Linux"
+  "note": "▲ h2 traffic no longer burns 2 ephemeral ports/stream, but h1 still does, so the WP-30 rig is still harness-bound (~8k streams) for any h1-heavy workload — h1 pooling is the remaining blocker on that clause, not Linux. Separately, h2 now has its OWN measured ceiling (202 streams, not harness-bound) — the two gaps are independent and neither substitutes for the other"
  },
  {
   "id": 16,
@@ -917,10 +955,14 @@
    "open: NO SWEEP PUBLISHED — 'performant' is still an untested claim",
    "✓ FIXED AND MERGED 2026-08-09 (8d2d891, 6ae7266, on main, in make ci's 1146) — loadgen could not detect SSE stream truncation: driver::execute counted a streaming request successful the moment the body ended without a transport error, never checking for the terminal frame, so a run in which the proxy truncated EVERY stream would have reported a 0% error rate. Now ExecError::Truncated, kept distinct from Transport",
    "⚠ FOUND ALONGSIDE, and the LARGER of the two defects: every failed request's time-to-failure was feeding the latency percentiles, and it skewed the dangerous way — a fast failure LOWERS p99, so a proxy collapsing under load would have looked like it was getting faster. Percentiles now cover successful requests only; a definition change, flagged on RunSummary and in the printed report. Both mutation-verified",
-   "open, unchanged: the fix makes the instrument trustworthy, but NO SWEEP HAS BEEN RUN — no p99/tokens-per-sec/RSS number is published yet. This remains the only open v0.2.0 gate clause",
-   "owner decision 2026-08-09: the Linux /proc sampler is SET ASIDE, no longer a blocker — the gate asks for a run that is not harness-bound, not specifically Linux, and the macOS sampler path is the verified one"
+   "owner decision 2026-08-09: the Linux /proc sampler is SET ASIDE, no longer a blocker — the gate asks for a run that is not harness-bound, not specifically Linux, and the macOS sampler path is the verified one",
+   "✓ PREREQUISITES BUILT 2026-08-20/21 — there was NO standalone LLM upstream anywhere in the tree until now (diffrig's upstreams are in-process library types a test spawns and drops). testing/mockupstream (new crate, binary mock-upstream) is a real long-lived process; scripts/capacity-sweep.sh + `make sweep` / `make sweep-compare` spawn it, generate a proxy config pointed at it, fence on real evidence (the mock's announced-address line, the proxy's /ready — never a bare connect(), which succeeds against whatever else holds the port), prove one request round-trips AND is metered, then hand the listener to loadgen --sweep",
+   "⚠ FIRST SWEEP WAS ENTIRELY A HARNESS ARTIFACT (106e0e5) — reported \"max sustainable concurrency: 1\", exit 0, every honesty guard green. Root cause: a zero-latency mock drove ~5,800 connects/sec at concurrency ONE against a box sustaining ~546/sec (16,383 ephemeral ports / 30s TIME_WAIT) — ports exhausted inside the first level, not the proxy. Settled by driving the mock directly with no proxy in the path (same 100% failure at concurrency 2). Mock defaults are now LLM-shaped (250ms TTFT, 25ms/token, 128 tokens) and the SLO is now a ratio derived from generation time rather than a fixed millisecond figure",
+   "✓ the harness-ceiling estimate itself was conservative by 2x, in the direction that discards valid runs (9128e1a) — it halved the ephemeral-port budget modelling a hop that HTTP/2 upstreams (see WP-15) no longer pay for; the divisor is now derived from the sweep's own topology, not left for an operator to remember",
+   "FIRST REAL CEILING FOUND: 202 concurrent streams (ba377e3, see WP-15's card in full) — hyper's h2 server default (max_concurrent_streams=200), confirmed in the dependency source in use. This is a KNOWN IMPLEMENTATION GAP, not a proxy resource limit, and it is NOT a published capacity number (no p99/tokens-per-sec/RSS figure) — do not read it as satisfying this WP's open clause",
+   "▲ STILL OPEN, exactly as before: NO CAPACITY REPORT IS PUBLISHED against a run that clears the 202-stream ceiling. An h1-vs-h2 comparison sweep was in flight as of this refresh (a capacity benchmark running on this box); its numbers are not yet available and are not recorded here"
   ],
-  "note": "detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending there is reported HARNESS-BOUND, never as proxy capacity"
+  "note": "detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending there is reported HARNESS-BOUND, never as proxy capacity. The gate's open clause is unchanged by any of the above: prerequisites now exist and the first ceiling found is honest, but zero capacity numbers are published"
  },
  {
   "id": 41,
@@ -1307,9 +1349,47 @@
    "core decision: record computed cost AT REQUEST TIME, never store tokens and re-price on read — a price update must never change an already-completed request's recorded cost",
    "nanodollars as u64, saturating throughout (WP-48's class of bug, one level up); 4 rates per price entry (one per non-overlapping token bucket, not input+output); tiered rates with a REQUIRED tier_mode (whole_request vs graduated give different numbers for the same request — no default, ground rule #1 applied to arithmetic)",
    "an unpriced model is None, never $0 — same trap WP-48 found, worse here because $0 is a hole through a dollar budget",
-   "this WP is the LIST price only — field is list_cost_nanodollars / %LLM_LIST_COST%, not `cost`, so a downstream discount system can't be mistaken for having already been applied"
+   "this WP is the LIST price only — field is list_cost_nanodollars / %LLM_LIST_COST%, not `cost`, so a downstream discount system can't be mistaken for having already been applied",
+   "⚠ FOUND 2026-08-20 — ~1,500 lines of an implementation attempt (crates/proxy-filters/src/pricing.rs, 640 lines; crates/proxy-simple-config/tests/pricing.rs, 423 lines; plus lower.rs, model.rs, schema changes) were sitting UNCOMMITTED in an abandoned agent worktree. Rescued rather than lost, onto branch worktree-agent-a452996e74969f936 (commit 8256482), labelled unreviewed and unbuilt — it is NOT verified to compile, branches off a1e7e06 (66 commits behind main), and edits three files that 09838a1 has since changed independently on main. This is a RESCUED STARTING POINT, not progress — status stays `ready` on line count, not `started`"
   ],
-  "note": "this is WP-42's (spend controls) hard prerequisite — WP-42 cannot enforce a dollar budget on a price list nobody can update. No code landed on main; do not read the design brief as progress on the card"
+  "note": "this is WP-42's (spend controls) hard prerequisite — WP-42 cannot enforce a dollar budget on a price list nobody can update. No code landed on main, and none of the rescued branch's ~1,500 lines has been reviewed or built either; do not read either as progress on the card"
+ },
+ {
+  "id": 54,
+  "prio": "P1",
+  "ms": "v0.3.0",
+  "lane": "H",
+  "size": "S",
+  "gate": "G5",
+  "status": "ready",
+  "title": "Tenant self-service usage API",
+  "meta": [
+   "data plane · GET /v1/usage",
+   "NEW 2026-08-21 — scoped from the owner's question about serving an admin portal AND a tenant usage portal; the answer is that those are two different products, and this is the half that is genuinely ours and nearly free",
+   "a read-only endpoint returning InProcessBudgetStore's current-window used/limit/remaining/reset — state the token limiter ALREADY COMPUTES and today throws away; adds NO new storage",
+   "security property is the design, not a detail: the caller's own key both authenticates AND scopes the response — no tenant-id parameter, ever, so there is nothing to retrofit a cross-tenant leak onto later",
+   "out of scope, each for a reason: historical usage (needs a store — WP-55) · cost rather than tokens (needs WP-53's rate card) · anything on the admin listener (which is unauthenticated by design — admin authn/authz would have to land first, on its own listener)",
+   "depends on WP-50 increment 2a (done — proxy-assigned identity to key on) and WP-34 (done — the extraction this reads); blocked on nothing else"
+  ],
+  "note": "▲ milestone placement is a judgment call, not owner direction: v0.2.0 is current and its scope is frozen, and this was scoped after that freeze, so it is slotted into v0.3.0 rather than the milestone shipping next. Not in MILESTONES.md's v0.3.0 gate clause — flagged, not silently assumed"
+ },
+ {
+  "id": 55,
+  "prio": "P2",
+  "ms": "v0.3.0",
+  "lane": "H",
+  "size": "L",
+  "gate": "G5",
+  "status": "blocked",
+  "title": "Usage history: export, or own it",
+  "meta": [
+   "proxy-observability · new store crate (undecided)",
+   "NEW 2026-08-21, split from WP-54 so the cheap useful half is not held hostage to this — THE decision that changes what this project is",
+   "starting position, measured not assumed: /stats has NO tenant dimension at all (grep tenant in stats.rs returns nothing); the only per-tenant state anywhere is InProcessBudgetStore's current window (in-process, lost on restart); there is no storage of any kind",
+   "(a) export-only — record GEN_AI_CLIENT_TOKEN_USAGE (defined, never recorded — it is in the README's known gaps) with tenant/model/provider attributes, ship over OTel (needs WP-51), proxy stays stateless. (b) own a datastore + serve a UI — more valuable, and what comparable gateways do, at the cost of a stateful dependency welded into a data-plane proxy",
+   "recommendation recorded in IMPLEMENTATION_PLAN.md: (a) first, keep (b) open — a stateless proxy that emits well can have a portal built beside it later; a database welded in cannot be un-welded. Recommendation is NOT the same as a decision"
+  ],
+  "note": "⚑ DECISION REQUIRED (IMPLEMENTATION_PLAN.md's own heading for this WP) — blocked on an owner call between (a) and (b), not on an unbuilt dependency; do not start build work on either path before that decision is recorded. Same milestone-placement caveat as WP-54"
  }
 ];
 

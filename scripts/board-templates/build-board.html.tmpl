@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 53 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-18 · 1146 tests passed, 24 skipped (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>, not counted here) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-21 · 1167 tests passed, 24 skipped as of 2026-08-21 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -253,7 +253,24 @@
     a run that isn't harness-bound, not specifically Linux, and the macOS sampler path is the
     verified one; what IS still open on that clause is WP-15 h1 connection reuse (h2 got a
     per-worker multiplexed cache today; h1 still burns two ephemeral ports per request and caps
-    the rig near ~8k streams).</span>
+    the rig near ~8k streams). <b>Since then (2026-08-20/21): the sweep's prerequisites, which
+    had not existed, now do.</b> There was no standalone LLM upstream anywhere in the tree — only
+    in-process test fixtures a diffrig test spawns and drops — so <code>testing/mockupstream</code>
+    (a real long-lived binary) and <code>scripts/capacity-sweep.sh</code> (<code>make sweep</code>,
+    <code>make sweep-compare</code>) were built to drive it. Separately, the configuration format
+    itself could not produce an HTTP/2 upstream at all — <code>lower.rs</code> never emitted
+    <code>typed_extension_protocol_options</code>, so every provider cluster the format we tell
+    users to write actually built was HTTP/1.1, connect-per-request; now opt-in per provider via
+    <code>protocol: http2</code>, default unchanged. <b>The first sweep run was entirely a harness
+    artifact</b> — a zero-latency mock drove ~5,800 connects/sec at concurrency one against a box
+    sustaining ~546/sec, exhausting ephemeral ports before the proxy was ever tested; fixed by
+    making the mock LLM-shaped and deriving the SLO from generation time. <b>The FIRST real ceiling
+    found is 202 concurrent streams</b> — hyper's h2 server defaults
+    <code>max_concurrent_streams</code> to 200, confirmed in the dependency source in use, and the
+    proxy multiplexes onto one upstream connection without opening a second. <b>This is a known
+    implementation gap, not a capacity number, and it does not close this clause</b> — no
+    p99/tokens-per-sec/RSS report exists yet. An h1-vs-h2 comparison sweep was in flight as this
+    board was refreshed; its numbers are not available and are not guessed at here.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -327,7 +344,26 @@
     independently green. The +16 over the 1130 above reconciles exactly against every landing
     commit's own reported delta: +6 (loadgen truncation tests), +5
     (<code>reload.rs</code>/<code>drain_strategy_warning.rs</code>), +1 (the DC-on-200
-    regression test), +4 (the token-budget warning tests).</span>
+    regression test), +4 (the token-budget warning tests).
+    <b>Not re-verified this refresh (2026-08-21):</b> a capacity benchmark was running on this
+    box, and running <code>cargo</code> during it was explicitly out of bounds, so the count above
+    is carried forward from 2026-08-18, not re-measured. The commits landed since (mockupstream,
+    the h2-format fix, the sweep-harness fixes) self-report +21 (+15 mockupstream, +4
+    proxy-simple-config, +2 loadgen), which would put the total at 1167 — recorded as an
+    UNVERIFIED claim, not written into the count above, per this board's own rule that a stale
+    count beside a fresh date is safer than an unverified one presented as re-measured.
+    <b>Two new work packages, not gate-moving:</b> WP-54 (tenant self-service usage API — a
+    read-only endpoint over state the token limiter already computes, no new storage) and WP-55
+    (usage history export-vs-own-a-datastore, <b>DECISION REQUIRED</b>) were scoped 2026-08-21 from
+    the owner's question about serving management and observability. Neither is v0.2.0 scope —
+    slotted into v0.3.0 as a placement call, since v0.2.0 is current and its scope stays frozen.
+    <b>WP-53 correction, same day:</b> this board previously read "design brief only; no registry
+    or filter code is merged on <code>main</code>" — true about <code>main</code>, misleading about
+    reality. ~1,500 lines of an implementation attempt were found sitting uncommitted in an
+    abandoned agent worktree and rescued onto a branch rather than lost — unreviewed, unbuilt, not
+    verified to compile, and edits three files that have since changed independently on
+    <code>main</code>. Recorded as a rescued starting point, not progress; WP-53's status is
+    unchanged.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>

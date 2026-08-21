@@ -227,7 +227,25 @@ releases:
       recorded</b> — the instrument is trustworthy now, but zero capacity numbers exist. Separately,
       the Linux <code>/proc</code> sampler is <b>no longer a blocker</b> (owner decision
       2026-08-09) — the gate asks for a run that is not harness-bound, not specifically Linux,
-      and the macOS sampler path is the verified one.
+      and the macOS sampler path is the verified one. <b>Update 2026-08-20/21: the sweep's
+      prerequisites, which had not existed, now do — and the first real ceiling has a number.</b>
+      There was no standalone LLM upstream anywhere in the tree (diffrig's are in-process library
+      types a test spawns and drops); <code>testing/mockupstream</code> plus
+      <code>scripts/capacity-sweep.sh</code> (<code>make sweep</code>, <code>make
+      sweep-compare</code>) now exist. Separately, the configuration format could not produce an
+      HTTP/2 upstream at all — <code>lower.rs</code> never emitted
+      <code>typed_extension_protocol_options</code>, so every provider cluster the format actually
+      built was HTTP/1.1; now opt-in per provider via <code>protocol: http2</code>, default
+      unchanged. The first sweep reported <b>"max sustainable concurrency: 1," entirely a harness
+      artifact</b>: a zero-latency mock drove ~5,800 connects/sec at concurrency one against a box
+      sustaining ~546/sec, exhausting ephemeral ports before the proxy was tested at all — fixed by
+      an LLM-shaped mock and an SLO derived from generation time. <b>The first real ceiling found
+      is 202 concurrent streams</b> — hyper's h2 server defaults <code>max_concurrent_streams</code>
+      to 200 (confirmed in the dependency source in use), and the proxy multiplexes onto one
+      upstream connection without ever opening a second. <b>This is a known implementation gap,
+      not a capacity number, and does not close this clause</b> — no p99/tokens-per-sec/RSS report
+      exists yet. An h1-vs-h2 comparison sweep was in flight as this board was refreshed; its
+      numbers are not available and are not recorded here.
   - wp: WP-23
     what: >-
       <b>Increments 1–6a landed 2026-08-08/09 and CLOSE this gate's <code>/stats</code>
@@ -285,12 +303,17 @@ releases:
       can update.
   - wp: WP-53
     what: >-
-      <b>New card this refresh — was already in the plan (added 2026-08-08) but missing from
-      this board.</b> Versioned model pricing, the rate card WP-42 depends on. Design brief
-      only (<code>docs/wp-53-pricing-design-brief.md</code>); no registry or filter code is
-      merged on <code>main</code>. Core decision: cost is computed and recorded at request
-      time and never re-priced on read, so a price update can't change an already-completed
-      request's bill.
+      Versioned model pricing, the rate card WP-42 depends on. Design brief only
+      (<code>docs/wp-53-pricing-design-brief.md</code>); no registry or filter code is merged on
+      <code>main</code>. Core decision: cost is computed and recorded at request time and never
+      re-priced on read, so a price update can't change an already-completed request's bill.
+      <b>Correction, 2026-08-21: this card previously stopped at "no code merged on
+      <code>main</code>," which is true but misleading — ~1,500 lines of an implementation
+      attempt (<code>pricing.rs</code>, its test file, plus lowering/schema changes) were found
+      sitting uncommitted in an abandoned agent worktree and were rescued onto a branch rather
+      than lost. Unreviewed, unbuilt, not verified to compile, and edits files that have since
+      changed independently on <code>main</code> — a rescued starting point, not progress. Status
+      unchanged.</b>
   - wp: WP-51
     what: >-
       OpenTelemetry (traces, metrics, semconv naming). Scheduled 2026-08-03, not started — the
@@ -365,7 +388,7 @@ releases:
     the six dependencies' license texts are recorded as owed but not yet bundled, and
     <code>SECURITY.md</code>'s reporting contact is still unfilled.</b> None of these are work
     packages today; flagged here rather than invented as one. <b>Test-suite note, reconciled
-    this refresh:</b> full workspace is <b>1146 tests passed, 24 skipped</b> (<code>cargo
+    this refresh:</b> full workspace is <b>1167 tests passed, 24 skipped</b> (<code>cargo
     nextest</code>, re-run directly via <code>make tq-count</code>, plus <code>cargo fmt
     --check</code>, <code>cargo clippy -D warnings</code>, <code>make tq-doc</code>, and
     <code>make qa</code> all independently re-run clean) — up from 1130/24 at the last refresh.
@@ -375,7 +398,21 @@ releases:
     regression test), +4 (the token-budget warning tests); the skip count is unchanged. A live
     run against a real local Ollama server (<code>local_openai_smoke.rs</code>, 4 of 7 passing,
     3 correctly failing on the WP-35 reason above) was also executed directly this refresh, not
-    merely reported.
+    merely reported. <b>Re-measured 2026-08-21, after the benchmark finished:</b>
+    <b>1167 tests passed, 24 skipped</b>, plus doctests 5 passed / 0 failed / 2 ignored
+    (<code>make tq</code> and <code>make tq-doc</code> on a quiet box). The +21 reconciles
+    exactly against the three lanes that landed: +15 <code>mockupstream</code>,
+    +4 <code>proxy-simple-config</code>, +2 <code>loadgen</code>; skips unchanged at 24.
+    This board initially carried 1146 forward and labelled 1167 an unverified claim, because
+    <code>cargo</code> was out of bounds while a capacity benchmark held the box — the right
+    call at the time, and recorded here rather than quietly overwritten. <b>Also from that refresh, not gate-moving:</b>
+    a capacity sweep found a real ceiling — 202 concurrent streams, hyper's h2 server default
+    <code>max_concurrent_streams</code> — which is a known implementation gap, not a published
+    capacity number, and does not touch this gate's open clause (see WP-30's card). WP-53's card
+    was also corrected: an unreviewed, unbuilt implementation attempt was rescued from an abandoned
+    agent worktree onto a branch, and is recorded as a rescued starting point rather than progress.
+    Two new work packages (WP-54, WP-55) were scoped from an owner question about usage/admin
+    portals and slotted into v0.3.0, not this milestone.
 - v: v0.3.0
   name: Dynamic configuration
   state: later
@@ -385,7 +422,7 @@ releases:
     per S8, and survives a control-plane reconnect with make-before-break cluster warming.
   verify: testing/controlplane harness plus a go-control-plane fixture.
   done: 0
-  open: 4
+  open: 6
   left:
   - wp: WP-20
     what: ADS client, state-of-the-world.
@@ -399,10 +436,24 @@ releases:
       waiting.
   - wp: WP-28
     what: Scenario DSL, reconnect/warming coverage in the control-plane harness.
+  - wp: WP-54
+    what: >-
+      <b>New 2026-08-21.</b> Tenant self-service usage API — a read-only <code>GET
+      /v1/usage</code>, authenticated and scoped by the caller's own key, over state the token
+      limiter already computes and today discards. No new storage. Not part of this milestone's
+      ADS gate; slotted here on a placement call because v0.2.0 was already current and frozen
+      when this was scoped — not because it depends on anything ADS-related.
+  - wp: WP-55
+    what: >-
+      <b>New 2026-08-21. DECISION REQUIRED.</b> Usage history: export via OTel (needs WP-51) and
+      stay stateless, or own a datastore and serve a UI. Recommendation recorded (export first,
+      keep owning-a-datastore open) but not yet an owner decision — blocked on that call, not on
+      an unbuilt dependency. Split from WP-54 so the free half isn't held hostage to it.
   scope: >-
     Deferred deliberately: static config carries v0.0.1 through v0.2.0. This is the largest
     single block of P2 work and it is <b>genuinely owed</b> — it's the on-ramp that lets a
-    team point an existing bootstrap at us.
+    team point an existing bootstrap at us. WP-54/WP-55 ride along in this milestone bucket by
+    placement, not by dependency — see their cards.
 - v: v0.4.0
   name: Envoy parity
   state: later
