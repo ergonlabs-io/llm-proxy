@@ -192,6 +192,78 @@ routes:
     }
 }
 
+/// `protocol: http2` on a provider must reach the IR as
+/// `UpstreamProtocol::Http2` on that provider's cluster -- asserted on the
+/// IR, not the intermediate JSON, since the JSON being right but the IR
+/// being wrong (a drift between this dialect's `HTTP_PROTOCOL_OPTIONS_KEY`
+/// and `proxy_config::lower`'s reader) is exactly the failure this test
+/// exists to catch. This is the on-ramp to `proxy-http::upstream_pool`'s h2
+/// upstream connection cache (WP-15 slice A).
+#[test]
+fn provider_protocol_http2_reaches_the_ir() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY}, protocol: http2 }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    assert_eq!(
+        snapshot.clusters["provider:openai"].upstream_protocol,
+        proxy_config::ir::UpstreamProtocol::Http2,
+    );
+}
+
+/// Omitting `protocol` entirely must still yield `Http1` -- Envoy's own
+/// default for an unconfigured cluster, and the behavior every config
+/// predating this field already has.
+#[test]
+fn provider_protocol_defaults_to_http1() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    assert_eq!(
+        snapshot.clusters["provider:openai"].upstream_protocol,
+        proxy_config::ir::UpstreamProtocol::Http1,
+    );
+}
+
+/// An unknown `protocol` value is a load error naming the full dotted path
+/// (ground rule #1) -- never a silent fallback to `http1`.
+#[test]
+fn provider_protocol_bad_value_errors_with_path() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY}, protocol: http3 }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect_err("unknown protocol value must fail");
+    let ConfigError::InvalidValue { field_path, .. } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "providers.openai.protocol");
+}
+
 /// Model globs lower to the right header matchers on the model header.
 #[test]
 fn model_globs_lower_to_header_matchers() {

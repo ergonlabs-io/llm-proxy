@@ -87,6 +87,25 @@ pub struct Provider {
     pub ca_file: Option<String>,
     #[serde(default)]
     pub connect_timeout: Option<SimpleDuration>,
+    /// Upstream HTTP protocol for this provider's cluster. `None` means
+    /// `http1` (Envoy's own default for an unconfigured cluster), which
+    /// keeps every config predating this field byte-identical in behavior.
+    #[serde(default)]
+    pub protocol: Option<UpstreamProtocol>,
+}
+
+/// `providers.<name>.protocol`: which HTTP version the proxy dials this
+/// provider's cluster with. `http1` connects once per request; `http2`
+/// reaches the per-worker upstream connection cache
+/// (`proxy_http::upstream_pool`, WP-15 slice A), multiplexing every
+/// concurrent request over one connection per (cluster, address). Most
+/// hosted providers support it; many local/self-hosted plaintext servers do
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamProtocol {
+    Http1,
+    Http2,
 }
 
 /// `auth`: downstream authentication (WP-50 increment 2a-iii). Mirrors the

@@ -55,6 +55,7 @@ JSON error body listing known models.
 | `extra_headers` | object of string | no | `{}` | Extra headers sent on every request to this provider. An Anthropic provider also gets a default `anthropic-version` header; setting it here overrides that default. |
 | `ca_file` | string (path) | no | system roots | PEM CA bundle for verifying this provider's TLS certificate. Only needed for a self-hosted backend with a private CA. |
 | `connect_timeout` | `Duration` | no | `5s` | TCP/TLS connection establishment timeout for this provider. |
+| `protocol` | enum: `http1`, `http2` | no | `http1` | Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse — the proxy keeps one multiplexed connection per worker to this provider instead of connecting fresh on every request. Most hosted providers support it; many local/self-hosted plaintext servers do not. |
 
 A `Provider` config rejects setting both `api_key` and `api_key_file`.
 

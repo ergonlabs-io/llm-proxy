@@ -99,6 +99,15 @@ const TOKEN_LIMIT_FILTER_TYPE_URL: &str =
 /// module doc, "Config" section).
 const ENFORCED_LIMIT_HEADER: &str = "authorization";
 
+/// The `typed_extension_protocol_options` map key, and (prefixed with
+/// `type.googleapis.com/`) its `@type` -- must match
+/// `proxy_config::lower::HTTP_PROTOCOL_OPTIONS_TYPE` exactly, for the same
+/// dependency-tree reason as `USAGE_FILTER_TYPE_URL` above (this crate never
+/// links `proxy-config`'s proto types, only its JSON surface).
+const HTTP_PROTOCOL_OPTIONS_KEY: &str = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+const HTTP_PROTOCOL_OPTIONS_TYPE_URL: &str =
+    "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+
 const UPSTREAM_TLS_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const DOWNSTREAM_TLS_TYPE_URL: &str =
@@ -421,6 +430,31 @@ fn lower_provider(
             format!("providers.{name}.ca_file"),
             "ca_file is ignored for plaintext (http://) providers",
         ));
+    }
+
+    // `protocol: http2` is the on-ramp to `proxy-http::upstream_pool`'s h2
+    // upstream connection cache (WP-15 slice A) -- see this cluster's own
+    // `UpstreamProtocol` doc. `http1` (the default, `None` here) emits
+    // NOTHING: `proxy_config::lower::convert_upstream_protocol` already reads
+    // an empty/absent `typed_extension_protocol_options` map as `Http1`
+    // (Envoy's own default for an unconfigured cluster), so emitting an
+    // explicit `http_protocol_options: {}` block would be redundant JSON that
+    // changes the emitted bytes for every config predating this field without
+    // changing behavior -- omitting it keeps that byte-identical guarantee.
+    //
+    // This sits on the PROVIDER cluster, which is exactly right per ground
+    // rule #6: `lower_provider` runs once per `providers` entry and never
+    // touches the `fallback:route-{index}` aggregate cluster `lower_route`
+    // builds separately, so a route with fallbacks still lowers cleanly --
+    // `typed_extension_protocol_options` on an aggregate is a hard load
+    // error (see the comment on `aggregate` below).
+    if provider.protocol == Some(UpstreamProtocol::Http2) {
+        cluster["typed_extension_protocol_options"] = json!({
+            HTTP_PROTOCOL_OPTIONS_KEY: {
+                "@type": HTTP_PROTOCOL_OPTIONS_TYPE_URL,
+                "explicit_http_config": { "http2_protocol_options": {} }
+            }
+        });
     }
 
     // Provider credentials live on the CLUSTER, not the route -- see
