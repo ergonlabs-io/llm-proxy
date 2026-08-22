@@ -461,8 +461,8 @@ releases:
   gate: >-
     The config-corpus scorecard clears 80% accept on real-world Envoy configs (baseline 15%),
     with zero <em>bug-we-accept</em> results in the differential run against Envoy v1.38.0.
-  done: 0
-  open: 7
+  done: 1
+  open: 6
   left:
   - wp: WP-27
     what: >-
@@ -478,8 +478,6 @@ releases:
     what: Watermarks, StopAll resume, 1xx — the S2 remainder.
   - wp: WP-29
     what: 'Fuzzing: h1 parser smuggling vectors, config, routes.'
-  - wp: WP-40
-    what: Dependency-tree review and cleanup.
 - v: v1.0.0
   name: Full LLM layer
   state: later

@@ -109,18 +109,32 @@ work_packages:
   lane: A
   size: M
   gate: G4
-  status: ready
+  status: done
   title: Dependency-tree review & cleanup
   meta:
   - workspace-wide
   - owner-requested
+  - >-
+    DONE 2026-08-22 — all three acceptance criteria met, full <code>make ci</code> green
+  - >-
+    <b>proxy-xds is eleven lines of doc comment and no code</b>, and three dependency edges
+    existed only in anticipation of it — including one from the shipped binary
+  - >-
+    6 unused edges removed, each verified by removing it and re-running CI rather than by the
+    grep that found it
+  - >-
+    <b>the pre-existing candidate list had already gone stale</b>: 5 entries it called
+    likely-unused had since acquired real users when WP-23's registry landed, so acting on it
+    later would have deleted working deps
+  - >-
+    <code>make deps-check</code> now runs inside <code>make ci</code>
+    (<code>scripts/check-deps.py</code> — the "equivalent", since cargo-udeps needs nightly +
+    a full build); it deliberately over-counts, and every allowlist entry must say why the use
+    is invisible
   - proxy-config → proxy-observability is the edge that constrains log/stat-shaped types
   - >-
-    a real cycle was hit once (unused proxy-core dep in proxy-cluster, masking a transitive
-    rand)
-  - >-
-    deliverable: documented graph in docs/ · no unused deps in CI · no duplicated types across
-    a boundary
+    dev-dep cycle proxy-config ⇄ proxy-filters left in place and documented — seen and judged,
+    not missed
 - id: 6
   prio: P1
   ms: v0.2.0
