@@ -1,11 +1,42 @@
-//! Per-worker HTTP/2 upstream connection cache (WP-15 slice A): keeps one
-//! live hyper h2 [`SendRequest`] per (cluster, address, protocol) and hands
-//! every concurrent stream to that upstream a clone of it, instead of
-//! dialing a fresh TCP connection (and TLS handshake, where configured) for
-//! every request. hyper's h2 `SendRequest` multiplexes concurrent requests
-//! over one connection internally and is cheap to `.clone()`, so this is the
-//! entire win: N concurrent requests to one provider become 1 TCP connection
-//! instead of N.
+//! Per-worker HTTP/2 upstream connection cache (WP-15 slice A, extended by
+//! slice C): keeps a small, bounded *set* of live hyper h2 [`SendRequest`]s
+//! per (cluster, address, protocol) instead of exactly one, and hands out
+//! clones from whichever member of that set has room, instead of dialing a
+//! fresh TCP connection (and TLS handshake, where configured) for every
+//! request. hyper's h2 `SendRequest` multiplexes concurrent requests over
+//! one connection internally and is cheap to `.clone()`, so the win is still
+//! N concurrent requests to one provider costing far fewer than N TCP
+//! connections -- just not always exactly 1 any more.
+//!
+//! ## Why slice A's "exactly one connection" wasn't enough (slice C)
+//!
+//! A capacity sweep plateaued at exactly 202 concurrent streams no matter
+//! how much load was offered, because the peer (any real h2 server,
+//! including hyper's own, whose server default is
+//! `max_concurrent_streams: 200`, `hyper-1.11.0/src/proto/h2/server.rs:69`)
+//! caps how many streams *one* connection may carry at once, and slice A
+//! cached exactly one connection per key. h1 hit no such ceiling (its own
+//! pool dials a fresh connection per stream), so h2 pooling was costing up
+//! to 5x peak concurrency versus h1 for the identical workload.
+//!
+//! The fix is a bounded *set* of connections (see [`MAX_CONNECTIONS_PER_KEY`])
+//! plus our own accounting of how many streams are in flight on each one
+//! (see [`SOFT_STREAMS_PER_CONNECTION`], [`StreamGuard`]) -- **not** hyper's
+//! `SendRequest::poll_ready`/`is_ready`/`is_closed`. Read those three
+//! methods in `hyper-1.11.0/src/client/conn/http2.rs` before reaching for
+//! them here: for the h2 client they only ever report whether the
+//! connection is *closed*, never whether it currently has spare stream
+//! capacity (that real backpressure exists, but it lives entirely inside
+//! the spawned connection-driving task -- `proto::h2::client::ClientTask`
+//! polls the underlying `h2::client::SendRequest::poll_ready` itself, and
+//! only pulls the next queued request off its internal channel once a real
+//! slot frees). Excess sends past the peer's true limit don't fail; they
+//! queue invisibly inside that task -- which is exactly the fixed-slot-queue
+//! symptom the sweep measured (TTFT jumping to one full stream duration).
+//! So this module tracks its own conservative "how busy does *this* pool
+//! think this connection is" counter to decide when to prefer a different
+//! (or new) connection; hyper's real per-connection queue is still what
+//! ultimately keeps everything safe if that guess runs a little high.
 //!
 //! h1 is untouched by this slice: it stays connect-per-stream through
 //! `proxy_cluster::pool::ConnectPool`, exactly as before (see `router.rs`'s
@@ -23,17 +54,21 @@
 //! [`proxy_cluster::pool::ConnectPool`] keeps doing exactly what it does
 //! today (dial raw bytes); this cache sits on top of it, worker-side.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use hyper::body::{Body, Frame, SizeHint};
 use hyper::client::conn::http2::SendRequest;
 use proxy_cluster::{HttpConnPool, PoolError, UpstreamProtocol};
 
-use crate::codec::handshake_upstream_http2;
-use crate::handler::StreamBody;
+use crate::codec::{handshake_upstream_http2, send_on_http2, UpstreamCodecError};
+use crate::handler::{local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody};
 
 /// The cache key -- and a security boundary, not just a lookup convenience.
 ///
@@ -81,12 +116,165 @@ impl Hash for ConnKey {
     }
 }
 
-/// One cache slot. `None` means nobody has successfully dialed this key yet
-/// (or the previous occupant died and was cleared). `Rc<tokio::sync::Mutex<_>>`,
-/// not a plain `RefCell` -- see [`UpstreamConnCache::get_or_connect`]'s doc
-/// for why a real (queueing) lock is required here even though this whole
-/// cache never leaves one worker thread.
-type Slot = Rc<tokio::sync::Mutex<Option<SendRequest<StreamBody>>>>;
+/// How many streams this cache will let itself *prefer* piling onto one
+/// connection before it goes looking for another. Not a real limit --
+/// nothing here can observe the peer's actual `max_concurrent_streams`
+/// (this module's doc explains why hyper's public h2 client API doesn't
+/// expose it) -- just our own conservative guess for "probably has room",
+/// used only to decide which of our own connections to route a request to.
+/// 100 is not invented for this: it's `DEFAULT_INITIAL_MAX_SEND_STREAMS`,
+/// the exact value hyper's own h2 client assumes for a connection before it
+/// has heard a real SETTINGS frame from the peer
+/// (`hyper-1.11.0/src/proto/h2/client.rs:61`) -- i.e. the same conservative
+/// "this is safe until proven otherwise" number hyper itself already
+/// trusts. Once every connection in the set looks this busy,
+/// [`UpstreamConnCache::get_or_connect`] dials another rather than queuing
+/// everything behind a guess.
+const SOFT_STREAMS_PER_CONNECTION: usize = 100;
+
+/// The hard cap on how many physical connections one [`ConnKey`] may hold at
+/// once. Must be bounded: with no cap, a sustained burst above
+/// [`SOFT_STREAMS_PER_CONNECTION`] would dial a fresh connection (and TLS
+/// handshake, where configured) per request once every existing connection
+/// looked busy -- recreating exactly the connect-per-request cost pooling
+/// exists to avoid. 4 is a deliberately small, fixed starting point: the
+/// capacity sweep that motivated this module plateaued with ONE connection
+/// capped at 200 real concurrent streams (hyper's own server default,
+/// `hyper-1.11.0/src/proto/h2/server.rs:69`); four connections, each free to
+/// carry however many streams the peer really allows (not just our
+/// [`SOFT_STREAMS_PER_CONNECTION`] guess -- see this module's doc), gives
+/// several times that ceiling per key while still amortizing the TCP+TLS
+/// handshake cost over many requests per connection, and without opening
+/// enough parallel connections to itself look like abuse to a peer that
+/// caps concurrent connections per client. Not (yet) configurable per
+/// cluster; a fixed conservative default is in scope for this slice.
+const MAX_CONNECTIONS_PER_KEY: usize = 4;
+
+/// One connection this cache is holding open for a [`ConnKey`], plus our own
+/// best guess at how many streams are currently in flight on it -- see
+/// [`StreamGuard`] for how that counter is kept honest across the whole
+/// request/response lifetime, not just until headers arrive.
+struct PooledConn {
+    sender: SendRequest<StreamBody>,
+    in_flight: Rc<Cell<usize>>,
+}
+
+/// One cache slot: the bounded set of connections currently held for a
+/// single [`ConnKey`]. Empty means nobody has successfully dialed this key
+/// yet (or every prior occupant died and was cleared).
+/// `Rc<tokio::sync::Mutex<_>>`, not a plain `RefCell` -- see
+/// [`UpstreamConnCache::get_or_connect`]'s doc for why a real (queueing)
+/// lock is required here even though this whole cache never leaves one
+/// worker thread.
+type Slot = Rc<tokio::sync::Mutex<Vec<PooledConn>>>;
+
+/// A leased h2 sender plus the [`StreamGuard`] that must ride along with
+/// whatever response body this stream produces -- see [`Self::send`].
+/// Returned by [`UpstreamConnCache::get_or_connect`] instead of a bare
+/// `SendRequest` (what slice A returned) so the router can't accidentally
+/// send a request without also carrying its stream-accounting guard.
+#[derive(Debug)]
+pub struct PooledSendRequest {
+    sender: SendRequest<StreamBody>,
+    guard: StreamGuard,
+}
+
+impl PooledSendRequest {
+    /// Send `req` over this leased connection and keep this stream counted
+    /// as in-flight (see [`StreamGuard`]) for as long as the *response body*
+    /// lives, not just until `codec::send_on_http2`'s `.await` resolves at
+    /// the response head. LLM responses are commonly long-lived SSE streams,
+    /// so "in flight" has to mean the whole stream duration or this cache's
+    /// accounting would systematically undercount exactly the workload it
+    /// was built for.
+    ///
+    /// Kept here rather than changing `codec::send_on_http2`'s own
+    /// signature, so `codec.rs` stays pool-agnostic -- the same split slice
+    /// A already drew between "dial" (`handshake_upstream_http2`) and "send"
+    /// (`send_on_http2`).
+    pub async fn send(self, req: HttpRequestParts) -> Result<HttpResponseParts, UpstreamCodecError> {
+        let PooledSendRequest { sender, guard } = self;
+        let mut response = send_on_http2(sender, req).await?;
+        response.body = guard.attach(response.body);
+        Ok(response)
+    }
+}
+
+/// RAII stream-accounting handle. Created by
+/// [`UpstreamConnCache::get_or_connect`] (via `lease`, incrementing
+/// [`PooledConn::in_flight`] there and then), and decremented on `Drop`
+/// -- whichever way that happens: the response body read to completion, an
+/// early `?` before one was ever produced, or the body simply being dropped
+/// because the downstream client went away mid-stream. Every one of those is
+/// "this stream is no longer in flight" for this cache's purposes, and
+/// `Drop` fires on all of them uniformly.
+///
+/// Rust note: `Cell<usize>`, not an atomic or a `Mutex` -- this whole cache
+/// never leaves its worker's OS thread (ADR-0003, the same reasoning
+/// `UpstreamConnCache`'s own doc gives for using `RefCell` over its map), so
+/// there's no cross-thread race to guard against, only interior mutability
+/// through a shared `Rc`.
+#[derive(Debug)]
+struct StreamGuard {
+    in_flight: Rc<Cell<usize>>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.in_flight.set(self.in_flight.get().saturating_sub(1));
+    }
+}
+
+impl StreamGuard {
+    /// Wrap `body` so this guard's decrement fires exactly when `body` is
+    /// dropped, instead of wherever `self` would otherwise have gone out of
+    /// scope -- see [`GuardedBody`].
+    fn attach(self, body: StreamBody) -> StreamBody {
+        local_boxed(GuardedBody {
+            inner: body,
+            _guard: self,
+        })
+    }
+}
+
+/// A [`Body`] combinator that just delegates to `inner`, holding `_guard`
+/// alive for exactly as long as the body itself is -- see
+/// `StreamGuard::attach`. Same shape as `router::guarded::GuardedBody`
+/// (not reused directly: that one is private to the `router` module, and
+/// this module owns its own guard type rather than adding a `proxy-http`
+/// visibility hole to reach it).
+///
+/// Rust note: `inner` is a [`StreamBody`] (`Pin<Box<dyn Body<..>>>`, which
+/// is `Unpin` regardless of what it boxes -- the box itself owns the pin),
+/// and `_guard: StreamGuard` is a plain owned value with no self-references
+/// (so it's `Unpin` too). That makes `GuardedBody` as a whole `Unpin`, so
+/// `poll_frame` below can use `self.get_mut()` to reach `&mut self.inner`
+/// directly -- no manual (`unsafe`) pin projection, and no need for the
+/// `pin-project`/`pin-project-lite` crate. `unsafe` is denied
+/// workspace-wide, so this field shape is what makes the safe projection
+/// possible at all.
+struct GuardedBody {
+    inner: StreamBody,
+    _guard: StreamGuard,
+}
+
+impl Body for GuardedBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 /// Per-worker cache of live HTTP/2 upstream connections, keyed by
 /// [`ConnKey`]. Reached via [`worker_conn_cache`]; see that function's doc
@@ -116,13 +304,19 @@ impl UpstreamConnCache {
         }
     }
 
-    /// Return a live h2 sender for `key`: a cloned handle onto the cached
-    /// connection if one exists and hasn't gone dead (hazard 2: GOAWAY /
-    /// upstream-initiated close), or a freshly dialed-and-handshaken one
-    /// otherwise. On a failed dial or handshake the cache is left holding no
-    /// entry for `key` (hazard 4) -- the caller's own retry, if any, or the
-    /// next request simply tries again from nothing rather than getting
-    /// stuck behind a poisoned entry.
+    /// Return a leased h2 sender for `key`: a clone from whichever cached
+    /// connection currently looks least busy, dialing a fresh one first if
+    /// none exist yet, none has room under [`SOFT_STREAMS_PER_CONNECTION`],
+    /// or the set is empty because every prior occupant died (hazard 2:
+    /// GOAWAY / upstream-initiated close). On a failed dial or handshake the
+    /// cache is left holding no *new* entry for `key` (hazard 4) -- the
+    /// caller's own retry, if any, or the next request simply tries again
+    /// rather than getting stuck behind a poisoned one. Never returns an
+    /// error purely because every existing connection is busy: once the set
+    /// is at [`MAX_CONNECTIONS_PER_KEY`], this hands out the least-loaded
+    /// member anyway and lets hyper's own per-connection queue (see this
+    /// module's doc) absorb the rest, exactly as slice A's single connection
+    /// already did for everything past its one connection's real capacity.
     ///
     /// Rust note: the per-key `tokio::sync::Mutex` (not this cache's own
     /// `RefCell`) is what's held across the `.await`s below (dial,
@@ -135,53 +329,84 @@ impl UpstreamConnCache {
     /// "nothing cached yet" on their first synchronous check and each go
     /// dial their own connection -- exactly the thundering-herd this whole
     /// cache exists to prevent (see the router's `two concurrent requests
-    /// open exactly one connection` test). The lock is scoped to one key
-    /// (`Rc`-shared per `ConnKey` entry, not one lock for the whole cache),
-    /// so two different clusters' dials never wait on each other.
+    /// open exactly one connection` test, which still holds: under
+    /// [`SOFT_STREAMS_PER_CONNECTION`] load this still converges on one
+    /// connection). The lock is scoped to one key (`Rc`-shared per `ConnKey`
+    /// entry, not one lock for the whole cache), so two different clusters'
+    /// dials never wait on each other, and it's held for this whole call
+    /// (lookup, and dial if needed) so no two concurrent callers for the
+    /// same key ever both decide to dial at once.
     pub async fn get_or_connect(
         &self,
         key: ConnKey,
         pool: &dyn HttpConnPool,
-    ) -> Result<SendRequest<StreamBody>, PoolError> {
+    ) -> Result<PooledSendRequest, PoolError> {
         let slot: Slot = self
             .slots
             .borrow_mut()
             .entry(key)
-            .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(None)))
+            .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(Vec::new())))
             .clone();
 
-        let mut guard = slot.lock().await;
-        if let Some(sender) = guard.as_ref() {
-            if !sender.is_closed() {
-                return Ok(sender.clone());
-            }
+        let mut conns = slot.lock().await;
+
+        // Hazard 2, generalized to a set: drop every dead connection up
+        // front so a stale one is never picked as "least loaded" nor
+        // counted against the cap below.
+        conns.retain(|c| !c.sender.is_closed());
+
+        // 1. Prefer whichever existing connection looks least busy, as long
+        // as it's under our own soft target -- see that constant's doc for
+        // why this is our own bookkeeping, not a real signal from hyper.
+        if let Some(conn) = conns
+            .iter()
+            .filter(|c| c.in_flight.get() < SOFT_STREAMS_PER_CONNECTION)
+            .min_by_key(|c| c.in_flight.get())
+        {
+            return Ok(lease(conn));
         }
-        // Either nothing was cached yet, or what was is dead -- clear it
-        // before dialing so a failed dial below leaves the slot empty, not
-        // stale (hazard 4). Concurrent callers for this same key are queued
-        // on `slot`'s lock, not racing this dial.
-        *guard = None;
 
-        let upstream = pool.new_stream().await?;
-        // A handshake failure is folded into `PoolError::TlsHandshake`:
-        // there's no dedicated pool-error variant for "connected, but the h2
-        // preface/settings exchange failed" (`PoolError` lives in
-        // `proxy-cluster`, out of scope this batch), and it belongs in the
-        // same "never got a usable connection" bucket the retry engine
-        // already treats a real TLS handshake failure as
-        // (`AttemptOutcome::from_pool_error`).
-        let sender = handshake_upstream_http2(upstream.io)
-            .await
-            .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))?;
+        // 2. Every existing connection (if any) looks busy -- dial one more,
+        // as long as the set is still under the hard cap on how many
+        // physical connections this key is allowed to hold.
+        if conns.len() < MAX_CONNECTIONS_PER_KEY {
+            let upstream = pool.new_stream().await?;
+            // A handshake failure is folded into `PoolError::TlsHandshake`:
+            // there's no dedicated pool-error variant for "connected, but
+            // the h2 preface/settings exchange failed" (`PoolError` lives in
+            // `proxy-cluster`, out of scope this batch), and it belongs in
+            // the same "never got a usable connection" bucket the retry
+            // engine already treats a real TLS handshake failure as
+            // (`AttemptOutcome::from_pool_error`).
+            let sender = handshake_upstream_http2(upstream.io)
+                .await
+                .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))?;
+            conns.push(PooledConn {
+                sender,
+                in_flight: Rc::new(Cell::new(0)),
+            });
+            let conn = conns.last().expect("just pushed one line above");
+            return Ok(lease(conn));
+        }
 
-        *guard = Some(sender.clone());
-        Ok(sender)
+        // 3. At the cap and everything looks busy: never fail purely
+        // because of that -- hand out the least-loaded connection anyway.
+        // hyper's own per-connection queue still won't drop or reject the
+        // request; it queues internally until a real stream slot frees,
+        // exactly like slice A's single connection did for everything past
+        // its own real capacity.
+        let conn = conns
+            .iter()
+            .min_by_key(|c| c.in_flight.get())
+            .expect("MAX_CONNECTIONS_PER_KEY > 0, so the set is non-empty by branch 2");
+        Ok(lease(conn))
     }
 
-    /// Evict the cached connection for `key`, if any. For a caller that just
-    /// observed a send failure on a sender it got from this cache and wants
-    /// the next request/retry to redial rather than risk handing out the
-    /// same now-suspect sender again before its `is_closed()` catches up.
+    /// Evict every cached connection for `key`, if any. For a caller that
+    /// just observed a send failure on a sender it got from this cache and
+    /// wants the next request/retry to redial rather than risk getting
+    /// handed the same now-suspect connection again before its
+    /// `is_closed()` catches up.
     pub fn invalidate(&self, key: &ConnKey) {
         self.slots.borrow_mut().remove(key);
     }
@@ -204,6 +429,19 @@ impl UpstreamConnCache {
     /// seam to call into.
     pub fn clear(&self) {
         self.slots.borrow_mut().clear();
+    }
+}
+
+/// Lease one stream on `conn`: increments its in-flight counter and returns
+/// a sender clone paired with the [`StreamGuard`] that decrements it again
+/// once the caller is done -- see [`PooledSendRequest::send`].
+fn lease(conn: &PooledConn) -> PooledSendRequest {
+    conn.in_flight.set(conn.in_flight.get() + 1);
+    PooledSendRequest {
+        sender: conn.sender.clone(),
+        guard: StreamGuard {
+            in_flight: conn.in_flight.clone(),
+        },
     }
 }
 
@@ -232,7 +470,6 @@ pub fn worker_conn_cache() -> Rc<UpstreamConnCache> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::send_on_http2;
     use crate::handler::{local_boxed, DownstreamInfo, HttpRequestParts};
     use bytes::Bytes;
     use http::{HeaderMap, Method, StatusCode, Uri};
@@ -358,10 +595,10 @@ mod tests {
                     .await
                     .expect("cluster-b connects");
 
-                send_on_http2(sender_a, get_request())
+                sender_a.send(get_request())
                     .await
                     .expect("cluster-a request");
-                send_on_http2(sender_b, get_request())
+                sender_b.send(get_request())
                     .await
                     .expect("cluster-b request");
 
@@ -387,7 +624,7 @@ mod tests {
                     .get_or_connect(key.clone(), &pool)
                     .await
                     .expect("first connect");
-                send_on_http2(sender1, get_request())
+                sender1.send(get_request())
                     .await
                     .expect("first request");
 
@@ -395,7 +632,7 @@ mod tests {
                     .get_or_connect(key, &pool)
                     .await
                     .expect("second connect (should reuse)");
-                send_on_http2(sender2, get_request())
+                sender2.send(get_request())
                     .await
                     .expect("second request");
 
@@ -435,7 +672,7 @@ mod tests {
                     )
                     .await
                     .expect("retrying against a now-live address must succeed cleanly");
-                send_on_http2(sender, get_request())
+                sender.send(get_request())
                     .await
                     .expect("request over the fresh connection");
                 assert_eq!(accepted.load(Ordering::SeqCst), 1);
@@ -462,13 +699,13 @@ mod tests {
                 let key = ConnKey::new("up", addr, UpstreamProtocol::Http2);
 
                 let sender1 = cache.get_or_connect(key.clone(), &pool).await.unwrap();
-                send_on_http2(sender1, get_request()).await.unwrap();
+                sender1.send(get_request()).await.unwrap();
                 assert_eq!(accepted.load(Ordering::SeqCst), 1);
 
                 cache.clear();
 
                 let sender2 = cache.get_or_connect(key, &pool).await.unwrap();
-                send_on_http2(sender2, get_request()).await.unwrap();
+                sender2.send(get_request()).await.unwrap();
                 assert_eq!(
                     accepted.load(Ordering::SeqCst),
                     2,
@@ -488,13 +725,13 @@ mod tests {
                 let key = ConnKey::new("up", addr, UpstreamProtocol::Http2);
 
                 let sender1 = cache.get_or_connect(key.clone(), &pool).await.unwrap();
-                send_on_http2(sender1, get_request()).await.unwrap();
+                sender1.send(get_request()).await.unwrap();
                 assert_eq!(accepted.load(Ordering::SeqCst), 1);
 
                 cache.invalidate(&key);
 
                 let sender2 = cache.get_or_connect(key, &pool).await.unwrap();
-                send_on_http2(sender2, get_request()).await.unwrap();
+                sender2.send(get_request()).await.unwrap();
                 assert_eq!(accepted.load(Ordering::SeqCst), 2);
             })
             .await;

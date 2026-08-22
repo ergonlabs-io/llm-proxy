@@ -74,7 +74,7 @@ use proxy_cluster::{
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher};
 use proxy_observability::ResponseFlag;
 
-use crate::codec::{send_on_http2, send_upstream_http1, Http1Options, UpstreamCodecError};
+use crate::codec::{send_upstream_http1, Http1Options, UpstreamCodecError};
 use crate::filter::{
     DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
     RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
@@ -86,21 +86,23 @@ use crate::handler::{
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, select_cluster};
 use crate::stat_handles::RouterStats;
-use crate::upstream_pool::{ConnKey, UpstreamConnCache};
+use crate::upstream_pool::{ConnKey, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 
 /// What `apply_forward`'s attempt loop got back from connecting to the
 /// picked host: an h1 [`UpstreamStream`] for a fresh connect-per-stream dial,
-/// or an h2 `SendRequest` that may be freshly dialed or a clone of an
-/// already-cached one (WP-15 slice A -- see `crate::upstream_pool`'s module
-/// doc). One `Result<Connected, PoolError>` for both protocols keeps the
-/// shared connect-failure handling (S3 retry classification, circuit-breaker
+/// or a [`PooledSendRequest`] leased from the worker's bounded h2 connection
+/// set -- possibly a clone of an already-cached, already-handshaken sender,
+/// possibly a freshly dialed one (WP-15 slice A, extended to a bounded set
+/// of connections by slice C -- see `crate::upstream_pool`'s module doc).
+/// One `Result<Connected, PoolError>` for both protocols keeps the shared
+/// connect-failure handling (S3 retry classification, circuit-breaker
 /// outcome, response-flag mapping) a single match arm instead of two
 /// near-duplicate ones.
 enum Connected {
     Http1(UpstreamStream),
-    Http2(hyper::client::conn::http2::SendRequest<StreamBody>),
+    Http2(PooledSendRequest),
 }
 
 mod guarded;
@@ -629,10 +631,14 @@ impl RouterHandler {
                 // future so the two arms share one type. h2 here is
                 // prior-knowledge cleartext (h2c) over the pool's raw TCP
                 // stream -- no per-request `Connection: close`, so it takes
-                // no `Http1Options`. WP-15 slice A: the h2 arm sends over
-                // whatever `SendRequest` `connected` carries -- possibly a
-                // clone of an already-cached, already-handshaken sender, not
-                // a fresh one this attempt just dialed.
+                // no `Http1Options`. WP-15 slice A/C: the h2 arm sends over
+                // whatever connection `connected` was leased from -- possibly
+                // a clone of an already-cached, already-handshaken sender,
+                // not a fresh one this attempt just dialed --
+                // `PooledSendRequest::send` (not `codec::send_on_http2`
+                // directly) so the stream stays counted as in-flight against
+                // that connection for the whole response, not just until
+                // headers arrive.
                 let send: std::pin::Pin<
                     Box<
                         dyn std::future::Future<
@@ -645,7 +651,7 @@ impl RouterHandler {
                         upstream_req,
                         Http1Options { keep_alive: false },
                     )),
-                    Connected::Http2(sender) => Box::pin(send_on_http2(sender, upstream_req)),
+                    Connected::Http2(pooled) => Box::pin(pooled.send(upstream_req)),
                 };
 
                 // S4.2: a route with a retry policy may additionally set
