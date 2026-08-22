@@ -607,6 +607,24 @@ Each WP references its normative spec sections.
   upstream (fail N then succeed) × every retry_on — attempt counts observed at upstream must
   match Envoy's within jitter-independent assertions.
 
+> **SLICE C MEASURED 2026-08-22: 202 -> 808 concurrent streams, a 4x improvement.** Same
+> harness, same LLM-shaped workload, only the pool changed. At the new plateau the proxy sits
+> at 20-22% CPU and 82.7MB RSS with a 0.00 error rate, so it is *still* not resource-bound —
+> the ceiling is still structural, just four times higher. Cost model: 61.4KB RSS per
+> concurrent stream (R^2=0.981), 0.80ms CPU per request (R^2=0.903).
+>
+> **The orchestrator predicted ~400 and was wrong, in a way worth recording**: the prediction
+> assumed `MAX_CONNECTIONS_PER_KEY` (4) x `SOFT_STREAMS_PER_CONNECTION` (100) = 400. But the
+> soft limit is the threshold at which we *dial another* connection, not a hard cap on what an
+> existing one carries — each connection still runs up to the peer's advertised limit (200
+> here). So the real ceiling is 4 x peer_limit = 800, measured 808. **The knob that moves this
+> number is `MAX_CONNECTIONS_PER_KEY`, not the soft limit**, and anyone tuning the soft limit
+> to raise capacity will be disappointed.
+>
+> For comparison on the same box: HTTP/1.1 upstreams reached at least 1024 (the harness cap,
+> never a proxy limit) at 301 rps and 107.7MB. So h2 is now within range of h1 on concurrency
+> while using less memory per stream, where before it was 5x worse.
+
 > **FOLLOW-UP FILED 2026-08-22 — a default-on retry condition that can never fire.**
 > `refused-stream` is fully wired *except* for the one step that detects it:
 > `RetryOn::refused_stream` exists in the IR (`ir.rs:897`), is parsed from Envoy config
