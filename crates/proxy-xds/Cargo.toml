@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
-proxy-api = { workspace = true }
-proxy-config = { workspace = true }
+# No dependencies: this crate is a placeholder for Lane E (WP-20/21/22) and
+# contains no code yet -- src/lib.rs is doc comments only. It previously
+# declared proxy-api and proxy-config, which nothing referenced, so the
+# workspace carried two edges that existed only in anticipation. Re-add them
+# when there is code that uses them (WP-40).
 
 [lints]
 workspace = true

@@ -11,6 +11,44 @@
 > `cargo tree`, `cargo metadata`, and `cargo-udeps` were **not** run — see
 > [What this document cannot tell you](#what-this-document-cannot-tell-you).
 
+## Update 2026-08-22 — audit executed, and this document had gone stale
+
+The original pass produced the candidate table below; this pass **acted on it**,
+and in doing so found the thing worth recording most: *the candidate table was
+already out of date.* Five entries it listed as "likely-unused" — `proxy-admin →
+proxy-observability` (called "the strongest candidate in the workspace"), and
+`proxy → {proxy-http, proxy-filters, proxy-observability}` — are all now genuinely
+used, because WP-23's stats registry landed after that analysis was written.
+`proxy-admin/src/server.rs:14` imports `proxy_observability::stats::{envoy_render,
+prometheus_render, Registry}`.
+
+Nobody was wrong. A hand-maintained candidate list simply decays, and this one
+decayed in the direction that would have caused real damage: acting on it later,
+without re-checking, would have deleted four dependencies that had since acquired
+users. That is the argument for the enforcement section at the end of this
+document — a check that runs is worth more than a list that was accurate once.
+
+**Removed this pass** (all verified by removal + full `make ci`, not by grep alone):
+
+| Crate | Dependency | Why |
+|---|---|---|
+| `proxy-xds` | `proxy-api`, `proxy-config` | The crate is **eleven lines of doc comment and no code**. Both edges existed purely in anticipation of WP-20. |
+| `proxy` | `proxy-xds` | The binary depended on that empty crate and never named it. |
+| `proxy-filters` | `serde` | Only `serde_json` is used; no `use serde`, no derives. |
+| `proxy-simple-config` | `proxy-api` (dev) | Zero occurrences anywhere in the crate, tests included. Tightens ground rule 2 at no cost. |
+| `testing/diffrig` | `http` | Uses `hyper` and `http-body-util`; no `http::` path. |
+| `testing/loadgen` | `futures` | Concurrency is `tokio` tasks throughout. |
+
+**Deliberate disagreement with the original, recorded rather than silently
+overridden:** the table below recommends *keeping* `proxy-xds`'s two edges with an
+allowlist entry naming WP-20. They were removed instead. An allowlist suppression
+for a crate containing no code is a suppression with nothing behind it, and
+re-adding one line when WP-20 actually starts is cheaper than carrying two edges
+and an explanation until then. `proxy-xds` remains a workspace member and still
+compiles.
+
+**Not removed, contrary to the table below:** `proxy-config → serde` is used.
+
 ## Why this document exists
 
 Crate-boundary decisions here have twice been forced by an edge rather than by
@@ -214,7 +252,12 @@ different semantics. Folding them would be a billing-accuracy bug.
 enum, the other a newtype `String` holding a rendered descriptor key. Worth
 knowing when reading a stack trace; not a boundary problem.
 
-## Candidate unused dependencies
+## Candidate unused dependencies (historical — superseded 2026-08-22)
+
+> **Do not act on this table.** It is preserved as the original analysis and as
+> evidence for how such a list decays; see the update section at the top for what
+> was actually removed and what has since acquired users. `make deps-check` is now
+> the live authority.
 
 **Read this as leads, not deletions.** Evidence is grep over each crate's `src/`
 and `tests/` for every form a dependency can appear in. Grep cannot see three
@@ -283,5 +326,22 @@ line. Two things keep it honest:
 
 1. The layering table is the reviewable artifact — a PR adding an upward edge
    should have to change that table to justify it.
-2. `cargo-udeps` in CI (WP-40's second acceptance criterion) catches the
-   accumulation this document exists to describe.
+2. **`make deps-check`, which now runs inside `make ci`** — WP-40's second
+   acceptance criterion, met with an equivalent rather than with `cargo-udeps`
+   itself (that needs a nightly toolchain and a full build; `cargo-machete` is not
+   installed here either). `scripts/check-deps.py` documents that tradeoff.
+
+   Two properties of that checker are deliberate and worth not "fixing":
+
+   - **It over-counts.** A mention in a doc comment counts as a use. That is the
+     safe direction for a gate: it will never fail a build over a dependency that
+     is genuinely needed. It does mean `proxy-api`'s `prost` currently registers
+     as used via a comment in `build.rs` — noted in the allowlist entry so the
+     real reason survives if that comment is ever reworded.
+   - **Every allowlist entry states why the use is invisible to a text scan.** An
+     unexplained suppression is how a checker quietly stops meaning anything.
+
+   Writing it surfaced its own blind spot, which is the reason to distrust a fresh
+   instrument: the first version guarded every path with `os.path.isdir`, so it
+   silently skipped every `build.rs` and reported build-dependencies clean without
+   ever having looked at them.

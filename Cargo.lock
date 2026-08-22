@@ -430,7 +430,6 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "http",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -883,7 +882,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
- "futures",
  "hdrhistogram",
  "http",
  "http-body-util",
@@ -1344,7 +1342,6 @@ dependencies = [
  "proxy-http",
  "proxy-observability",
  "proxy-simple-config",
- "proxy-xds",
  "ring",
  "tokio",
  "tracing",
@@ -1458,7 +1455,6 @@ dependencies = [
  "proxy-config",
  "proxy-http",
  "ring",
- "serde",
  "serde_json",
  "tracing",
 ]
@@ -1503,7 +1499,6 @@ dependencies = [
  "bytes",
  "http",
  "http-body-util",
- "proxy-api",
  "proxy-cluster",
  "proxy-config",
  "proxy-filters",
@@ -1521,10 +1516,6 @@ dependencies = [
 [[package]]
 name = "proxy-xds"
 version = "0.1.0"
-dependencies = [
- "proxy-api",
- "proxy-config",
-]
 
 [[package]]
 name = "quote"

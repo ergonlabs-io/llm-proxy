@@ -13,7 +13,6 @@ serde_path_to_error = { workspace = true }
 serde_yaml = { workspace = true }
 
 [dev-dependencies]
-proxy-api = { workspace = true }
 # Test-only: pins the usage filter's type URL, which `lower.rs` duplicates as a
 # literal rather than importing (see the comment on `USAGE_FILTER_TYPE_URL`).
 # A dev-dependency keeps the data plane out of the production dependency tree.

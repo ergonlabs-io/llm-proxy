@@ -148,11 +148,12 @@ lint: ## Clippy with warnings denied (what CI enforces)
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: ci
-ci: ## Everything CI runs: format check, lint, tests, doctests, black-box QA
+ci: ## Everything CI runs: format check, lint, tests, doctests, dep audit, black-box QA
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo nextest run --workspace
 	@$(MAKE) tq-doc
+	@$(MAKE) deps-check
 	@$(MAKE) qa
 
 .PHONY: clean
@@ -267,6 +268,16 @@ docs-dev: ## Run the docs site dev server (docs/site), http://localhost:4321
 .PHONY: docs-build
 docs-build: ## Production build of the docs site to docs/site/dist/
 	cd docs/site && npm run build
+
+# -------------------------------------------------------------------- deps --
+
+.PHONY: deps-check
+deps-check: ## WP-40: fail if any crate declares a dependency nothing references
+	python3 scripts/check-deps.py
+
+.PHONY: deps-list
+deps-list: ## Same, but also print the allowlisted suppressions and their reasons
+	python3 scripts/check-deps.py --list
 
 # ------------------------------------------------------------------- sweep --
 # WP-30 phase 3. These start real processes and bind real ports -- never run

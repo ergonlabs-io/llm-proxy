@@ -15,7 +15,6 @@ prost-reflect = { workspace = true }
 # compare). See docs/wp-50-auth-design-brief.md for why a keyed cryptographic
 # hash and NOT `token_limit_filter::hash_credential`'s FNV-1a.
 ring = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 # WP-34: warns loudly (rather than failing closed) when a budget applies to a
 # request but usage could not be read -- see `token_limit_filter`'s module doc.

@@ -750,7 +750,11 @@ mod tests {
     /// straight off the resolved handles.
     fn token_stats_for(
         provider: &str,
-    ) -> (Arc<GenAiTokenStats>, Arc<TokenUsageStatHandles>, Arc<Registry>) {
+    ) -> (
+        Arc<GenAiTokenStats>,
+        Arc<TokenUsageStatHandles>,
+        Arc<Registry>,
+    ) {
         let control = StatsControl::new(1);
         let handles = Arc::new(TokenUsageStatHandles::build(&control, [provider]));
         let registry = control.registry();

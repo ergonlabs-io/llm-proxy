@@ -1389,7 +1389,7 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   currently-inert fields (`HttpConnectionManagerConfig.access_logs`, `stat_prefix`) are allowlisted
   with their owning WP and drop off the list when consumed.
 
-#### WP-40 — Dependency-tree review & cleanup (Size: S→M, owner-requested)  — **Priority: P2**
+#### WP-40 — Dependency-tree review & cleanup (Size: S→M, owner-requested)  — **Priority: P2** · **DONE 2026-08-22**
 - **Why.** The access-log sink hit a genuine cycle constraint (`proxy-config` → `proxy-observability`,
   never the reverse), and a worker's first instinct was to duplicate an enum across the seam. That
   resolved cleanly by moving `AccessLogSink` into `proxy-observability` and re-exporting it, but it is
@@ -1402,6 +1402,16 @@ Both come out of defects found while landing WP-13/14/24/26, not from the origin
   `proxy-config` and `proxy-xds`.
 - **Acceptance:** a documented dependency graph in `docs/`; no unused deps (`cargo-udeps` or
   equivalent in CI); no duplicated same-shaped types across a crate boundary.
+- **Done 2026-08-22.** All three met. `docs/dependency-graph.md` carries the graph, the layering
+  rule, type ownership, and now the executed audit; `make deps-check` runs inside `make ci`
+  (`scripts/check-deps.py` — the "equivalent", since `cargo-udeps` needs nightly plus a full build);
+  six unused edges removed and verified by removal plus a full green `make ci`, not by grep.
+  Headline finding: **`proxy-xds` is eleven lines of doc comment and no code**, and three
+  dependency edges existed only in anticipation of it, including one from the shipped binary.
+  Second finding, recorded in the doc because it generalises: the original candidate table had
+  **already gone stale** — five entries it called likely-unused had since acquired real users when
+  WP-23's registry landed, so acting on it later without re-checking would have deleted working
+  dependencies. A check that runs beats a list that was accurate once.
 
 #### WP-41 — Black-box QA suite (Go) (Size: M)  — **Priority: P1**
 - **Why.** Every Rust test in this repo is written by someone who has read the code, and shares its

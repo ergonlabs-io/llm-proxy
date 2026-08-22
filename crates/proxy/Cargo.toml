@@ -22,7 +22,6 @@ proxy-filters = { workspace = true }
 proxy-http = { workspace = true }
 proxy-observability = { workspace = true }
 proxy-simple-config = { workspace = true }
-proxy-xds = { workspace = true }
 ring = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
