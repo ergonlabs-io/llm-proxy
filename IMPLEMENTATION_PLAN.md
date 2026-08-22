@@ -607,6 +607,30 @@ Each WP references its normative spec sections.
   upstream (fail N then succeed) × every retry_on — attempt counts observed at upstream must
   match Envoy's within jitter-independent assertions.
 
+> **FOLLOW-UP FILED 2026-08-22 — a default-on retry condition that can never fire.**
+> `refused-stream` is fully wired *except* for the one step that detects it:
+> `RetryOn::refused_stream` exists in the IR (`ir.rs:897`), is parsed from Envoy config
+> (`ir.rs:914`), is honored by the retry engine (`retry.rs:118`), has a test
+> (`retry.rs:296`), is normative in S3.2's trigger table, **and the configuration format
+> emits it in its DEFAULT `retry_on` list** (`proxy-simple-config/src/lower.rs:787`). But
+> `AttemptOutcome::RefusedStream` is never produced — `retry.rs:47` says so itself: *"the
+> upstream h2 codec doesn't decode RST_STREAM reasons yet."* So every user of the
+> configuration format has this retry enabled and it has never once fired.
+>
+> This matters more after slice C. hyper's h2 **client** optimistically opens up to 100
+> streams on a fresh connection *before* it has processed the peer's `SETTINGS` frame, so a
+> cold burst against a peer advertising fewer than that draws `REFUSED_STREAM` — and slice C
+> dials up to four fresh connections per key instead of one, making the cold-start window
+> more reachable rather than less. RFC 7540 is explicit that `REFUSED_STREAM` means the
+> stream was never processed, which is exactly why Envoy gives it a named retry condition
+> and calls it always-safe.
+>
+> **The fix is small and self-contained:** decode the h2 reason out of the `hyper::Error`
+> returned by `send_on_http2` and map `Reason::REFUSED_STREAM` to
+> `AttemptOutcome::RefusedStream`. Everything downstream of that already works. Note the
+> slice C test deliberately warms its connection to stay deterministic, so the cold-start
+> path is **not** covered today and the follow-up needs its own test.
+
 #### WP-15 — Upstream connection pools + circuit breakers  (Size: L)  — **Priority: P1**
 - Per-worker, per-host, per-protocol pools. h1: connection reuse queue, max requests/conn;
   h2: single (or `max_concurrent_streams`-aware N) connection multiplexing with stream
