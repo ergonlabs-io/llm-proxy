@@ -33,6 +33,7 @@ use std::cell::RefCell;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
@@ -47,6 +48,7 @@ use proxy_observability::ResponseFlag;
 
 use crate::handler::{BodyError, StreamBody};
 use crate::router::idle::IdleTimeoutError;
+use crate::stat_handles::GenAiTokenStats;
 use crate::stream_info::StreamInfo;
 
 /// One configured logger, resolved at HCM-bind time (mirrors
@@ -239,6 +241,12 @@ pub(crate) struct AccessLogContext {
     pub(crate) response_headers: HeaderMap,
     pub(crate) response_code: u16,
     pub(crate) downstream_remote_address: String,
+    /// WP-23 increment 6b: this stream's `gen_ai.client.token.usage`
+    /// recorder, if the HCM has one wired (`FilterChainHandler::with_token_stats`)
+    /// -- `None` on any handler nothing attached one to (every pre-existing
+    /// caller, and any HCM `proxy-core` never resolved provider handles
+    /// for). See [`LoggingBody::finish`] for the one call site.
+    pub(crate) token_stats: Option<Arc<GenAiTokenStats>>,
 }
 
 /// Wraps a response [`StreamBody`] so that -- regardless of whether the
@@ -468,6 +476,24 @@ impl LoggingBody {
             )
         };
 
+        // WP-23 increment 6b: record GEN_AI_CLIENT_TOKEN_USAGE here, at the
+        // same "stream has ended, exactly once" point access logging itself
+        // uses. `provider` is the cluster ACTUALLY DIALLED
+        // (`upstream_cluster`), never the routed cluster name -- ground rule
+        // #6: on a fallback the two differ, and the member that served the
+        // request is the one whose tokens these are. A stream with no usage
+        // reported (`llm_tokens: None`) records nothing at all -- "no usage
+        // was reported" and "zero tokens were used" are different facts, and
+        // recording a zero here would silently corrupt any rate computed
+        // from this series.
+        if let (Some(tokens), Some(token_stats), Some(provider)) = (
+            llm_tokens,
+            ctx.token_stats.as_ref(),
+            upstream_cluster.as_deref(),
+        ) {
+            token_stats.record_usage(provider, tokens);
+        }
+
         let log_ctx = LogContext {
             start_time: ctx.start_time,
             request_headers: &ctx.request.headers,
@@ -665,6 +691,7 @@ mod tests {
             response_headers: HeaderMap::new(),
             response_code: StatusCode::OK.as_u16(),
             downstream_remote_address: "127.0.0.1:0".to_string(),
+            token_stats: None,
         };
 
         let body = local_boxed(
@@ -705,6 +732,111 @@ mod tests {
             render_one(crate::stream_info::LlmStats::default()).await,
             "- - - - - -"
         );
+    }
+
+    // --- WP-23 increment 6b: gen_ai token-usage recording plumbing --------
+    //
+    // These prove `LoggingBody::finish` actually calls into a wired
+    // `GenAiTokenStats` with the right provider and per-bucket values -- not
+    // just that `access_log::render` can format `LlmTokens` (already covered
+    // above). `flags_ctx` is defined further down this file (mid-stream
+    // failure tests); Rust doesn't require definition order within a module.
+
+    use crate::stat_handles::{GenAiTokenStats, TokenUsageStatHandles};
+    use proxy_observability::stats::{Registry, StatsControl, WorkerId as StatsWorkerId};
+
+    /// Builds a `GenAiTokenStats` resolved for `provider`, handing back the
+    /// underlying `Registry` too so a test can read `Registry::value`
+    /// straight off the resolved handles.
+    fn token_stats_for(
+        provider: &str,
+    ) -> (Arc<GenAiTokenStats>, Arc<TokenUsageStatHandles>, Arc<Registry>) {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, [provider]));
+        let registry = control.registry();
+        let stats = Arc::new(GenAiTokenStats::new(
+            registry.clone(),
+            handles.clone(),
+            StatsWorkerId(0),
+        ));
+        (stats, handles, registry)
+    }
+
+    /// Drives a `LoggingBody` seeded with `usage`/`upstream_cluster` and a
+    /// wired `token_stats` to completion (`finish()` via clean end-of-stream).
+    async fn drive_with_usage_and_provider(
+        token_stats: Option<Arc<GenAiTokenStats>>,
+        upstream_cluster: Option<&str>,
+        usage: Option<LlmTokenUsage>,
+    ) {
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        ctx.token_stats = token_stats;
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.upstream_cluster = upstream_cluster.map(str::to_string);
+            info.llm.usage = usage;
+        }
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        let _ = LoggingBody::new(body, ctx).collect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_reaches_gen_ai_token_stats_against_the_dialled_provider() {
+        let (token_stats, handles, registry) = token_stats_for("openai-fallback");
+
+        drive_with_usage_and_provider(
+            Some(token_stats),
+            Some("openai-fallback"),
+            Some(LlmTokenUsage {
+                input_tokens: 40,
+                cached_tokens: 10,
+                cache_creation_tokens: 0,
+                output_tokens: 7,
+            }),
+        )
+        .await;
+
+        let h = handles.for_provider("openai-fallback").unwrap();
+        assert_eq!(registry.value(h.input), 40);
+        assert_eq!(registry.value(h.cached), 10);
+        assert_eq!(registry.value(h.cache_creation), 0);
+        assert_eq!(registry.value(h.output), 7);
+    }
+
+    #[tokio::test]
+    async fn no_usage_records_nothing_even_with_a_wired_recorder() {
+        // The gap this closes if it regresses: "no usage was reported" and
+        // "zero tokens were used" are different facts, and this must not
+        // synthesize the second from the absence of the first.
+        let (token_stats, handles, registry) = token_stats_for("openai");
+
+        drive_with_usage_and_provider(Some(token_stats), Some("openai"), None).await;
+
+        let h = handles.for_provider("openai").unwrap();
+        assert_eq!(registry.value(h.input), 0);
+        assert_eq!(registry.value(h.output), 0);
+    }
+
+    #[tokio::test]
+    async fn no_wired_recorder_does_not_panic() {
+        // A handler with no `access_logs`-adjacent token recorder attached
+        // (`token_stats: None`, every pre-6b caller's shape) must simply
+        // skip recording, not panic reaching for one.
+        drive_with_usage_and_provider(
+            None,
+            Some("openai"),
+            Some(LlmTokenUsage {
+                input_tokens: 1,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 1,
+            }),
+        )
+        .await;
     }
 
     // --- WP-46: TPOT / max-stall / response-chunks plumbing ---------------
@@ -837,6 +969,11 @@ mod tests {
             response_headers: HeaderMap::new(),
             response_code: StatusCode::OK.as_u16(),
             downstream_remote_address: "127.0.0.1:0".to_string(),
+            // This helper renders only %RESPONSE_FLAGS% %BYTES_SENT%, so it
+            // has no reason to record token usage; `None` is the "no
+            // recorder wired" case, which is also what an HCM without stats
+            // produces in production.
+            token_stats: None,
         }
     }
 

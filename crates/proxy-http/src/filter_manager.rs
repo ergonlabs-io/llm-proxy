@@ -121,6 +121,7 @@ use crate::handler::{
     StreamHandler,
 };
 use crate::route::{match_route, RouteMatch, RouteRequest};
+use crate::stat_handles::GenAiTokenStats;
 use crate::stream_info::StreamInfo;
 
 /// Default per-direction buffer limit (Envoy's
@@ -405,6 +406,16 @@ pub struct FilterChainHandler {
     /// default (`per_route_config()` then always returns `None`, this
     /// handler's pre-increment-2 behavior).
     per_route: Arc<PerRouteTable>,
+    /// WP-23 increment 6b: this HCM's `gen_ai.client.token.usage` recorder,
+    /// if the boot/reload wiring set one (`proxy-core`'s `build_hcm_handler`
+    /// always does for a real HCM build -- see [`Self::with_token_stats`]).
+    /// `None` is the constructors' baseline (every existing `new*` call site
+    /// is unaffected by this field), and is also a legitimate steady state
+    /// for a test-only handler with nothing to record into. Threaded into
+    /// [`AccessLogContext`] in [`Self::handle`] below; recording itself
+    /// happens once, at stream end, from `access_logging::LoggingBody::finish`
+    /// -- never here.
+    token_stats: Option<Arc<GenAiTokenStats>>,
 }
 
 impl FilterChainHandler {
@@ -427,6 +438,7 @@ impl FilterChainHandler {
             request_id_rng: std::cell::RefCell::new(crate::headers::seed_from_entropy()),
             access_loggers: Rc::new(Vec::new()),
             per_route: Arc::new(PerRouteTable::default()),
+            token_stats: None,
         }
     }
 
@@ -534,6 +546,18 @@ impl FilterChainHandler {
 
     pub fn with_buffer_limit(mut self, limit: usize) -> Self {
         self.buffer_limit = limit;
+        self
+    }
+
+    /// WP-23 increment 6b: attaches this HCM's `gen_ai.client.token.usage`
+    /// recorder -- a builder method (not a constructor parameter) so every
+    /// existing `new*` call site, in this crate and its dependents, is
+    /// unaffected. `proxy-core`'s `build_hcm_handler` calls this for every
+    /// real HCM build/rebuild, the same "resolved once at boot/reload,
+    /// cheap `Arc` clone into every handler" shape `router_stats` already
+    /// uses one layer down (`RouterFilterFactory`).
+    pub fn with_token_stats(mut self, token_stats: Arc<GenAiTokenStats>) -> Self {
+        self.token_stats = Some(token_stats);
         self
     }
 }
@@ -654,6 +678,7 @@ impl StreamHandler for FilterChainHandler {
                 response_headers: resp.head.headers.clone(),
                 response_code: resp.head.status.as_u16(),
                 downstream_remote_address,
+                token_stats: self.token_stats.clone(),
             };
             HttpResponseParts {
                 head: resp.head,
