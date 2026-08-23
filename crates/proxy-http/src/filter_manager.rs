@@ -760,6 +760,33 @@ struct EncodeState {
     /// [`StreamingEncoder::pending`]) immediately after the injecting
     /// callback returns.
     injected: VecDeque<PendingFrame>,
+    /// S2.2 (I2): the encode-direction mirror of [`DirectionState::dont_end_stream`]
+    /// -- a filter at position `p` returned `ContinueAndDontEndStream` from
+    /// `encode_headers`, so it (and it alone) has taken responsibility for
+    /// telling positions AFTER it (toward the client) when the response is
+    /// really over, via `inject_encoded_data_to_filter_chain(.., end_stream:
+    /// true)`.
+    ///
+    /// Unlike decode, this can't be a plain sticky `bool`: decode resolves in
+    /// one synchronous forward pass, so "everyone after the sender" falls out
+    /// for free from a loop variable updated as the pass runs. Encode is a
+    /// live stream -- the SAME later frame (the end-of-stream flush, or the
+    /// real content-length-exhausting frame) is delivered to every position in
+    /// one `encode_frame` call, so "before" vs. "after" the sender has to be
+    /// judged by comparing `p` against the recorded position, not by timing.
+    /// The first position to claim it wins (`Option::get_or_insert`): once
+    /// one filter has taken responsibility, a later claim changes nothing
+    /// positions after the FIRST one still need to see.
+    ///
+    /// Only [`StreamingEncoder::encode_frame`]'s two call sites that carry the
+    /// *automatic* "upstream is really exhausted" signal consult this (its
+    /// `honor_dont_end_stream` parameter) -- never the delivery of a
+    /// `self.pending` frame, whether that frame is a header-hold leftover or
+    /// a filter's own injection. That distinction is what lets the sender's
+    /// own later `inject_encoded_data_to_filter_chain(.., true)` still reach
+    /// positions after it as a real `end_stream = true`: it is delivered
+    /// through `self.pending`, not through the suppressed automatic path.
+    dont_end_stream_from: Option<usize>,
 }
 
 /// Split-storage counterpart to the filter `Vec`: everything a callback may
@@ -1524,10 +1551,17 @@ async fn encode_headers_phase(
         pending.extend(ctx.encode.injected.drain(..));
 
         match status {
-            FilterHeadersStatus::Continue | FilterHeadersStatus::ContinueAndDontEndStream => {
-                // ContinueAndDontEndStream: TODO(WP-11 chunk 4) requires
-                // inject_*_to_filter_chain to let the filter later end the
-                // stream itself; treated as Continue here.
+            FilterHeadersStatus::Continue => {
+                p += 1;
+            }
+            // S2.2 (I2): headers already go out with `end_stream=false`
+            // unconditionally here (this fn's own doc comment) -- the header
+            // phase itself has nothing left to change. What the status DOES
+            // change is what happens once the real body ends: see
+            // `EncodeState::dont_end_stream_from`'s doc for why that needs the
+            // position recorded, not just a bool.
+            FilterHeadersStatus::ContinueAndDontEndStream => {
+                ctx.encode.dont_end_stream_from.get_or_insert(p);
                 p += 1;
             }
             FilterHeadersStatus::StopAllIterationAndBuffer
@@ -1796,16 +1830,39 @@ impl StreamingEncoder {
     /// Buffer overflow here is `Err` (not a status code): headers have
     /// already gone out, so the only thing left to do is truncate the
     /// stream with an error — there is no 500 to send anymore.
+    ///
+    /// `honor_dont_end_stream`: whether `end_stream` here is the AUTOMATIC
+    /// "upstream is really exhausted" signal — a real frame pulled off
+    /// `upstream`, or the synthetic end-of-stream flush — as opposed to a
+    /// frame from `self.pending` (a header-hold leftover, or a filter's own
+    /// `inject_encoded_data_to_filter_chain`). Only the former can be
+    /// overridden by S2.2 (I2)'s `EncodeState::dont_end_stream_from`; see its
+    /// doc for why suppressing the latter would break the very mechanism the
+    /// status exists to enable.
     fn encode_frame(
         &mut self,
         mut data: Bytes,
         end_stream: bool,
         start_pos: usize,
+        honor_dont_end_stream: bool,
     ) -> Result<Option<Bytes>, BodyError> {
         let n = self.filters.len();
         let mut p = start_pos;
         while p < n {
             let idx = n - 1 - p;
+            // S2.2 (I2): positions strictly AFTER the filter that claimed
+            // `ContinueAndDontEndStream` never see the automatic exhaustion
+            // signal as `true` — that filter alone gets to assert it (and
+            // does, via its own later injection, delivered through
+            // `self.pending` instead of this path).
+            let end_stream = if honor_dont_end_stream {
+                match self.ctx.encode.dont_end_stream_from {
+                    Some(sp) if p > sp => false,
+                    _ => end_stream,
+                }
+            } else {
+                end_stream
+            };
             match self.ctx.encode.positions[p].stop {
                 Some(StopKind::StopAll) => {
                     // The filter is not called at all while stop-all is in
@@ -2019,7 +2076,13 @@ impl Body for StreamingEncoder {
             // 1. Drain anything already pulled off `upstream` first, so frame
             // order survives header holds / prior full-buffering.
             if let Some(frame) = this.pending.pop_front() {
-                match this.encode_frame(frame.data, frame.end_stream, frame.start_pos) {
+                // S2.2 (I2): `honor_dont_end_stream: false` -- this frame is
+                // either a header-hold leftover or a filter's own injection,
+                // never the automatic exhaustion signal, so its `end_stream`
+                // is delivered verbatim. This is what lets the claiming
+                // filter's own `inject_encoded_data_to_filter_chain(.., true)`
+                // still reach positions after it.
+                match this.encode_frame(frame.data, frame.end_stream, frame.start_pos, false) {
                     Ok(Some(bytes)) => return Poll::Ready(Some(Ok(Frame::data(bytes)))),
                     // Fully buffered — produced nothing observable; try the
                     // next queued frame (or fall through) without returning
@@ -2047,7 +2110,11 @@ impl Body for StreamingEncoder {
                             // from position 0, always — never resuming from
                             // wherever some *other* position last stopped,
                             // which used to skip every filter before it.
-                            match this.encode_frame(data, is_final_by_length, 0) {
+                            // `honor_dont_end_stream: true` -- this IS the
+                            // automatic exhaustion signal (S2.2 I2), so a
+                            // filter that claimed `ContinueAndDontEndStream`
+                            // suppresses it for whoever's after that filter.
+                            match this.encode_frame(data, is_final_by_length, 0, true) {
                                 Ok(Some(bytes)) => {
                                     return Poll::Ready(Some(Ok(Frame::data(bytes))))
                                 }
@@ -2088,9 +2155,24 @@ impl Body for StreamingEncoder {
                 // 0 (same defect-fix reasoning as above), so a filter that
                 // gated on end-of-stream can release its buffer -- and so can
                 // every position after it, in the same pass.
-                match this.encode_frame(Bytes::new(), true, 0) {
+                // `honor_dont_end_stream: true` -- this is exactly the
+                // automatic exhaustion signal S2.2 (I2) exists to let a
+                // filter override; see `EncodeState::dont_end_stream_from`.
+                match this.encode_frame(Bytes::new(), true, 0, true) {
                     Ok(Some(bytes)) => return Poll::Ready(Some(Ok(Frame::data(bytes)))),
-                    Ok(None) => {} // fall through to the checks below
+                    // S2.2 (I2): NOT a plain fall-through. A filter that just
+                    // received this call (with `end_stream` suppressed to
+                    // `false` for whoever's after it) may have reacted by
+                    // calling `inject_encoded_data_to_filter_chain(.., true)`
+                    // — which `encode_frame`'s `None` branch already folded
+                    // into `self.pending` (S2.7) before returning here. `continue`
+                    // re-enters the loop at step 1, which drains exactly that
+                    // before anything below can conclude the stream is over.
+                    // A quieter run with nothing injected just falls through
+                    // step 1 (empty) and step 2 (`upstream_done`) straight to
+                    // the checks below, so this costs one harmless extra
+                    // iteration in the common case.
+                    Ok(None) => continue,
                     Err(e) => return Poll::Ready(Some(Err(e))),
                 }
             }

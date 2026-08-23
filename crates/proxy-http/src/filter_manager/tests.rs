@@ -1794,15 +1794,118 @@ fn continue_and_dont_end_stream_also_reaches_the_terminal() {
 
 /// S2.2 (I2): the ENCODE-direction mirror of I1 — `ContinueAndDontEndStream`
 /// on `encode_headers`.
+///
+/// The encode side is NOT symmetric with decode (see `encode_headers_phase`'s
+/// doc comment): headers already go out with `end_stream=false`
+/// unconditionally, since a streaming body's emptiness can't be known ahead of
+/// time. So the status can't mean "forward headers with end_stream=false" —
+/// that's already what happens. What it DOES mean here: the claiming filter
+/// takes over responsibility for telling positions after it (toward the
+/// client) when the response is really over. When `upstream` naturally
+/// exhausts, those positions see `end_stream=false` instead of the automatic
+/// `true` — the claiming filter must supply the real end itself, via
+/// `inject_encoded_data_to_filter_chain(.., end_stream: true)`.
+///
+/// A filter positioned so it does NOT see it (`RecordsEncodeDataFilter` here
+/// is configured BEFORE the claimant, i.e. AFTER it in encode order — see
+/// `EncodeState::dont_end_stream_from`'s doc on position vs. config order) so
+/// this is a real assertion, not a tautology: without the status,
+/// `end_stream` on the natural flush is unconditionally `true`.
+struct DontEndStreamThenInjectOnFlushFilter {
+    /// Supplied via `inject_encoded_data_to_filter_chain` once this filter
+    /// sees the real (unsuppressed, since it's at the claiming position
+    /// itself) `end_stream=true` on `encode_data`.
+    injected: Bytes,
+}
+
+impl HttpFilter for DontEndStreamThenInjectOnFlushFilter {
+    fn encode_headers(
+        &mut self,
+        _cb: &mut dyn EncoderCallbacks,
+        _h: &mut ResponseHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        FilterHeadersStatus::ContinueAndDontEndStream
+    }
+
+    fn encode_data(
+        &mut self,
+        cb: &mut dyn EncoderCallbacks,
+        _data: &mut Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        if end_stream {
+            cb.inject_encoded_data_to_filter_chain(self.injected.clone(), true);
+        }
+        FilterDataStatus::Continue
+    }
+}
+
+/// Records every `(data, end_stream)` pair a filter's `encode_data` observed
+/// — the encode-side counterpart to `ProbeFilter::seen_decode_data`, except
+/// `ProbeFilter::seen_encode_data` (S2.5) throws away `end_stream`, which is
+/// the one thing this test needs to see.
+struct RecordsEncodeDataFilter {
+    seen: Arc<Mutex<Vec<(Bytes, bool)>>>,
+}
+
+impl HttpFilter for RecordsEncodeDataFilter {
+    fn encode_data(
+        &mut self,
+        _cb: &mut dyn EncoderCallbacks,
+        data: &mut Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        self.seen.lock().unwrap().push((data.clone(), end_stream));
+        FilterDataStatus::Continue
+    }
+}
+
 #[test]
-#[ignore = "WP-11 chunk 4: ContinueAndDontEndStream"]
 fn encode_continue_and_dont_end_stream_forwards_headers_with_end_stream_false() {
     block_on(async {
-        let mut a = ProbeFilter::new("a", log_of());
-        a.encode_headers_status = FilterHeadersStatus::ContinueAndDontEndStream;
-        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a)];
-        run_chain(filters, log_of(), b"", DEFAULT_BUFFER_LIMIT).await;
-        unimplemented!("needs inject_encoded_data_to_filter_chain (I7) to complete the scenario");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // Config order [recorder, sender] -> encode order visits `sender`
+        // FIRST (position 0, closer to upstream) and `recorder` SECOND
+        // (position 1, closer to the client) -- S2.1's reverse-config-order
+        // rule. `recorder` is therefore genuinely "after" the claimant.
+        let filters: Vec<Box<dyn HttpFilter>> = vec![
+            Box::new(RecordsEncodeDataFilter { seen: seen.clone() }),
+            Box::new(DontEndStreamThenInjectOnFlushFilter {
+                injected: Bytes::from_static(b"late tail"),
+            }),
+        ];
+        let (status, _req_seen, resp_body) =
+            run_chain(filters, log_of(), b"", DEFAULT_BUFFER_LIMIT).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // `run_chain`'s terminal always answers with a single `b"resp"`
+        // chunk and no `content-length` header, so the flow is: one real
+        // data frame (end_stream=false), then the synthetic end-of-stream
+        // flush the claim suppresses, then the injected tail.
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.contains(&(Bytes::from_static(b"resp"), false)),
+            "the real response chunk must still flow through untouched; saw: {seen:?}"
+        );
+        assert!(
+            seen.contains(&(Bytes::new(), false)),
+            "the automatic end-of-stream flush must reach the filter after the \
+             claimant as end_stream=false, not true -- that's the whole status; \
+             saw: {seen:?}"
+        );
+        assert!(
+            seen.contains(&(Bytes::from_static(b"late tail"), true)),
+            "the claimant's own injected tail must reach the filter after it \
+             as end_stream=true -- it alone gets to assert the real end; \
+             saw: {seen:?}"
+        );
+        assert_eq!(
+            resp_body,
+            Bytes::from_static(b"resplate tail"),
+            "the injected tail must actually reach the wire, appended after \
+             the real response body"
+        );
     });
 }
 
