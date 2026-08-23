@@ -31,6 +31,16 @@ tracing-subscriber = { workspace = true }
 # tests/keygen.rs's end-to-end proof (WP-50 acceptance test 4) builds a real
 # `HeaderMap` to hand a `VirtualKeyAuthenticator`.
 http = { workspace = true }
+# tests/stats_e2e.rs's `gen_ai.client.token.usage` case needs a real upstream
+# that returns OpenAI-shaped usage -- `mockupstream`'s `mock-upstream` binary
+# does that, but it lives in a sibling workspace crate, and Cargo's binary
+# artifact dependencies (`artifact = "bin"`) are still nightly-only
+# (`-Z bindeps`) as of this toolchain. `serde_json` is what lets the test
+# locate that binary robustly instead: it asks `cargo build` itself, via
+# `--message-format=json`, for the exact executable path it produced, rather
+# than guessing a `target/` layout that a per-worktree `CARGO_TARGET_DIR`
+# (see CLAUDE.md) could change out from under a hardcoded guess.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

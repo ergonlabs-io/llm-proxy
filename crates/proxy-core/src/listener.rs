@@ -35,7 +35,7 @@ use proxy_http::filter::{FactoryContext, FilterRegistry, TerminalFilterInstanceF
 use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
-use proxy_http::stat_handles::RouterStats;
+use proxy_http::stat_handles::{DownstreamStats, GenAiTokenStats, RouterStats};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -213,6 +213,7 @@ fn build_listener_hcm(
     listener: &ListenerConfig,
     cluster_manager: &Arc<ClusterManager>,
     router_stats: &Arc<RouterStats>,
+    token_stats: &Arc<GenAiTokenStats>,
 ) -> Result<ListenerHcm, HttpFilterChainBuildError> {
     let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
     for (i, chain) in listener.filter_chains.iter().enumerate() {
@@ -224,6 +225,7 @@ fn build_listener_hcm(
                     &context,
                     cluster_manager,
                     router_stats,
+                    token_stats,
                 )?)
             }
             _ => None,
@@ -242,6 +244,7 @@ fn build_listener_hcm(
                 &context,
                 cluster_manager,
                 router_stats,
+                token_stats,
             )?)
         }
         _ => None,
@@ -320,6 +323,21 @@ fn bind_listener(listener: &ListenerConfig) -> io::Result<TcpListener> {
     TcpListener::from_std(std_listener)
 }
 
+/// The three worker-scoped stats recorders [`initial_bind`]/[`reconcile`]/
+/// [`run_listener_manager`] all need -- bundled into one struct purely to
+/// keep THOSE functions' own argument counts under clippy's
+/// `too_many_arguments` threshold, same motivation [`WorkerShared`]/
+/// [`ListenerCaches`] document for their own bundling one layer down.
+/// Unpacked back into [`WorkerShared`]'s three separate fields wherever one
+/// is built -- `WorkerShared` keeps them separate because it predates this
+/// bundle (WP-23 increment 6a) and its own field count was never close to
+/// the threshold.
+pub struct StatsRecorders {
+    pub router: Arc<RouterStats>,
+    pub downstream: Arc<DownstreamStats>,
+    pub token: Arc<GenAiTokenStats>,
+}
+
 /// Bind `listener_ir` and spawn its accept loop, returning the [`BoundListener`]
 /// on success. The one place that actually calls `bind_listener` +
 /// `spawn_accept_loop` together; [`initial_bind`] and reconcile-time binding
@@ -343,6 +361,18 @@ struct WorkerShared<'a> {
     /// `crates/proxy/src/main.rs`'s `worker_main`, threaded down to
     /// [`RouterFilterFactory`] exactly like `cluster_manager` is.
     router_stats: &'a Arc<RouterStats>,
+    /// WP-23 increment 6b: this worker's `downstream_cx_total` recorder --
+    /// same per-worker cadence and construction site as `router_stats`
+    /// above, threaded down to [`spawn_accept_loop`] instead of a filter
+    /// factory since the instrument it records is about the accept loop
+    /// itself, not routing.
+    downstream_stats: &'a Arc<DownstreamStats>,
+    /// This worker's `gen_ai.client.token.usage` recorder -- same per-worker
+    /// cadence and construction site as `router_stats`, threaded down to
+    /// [`build_hcm_handler`], which wires it into the built
+    /// `FilterChainHandler` via
+    /// [`proxy_http::filter_manager::FilterChainHandler::with_token_stats`].
+    token_stats: &'a Arc<GenAiTokenStats>,
 }
 
 fn spawn_bound(
@@ -355,7 +385,12 @@ fn spawn_bound(
     // filter chain whose certs won't load, or whose HTTP filter chain
     // references an unregistered filter.
     let tls = build_listener_tls(listener_ir)?;
-    let hcm = build_listener_hcm(listener_ir, shared.cluster_manager, shared.router_stats)?;
+    let hcm = build_listener_hcm(
+        listener_ir,
+        shared.cluster_manager,
+        shared.router_stats,
+        shared.token_stats,
+    )?;
     let tcp_listener = bind_listener(listener_ir).map_err(|source| InitialBindError::Bind {
         name: name.clone(),
         addr: listener_ir.address,
@@ -374,6 +409,8 @@ fn spawn_bound(
             shutdown: shared.shutdown.clone(),
             cluster_manager: shared.cluster_manager.clone(),
             router_stats: shared.router_stats.clone(),
+            downstream_stats: shared.downstream_stats.clone(),
+            token_stats: shared.token_stats.clone(),
         },
     );
     Ok(BoundListener { addr, task })
@@ -420,14 +457,16 @@ pub fn initial_bind(
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
     cluster_manager: &Arc<ClusterManager>,
-    router_stats: &Arc<RouterStats>,
+    stats: &StatsRecorders,
 ) -> Result<HashMap<ListenerName, BoundListener>, InitialBindError> {
     let shared = WorkerShared {
         config,
         registry,
         shutdown,
         cluster_manager,
-        router_stats,
+        router_stats: &stats.router,
+        downstream_stats: &stats.downstream,
+        token_stats: &stats.token,
     };
     let mut bound: HashMap<ListenerName, BoundListener> = HashMap::new();
     for (name, listener_ir) in snapshot.listeners.iter() {
@@ -469,6 +508,15 @@ struct AcceptLoopShared {
     shutdown: watch::Receiver<bool>,
     cluster_manager: Arc<ClusterManager>,
     router_stats: Arc<RouterStats>,
+    /// WP-23 increment 6b: this worker's `downstream_cx_total` recorder --
+    /// see [`WorkerShared::downstream_stats`].
+    downstream_stats: Arc<DownstreamStats>,
+    /// This worker's `gen_ai.client.token.usage` recorder -- see
+    /// [`WorkerShared::token_stats`]; needed here (not just at
+    /// [`spawn_bound`] time) because the accept loop's own runtime HCM
+    /// rebuild (on a snapshot version change) calls [`build_listener_hcm`]
+    /// again directly.
+    token_stats: Arc<GenAiTokenStats>,
 }
 
 /// One accept loop per bound listener, spawned with `spawn_local` (this
@@ -491,6 +539,8 @@ fn spawn_accept_loop(
         mut shutdown,
         cluster_manager,
         router_stats,
+        downstream_stats,
+        token_stats,
     } = shared;
     tokio::task::spawn_local(async move {
         // Rust note: `mut` locals, not behind a lock -- this whole task is
@@ -515,6 +565,12 @@ fn spawn_accept_loop(
                     return;
                 }
             };
+
+            // WP-23 increment 6b: counted once per successfully accepted
+            // connection, and only here -- the `Err(err)` arm above already
+            // `continue`d before reaching this line, so a failed `accept()`
+            // never contributes to `downstream_cx_total`.
+            downstream_stats.record_connection_accepted(&name);
 
             // Rust note: the snapshot is reloaded here, once per *accepted
             // connection*, not once for the whole lifetime of this accept
@@ -552,7 +608,7 @@ fn spawn_accept_loop(
                     // Same rebuild cadence and same "whole-listener fallback"
                     // tradeoff as the TLS cache just above, for the HTTP
                     // filter-chain handlers.
-                    match build_listener_hcm(l, &cluster_manager, &router_stats) {
+                    match build_listener_hcm(l, &cluster_manager, &router_stats, &token_stats) {
                         Ok(rebuilt) => hcm_cache = Rc::new(rebuilt),
                         Err(err) => {
                             tracing::warn!(listener = %name, error = %err, "failed to rebuild HTTP filter chain after config change; HCM chains on this listener will reset connections until fixed");
@@ -890,6 +946,7 @@ fn build_hcm_handler(
     context: &str,
     cluster_manager: &Arc<ClusterManager>,
     router_stats: &Arc<RouterStats>,
+    token_stats: &Arc<GenAiTokenStats>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
     let factory_ctx = FactoryContext {};
@@ -957,6 +1014,12 @@ fn build_hcm_handler(
     // plain `new_with_access_logs`) -- `filters` carries each entry's Envoy
     // name and registered factory, needed to resolve `typed_per_filter_config`
     // against the real chain once, here, rather than never (ground rule #1).
+    // WP-23 increment 6b: `.with_token_stats` on every real HCM build --
+    // `FilterChainHandler::with_token_stats`'s own doc says this is exactly
+    // what this function is supposed to do; before this, the field it sets
+    // was wired end to end everywhere except here, so `token_stats` was
+    // always `None` and `gen_ai.client.token.usage` was never recorded no
+    // matter what a route configured.
     Ok(Rc::new(
         FilterChainHandler::new_with_filters_and_access_logs(
             filters,
@@ -970,7 +1033,8 @@ fn build_hcm_handler(
         .map_err(|e| HttpFilterChainBuildError {
             context: context.to_string(),
             reason: format!("failed to build filter chain: {e}"),
-        })?,
+        })?
+        .with_token_stats(token_stats.clone()),
     ))
 }
 
@@ -1088,14 +1152,16 @@ fn reconcile(
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
     cluster_manager: &Arc<ClusterManager>,
-    router_stats: &Arc<RouterStats>,
+    stats: &StatsRecorders,
 ) {
     let shared = WorkerShared {
         config,
         registry,
         shutdown,
         cluster_manager,
-        router_stats,
+        router_stats: &stats.router,
+        downstream_stats: &stats.downstream,
+        token_stats: &stats.token,
     };
     // Removed: present in `bound`, absent from the new snapshot. Stop
     // accepting; established connections under the old listener keep their
@@ -1164,7 +1230,7 @@ pub async fn run_listener_manager(
     mut shutdown: watch::Receiver<bool>,
     registry: ConnectionRegistry,
     cluster_manager: Arc<ClusterManager>,
-    router_stats: Arc<RouterStats>,
+    stats: StatsRecorders,
 ) {
     loop {
         tokio::select! {
@@ -1180,7 +1246,7 @@ pub async fn run_listener_manager(
                     &registry,
                     &shutdown,
                     &cluster_manager,
-                    &router_stats,
+                    &stats,
                 );
             }
             _ = shutdown.changed() => {
@@ -1559,13 +1625,68 @@ mod tests {
     /// builds once at boot from the real config snapshot; these tests need
     /// the same shape so `RouterFilterFactory` (built deep inside
     /// `initial_bind`/`build_listener_hcm`) has somewhere to record into.
-    fn router_stats_for(snapshot: &ConfigSnapshot) -> Arc<RouterStats> {
-        let control = proxy_observability::stats::StatsControl::new(1);
+    ///
+    /// Takes `control` by reference rather than building its own, and so do
+    /// [`downstream_stats_for`]/[`token_stats_for`] below -- all three
+    /// recorders must share the SAME [`proxy_observability::stats::StatsControl`]
+    /// (and so the same underlying `Registry`), exactly like
+    /// `crates/proxy/src/main.rs`'s `run_serve` shares one `stats_control`
+    /// across `stat_handles`/`downstream_stat_handles`/
+    /// `token_usage_stat_handles`. A [`Handle`](proxy_observability::stats::Handle)
+    /// is just an index into its resolving control's registry; handing one
+    /// recorder a handle resolved from a DIFFERENT, unrelated control's
+    /// registry is exactly the bug this shape prevents (found by these
+    /// tests panicking with "index out of bounds" the first time
+    /// `downstream_stats_for`/`token_stats_for` each built their own private
+    /// `StatsControl`).
+    fn router_stats_for(
+        control: &proxy_observability::stats::StatsControl,
+        snapshot: &ConfigSnapshot,
+    ) -> Arc<RouterStats> {
         let handles = Arc::new(proxy_http::stat_handles::StatHandles::build(
-            &control,
+            control,
             snapshot.clusters.keys().map(String::as_str),
         ));
         Arc::new(RouterStats::new(
+            control.registry(),
+            handles,
+            proxy_observability::stats::WorkerId(0),
+        ))
+    }
+
+    /// [`router_stats_for`]'s counterpart for `downstream_cx_total` -- see
+    /// that function's doc for why this shares `control` rather than
+    /// building its own.
+    fn downstream_stats_for(
+        control: &proxy_observability::stats::StatsControl,
+        snapshot: &ConfigSnapshot,
+    ) -> Arc<DownstreamStats> {
+        let handles = Arc::new(
+            proxy_http::stat_handles::DownstreamStatHandles::build(
+                control,
+                snapshot.listeners.keys().map(String::as_str),
+            ),
+        );
+        Arc::new(DownstreamStats::new(
+            control.registry(),
+            handles,
+            proxy_observability::stats::WorkerId(0),
+        ))
+    }
+
+    /// [`router_stats_for`]'s counterpart for `gen_ai.client.token.usage` --
+    /// see that function's doc for why this shares `control` rather than
+    /// building its own. Resolved for every cluster (= provider, ground
+    /// rule #6) in `snapshot`.
+    fn token_stats_for(
+        control: &proxy_observability::stats::StatsControl,
+        snapshot: &ConfigSnapshot,
+    ) -> Arc<GenAiTokenStats> {
+        let handles = Arc::new(proxy_http::stat_handles::TokenUsageStatHandles::build(
+            control,
+            snapshot.clusters.keys().map(String::as_str),
+        ));
+        Arc::new(GenAiTokenStats::new(
             control.registry(),
             handles,
             proxy_observability::stats::WorkerId(0),
@@ -1578,7 +1699,12 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let registry = ConnectionRegistry::new();
         let cluster_manager = cluster_manager_for(&initial).await;
-        let router_stats = router_stats_for(&initial);
+        let stats_control = proxy_observability::stats::StatsControl::new(1);
+        let stats = StatsRecorders {
+            router: router_stats_for(&stats_control, &initial),
+            downstream: downstream_stats_for(&stats_control, &initial),
+            token: token_stats_for(&stats_control, &initial),
+        };
 
         let bound = initial_bind(
             &initial,
@@ -1586,7 +1712,7 @@ mod tests {
             &registry,
             &shutdown_rx,
             &cluster_manager,
-            &router_stats,
+            &stats,
         )
         .expect("initial_bind should succeed in tests");
 
@@ -1597,7 +1723,7 @@ mod tests {
             shutdown_rx,
             registry.clone(),
             cluster_manager,
-            router_stats,
+            stats,
         ));
 
         Harness {
@@ -2335,7 +2461,12 @@ mod tests {
             let registry = ConnectionRegistry::new();
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
             let cluster_manager = cluster_manager_for(&snapshot).await;
-            let router_stats = router_stats_for(&snapshot);
+            let stats_control = proxy_observability::stats::StatsControl::new(1);
+            let stats = StatsRecorders {
+                router: router_stats_for(&stats_control, &snapshot),
+                downstream: downstream_stats_for(&stats_control, &snapshot),
+                token: token_stats_for(&stats_control, &snapshot),
+            };
 
             let result = initial_bind(
                 &snapshot,
@@ -2343,7 +2474,7 @@ mod tests {
                 &registry,
                 &shutdown_rx,
                 &cluster_manager,
-                &router_stats,
+                &stats,
             );
             match result {
                 Err(err @ InitialBindError::Tls(_)) => {
@@ -3333,9 +3464,11 @@ static_resources:
             Arc::new(proxy_cluster::resolver::TokioResolver),
             crate::tls::transport_socket_builder(),
         ));
-        let router_stats = router_stats_for(&snapshot);
+        let stats_control = proxy_observability::stats::StatsControl::new(1);
+        let router_stats = router_stats_for(&stats_control, &snapshot);
+        let token_stats = token_stats_for(&stats_control, &snapshot);
 
-        let err = match build_listener_hcm(listener_ir, &cluster_manager, &router_stats) {
+        let err = match build_listener_hcm(listener_ir, &cluster_manager, &router_stats, &token_stats) {
             Ok(_) => panic!("an invalid per-route dialect must fail the build, is_optional or not"),
             Err(err) => err,
         };
