@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-21 · 1167 tests passed, 24 skipped as of 2026-08-21 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-23 · 1222 tests passed, 23 skipped as of 2026-08-23 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -217,7 +217,8 @@
     ceiling, RSS under sustained long-lived streams) from a run that is not harness-bound, plus
     <code>/config_dump</code> and <code>/stats</code> on the admin endpoint, plus a config swap
     under live traffic with zero dropped streams. <b>Two of the three clauses CLOSED 2026-08-09;
-    the capacity report is now the only one open, and it has a named blocker.</b>
+    the capacity report is now the only one open. Its previously-named blocker (a 202-stream h2
+    ceiling) is fixed as of 2026-08-22 — no report has been published regardless.</b>
     <code>/config_dump</code> and <code>/stats</code> — closed: <code>/config_dump</code>'s
     redaction is structural (WP-50 increment 1), and <code>/stats</code> now reports <b>real
     traffic</b>, not merely a correctly-rendered empty registry — WP-23 increments 4/5/6a landed
@@ -267,18 +268,34 @@
     making the mock LLM-shaped and deriving the SLO from generation time. <b>The FIRST real ceiling
     found is 202 concurrent streams</b> — hyper's h2 server defaults
     <code>max_concurrent_streams</code> to 200, confirmed in the dependency source in use, and the
-    proxy multiplexes onto one upstream connection without opening a second. <b>This is a known
-    implementation gap, not a capacity number, and it does not close this clause</b> — no
-    p99/tokens-per-sec/RSS report exists yet. An h1-vs-h2 comparison sweep was in flight as this
-    board was refreshed; its numbers are not available and are not guessed at here.</span>
+    proxy multiplexes onto one upstream connection without opening a second. This was a known
+    implementation gap, not a capacity number, and did not close this clause. <b>FIXED
+    2026-08-22 (WP-15 slice C, <code>6965fd6</code>):</b> the h2 cache now keeps a bounded set of
+    connections per key and dials another once one saturates. Measured 202 → 808 concurrent
+    streams (4x) on the identical harness, still not resource-bound (20-22% CPU, 82.7MB RSS,
+    0.00 error rate). <b>Two more loadgen measurement-honesty bugs, found 2026-08-21 by running
+    real sweeps</b> (<code>c029d44</code>): an all-failure level rendered its percentiles as
+    <code>Duration::MAX</code>'s float conversion (a huge number a reader could misread as "very
+    slow" instead of "no data"), and the harness guard budgeted only concurrent streams while a
+    fast upstream is actually churn-rate bound (measured 5,800 connects/sec at concurrency 1
+    against a ~546/sec ceiling — the guard stayed silent through a 10.6x overload). Both fixed
+    and mutation-verified. <b>As of this refresh, nothing is known to block running the sweep
+    except that no one has</b> — every previously-cited blocker on this clause is now fixed, and
+    zero p99/tokens-per-sec/RSS numbers are published regardless. An h1-vs-h2 comparison sweep
+    was reported "in flight" as of an earlier refresh; its numbers were never recorded here and
+    should not be assumed to still be running.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
     that is an argument, not the v0.0.1 standard, which was a manual run against real endpoints,
-    executed and recorded. <b>Second standing risk, unchanged since 2026-08-01:</b> the LLM layer
-    stacks on serving foundations that are not finished — no connection pooling (WP-15, still
-    connect-per-stream), no downstream h2 (WP-10), watermarks aliased to buffering rather than real
-    backpressure (WP-11) — none exercised by the tests that closed v0.1.0's gate.
+    executed and recorded. <b>Second standing risk, named 2026-08-01, narrower as of 2026-08-23:</b>
+    the LLM layer stacks on serving foundations that were not finished at the time. Two have since
+    closed: downstream h2 landed 2026-08-02 (only h2c and S10 upgrades remain, WP-10), and h2
+    upstream connection pooling went from connect-per-stream to a bounded per-key connection set
+    that measured 808 concurrent streams, 4x its prior ceiling (WP-15 slice C, 2026-08-22). Still
+    open: h1 upstream pooling (still connect-per-stream) and watermarks aliased to buffering
+    rather than real backpressure (WP-11) — neither exercised by the tests that closed v0.1.0's
+    gate.
     <b>WP-41, the black-box QA suite, found five real bugs across the two milestones</b> — no
     dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too),
     no response flag on a mid-stream failure, a JSON-float usage report silently billed as zero
@@ -363,7 +380,24 @@
     abandoned agent worktree and rescued onto a branch rather than lost — unreviewed, unbuilt, not
     verified to compile, and edits three files that have since changed independently on
     <code>main</code>. Recorded as a rescued starting point, not progress; WP-53's status is
-    unchanged.</span>
+    unchanged.
+    <b>Re-measured 2026-08-23:</b> <b>1222 tests passed, 23 skipped</b> (<code>make
+    tq-count</code>, a real re-run) — up from 1167/24. The +55/-1 reconciles against the
+    self-reported delta of every commit between the two refreshes, ending exactly at the measured
+    number: WP-15 slice C (h2 pooling, 202 → 808 concurrent streams), the refused-stream retry
+    decode, WP-40's dependency cleanup, WP-23 increment 6b plus its renderer and
+    access-log-gating follow-ups, WP-35's cluster-side usage-dialect carrier plus a
+    <code>routes:</code>-surface dialect fix, and WP-11 chunk 4's decode-side
+    <code>ContinueAndDontEndStream</code> (also the skip-count change: chunk 4's own ignored-test
+    count went 9 → 8, "8 and moving" as of this refresh, not a fixed number). Doctests unchanged
+    at 5 passed / 2 ignored. <b>WP-24's response-flag audit</b> (2026-08-22/23) found two flags
+    declared and never set (<code>RL</code>, <code>URX</code> — both fixed) and two more that
+    were declared, looked wired, and were dead code (<code>UR</code>, <code>DC</code> — both
+    fixed 2026-08-23; <code>DC</code>'s own unit test had fabricated its trigger condition
+    instead of driving it, which is exactly why the gap survived). <b>WP-10's row</b> is
+    corrected above (downstream h2 has been done since 2026-08-02; this board mislabelled it as
+    outstanding until 2026-08-23). None of the above moves a ship gate — the v0.2.0 capacity
+    report is still the only open clause on this milestone, see above.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
@@ -625,7 +659,8 @@
    "✓ S2.8 ROUTE CACHE (ADR-0004 step 1) — the manager owns resolution; clear_route_cache genuinely invalidates. This unblocked WP-35",
    "✓ PER-ROUTE FILTER CONFIG (ADR-0004 step 4) — resolved at HCM build time, exposed via DecoderCallbacks::per_route_config(); route > vhost > route-config, through the S2.8 cache",
    "open (v0.4.0): StopAll resume · 1xx · and WATERMARKS, which today are handled as ALIASES for the buffering variants — a filter asking for watermarks gets bounded buffering that 413s on overflow, NOT a backpressure signal. So there is no flow control, only a cap",
-   "▲ this is a SERVING foundation, not a feature: fast upstream + slow client + long SSE stream is the exact LLM traffic shape, and it is the one the cap-not-backpressure gap mishandles"
+   "▲ this is a SERVING foundation, not a feature: fast upstream + slow client + long SSE stream is the exact LLM traffic shape, and it is the one the cap-not-backpressure gap mishandles",
+   "CHUNK 4, the honest measure: the #[ignore]d tests in filter_manager/tests.rs, each naming its own gap — 9 as of 2026-08-22's audit (a symbol-grep re-read had guessed this row was closer to done; it was wrong, \"counting mentions is not evidence of behaviour\"). Decode-side ContinueAndDontEndStream (S2.2 I1) landed 2026-08-23 (c56644d), taking it to 8: watermark backpressure (2), StopAll out-of-band resume + StopAll-blocks-terminal (2), decode trailer-hold (1), StopIterationNoBuffer drop on decode (1), 1xx/S2.6 (1), and the encode-side ContinueAndDontEndStream mirror (1, deliberately separate — that path can't know a streaming body is empty at the header phase). Report as 8 AND MOVING, not a fixed number — active lanes were still un-ignoring more of these as of this refresh"
   ],
   "note": "▲ mutation-verified: shifting decode delivery to from_idx caused an INFINITE LOOP (the injector re-entering itself) — stronger proof of the re-entrance guard than the test aimed for"
  },
@@ -702,9 +737,11 @@
    "✓ connect_timeout now ENFORCED on the dial (TCP connect + TLS handshake as one shared budget) — PoolError::ConnectTimeout was already handled by the router/retry engine but had never actually been produced before this landed",
    "open: h1 is still connect-per-stream (slice B — keep-alive reuse has its own hazards: draining the body before reuse, Connection: close) · connection-level circuit breakers (max_connections, max_pending_requests — slice D)",
    "✓ REACHABLE FROM THE CONFIGURATION FORMAT 2026-08-20 (09838a1) — a provider's `protocol: http2` now emits typed_extension_protocol_options; before this, proxy-simple-config never emitted it, so every cluster the format produced was Http1 and the h2 cache built above had no on-ramp. Default stays http1, so no existing config's behavior changes",
-   "⚠ MEASURED 2026-08-21 (ba377e3): a capacity sweep against a standalone mock upstream (not an in-process test fixture) plateaued at EXACTLY 202 concurrent streams — proxy at 11% CPU / 45MB RSS, nothing else saturated, throughput pinned at 59.3 rps, TTFT jumping by one full stream duration (the signature of a fixed-slot queue). Root cause confirmed in the dependency source actually in use: hyper-1.11.0/src/proto/h2/server.rs:69 defaults max_concurrent_streams to 200. The proxy multiplexes every stream onto ONE upstream connection and never opens a second — this WP's own text called for \"single (or max_concurrent_streams-aware N)\"; slice A shipped single, and this is that gap arriving with a number attached, not a new defect"
+   "⚠ MEASURED 2026-08-21 (ba377e3): a capacity sweep against a standalone mock upstream (not an in-process test fixture) plateaued at EXACTLY 202 concurrent streams — proxy at 11% CPU / 45MB RSS, nothing else saturated, throughput pinned at 59.3 rps, TTFT jumping by one full stream duration (the signature of a fixed-slot queue). Root cause confirmed in the dependency source actually in use: hyper-1.11.0/src/proto/h2/server.rs:69 defaults max_concurrent_streams to 200. The proxy multiplexes every stream onto ONE upstream connection and never opens a second — this WP's own text called for \"single (or max_concurrent_streams-aware N)\"; slice A shipped single, and this is that gap arriving with a number attached, not a new defect",
+   "✓ SLICE C FIXES THE 202 CEILING — landed 2026-08-22 (6965fd6): the h2 cache now keeps a bounded SET of connections per (cluster, address, protocol), each with its own in-flight stream accounting (MAX_CONNECTIONS_PER_KEY, SOFT_STREAMS_PER_CONNECTION, StreamGuard), and dials another connection once one is saturated instead of queuing behind it. MEASURED (0be0b61): 202 → 808 concurrent streams, 4x, same harness/workload — 20-22% CPU, 82.7MB RSS, 0.00 error rate, so still not resource-bound; the ceiling is structural, just 4x higher. The knob that moves it is MAX_CONNECTIONS_PER_KEY (4 × peer's 200-stream limit = 800, matching the 808 measured), NOT the soft limit — the orchestrator's own 400 prediction (4 × soft-limit-100) was wrong for exactly this reason, recorded because it generalises",
+   "✓ refused-stream retry now fires — 2026-08-23 (71c8e95). `retry_on: refused-stream` was fully wired (IR, parser, retry engine, default retry_on list) except the one step that detects it: send_on_http2 now decodes the h2 RST_STREAM reason and maps REFUSED_STREAM to its own outcome, unconditionally safe to replay since the peer did no work. Matters more after slice C: hyper's h2 client optimistically opens up to 100 streams before processing the peer's SETTINGS frame, and dialling up to 4 fresh connections per key (slice C) makes that cold-start collision MORE reachable, not less. Bonus: a refused stream now flags UR instead of UC (UR had no producer anywhere in the tree until this)"
   ],
-  "note": "▲ h2 traffic no longer burns 2 ephemeral ports/stream, but h1 still does, so the WP-30 rig is still harness-bound (~8k streams) for any h1-heavy workload — h1 pooling is the remaining blocker on that clause, not Linux. Separately, h2 now has its OWN measured ceiling (202 streams, not harness-bound) — the two gaps are independent and neither substitutes for the other"
+  "note": "▲ h2 traffic no longer burns 2 ephemeral ports/stream, but h1 still does, so the WP-30 rig is still harness-bound (~8k streams) for any h1-heavy workload — h1 pooling is the remaining blocker on that clause, not Linux. The h2 ceiling that WAS 202 (harness-measured, not harness-bound) is FIXED by slice C — measured 808, 4x — so it is no longer the open item on this card; h1 pooling (slice B) and connection-level circuit breakers (slice D) are what remain open here"
  },
  {
   "id": 16,
@@ -832,9 +869,10 @@
    "✓ inc 1-3 (registry core, histograms w/ Envoy default buckets, Envoy text renderer) then inc 4 (/stats/prometheus + label mangling) — the histogram line format P<n>(interval,cumulative), space-joined, confirmed against Envoy's own source (two different quantileSummary() impls exist; the admin path calls the ParentHistogram one). Grafana conformance test is deliberately PROVISIONAL — the Envoy repo vendors no dashboard at all",
    "✓ inc 5 (2026-08-09) — registry survives a config swap: API split into Registry (shared, hot path, no public resolve) vs StatsControl (non-Clone, owns resolution), an ArcSwap published snapshot, block-chunked counter shards. This is what makes a new cluster appearing on a SIGHUP reload get counters instead of panicking or silently dropping",
    "✓ inc 6a (2026-08-09) — cluster stat call sites wired in; /stats now reports REAL traffic, not an empty rendering of an untouched registry. crates/proxy/tests/stats_e2e.rs proves it: real binary, real requests, real scrape asserting the rendered body, mutation-verified (remove the router's increment and it fails with upstream_rq_total: 0). CLOSES the v0.2.0 /stats gate clause",
-   "open: inc 6b — DOWNSTREAM_CX_TOTAL (listener) and GEN_AI_CLIENT_TOKEN_USAGE (usage filter) have instruments defined but NO production call site yet (checked: only referenced from a unit test and the renderer/conformance test, never incremented from proxy-core or proxy-filters) — so listener-level and LLM-token stats are still silently absent from a live scrape"
+   "✓ inc 6b DONE 2026-08-22 (17d6cfb, 5bf8be6) — DOWNSTREAM_CX_TOTAL and GEN_AI_CLIENT_TOKEN_USAGE had instruments defined but no production call site (with_token_stats existed, named build_hcm_handler as its call site, and build_hcm_handler never called it — every unit test passed throughout because they construct the handler directly). Now wired; proved by an e2e against the real binary and mock-upstream, not the unit suite",
+   "✓ TWO FOLLOW-UP GAPS FOUND THE SAME DAY, BOTH NOW CLOSED — envoy_counter_name had no downstream_cx_total case, so it rendered to nothing on plain /stats while /stats/prometheus reported it correctly (fixed 2026-08-22, cfe0002, mutation-checked); and a listener with llmproxy.usage but no access_log recorded no token usage at all, since the wrapper that runs both jobs was gated on access_loggers alone (fixed 2026-08-23, c35da26, the gate is now an OR)"
   ],
-  "note": "the /stats gate clause is closed on cluster traffic; it is not yet complete across every stat family the registry defines names for"
+  "note": "the /stats gate clause is closed on cluster traffic, and as of 2026-08-23 the listener and LLM-token stat families are wired too. Remaining scope is narrower: Grafana conformance stays deliberately provisional (Envoy vendors no dashboard to conform to), and it is not verified every other Envoy stat family the registry names has a renderer arm — only the ones a test has driven"
  },
  {
   "id": 24,
@@ -857,6 +895,7 @@
    "✓ transparent proxy: we log the failure, we never inject an error event into the SSE stream (owner decision)",
    "⚠ FOUND AND FIXED 2026-08-14, by a live Ollama run, not by any mock — a successful content-length-framed 200 was logged response_flags: DC (DownstreamConnectionTermination). hyper's h1 write dispatcher stops polling the body the instant it has written exactly the declared length, so LoggingBody's terminal Ready(None) never arrived and Drop fired instead. Fixed by giving LoggingBody the same content-length fix-up StreamingEncoder already had. Verified before/after against real Ollama: same request, DC → \"-\"",
    "⚠ WHY NO MOCK CAUGHT IT: mock_e2e.rs never configures access_logs at all, so no test in that suite has ever inspected a rendered log line. The only place real access logging and real per-route dialect resolution meet is testing/diffrig/tests/local_openai_smoke.rs, which is #[ignore]d behind a local Ollama and had evidently not run since WP-45 landed — a whole observability surface was untested end to end while the suite stayed green",
+   "✓ RESPONSE-FLAG AUDIT 2026-08-22/23 (6f15eee, 71c8e95, 934442f) — of the 20 declared flags, 2 were declared and never set: RL (the token limiter's 429 was indistinguishable from any other 429; now set on the deny path only) and URX (a request that exhausted its retry budget logged only the last attempt's flag; now fires off RetryState::retry_limit_exceeded, the exact complement of the should_retry budget clause). The audit's more useful output was 2 MORE that were declared, looked wired, and were DEAD CODE — UR (PoolError::ResetBeforeHeaders had no constructor anywhere) and DC (BodyError::Downstream was flattened to () in collect_request before any flag could see it; its own unit test fabricated the condition instead of driving it, which is exactly why the gap survived). Both fixed 2026-08-23: UR now fires off the WP-15 refused-stream decode (a refused stream is a deliberate remote reset); DC's test now runs the real downstream codec and dies mid-upload for real (announce Content-Length: 100, send 10 bytes, close the write half) rather than fabricating the error. Each flag is still only PARTLY wired where a second route to it exists — a post-connect TCP reset still reports UF, not UR",
    "open: the acceptance gate itself — field-by-field differential log-line comparison against the WP-13 lifecycle suite, plus \"every response flag reachable by at least one test\". This row read \"nothing emits\" long after the above had landed; corrected 2026-08-09 to functionally-done rather than done, because the gate is real work, not paperwork"
   ],
   "note": "⚠ FIXED TWO (found by QA-1 + QA-6): %REQ(:METHOD)% rendered '-' in EVERY log line including Envoy mode, since Envoy's own default format uses it; and a stream killed mid-flight set NO response flag, making a network death byte-identical to a short completion on the SSE path that is most LLM traffic"
@@ -963,10 +1002,11 @@
    "✓ PREREQUISITES BUILT 2026-08-20/21 — there was NO standalone LLM upstream anywhere in the tree until now (diffrig's upstreams are in-process library types a test spawns and drops). testing/mockupstream (new crate, binary mock-upstream) is a real long-lived process; scripts/capacity-sweep.sh + `make sweep` / `make sweep-compare` spawn it, generate a proxy config pointed at it, fence on real evidence (the mock's announced-address line, the proxy's /ready — never a bare connect(), which succeeds against whatever else holds the port), prove one request round-trips AND is metered, then hand the listener to loadgen --sweep",
    "⚠ FIRST SWEEP WAS ENTIRELY A HARNESS ARTIFACT (106e0e5) — reported \"max sustainable concurrency: 1\", exit 0, every honesty guard green. Root cause: a zero-latency mock drove ~5,800 connects/sec at concurrency ONE against a box sustaining ~546/sec (16,383 ephemeral ports / 30s TIME_WAIT) — ports exhausted inside the first level, not the proxy. Settled by driving the mock directly with no proxy in the path (same 100% failure at concurrency 2). Mock defaults are now LLM-shaped (250ms TTFT, 25ms/token, 128 tokens) and the SLO is now a ratio derived from generation time rather than a fixed millisecond figure",
    "✓ the harness-ceiling estimate itself was conservative by 2x, in the direction that discards valid runs (9128e1a) — it halved the ephemeral-port budget modelling a hop that HTTP/2 upstreams (see WP-15) no longer pay for; the divisor is now derived from the sweep's own topology, not left for an operator to remember",
-   "FIRST REAL CEILING FOUND: 202 concurrent streams (ba377e3, see WP-15's card in full) — hyper's h2 server default (max_concurrent_streams=200), confirmed in the dependency source in use. This is a KNOWN IMPLEMENTATION GAP, not a proxy resource limit, and it is NOT a published capacity number (no p99/tokens-per-sec/RSS figure) — do not read it as satisfying this WP's open clause",
-   "▲ STILL OPEN, exactly as before: NO CAPACITY REPORT IS PUBLISHED against a run that clears the 202-stream ceiling. An h1-vs-h2 comparison sweep was in flight as of this refresh (a capacity benchmark running on this box); its numbers are not yet available and are not recorded here"
+   "FIRST REAL CEILING FOUND: 202 concurrent streams (ba377e3) — hyper's h2 server default (max_concurrent_streams=200), confirmed in the dependency source in use. **FIXED 2026-08-22, see WP-15's card**: slice C measured 202 → 808 (4x) on the same harness/workload. This was a known implementation gap, not a proxy resource limit, and its fix is not itself a published capacity number — still no p99/tokens-per-sec/RSS figure exists",
+   "⚠ TWO MORE HONESTY-GUARD BUGS, found 2026-08-21 by running real sweeps, not by reading code (c029d44): an all-failure level rendered p50/p99/ttft_p99 as Duration::MAX's float conversion — a huge number a reader could misread as \"very slow\" instead of \"no data\"; percentiles are now Option, and the SLO gate skips latency clauses when there is none. Separately, the harness guard budgeted only CONCURRENT STREAMS and missed that a fast upstream is CHURN-RATE bound — measured 5,800 connects/sec at concurrency 1 against a ~546/sec ceiling, a 10.6x overload the guard stayed silent through. Now derives connect_rate_budget from the port range and OS TIME_WAIT, checked before the concurrency clauses so the two failure modes are never confused",
+   "▲ STILL OPEN: NO CAPACITY REPORT IS PUBLISHED. The 202-stream ceiling that used to be the open blocker is fixed (WP-15 slice C); the loadgen instrument's own two honesty bugs above are also fixed and mutation-verified — so as of this refresh, nothing is known to block running the sweep except that no one has. An h1-vs-h2 comparison sweep was reported \"in flight\" as of an earlier refresh; its numbers were never recorded here and are not assumed to still be running"
   ],
-  "note": "detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending there is reported HARNESS-BOUND, never as proxy capacity. The gate's open clause is unchanged by any of the above: prerequisites now exist and the first ceiling found is honest, but zero capacity numbers are published"
+  "note": "detects its own ceilings: ~8k streams here from the ephemeral port range — a run ending there is reported HARNESS-BOUND, never as proxy capacity. The gate's open clause is unchanged by any of the above: prerequisites, the ceiling fix, and the measurement-honesty fixes all exist now, but zero capacity numbers are published — that is the one fact this card should not be read past"
  },
  {
   "id": 41,
@@ -1080,7 +1120,9 @@
    "✓ VERIFIED END-TO-END 2026-08-08 (c1314b6) — testing/diffrig/tests/failover_e2e.rs drives the real llm-proxy binary against a real llmproxy dialect config with fallbacks:, mock primary forced to 429. Three assertions, each mutation-tested: attempt accounting exact (one request per upstream), standby receives its OWN credential with the primary's key NOWHERE on the wire (negative asserted explicitly), standby receives its OWN Host. This is the v0.1.0 gate's failover clause going from code-complete to verified — see docs/MILESTONES.md",
    "Scope that closes here: SAME-DIALECT fallback (e.g. openai → an openai-compatible provider). examples/llmproxy.yaml's fallback showcase changed from cross-dialect (gpt-5* → anthropic) to local-vllm as a result",
    "⚑ NOT in this WP: cross-dialect fallback (openai → anthropic) is a hard config-time error naming routes[i].fallbacks[j], deliberately — the request/response shape translation it needs is real, un-started work. Split into WP-52 (v1.0.0), not silently dropped from scope",
-   "▲ ORDERING PREREQUISITE recorded 2026-08-14 in IMPLEMENTATION_PLAN.md, read before WP-52 starts: the usage dialect still lives on the ROUTE, safe today only because cross-dialect fallback is rejected at load. WP-52's translation work is what makes cross-dialect fallback legal — the dialect MUST move to the CLUSTER first, or this reproduces the shape of the two prior P0s (credentials, host_rewrite_literal), except the symptom is silently wrong billing. Live evidence already exists: three tests in local_openai_smoke.rs fail today because a same-dialect alias reroute already hits this (see WP-34's card)"
+   "▲ ORDERING PREREQUISITE recorded 2026-08-14 in IMPLEMENTATION_PLAN.md, read before WP-52 starts: the usage dialect still lives on the ROUTE, safe today only because cross-dialect fallback is rejected at load. WP-52's translation work is what makes cross-dialect fallback legal — the dialect MUST move to the CLUSTER first, or this reproduces the shape of the two prior P0s (credentials, host_rewrite_literal), except the symptom is silently wrong billing. Live evidence already exists: three tests in local_openai_smoke.rs fail today because a same-dialect alias reroute already hits this (see WP-34's card)",
+   "✓ PREREQUISITE INCREMENT 1 DONE 2026-08-22 (940c5b8) — the carrier now exists, additive: Cluster.metadata.filter_metadata[\"io.llmproxy.usage\"] lowers to ClusterConfig.usage_dialect. Nothing reads it yet (the filter still reads the route copy; cross-dialect fallback stays rejected until increment 2 switches it over), and that sequencing is enforced by the ir_readership guard, not just documented. THE FIRST CUT SHIPPED THE BUG IT WAS WRITTEN TO PREVENT: it derived the cluster's dialect from provider `type` while the route derives it through `resolved_dialect` (which honours an explicit `models:` entry `dialect:`), so the two carriers could disagree on Vertex/Bedrock — reintroducing the confirmed quota-bypass shape the fix was meant to close. Now both resolve through the same function",
+   "✓ CLOSED 2026-08-23 (897d515) — a second instance of the same class, found and fixed the same week: only `models:` ran the dialect-ambiguity check, so a Vertex/Bedrock provider reached through `routes:` (not `models:`) silently fell through to usage_dialect's `_ => \"openai\"` default — the same quota-bypass shape, in the route carrier this time. Unreachable today only because both provider types are still hard-rejected as unbuilt credential schemes; fixed before either ships rather than after. All three route-surface sites (primary, fallback, listener default) now resolve through cluster_usage_dialect"
   ],
   "note": "historical: the dialect used to WARN AND DROP `fallbacks` (parsed, validated, lowered, then dropped with one stderr line) — corrected in MILESTONES.md 2026-08-03 and again 2026-08-06. Increment 2c (399b954) replaced that with a real lowering, so this note is now history, not the current behavior"
  },
@@ -1311,12 +1353,13 @@
   "title": "OpenTelemetry (traces · metrics · semconv naming)",
   "meta": [
    "proxy-observability",
-   "OWNER 2026-08-03: make the project OTel-ready — recorded and scheduled, not worked yet, since v0.1.0's scope stays frozen",
-   "measured 2026-08-03 — logs strong (79 access-log operators, 9 LLM-specific) but ours not semconv-named; traceparent PASSES THROUGH already (nothing strips it) but we emit no spans; metrics is NOTHING (0 otel/prometheus/metrics deps, /stats a deliberate 404)",
-   "inc 1: semconv-name the LLM access-log operators (gen_ai.usage.* etc, old names alias for one release) · inc 2: trace participation (parse traceparent, span per request + per upstream attempt) · inc 3: OTLP export, gated on WP-23",
+   "OWNER 2026-08-03: make the project OTel-ready — recorded and scheduled; this is WHY WP-23's registry became OTel-native internally (see WP-23's card) — Envoy's flat /stats names are a RENDERING of that model now, not the model itself",
+   "⚠ METRICS LINE SUPERSEDED 2026-08-22 — WP-23 landed. There is a real registry, /stats and /stats/prometheus both serve real traffic, and cluster/listener/token instruments are wired. Zero opentelemetry/prometheus/metrics crate deps remains true for INCREMENT 3 specifically (OTLP export) — the Prometheus text format is hand-rendered, so OTLP means adding the first such dependency, not swapping one out",
+   "⚑ INCREMENT 1 IMPLEMENTED, REVIEWED, AND DECLINED BY THE OWNER — same day, 2026-08-21 (ce238dd, 22eb9c7). Do not re-propose without reading the plan's WP-51 section first. The blocker is arithmetic, not naming: TokenUsage models DISJOINT buckets that sum to a total (input_tokens excludes the cached portion), but the OTel registry defines gen_ai.usage.input_tokens as INCLUSIVE of its cache sub-buckets — a plain alias would have shipped a standard name carrying a non-standard meaning, silently under-counting input by exactly the cached portion on the field people bill from. Caught only because the implementing agent had no network access and asked for its mapping to be spot-checked — its own tests could not have caught this, since every alias renders identically to its legacy name by construction. The LLM_* names stay; the inclusive/disjoint conversion belongs at the OTLP export boundary (increment 3) if that ever ships, not as a log-operator alias",
+   "inc 2 (not started): trace participation (parse traceparent, span per request + per upstream attempt) · inc 3 (not started): OTLP export, gated on WP-23",
    "▲ the !Send collision: ADR-0003 makes the data plane !Send/worker-local, the OTel SDK's providers are Send+Sync. Fix is ADR-0005's shape inverted — workers write local buffers, control side aggregates + exports"
   ],
-  "note": "this decision is WHY WP-23's registry became OTel-native (see WP-23's card) — Envoy's flat /stats names are now a rendering of this model, not the model itself"
+  "note": "status stays `ready` (not `started`) on the WHOLE WP: increment 1 was built, reviewed, and reverted rather than merged, so nothing OTel-shaped has actually landed here yet. The value of the attempt is the recorded reasoning, not partial progress"
  },
  {
   "id": 52,
@@ -1363,7 +1406,7 @@
   "prio": "P1",
   "ms": "v0.3.0",
   "lane": "H",
-  "size": "S",
+  "size": "M",
   "gate": "G5",
   "status": "ready",
   "title": "Tenant self-service usage API",
@@ -1373,7 +1416,8 @@
    "a read-only endpoint returning InProcessBudgetStore's current-window used/limit/remaining/reset — state the token limiter ALREADY COMPUTES and today throws away; adds NO new storage",
    "security property is the design, not a detail: the caller's own key both authenticates AND scopes the response — no tenant-id parameter, ever, so there is nothing to retrofit a cross-tenant leak onto later",
    "out of scope, each for a reason: historical usage (needs a store — WP-55) · cost rather than tokens (needs WP-53's rate card) · anything on the admin listener (which is unauthenticated by design — admin authn/authz would have to land first, on its own listener)",
-   "depends on WP-50 increment 2a (done — proxy-assigned identity to key on) and WP-34 (done — the extraction this reads); blocked on nothing else"
+   "depends on WP-50 increment 2a (done — proxy-assigned identity to key on) and WP-34 (done — the extraction this reads); blocked on nothing else",
+   "⚠ RESIZED S→M on its own 2026-08-21 design pass (8f9719c) — \"the limiter already computes this\" is true of one window, false of the QUERY an API actually needs. LimitKey is an opaque String built from flattened descriptors, and usage is per-(route, tenant); answering \"this tenant's usage\" means enumerating across routes, which Mutex&lt;HashMap&lt;LimitKey, Window&gt;&gt; cannot do without parsing its own key format back out. A real decision is needed first (named-field LimitKey vs a secondary tenant index) before implementation starts — recorded the trap explicitly: do not ship a \"current route only\" version just to keep the S label"
   ],
   "note": "▲ milestone placement is a judgment call, not owner direction: v0.2.0 is current and its scope is frozen, and this was scoped after that freeze, so it is slotted into v0.3.0 rather than the milestone shipping next. Not in MILESTONES.md's v0.3.0 gate clause — flagged, not silently assumed"
  },

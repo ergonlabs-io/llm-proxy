@@ -242,10 +242,26 @@ releases:
       an LLM-shaped mock and an SLO derived from generation time. <b>The first real ceiling found
       is 202 concurrent streams</b> — hyper's h2 server defaults <code>max_concurrent_streams</code>
       to 200 (confirmed in the dependency source in use), and the proxy multiplexes onto one
-      upstream connection without ever opening a second. <b>This is a known implementation gap,
-      not a capacity number, and does not close this clause</b> — no p99/tokens-per-sec/RSS report
-      exists yet. An h1-vs-h2 comparison sweep was in flight as this board was refreshed; its
-      numbers are not available and are not recorded here.
+      upstream connection without ever opening a second. This was a known implementation gap,
+      not a capacity number, and did not close this clause. <b>FIXED 2026-08-22 (WP-15 slice C,
+      <code>6965fd6</code>):</b> the h2 cache now keeps a bounded SET of connections per key and
+      dials another once one saturates, instead of queuing behind a single connection. Measured
+      202 → 808 concurrent streams (4x) on the identical harness and workload, proxy still at
+      20-22% CPU / 82.7MB RSS / 0.00 error rate — the ceiling is structural, just four times
+      higher, and still not resource-bound. <b>Two more measurement-honesty bugs in the loadgen
+      instrument itself, found 2026-08-21 by running real sweeps</b> (<code>c029d44</code>): an
+      all-failure level rendered its percentiles as <code>Duration::MAX</code>'s float conversion
+      (a huge number a reader could misread as "very slow" instead of "no data"; percentiles are
+      now <code>Option</code>, and the SLO gate skips latency clauses with none), and the harness
+      guard budgeted only concurrent streams while a fast upstream is actually churn-rate bound
+      (measured 5,800 connects/sec at concurrency 1 against a ~546/sec ceiling — a 10.6x overload
+      the guard stayed silent through); it now derives a <code>connect_rate_budget</code> from the
+      port range and OS <code>TIME_WAIT</code>. <b>What is still open, and it is the one fact
+      this card should not be read past: no capacity sweep has actually been run and
+      published.</b> Every previously-cited blocker (the 202-stream ceiling, both loadgen honesty
+      bugs) is now fixed — nothing is known to prevent running the sweep except that no one has.
+      An earlier refresh noted an h1-vs-h2 comparison sweep "in flight"; its numbers were never
+      recorded here and should not be assumed to still be running.
   - wp: WP-23
     what: >-
       <b>Increments 1–6a landed 2026-08-08/09 and CLOSE this gate's <code>/stats</code>
@@ -255,12 +271,23 @@ releases:
       source), a registry API that survives a config swap (<code>Registry</code> vs
       non-<code>Clone</code> <code>StatsControl</code>, ArcSwap-published snapshot), and
       cluster stat call sites so <code>/stats</code> reports <b>real traffic</b> — proven by
-      <code>crates/proxy/tests/stats_e2e.rs</code> and mutation-verified. <b>Not the same claim
-      as WP-23 being done:</b> increment 6b (the <code>DOWNSTREAM_CX_TOTAL</code> listener stat
-      and the <code>GEN_AI_CLIENT_TOKEN_USAGE</code> usage-filter stat) has instruments defined
-      but no production call site yet, so listener- and LLM-token-level stats are still absent
-      from a live scrape. The Grafana conformance test stays provisional — the Envoy repo
-      vendors no dashboard at all.
+      <code>crates/proxy/tests/stats_e2e.rs</code> and mutation-verified. <b>Increment 6b DONE
+      2026-08-22</b> (<code>17d6cfb</code>, <code>5bf8be6</code>) — <code>with_token_stats</code>
+      existed and named <code>build_hcm_handler</code> as its call site, but
+      <code>build_hcm_handler</code> never called it, so <code>token_stats</code> was
+      <code>None</code> on every chain the binary actually serves and no unit test could see it
+      (they construct the handler directly). Fixed and proven by an e2e against the real binary
+      and a real mock-upstream. <b>Two follow-up gaps found the same day, BOTH now closed:</b>
+      <code>envoy_counter_name</code> had no <code>downstream_cx_total</code> case, so it
+      rendered to nothing on plain <code>/stats</code> while <code>/stats/prometheus</code>
+      reported it correctly (fixed 2026-08-22, <code>cfe0002</code>, mutation-checked, both
+      endpoints now asserted to agree); and a listener with <code>llmproxy.usage</code> but no
+      <code>access_log</code> recorded no token usage at all, since the wrapper that runs both
+      jobs was gated on access loggers alone (fixed 2026-08-23, <code>c35da26</code>, the gate is
+      now an OR, mutation-verified). Listener- and LLM-token-level stats now reach a live scrape.
+      The Grafana conformance test stays deliberately provisional — the Envoy repo vendors no
+      dashboard to conform to — and it is not verified that every other Envoy stat name the
+      registry defines has a renderer arm, only the ones a test has driven.
   - wp: WP-06
     what: >-
       <b>Done, and CLOSES this gate's config-swap clause.</b> SIGHUP now re-reads the config
@@ -412,7 +439,25 @@ releases:
     was also corrected: an unreviewed, unbuilt implementation attempt was rescued from an abandoned
     agent worktree onto a branch, and is recorded as a rescued starting point rather than progress.
     Two new work packages (WP-54, WP-55) were scoped from an owner question about usage/admin
-    portals and slotted into v0.3.0, not this milestone.
+    portals and slotted into v0.3.0, not this milestone. <b>Re-measured 2026-08-23:</b>
+    <b>1222 tests passed, 23 skipped</b> (<code>make tq-count</code>, a real re-run, cargo
+    nextest) — up from 1167/24. The +55/-1 reconciles against the self-reported delta in every
+    commit between the two refreshes, ending exactly at the measured number: WP-15 slice C
+    (h2 pooling, per-worker connection SETS instead of one), the refused-stream retry decode,
+    WP-40's dependency cleanup, WP-23 increment 6b plus its renderer and access-log-gating
+    follow-ups, WP-35's cluster-side usage-dialect carrier and the <code>routes:</code>-surface
+    fix, and WP-11 chunk 4's decode-side <code>ContinueAndDontEndStream</code> (which is also
+    the one skipped-count change: chunk-4's own ignored-test count went 9 → 8). Doctests
+    unchanged at 5 passed / 2 ignored. <b>Two gate-relevant fixes, neither moving the gate
+    itself:</b> the WP-15 202-concurrent-stream ceiling that WP-30's card cited as a blocker is
+    fixed (808 measured, see WP-15/WP-30 above), and two more loadgen measurement-honesty bugs
+    (a <code>Duration::MAX</code> percentile and a stream-count-only harness guard blind to
+    connection churn) were found and fixed 2026-08-21 — so as of this refresh nothing is known
+    to block running the capacity sweep except that no one has. <b>Also closed this pass, not
+    gate-moving:</b> WP-24's response-flag audit found two flags declared and never set (RL,
+    URX — both fixed) and two more that were declared, looked wired, and were dead code (UR, DC
+    — both fixed 2026-08-23, with DC's own test rewritten to drive the real condition instead of
+    fabricating it, which is why the gap survived as long as it did).
 - v: v0.3.0
   name: Dynamic configuration
   state: later
@@ -473,9 +518,17 @@ releases:
   - wp: WP-32
     what: ext_authz, ratelimit, ext_proc — ext_proc is what v1.0.0 needs.
   - wp: WP-10
-    what: Downstream h2 and upgrades (S10).
+    what: >-
+      Downstream h2 (TLS + ALPN) is DONE (<code>serve_http2</code>, dispatched off negotiated
+      ALPN, 5 tests) — this row said otherwise until 2026-08-23. What's left: h2c (plaintext,
+      no ALPN to dispatch on) and upgrades (S10).
   - wp: WP-11
-    what: Watermarks, StopAll resume, 1xx — the S2 remainder.
+    what: >-
+      Chunk 4, the S2 remainder — watermarks (real backpressure vs the current buffer-and-413
+      alias), StopAll out-of-band resume, decode trailer-hold, 1xx, and the encode-side
+      <code>ContinueAndDontEndStream</code> mirror. Measured as 8 <code>#[ignore]</code>d tests
+      as of 2026-08-23 (decode-side <code>ContinueAndDontEndStream</code> just closed one) — not
+      a fixed number, more were being closed as this board was refreshed.
   - wp: WP-29
     what: 'Fuzzing: h1 parser smuggling vectors, config, routes.'
 - v: v1.0.0
@@ -498,7 +551,12 @@ releases:
       fallback shipped in v0.1.0; an openai-shaped route falling back to an anthropic one is a
       hard config-time error today, not silently accepted. Needs WP-35 (done, the mechanism
       this reuses), WP-45 (the bounded-buffer body pipeline, a possible substrate), and WP-49
-      (the provider-type distinction, not just the cluster name).
+      (the provider-type distinction, not just the cluster name). <b>Its own prerequisite is
+      now in progress inside WP-35</b>: the usage dialect must move from the route onto the
+      cluster before this WP can legalize cross-dialect fallback, or it reproduces the
+      credentials/<code>host_rewrite_literal</code> P0 shape with silently wrong billing as the
+      symptom. Increment 1 (the additive cluster-side carrier) landed 2026-08-22; nothing reads
+      it yet — see WP-35's card.
   - wp: WP-43
     what: >-
       <b>Response caching.</b> New from the competitive review. Streaming is the hard part

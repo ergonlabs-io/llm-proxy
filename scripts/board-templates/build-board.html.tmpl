@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-21 · 1167 tests passed, 24 skipped as of 2026-08-21 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-23 · 1222 tests passed, 23 skipped as of 2026-08-23 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -217,7 +217,8 @@
     ceiling, RSS under sustained long-lived streams) from a run that is not harness-bound, plus
     <code>/config_dump</code> and <code>/stats</code> on the admin endpoint, plus a config swap
     under live traffic with zero dropped streams. <b>Two of the three clauses CLOSED 2026-08-09;
-    the capacity report is now the only one open, and it has a named blocker.</b>
+    the capacity report is now the only one open. Its previously-named blocker (a 202-stream h2
+    ceiling) is fixed as of 2026-08-22 — no report has been published regardless.</b>
     <code>/config_dump</code> and <code>/stats</code> — closed: <code>/config_dump</code>'s
     redaction is structural (WP-50 increment 1), and <code>/stats</code> now reports <b>real
     traffic</b>, not merely a correctly-rendered empty registry — WP-23 increments 4/5/6a landed
@@ -267,18 +268,34 @@
     making the mock LLM-shaped and deriving the SLO from generation time. <b>The FIRST real ceiling
     found is 202 concurrent streams</b> — hyper's h2 server defaults
     <code>max_concurrent_streams</code> to 200, confirmed in the dependency source in use, and the
-    proxy multiplexes onto one upstream connection without opening a second. <b>This is a known
-    implementation gap, not a capacity number, and it does not close this clause</b> — no
-    p99/tokens-per-sec/RSS report exists yet. An h1-vs-h2 comparison sweep was in flight as this
-    board was refreshed; its numbers are not available and are not guessed at here.</span>
+    proxy multiplexes onto one upstream connection without opening a second. This was a known
+    implementation gap, not a capacity number, and did not close this clause. <b>FIXED
+    2026-08-22 (WP-15 slice C, <code>6965fd6</code>):</b> the h2 cache now keeps a bounded set of
+    connections per key and dials another once one saturates. Measured 202 → 808 concurrent
+    streams (4x) on the identical harness, still not resource-bound (20-22% CPU, 82.7MB RSS,
+    0.00 error rate). <b>Two more loadgen measurement-honesty bugs, found 2026-08-21 by running
+    real sweeps</b> (<code>c029d44</code>): an all-failure level rendered its percentiles as
+    <code>Duration::MAX</code>'s float conversion (a huge number a reader could misread as "very
+    slow" instead of "no data"), and the harness guard budgeted only concurrent streams while a
+    fast upstream is actually churn-rate bound (measured 5,800 connects/sec at concurrency 1
+    against a ~546/sec ceiling — the guard stayed silent through a 10.6x overload). Both fixed
+    and mutation-verified. <b>As of this refresh, nothing is known to block running the sweep
+    except that no one has</b> — every previously-cited blocker on this clause is now fixed, and
+    zero p99/tokens-per-sec/RSS numbers are published regardless. An h1-vs-h2 comparison sweep
+    was reported "in flight" as of an earlier refresh; its numbers were never recorded here and
+    should not be assumed to still be running.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
     that is an argument, not the v0.0.1 standard, which was a manual run against real endpoints,
-    executed and recorded. <b>Second standing risk, unchanged since 2026-08-01:</b> the LLM layer
-    stacks on serving foundations that are not finished — no connection pooling (WP-15, still
-    connect-per-stream), no downstream h2 (WP-10), watermarks aliased to buffering rather than real
-    backpressure (WP-11) — none exercised by the tests that closed v0.1.0's gate.
+    executed and recorded. <b>Second standing risk, named 2026-08-01, narrower as of 2026-08-23:</b>
+    the LLM layer stacks on serving foundations that were not finished at the time. Two have since
+    closed: downstream h2 landed 2026-08-02 (only h2c and S10 upgrades remain, WP-10), and h2
+    upstream connection pooling went from connect-per-stream to a bounded per-key connection set
+    that measured 808 concurrent streams, 4x its prior ceiling (WP-15 slice C, 2026-08-22). Still
+    open: h1 upstream pooling (still connect-per-stream) and watermarks aliased to buffering
+    rather than real backpressure (WP-11) — neither exercised by the tests that closed v0.1.0's
+    gate.
     <b>WP-41, the black-box QA suite, found five real bugs across the two milestones</b> — no
     dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too),
     no response flag on a mid-stream failure, a JSON-float usage report silently billed as zero
@@ -363,7 +380,24 @@
     abandoned agent worktree and rescued onto a branch rather than lost — unreviewed, unbuilt, not
     verified to compile, and edits three files that have since changed independently on
     <code>main</code>. Recorded as a rescued starting point, not progress; WP-53's status is
-    unchanged.</span>
+    unchanged.
+    <b>Re-measured 2026-08-23:</b> <b>1222 tests passed, 23 skipped</b> (<code>make
+    tq-count</code>, a real re-run) — up from 1167/24. The +55/-1 reconciles against the
+    self-reported delta of every commit between the two refreshes, ending exactly at the measured
+    number: WP-15 slice C (h2 pooling, 202 → 808 concurrent streams), the refused-stream retry
+    decode, WP-40's dependency cleanup, WP-23 increment 6b plus its renderer and
+    access-log-gating follow-ups, WP-35's cluster-side usage-dialect carrier plus a
+    <code>routes:</code>-surface dialect fix, and WP-11 chunk 4's decode-side
+    <code>ContinueAndDontEndStream</code> (also the skip-count change: chunk 4's own ignored-test
+    count went 9 → 8, "8 and moving" as of this refresh, not a fixed number). Doctests unchanged
+    at 5 passed / 2 ignored. <b>WP-24's response-flag audit</b> (2026-08-22/23) found two flags
+    declared and never set (<code>RL</code>, <code>URX</code> — both fixed) and two more that
+    were declared, looked wired, and were dead code (<code>UR</code>, <code>DC</code> — both
+    fixed 2026-08-23; <code>DC</code>'s own unit test had fabricated its trigger condition
+    instead of driving it, which is exactly why the gap survived). <b>WP-10's row</b> is
+    corrected above (downstream h2 has been done since 2026-08-02; this board mislabelled it as
+    outstanding until 2026-08-23). None of the above moves a ship gate — the v0.2.0 capacity
+    report is still the only open clause on this milestone, see above.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
