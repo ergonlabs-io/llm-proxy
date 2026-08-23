@@ -4204,3 +4204,62 @@ fn token_stats_are_recorded_with_no_access_logs_configured() {
         );
     });
 }
+
+/// Holds trailers with `StopIteration` but calls `continue_decoding()` from
+/// inside the same callback -- the resume half of the S2.4 contract.
+struct ResumingTrailerHoldFilter {
+    log: Log,
+}
+
+impl HttpFilter for ResumingTrailerHoldFilter {
+    fn decode_trailers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _t: &mut RequestTrailers,
+    ) -> FilterTrailersStatus {
+        self.log
+            .borrow_mut()
+            .push("hold:decode_trailers".to_string());
+        cb.continue_decoding();
+        FilterTrailersStatus::StopIteration
+    }
+}
+
+/// S2.4: the resume half. `decode_trailers_stop_iteration_holds_until_resumed`
+/// is named for a resume it never performs -- its own comment says "here,
+/// simply never" -- so it only ever proved the HOLD. The implementation reads
+/// `continue_decoding()` as overriding a `StopIteration`, and does so through
+/// a deliberately subtle reset: `continue_requested` is cleared immediately
+/// before the `decode_trailers` call, because reaching that branch means
+/// `decode_data` already continued and its leftover `true` would otherwise
+/// read as this filter resuming its own trailer hold.
+///
+/// That reset is exactly the kind of reasoning that needs a test, and it had
+/// none. If it were removed, `StopIteration` here would be indistinguishable
+/// from `Continue` and the hold test alone would not notice.
+#[test]
+fn a_trailer_hold_resumed_in_the_same_callback_reaches_later_filters() {
+    block_on(async {
+        let log = log_of();
+        let filters: Vec<Box<dyn HttpFilter>> = vec![
+            Box::new(ResumingTrailerHoldFilter { log: log.clone() }),
+            Box::new(ProbeFilter::new("b", log.clone())),
+        ];
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-trace", HeaderValue::from_static("1"));
+        let req = request_with_trailers(b"hi", trailers);
+        run_chain_req(filters, log.clone(), req, DEFAULT_BUFFER_LIMIT).await;
+
+        let entries = log.borrow().clone();
+        assert!(
+            entries.iter().any(|e| e == "hold:decode_trailers"),
+            "the holding filter must have run: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e == "b:decode_trailers"),
+            "continue_decoding() from inside decode_trailers must release the \
+             hold, so a later filter DOES see the trailers (S2.4) -- this is \
+             the case the hold-only test cannot distinguish; log: {entries:?}"
+        );
+    });
+}
