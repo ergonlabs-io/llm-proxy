@@ -203,6 +203,44 @@ pub enum UpstreamCodecError {
     /// `send_upstream_http1` (h1 has no `:authority` pseudo-header).
     #[error("request has no authority: URI is origin-form and no Host header was present")]
     MissingAuthority,
+    /// h2-only: the peer answered with `RST_STREAM(REFUSED_STREAM)`, which
+    /// means it did no work on this stream at all. Its own variant rather
+    /// than a `Send` in disguise because S3.2 treats it as *always* safe to
+    /// retry -- even a non-idempotent request, and even a body that has
+    /// already been written -- which no other send failure is. Produced only
+    /// by [`send_on_http2`]; `send_upstream_http1` cannot reach it (h1 has no
+    /// stream-level reset).
+    #[error("upstream refused the h2 stream (RST_STREAM: REFUSED_STREAM)")]
+    RefusedStream,
+}
+
+/// Pull the h2 stream-error reason out of a `hyper::Error`, if there is one.
+///
+/// hyper wraps the underlying `h2::Error` rather than exposing it, so the
+/// only route to the reason code is walking the `source()` chain and
+/// downcasting -- the technique proven in `tests/hyper_spike.rs`'s capability
+/// (c) before any of this was built on it.
+///
+/// **This is only sound because `h2` is the same compiled crate hyper uses.**
+/// `downcast_ref` compares `TypeId`s; two semver-incompatible copies of h2 in
+/// the tree are two different types, and this would return `None` forever
+/// with no error anywhere -- a silent, permanent no-op. That is why
+/// `crates/proxy-http/Cargo.toml` says not to make h2 a workspace dependency
+/// with an independent version, and why the test that covers this drives a
+/// real RST_STREAM instead of constructing an `UpstreamCodecError` by hand.
+///
+/// Rust note: the chain is walked rather than checking only the immediate
+/// source, because how deeply hyper nests its cause is an implementation
+/// detail that has changed across hyper versions.
+fn h2_reason(err: &hyper::Error) -> Option<h2::Reason> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if let Some(h2_err) = cause.downcast_ref::<h2::Error>() {
+            return h2_err.reason();
+        }
+        source = cause.source();
+    }
+    None
 }
 
 /// Send one request upstream over `io` as HTTP/1.1 and return the response,
@@ -408,6 +446,14 @@ pub async fn send_on_http2(
     let response = match sender.send_request(request).await {
         Ok(response) => response,
         Err(send_err) => {
+            // S3.2 `refused-stream`: REFUSED_STREAM is the one reset the peer
+            // can send that carries a guarantee -- it did no work on this
+            // stream, so replaying is safe unconditionally. Every other
+            // reason (CANCEL, INTERNAL_ERROR, a plain connection error)
+            // stays a `Send` and gets the ordinary, conservative treatment.
+            if h2_reason(&send_err) == Some(h2::Reason::REFUSED_STREAM) {
+                return Err(UpstreamCodecError::RefusedStream);
+            }
             return Err(UpstreamCodecError::Send(send_err));
         }
     };

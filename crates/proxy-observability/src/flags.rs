@@ -15,11 +15,16 @@
 //! - **Unreachable**: the condition cannot occur in what's built today. Each
 //!   such variant's doc says why, so the next audit doesn't start from
 //!   scratch. `docs/envoy-divergences.md` carries the same table with the
-//!   fuller narrative, including two flags this audit found are declared but
-//!   **dead code** despite looking wired (`UpstreamRemoteReset`,
-//!   `DownstreamConnectionTermination`) — worth reading before trusting a
-//!   `grep` for `set_response_flag` as a reachability proof, which is
-//!   exactly the mistake that undercounted them the first time.
+//!   fuller narrative.
+//!
+//! That audit found two flags declared, apparently wired, and yet **dead
+//! code**: `UpstreamRemoteReset` and `DownstreamConnectionTermination`. Both
+//! matched on an error variant nothing ever constructed. `UpstreamRemoteReset`
+//! has since gained a real producer (the h2 refused-stream decode), leaving
+//! `DownstreamConnectionTermination`. Worth reading before trusting a `grep`
+//! for `set_response_flag` as a reachability proof — that is exactly the
+//! mistake that undercounted them the first time. A flag is reachable when
+//! something can construct the condition, not when something matches on it.
 
 /// Why a request ended the way it did. See the module doc's WP-24 audit for
 /// which variants are reachable (and where their test lives) versus
@@ -96,17 +101,20 @@ pub enum ResponseFlag {
     /// `UF`/`UC`/`UR`) -- Envoy's own uses of `LR` (e.g. an internal error
     /// aborting a stream) have no analog here.
     LocalReset,
-    /// UR: upstream remote reset (a TCP/TLS reset between connect and the
-    /// first response byte). **Declared, never produced**:
-    /// `PoolError::ResetBeforeHeaders` -- the only value `router.rs`'s `UR`
-    /// arm matches on -- is never constructed by `ConnectPool::new_stream`
-    /// (h1) or the h2 connection cache; both only ever return
-    /// `ConnectFailure`/`ConnectTimeout`/`TlsHandshake`. A genuine
-    /// post-connect reset is currently indistinguishable from those in our
-    /// pool implementation, so this arm is dead code today. Distinguishing
-    /// it (e.g. matching `ECONNRESET` specifically after a successful
-    /// connect) is buildable but a classification decision, not a wiring
-    /// fix -- see `docs/envoy-divergences.md`.
+    /// UR: upstream remote reset -- the peer deliberately reset the stream
+    /// between connect and the first response byte. **Reachable and tested**
+    /// since the h2 codec learned to decode RST_STREAM reasons: an
+    /// `UpstreamCodecError::RefusedStream` (h2 `REFUSED_STREAM`) is a remote
+    /// reset, and `router.rs` flags it `UR` rather than `UC`.
+    /// `response_flags::a_refused_h2_stream_records_and_renders_the_ur_flag`.
+    ///
+    /// The *other* route to this flag is still dead:
+    /// `PoolError::ResetBeforeHeaders` is constructed by neither
+    /// `ConnectPool::new_stream` (h1) nor the h2 connection cache, so a
+    /// post-connect TCP reset is still indistinguishable from a connect
+    /// failure and reports as `UF`. Distinguishing it (matching `ECONNRESET`
+    /// specifically after a successful connect) remains a classification
+    /// decision -- see `docs/envoy-divergences.md`.
     UpstreamRemoteReset,
     /// UC: upstream connection termination. Reachable: any hyper-level
     /// failure sending the request or parsing the response (a malformed

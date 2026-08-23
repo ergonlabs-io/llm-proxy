@@ -44,12 +44,16 @@ pub enum AttemptOutcome {
     /// exist.
     ResetAfterHeaders,
     /// h2 REFUSED_STREAM: the peer bounced the stream before doing any work,
-    /// always safe to retry (S3.2's `refused-stream`). Not yet produced --
-    /// the upstream h2 codec doesn't decode RST_STREAM reasons yet.
+    /// always safe to retry (S3.2's `refused-stream`). Produced by
+    /// `codec::send_on_http2`, which decodes the reason off the
+    /// `hyper::Error`'s source chain; `UpstreamCodecError::RefusedStream` is
+    /// the carrier.
     RefusedStream,
-    /// The per-try timeout (S4.2) fired before a response arrived. Not yet
-    /// produced anywhere -- per-try timeout enforcement is a WP-13 follow-up
-    /// that hasn't landed on the router.
+    /// The per-try timeout (S4.2) fired before a response arrived. Produced
+    /// by `router.rs`'s attempt loop, which wraps each attempt in
+    /// `tokio::time::timeout(per_try_timeout, ..)`. (This doc previously said
+    /// "not yet produced anywhere" long after that landed -- status prose
+    /// decays toward overstating what is missing; check the call sites.)
     PerTryTimeout,
     /// Circuit-breaker / pending-queue overflow (S5): [`PoolError::Overflow`].
     PoolOverflow,
@@ -87,6 +91,7 @@ impl AttemptOutcome {
             | UpstreamCodecError::Connection(_)
             | UpstreamCodecError::Send(_)
             | UpstreamCodecError::MissingAuthority => Self::ResetBeforeHeaders,
+            UpstreamCodecError::RefusedStream => Self::RefusedStream,
         }
     }
 }

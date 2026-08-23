@@ -778,9 +778,23 @@ impl RouterHandler {
                                 continue;
                             }
                         }
-                        tracing::debug!(response_flag = "UC", cluster = %attempt_cluster, "upstream codec error");
-                        dcb.stream_info()
-                            .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
+                        // A refused stream is a REMOTE RESET, not a codec
+                        // failure -- the peer deliberately bounced the
+                        // stream, which is exactly what Envoy's `UR` means.
+                        // Every other codec error stays `UC`. Before the
+                        // refused-stream decode landed, `UR` was declared and
+                        // never produced by anything (docs/envoy-divergences.md
+                        // recorded it as dead code); this is its first real
+                        // producer.
+                        if matches!(err, UpstreamCodecError::RefusedStream) {
+                            tracing::debug!(response_flag = "UR", cluster = %attempt_cluster, "upstream refused the stream");
+                            dcb.stream_info()
+                                .set_response_flag(ResponseFlag::UpstreamRemoteReset);
+                        } else {
+                            tracing::debug!(response_flag = "UC", cluster = %attempt_cluster, "upstream codec error");
+                            dcb.stream_info()
+                                .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
+                        }
                         record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
                         return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
                     }
@@ -2198,6 +2212,116 @@ mod tests {
     }
 
     // ------------------------------------------- WP-15 slice A: h2 reuse --
+
+    /// An h2 upstream that answers `RST_STREAM(REFUSED_STREAM)` to the first
+    /// `refusals` streams it is asked to serve, then serves 200 forever.
+    ///
+    /// Raw `h2::server` rather than hyper: hyper's server always intends to
+    /// serve a stream and gives no way to refuse one, and a REFUSED_STREAM
+    /// that never reaches the wire would make these tests prove nothing.
+    /// Counts connections too, since the router invalidates its connection
+    /// cache on a codec error and therefore redials before retrying.
+    async fn spawn_stream_refusing_h2_upstream(
+        refusals: usize,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remaining = Arc::new(AtomicUsize::new(refusals));
+        let streams_seen = Arc::new(AtomicUsize::new(0));
+        let remaining_outer = remaining.clone();
+        let seen_outer = streams_seen.clone();
+
+        tokio::task::spawn_local(async move {
+            loop {
+                let (io, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let remaining = remaining_outer.clone();
+                let seen = seen_outer.clone();
+                tokio::task::spawn_local(async move {
+                    let Ok(mut conn) = h2::server::handshake(io).await else {
+                        return;
+                    };
+                    while let Some(accepted) = conn.accept().await {
+                        let Ok((_req, mut respond)) = accepted else {
+                            return;
+                        };
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        // `fetch_update` rather than load-then-store: two
+                        // streams can be in flight on one h2 connection, and
+                        // a non-atomic decrement could refuse more than
+                        // `refusals` of them.
+                        let refuse = remaining
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok();
+                        if refuse {
+                            respond.send_reset(h2::Reason::REFUSED_STREAM);
+                        } else {
+                            let _ = respond.send_response(http::Response::new(()), true);
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, streams_seen)
+    }
+
+    fn refused_stream_retry_policy() -> proxy_config::ir::RetryPolicyIR {
+        proxy_config::ir::RetryPolicyIR {
+            retry_on: proxy_config::ir::RetryOn::parse("refused-stream"),
+            num_retries: 1,
+            per_try_timeout: None,
+            retriable_status_codes: Vec::new(),
+            retry_back_off: proxy_config::ir::RetryBackOff {
+                base_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(2),
+            },
+            host_selection_retry_max_attempts: 1,
+        }
+    }
+
+    /// WP-15: `retry_on: refused-stream` end to end, on a real RST_STREAM.
+    ///
+    /// This trigger has been configurable, documented, and switched on by
+    /// every config this repo's format produces since S3 landed, and until
+    /// the codec learned to decode the reason it could never fire once --
+    /// `AttemptOutcome::RefusedStream` had no producer, so a refused stream
+    /// projected to `ResetBeforeHeaders` and only matched if the operator
+    /// happened to also list `reset`. The upstream here refuses exactly one
+    /// stream; a 200 back means the retry engine saw the refusal for what it
+    /// was.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_stream_is_retried_and_succeeds() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, streams) = spawn_stream_refusing_h2_upstream(1).await;
+                let fwd = ForwardAction {
+                    retry_policy: Some(refused_stream_retry_policy()),
+                    ..forward_to_up(None, None, None)
+                };
+                let router = build_router_h2(addr, prefix_matcher("/"), fwd).await;
+
+                let resp = router.handle(request("/")).await;
+                assert_eq!(
+                    resp.head.status,
+                    StatusCode::OK,
+                    "a refused stream with `retry_on: refused-stream` must be retried and \
+                     succeed, not surface as a 502"
+                );
+                assert_eq!(
+                    streams.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "exactly two streams must reach the upstream: the refused one and the \
+                     retry. A count of 1 would mean the retry never happened and the 200 came \
+                     from somewhere else"
+                );
+            })
+            .await;
+    }
 
     /// The point of the whole slice: N concurrent h2 requests to one cluster
     /// must open exactly ONE TCP connection, not N. `join_all` drives all N

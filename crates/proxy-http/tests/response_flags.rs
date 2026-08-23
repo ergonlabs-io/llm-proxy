@@ -115,6 +115,9 @@ struct Scenario {
     endpoints: Vec<EndpointIR>,
     circuit_breakers: CircuitBreakers,
     fwd: ForwardAction,
+    /// `UR` is the only flag here that needs h2: REFUSED_STREAM is a
+    /// stream-level reset, and h1 has no such frame.
+    protocol: proxy_config::ir::UpstreamProtocol,
 }
 
 impl Scenario {
@@ -129,6 +132,7 @@ impl Scenario {
             }],
             circuit_breakers: CircuitBreakers::default(),
             fwd,
+            protocol: proxy_config::ir::UpstreamProtocol::Http1,
         }
     }
 }
@@ -148,7 +152,7 @@ async fn build_router(scenario: Scenario, access_logs: &[AccessLogIR]) -> Filter
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: scenario.circuit_breakers,
-            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            upstream_protocol: scenario.protocol,
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
         }),
@@ -485,4 +489,75 @@ async fn an_idle_response_body_records_and_renders_the_si_flag() {
     })
     .await
     .expect("should complete well within the test's own guard timeout");
+}
+
+// --- UR: upstream remote reset ----------------------------------------------
+
+/// An h2 upstream that refuses every stream with
+/// `RST_STREAM(REFUSED_STREAM)`.
+///
+/// Raw `h2::server`, not hyper: hyper's server always intends to serve a
+/// stream and offers no way to refuse one. Spawned with `spawn_local` because
+/// these tests run on a `current_thread` runtime under a `LocalSet`.
+async fn spawn_h2_upstream_that_refuses_every_stream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        loop {
+            let Ok((io, _peer)) = listener.accept().await else {
+                return;
+            };
+            tokio::task::spawn_local(async move {
+                let Ok(mut conn) = h2::server::handshake(io).await else {
+                    return;
+                };
+                while let Some(accepted) = conn.accept().await {
+                    let Ok((_req, mut respond)) = accepted else {
+                        return;
+                    };
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// `UR` had no producer at all until the h2 codec learned to decode
+/// RST_STREAM reasons -- `PoolError::ResetBeforeHeaders`, the only value
+/// `router.rs`'s old `UR` arm matched, is constructed by neither pool, so the
+/// flag was dead code (recorded as such in docs/envoy-divergences.md). A
+/// refused stream is a deliberate remote reset, which is precisely what Envoy
+/// means by `UR`; every other codec failure stays `UC`.
+///
+/// No retry policy here on purpose: with one, this request would succeed and
+/// there would be no flag to render.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_h2_stream_records_and_renders_the_ur_flag() {
+    LocalSet::new()
+        .run_until(async {
+            let addr = spawn_h2_upstream_that_refuses_every_stream().await;
+            let path = temp_path("ur-flag");
+            let mut scenario =
+                Scenario::forwarding_to(addr, forward_to(ForwardTarget::Cluster("up".into())));
+            scenario.protocol = proxy_config::ir::UpstreamProtocol::Http2;
+            let handler = build_router(
+                scenario,
+                &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
+            )
+            .await;
+
+            let resp = handler.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::BAD_GATEWAY);
+            resp.body.collect().await.unwrap();
+
+            assert_eq!(
+                read_to_string(&path),
+                "502 UR\n",
+                "a stream the peer refused is a remote reset, not a codec failure -- `UC` here \
+                 would mean the refused-stream decode never reached the router"
+            );
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
 }

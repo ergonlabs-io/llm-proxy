@@ -628,7 +628,7 @@ Each WP references its normative spec sections.
 > never a proxy limit) at 301 rps and 107.7MB. So h2 is now within range of h1 on concurrency
 > while using less memory per stream, where before it was 5x worse.
 
-> **FOLLOW-UP FILED 2026-08-22 — a default-on retry condition that can never fire.**
+> **DONE 2026-08-23 — see the resolution note after this block.** Filed 2026-08-22 as: *a default-on retry condition that can never fire.*
 > `refused-stream` is fully wired *except* for the one step that detects it:
 > `RetryOn::refused_stream` exists in the IR (`ir.rs:897`), is parsed from Envoy config
 > (`ir.rs:914`), is honored by the retry engine (`retry.rs:118`), has a test
@@ -651,6 +651,44 @@ Each WP references its normative spec sections.
 > `AttemptOutcome::RefusedStream`. Everything downstream of that already works. Note the
 > slice C test deliberately warms its connection to stay deterministic, so the cold-start
 > path is **not** covered today and the follow-up needs its own test.
+
+> **RESOLVED.** `codec::h2_reason` walks the `hyper::Error` source chain and
+> downcasts to `h2::Error`, and `send_on_http2` maps `REFUSED_STREAM` to a new
+> `UpstreamCodecError::RefusedStream`, which `from_codec_error` projects to
+> `AttemptOutcome::RefusedStream`. h2 became a real dependency of `proxy-http`
+> (it was dev-only, for the spike that proved this technique in the first
+> place) — not a new crate in the tree, hyper already pulls in this exact
+> version.
+>
+> **The soundness condition is worth knowing, because getting it wrong is
+> silent.** `downcast_ref` compares `TypeId`s, so the decode only works while
+> `h2` is the SAME compiled crate hyper links. Two semver-incompatible copies
+> would make it return `None` forever — no error, no warning, the trigger
+> simply goes back to never firing. That is why the tests drive a real
+> `RST_STREAM` from a raw `h2::server` rather than constructing an
+> `UpstreamCodecError` by hand: a hand-built-error test would keep passing
+> through exactly that failure. `Cargo.toml` carries the warning.
+>
+> **Bonus, and it closes a WP-24 finding from the day before:** a refused
+> stream is a deliberate remote reset, so `router.rs` now flags it `UR`
+> instead of `UC`. `UR` had been declared with no producer anywhere in the
+> tree. The other route to it (`PoolError::ResetBeforeHeaders`) is still dead
+> — a post-connect TCP reset still reports `UF` — so the flag is now partly,
+> not fully, wired; `docs/envoy-divergences.md` says which half.
+>
+> Four tests: the decode on a real RST_STREAM, the negative case (`CANCEL`
+> must NOT decode as refused, or an unsafe replay becomes possible on a
+> non-idempotent request), the router retrying a refused stream to a 200 while
+> asserting exactly two streams reached the upstream, and the `UR` render.
+> Mutation-checked: removing the decode reds the first and shows the old
+> behaviour in the failure output (`Send(... Reset(StreamId(1),
+> REFUSED_STREAM, Remote))`).
+>
+> **Also corrected while here:** `AttemptOutcome::PerTryTimeout`'s doc claimed
+> it was "not yet produced anywhere" long after `router.rs` started producing
+> it. That is the fourth stale status claim found this week, all decaying the
+> same direction — prose overstating what is missing. Treat a doc comment's
+> claim that something is unimplemented as a hypothesis, not a fact.
 
 #### WP-15 — Upstream connection pools + circuit breakers  (Size: L)  — **Priority: P1**
 - Per-worker, per-host, per-protocol pools. h1: connection reuse queue, max requests/conn;

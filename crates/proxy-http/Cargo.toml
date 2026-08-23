@@ -24,16 +24,23 @@ thiserror = { workspace = true }
 # S9: per-worker seeding for `x-request-id` generation (headers.rs).
 rand = { workspace = true }
 tracing = { workspace = true }
+# S3.2 `refused-stream`: the retry engine has to tell an h2 REFUSED_STREAM
+# apart from any other send failure, and the only way to do that is to
+# downcast the `hyper::Error`'s source chain to the `h2::Error` underneath
+# (see `codec::h2_reason`). h2 is NOT a workspace dependency and is not a new
+# crate in the tree -- hyper already pulls in this exact version, and the
+# downcast is only sound because it is the SAME compiled crate. Two
+# semver-incompatible h2 versions would make `downcast_ref` silently return
+# `None` and the decode a permanent no-op, so `refused_stream_is_decoded_...`
+# in tests/http2_upstream_codec.rs drives a real RST_STREAM end to end rather
+# than unit-testing the projection.
+h2 = "0.4"
 
 [dev-dependencies]
 # Rust note: these power the WP-10 chunk A hyper capability spike
 # (tests/hyper_spike.rs) only -- the real data-plane dependency surface above
 # is untouched.
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }
-# h2 isn't a workspace dependency; pinned here to match the version hyper 1.x
-# pulls in, purely so the spike can downcast a hyper::Error into h2::Error to
-# inspect RST_STREAM reasons (capability (c)).
-h2 = "0.4"
 
 [lints]
 workspace = true
