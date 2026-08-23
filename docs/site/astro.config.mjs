@@ -54,15 +54,15 @@ export default defineConfig({
 						// { label: 'Strict config mode', slug: 'configuration/strict-config-mode' },
 					],
 				},
-				// {
-				// 	label: 'Providers and routing',
-				// 	items: [
-				// 		{ label: 'Providers and clusters', slug: 'providers-and-routing/providers-and-clusters' },
-				// 		{ label: 'Failover and aggregates', slug: 'providers-and-routing/failover-and-aggregates' },
-				// 		{ label: 'Load balancing', slug: 'providers-and-routing/load-balancing' },
-				// 		{ label: 'Timeouts and retries', slug: 'providers-and-routing/timeouts-and-retries' },
-				// 	],
-				// },
+				{
+					label: 'Providers and routing',
+					items: [
+						{ label: 'Providers and clusters', slug: 'providers-and-routing/providers-and-clusters' },
+						{ label: 'Failover and aggregates', slug: 'providers-and-routing/failover-and-aggregates' },
+						{ label: 'Load balancing', slug: 'providers-and-routing/load-balancing' },
+						{ label: 'Timeouts and retries', slug: 'providers-and-routing/timeouts-and-retries' },
+					],
+				},
 				// {
 				// 	label: 'API compatibility',
 				// 	items: [

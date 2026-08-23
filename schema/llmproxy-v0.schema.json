@@ -284,7 +284,7 @@
         },
         "retries": {
           "type": "object",
-          "description": "Retry policy against the SAME provider, applied before moving to `fallbacks`. Defaults are LLM-safe: retry only what is certainly unserved (connection failures, 429s, and 5xx received before any response byte); a request is never replayed once streaming to the client has begun.",
+          "description": "Retry policy for this route. Defaults are LLM-safe: retry only what is certainly unserved (connection failures, 429s, and 5xx received before any response byte); a request is never replayed once streaming to the client has begun. NOT a separate budget from `fallbacks` -- both draw on one retry count, and each retry against a fallback chain moves to the NEXT member rather than repeating the primary.",
           "additionalProperties": false,
           "properties": {
             "attempts": {
@@ -292,7 +292,7 @@
               "minimum": 0,
               "maximum": 5,
               "default": 1,
-              "description": "Extra attempts against the primary provider (0 disables retries)."
+              "description": "Extra attempts (0 disables retries). On a route with `fallbacks`, retries walk the chain instead of repeating the primary, and the emitted retry count is raised to whichever is larger -- this value, or the number needed to reach the last fallback -- so 0 does NOT disable failover there."
             }
           }
         },
