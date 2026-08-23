@@ -146,6 +146,7 @@ async fn build_router(
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
                 request_headers_to_add: Vec::new(),
                 usage_dialect: None,
+                health_check: None,
             }),
         );
         manager.update_from_snapshot(&snapshot).await;

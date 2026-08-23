@@ -2217,6 +2217,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         upstream_protocol,
         request_headers_to_add,
         usage_dialect,
+        health_check: None,
     })
 }
 

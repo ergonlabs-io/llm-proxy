@@ -155,6 +155,7 @@ async fn build_router(scenario: Scenario, access_logs: &[AccessLogIR]) -> Filter
             upstream_protocol: scenario.protocol,
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
+            health_check: None,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;

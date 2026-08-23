@@ -474,6 +474,63 @@ pub struct ClusterConfig {
     /// `convert_cluster`), so the member that actually serves a request is
     /// the one that must carry it.
     pub usage_dialect: Option<UsageDialect>,
+    /// S6 active health checking (WP-18); `None` when the config configures
+    /// none, which is Envoy's own default (no probing, every host healthy).
+    /// Singular though the proto field is repeated — see [`HealthCheckIR`].
+    pub health_check: Option<HealthCheckIR>,
+}
+
+// ---------------------------------------------------------- health checks --
+
+/// IR for `envoy.config.core.v3.HealthCheck` (supported surface) — WP-18.
+///
+/// Envoy's `Cluster.health_checks` is *repeated*, and a host must pass every
+/// configured check. Only one check per cluster is implemented, so lowering
+/// rejects a config carrying more than one rather than silently running the
+/// first (ground rule #1).
+///
+/// Envoy marks `timeout`, `interval`, `unhealthy_threshold` and
+/// `healthy_threshold` required in its own PGV rules, so none of the four has
+/// a default to fall back on here.
+#[derive(Debug, Clone)]
+pub struct HealthCheckIR {
+    /// Spacing between probes of one host.
+    pub interval: Duration,
+    /// Bound on a single probe (connect + check); exceeding it is a failure.
+    pub timeout: Duration,
+    /// Uniform random jitter added to `interval` on each scheduling decision,
+    /// so a cluster's hosts don't fall into lockstep. Envoy default: 0.
+    pub interval_jitter: Duration,
+    /// Consecutive failures required to flip a host healthy → unhealthy.
+    pub unhealthy_threshold: u32,
+    /// Consecutive successes required to flip a host unhealthy → healthy.
+    pub healthy_threshold: u32,
+    /// Carried for surface completeness only — the engine does not act on it
+    /// yet, and says why at
+    /// `proxy_cluster::health_check::DEFAULT_NO_TRAFFIC_INTERVAL`.
+    pub no_traffic_interval: Duration,
+    /// What the probe actually sends and accepts.
+    pub kind: HealthCheckKindIR,
+}
+
+/// Which health checker a [`HealthCheckIR`] runs — Envoy's `health_checker`
+/// oneof, narrowed to the two modes the engine implements. `grpc_health_check`
+/// and `custom_health_check` are rejected at lowering: a stub that always
+/// reported healthy would be worse than refusing the config.
+#[derive(Debug, Clone)]
+pub enum HealthCheckKindIR {
+    /// `HttpHealthCheck`: a `GET path` with `Connection: close` and an
+    /// optional `Host` override. An empty `expected_statuses` means 200 only,
+    /// which is Envoy's own zero-value-means-default convention for the field.
+    Http {
+        path: String,
+        expected_statuses: Vec<u16>,
+        host: Option<String>,
+    },
+    /// `TcpHealthCheck`: connect, optionally write `send`, then optionally
+    /// read `expect.len()` bytes and require an exact match. Both empty means
+    /// a bare TCP connect is the whole check.
+    Tcp { send: Vec<u8>, expect: Vec<u8> },
 }
 
 /// The wire dialect a provider cluster speaks, for the usage filter's request
