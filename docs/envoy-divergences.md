@@ -8,6 +8,7 @@ undocumented divergence found by the rig is a bug.
 |---|------|----------------|--------------|---------------|----------------|
 | 1 | `--drain-strategy` | `gradual` ramps the probability an in-flight response is closed linearly over the drain window; `immediate` closes at 100% from the start of the drain. | `gradual` and `immediate` are byte-identical: the drain sequence only ever waits for the connection registry to empty or the drain deadline to pass, then flips a plain shutdown signal hyper's `graceful_shutdown()` reacts to. `DrainState::drain_close_probability` implements the ramp but has no call site. | Wiring it properly requires the HTTP codecs (`proxy-http`) to consult a per-response close probability, which is its own work package, not a contained fix — see "Drain strategy" below. A silent no-op would violate ground rule #1, so this is a loud startup `tracing::warn!` instead (`crates/proxy/src/main.rs`, `serve`). | none yet — tracked by `crates/proxy-core/src/drain.rs`'s own unit tests on `drain_close_probability` plus the startup warning; no diff-rig fixture exists for drain timing yet. |
 | 2 | `%RESPONSE_FLAGS%` | All 20 documented flags can fire under the conditions Envoy defines for them. | 6 of 20 are genuinely unreachable (no corresponding feature exists) and 2 more are declared and apparently wired but are dead code (their only producer is never actually constructed) — see "Response flags (WP-24)" below for the full per-flag table. | Most of the 6 name features not yet built (`ext_authz`, gRPC ratelimit service, strict header validation, `max_stream_duration`, a downstream/upstream health-check surface) — see ground rule #1's spirit: rather than silently claim coverage, each is documented with the specific reason so the next audit doesn't re-derive it. | `crates/proxy-observability/src/flags.rs`'s per-variant doc comments (normative); `crates/proxy-http/tests/response_flags.rs`, `router_retry.rs`, `router_access_log.rs`, and `proxy-filters`' `token_limit_filter.rs` pin the 11 reachable flags. |
+| 3 | Listener stat naming | Listener stats are keyed by the listener's resolved **address** (`listener.0.0.0.0_80.downstream_cx_total`), unless a `Listener.stat_prefix` is configured, in which case that is used instead. | Keyed by the configured listener **name**, always (`listener.ingress_http.downstream_cx_total`). There is no `stat_prefix` handling. | The attribute the instrument carries is the name (`DOWNSTREAM_CX_TOTAL.attribute_keys = ["listener"]`), and the address is not available where the counter is recorded — `spawn_accept_loop` knows the listener by name. A name is also stable across a rebind, where an address is not, and it matches how this proxy already keys cluster stats (`cluster.<name>.upstream_rq_total`, which IS Envoy's own scheme for clusters). Recorded as a divergence rather than resolved because changing it means threading the bound address down to the recording site, which is a larger change than this gap warranted. | `envoy_render::tests::downstream_cx_total_renders_under_the_listener_name` (unit) and `crates/proxy/tests/stats_e2e.rs::served_requests_are_reflected_in_stats` (e2e, asserts `/stats` and `/stats/prometheus` agree). |
 
 ## CLI flag policy
 
@@ -129,3 +130,27 @@ comment saying "see the code": both look reachable from a `grep` for
 both are dead code once you trace back to what actually constructs the
 value that arm matches on. A future audit that only greps for the flag name
 will reach the same wrong conclusion these did on the first pass.
+
+
+## Listener stat naming (WP-23 increment 6b follow-up)
+
+`downstream_cx_total` is a real Envoy stat, and until 2026-08-22 the
+Envoy-text `/stats` endpoint omitted it entirely while `/stats/prometheus`
+reported it correctly. `envoy_render::envoy_counter_name` simply had no case
+for the instrument, and its `_ => None` arm — correct policy for `gen_ai.*`,
+which genuinely has no Envoy equivalent — silently swallowed one that does.
+
+Two things are worth carrying from that:
+
+- **Two renderers over one registry can disagree, and a test that checks only
+  one will not notice.** The e2e test now asserts both endpoints report the
+  same count for the same listener.
+- **A catch-all arm whose policy is "omit what has no equivalent" cannot tell
+  that apart from "we forgot to add a case."** Anything added to
+  `stats.rs`'s `instruments` module that mirrors an Envoy stat needs an
+  `envoy_counter_name`/`envoy_histogram_name` arm at the same time.
+
+The remaining divergence is the key. Envoy keys listener stats by address;
+this renders the configured listener name. See the table row above for why —
+briefly, the name is what the recording site has, and it is what this proxy
+already uses for cluster stats.

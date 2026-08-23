@@ -213,6 +213,25 @@ fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Op
                 None => Some(format!("cluster.{cluster}.upstream_rq_total")),
             }
         }
+        // Envoy's listener stat family. **Divergence, deliberate:** Envoy
+        // keys these by the listener's ADDRESS by default
+        // (`listener.0.0.0.0_80.downstream_cx_total`), falling back to a
+        // configured `Listener.stat_prefix` when one is set. This renders the
+        // configured listener NAME instead, unconditionally — see
+        // docs/envoy-divergences.md for the reasoning. The short version:
+        // the attribute this instrument carries IS the name
+        // (`DOWNSTREAM_CX_TOTAL.attribute_keys`), the address is not
+        // available at the recording site, and a name is stable across a
+        // rebind where an address is not.
+        //
+        // This is "rendered under a different key", not "invented": the stat
+        // itself is Envoy's, unlike `gen_ai.*` below. Rule 2 forbids making
+        // up a stat that has no Envoy equivalent, not choosing between two
+        // real Envoy key schemes.
+        "downstream_cx_total" => {
+            let listener = attr(attrs, "listener")?;
+            Some(format!("listener.{listener}.downstream_cx_total"))
+        }
         // Everything else (gen_ai.*, and any future counter this table
         // hasn't been taught about yet) has no Envoy /stats equivalent —
         // omitted, not invented. See the module doc's Rule 2.
@@ -316,6 +335,28 @@ mod tests {
             output.contains("cluster.x.upstream_rq_5xx: 1\n"),
             "output: {output}"
         );
+    }
+
+    // ---- 2b: the listener family ------------------------------------------
+
+    /// WP-23 increment 6b follow-up: `downstream_cx_total` is a real Envoy
+    /// stat, and until this case existed it rendered to nothing on `/stats`
+    /// while appearing normally on `/stats/prometheus` -- so the Envoy-text
+    /// endpoint silently under-reported. Keyed by listener NAME, which is a
+    /// deliberate divergence from Envoy's address-keyed default; see
+    /// `envoy_counter_name` and docs/envoy-divergences.md.
+    #[test]
+    fn downstream_cx_total_renders_under_the_listener_name() {
+        let control = StatsControl::new(1);
+        let h = control.resolve(
+            &instruments::DOWNSTREAM_CX_TOTAL,
+            &[("listener", "ingress_http")],
+        );
+        let registry = control.registry();
+        registry.incr(WorkerId(0), h, 3);
+
+        let output = render(&registry);
+        assert_eq!(output, "listener.ingress_http.downstream_cx_total: 3\n");
     }
 
     // ---- 3: an instrument with no Envoy template is absent -----------------

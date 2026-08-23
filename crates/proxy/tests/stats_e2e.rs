@@ -19,18 +19,20 @@
 //!
 //! # `downstream_cx_total`/`gen_ai.client.token.usage`: `/stats/prometheus`, not `/stats`
 //!
-//! Both WP-23 increment 6b instruments are asserted against
-//! `/stats/prometheus`, never the Envoy-text `/stats` endpoint --
+//! `gen_ai.client.token.usage` is asserted against `/stats/prometheus` only:
 //! `proxy_observability::stats::instruments::GEN_AI_CLIENT_TOKEN_USAGE`'s own
 //! doc says it "has no Envoy equivalent" and renders to nothing in the
-//! increment-3 text format by design. `DOWNSTREAM_CX_TOTAL` reads as though
-//! it should be the other way ("mirrors Envoy's own `downstream_cx_total`
-//! stat directly") but as of this increment `envoy_render::envoy_counter_name`
-//! still only has a case for `upstream_rq` -- nothing taught it
-//! `downstream_cx_total`'s name mapping, so today it renders to nothing on
-//! `/stats` too, exactly like `gen_ai.*`. Asserting against `/stats` for
-//! either would look like a wiring bug when it is actually a renderer gap
-//! one layer down (`proxy-observability`, out of scope for this file).
+//! Envoy-text format by design, so asserting it on `/stats` would be
+//! asserting a bug.
+//!
+//! `downstream_cx_total` is asserted on BOTH, and the `/stats` half is the
+//! more interesting one. It was originally `/stats/prometheus`-only for the
+//! same reason -- but that reason was wrong: this stat DOES have an Envoy
+//! equivalent, and `envoy_render::envoy_counter_name` simply had no case for
+//! it, so the Envoy-text endpoint silently under-reported while Prometheus
+//! looked fine. Two renderers over one registry can disagree, and only
+//! checking both catches it. Note the key is the listener NAME, a deliberate
+//! divergence from Envoy's address-keyed default (docs/envoy-divergences.md).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -416,9 +418,9 @@ static_resources:
     // no HTTP request before being dropped. 2 + 1 = 3, and this is the right
     // number, not a fudge -- `downstream_cx_total` counts every accepted
     // connection, not every HTTP request (that's `upstream_rq`'s job).
-    // Asserted against `/stats/prometheus`, not `/stats` -- see this file's
-    // module doc for why `downstream_cx_total` renders to nothing on the
-    // Envoy-text endpoint today.
+    // Asserted on BOTH rendered endpoints -- see this file's module doc: the
+    // Envoy-text renderer had no case for this stat and silently omitted it
+    // while Prometheus reported it correctly.
     let prometheus_response = get(admin_addr, "/stats/prometheus", "admin.local");
     assert!(
         prometheus_response.starts_with("HTTP/1.1 200"),
@@ -433,6 +435,19 @@ static_resources:
         "expected /stats/prometheus to report 3 accepted connections on listener \
          \"ingress_http\" (2 requests + 1 readiness probe), got body:\n{prometheus_body}\n\
          (full response: {prometheus_response})"
+    );
+
+    // The Envoy-text endpoint must agree. `get()` above opened one more
+    // connection to fetch `/stats/prometheus`, but that one lands on the
+    // ADMIN listener, not `ingress_http`, so this count is still 3 -- which
+    // is itself worth asserting: it proves the counter is keyed per listener
+    // rather than counting every accepted connection in the process.
+    let stats_response = get(admin_addr, "/stats", "admin.local");
+    assert!(
+        stats_response.contains("listener.ingress_http.downstream_cx_total: 3"),
+        "expected /stats to agree with /stats/prometheus on the connection count; \
+         two renderers over one registry disagreeing is the bug this asserts against. \
+         Got:\n{stats_response}"
     );
 
     let pid = child.0.id().to_string();
