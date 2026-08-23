@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use proxy_cluster::manager::ClusterManager;
 use proxy_config::ir::{
-    HttpConnectionManagerConfig, ListenerConfig, ListenerFilterSpec, ListenerName,
+    CodecType, HttpConnectionManagerConfig, ListenerConfig, ListenerFilterSpec, ListenerName,
     NetworkFilterSpec, SnapshotVersion,
 };
 use proxy_config::ConfigSnapshot;
@@ -770,6 +770,15 @@ async fn serve_connection(conn: ServeConnection) {
     };
     let filter = terminal_filter(matched, buffer_limit, hcm_handler);
 
+    // WP-10: the configured `codec_type` for `matched`'s terminal filter, if
+    // it has one (a `tcp_proxy` chain has no HCM and so no codec to pick --
+    // `Auto` there is inert, never read, since the `(false, _)` arm below
+    // only consults it when `filter` is actually `TerminalFilter::Http`).
+    let codec_type = match matched.filters.last() {
+        Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => hcm.codec_type,
+        Some(NetworkFilterSpec::TcpProxy(_)) | None => CodecType::Auto,
+    };
+
     let factory = matched
         .transport_socket
         .as_ref()
@@ -781,12 +790,18 @@ async fn serve_connection(conn: ServeConnection) {
     match (matched.transport_socket.is_some(), factory) {
         (true, Some(factory)) => match factory.wrap(stream).await {
             Ok(tls_stream) => {
-                // WP-10 h2: the ALPN protocol rustls just negotiated with the
-                // client decides which codec serves this connection -- see
-                // `downstream_codec_for_alpn`'s doc comment for why this has
-                // to be read *here* (post-handshake) rather than assumed from
-                // config, and for the h2c-is-out-of-scope note.
-                let codec = downstream_codec_for_alpn(&tls_stream);
+                // WP-10: an explicit `codec_type` (`Http1`/`Http2`) is
+                // unconditional -- the operator has said what the client
+                // speaks, so there's nothing to negotiate. Only `Auto` (the
+                // Envoy default) falls back to reading what ALPN actually
+                // negotiated -- see `downstream_codec_for_alpn`'s doc comment
+                // for why that has to happen *here* (post-handshake) rather
+                // than be assumed from config.
+                let codec = match codec_type {
+                    CodecType::Http1 => DownstreamCodec::Http1,
+                    CodecType::Http2 => DownstreamCodec::Http2,
+                    CodecType::Auto => downstream_codec_for_alpn(&tls_stream),
+                };
                 // Can't `reset` (SO_LINGER) a `TlsStream` the way we can a
                 // bare `TcpStream` -- `run_terminal_filter` hands the stream
                 // back on the no-op paths so the *unimplemented*/no-filter
@@ -825,11 +840,23 @@ async fn serve_connection(conn: ServeConnection) {
             // Plaintext (or TLS-passthrough, if `matched` was selected via SNI
             // but configures no `transport_socket`): dispatch straight to the
             // terminal L4 filter on `stream`. No ALPN exists over plaintext,
-            // and h2c (cleartext HTTP/2) is out of scope (see
-            // `downstream_codec_for_alpn`'s doc comment) -- always h1.
+            // so `codec_type` (`Auto` unless the operator overrode it) is
+            // resolved by peeking for the h2 client connection preface
+            // instead -- see `resolve_plaintext_codec`. The h1 `Upgrade: h2c`
+            // dance is still out of scope (see `downstream_codec_for_alpn`'s
+            // doc comment); this only covers h2 prior-knowledge.
             let downstream = DownstreamInfo {
                 remote: peer,
                 is_tls: false,
+            };
+            // Only worth resolving when there's an HTTP codec to pick at all
+            // -- a `tcp_proxy` (or no-filter) chain ignores `codec` entirely
+            // (see `RunTerminalFilterCtx::codec`'s doc), so skip the peek and
+            // its potential wait rather than delaying those connections for
+            // no reason.
+            let codec = match &filter {
+                Some(TerminalFilter::Http(_)) => resolve_plaintext_codec(codec_type, &stream).await,
+                _ => DownstreamCodec::Http1,
             };
             if let Some(stream) = run_terminal_filter(
                 stream,
@@ -840,7 +867,7 @@ async fn serve_connection(conn: ServeConnection) {
                     shutdown,
                     name: &name,
                     downstream,
-                    codec: DownstreamCodec::Http1,
+                    codec,
                 },
             )
             .await
@@ -851,26 +878,28 @@ async fn serve_connection(conn: ServeConnection) {
     }
 }
 
-/// Which HTTP codec serves a downstream connection: h1 unconditionally for
-/// plaintext (see the `(false, _)` call site) and now, correctly, negotiated
-/// ALPN for TLS -- **this used to be a live bug**: `server_config.alpn_protocols`
-/// (set from `spec.alpn_protocols` in `crates/proxy-core/src/tls/mod.rs`)
-/// already let an operator configure `alpn_protocols: ["h2"]` on a downstream
-/// listener, rustls would happily negotiate `h2` with the client during
-/// `factory.wrap`, and this module then unconditionally called `serve_http1`
-/// on the result -- a config field accepted and then silently not honored
-/// (ground rule #1), and a protocol violation from the client's point of
-/// view (it believes it's speaking h2 framing to us; we read h1 framing off
-/// the same bytes). This function is the fix: read what rustls actually
-/// negotiated, post-handshake, rather than assuming h1.
+/// Which HTTP codec serves a **TLS** downstream connection: negotiated ALPN,
+/// read post-handshake -- **this used to be a live bug**:
+/// `server_config.alpn_protocols` (set from `spec.alpn_protocols` in
+/// `crates/proxy-core/src/tls/mod.rs`) already let an operator configure
+/// `alpn_protocols: ["h2"]` on a downstream listener, rustls would happily
+/// negotiate `h2` with the client during `factory.wrap`, and this module then
+/// unconditionally called `serve_http1` on the result -- a config field
+/// accepted and then silently not honored (ground rule #1), and a protocol
+/// violation from the client's point of view (it believes it's speaking h2
+/// framing to us; we read h1 framing off the same bytes). This function is
+/// the fix: read what rustls actually negotiated, post-handshake, rather than
+/// assuming h1.
 ///
 /// Only `h2` selects [`DownstreamCodec::Http2`]; anything else (`http/1.1`,
 /// no ALPN negotiated at all, e.g. `alpn_protocols` left empty in config) is
-/// h1. h2c -- HTTP/2 over cleartext, either "prior knowledge" or the h1
-/// `Upgrade: h2c` mechanism -- is deliberately out of scope for this WP (see
-/// `serve_http2`'s and `proxy_http::codec`'s module doc): there is no ALPN on
-/// a plaintext connection to dispatch on, so h2c would need its own detection
-/// path this function does not implement.
+/// h1. Only called for `codec_type: Auto` (the Envoy default) -- the call
+/// site handles an explicit `Http1`/`Http2` itself, unconditionally, without
+/// consulting ALPN at all. See [`resolve_plaintext_codec`] for the plaintext
+/// side, where there's no ALPN to read and the `Auto` case peeks for the h2
+/// client preface instead. The h1 `Upgrade: h2c` mechanism remains out of
+/// scope either way (see `serve_http2`'s and `proxy_http::codec`'s module
+/// doc).
 fn downstream_codec_for_alpn<IO>(
     tls_stream: &tokio_rustls::server::TlsStream<IO>,
 ) -> DownstreamCodec {
@@ -893,6 +922,96 @@ fn downstream_codec_for_alpn<IO>(
 enum DownstreamCodec {
     Http1,
     Http2,
+}
+
+/// The HTTP/2 client connection preface (RFC 9113 S3.4): the exact 24 bytes
+/// a client speaking h2 "prior knowledge" (no ALPN, no `Upgrade` -- it just
+/// starts sending h2 framing) sends before anything else. This is the only
+/// signal available to tell such a client apart from an ordinary h1 request
+/// on a **plaintext** connection, which has no ALPN to consult at all.
+const H2_CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Wall-clock bound on [`resolve_plaintext_codec`]'s preface peek -- same
+/// reasoning as `tls_inspector::INSPECT_TIMEOUT`: a client that sends fewer
+/// than 24 bytes and then goes quiet must not hang this connection forever
+/// waiting to see whether the rest of the preface ever arrives.
+const H2_PREFACE_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Backoff applied when a peek returns exactly as many bytes as the previous
+/// one and the preface is still incomplete -- see the Rust note in
+/// `tls_inspector::peek_client_hello` for why this is necessary:
+/// `TcpStream::peek` is level-triggered on "there is unread data", so
+/// re-`.await`ing it with no new bytes on the wire can return instantly with
+/// the same stale peek instead of waiting for more to arrive.
+const H2_PREFACE_STALL_BACKOFF: Duration = Duration::from_millis(5);
+
+/// WP-10: which codec serves a **plaintext** HTTP connection manager
+/// connection, given its configured `codec_type`. `Http1`/`Http2` are
+/// unconditional -- the operator has said what the client speaks. `Auto`
+/// (the Envoy default) has no ALPN to consult over plaintext (unlike
+/// [`downstream_codec_for_alpn`]'s TLS case), so it peeks -- without
+/// consuming, same as `tls_inspector` -- for the [`H2_CLIENT_PREFACE`]: a
+/// match means h2 prior-knowledge, anything else (including "never
+/// resolved within the timeout") is treated as h1.
+async fn resolve_plaintext_codec(codec_type: CodecType, stream: &TcpStream) -> DownstreamCodec {
+    match codec_type {
+        CodecType::Http1 => DownstreamCodec::Http1,
+        CodecType::Http2 => DownstreamCodec::Http2,
+        CodecType::Auto => {
+            match tokio::time::timeout(H2_PREFACE_PEEK_TIMEOUT, peek_for_h2_preface(stream)).await {
+                Ok(true) => DownstreamCodec::Http2,
+                // `Ok(false)`: the peeked bytes definitely aren't the preface.
+                // `Err(_elapsed)`: never resolved either way in time -- same
+                // "collapse to the non-TLS/h1 default" fallback
+                // `tls_inspector::inspect_client_hello` uses for its own
+                // timeout, and for the same reason (a stalled *client* must
+                // not become a stalled *codec choice*).
+                Ok(false) | Err(_) => DownstreamCodec::Http1,
+            }
+        }
+    }
+}
+
+/// The actual peek loop, run under [`resolve_plaintext_codec`]'s timeout.
+/// Returns `true` only once all 24 preface bytes have arrived and match
+/// exactly; returns `false` as soon as an arrived byte diverges from
+/// [`H2_CLIENT_PREFACE`] -- an h1 request line and the h2 preface disagree
+/// within the first couple of bytes in every real case (`GET`/`POST`/... vs
+/// `PRI *`), so this discriminates promptly rather than always waiting for
+/// the full 24 bytes.
+async fn peek_for_h2_preface(stream: &TcpStream) -> bool {
+    let mut buf = [0u8; H2_CLIENT_PREFACE.len()];
+    // Tracks the byte count from the previous iteration, so a peek that
+    // returns the exact same (incomplete) prefix as last time -- no new
+    // bytes arrived -- can be told apart from real progress; see
+    // `H2_PREFACE_STALL_BACKOFF`'s doc.
+    let mut last_n: Option<usize> = None;
+    loop {
+        // Rust note: like `tls_inspector::peek_client_hello`, `TcpStream::
+        // peek` reads from the front of the kernel receive buffer *without*
+        // draining it -- every byte looked at here is still there for
+        // `serve_http1`/`serve_http2` to read again once dispatch decides.
+        let n = match stream.peek(&mut buf).await {
+            Ok(n) => n,
+            // A real socket error: let the chosen codec's own read surface
+            // it rather than treating it as a signal about the preface.
+            Err(_) => return false,
+        };
+        if n == 0 {
+            return false; // peer closed before sending anything
+        }
+        if buf[..n] != H2_CLIENT_PREFACE[..n] {
+            return false;
+        }
+        if n == H2_CLIENT_PREFACE.len() {
+            return true;
+        }
+        if last_n == Some(n) {
+            tokio::time::sleep(H2_PREFACE_STALL_BACKOFF).await;
+        } else {
+            last_n = Some(n);
+        }
+    }
 }
 
 /// The matched chain's terminal network filter, resolved into cheap owned
@@ -1292,6 +1411,118 @@ mod tests {
         port
     }
 
+    /// A connected `TcpStream` pair over loopback -- for tests that exercise
+    /// [`peek_for_h2_preface`]/[`resolve_plaintext_codec`] directly, without
+    /// going through a whole listener/`spawn_manager` harness (same
+    /// motivation as `tls_inspector::tests::loopback_pair`, which this
+    /// mirrors).
+    async fn tcp_loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    // --- WP-10: `codec_type` peek/dispatch on a plaintext connection --------
+
+    /// Sanity check: a preface delivered in a single write is recognized.
+    #[test]
+    fn peek_for_h2_preface_true_for_a_complete_preface_in_one_write() {
+        run_local(async {
+            let (mut client, server) = tcp_loopback_pair().await;
+            client.write_all(H2_CLIENT_PREFACE).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), peek_for_h2_preface(&server))
+                .await
+                .expect("should resolve promptly");
+            assert!(result, "a complete, correct preface must be recognized");
+        });
+    }
+
+    /// A request that diverges from the preface at its very first byte (an
+    /// ordinary h1 method) must be rejected promptly -- it should not need to
+    /// wait anywhere near `H2_PREFACE_PEEK_TIMEOUT` to decide, the same
+    /// "discriminate on the bytes actually seen, don't wait for more than
+    /// necessary" property `tls_inspector::non_tls_first_byte_returns_none_promptly`
+    /// checks for the TLS ClientHello peek.
+    #[test]
+    fn peek_for_h2_preface_false_promptly_for_a_mismatched_first_byte() {
+        run_local(async {
+            let (mut client, server) = tcp_loopback_pair().await;
+            client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_millis(500), peek_for_h2_preface(&server))
+                    .await
+                    .expect(
+                        "a first-byte mismatch should resolve promptly, not wait for the timeout",
+                    );
+            assert!(!result, "an ordinary h1 request line is not the h2 preface");
+        });
+    }
+
+    /// WP-10 acceptance criterion: "a connection that sends 23 bytes of a
+    /// valid preface then more must still work" -- the peek loop must keep
+    /// waiting across a slow, split write of an otherwise-valid preface, not
+    /// bail out (or misread the split as a mismatch) on the first incomplete
+    /// read.
+    #[test]
+    fn peek_for_h2_preface_handles_a_slow_split_write_of_an_otherwise_valid_preface() {
+        run_local(async {
+            let (mut client, server) = tcp_loopback_pair().await;
+            client
+                .write_all(&H2_CLIENT_PREFACE[..H2_CLIENT_PREFACE.len() - 1])
+                .await
+                .unwrap();
+
+            let peek = tokio::task::spawn_local(async move {
+                tokio::time::timeout(Duration::from_secs(2), peek_for_h2_preface(&server))
+                    .await
+                    .expect("should resolve once the rest of the preface arrives")
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client
+                .write_all(&H2_CLIENT_PREFACE[H2_CLIENT_PREFACE.len() - 1..])
+                .await
+                .unwrap();
+
+            assert!(
+                peek.await.expect("peek task should not panic"),
+                "a preface split across a slow write must still be recognized, not misread as h1"
+            );
+        });
+    }
+
+    /// WP-10 acceptance criterion: "a connection sending fewer than 24 bytes
+    /// and then waiting must not hang forever" -- a client that sends a valid
+    /// preface *prefix* and then goes quiet forever must still resolve,
+    /// falling back to h1 once `H2_PREFACE_PEEK_TIMEOUT` elapses rather than
+    /// blocking the connection indefinitely. The outer `tokio::time::timeout`
+    /// here is the test's own safety net (so a regression that removes the
+    /// bound fails this test instead of hanging the suite); the inner bound
+    /// is `resolve_plaintext_codec`'s real one.
+    #[test]
+    fn resolve_plaintext_codec_auto_falls_back_to_http1_when_a_partial_preface_never_completes() {
+        run_local(async {
+            let (mut client, server) = tcp_loopback_pair().await;
+            client.write_all(&H2_CLIENT_PREFACE[..10]).await.unwrap();
+            // Never sends the rest, and never closes -- `server` must give up
+            // on its own rather than wait on `client` forever.
+
+            let codec = tokio::time::timeout(
+                H2_PREFACE_PEEK_TIMEOUT + Duration::from_secs(2),
+                resolve_plaintext_codec(CodecType::Auto, &server),
+            )
+            .await
+            .expect("resolve_plaintext_codec must give up on its own bound, not hang forever");
+            assert_eq!(
+                codec,
+                DownstreamCodec::Http1,
+                "an incomplete preface that never completes should fall back to h1"
+            );
+        });
+    }
+
     /// A `tcp_proxy` filter targeting `cluster`, no idle timeout, a single
     /// connect attempt -- the minimal filter every "held open" fixture below
     /// needs now that empty filter lists no longer hold a connection open
@@ -1332,6 +1563,7 @@ mod tests {
                 .expect("empty route table can't have duplicate domains"),
             ),
             http_filters: vec![],
+            codec_type: proxy_config::ir::CodecType::Auto,
             generate_request_id: true,
             use_remote_address: false,
             xff_num_trusted_hops: 0,
@@ -1405,6 +1637,7 @@ mod tests {
                     is_router: true,
                 },
             ],
+            codec_type: proxy_config::ir::CodecType::Auto,
             generate_request_id: true,
             use_remote_address: false,
             xff_num_trusted_hops: 0,
@@ -2187,15 +2420,27 @@ mod tests {
     }
 
     /// An `http_connection_manager` filter whose route table always returns a
-    /// fixed-status `DirectResponse` -- the WP-10 h2 dispatch test below only
-    /// cares "did the right codec (h1 vs h2) serve this connection", not
+    /// fixed-status `DirectResponse` -- the WP-10 h2 dispatch tests below only
+    /// care "did the right codec (h1 vs h2) serve this connection", not
     /// about routing, so this is deliberately simpler than
-    /// [`hcm_filter_with_header_mutation`].
+    /// [`hcm_filter_with_header_mutation`]. `codec_type` defaults to `Auto`
+    /// (Envoy's default); see [`hcm_filter_direct_response_with_codec`] for
+    /// the plaintext `codec_type` dispatch tests, which need to set it
+    /// explicitly.
     fn hcm_filter_direct_response(status: u16) -> NetworkFilterSpec {
+        hcm_filter_direct_response_with_codec(status, proxy_config::ir::CodecType::Auto)
+    }
+
+    /// See [`hcm_filter_direct_response`].
+    fn hcm_filter_direct_response_with_codec(
+        status: u16,
+        codec_type: proxy_config::ir::CodecType,
+    ) -> NetworkFilterSpec {
         NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
             stat_prefix: "test".to_string(),
             route_table: direct_response_route_table(status),
             http_filters: vec![],
+            codec_type,
             generate_request_id: true,
             use_remote_address: false,
             xff_num_trusted_hops: 0,
@@ -2308,6 +2553,204 @@ mod tests {
             assert!(
                 response.starts_with("HTTP/1.1 200"),
                 "expected an ordinary h1 status line (http/1.1 served), got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    /// The `h2` frame-body of an empty SETTINGS frame -- 3-byte length (0),
+    /// 1-byte type (0x4), 1-byte flags (0x0), 4-byte stream id (0), per RFC
+    /// 9113 S4.1/S6.5. Paired with [`H2_CLIENT_PREFACE`], this is a complete,
+    /// valid client connection preface (RFC 9113 S3.4) -- shared by the
+    /// plaintext dispatch tests below, same bytes
+    /// `alpn_negotiated_protocol_selects_the_serving_codec` hand-writes
+    /// inline for the TLS/ALPN case.
+    const EMPTY_SETTINGS_FRAME: [u8; 9] = [0, 0, 0, 0x4, 0x0, 0, 0, 0, 0];
+
+    /// `true` if `frame_header` (the first 9 bytes read back from a
+    /// connection) is itself a SETTINGS frame at stream id 0 -- something
+    /// only a real h2 codec produces as its first frame. Shared by the
+    /// plaintext dispatch tests below.
+    fn looks_like_a_settings_frame_at_stream_zero(frame_header: &[u8]) -> bool {
+        frame_header.len() >= 9 && frame_header[3] == 0x4 && frame_header[5..9] == [0, 0, 0, 0]
+    }
+
+    /// Read whatever arrives on `stream` within `wait`, or an empty `Vec` if
+    /// nothing does (EOF, a reset, or the bound elapsing first) -- for
+    /// dispatch tests that need to assert a *negative* ("this was not served
+    /// as h1"/"this was not served as h2"), where the failure mode on the
+    /// wrong codec is usually a closed connection or a protocol-level error
+    /// frame rather than a clean, parseable response.
+    async fn read_whatever_arrives(stream: &mut TcpStream, wait: Duration) -> Vec<u8> {
+        let mut buf = vec![0u8; 256];
+        match tokio::time::timeout(wait, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => Vec::new(),
+            Ok(Ok(n)) => buf[..n].to_vec(),
+            Ok(Err(_)) => Vec::new(),
+        }
+    }
+
+    /// WP-10: `codec_type: AUTO` (the default) on a **plaintext** connection
+    /// has no ALPN to consult -- see [`resolve_plaintext_codec`]'s doc. This
+    /// is the plaintext counterpart of
+    /// `alpn_negotiated_protocol_selects_the_serving_codec`: same
+    /// discrimination technique (an h2 client preface for one connection, an
+    /// ordinary h1 request line for the other, on the SAME listener), just
+    /// without TLS/ALPN in the picture at all.
+    #[test]
+    fn plaintext_codec_auto_detects_h2_prior_knowledge_and_an_ordinary_h1_request() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                hcm_filter_direct_response_with_codec(200, CodecType::Auto),
+            );
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // -- h2 side: prior-knowledge preface, no ALPN/TLS involved.
+            let mut stream = TcpStream::connect(addr).await.expect("h2 connect");
+            let mut preface = Vec::from(&H2_CLIENT_PREFACE[..]);
+            preface.extend_from_slice(&EMPTY_SETTINGS_FRAME);
+            stream.write_all(&preface).await.expect("write preface");
+
+            let mut frame_header = [0u8; 9];
+            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut frame_header))
+                .await
+                .expect("server should respond with its own frame before the timeout")
+                .expect("read server's first frame header");
+            assert!(
+                looks_like_a_settings_frame_at_stream_zero(&frame_header),
+                "server's first frame should be its own SETTINGS frame (h2 served), got: {frame_header:?}"
+            );
+
+            // -- h1 side: an ordinary request line, same listener.
+            let mut stream = TcpStream::connect(addr).await.expect("h1 connect");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected an ordinary h1 status line (http/1.1 served), got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    /// WP-10: `codec_type: HTTP2` is unconditional -- `serve_http2` is used
+    /// even for a request that, under `AUTO`, would have been detected as h1
+    /// (see `plaintext_codec_auto_detects_h2_prior_knowledge_and_an_ordinary_h1_request`'s
+    /// h1 side, which sends the exact same bytes against the same fixture
+    /// and gets a clean 200). This is the test that would catch a regression
+    /// where an explicit `codec_type` silently fell back to `AUTO`'s peek
+    /// instead of skipping it.
+    #[test]
+    fn plaintext_codec_type_http2_serves_h2_unconditionally() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                hcm_filter_direct_response_with_codec(200, CodecType::Http2),
+            );
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // -- positive: a real h2 client (real preface) is served h2.
+            let mut stream = TcpStream::connect(addr).await.expect("h2 connect");
+            let mut preface = Vec::from(&H2_CLIENT_PREFACE[..]);
+            preface.extend_from_slice(&EMPTY_SETTINGS_FRAME);
+            stream.write_all(&preface).await.expect("write preface");
+            let mut frame_header = [0u8; 9];
+            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut frame_header))
+                .await
+                .expect("server should respond with its own frame before the timeout")
+                .expect("read server's first frame header");
+            assert!(
+                looks_like_a_settings_frame_at_stream_zero(&frame_header),
+                "codec_type: HTTP2 should serve a real h2 client as h2, got: {frame_header:?}"
+            );
+
+            // -- discriminating: an ordinary h1 request line must NOT get an
+            // ordinary h1 response -- `AUTO` would have peeked, seen no
+            // preface, and answered "HTTP/1.1 200"; an unconditional HTTP2
+            // must not.
+            let mut stream = TcpStream::connect(addr).await.expect("h1 connect");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let response = read_whatever_arrives(&mut stream, Duration::from_millis(500)).await;
+            assert!(
+                !response.starts_with(b"HTTP/1.1"),
+                "codec_type: HTTP2 must not serve an h1-shaped request as h1, got: {response:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    /// WP-10: `codec_type: HTTP1` is unconditional -- `serve_http1` is used
+    /// "even when a preface is present" (WP-10's own acceptance wording).
+    /// Mirrors `plaintext_codec_type_http2_serves_h2_unconditionally`, with
+    /// the codec and the discriminating payload swapped.
+    #[test]
+    fn plaintext_codec_type_http1_serves_h1_unconditionally() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener_ir = match_all_listener_with_filter(
+                "l1",
+                addr,
+                hcm_filter_direct_response_with_codec(200, CodecType::Http1),
+            );
+            let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // -- positive: an ordinary h1 request is served h1.
+            let mut stream = TcpStream::connect(addr).await.expect("h1 connect");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("read should not time out")
+                .expect("read should succeed");
+            let response = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "expected an ordinary h1 status line, got: {response:?}"
+            );
+
+            // -- discriminating: a full, valid h2 client preface must NOT get
+            // an h2 SETTINGS frame back -- `AUTO` would have peeked, seen the
+            // preface, and answered with its own SETTINGS frame; an
+            // unconditional HTTP1 must not.
+            let mut stream = TcpStream::connect(addr).await.expect("h2-shaped connect");
+            let mut preface = Vec::from(&H2_CLIENT_PREFACE[..]);
+            preface.extend_from_slice(&EMPTY_SETTINGS_FRAME);
+            stream.write_all(&preface).await.expect("write preface");
+            let response = read_whatever_arrives(&mut stream, Duration::from_millis(500)).await;
+            assert!(
+                !looks_like_a_settings_frame_at_stream_zero(&response),
+                "codec_type: HTTP1 must not serve a preface-bearing connection as h2, got: {response:?}"
             );
 
             harness.shutdown().await;
@@ -3004,6 +3447,7 @@ mod tests {
                     is_router: true,
                 },
             ],
+            codec_type: proxy_config::ir::CodecType::Auto,
             generate_request_id: true,
             use_remote_address: false,
             xff_num_trusted_hops: 0,

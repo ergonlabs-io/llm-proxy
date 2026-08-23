@@ -203,6 +203,32 @@ pub struct TcpProxyConfig {
     pub max_connect_attempts: u32,
 }
 
+/// WP-10: which HTTP codec the connection manager assumes for a downstream
+/// connection, before any bytes have been read from it. Envoy's
+/// `HttpConnectionManager.codec_type`; `HTTP3` isn't representable here — this
+/// proxy has no QUIC/UDP listener, so lowering rejects it with its dotted
+/// path rather than adding a variant nothing can ever produce (ground rule
+/// #1 still applies to values with no implementation, not just unknown
+/// fields).
+///
+/// The dispatch that actually reads this lives in `proxy-core`'s listener
+/// (`terminal_filter`/`serve_connection`): `Auto` on a TLS connection defers
+/// to negotiated ALPN (unchanged since WP-10 chunk B); `Auto` on a plaintext
+/// connection peeks the client connection preface (RFC 9113 §3.4) to tell h2
+/// prior-knowledge apart from h1; `Http1`/`Http2` skip detection entirely and
+/// assume the operator is right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodecType {
+    /// Envoy default: ALPN over TLS, protocol-sniffed over plaintext.
+    #[default]
+    Auto,
+    /// Always HTTP/1.1, even if the client speaks the h2 preface.
+    Http1,
+    /// Always HTTP/2, prior-knowledge cleartext allowed (Envoy does not
+    /// require TLS/ALPN for h2 — see the proto's own `CodecType.HTTP2` doc).
+    Http2,
+}
+
 /// IR for the HTTP connection manager (supported subset).
 #[derive(Debug)]
 pub struct HttpConnectionManagerConfig {
@@ -211,6 +237,9 @@ pub struct HttpConnectionManagerConfig {
     pub route_table: Arc<RouteTable>,
     /// Ordered HTTP filters; the last must be the router.
     pub http_filters: Vec<HttpFilterSpec>,
+    /// WP-10: which codec serves a downstream connection on this HCM. Envoy
+    /// default `AUTO`; see [`CodecType`]'s doc for the dispatch this drives.
+    pub codec_type: CodecType,
     /// S9: generate an `x-request-id` when the request lacks one. Envoy
     /// default true (the proto field is a `BoolValue`; absent => true).
     pub generate_request_id: bool,
