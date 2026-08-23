@@ -1343,6 +1343,7 @@ dependencies = [
  "proxy-observability",
  "proxy-simple-config",
  "ring",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

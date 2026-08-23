@@ -30,7 +30,10 @@ use proxy_core::tls::DownstreamTlsFactory;
 use proxy_http::codec::{serve_http1, Http1Options};
 use proxy_http::handler::stub::FixedResponseHandler;
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
-use proxy_http::stat_handles::{RouterStats, StatHandles};
+use proxy_http::stat_handles::{
+    DownstreamStatHandles, DownstreamStats, GenAiTokenStats, RouterStats, StatHandles,
+    TokenUsageStatHandles,
+};
 use proxy_observability::stats::{StatsControl, WorkerId};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -281,13 +284,41 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         WorkerId(0),
     ));
 
+    // WP-23 increment 6b: `DownstreamStats`/`GenAiTokenStats` counterparts to
+    // `router_stats` above -- `initial_bind` now requires both too, mirroring
+    // `crates/proxy/src/main.rs`'s `worker_main`.
+    let downstream_handles = Arc::new(DownstreamStatHandles::build(
+        &stats_control,
+        snapshot.listeners.keys().map(String::as_str),
+    ));
+    let downstream_stats = Arc::new(DownstreamStats::new(
+        stats_control.registry(),
+        downstream_handles,
+        WorkerId(0),
+    ));
+    let token_usage_handles = Arc::new(TokenUsageStatHandles::build(
+        &stats_control,
+        snapshot.clusters.keys().map(String::as_str),
+    ));
+    let token_stats = Arc::new(GenAiTokenStats::new(
+        stats_control.registry(),
+        token_usage_handles,
+        WorkerId(0),
+    ));
+
+    let stats = proxy_core::listener::StatsRecorders {
+        router: router_stats,
+        downstream: downstream_stats,
+        token: token_stats,
+    };
+
     let bound = initial_bind(
         &snapshot,
         &config,
         &registry,
         &shutdown_rx,
         &cluster_manager,
-        &router_stats,
+        &stats,
     )
     .expect("initial_bind should succeed in tests");
 
@@ -298,7 +329,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         shutdown_rx,
         registry,
         cluster_manager,
-        router_stats,
+        stats,
     ));
 
     Harness {

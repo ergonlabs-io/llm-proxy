@@ -552,6 +552,28 @@ async fn run_serve(
         &stats_control,
         snapshot.clusters.keys().map(String::as_str),
     ));
+    // WP-23 increment 6b: `DownstreamStatHandles`'s counterpart to
+    // `stat_handles` above, resolved once at boot for every listener this
+    // boot snapshot names (rather than every cluster) -- see
+    // `proxy_http::stat_handles`'s module doc for why the two tables mirror
+    // each other's shape, and `reload` below for why a listener a later
+    // SIGHUP introduces still gets a handle resolved for it.
+    let downstream_stat_handles = Arc::new(proxy_http::stat_handles::DownstreamStatHandles::build(
+        &stats_control,
+        snapshot.listeners.keys().map(String::as_str),
+    ));
+    // WP-23 increment 6b: `TokenUsageStatHandles`'s counterpart to
+    // `stat_handles` above -- resolved once at boot for every cluster (a
+    // provider, per ground rule #6, is a cluster, never a route), same
+    // cadence as `stat_handles`. `FilterChainHandler::with_token_stats`'s doc
+    // names `crate-core`'s `build_hcm_handler` as the one real call site this
+    // feeds -- see that function for the missing half of the wiring this
+    // finishes.
+    let token_usage_stat_handles =
+        Arc::new(proxy_http::stat_handles::TokenUsageStatHandles::build(
+            &stats_control,
+            snapshot.clusters.keys().map(String::as_str),
+        ));
     let registry = stats_control.registry();
 
     // Every consumer that must observe a SIGHUP-published snapshot registers
@@ -618,7 +640,11 @@ async fn run_serve(
     // the SAME cluster manager and stats table every worker already reads
     // through.
     let cluster_manager_for_reload = cluster_manager.clone();
-    let stat_handles_for_reload = stat_handles.clone();
+    let stat_handle_tables_for_reload = StatHandleTables {
+        router: stat_handles.clone(),
+        downstream: downstream_stat_handles.clone(),
+        token_usage: token_usage_stat_handles.clone(),
+    };
     let mut current_version = snapshot.version;
 
     let publisher = WorkerPool::spawn(
@@ -636,6 +662,8 @@ async fn run_serve(
                 cluster_manager.clone(),
                 registry.clone(),
                 stat_handles.clone(),
+                downstream_stat_handles.clone(),
+                token_usage_stat_handles.clone(),
             )
         },
     );
@@ -678,7 +706,7 @@ async fn run_serve(
                     &publisher,
                     &cluster_manager_for_reload,
                     &stats_control,
-                    &stat_handles_for_reload,
+                    &stat_handle_tables_for_reload,
                 )
                 .await
                 {
@@ -715,6 +743,18 @@ async fn run_serve(
 /// down, and that has to hold even for a failure `build_snapshot` itself
 /// has no way to catch.
 ///
+/// The three boot-resolved stat-handle tables [`reload`] must extend when a
+/// SIGHUP introduces a listener or cluster the boot snapshot never named.
+/// Bundled purely to keep `reload`'s own argument count under clippy's
+/// `too_many_arguments` threshold -- the same motivation, one layer up, that
+/// [`proxy_core::listener::StatsRecorders`] documents for bundling the three
+/// *recorders* these tables feed.
+struct StatHandleTables {
+    router: Arc<proxy_http::stat_handles::StatHandles>,
+    downstream: Arc<proxy_http::stat_handles::DownstreamStatHandles>,
+    token_usage: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
+}
+
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
@@ -724,7 +764,7 @@ async fn reload(
     publisher: &proxy_core::runtime::ConfigPublisher,
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
     stats_control: &proxy_observability::stats::StatsControl,
-    stat_handles: &proxy_http::stat_handles::StatHandles,
+    tables: &StatHandleTables,
 ) -> Option<SnapshotVersion> {
     let mut snapshot = match source.load() {
         Ok(snapshot) => snapshot,
@@ -750,7 +790,23 @@ async fn reload(
     // since boot (`current_version`, threaded in by the caller).
     snapshot.version = SnapshotVersion(current_version.0 + 1);
 
-    stat_handles.resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
+    tables
+        .router
+        .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
+    // WP-23 increment 6b: same reasoning as the line above, for the
+    // listener-keyed table -- a listener a reload introduces must have a
+    // `downstream_cx_total` handle resolved before its accept loop can
+    // possibly see a connection.
+    tables
+        .downstream
+        .resolve_missing(stats_control, snapshot.listeners.keys().map(String::as_str));
+    // WP-23 increment 6b: same reasoning again, for the provider(=cluster)-
+    // keyed token-usage table -- a cluster a reload introduces must have its
+    // four `gen_ai.client.token.usage` handles resolved before it can dial
+    // its first request.
+    tables
+        .token_usage
+        .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
 
     let rejected = cluster_manager
         .update_from_snapshot(&snapshot.clusters)
@@ -876,6 +932,8 @@ async fn worker_main(
     cluster_manager: Arc<proxy_cluster::manager::ClusterManager>,
     stats_registry: Arc<proxy_observability::stats::Registry>,
     stat_handles: Arc<proxy_http::stat_handles::StatHandles>,
+    downstream_stat_handles: Arc<proxy_http::stat_handles::DownstreamStatHandles>,
+    token_usage_stat_handles: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
 ) {
     let registry = ConnectionRegistry::new();
     // WP-23 increment 6a: built fresh per worker -- `stats_registry`/
@@ -890,10 +948,33 @@ async fn worker_main(
     // dependency cycle) -- `.0` is the conversion at this boundary, exactly
     // where that comment says it belongs.
     let router_stats = Arc::new(proxy_http::stat_handles::RouterStats::new(
-        stats_registry,
+        stats_registry.clone(),
         stat_handles,
         proxy_observability::stats::WorkerId(ctx.id.0),
     ));
+    // WP-23 increment 6b: `DownstreamStats`'s counterpart to `router_stats`
+    // above, same per-worker `WorkerId` and same shared `stats_registry` --
+    // this is what `crate::listener::spawn_accept_loop` calls once per
+    // accepted connection.
+    let downstream_stats = Arc::new(proxy_http::stat_handles::DownstreamStats::new(
+        stats_registry.clone(),
+        downstream_stat_handles,
+        proxy_observability::stats::WorkerId(ctx.id.0),
+    ));
+    // WP-23 increment 6b: `GenAiTokenStats`'s counterpart to `router_stats`
+    // above -- this is what `crate::listener::build_hcm_handler` wires into
+    // every real `FilterChainHandler` it builds, via `.with_token_stats`.
+    let token_stats = Arc::new(proxy_http::stat_handles::GenAiTokenStats::new(
+        stats_registry,
+        token_usage_stat_handles,
+        proxy_observability::stats::WorkerId(ctx.id.0),
+    ));
+
+    let stats = proxy_core::listener::StatsRecorders {
+        router: router_stats,
+        downstream: downstream_stats,
+        token: token_stats,
+    };
 
     let bound = match initial_bind(
         &ctx.config.load(),
@@ -901,7 +982,7 @@ async fn worker_main(
         &registry,
         &ctx.shutdown,
         &cluster_manager,
-        &router_stats,
+        &stats,
     ) {
         Ok(bound) => {
             let _ = bind_tx.send((ctx.id, Ok(())));
@@ -926,7 +1007,7 @@ async fn worker_main(
         ctx.shutdown.clone(),
         registry.clone(),
         cluster_manager.clone(),
-        router_stats,
+        stats,
     ));
 
     drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
