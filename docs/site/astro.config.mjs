@@ -15,9 +15,6 @@ export default defineConfig({
 		starlight({
 			title: 'llm-proxy',
 			description: 'A high-performance proxy for LLM inference APIs.',
-			// Overrides Starlight's theme tokens only (accent, greys, fonts) so
-			// these docs match ergonlabs.io, which serves them.
-			customCss: ['./src/styles/custom.css'],
 			// No `social` entry: `git remote -v` in this repo has no configured
 			// remote to link to. Add one here once the repo has a GitHub home.
 			plugins: [
@@ -33,9 +30,6 @@ export default defineConfig({
 			// src/content/docs/<slug>/) as content arrives; keep the group order
 			// and item labels as specified.
 			sidebar: [
-				// Way back to the site that serves these docs. External links are
-				// left untouched by `base`, so this one is written in full.
-				{ label: '← ergonlabs.io', link: 'https://ergonlabs.io/' },
 				{
 					label: 'Getting started',
 					items: [
