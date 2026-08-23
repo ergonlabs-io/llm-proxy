@@ -1,0 +1,296 @@
+{
+  "rows": [
+    {
+      "concurrency": 1,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 0.25925925925925924,
+      "p50_latency_ms": 3727.359,
+      "p99_latency_ms": 3815.4230000000002,
+      "ttft_p99_ms": 351.743,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 33062912,
+      "mean_cpu_percent": 0.4014901912781335,
+      "peak_fds": 55
+    },
+    {
+      "concurrency": 2,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 0.5925925925925926,
+      "p50_latency_ms": 3704.831,
+      "p99_latency_ms": 3774.4629999999997,
+      "ttft_p99_ms": 292.863,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 33112064,
+      "mean_cpu_percent": 0.5464577195937392,
+      "peak_fds": 56
+    },
+    {
+      "concurrency": 4,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 1.1851851851851851,
+      "p50_latency_ms": 3708.927,
+      "p99_latency_ms": 3782.655,
+      "ttft_p99_ms": 305.407,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 33243136,
+      "mean_cpu_percent": 0.6991291410704846,
+      "peak_fds": 58
+    },
+    {
+      "concurrency": 8,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 2.3703703703703702,
+      "p50_latency_ms": 3702.7830000000004,
+      "p99_latency_ms": 3772.415,
+      "ttft_p99_ms": 311.55100000000004,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 33669120,
+      "mean_cpu_percent": 0.9953972369455687,
+      "peak_fds": 62
+    },
+    {
+      "concurrency": 16,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 4.7407407407407405,
+      "p50_latency_ms": 3706.879,
+      "p99_latency_ms": 3717.1189999999997,
+      "ttft_p99_ms": 367.103,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 34209792,
+      "mean_cpu_percent": 1.605489492165323,
+      "peak_fds": 70
+    },
+    {
+      "concurrency": 32,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 9.481481481481481,
+      "p50_latency_ms": 3708.927,
+      "p99_latency_ms": 3803.135,
+      "ttft_p99_ms": 300.031,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 35078144,
+      "mean_cpu_percent": 2.690362226990994,
+      "peak_fds": 86
+    },
+    {
+      "concurrency": 64,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 18.962962962962962,
+      "p50_latency_ms": 3710.975,
+      "p99_latency_ms": 3794.9429999999998,
+      "ttft_p99_ms": 336.639,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 37044224,
+      "mean_cpu_percent": 4.474821522519826,
+      "peak_fds": 118
+    },
+    {
+      "concurrency": 128,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 37.925925925925924,
+      "p50_latency_ms": 3719.167,
+      "p99_latency_ms": 3794.9429999999998,
+      "ttft_p99_ms": 379.90299999999996,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 41123840,
+      "mean_cpu_percent": 8.20929821461864,
+      "peak_fds": 183
+    },
+    {
+      "concurrency": 256,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 75.85185185185185,
+      "p50_latency_ms": 3708.927,
+      "p99_latency_ms": 3778.559,
+      "ttft_p99_ms": 349.439,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 47562752,
+      "mean_cpu_percent": 11.951341533797715,
+      "peak_fds": 312
+    },
+    {
+      "concurrency": 512,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 146.40740740740742,
+      "p50_latency_ms": 3719.167,
+      "p99_latency_ms": 3792.895,
+      "ttft_p99_ms": 374.527,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 60456960,
+      "mean_cpu_percent": 17.772573413920565,
+      "peak_fds": 569
+    },
+    {
+      "concurrency": 768,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 227.55555555555554,
+      "p50_latency_ms": 3715.071,
+      "p99_latency_ms": 3770.367,
+      "ttft_p99_ms": 360.95899999999995,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88473600,
+      "mean_cpu_percent": 22.114646537992304,
+      "peak_fds": 825
+    },
+    {
+      "concurrency": 800,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 237.03703703703704,
+      "p50_latency_ms": 3710.975,
+      "p99_latency_ms": 3749.887,
+      "ttft_p99_ms": 388.863,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 23.212115601904582,
+      "peak_fds": 857
+    },
+    {
+      "concurrency": 808,
+      "passed": true,
+      "violations": [],
+      "throughput_rps": 237.03703703703704,
+      "p50_latency_ms": 3704.831,
+      "p99_latency_ms": 3792.895,
+      "ttft_p99_ms": 397.31100000000004,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 21.728857592759027,
+      "peak_fds": 865
+    },
+    {
+      "concurrency": 809,
+      "passed": false,
+      "violations": [
+        "p99_latency",
+        "ttft_p99"
+      ],
+      "throughput_rps": 237.03703703703704,
+      "p50_latency_ms": 3721.215,
+      "p99_latency_ms": 7213.054999999999,
+      "ttft_p99_ms": 3776.511,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 21.042178319201795,
+      "peak_fds": 866
+    },
+    {
+      "concurrency": 810,
+      "passed": false,
+      "violations": [
+        "p99_latency",
+        "ttft_p99"
+      ],
+      "throughput_rps": 227.0,
+      "p50_latency_ms": 3710.975,
+      "p99_latency_ms": 6987.775,
+      "ttft_p99_ms": 3567.615,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 22.74106206819266,
+      "peak_fds": 867
+    },
+    {
+      "concurrency": 812,
+      "passed": false,
+      "violations": [
+        "p99_latency",
+        "ttft_p99"
+      ],
+      "throughput_rps": 237.03703703703704,
+      "p50_latency_ms": 3719.167,
+      "p99_latency_ms": 7094.271,
+      "ttft_p99_ms": 3665.9190000000003,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 21.247639283214802,
+      "peak_fds": 869
+    },
+    {
+      "concurrency": 816,
+      "passed": false,
+      "violations": [
+        "p99_latency",
+        "ttft_p99"
+      ],
+      "throughput_rps": 222.03703703703704,
+      "p50_latency_ms": 3719.167,
+      "p99_latency_ms": 7106.559,
+      "ttft_p99_ms": 3690.495,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 22.642078600606773,
+      "peak_fds": 873
+    },
+    {
+      "concurrency": 832,
+      "passed": false,
+      "violations": [
+        "p99_latency",
+        "ttft_p99"
+      ],
+      "throughput_rps": 237.03703703703704,
+      "p50_latency_ms": 3723.2630000000004,
+      "p99_latency_ms": 7340.031,
+      "ttft_p99_ms": 3915.775,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 21.520240212687604,
+      "peak_fds": 889
+    },
+    {
+      "concurrency": 896,
+      "passed": false,
+      "violations": [
+        "p99_latency",
+        "ttft_p99"
+      ],
+      "throughput_rps": 237.03703703703704,
+      "p50_latency_ms": 3737.5989999999997,
+      "p99_latency_ms": 7172.094999999999,
+      "ttft_p99_ms": 3756.031,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88539136,
+      "mean_cpu_percent": 22.107814947895537,
+      "peak_fds": 953
+    },
+    {
+      "concurrency": 1024,
+      "passed": false,
+      "violations": [
+        "p99_latency",
+        "ttft_p99"
+      ],
+      "throughput_rps": 237.03703703703704,
+      "p50_latency_ms": 3743.7430000000004,
+      "p99_latency_ms": 7401.471,
+      "ttft_p99_ms": 3977.215,
+      "error_rate": 0.0,
+      "peak_rss_bytes": 88473600,
+      "mean_cpu_percent": 21.956677531234515,
+      "peak_fds": 1081
+    }
+  ],
+  "max_sustainable": 808,
+  "first_failing": 809,
+  "cost_model": {
+    "bytes_per_stream": 65353.07397247688,
+    "rss_baseline_bytes": 32981752.140333116,
+    "rss_fit_r_squared": 0.9805884062697565,
+    "cpu_ms_per_request": 0.8709537087846124,
+    "cpu_ms_baseline": 543.8167475331616,
+    "cpu_fit_r_squared": 0.9725438338836487
+  },
+  "harness_bound": null
+}
