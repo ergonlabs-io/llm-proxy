@@ -56,8 +56,18 @@ providers:
 # its own request with that header: the proxy overwrites the header when the
 # body names a model, and deletes the header when the body does not.
 routes:
+  # `fallbacks` is a preference order, tried strictly top to bottom: xAI is
+  # dialled only after OpenAI fails, and only for failures the retry policy
+  # treats as retriable. Each provider is dialled with its OWN credentials and
+  # its own Host header — a fallback never receives the primary's API key.
+  #
+  # Every provider in a chain must speak the same wire dialect as the primary,
+  # which is why `xai` (openai-compatible) is legal here and `anthropic` is
+  # not: a chain that crosses dialects is a load error, because the request
+  # body would reach the second provider in a format it cannot parse.
   - model: gpt-*
     provider: openai
+    fallbacks: [xai]
 
   - model: o[0-9]*
     provider: openai
@@ -82,15 +92,6 @@ routes:
 # warning tells you precisely what is and is not active; a config that silently
 # did nothing would be worse. Check stderr on startup, or run `--mode validate`.
 # ---------------------------------------------------------------------------
-
-# Provider fallback (WP-35, in progress). Today this warns and only
-# same-provider retries are active — a request will NOT move to Anthropic if
-# OpenAI fails. Uncomment once WP-35 lands.
-#
-# routes:
-#   - model: gpt-*
-#     provider: openai
-#     fallbacks: [anthropic, xai]
 
 # Model catalogue (WP-49 increment 1). A client that asks for `fast` is routed
 # to `providers[0]` — the name below matches against the body's model field like
