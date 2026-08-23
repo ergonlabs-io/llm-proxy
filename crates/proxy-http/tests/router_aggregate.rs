@@ -136,6 +136,7 @@ fn member_cluster(name: &str, addr: SocketAddr, mutations: Vec<HeaderMutation>) 
         circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
         upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
         request_headers_to_add: mutations,
+        usage_dialect: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn aggregate_cluster() -> ClusterConfig {
         circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
         upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
         request_headers_to_add: Vec::new(),
+        usage_dialect: None,
     }
 }
 

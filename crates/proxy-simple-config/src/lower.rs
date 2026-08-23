@@ -486,13 +486,22 @@ fn lower_provider(
     // identical value via `host_rewrite_literal`, so this is a no-op there,
     // and one rule is simpler than two.
     headers_to_add.push(json!({ "key": "host", "value": up.host }));
-    if !headers_to_add.is_empty() {
-        cluster["metadata"] = json!({
-            "filter_metadata": {
-                PROVIDER_AUTH_METADATA_KEY: { "headers": headers_to_add }
-            }
-        });
-    }
+    // WP-35 increment 1 (ground rule #6's third instance, CLAUDE.md): the
+    // usage-filter dialect is per-provider too, so it rides onto the CLUSTER
+    // alongside credentials and `Host` above rather than staying only on the
+    // route's `typed_per_filter_config` -- that route-level copy is left
+    // completely unchanged by this increment (both carriers must agree; see
+    // `dialect.rs`'s test for that), and the usage filter itself does not
+    // read this one yet. This runs once per provider, exactly like the
+    // credential/Host headers above, so a provider used by five routes still
+    // gets exactly one copy.
+    let dialect = usage_dialect(name, provider);
+    cluster["metadata"] = json!({
+        "filter_metadata": {
+            PROVIDER_AUTH_METADATA_KEY: { "headers": headers_to_add },
+            USAGE_DIALECT_METADATA_KEY: { "dialect": dialect },
+        }
+    });
 
     Ok(cluster)
 }
@@ -506,6 +515,15 @@ fn lower_provider(
 /// same reason `USAGE_FILTER_TYPE_URL` above is pinned by a dev-dependency
 /// test rather than trusted to stay in sync.
 const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
+
+/// Namespace key under `Cluster.metadata.filter_metadata` this dialect uses
+/// to carry the usage-filter dialect -- must match
+/// `proxy_config::lower::USAGE_DIALECT_METADATA_KEY` exactly, for the same
+/// "the two crates only agree by convention" reason as
+/// [`PROVIDER_AUTH_METADATA_KEY`] above (protos never cross the
+/// `proxy-config`/`proxy-xds` boundary, so there is no shared Rust type to
+/// pin either string to).
+const USAGE_DIALECT_METADATA_KEY: &str = "io.llmproxy.usage";
 
 /// The auth header this provider type expects, if a key is configured.
 fn auth_header(

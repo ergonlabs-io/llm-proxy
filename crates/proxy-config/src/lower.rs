@@ -2131,8 +2131,9 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
             return Err(invalid(
                 format!("{path}.metadata"),
                 "inert on an aggregate cluster, and dangerous if it carries \
-                 `io.llmproxy.provider_auth`: credentials set here would silently never apply \
-                 -- they belong on the member cluster that actually serves the request",
+                 `io.llmproxy.provider_auth` or `io.llmproxy.usage`: credentials or the usage \
+                 dialect set here would silently never apply -- they belong on the member \
+                 cluster that actually serves the request",
             ));
         }
     }
@@ -2168,6 +2169,10 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // instead; a hand-written Envoy config that never sets this namespace
     // gets an empty list here, unchanged from before.
     let request_headers_to_add = convert_provider_auth_metadata(c.metadata.as_ref(), path)?;
+    // Ground rule #6's third instance (CLAUDE.md): the usage-filter dialect
+    // is per-provider, so it rides the same `Cluster.metadata.filter_metadata`
+    // smuggling channel as credentials above, under its own namespace.
+    let usage_dialect = convert_usage_dialect_metadata(c.metadata.as_ref(), path)?;
 
     Ok(ClusterConfig {
         name: c.name.clone(),
@@ -2183,6 +2188,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         circuit_breakers,
         upstream_protocol,
         request_headers_to_add,
+        usage_dialect,
     })
 }
 
@@ -2357,6 +2363,68 @@ fn provider_auth_string_field(
         Some(prost_types::value::Kind::StringValue(v)) => Ok(v.clone()),
         Some(_) => Err(invalid(format!("{path}.{name}"), "must be a string")),
         None => Err(invalid(format!("{path}.{name}"), "is required")),
+    }
+}
+
+/// Namespace key the `llmproxy` dialect uses to carry the usage-filter
+/// dialect through `Cluster.metadata.filter_metadata` -- ground rule #6's
+/// third instance (CLAUDE.md): the dialect is a per-provider property, so it
+/// has to follow the cluster that is actually dialled, the same way
+/// [`PROVIDER_AUTH_METADATA_KEY`] carries credentials. This increment (WP-35
+/// inc 1) only populates [`ClusterConfig::usage_dialect`]; the usage filter
+/// itself still reads the route-level `typed_per_filter_config` copy until a
+/// later increment plumbs the cluster value through to it.
+const USAGE_DIALECT_METADATA_KEY: &str = "io.llmproxy.usage";
+
+/// Lower `Cluster.metadata.filter_metadata["io.llmproxy.usage"]` into
+/// [`ClusterConfig::usage_dialect`]. The expected shape is
+/// `{ dialect: "openai" | "anthropic" }`.
+///
+/// Same re-implementation-by-hand rationale as
+/// [`convert_provider_auth_metadata`]: `google.protobuf.Struct` is opaque to
+/// the reflective surface walk, so ground rule #1 has to be enforced here
+/// directly -- an unrecognized `dialect` value, a missing `dialect` key, or
+/// any unexpected key in the namespace is a hard error with its full dotted
+/// path, never a silent skip. Any *other* `filter_metadata` namespace
+/// (including [`PROVIDER_AUTH_METADATA_KEY`]) is left alone.
+fn convert_usage_dialect_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<Option<UsageDialect>, ConfigError> {
+    let Some(usage) = metadata.and_then(|m| m.filter_metadata.get(USAGE_DIALECT_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let usage_path = format!("{path}.metadata.filter_metadata[\"{USAGE_DIALECT_METADATA_KEY}\"]");
+
+    // Rust note: `Struct::fields` is a `HashMap`, so sort keys before
+    // reporting one to keep the error deterministic across runs.
+    let mut unknown: Vec<&String> = usage
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "dialect")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{usage_path}.{key}"),
+            format!("`{USAGE_DIALECT_METADATA_KEY}` only supports a `dialect` string"),
+        ));
+    }
+
+    let dialect_path = format!("{usage_path}.dialect");
+    let dialect = match usage.fields.get("dialect").and_then(|v| v.kind.as_ref()) {
+        Some(prost_types::value::Kind::StringValue(v)) => v.as_str(),
+        Some(_) => return Err(invalid(&dialect_path, "must be a string")),
+        None => return Err(invalid(&dialect_path, "is required")),
+    };
+    match dialect {
+        "openai" => Ok(Some(UsageDialect::OpenAi)),
+        "anthropic" => Ok(Some(UsageDialect::Anthropic)),
+        other => Err(invalid(
+            &dialect_path,
+            format!("unrecognized dialect `{other}`; expected `openai` or `anthropic`"),
+        )),
     }
 }
 
