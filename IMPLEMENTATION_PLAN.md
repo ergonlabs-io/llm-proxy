@@ -759,6 +759,30 @@ Each WP references its normative spec sections.
 ### Lane F — Observability & admin
 
 #### WP-23 — Stats registry  (Size: M)  — **Priority: P1**
+
+> **Increment 6b DONE 2026-08-22, and it closed a gap the whole unit suite
+> agreed did not exist.** `FilterChainHandler::with_token_stats` existed, its own
+> doc named `proxy-core`'s `build_hcm_handler` as the call site it was written
+> for, and `build_hcm_handler` never called it. So `token_stats` was `None` on
+> every chain the binary actually serves and `gen_ai.client.token.usage` recorded
+> nothing regardless of configuration — while every unit test passed, because they
+> construct the handler directly and set the field themselves. Rule 16's shape
+> exactly: a suite that never switches a feature on cannot regress it. The proof
+> is therefore an e2e test spawning the real binary against a real
+> `mock-upstream` and reading the rendered admin body.
+>
+> **Two gaps recorded rather than papered over** (both in
+> `crates/proxy/tests/stats_e2e.rs`'s module doc):
+> - **`envoy_counter_name` has no `downstream_cx_total` case**, so a stat that
+>   genuinely does have an Envoy equivalent renders to nothing on `/stats`. Both
+>   6b instruments are therefore asserted against `/stats/prometheus`. This is a
+>   renderer gap in `proxy-observability/src/stats/envoy_render.rs`, one layer
+>   below the wiring, and it is the next small piece of this WP. (`gen_ai.*`
+>   rendering to nothing there is by design and stays.)
+> - **A listener with `llmproxy.usage` but no `access_log` records no token usage
+>   at all**: `filter_manager::handle` only wraps the response in `LoggingBody`
+>   (whose `finish()` records) when `access_loggers` is non-empty. Silent, and the
+>   same shape as the gap 6b just closed.
 > **Owner decision 2026-08-03 — the internal model is OTel, Envoy names are an adapter.**
 > This reverses the emphasis of the bullets below, which were written Envoy-first; they stay
 > because the Envoy-exact output is still a deliverable, but it becomes a *rendering* of the
@@ -795,6 +819,31 @@ Each WP references its normative spec sections.
   equality for deterministic scenarios.
 
 #### WP-24 — Access logging  (Size: M)  — **Priority: P1**
+
+> **Response-flag audit DONE 2026-08-22 — two of the 20 were declared but never
+> set, and the second was found only by auditing the other 19.** `RL` was the
+> reported one: the token limiter is the only filter that refuses a request
+> outright, and its 429 was indistinguishable in the log from any other 429.
+> `URX` had a working retry engine underneath it and no call site at all, so a
+> request that exhausted its budget logged only the last attempt's flag.
+> `RetryState::retry_limit_exceeded` is the exact complement of `should_retry`'s
+> budget clause, which keeps it off the two cases that merely resemble it (an
+> outcome the policy never retried; a body that was not replayable) — neither is
+> a limit being exceeded.
+>
+> **The audit's more useful output is the list of what CANNOT happen.** `UR` and
+> `DC` are declared, look wired, and are dead code: `PoolError::ResetBeforeHeaders`
+> is constructed by neither pool, and `BodyError::Downstream` is discarded in
+> `filter_manager::collect_request` before any flag can be set — its existing unit
+> test fabricates the condition rather than driving it, which is why the gap
+> survived. Both are wiring gaps, not missing features, and both are now in
+> `docs/envoy-divergences.md`. The remaining 11 are unreachable because the
+> feature behind them does not exist yet (ext_authz, RLS, max_stream_duration…),
+> which is honest rather than a gap.
+>
+> **Transferable:** a fabricated-condition test is worse than no test — it makes
+> an unreachable path look covered. When a flag has a test, check whether the test
+> *drives* the condition or *constructs* it.
 - Format-string engine: default format ✅ (`[%START_TIME%] "%REQ(:METHOD)% …"`) and the
   operator set: `%REQ(X?Y):Z%`, `%RESP%`, `%TRAILER%`, `%DURATION%`, `%REQUEST_DURATION%`,
   `%RESPONSE_DURATION%`, `%RESPONSE_FLAGS%` (full flag vocabulary — UH,UF,UO,NR,URX,NC,DC,LH,
@@ -919,6 +968,43 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
 >
 > **So: move the usage dialect onto the cluster BEFORE enabling cross-dialect
 > fallback.** It is a prerequisite, not a cleanup.
+>
+> **Increment 1 DONE 2026-08-22** — the carrier exists and is additive.
+> `Cluster.metadata.filter_metadata["io.llmproxy.usage"]` lowers to
+> `ClusterConfig::usage_dialect`, mirroring how `io.llmproxy.provider_auth`
+> carries credentials. Nothing reads it yet: the usage filter still reads the
+> route copy, and **the cross-dialect prohibition in
+> `proxy-simple-config/src/lower.rs` MUST STAY** until increment 2 switches the
+> filter over. That sequencing is enforced, not just documented — the field has a
+> `KnownInert` entry in `crates/proxy-config/tests/ir_readership.rs`, and
+> `allowlist_has_no_stale_entries` fails the suite the moment a runtime crate
+> reads the field, so increment 2 cannot land without deleting the entry and
+> confronting the prohibition.
+>
+> **Increment 1's first cut shipped the bug it was written to prevent — worth
+> reading before increment 2.** It derived the cluster's dialect from the
+> provider `type`, while the route derives it through `resolved_dialect`, which
+> honours an explicit `dialect:` on a `models` entry. Nothing constrains that
+> field to agree with `type`, so the two carriers disagreed for any entry that
+> states one — and it is *mandatory* on Vertex and Bedrock, whose whole reason
+> for being dialect-ambiguous is that they host Anthropic-shaped models. Cluster
+> claims `openai`, upstream speaks Anthropic, the parser finds no usage object,
+> reads `None`, and per ground rule 17 the token limiter fails open: the
+> confirmed quota-bypass shape from rule 16, reintroduced by the fix. The lesson
+> is narrow and reusable: **when you add a second carrier for a value, the new
+> one must resolve through the same function as the old one** — `cluster_usage_dialect`
+> now calls `resolved_dialect`, and `both_dialect_carriers_agree_on_the_example_config`
+> walks aggregate *members*, not just direct route targets, because failover is
+> the case the rule is about.
+>
+> **Open, found the same day, deliberately NOT fixed in increment 1:** the
+> `routes:` surface never rejects a dialect-ambiguous provider type. Only the
+> `models:` surface runs the `resolved_dialect(..).is_none()` check in
+> `parse.rs`; a Vertex/Bedrock provider reached through `routes:` silently gets
+> `usage_dialect`'s `_ => "openai"` fallback. Pre-existing behaviour of the ROUTE
+> carrier, not introduced by the cluster one, and currently unreachable because
+> both types are rejected as unbuilt credential schemes — but it must be closed in
+> `validate_semantics` before either type ships.
 >
 > Related and already observable: because `body_rewrite` overwrites the model
 > header from the body and calls `clear_route_cache()` (WP-45 decision 4,
