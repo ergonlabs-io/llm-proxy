@@ -13,11 +13,12 @@
 //! added/removed/unchanged classification via [`diff_host_sets`], both for
 //! observability and so tests can assert on it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use crate::Host;
+use crate::{HealthFlags, Host};
 
 /// Immutable per-cluster membership snapshot, indexed by numeric priority
 /// (0 = primary, matching [`crate::RoutingPriority`]/S5/S7 failover order).
@@ -112,6 +113,50 @@ pub fn diff_host_sets(old: &HostSet, new: &HostSet) -> HostSetDiff {
     diff.removed.sort();
     diff.unchanged.sort();
     diff
+}
+
+/// Carry `health_flags` over from `old` to `new` for every address `diff`
+/// calls `unchanged` (WP-18 runtime wiring).
+///
+/// `discovery::resolve` builds every `Host` fresh, with `HealthFlags::default()`
+/// -- it has no notion of "this address was already known", so a plain
+/// `managed.host_set.store(new)` on every DNS/EDS refresh would silently
+/// mark a host healthy again on a timer, erasing the active health checker's
+/// (and outlier detector's) entire output with nothing logged. Only
+/// `unchanged` addresses are touched: `added` addresses are genuinely new
+/// (nothing to carry from), and `removed` addresses don't exist in `new` to
+/// carry anything onto.
+///
+/// Rust note: rebuilds the `Vec<Arc<Host>>` and re-buckets via
+/// `HostSet::from_hosts` rather than mutating in place -- `Host` has no
+/// interior mutability for `health_flags` (see `health_check`'s own
+/// `apply_health_transition`, which rebuilds for the same reason), so a new
+/// `Arc<Host>` is the only way to change it.
+pub fn carry_over_health_flags(old: &HostSet, new: HostSet, diff: &HostSetDiff) -> HostSet {
+    if diff.unchanged.is_empty() {
+        return new;
+    }
+    let old_flags: HashMap<SocketAddr, HealthFlags> = old
+        .all_hosts()
+        .iter()
+        .map(|h| (h.address, h.health_flags))
+        .collect();
+    let hosts: Vec<Arc<Host>> = new
+        .all_hosts()
+        .into_iter()
+        .map(|h| match old_flags.get(&h.address) {
+            Some(flags) if *flags != h.health_flags => Arc::new(Host {
+                address: h.address,
+                hostname: h.hostname.clone(),
+                weight: h.weight,
+                priority: h.priority,
+                health_flags: *flags,
+                active_requests: AtomicU64::new(h.active_request_count()),
+            }),
+            _ => h,
+        })
+        .collect();
+    HostSet::from_hosts(hosts)
 }
 
 #[cfg(test)]

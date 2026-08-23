@@ -6,16 +6,14 @@
 //! control runtime; the only thing that crosses to workers is the `Arc<Host>`
 //! snapshot itself.
 //!
-//! **IR wiring is outstanding.** `proxy_config::ir::ClusterConfig` has no
-//! health-check field yet, so [`HealthCheckConfig`]/[`HealthCheckKind`] are
-//! defined here rather than in the IR (ground rule #2's proto/IR boundary is
-//! a different agent's call to make, and inventing an IR field here would
-//! step on that). [`HealthCheckEngine`] takes its config as a plain
-//! constructor argument, so once the IR grows a `health_checks` field,
-//! wiring it into [`crate::manager::ClusterManager`] is additive: build a
-//! [`HealthCheckEngine`] per cluster from the lowered config and call
-//! [`HealthCheckEngine::spawn_for_host`] for each host as cluster membership
-//! changes.
+//! **IR wiring landed (WP-18 runtime wiring).** `proxy_config::ir::ClusterConfig`
+//! carries `health_check: Option<HealthCheckIR>`; [`HealthCheckConfig`]/
+//! [`HealthCheckKind`] are still defined here rather than in the IR (ground
+//! rule #2 keeps proto/IR types from leaking past `proxy-config`), and
+//! [`HealthCheckEngine::from_ir`] is the one conversion site. `crate::manager`
+//! builds an engine per config-sourced `Endpoints` cluster and calls
+//! [`HealthCheckEngine::spawn_for_host`]/aborts its `JoinHandle` as
+//! `diff_host_sets` reports hosts added/removed on each refresh.
 //!
 //! gRPC health checks (`grpc.health.v1.Health/Check`) are **out of scope**
 //! here -- see [`HealthCheckKind`]'s doc comment for why silently reporting
@@ -181,6 +179,39 @@ pub struct HealthCheckEngine {
 impl HealthCheckEngine {
     pub fn new(config: HealthCheckConfig, kind: HealthCheckKind) -> Arc<Self> {
         Arc::new(Self { config, kind })
+    }
+
+    /// Builds an engine from the lowered IR (WP-18 runtime wiring): the
+    /// module doc's wiring plan, now that `ClusterConfig::health_check`
+    /// exists. This is the one place `proxy_config::ir::HealthCheckIR`/
+    /// `HealthCheckKindIR` convert to this module's own
+    /// `HealthCheckConfig`/`HealthCheckKind` -- ground rule #2 keeps the IR
+    /// types from leaking any further than this call site.
+    pub fn from_ir(ir: &proxy_config::ir::HealthCheckIR) -> Arc<Self> {
+        let config = HealthCheckConfig {
+            interval: ir.interval,
+            timeout: ir.timeout,
+            unhealthy_threshold: ir.unhealthy_threshold,
+            healthy_threshold: ir.healthy_threshold,
+            no_traffic_interval: ir.no_traffic_interval,
+            interval_jitter: ir.interval_jitter,
+        };
+        let kind = match &ir.kind {
+            proxy_config::ir::HealthCheckKindIR::Http {
+                path,
+                expected_statuses,
+                host,
+            } => HealthCheckKind::Http {
+                path: path.clone(),
+                expected_statuses: expected_statuses.clone(),
+                host: host.clone(),
+            },
+            proxy_config::ir::HealthCheckKindIR::Tcp { send, expect } => HealthCheckKind::Tcp {
+                send: send.clone(),
+                expect: expect.clone(),
+            },
+        };
+        Self::new(config, kind)
     }
 
     /// Spawn a check loop for one host address on the current (control)

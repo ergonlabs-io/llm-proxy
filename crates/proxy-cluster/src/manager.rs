@@ -12,14 +12,17 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use proxy_config::ir::{ClusterConfig, ClusterKind, ClusterName, EndpointIR, LbPolicy};
+use tokio::task::JoinHandle;
 
 use crate::discovery;
-use crate::host_set::{diff_host_sets, HostSet, HostSetDiff};
+use crate::health_check::HealthCheckEngine;
+use crate::host_set::{carry_over_health_flags, diff_host_sets, HostSet, HostSetDiff};
 use crate::load_balancer::{self, HostPicker, LbError};
 use crate::resolver::HostResolver;
 use crate::transport::{
@@ -71,7 +74,16 @@ enum ClusterSource {
 /// inert placeholders -- see [`ManagedCluster::from_config`]'s aggregate arm.
 struct ManagedCluster {
     source: ClusterSource,
-    host_set: ArcSwap<HostSet>,
+    /// Rust note: `Arc<ArcSwap<..>>` (not a bare `ArcSwap<..>`) so
+    /// [`health_check::HealthCheckEngine::spawn_for_host`] -- which needs an
+    /// owned handle to publish transitions onto, since its check loop
+    /// outlives any single call into this manager -- can hold a clone of the
+    /// exact swap cell every reader of this cluster shares, rather than a
+    /// borrow tied to `&self`. `.load()`/`.store()`/`.rcu()` still work
+    /// unchanged through `Arc`'s `Deref`.
+    ///
+    /// [`health_check::HealthCheckEngine::spawn_for_host`]: crate::health_check::HealthCheckEngine::spawn_for_host
+    host_set: Arc<ArcSwap<HostSet>>,
     /// Flips to `true` once the cluster's first resolution (or, for EDS, its
     /// first externally-supplied set) has landed. Also `true` from
     /// construction for an aggregate, which has nothing of its own to
@@ -108,6 +120,47 @@ struct ManagedCluster {
     /// aggregate arm's own pool is never actually dialed -- see
     /// `ClusterHandle::http_pool`), fall back to the same Envoy default.
     connect_timeout: std::time::Duration,
+    /// S6 active health checking (WP-18 runtime wiring): built once from
+    /// `config.health_check` at construction, same as `host_picker`/
+    /// `transport` above. `None` when the config configures no health check
+    /// (Envoy's own default, every host healthy), and always `None` for an
+    /// aggregate (no hosts of its own to probe -- see the aggregate arm) or
+    /// an EDS cluster (no `ClusterConfig` to read one from -- see [`Self::eds`]).
+    health_engine: Option<Arc<HealthCheckEngine>>,
+    /// Live probe tasks, one per currently-probed host address. Reconciled
+    /// against membership on every `refresh_cluster`/`accept_eds_update`
+    /// call by [`Self::reconcile_probes`]. Kept here (not on the engine
+    /// itself) because it's per-*cluster* membership, and a `ManagedCluster`
+    /// is what actually gets discarded wholesale on a config reload -- see
+    /// this type's `Drop` impl for why that discard must abort every handle
+    /// here rather than just letting them go.
+    ///
+    /// Rust note: `std::sync::Mutex`, not `tokio::sync::Mutex` -- every
+    /// critical section here is a plain, non-async `HashMap` insert/remove/
+    /// drain, so there's no `.await` under the lock to require the async
+    /// variant (same reasoning as `resolver::FakeResolver::records`).
+    probes: Mutex<HashMap<SocketAddr, JoinHandle<()>>>,
+}
+
+impl Drop for ManagedCluster {
+    /// A dropped `JoinHandle` does **not** abort its task -- it only detaches
+    /// from it, and the check loop keeps running with nobody left to stop it.
+    /// `ClusterManager::update_from_snapshot` rebuilds every config-sourced
+    /// cluster wholesale on each call (its own doc says so), so without this,
+    /// every config reload -- and this proxy reloads on SIGHUP in production
+    /// -- would leak one permanently-running probe loop per host, forever.
+    fn drop(&mut self) {
+        // Rust note: `Mutex::lock`'s `Err` case is poisoning (a prior holder
+        // panicked mid-critical-section) -- `if let Ok` rather than
+        // `.unwrap()` here so a poisoned lock still aborts whatever handles
+        // it can reach instead of panicking again inside a `Drop` (a
+        // double-panic during unwind aborts the whole process).
+        if let Ok(mut probes) = self.probes.lock() {
+            for (_, handle) in probes.drain() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 /// Envoy's own default for `Cluster.connect_timeout` when a config doesn't
@@ -137,9 +190,14 @@ impl ManagedCluster {
                 // into `source` below.
                 let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
                 let connect_timeout = config.connect_timeout;
+                // WP-18 runtime wiring: build the engine now, from the
+                // lowered config, same as `policy`/`transport` above --
+                // `None` means the config configures no health check at all
+                // (Envoy's own default), not that this cluster is exempt.
+                let health_engine = config.health_check.as_ref().map(HealthCheckEngine::from_ir);
                 Ok(Self {
                     source: ClusterSource::Config(config),
-                    host_set: ArcSwap::from_pointee(HostSet::default()),
+                    host_set: Arc::new(ArcSwap::from_pointee(HostSet::default())),
                     initialized: AtomicBool::new(false),
                     host_picker: HostPicker::new(policy),
                     default_cb,
@@ -147,6 +205,8 @@ impl ManagedCluster {
                     upstream_protocol,
                     transport,
                     connect_timeout,
+                    health_engine,
+                    probes: Mutex::new(HashMap::new()),
                 })
             }
             ClusterKind::Aggregate { .. } => {
@@ -162,11 +222,15 @@ impl ManagedCluster {
                 // would make WP-21 warming wait forever on a cluster that
                 // never runs discovery. `connect_timeout` is read from the
                 // real config anyway (it costs nothing and stays correct if
-                // this arm's pool is ever actually dialed).
+                // this arm's pool is ever actually dialed). `health_engine`
+                // stays `None` for the same reason as the rest of this arm:
+                // an aggregate has no hosts of its own to probe -- probing
+                // happens on the member cluster, which has its own real
+                // `ManagedCluster` and its own `health_engine`.
                 let connect_timeout = config.connect_timeout;
                 Ok(Self {
                     source: ClusterSource::Config(config),
-                    host_set: ArcSwap::from_pointee(HostSet::default()),
+                    host_set: Arc::new(ArcSwap::from_pointee(HostSet::default())),
                     initialized: AtomicBool::new(true),
                     host_picker: HostPicker::new(
                         load_balancer::build(LbPolicy::RoundRobin)
@@ -177,8 +241,37 @@ impl ManagedCluster {
                     upstream_protocol: UpstreamProtocol::Http1,
                     transport: Arc::new(transport::RawTransportSocket),
                     connect_timeout,
+                    health_engine: None,
+                    probes: Mutex::new(HashMap::new()),
                 })
             }
+        }
+    }
+
+    /// Reconcile this cluster's active-health-check probes against a
+    /// membership diff (WP-18 runtime wiring): stop the probe for every
+    /// `removed` address (aborting its task, not just dropping the handle --
+    /// see this type's `Drop` impl for why a drop alone isn't enough), and
+    /// start one for every `added` address. `unchanged` addresses are left
+    /// alone -- their probe, if any, is already running against this same
+    /// `host_set`, and re-spawning would just be a second task racing the
+    /// first over the same host.
+    ///
+    /// A no-op when this cluster has no health check configured
+    /// (`health_engine` is `None`).
+    fn reconcile_probes(&self, diff: &HostSetDiff) {
+        let Some(engine) = &self.health_engine else {
+            return;
+        };
+        let mut probes = self.probes.lock().unwrap();
+        for addr in &diff.removed {
+            if let Some(handle) = probes.remove(addr) {
+                handle.abort();
+            }
+        }
+        for &addr in &diff.added {
+            let handle = engine.spawn_for_host(addr, Arc::clone(&self.host_set));
+            probes.insert(addr, handle);
         }
     }
 
@@ -187,10 +280,12 @@ impl ManagedCluster {
     /// own cluster-wide default, to plaintext (there's no
     /// `transport_socket` field to read), and to Envoy's own
     /// `connect_timeout` default (there's no field to read that either).
+    /// `health_engine` is `None` for the same reason: there's no
+    /// `ClusterConfig.health_check` to build one from.
     fn eds() -> Self {
         Self {
             source: ClusterSource::Eds,
-            host_set: ArcSwap::from_pointee(HostSet::default()),
+            host_set: Arc::new(ArcSwap::from_pointee(HostSet::default())),
             initialized: AtomicBool::new(false),
             host_picker: HostPicker::new(
                 load_balancer::build(LbPolicy::RoundRobin).expect("round robin always builds"),
@@ -200,6 +295,8 @@ impl ManagedCluster {
             upstream_protocol: UpstreamProtocol::Http1,
             transport: Arc::new(transport::RawTransportSocket),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            health_engine: None,
+            probes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -365,9 +462,16 @@ impl ClusterManager {
         // cluster's config or an externally-pushed EDS response.
         let hosts = discovery::static_hosts(endpoints)?;
         let new_set = HostSet::from_hosts(hosts);
-        let diff = diff_host_sets(&managed.host_set.load(), &new_set);
+        let old_set = managed.host_set.load();
+        let diff = diff_host_sets(&old_set, &new_set);
+        // WP-18 runtime wiring: carry `health_flags` over for every address
+        // still present, or an active-check flip would be silently erased
+        // by the next EDS push -- see `host_set::carry_over_health_flags`.
+        let new_set = carry_over_health_flags(&old_set, new_set, &diff);
+        drop(old_set);
         managed.host_set.store(Arc::new(new_set));
         managed.initialized.store(true, Ordering::Release);
+        managed.reconcile_probes(&diff);
         Ok(diff)
     }
 
@@ -402,9 +506,17 @@ impl ClusterManager {
             ClusterSource::Config(config) => config,
         };
         let new_set = discovery::resolve(config, self.resolver.as_ref()).await?;
-        let diff = diff_host_sets(&managed.host_set.load(), &new_set);
+        let old_set = managed.host_set.load();
+        let diff = diff_host_sets(&old_set, &new_set);
+        // WP-18 runtime wiring: `discovery::resolve` always builds fresh
+        // `Host`s with `HealthFlags::default()`, so without this a DNS
+        // refresh would silently re-mark every unchanged host healthy --
+        // see `host_set::carry_over_health_flags`.
+        let new_set = carry_over_health_flags(&old_set, new_set, &diff);
+        drop(old_set);
         managed.host_set.store(Arc::new(new_set));
         managed.initialized.store(true, Ordering::Release);
+        managed.reconcile_probes(&diff);
         Ok(diff)
     }
 
@@ -593,9 +705,12 @@ impl ClusterEntry for ClusterHandle {
 mod tests {
     use super::*;
     use crate::resolver::FakeResolver;
+    use crate::HealthFlags;
     use proxy_config::ir::{DiscoveryType, LbPolicy};
     use std::net::{IpAddr, SocketAddr};
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+    use tokio::net::TcpListener;
 
     fn cluster_config(
         name: &str,
@@ -649,6 +764,88 @@ mod tests {
             port,
             weight: 1,
             priority: 0,
+        }
+    }
+
+    // ------------------------------------------------- WP-18 runtime wiring --
+
+    /// Same shape as `cluster_config` above, plus a `health_check` -- kept
+    /// separate rather than adding a parameter to `cluster_config` so the
+    /// many call sites above that don't care about health checking stay
+    /// untouched.
+    fn cluster_config_with_health_check(
+        name: &str,
+        discovery: DiscoveryType,
+        endpoints: Vec<EndpointIR>,
+        health_check: proxy_config::ir::HealthCheckIR,
+    ) -> Arc<ClusterConfig> {
+        Arc::new(ClusterConfig {
+            name: name.to_string(),
+            discovery,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints,
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+            usage_dialect: None,
+            health_check: Some(health_check),
+        })
+    }
+
+    /// A bare-TCP-connect health check (empty `send`/`expect`, see
+    /// `HealthCheckKindIR::Tcp`'s own doc) with the given thresholds/interval
+    /// and a generous fixed timeout -- these tests care about threshold and
+    /// scheduling behavior, not timeout edge cases (`health_check.rs`'s own
+    /// test module already covers those).
+    fn tcp_health_check(
+        unhealthy_threshold: u32,
+        healthy_threshold: u32,
+        interval: Duration,
+    ) -> proxy_config::ir::HealthCheckIR {
+        proxy_config::ir::HealthCheckIR {
+            interval,
+            timeout: Duration::from_millis(500),
+            interval_jitter: Duration::ZERO,
+            unhealthy_threshold,
+            healthy_threshold,
+            no_traffic_interval: crate::health_check::DEFAULT_NO_TRAFFIC_INTERVAL,
+            kind: proxy_config::ir::HealthCheckKindIR::Tcp {
+                send: Vec::new(),
+                expect: Vec::new(),
+            },
+        }
+    }
+
+    /// Spawns a task that accepts connections forever and counts each one --
+    /// the observable signal these tests use to prove a probe loop is (or
+    /// isn't) still running, since a `JoinHandle` living or dying isn't
+    /// otherwise visible from outside `manager.rs`.
+    fn spawn_counting_acceptor(listener: TcpListener, hits: Arc<AtomicUsize>) {
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_ok() {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+    }
+
+    /// Poll `cond` on real wall-clock time until it's true or `deadline`
+    /// elapses -- same rationale as `health_check`'s own `wait_until`: these
+    /// tests assert on genuine TCP connect/accept timing, which races
+    /// unpredictably against a paused clock's auto-advance.
+    async fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < deadline,
+                "condition not met within {deadline:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -947,5 +1144,222 @@ mod tests {
             .select_host(&ctx)
             .expect("aggregate should skip the nested aggregate and serve b");
         assert_eq!(sel.member.unwrap().name, "b");
+    }
+
+    // ------------------------------------------------- WP-18 runtime wiring --
+
+    /// The acceptance test named in the WP-18 runtime-wiring brief: before
+    /// this task, no configuration could make an active health check
+    /// actually run. Two static hosts -- one a live listener, one a bound-
+    /// then-dropped port so nothing answers -- with `unhealthy_threshold: 1`
+    /// and a short interval; `all_healthy_hosts()` must converge to exactly
+    /// the live host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_check_converges_to_only_the_live_host() {
+        let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let _ = live.accept().await;
+            }
+        });
+
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead); // nothing listens here -> every connect attempt fails
+
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "hc-svc".to_string(),
+            cluster_config_with_health_check(
+                "hc-svc",
+                DiscoveryType::Static,
+                vec![
+                    endpoint(&live_addr.ip().to_string(), live_addr.port()),
+                    endpoint(&dead_addr.ip().to_string(), dead_addr.port()),
+                ],
+                tcp_health_check(1, 1, Duration::from_millis(10)),
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+
+        wait_until(Duration::from_secs(5), || {
+            let clusters = manager.clusters.load();
+            let managed = clusters.get("hc-svc").expect("cluster must exist");
+            let healthy: Vec<SocketAddr> = managed
+                .host_set
+                .load()
+                .all_healthy_hosts()
+                .iter()
+                .map(|h| h.address)
+                .collect();
+            healthy == vec![live_addr]
+        })
+        .await;
+    }
+
+    /// The second WP-18 runtime-wiring hazard: `discovery::resolve` builds
+    /// every `Host` fresh with `HealthFlags::default()`, so a naive
+    /// `host_set.store(new_set)` on refresh would silently re-mark an
+    /// already-unhealthy host healthy on every DNS cycle. Flip a host
+    /// unhealthy directly (simulating an active-check failure that already
+    /// landed), re-run discovery against an unchanged DNS record set, and
+    /// confirm the flag survives.
+    #[tokio::test]
+    async fn refresh_cluster_carries_over_health_flags_for_unchanged_hosts() {
+        let resolver = Arc::new(FakeResolver::new());
+        resolver.set("svc.internal", vec![IpAddr::from([10, 0, 0, 1])]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "dns-svc".to_string(),
+            cluster_config(
+                "dns-svc",
+                DiscoveryType::StrictDns,
+                vec![endpoint("svc.internal", 80)],
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+
+        let addr = SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80);
+        let managed = manager.clusters.load().get("dns-svc").unwrap().clone();
+        managed
+            .host_set
+            .store(Arc::new(HostSet::from_hosts(vec![Arc::new(Host {
+                address: addr,
+                hostname: Some("svc.internal".to_string()),
+                weight: 1,
+                priority: 0,
+                health_flags: HealthFlags {
+                    failed_active_hc: true,
+                    failed_outlier_check: false,
+                },
+                active_requests: std::sync::atomic::AtomicU64::new(0),
+            })])));
+
+        // Same DNS record set -- `addr` is `unchanged`, so its flipped flag
+        // must survive, not be reset to `HealthFlags::default()` by the
+        // freshly-resolved `Host` this refresh builds.
+        manager.refresh_cluster("dns-svc").await.unwrap();
+
+        let host = managed
+            .host_set
+            .load()
+            .all_hosts()
+            .into_iter()
+            .find(|h| h.address == addr)
+            .expect("host must still be present after refresh");
+        assert!(
+            !host.is_healthy(),
+            "an unchanged host's health flag was reset by refresh_cluster"
+        );
+    }
+
+    /// A removed host's probe must stop: flip `host-doomed`'s DNS record to
+    /// empty and re-resolve the *same* cluster (`refresh_cluster`, not a
+    /// config reload) -- `reconcile_probes`'s `removed` path must abort its
+    /// task, not just drop the map entry (a bare drop doesn't abort the
+    /// underlying tokio task -- see `ManagedCluster`'s `Drop` impl doc).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_removed_hosts_probe_stops() {
+        let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let live_hits = Arc::new(AtomicUsize::new(0));
+        spawn_counting_acceptor(live, Arc::clone(&live_hits));
+
+        let doomed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doomed_addr = doomed.local_addr().unwrap();
+        let doomed_hits = Arc::new(AtomicUsize::new(0));
+        spawn_counting_acceptor(doomed, Arc::clone(&doomed_hits));
+
+        let resolver = Arc::new(FakeResolver::new());
+        resolver.set("host-live", vec![live_addr.ip()]);
+        resolver.set("host-doomed", vec![doomed_addr.ip()]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "removal".to_string(),
+            cluster_config_with_health_check(
+                "removal",
+                DiscoveryType::StrictDns,
+                vec![
+                    endpoint("host-live", live_addr.port()),
+                    endpoint("host-doomed", doomed_addr.port()),
+                ],
+                tcp_health_check(1, 1, Duration::from_millis(15)),
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        wait_until(Duration::from_secs(5), || {
+            live_hits.load(Ordering::SeqCst) >= 2 && doomed_hits.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+
+        resolver.set("host-doomed", vec![]);
+        manager.refresh_cluster("removal").await.unwrap();
+
+        let doomed_after_removal = doomed_hits.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            doomed_hits.load(Ordering::SeqCst),
+            doomed_after_removal,
+            "a removed host's probe kept connecting after it left the cluster"
+        );
+        // host-live's own probe is unaffected by host-doomed's removal.
+        wait_until(Duration::from_secs(5), || {
+            live_hits.load(Ordering::SeqCst) > doomed_after_removal
+        })
+        .await;
+    }
+
+    /// A config reload must not leak the previous generation's probes.
+    /// `update_from_snapshot` rebuilds every config-sourced `ManagedCluster`
+    /// wholesale on every call (its own doc comment says so) -- reload the
+    /// identical single-host config several times and confirm the hit rate
+    /// against that host's listener stays at roughly one generation's worth,
+    /// rather than scaling with the number of reloads (which is exactly what
+    /// a dropped-but-not-aborted `JoinHandle` per reload would produce).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_config_reload_does_not_leak_the_previous_generations_probes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        spawn_counting_acceptor(listener, Arc::clone(&hits));
+
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "reload".to_string(),
+            cluster_config_with_health_check(
+                "reload",
+                DiscoveryType::Static,
+                vec![endpoint(&addr.ip().to_string(), addr.port())],
+                tcp_health_check(1, 1, Duration::from_millis(15)),
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        wait_until(Duration::from_secs(5), || hits.load(Ordering::SeqCst) >= 3).await;
+
+        let baseline_start = hits.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let baseline = hits.load(Ordering::SeqCst) - baseline_start;
+
+        for _ in 0..4 {
+            manager.update_from_snapshot(&snapshot).await;
+        }
+
+        let after_start = hits.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let after = hits.load(Ordering::SeqCst) - after_start;
+
+        assert!(
+            after <= baseline * 3,
+            "hit rate after 4 reloads ({after} hits/250ms) is far above the \
+             single-generation baseline ({baseline} hits/250ms) -- earlier \
+             generations' probes were never aborted and are still running"
+        );
     }
 }

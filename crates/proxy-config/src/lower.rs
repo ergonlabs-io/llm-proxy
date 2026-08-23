@@ -32,6 +32,7 @@ use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use proxy_api::envoy::extensions::upstreams::http::v3 as upstream_http_v3;
 use proxy_api::envoy::r#type::matcher::v3 as matcher_v3;
+use proxy_api::envoy::r#type::v3 as type_v3;
 use proxy_observability::access_log::{parse_format, FormatString};
 use proxy_observability::ResponseFlag;
 
@@ -157,6 +158,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "circuit_breakers",
             "typed_extension_protocol_options",
             "metadata",
+            "health_checks",
         ],
         // WP-35 increment 2b-i: the only custom cluster type implemented is
         // `envoy.clusters.aggregate` (see `convert_cluster`'s
@@ -207,6 +209,44 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "max_requests",
             "max_retries",
         ],
+        // S6 active health checking (WP-18). `initial_jitter`,
+        // `interval_jitter_percent`, `alt_port`, `reuse_connection`,
+        // `unhealthy_interval`/`unhealthy_edge_interval`/`healthy_edge_interval`,
+        // `event_log_path`, `event_logger`, `event_service`,
+        // `always_log_health_check_*`, `tls_options`, and
+        // `transport_socket_match_criteria` are not implemented and stay off
+        // this list on purpose -- setting any of them must fail loudly.
+        // `grpc_health_check` and `custom_health_check` ARE listed here even
+        // though neither reaches the IR: `convert_health_check` rejects both
+        // explicitly with an operator-facing message (a stub that always
+        // reports healthy is worse than refusing the config), and that only
+        // fires if the surface walk lets the field through instead of
+        // stopping on its own generic "not implemented yet" text first --
+        // same reasoning as `LbPolicy::RingHash`/`Maglev` in `convert_cluster`.
+        "envoy.config.core.v3.HealthCheck" => &[
+            "timeout",
+            "interval",
+            "interval_jitter",
+            "unhealthy_threshold",
+            "healthy_threshold",
+            "no_traffic_interval",
+            "http_health_check",
+            "tcp_health_check",
+            "grpc_health_check",
+            "custom_health_check",
+        ],
+        // `send`, `receive`, `response_buffer_size`, `request_headers_to_add`,
+        // `request_headers_to_remove`, `retriable_statuses`,
+        // `codec_client_type`, `service_name_matcher`, and `method` are not
+        // implemented -- no HTTP-body payload matching, no header injection,
+        // no retriable-status bucket, always GET/1.1.
+        "envoy.config.core.v3.HealthCheck.HttpHealthCheck" => {
+            &["host", "path", "expected_statuses"]
+        }
+        // `proxy_protocol_config` is not implemented.
+        "envoy.config.core.v3.HealthCheck.TcpHealthCheck" => &["send", "receive"],
+        "envoy.config.core.v3.HealthCheck.Payload" => &["text", "binary"],
+        "envoy.type.v3.Int64Range" => &["start", "end"],
         "envoy.config.endpoint.v3.ClusterLoadAssignment" => &["cluster_name", "endpoints"],
         "envoy.config.endpoint.v3.LocalityLbEndpoints" => &["lb_endpoints", "priority"],
         "envoy.config.endpoint.v3.LbEndpoint" => &["endpoint", "load_balancing_weight"],
@@ -657,6 +697,8 @@ const DEFAULT_CONN_BUFFER_LIMIT: u32 = 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 /// Envoy default route timeout: 15s (S4).
 const DEFAULT_ROUTE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+/// Envoy default `HealthCheck.no_traffic_interval` (S6, WP-18): 60s.
+const DEFAULT_NO_TRAFFIC_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 fn convert_listener(l: &listener_v3::Listener, path: &str) -> Result<ListenerConfig, ConfigError> {
     let addr_path = format!("{path}.address");
@@ -2201,6 +2243,18 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // is per-provider, so it rides the same `Cluster.metadata.filter_metadata`
     // smuggling channel as credentials above, under its own namespace.
     let usage_dialect = convert_usage_dialect_metadata(c.metadata.as_ref(), path)?;
+    // S6 active health checking (WP-18): meaningful on an aggregate too, in
+    // principle, but Envoy runs health checks against a cluster's own hosts
+    // -- an aggregate has none -- so `c.health_checks` on one is inert the
+    // same way `load_assignment` is, and gets the same treatment below.
+    if is_aggregate && !c.health_checks.is_empty() {
+        return Err(invalid(
+            format!("{path}.health_checks"),
+            "inert on an aggregate cluster: it has no hosts of its own to probe -- health \
+             checking belongs on the member cluster that actually serves the request",
+        ));
+    }
+    let health_check = convert_health_check(&c.health_checks, path)?;
 
     Ok(ClusterConfig {
         name: c.name.clone(),
@@ -2217,7 +2271,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         upstream_protocol,
         request_headers_to_add,
         usage_dialect,
-        health_check: None,
+        health_check,
     })
 }
 
@@ -2609,6 +2663,234 @@ fn convert_circuit_breakers(
         default: default_bucket.unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT),
         high: high_bucket.unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT),
     })
+}
+
+/// S6: lower Envoy's repeated `health_checks` to the IR's singular
+/// `HealthCheckIR` -- see that type's doc for why more than one is rejected
+/// rather than silently narrowed to the first.
+fn convert_health_check(
+    health_checks: &[core_v3::HealthCheck],
+    path: &str,
+) -> Result<Option<HealthCheckIR>, ConfigError> {
+    if health_checks.is_empty() {
+        return Ok(None);
+    }
+    if health_checks.len() > 1 {
+        return Err(unsupported(
+            format!("{path}.health_checks[1]"),
+            "only one health check per cluster is implemented; running the first while \
+             ignoring the rest would silently approximate the config",
+        ));
+    }
+    let hc = &health_checks[0];
+    let hc_path = format!("{path}.health_checks[0]");
+
+    // Envoy's own PGV rules mark all four required (`duration.required` on
+    // `timeout`/`interval`, `message.required` on the two thresholds); this
+    // duplicates that check rather than leaning on it so the error here
+    // names the field's own path even if a caller ever reaches this function
+    // without having run PGV first (same defensiveness as `endpoint.
+    // ok_or_else` above in `convert_endpoint`).
+    let timeout = to_std_duration(
+        hc.timeout
+            .as_ref()
+            .ok_or_else(|| invalid(format!("{hc_path}.timeout"), "timeout is required"))?,
+        &format!("{hc_path}.timeout"),
+    )?;
+    let interval = to_std_duration(
+        hc.interval
+            .as_ref()
+            .ok_or_else(|| invalid(format!("{hc_path}.interval"), "interval is required"))?,
+        &format!("{hc_path}.interval"),
+    )?;
+    let interval_jitter = match &hc.interval_jitter {
+        Some(d) => to_std_duration(d, &format!("{hc_path}.interval_jitter"))?,
+        None => StdDuration::ZERO,
+    };
+    let unhealthy_threshold = hc.unhealthy_threshold.ok_or_else(|| {
+        invalid(
+            format!("{hc_path}.unhealthy_threshold"),
+            "unhealthy_threshold is required",
+        )
+    })?;
+    let healthy_threshold = hc.healthy_threshold.ok_or_else(|| {
+        invalid(
+            format!("{hc_path}.healthy_threshold"),
+            "healthy_threshold is required",
+        )
+    })?;
+    let no_traffic_interval = match &hc.no_traffic_interval {
+        Some(d) => to_std_duration(d, &format!("{hc_path}.no_traffic_interval"))?,
+        None => DEFAULT_NO_TRAFFIC_INTERVAL,
+    };
+
+    use core_v3::health_check::HealthChecker;
+    let kind = match &hc.health_checker {
+        Some(HealthChecker::HttpHealthCheck(http)) => {
+            convert_http_health_check(http, &format!("{hc_path}.http_health_check"))?
+        }
+        Some(HealthChecker::TcpHealthCheck(tcp)) => {
+            convert_tcp_health_check(tcp, &format!("{hc_path}.tcp_health_check"))?
+        }
+        // Both rejected outright rather than lowered to a stub that always
+        // reports healthy -- see `HealthCheckKindIR`'s doc. Reachable
+        // despite the surface walk allowing these two field names through
+        // (see the `allowed_fields` comment above `"envoy.config.core.v3.
+        // HealthCheck"`): this match runs after that walk and gives the
+        // operator-facing reason instead of the walk's generic text.
+        Some(HealthChecker::GrpcHealthCheck(_)) => {
+            return Err(unsupported(
+                format!("{hc_path}.grpc_health_check"),
+                "gRPC health checks are not implemented",
+            ))
+        }
+        Some(HealthChecker::CustomHealthCheck(_)) => {
+            return Err(unsupported(
+                format!("{hc_path}.custom_health_check"),
+                "custom health checks are not implemented",
+            ))
+        }
+        None => {
+            return Err(invalid(
+                &hc_path,
+                "a health_checker is required (http_health_check or tcp_health_check)",
+            ))
+        }
+    };
+
+    Ok(Some(HealthCheckIR {
+        interval,
+        timeout,
+        interval_jitter,
+        unhealthy_threshold,
+        healthy_threshold,
+        no_traffic_interval,
+        kind,
+    }))
+}
+
+fn convert_http_health_check(
+    http: &core_v3::health_check::HttpHealthCheck,
+    path: &str,
+) -> Result<HealthCheckKindIR, ConfigError> {
+    let mut expected_statuses = Vec::new();
+    for (i, range) in http.expected_statuses.iter().enumerate() {
+        expand_status_range(
+            range,
+            &format!("{path}.expected_statuses[{i}]"),
+            &mut expected_statuses,
+        )?;
+    }
+    Ok(HealthCheckKindIR::Http {
+        path: http.path.clone(),
+        expected_statuses,
+        host: if http.host.is_empty() {
+            None
+        } else {
+            Some(http.host.clone())
+        },
+    })
+}
+
+/// Expand one half-open `Int64Range` (start inclusive, end exclusive -- see
+/// the proto's own doc on `Int64Range`) into `HealthCheckKindIR::Http`'s flat
+/// `u16` list. Rejects a range outside `[100, 600)` -- the only statuses a
+/// health check response can legally carry -- or with `end <= start`, since
+/// either would otherwise produce a `u16` that does not correspond to a real
+/// status code.
+fn expand_status_range(
+    range: &type_v3::Int64Range,
+    path: &str,
+    out: &mut Vec<u16>,
+) -> Result<(), ConfigError> {
+    if range.end <= range.start {
+        return Err(invalid(
+            path,
+            format!(
+                "range end ({}) must be greater than start ({})",
+                range.end, range.start
+            ),
+        ));
+    }
+    if range.start < 100 || range.end > 600 {
+        return Err(invalid(
+            path,
+            format!(
+                "range [{}, {}) falls outside the only statuses a health check response can \
+                 carry, [100, 600)",
+                range.start, range.end
+            ),
+        ));
+    }
+    // Rust note: bounds are already proven to fit `u16` (100..=599) by the
+    // checks above, so this cast never truncates.
+    out.extend((range.start..range.end).map(|status| status as u16));
+    Ok(())
+}
+
+fn convert_tcp_health_check(
+    tcp: &core_v3::health_check::TcpHealthCheck,
+    path: &str,
+) -> Result<HealthCheckKindIR, ConfigError> {
+    let send = match &tcp.send {
+        Some(p) => convert_payload(p, &format!("{path}.send"))?,
+        None => Vec::new(),
+    };
+    if tcp.receive.len() > 1 {
+        return Err(unsupported(
+            format!("{path}.receive[1]"),
+            "only one `receive` payload per TCP health check is implemented; the IR carries a \
+             single `expect`",
+        ));
+    }
+    let expect = match tcp.receive.first() {
+        Some(p) => convert_payload(p, &format!("{path}.receive[0]"))?,
+        None => Vec::new(),
+    };
+    Ok(HealthCheckKindIR::Tcp { send, expect })
+}
+
+/// `Payload.text` is HEX-ENCODED (Envoy's own doc: `"000000FF"` decodes to
+/// four bytes), never raw text; `Payload.binary` is already raw bytes.
+/// Getting this backwards silently changes what a TCP health check sends or
+/// matches without any error -- exactly ground rule #1's failure mode.
+fn convert_payload(
+    payload: &core_v3::health_check::Payload,
+    path: &str,
+) -> Result<Vec<u8>, ConfigError> {
+    use core_v3::health_check::payload::Payload as PayloadKind;
+    match &payload.payload {
+        Some(PayloadKind::Text(hex)) => decode_hex_payload(hex, &format!("{path}.text")),
+        Some(PayloadKind::Binary(bytes)) => Ok(bytes.clone()),
+        None => Err(invalid(path, "payload is required (text or binary)")),
+    }
+}
+
+fn decode_hex_payload(hex: &str, path: &str) -> Result<Vec<u8>, ConfigError> {
+    // Rust note: work over bytes rather than `&str` slicing -- `hex[i..i+2]`
+    // would panic on a non-ASCII input that lands a byte index off a char
+    // boundary, before we ever get the chance to report an ordinary
+    // "not valid hex" error instead.
+    let bytes = hex.as_bytes();
+    if !hex.is_ascii() || !bytes.len().is_multiple_of(2) {
+        return Err(invalid(
+            path,
+            format!(
+                "`{hex}` is not valid hex (must be ASCII with an even number of digits, e.g. \
+                 \"000000FF\")"
+            ),
+        ));
+    }
+    bytes
+        .chunks(2)
+        .map(|pair| {
+            // `str::from_utf8` cannot fail: `is_ascii` above already proved
+            // every byte is a single-byte UTF-8 char boundary.
+            let digits = std::str::from_utf8(pair).expect("ascii-checked above");
+            u8::from_str_radix(digits, 16)
+                .map_err(|_| invalid(path, format!("`{hex}` is not valid hex")))
+        })
+        .collect()
 }
 
 fn convert_endpoint(
