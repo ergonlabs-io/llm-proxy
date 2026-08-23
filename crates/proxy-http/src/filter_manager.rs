@@ -46,20 +46,37 @@
 //! helper, for the same reason: no response should bypass the chain filters
 //! were installed to observe.
 //!
+//! Chunk 4 adds the decode-side **StopAll stall / out-of-band resume** model
+//! (an unresumed `StopAllIterationAndBuffer`/`Watermark` hold now genuinely
+//! stalls the stream instead of falling through to the terminal — see
+//! [`drive_decode`]'s watermark/StopAll branch and [`wait_for_decode_resume`]'s
+//! doc for the hazard that buys) and **decode watermark buffering** (a
+//! recorded signal on a fully-buffered path — see the paragraph below).
+//! `StopIterationAndWatermark`/`StopAllIterationAndWatermark` overflow now
+//! records [`ChainCtx::decode_high_watermark`] and keeps buffering instead of
+//! 413ing; genuine backpressure (readDisable / HTTP/2 flow control) still
+//! isn't expressible, because that needs a decode *read* to disable, and
+//! decode stays fully buffered (module doc above) — there's nothing to
+//! disable, only a signal to have recorded once decode streams (a later
+//! chunk). The still-open decode-side S2.2 gotcha — `StopAll*` does not yet
+//! skip *its own* filter's data/trailers callbacks the way the encode-side
+//! `StreamingEncoder` does (see [`StopKind::StopAll`]'s doc) — is unchanged
+//! by this chunk; it's a separate, still-tracked gap.
+//!
 //! Deferred to later chunks:
-//! watermark backpressure (treated as plain buffering for now); 1xx (S2.6);
-//! `inject_*_to_filter_chain` and `ContinueAndDontEndStream` (S2.7); lazy route
-//! resolution + cache (S2.8, needs the WP-12 route table); resetting the
-//! downstream stream when a filter stalls forever past end-of-stream, or when
-//! an encode header-hold is never resolved before the upstream response ends
-//! (both noted at their call sites); an out-of-callback `continue_encoding()`
-//! that could wake a *pending* `poll_frame` (today it only matters if observed
-//! synchronously inside a callback — there's no waker registered for a filter
-//! that decides to continue later, e.g. after async work); a genuine stream
-//! **reset** for `send_local_reply` called after response headers have
-//! already been forwarded — we have no reset primitive through the body seam
-//! yet, so that case terminates the body with a [`BodyError`] instead (noted
-//! at [`DecoderCallbacksAdapter::send_local_reply`]). The ~60-case S2
+//! 1xx (S2.6); resetting the downstream stream when a filter stalls forever
+//! past end-of-stream, or when an encode header-hold is never resolved
+//! before the upstream response ends (both noted at their call sites); an
+//! out-of-callback `continue_encoding()` that could wake a *pending*
+//! `poll_frame` (today it only matters if observed synchronously inside a
+//! callback — there's no waker registered for a filter that decides to
+//! continue later, e.g. after async work — [`DecodeContinueHandle`] is the
+//! decode-side fix for the equivalent decode gap, chunk 4; encode's own
+//! version is still open); a genuine stream **reset** for `send_local_reply`
+//! called after response headers have already been forwarded — we have no
+//! reset primitive through the body seam yet, so that case terminates the
+//! body with a [`BodyError`] instead (noted at
+//! [`DecoderCallbacksAdapter::send_local_reply`]). The ~60-case S2
 //! conformance suite (chunk 2, already landed for decode) is what will keep
 //! pinning every corner as the remaining items land.
 //!
@@ -103,6 +120,7 @@ use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Frame};
+use tokio::sync::Notify;
 
 use proxy_config::ir::{AccessLogIR, PerFilterConfig, RouteEntry, RouteTable};
 use proxy_config::ConfigError;
@@ -111,10 +129,10 @@ use crate::access_logging::{
     snapshot_request, AccessLogContext, AccessLoggerRuntime, LoggingBody, RequestSnapshot,
 };
 use crate::filter::{
-    BufferedBody, DecoderCallbacks, EncoderCallbacks, FilterDataStatus, FilterHeadersStatus,
-    FilterInstanceFactory, FilterTrailersStatus, HeaderMutationFn, HttpFilter, HttpFilterFactory,
-    PerRouteConfig, RequestHeaders, RequestTrailers, ResponseHeaders, ResponseTrailers,
-    TerminalFilterInstanceFactory, TerminalHttpFilter,
+    BufferedBody, DecodeContinueHandle, DecoderCallbacks, EncoderCallbacks, FilterDataStatus,
+    FilterHeadersStatus, FilterInstanceFactory, FilterTrailersStatus, HeaderMutationFn, HttpFilter,
+    HttpFilterFactory, PerRouteConfig, RequestHeaders, RequestTrailers, ResponseHeaders,
+    ResponseTrailers, TerminalFilterInstanceFactory, TerminalHttpFilter,
 };
 use crate::handler::{
     local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody as SeamBody,
@@ -730,6 +748,21 @@ struct DirectionState {
     /// of the status is that the stream is no longer known to be over, and
     /// that is a fact about the stream, not about one filter's view of it.
     dont_end_stream: bool,
+    /// WP-11 chunk 4 (I3): the decode direction's out-of-band resume signal
+    /// — what [`DecoderCallbacksAdapter::continue_handle`] hands out
+    /// (wrapped in a [`DecodeContinueHandle`]) and what
+    /// [`wait_for_decode_resume`] parks on. One per direction, not one per
+    /// filter: only one `StopAll*` hold is ever outstanding at a time (the
+    /// decode pointer machine is strictly sequential), so there's nothing to
+    /// disambiguate.
+    ///
+    /// Rust note: `Rc<Notify>`, not a plain `Notify` field — the handle
+    /// clones this out and must be able to outlive the `&mut ChainCtx`
+    /// borrow that produced it (that's the entire point of the handle: a
+    /// filter stashes it and calls it back later, from outside callback
+    /// context). `Notify::default()` builds a fresh, never-fired `Notify`,
+    /// same as `Notify::new()`.
+    resume: Rc<Notify>,
 }
 
 /// Encode-side counterpart to [`DirectionState`]. Unlike decode, encode is
@@ -879,6 +912,25 @@ struct ChainCtx {
     /// (`drive_decode`) returns, exactly the point configured decoder
     /// filters stop getting a say over what the terminal forwards upstream.
     decoded_headers_forwarded: bool,
+    /// WP-11 chunk 4 (design C): the decode direction's high-watermark
+    /// signal — set once a filter's own buffered bytes exceed `buffer_limit`
+    /// while that filter is in one of the `*AndWatermark` statuses (see
+    /// [`check_decode_overflow`]). `Rc<RefCell<..>>`, not a plain `bool` on
+    /// [`DirectionState`], for the identical reason as
+    /// [`Self::request_headers_snapshot`] above: `ChainCtx` moves into
+    /// `FilterManager`/`StreamingEncoder` and is gone by the time `run()`
+    /// returns, but a caller needs to read this back afterward — clone the
+    /// `Rc` out before handing `ChainCtx` to `FilterManager`, same pattern.
+    ///
+    /// Read today only by `filter_manager::tests` (`#[allow(dead_code)]`
+    /// below covers the plain-`cargo build` case, where `mod tests` isn't
+    /// compiled at all): there is no production *consumer* of this signal
+    /// yet, because genuine backpressure (readDisable / HTTP/2 flow control)
+    /// needs a decode *read* to disable, and decode stays fully buffered
+    /// until decode streams (a later chunk, module doc). This field is
+    /// exactly what that future consumer will read.
+    #[allow(dead_code)]
+    decode_high_watermark: Rc<RefCell<bool>>,
 }
 
 impl ChainCtx {
@@ -902,6 +954,7 @@ impl ChainCtx {
             reset_after_headers: false,
             request_headers_snapshot: Rc::new(RefCell::new(None)),
             decoded_headers_forwarded: false,
+            decode_high_watermark: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -2228,6 +2281,48 @@ impl Drop for StreamingEncoder {
     }
 }
 
+/// WP-11 chunk 4 (design C): the shared decode buffer-limit check. Overflow
+/// while `is_watermark` is `true` (the callback that just ran returned one of
+/// the `*AndWatermark` statuses) records
+/// [`ChainCtx::decode_high_watermark`] and keeps buffering instead of
+/// rejecting — the S2.2/S2.3 contract for those statuses is backpressure, not
+/// an error. Every other overflow still 413s, unchanged. Shared by every
+/// decode overflow check site so they all agree on this distinction.
+fn check_decode_overflow(
+    ctx: &mut ChainCtx,
+    buffer_limit: usize,
+    is_watermark: bool,
+) -> Result<(), http::StatusCode> {
+    if ctx.decode.buffer.0.len() <= buffer_limit {
+        return Ok(());
+    }
+    if is_watermark {
+        *ctx.decode_high_watermark.borrow_mut() = true;
+        Ok(())
+    } else {
+        Err(http::StatusCode::PAYLOAD_TOO_LARGE)
+    }
+}
+
+/// WP-11 chunk 4 (design B, I3): park the decode driver on the direction's
+/// out-of-band resume signal — the only place decode genuinely stalls the
+/// stream (a `StopAllIterationAndBuffer`/`Watermark` hold whose own data
+/// callback also declined to continue) rather than falling through.
+///
+/// # What this buys, and what it does not
+///
+/// An unresumed `StopAll*` hold now holds the stream **forever**: there is
+/// still no HCM `stream_idle_timeout` inheritance (WP-13) to bound it. That
+/// is Envoy's own layering — the idle timeout, not the filter manager, is
+/// what caps a stalled stream — but it is a real hazard for anything driving
+/// this code path without one configured. **Any caller that can reach this
+/// await point in a test MUST wrap the call in `tokio::time::timeout`**, or
+/// an unresumed hold trips nextest's `terminate-after` as an anonymous hang
+/// instead of a named assertion failure.
+async fn wait_for_decode_resume(ctx: &ChainCtx) {
+    ctx.decode.resume.notified().await;
+}
+
 /// Drive the decoder chain over a fully-buffered request. Returns `Err(status)`
 /// if a filter's buffering overflowed `buffer_limit` (→ 413) — the only failure
 /// this chunk raises. `body` may be mutated in place by `decode_data`.
@@ -2255,6 +2350,14 @@ impl Drop for StreamingEncoder {
 /// `decode_data` can now also mean "ask the filter if it has async work"
 /// (`HttpFilter::poll_pending`) instead of only "wait for `continue_decoding()`".
 /// See [`poll_async_resumption`] for the shared retry policy both call sites use.
+///
+/// WP-11 chunk 4 (design B): a `StopAllIterationAndBuffer`/`Watermark` header
+/// hold that the filter's own data callback also declines to continue is no
+/// longer treated as "give up and fall through" — it genuinely stalls this
+/// `async fn`'s future (see [`wait_for_decode_resume`]) until
+/// [`DecodeContinueHandle::continue_decoding`] releases it. Plain
+/// `StopIteration` keeps today's fallthrough (still-open, separate gap — see
+/// the module doc); only the StopAll statuses changed here.
 async fn drive_decode(
     filters: &mut [Box<dyn HttpFilter>],
     ctx: &mut ChainCtx,
@@ -2291,10 +2394,14 @@ async fn drive_decode(
         // here (see the trait doc).
         let mut cb = DecoderCallbacksAdapter::new(ctx);
         let status = filters[idx].decode_headers(&mut cb, head, end_stream_on_headers);
-        // A filter that buffered via add_decoded_data must not exceed the limit.
-        if ctx.decode.buffer.0.len() > buffer_limit {
-            return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
-        }
+        // A filter that buffered via add_decoded_data must not exceed the
+        // limit -- unless it's watermarking (design C): see
+        // `check_decode_overflow`'s doc.
+        check_decode_overflow(
+            ctx,
+            buffer_limit,
+            matches!(status, FilterHeadersStatus::StopAllIterationAndWatermark),
+        )?;
         // S2.7: deliver anything `idx` injected out-of-band before doing
         // anything else with its status — injected data reaches subsequent
         // filters immediately, not whenever the normal pointer machine
@@ -2355,6 +2462,17 @@ async fn drive_decode(
                 }
                 // Headers held at `idx`. Deliver the (buffered) data to this same
                 // filter; if it continues, resume header delivery at the next.
+                //
+                // WP-11 chunk 4 (design B): only a StopAll* header status
+                // (never plain `StopIteration`) makes this a genuine stall
+                // if the filter's own data callback also declines to
+                // continue -- see `deliver_decode_data`'s `is_stop_all`
+                // parameter and the module doc's "what this buys" note.
+                let is_stop_all = matches!(
+                    status,
+                    FilterHeadersStatus::StopAllIterationAndBuffer
+                        | FilterHeadersStatus::StopAllIterationAndWatermark
+                );
                 let continued = deliver_decode_data(
                     filters,
                     ctx,
@@ -2365,6 +2483,7 @@ async fn drive_decode(
                     &mut data_consumed,
                     head,
                     &mut resumptions,
+                    is_stop_all,
                 )
                 .await?;
                 // S2.5: a `send_local_reply` from this filter's data/trailers
@@ -2398,6 +2517,11 @@ async fn drive_decode(
             &mut data_consumed,
             head,
             &mut resumptions,
+            // `is_stop_all: false` — every filter reaching this loop already
+            // continued past `decode_headers` (that's what put it in
+            // `[0, header_reach)`), so there is no outstanding StopAll
+            // header hold to stall on here.
+            false,
         )
         .await?;
         // S2.5: stop the trailing-data phase too if a local reply was requested.
@@ -2498,6 +2622,15 @@ async fn poll_async_resumption(
 /// `drive_decode`'s header phase uses) lets a filter that stopped on
 /// `decode_data` also be offered an async resumption before this falls back
 /// to "stopped, wait for `continue_decoding()`" — see [`poll_async_resumption`].
+///
+/// WP-11 chunk 4 (design B): `is_stop_all` is `true` exactly when `idx`'s
+/// `decode_headers` returned `StopAllIterationAndBuffer`/`Watermark` — i.e.
+/// this call is resolving a StopAll hold, not a plain `StopIteration` one
+/// (`false` from every trailing-phase call: see that call site's doc). When
+/// it's `true` and every synchronous avenue (a `Continue` status, an
+/// in-callback `continue_decoding()`, an async `poll_pending` resumption)
+/// has declined, this genuinely parks on [`wait_for_decode_resume`] instead
+/// of giving up — see that function's doc for the hazard that buys.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_decode_data(
     filters: &mut [Box<dyn HttpFilter>],
@@ -2509,6 +2642,7 @@ async fn deliver_decode_data(
     data_consumed: &mut [bool],
     head: &mut RequestHeaders,
     resumptions: &mut [u32],
+    is_stop_all: bool,
 ) -> Result<bool, http::StatusCode> {
     data_consumed[idx] = true;
     ctx.decode.continue_requested = false;
@@ -2518,23 +2652,40 @@ async fn deliver_decode_data(
     // `decode_headers` call.
     sync_route_head(ctx, head);
     let end_stream = trailers.is_none();
+    // WP-11 chunk 4 (I3): once an out-of-band `continue_decoding()` has
+    // released a StopAll hold, the NEXT loop iteration must not re-invoke
+    // `decode_data` -- it already ran once and declined; the out-of-band
+    // signal itself is what "continues" it now. This flag is what lets one
+    // `loop` body serve both the ordinary synchronous path and the
+    // resumed-after-park path without duplicating the trailers-delivery
+    // logic below.
+    let mut resumed_out_of_band = false;
     // ADR-0004 step 2: a `loop` because a filter may ask for (bounded) async
     // resumptions before it finally continues or gives up; every other
     // iteration is the same synchronous `decode_data` call chunk 1 always made.
     loop {
-        // WP-45 increment 2b: `head` has no competing borrow here (no
-        // `headers` parameter on `decode_data`), so `cb` holds the real
-        // borrow directly — no clone, no splice-back.
-        let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
-        let status = filters[idx].decode_data(&mut cb, body, end_stream);
-        if ctx.decode.buffer.0.len() > buffer_limit {
-            return Err(http::StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        // S2.7: `idx` may have injected data out-of-band from `decode_data` —
-        // deliver it to filters after `idx` before deciding anything else.
-        drain_decode_injections(filters, ctx, buffer_limit, head)?;
-        let continued =
-            matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested;
+        let continued = if resumed_out_of_band {
+            true
+        } else {
+            // WP-45 increment 2b: `head` has no competing borrow here (no
+            // `headers` parameter on `decode_data`), so `cb` holds the real
+            // borrow directly — no clone, no splice-back.
+            let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
+            let status = filters[idx].decode_data(&mut cb, body, end_stream);
+            // A filter that buffered via add_decoded_data must not exceed
+            // the limit -- unless it's watermarking (design C): see
+            // `check_decode_overflow`'s doc.
+            check_decode_overflow(
+                ctx,
+                buffer_limit,
+                matches!(status, FilterDataStatus::StopIterationAndWatermark),
+            )?;
+            // S2.7: `idx` may have injected data out-of-band from
+            // `decode_data` — deliver it to filters after `idx` before
+            // deciding anything else.
+            drain_decode_injections(filters, ctx, buffer_limit, head)?;
+            matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested
+        };
 
         if continued {
             if let Some(t) = trailers {
@@ -2579,6 +2730,30 @@ async fn deliver_decode_data(
         // `poll_async_resumption` may have set `ctx.local_reply` itself
         // (resumption budget exhausted); either way the caller's own
         // `ctx.local_reply.is_some()` check right after this call handles it.
+        if ctx.local_reply.is_some() {
+            return Ok(false);
+        }
+
+        // WP-11 chunk 4 (design B): a StopAll hold with no synchronous or
+        // async resolution left genuinely stalls now, rather than giving up.
+        // See `wait_for_decode_resume`'s doc for the hazard this trades in
+        // (an unresumed hold blocks forever) and why every caller reaching
+        // this in a test MUST bound it with `tokio::time::timeout`.
+        if is_stop_all {
+            wait_for_decode_resume(ctx).await;
+            if ctx.local_reply.is_some() {
+                return Ok(false);
+            }
+            // Resumed out-of-band: per `DecoderCallbacks::continue_decoding`'s
+            // doc ("resume iteration at the next filter, replaying buffered
+            // body then trailers"), treat this exactly like a synchronous
+            // `continue_decoding()` would have -- deliver trailers (if any)
+            // to this SAME filter next time through the loop, without
+            // re-invoking `decode_data` (it already ran once and declined).
+            resumed_out_of_band = true;
+            continue;
+        }
+
         return Ok(false);
     }
 }
@@ -2721,6 +2896,13 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
 
     fn continue_decoding(&mut self) {
         self.ctx.decode.continue_requested = true;
+    }
+
+    fn continue_handle(&mut self) -> DecodeContinueHandle {
+        // WP-11 chunk 4 (I3): wired to the direction's REAL resume signal —
+        // unlike the trait's default (a throwaway `Notify` nobody awaits),
+        // this is the one `wait_for_decode_resume` actually parks on.
+        DecodeContinueHandle::new(self.ctx.decode.resume.clone())
     }
 
     fn add_decoded_data(&mut self, data: Bytes, _streaming: bool) {

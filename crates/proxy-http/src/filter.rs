@@ -12,12 +12,14 @@
 //! the set of filters on a stream is decided by config at runtime.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use proxy_config::ir::RouteEntry;
 use proxy_config::ConfigError;
+use tokio::sync::Notify;
 
 use crate::handler::HttpResponseParts;
 use crate::stream_info::StreamInfo;
@@ -101,6 +103,50 @@ pub struct BufferedBody(pub BytesMut);
 /// cross threads. Used to let `send_local_reply` callers mutate response headers.
 pub type HeaderMutationFn = Box<dyn FnOnce(&mut HeaderMap) + Send>;
 
+/// A cloneable handle that resumes a decode-direction `StopAll*` hold from
+/// OUTSIDE callback context (WP-11 chunk 4 — S2.2's "out-of-band continue"
+/// case, the one thing [`DecoderCallbacks::continue_decoding`] can't do,
+/// since that method only exists on the callbacks borrow, which does not
+/// outlive the callback that received it). A filter that stops all
+/// iteration to wait on work that resolves independently of
+/// [`HttpFilter::poll_pending`] (a webhook callback, a timer, some other
+/// out-of-band event) stashes this handle during the callback and calls
+/// [`Self::continue_decoding`] on it whenever that work finishes — possibly
+/// long after the callback that produced it has returned.
+///
+/// Rust note: `Rc<tokio::sync::Notify>`, not `Arc` — the filter manager is
+/// per-worker and single-threaded (`ChainCtx` holds `Rc<RefCell<StreamInfo>>`
+/// for the identical reason, ADR-0003), so this handle is `!Send` by design
+/// and never needs to cross a thread. `Notify` specifically (not a plain
+/// `bool` flag) because it **stores a permit**: a `notify_one()` that lands
+/// before the driver ever awaits `notified()` is not lost — the very next
+/// `.await` on it resolves immediately instead of parking. That is exactly
+/// the race this handle has to be safe against: a resume that arrives while
+/// the driver is still between callbacks (not yet parked) must not
+/// deadlock the stream by dropping the wakeup on the floor.
+#[derive(Clone)]
+pub struct DecodeContinueHandle {
+    resume: Rc<Notify>,
+}
+
+impl DecodeContinueHandle {
+    /// Built by whoever owns the real per-stream signal — the adapter
+    /// (`filter_manager::DecoderCallbacksAdapter::continue_handle`) wires
+    /// this to the direction's actual resume `Notify`; [`DecoderCallbacks::continue_handle`]'s
+    /// default builds a throwaway one instead (see that method's doc).
+    pub(crate) fn new(resume: Rc<Notify>) -> Self {
+        Self { resume }
+    }
+
+    /// Resume a stalled decode-direction `StopAll*` hold. Safe to call any
+    /// number of times, and safe to call before the driver has actually
+    /// parked on it (see the struct doc's `Notify` note) — a call that
+    /// "arrives early" is remembered, not dropped.
+    pub fn continue_decoding(&self) {
+        self.resume.notify_one();
+    }
+}
+
 /// Callbacks available to decoder (request-path) filters — S2.5 / S2.7 / S2.8.
 ///
 /// Rust note: filters receive `&mut dyn DecoderCallbacks` — a mutable borrow of a
@@ -120,6 +166,23 @@ pub trait DecoderCallbacks {
 
     /// Resume iteration at the NEXT filter, replaying buffered body then trailers.
     fn continue_decoding(&mut self);
+
+    /// A cloneable handle that can call the equivalent of
+    /// [`Self::continue_decoding`] from OUTSIDE callback context (WP-11
+    /// chunk 4) — see [`DecodeContinueHandle`]'s doc for the whole
+    /// out-of-band-continue story.
+    ///
+    /// Rust note: defaulted (like [`Self::modify_decoded_headers`] and
+    /// [`EncoderCallbacks::per_route_config`]) so existing test-double
+    /// implementors of this trait outside this increment's scope keep
+    /// compiling — the default builds a handle over its OWN throwaway
+    /// `Notify` that nothing ever awaits, so calling `continue_decoding()`
+    /// on it is a harmless no-op rather than a compile break. The real
+    /// adapter (`filter_manager::DecoderCallbacksAdapter`) overrides this
+    /// with a handle wired to the direction's actual resume signal.
+    fn continue_handle(&mut self) -> DecodeContinueHandle {
+        DecodeContinueHandle::new(Rc::new(Notify::new()))
+    }
 
     /// Append to the buffered body (legal from headers/data/trailers callbacks).
     fn add_decoded_data(&mut self, data: Bytes, streaming: bool);

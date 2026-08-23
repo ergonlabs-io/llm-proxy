@@ -101,6 +101,24 @@ struct ProbeFilter {
     /// `decode_headers`, so a test can assert a mutation made by an EARLIER
     /// async filter (during its resumption) is visible here.
     seen_decode_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
+    /// WP-11 chunk 4 (I3) test hook: if set, `decode_headers` stashes
+    /// `cb.continue_handle()` here so a test can call `continue_decoding()`
+    /// on it from OUTSIDE callback context — the whole point of the
+    /// out-of-band-continue case.
+    stash_decode_continue_handle: Option<Rc<RefCell<Option<DecodeContinueHandle>>>>,
+    /// WP-11 chunk 4 (design A) test hook: if set (with
+    /// `stash_decode_continue_handle`), `decode_headers` also calls
+    /// `continue_decoding()` on the handle SYNCHRONOUSLY, before returning —
+    /// i.e. before the driver has any chance to reach `wait_for_decode_resume`.
+    /// Pins the "permit stored before park" half of the `Notify` contract
+    /// deterministically, with no scheduler-timing dependence.
+    fire_continue_handle_immediately: bool,
+    /// WP-11 chunk 4 (design C) test hook: bytes appended via
+    /// `add_decoded_data` from `decode_data` (mirrors `add_decoded`, which
+    /// only fires from `decode_headers` — needed to trigger a
+    /// `StopIterationAndWatermark` overflow, since that status only exists
+    /// on `decode_data`, not `decode_headers`).
+    add_decoded_from_data: Option<Bytes>,
 }
 
 impl ProbeFilter {
@@ -127,6 +145,9 @@ impl ProbeFilter {
             seen_decode_data: None,
             inject_encoded: None,
             seen_decode_headers: None,
+            stash_decode_continue_handle: None,
+            fire_continue_handle_immediately: false,
+            add_decoded_from_data: None,
         }
     }
 
@@ -148,6 +169,13 @@ impl HttpFilter for ProbeFilter {
         }
         if let Some(data) = &self.add_decoded {
             cb.add_decoded_data(data.clone(), false);
+        }
+        if let Some(slot) = &self.stash_decode_continue_handle {
+            let handle = cb.continue_handle();
+            if self.fire_continue_handle_immediately {
+                handle.continue_decoding();
+            }
+            *slot.borrow_mut() = Some(handle);
         }
         if let Some((code, body, details)) = self.send_local_reply {
             // Rust note: building the `HeaderMutationFn` here means moving
@@ -182,6 +210,9 @@ impl HttpFilter for ProbeFilter {
         }
         if let Some((code, body, details)) = self.send_local_reply_from_data {
             cb.send_local_reply(code, body, None, details);
+        }
+        if let Some(data) = &self.add_decoded_from_data {
+            cb.add_decoded_data(data.clone(), false);
         }
         if let Some((data, end_stream)) = &self.inject_decoded {
             cb.inject_decoded_data_to_filter_chain(data.clone(), *end_stream);
@@ -508,6 +539,43 @@ async fn run_chain(
     (status, seen, resp_body)
 }
 
+/// Like [`run_chain`], but also returns the decode direction's high-watermark
+/// signal (WP-11 chunk 4, design C) -- cloned out of `ChainCtx` before it
+/// moves into `FilterManager`, the same escape-hatch pattern
+/// `ChainCtx::request_headers_snapshot` already uses (see that field's doc):
+/// `ChainCtx` is gone by the time `run()` returns, so anything a caller needs
+/// to read back afterward has to be an `Rc<RefCell<..>>` cloned out first.
+async fn run_chain_watermark(
+    filters: Vec<Box<dyn HttpFilter>>,
+    log: Log,
+    body: &'static [u8],
+    buffer_limit: usize,
+) -> (StatusCode, Bytes, Bytes, bool) {
+    let seen_body = Arc::new(Mutex::new(Bytes::new()));
+    let terminal = RecordingTerminal {
+        log: log.clone(),
+        term_log: None,
+        seen_body: seen_body.clone(),
+        seen_request_id: Arc::new(Mutex::new(None)),
+        seen_headers: None,
+        captured_body: Bytes::new(),
+    };
+    let ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
+    let watermark = ctx.decode_high_watermark.clone();
+    let mgr = FilterManager {
+        filters,
+        ctx,
+        terminal: Box::new(terminal),
+        buffer_limit,
+    };
+    let resp = mgr.run(request(body)).await;
+    let status = resp.head.status;
+    let resp_body = resp.body.collect().await.expect("resp body").to_bytes();
+    let seen = seen_body.lock().unwrap().clone();
+    let watermark = *watermark.borrow();
+    (status, seen, resp_body, watermark)
+}
+
 fn block_on<F: Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -643,6 +711,13 @@ fn stop_iteration_on_headers_still_delivers_data_to_that_filter_and_resumes() {
 
 /// S2.2/S2.3: a filter that holds headers and never continues stops everything
 /// past it — later filters see neither headers nor data.
+///
+/// WP-11 chunk 4 (design B): an unresumed `StopAllIterationAndBuffer` hold
+/// now genuinely stalls the stream rather than falling through (see
+/// `stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal`,
+/// which pins that half too), so `run_chain(..).await` here never completes
+/// on its own — bounded with `tokio::time::timeout` so a regression fails
+/// loudly instead of hanging.
 #[test]
 fn unresolved_header_hold_blocks_subsequent_filters() {
     block_on(async {
@@ -652,7 +727,11 @@ fn unresolved_header_hold_blocks_subsequent_filters() {
         a.decode_data_status = FilterDataStatus::StopIterationAndBuffer; // never continues
         let filters: Vec<Box<dyn HttpFilter>> =
             vec![Box::new(a), Box::new(ProbeFilter::new("b", log.clone()))];
-        let (_, _, _) = run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT),
+        )
+        .await;
 
         let entries = log.borrow().clone();
         assert!(
@@ -1250,23 +1329,16 @@ fn stop_all_iteration_and_buffer_encode_overflow_yields_500() {
 /// `StopKind::StopAll`. Setting `decode_data_status` here isolates THIS
 /// case's specific claim (terminal must not run) from that separate gap.
 ///
-/// NOTE: as written this still asserts the full S2.2 contract, including
-/// that the terminal handler must not run. See the task report: the terminal
-/// DOES run today (verified directly against `FilterManager::run`) —
-/// `drive_decode` returning `Ok(())` when a header hold never resolves does
-/// not stop `run()` from calling the terminal handler with whatever body
-/// currently exists. This is being reported as a suspected filter-manager
-/// bug, not weakened here to match observed behavior (per the Hard rule).
-///
-/// ORCHESTRATOR ADJUDICATION: deferred, not a live bug. A synchronous buffered
-/// decode can't represent "hold the request forever" — a StopAll that never
-/// resumes *should* stall the stream until an out-of-band `continue_()` (or a
-/// timeout) fires, which is the same chunk-4 resume machinery I3 defers. So
-/// "terminal is blocked" can't be asserted until that model exists. The
-/// implemented half — StopAll blocks *subsequent filters* (data + trailers) —
-/// is covered green by `stop_all_iteration_and_buffer_blocks_trailers` (G6).
+/// NOW REAL (WP-11 chunk 4, design B): an unresumed `StopAllIterationAndBuffer`
+/// hold genuinely stalls the stream instead of falling through — `drive_decode`
+/// parks on `wait_for_decode_resume` once every synchronous and
+/// async avenue has declined, and nothing here ever resumes it, so
+/// `run_chain(..).await` never completes on its own. Bounded with
+/// `tokio::time::timeout` (module-level requirement for any test that can
+/// reach the stall path), and the timeout firing IS part of the assertion —
+/// a regression that makes the stream fall through again would let `run_chain`
+/// complete well inside the deadline.
 #[test]
-#[ignore = "WP-11 chunk 4: StopAll blocks the terminal (needs stall / out-of-band resume model)"]
 fn stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal() {
     block_on(async {
         let log = log_of();
@@ -1275,7 +1347,17 @@ fn stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal() {
         a.decode_data_status = FilterDataStatus::StopIterationAndBuffer; // never continues
         let filters: Vec<Box<dyn HttpFilter>> =
             vec![Box::new(a), Box::new(ProbeFilter::new("b", log.clone()))];
-        run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresumed StopAll hold must stall the stream, not complete it \
+             (WP-11 chunk 4, design B)"
+        );
 
         let entries = log.borrow().clone();
         assert!(
@@ -1294,6 +1376,12 @@ fn stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal() {
 /// S2.2 (G6): `StopAllIterationAndBuffer` also blocks TRAILERS — a trailers
 /// frame must not slip past a StopAll'd filter to a subsequent filter. Same
 /// `decode_data_status` isolation as G5 above (see its doc comment).
+///
+/// WP-11 chunk 4 (design B): this is also a never-resumed StopAll hold, so
+/// it now genuinely stalls (see
+/// `stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal`
+/// for the dedicated test of that half); bounded with `tokio::time::timeout`
+/// so a regression fails loudly instead of hanging.
 #[test]
 fn stop_all_iteration_and_buffer_blocks_trailers() {
     block_on(async {
@@ -1306,7 +1394,11 @@ fn stop_all_iteration_and_buffer_blocks_trailers() {
         let mut trailers = HeaderMap::new();
         trailers.insert("x-trace", HeaderValue::from_static("1"));
         let req = request_with_trailers(b"hi", trailers);
-        run_chain_req(filters, log.clone(), req, DEFAULT_BUFFER_LIMIT).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_chain_req(filters, log.clone(), req, DEFAULT_BUFFER_LIMIT),
+        )
+        .await;
 
         let entries = log.borrow().clone();
         assert!(
@@ -1911,73 +2003,183 @@ fn encode_continue_and_dont_end_stream_forwards_headers_with_end_stream_false() 
 
 /// S2.2 (I3): `StopAllIterationAndBuffer` RESUME — after the block, only an
 /// out-of-band `continue_decoding()` should release the buffered
-/// headers+data+trailers to subsequent filters in order. Today: "nothing here
-/// re-invokes the filter" (module doc; filter_manager.rs L631-636/L729/L747
-/// for the encode-side analogue).
+/// headers+data+trailers to subsequent filters in order.
+///
+/// NOW REAL (WP-11 chunk 4, design A/B): `cb.continue_handle()` gives `a` a
+/// [`DecodeContinueHandle`] it stashes in `handle_slot`, OUTLIVING the
+/// `decode_headers`/`decode_data` callbacks that produced it. `a`'s own
+/// `decode_data` is set to a never-continuing `StopIterationAndBuffer` (like
+/// `stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal`)
+/// so the driver has no SYNCHRONOUS way to resolve the hold and must
+/// actually park on `wait_for_decode_resume`. The request is driven on a
+/// `LocalSet` (`spawn_local`, since the whole filter-manager future is
+/// `!Send`, ADR-0003) so this test can poll it forward far enough to reach
+/// that park point, retrieve the handle, and THEN call
+/// `continue_decoding()` on it — from genuinely outside callback context,
+/// the whole point of the case — while the driver task is still parked.
 #[test]
-#[ignore = "WP-11 chunk 4: StopAll out-of-band resume"]
 fn stop_all_iteration_and_buffer_resumes_via_out_of_band_continue() {
-    block_on(async {
+    let local = tokio::task::LocalSet::new();
+    block_on(local.run_until(async {
         let log = log_of();
+        let handle_slot: Rc<RefCell<Option<DecodeContinueHandle>>> = Rc::new(RefCell::new(None));
         let mut a = ProbeFilter::new("a", log.clone());
         a.decode_headers_status = FilterHeadersStatus::StopAllIterationAndBuffer;
+        a.decode_data_status = FilterDataStatus::StopIterationAndBuffer; // never continues on its own
+        a.stash_decode_continue_handle = Some(handle_slot.clone());
         let filters: Vec<Box<dyn HttpFilter>> =
             vec![Box::new(a), Box::new(ProbeFilter::new("b", log.clone()))];
-        // There is no out-of-callback handle to call `continue_decoding()`
-        // from once `run()` has already returned control past the stopped
-        // filter — that's precisely the missing primitive this case targets.
-        // The correct assertion, once it exists: an out-of-band
-        // `continue_decoding()` call releases `b`'s decode_headers/decode_data.
-        let (_, _, _) = run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT).await;
+
+        let driver =
+            tokio::task::spawn_local(run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT));
+
+        // Give the driver task turns until it has run decode_headers (which
+        // stashes the handle) and parked on the resume signal. Polling in a
+        // loop rather than assuming one `yield_now()` suffices: what matters
+        // for this test is that the handle genuinely arrived from outside
+        // callback context, not the exact number of scheduler turns that
+        // takes.
+        let mut handle = None;
+        for _ in 0..64 {
+            if let Some(h) = handle_slot.borrow_mut().take() {
+                handle = Some(h);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let handle =
+            handle.expect("the filter must have stashed a continue_handle() by now — log a bug");
+        handle.continue_decoding();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .expect("an out-of-band continue_decoding() must not deadlock the stream")
+            .expect("driver task panicked");
+        let (status, _, _) = result;
+        assert_eq!(status, StatusCode::OK);
+
         let entries = log.borrow().clone();
         assert!(
             entries.iter().any(|e| e == "b:decode_headers"),
             "an out-of-band continue_decoding() must release a StopAll hold; log: {entries:?}"
         );
+    }));
+}
+
+/// WP-11 chunk 4 (design A): the `Notify`-backed permit must not be lost when
+/// `continue_decoding()` is called BEFORE the driver ever parks — see
+/// [`DecodeContinueHandle`]'s doc for why `Notify::notify_one` specifically
+/// (not a plain flag) is what makes that safe. Pinned deterministically, no
+/// scheduler-timing dependence: `a` calls `continue_decoding()` on its own
+/// stashed handle synchronously, from INSIDE `decode_headers` itself —
+/// before `decode_data` (and so before `wait_for_decode_resume`) has any
+/// chance to run. If the permit were lost, `wait_for_decode_resume` would
+/// park forever with nobody left to wake it; bounded with a timeout anyway,
+/// per the module-level rule for anything that can reach the stall path.
+#[test]
+fn decode_continue_handle_notify_before_park_is_not_lost() {
+    block_on(async {
+        let log = log_of();
+        let mut a = ProbeFilter::new("a", log.clone());
+        a.decode_headers_status = FilterHeadersStatus::StopAllIterationAndBuffer;
+        a.decode_data_status = FilterDataStatus::StopIterationAndBuffer; // never continues on its own
+        a.stash_decode_continue_handle = Some(Rc::new(RefCell::new(None)));
+        a.fire_continue_handle_immediately = true; // fires inside decode_headers, before the park
+        let filters: Vec<Box<dyn HttpFilter>> =
+            vec![Box::new(a), Box::new(ProbeFilter::new("b", log.clone()))];
+
+        let (status, _, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_chain(filters, log.clone(), b"hi", DEFAULT_BUFFER_LIMIT),
+        )
+        .await
+        .expect("an early continue_decoding() must not be lost, and must not deadlock");
+
+        assert_eq!(status, StatusCode::OK);
+        let entries = log.borrow().clone();
+        assert!(
+            entries.iter().any(|e| e == "b:decode_headers"),
+            "the early continue_decoding() must have released the StopAll hold; log: {entries:?}"
+        );
     });
 }
 
 /// S2.3 (I4): `StopIterationAndWatermark` BACKPRESSURE — overflow should
-/// raise a readDisable/flow-control signal instead of erroring (distinct from
-/// G11, which only checks bytes). Watermark collapses to plain buffering
-/// today (module doc: "watermark backpressure ... treated as plain
-/// buffering").
+/// record a high-watermark signal instead of erroring (distinct from G11,
+/// which only checks bytes).
+///
+/// NOW REAL (WP-11 chunk 4, design C): decode stays fully buffered (module
+/// doc), so there is no read to disable — the only overflow that can happen
+/// is a filter's own `add_decoded_data` exceeding `buffer_limit`, exactly
+/// what this configures from `decode_data` (there is no `StopIterationAndWatermark`
+/// on the headers callback — only `decode_data` carries it, S2.3). Asserts
+/// all three things design C calls for: the request succeeds, the bytes
+/// survive intact to the terminal, and the high-watermark signal was
+/// actually recorded — not just "status != 413" (which would also pass for
+/// a 500).
 #[test]
-#[ignore = "WP-11 chunk 4: watermark backpressure"]
 fn stop_iteration_and_watermark_applies_backpressure_on_overflow() {
     block_on(async {
         let log = log_of();
         let mut a = ProbeFilter::new("a", log.clone());
-        a.add_decoded = Some(Bytes::from_static(b"0123456789"));
+        a.add_decoded_from_data = Some(Bytes::from_static(b"0123456789")); // 10 bytes > the 4-byte limit below
+        a.decode_data_status = FilterDataStatus::StopIterationAndWatermark;
+        a.call_continue_decoding = true; // resolve the hold so the request completes
         let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a)];
-        // Limit of 4 < the 10 bytes buffered; watermark should signal
-        // backpressure rather than reject with 413. There is no
-        // backpressure/readDisable observable through this harness yet.
-        let (status, _, _) = run_chain(filters, log.clone(), b"body", 4).await;
-        assert_ne!(
+        let (status, seen, _, watermark) =
+            run_chain_watermark(filters, log.clone(), b"body", 4).await;
+
+        assert_eq!(
             status,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "watermark overflow must apply backpressure, not 413 (S2.2)"
+            StatusCode::OK,
+            "watermark overflow must keep buffering and complete the request, not 413/500"
+        );
+        assert!(
+            seen.starts_with(b"0123456789"),
+            "the buffered bytes must survive intact to the terminal; seen={seen:?}"
+        );
+        assert!(
+            watermark,
+            "the high-watermark signal must be recorded on overflow"
         );
     });
 }
 
 /// S2.2 (I5): `StopAllIterationAndWatermark` — block plus backpressure on
 /// overflow (no 413/500).
+///
+/// NOW REAL (WP-11 chunk 4, design C): same contract as the plain-data case
+/// above, but the watermark status is on `decode_headers` instead, and
+/// `decode_data_status` is ALSO set to a watermark variant so the SAME
+/// buffer is judged consistently at both overflow-check sites (the known,
+/// separate decode-side S2.2 gotcha gap — `a`'s own `decode_data` still
+/// fires for a StopAll hold, see the module doc — means both checks run
+/// against this filter's real status each time).
 #[test]
-#[ignore = "WP-11 chunk 4: StopAll watermark"]
 fn stop_all_iteration_and_watermark_applies_backpressure_on_overflow() {
     block_on(async {
         let log = log_of();
         let mut a = ProbeFilter::new("a", log.clone());
         a.decode_headers_status = FilterHeadersStatus::StopAllIterationAndWatermark;
-        a.add_decoded = Some(Bytes::from_static(b"0123456789"));
+        a.add_decoded = Some(Bytes::from_static(b"0123456789")); // 10 bytes > the 4-byte limit below
+        a.decode_data_status = FilterDataStatus::StopIterationAndWatermark;
+        a.call_continue_decoding = true; // resolve the hold so the request completes
         let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a)];
-        let (status, _, _) = run_chain(filters, log.clone(), b"body", 4).await;
-        assert_ne!(
+        let (status, seen, _, watermark) =
+            run_chain_watermark(filters, log.clone(), b"body", 4).await;
+
+        assert_eq!(
             status,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "StopAll + watermark overflow must apply backpressure, not 413/500 (S2.2)"
+            StatusCode::OK,
+            "StopAll + watermark overflow must keep buffering and complete the request, not 413/500"
+        );
+        assert!(
+            seen.starts_with(b"0123456789"),
+            "the buffered bytes must survive intact to the terminal; seen={seen:?}"
+        );
+        assert!(
+            watermark,
+            "the high-watermark signal must be recorded on overflow"
         );
     });
 }
