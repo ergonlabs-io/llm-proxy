@@ -494,6 +494,14 @@ impl LoggingBody {
             token_stats.record_usage(provider, tokens);
         }
 
+        // A stats-only stream (token_stats wired, no access loggers) has
+        // nothing left to do -- `LogContext` borrows a dozen fields purely to
+        // hand them to `render`, so building it for an empty loop is waste on
+        // every request of such a listener.
+        if ctx.loggers.is_empty() {
+            return;
+        }
+
         let log_ctx = LogContext {
             start_time: ctx.start_time,
             request_headers: &ctx.request.headers,

@@ -3881,3 +3881,108 @@ fn modify_decoded_headers_is_a_no_op_once_headers_are_forwarded() {
         );
     });
 }
+
+// --- Token stats do not depend on access logging being configured ---------
+//
+// `FilterChainHandler::handle` wraps the response in `LoggingBody`, and
+// `LoggingBody::finish` does two independent jobs at end-of-stream: it renders
+// access-log lines, and it records GEN_AI_CLIENT_TOKEN_USAGE (WP-23 increment
+// 6b). The wrap used to be gated on `access_loggers.is_empty()` alone, so a
+// listener that configured `llmproxy.usage` for token metrics but no
+// `access_log` silently recorded nothing -- the instrument was wired end to
+// end and then skipped by the one branch that decides whether anything runs.
+//
+// This is the same shape as every other defect in that batch: a declared
+// capability with no producer. It needs a test that switches token stats on
+// and access logs OFF, because a suite that never configures that combination
+// cannot regress it (ground rule 16).
+
+/// Stamps both the usage AND the dialled cluster at end-of-stream --
+/// `record_usage` needs a provider name, and it comes from
+/// `StreamInfo::upstream_cluster` (ground rule #6: the member actually
+/// dialled, not the routed name).
+struct StampsUsageAndClusterFilter;
+
+impl HttpFilter for StampsUsageAndClusterFilter {
+    fn encode_data(
+        &mut self,
+        cb: &mut dyn EncoderCallbacks,
+        _data: &mut Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        if end_stream {
+            let info = &mut *cb.stream_info();
+            info.upstream_cluster = Some("provider:openai".to_string());
+            info.llm.usage = Some(crate::stream_info::LlmTokenUsage {
+                input_tokens: 11,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 7,
+            });
+        }
+        FilterDataStatus::Continue
+    }
+}
+
+struct StampsUsageAndClusterFilterFactory;
+
+impl FilterInstanceFactory for StampsUsageAndClusterFilterFactory {
+    fn create_filter(&self) -> Box<dyn HttpFilter> {
+        Box::new(StampsUsageAndClusterFilter)
+    }
+}
+
+#[test]
+fn token_stats_are_recorded_with_no_access_logs_configured() {
+    use crate::stat_handles::{GenAiTokenStats, TokenUsageStatHandles};
+    use proxy_observability::stats::{StatsControl, WorkerId as StatsWorkerId};
+
+    block_on(async {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["provider:openai"]));
+        let registry = control.registry();
+        let token_stats = Arc::new(GenAiTokenStats::new(
+            registry.clone(),
+            handles.clone(),
+            StatsWorkerId(0),
+        ));
+
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+            Arc::new(RecordingTerminalFactory {
+                seen_body: Arc::new(Mutex::new(Bytes::new())),
+                seen_request_id: Arc::new(Mutex::new(None)),
+                seen_headers: None,
+                term_log: None,
+            });
+        // The point of the test: `&[]` -- no access logs at all.
+        let handler = FilterChainHandler::new_with_access_logs(
+            vec![Arc::new(StampsUsageAndClusterFilterFactory)],
+            terminal_factory,
+            empty_route_table(),
+            false,
+            false,
+            0,
+            &[],
+        )
+        .expect("no sinks to open")
+        .with_token_stats(token_stats);
+
+        let resp = handler.handle(request(b"hi")).await;
+        assert_eq!(resp.head.status, StatusCode::OK);
+        resp.body.collect().await.expect("resp body must collect");
+
+        let h = handles
+            .for_provider("provider:openai")
+            .expect("provider was resolved at build");
+        assert_eq!(
+            registry.value(h.input),
+            11,
+            "input tokens must be recorded even with no access_log configured"
+        );
+        assert_eq!(
+            registry.value(h.output),
+            7,
+            "output tokens must be recorded even with no access_log configured"
+        );
+    });
+}

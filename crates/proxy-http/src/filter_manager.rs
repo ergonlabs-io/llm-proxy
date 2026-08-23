@@ -656,7 +656,15 @@ impl StreamHandler for FilterChainHandler {
             let request_headers_snapshot = mgr.ctx.request_headers_snapshot.clone();
             let resp = mgr.run(req).await;
 
-            if self.access_loggers.is_empty() {
+            // The wrap is what runs `finish()` at end-of-stream, and `finish()`
+            // does TWO jobs: it renders the access log AND it records the
+            // GEN_AI_CLIENT_TOKEN_USAGE instrument (WP-23 increment 6b). Gating
+            // it on access loggers alone meant a listener that configured
+            // `llmproxy.usage` for token metrics but no `access_log` recorded no
+            // tokens at all -- the stat was wired end to end and then skipped by
+            // the one branch that decides whether anything runs. Neither reason
+            // implies the other, so this is an OR.
+            if self.access_loggers.is_empty() && self.token_stats.is_none() {
                 return resp;
             }
 
