@@ -1461,24 +1461,14 @@ fn decode_stop_iteration_and_watermark_replays_intact_like_buffer() {
     });
 }
 
-/// S2.4 (G13): `decode_trailers` returning `StopIteration` HOLDS the
+/// S2.4/chunk 4 (G13): `decode_trailers` returning `StopIteration` HOLDS the
 /// trailers — a subsequent filter must not see them until `continue_decoding()`
-/// resumes iteration.
-///
-/// NOTE: as written this asserts the correct S2.4 hold contract. See the
-/// task report — `deliver_decode_data` discards the `FilterTrailersStatus`
-/// returned by `decode_trailers` entirely (`let _ = ...decode_trailers(...)`),
-/// so there is no trailer-hold mechanism at all on the decode side today; a
-/// filter returning `StopIteration` here has no observable effect. Reported
-/// as a suspected filter-manager bug, not weakened to match observed behavior
-/// (per the Hard rule, which explicitly anticipates this one).
-// ORCHESTRATOR ADJUDICATION: deferred, not a live bug. Decode-side trailer-hold
-// is simply unimplemented — `deliver_decode_data` discards the
-// `FilterTrailersStatus`. Implementing it needs the same held-trailers + resume
-// machinery as the chunk-4 hold work; request trailers are also rare for LLM
-// traffic, so it's low priority. Kept as the target spec.
+/// resumes iteration. `deliver_decode_data` now checks the
+/// `FilterTrailersStatus` it gets back (previously discarded via
+/// `let _ = ...decode_trailers(...)`) and reports "not continued" up to
+/// `drive_decode`, which stops delivering to later filters exactly like an
+/// unresolved header/data hold already does.
 #[test]
-#[ignore = "WP-11 chunk 4: decode trailer-hold (StopIteration on decode_trailers)"]
 fn decode_trailers_stop_iteration_holds_until_resumed() {
     block_on(async {
         let log = log_of();
