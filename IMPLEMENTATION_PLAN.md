@@ -59,8 +59,8 @@ WP-14).
 | WP-07 | Listener manager + filter-chain matching | ✅ done — IR criteria + 9-step matcher + SO_REUSEPORT per-worker binds; initial binds fatal, reconcile binds log-and-skip |
 | WP-08 | Transport sockets (TLS) + listener filters | ✅ done — downstream termination (dual-cert hot-reload resolver, SAN/mTLS/expired-cert verifiers), `tls_inspector` ClientHello peek → SNI/ALPN matching, **and upstream TLS now live at runtime** (see WP-15) |
 | WP-09 | Network filter framework + `tcp_proxy` | ✅ done — deadlock-free bidirectional pump with half-close FIN propagation and idle timeout; serves plaintext and TLS-terminated streams |
-| WP-10 | h1/h2 codecs | 🔶 downstream h1 + `StreamHandler` seam + listener wiring + **upstream h1 (`send_upstream_http1`) and upstream h2 (`send_upstream_http2`)** done, with dispatch selected by `UpstreamProtocol`. **Downstream h2 and upgrades (S10) outstanding** |
-| WP-11 | HTTP filter manager (S2) | 🔶 chunks 1–3 done (S2.1 ordering, S2.2/S2.3 hold+resume, S2.5 local replies through the encoder chain, S2.7 buffer APIs, streaming encode). The chunk-2 conformance suite found one real S2.5 bug, now fixed. **Chunk 4 outstanding** — `ContinueAndDontEndStream`, watermark backpressure, StopAll out-of-band resume, decode trailer-hold, ~~`inject_*_data_to_filter_chain` (**panics if a filter calls it today**)~~ — **FALSE as of 2026-08-22: fully implemented** (S2.7 out-of-band injection, `filter_manager.rs:2557`/`:2653`, delivered by `drain_decode_injections`, two dedicated tests). No panic exists. **The rest of chunk 4 needs re-verification, not assumption**: `ContinueAndDontEndStream`, watermark backpressure, trailer-hold, 1xx (S2.6) and route cache (S2.8) all show implementation *and* filter_manager tests (6/10/64/3/13 test hits respectively), so this row is probably much closer to done than it reads. Someone should confirm properly and close it. |
+| WP-10 | h1/h2 codecs | 🔶 downstream h1 + `StreamHandler` seam + listener wiring + **upstream h1 (`send_upstream_http1`) and upstream h2 (`send_upstream_http2`)** done, with dispatch selected by `UpstreamProtocol`. **Downstream h2 is also done** — `codec.rs`'s `serve_http2`, dispatched at `listener.rs:1120` off negotiated ALPN, 5 tests in `http2_codec.rs`; this row claimed otherwise until 2026-08-23. Outstanding: **h2c** (plaintext h2, prior-knowledge and `Upgrade: h2c` — deliberately out of scope, `listener.rs:871`: there is no ALPN on a cleartext connection to dispatch on) and **upgrades (S10)** |
+| WP-11 | HTTP filter manager (S2) | 🔶 chunks 1–3 done (S2.1 ordering, S2.2/S2.3 hold+resume, S2.5 local replies through the encoder chain, S2.7 buffer APIs, streaming encode). The chunk-2 conformance suite found one real S2.5 bug, now fixed. **Chunk 4 outstanding** — `ContinueAndDontEndStream`, watermark backpressure, StopAll out-of-band resume, decode trailer-hold, ~~`inject_*_data_to_filter_chain` (**panics if a filter calls it today**)~~ — **FALSE as of 2026-08-22: fully implemented** (S2.7 out-of-band injection, `filter_manager.rs:2557`/`:2653`, delivered by `drain_decode_injections`, two dedicated tests). No panic exists. ~~The rest of chunk 4 needs re-verification, not assumption: ... so this row is probably much closer to done than it reads.~~ **Re-verified 2026-08-23, and that optimistic re-read was itself wrong.** Grepping for symbols counted mentions, not behaviour. The honest measure is the 9 `#[ignore]`d tests in `filter_manager/tests.rs`, each naming its own gap: `ContinueAndDontEndStream` (2 — the variant is accepted but folded into `Continue` at `filter_manager.rs:1504` and `:2208`, both with live TODOs), watermark backpressure (2 — module doc: "treated as plain buffering"), StopAll out-of-band resume and StopAll-blocks-terminal (2), decode trailer-hold (1), `StopIterationNoBuffer` drop on decode (1), and **1xx / S2.6 (1 — which the re-read guessed was done; it is not)**. Route cache (S2.8) does look genuinely complete. Un-ignoring those 9 is the close-out gate. |
 | WP-12 | Route table & matching engine (S1) | ✅ done — 36 tests built through real YAML lowering; regexes anchored at config-compile time |
 | WP-13 | Router filter & upstream lifecycle | 🔶 route → cluster → LB pick → S5 permit → pool → TLS → h1/h2 → response back through the encode chain. **S9 request transforms are now complete** — XFF, `x-request-id`, `:authority`, `prefix_rewrite`/`host_rewrite`, **and `request_headers_to_add` (see the P0 below)**. **S4 timeouts** (route `timeout` bounding the whole attempt loop, `idle_timeout`, per-try, `x-envoy-expected-rq-timeout-ms`) landed. **Outstanding**: maintenance-mode check, `x-envoy-upstream-service-time`, `x-envoy-attempt-count` (needs an IR field), all of upgrade routing (S10.1), redirects (501), file-sourced `direct_response` (500), HCM `stream_idle_timeout` inheritance, and the lifecycle differential suite — which is gated on access-log response flags (WP-24) |
 | WP-14 | Retry & hedging engine (S3) | 🔶 **engine built AND wired.** `retry.rs` (26 tests) + a real attempt loop in `router.rs`: per-attempt CB permit and host re-pick, outcome classification, S3.3 fully-jittered exponential backoff, S3.4 body-replay buffering (only when a policy exists, so retry-free routes keep the zero-copy path), and the **S4.2 per-try timeout** armed fresh per attempt. **Outstanding**: `x-envoy-max-retries` header override, S5.2 retry *budgets* (20% default, `min_retry_concurrency` 3), the previously-attempted-host predicate, **hedge-on-per-try-timeout (half this WP's title)**, and the differential chaos suite. Two knobs the router cannot honor are now **rejected at config load** rather than silently dropped: `host_selection_retry_max_attempts > 1` and `retry_on: envoy-ratelimited` |
@@ -1056,14 +1056,28 @@ goal: Envoy AI Gateway's capability set **without the ext_proc sidecar hop**.
 > walks aggregate *members*, not just direct route targets, because failover is
 > the case the rule is about.
 >
-> **Open, found the same day, deliberately NOT fixed in increment 1:** the
-> `routes:` surface never rejects a dialect-ambiguous provider type. Only the
-> `models:` surface runs the `resolved_dialect(..).is_none()` check in
-> `parse.rs`; a Vertex/Bedrock provider reached through `routes:` silently gets
-> `usage_dialect`'s `_ => "openai"` fallback. Pre-existing behaviour of the ROUTE
-> carrier, not introduced by the cluster one, and currently unreachable because
-> both types are rejected as unbuilt credential schemes — but it must be closed in
-> `validate_semantics` before either type ships.
+> **CLOSED 2026-08-23** (was: open, found the same day, deliberately not fixed in
+> increment 1). The `routes:` surface never rejected a dialect-ambiguous provider
+> type: only `models:` ran the `resolved_dialect(..).is_none()` check, so a
+> Vertex/Bedrock provider reached through `routes:` silently got `usage_dialect`'s
+> `_ => "openai"` fallback — the quota-bypass shape above, in the route carrier
+> this time. It was unreachable only because both types are still rejected as
+> unbuilt credential schemes, which is precisely why it was worth closing before
+> either ships rather than after.
+>
+> The fix applies the same lesson one level further out. `dialect_from_models` is
+> `cluster_usage_dialect`'s models-walk, split out so `validate_semantics` can ask
+> the question the carriers answer — *does any `models:` entry pin this provider's
+> dialect?* — and all three route-surface sites (primary, fallback, listener
+> default) now resolve through `cluster_usage_dialect` instead of `usage_dialect`.
+> `check_route_ref_dialect` rejects an ambiguous type only when no `models:` entry
+> states its wire format.
+>
+> Note what it does NOT do: reject on sight. `routes:` is unconditionally
+> required, so a blanket refusal would make Vertex and Bedrock *unusable* rather
+> than merely unconfigured — no valid config could name one. The first cut did
+> exactly that and three existing tests caught it. Four new tests in
+> `dialect.rs`, both directions mutation-verified.
 >
 > Related and already observable: because `body_rewrite` overwrites the model
 > header from the body and calls `clear_route_cache()` (WP-45 decision 4,
