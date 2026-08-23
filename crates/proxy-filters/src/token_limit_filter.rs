@@ -171,6 +171,7 @@ use proxy_http::filter::{
     ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::LlmTokenUsage;
+use proxy_observability::ResponseFlag;
 
 use crate::token_limit::{
     BudgetStore, BudgetUnavailable, InProcessBudgetStore, LimitDecision, LimitKey, LimitOn,
@@ -583,6 +584,19 @@ impl HttpFilter for TokenLimitFilterInstance {
                 retry_after,
             }) => {
                 self.key = Some(key);
+                // WP-24: this is the one place this filter actually REFUSES a
+                // request (as opposed to the fail-open paths above, which
+                // admit it) -- so it's the one place `RL` belongs. Set
+                // *before* `send_local_reply` so a `%RESPONSE_FLAGS%` logger
+                // reading `StreamInfo` after this callback returns already
+                // sees it, same ordering `auth_filter`/`router.rs` use for
+                // their own flags. Never set on the fail-open branch above
+                // (`Allow`/`Err(BudgetUnavailable)`): that request was
+                // admitted, and `RL` would misreport a refusal that never
+                // happened (see the module doc's "Loud on unreadable usage"
+                // section for the analogous rule on warnings).
+                cb.stream_info()
+                    .set_response_flag(ResponseFlag::RateLimited);
                 let reset_secs = reset_after.as_secs();
                 let retry_secs = retry_after.as_secs();
                 cb.send_local_reply(
@@ -1059,6 +1073,46 @@ mod tests {
         }
         assert_eq!(headers.get("x-ratelimit-limit").unwrap(), "10");
         assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "0");
+    }
+
+    /// WP-24: a real 429 (driven through `decode_headers`, not a hand-built
+    /// `StreamInfo`) must render `%RESPONSE_FLAGS%` as `RL` -- the defect
+    /// this test exists to catch left this filter's own refusal
+    /// indistinguishable in the access log from any other 429. Asserts
+    /// through [`proxy_observability::render_flags`], the exact function
+    /// `%RESPONSE_FLAGS%` formatting uses (`access_log.rs`'s
+    /// `FormatOp::ResponseFlags` arm), not just the enum -- the rendering is
+    /// the contract, per the module doc's rule for these tests.
+    #[test]
+    fn a_denied_request_renders_the_rl_response_flag() {
+        let store = store_with(10, Duration::from_secs(60));
+
+        // First request spends the whole 10-token budget, through the real
+        // decode+encode cycle (`run_request` drives both, exactly like a
+        // real stream).
+        let first = run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(10)));
+        assert!(first.is_none(), "the first request must be admitted");
+
+        // Second request, now over budget: built directly (not through
+        // `run_request`, which discards `cb`) so `StreamInfo` can be
+        // inspected after the denial.
+        let mut filter = filter_with(Arc::clone(&store));
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer sk-1"));
+        filter.decode_headers(&mut cb, &mut head, true);
+
+        assert!(
+            cb.local_reply.is_some(),
+            "the second request over a 10-token budget must be denied"
+        );
+        let flags = cb.stream_info.borrow().response_flags().to_vec();
+        assert_eq!(
+            proxy_observability::flags::render_flags(&flags),
+            "RL",
+            "a request this filter refuses must render exactly `RL`, matching Envoy's \
+             local-rate-limit code -- an admitted request must never carry it (see the \
+             fail-open tests above, none of which touch response_flags)"
+        );
     }
 
     // --- central semantic: in-flight requests are never truncated -----------

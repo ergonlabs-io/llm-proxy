@@ -531,7 +531,13 @@ impl RouterHandler {
                                 continue;
                             }
                         }
-                        return match err {
+                        // Rust note: bound to `resp` (rather than `return
+                        // match err {...}` directly) so the WP-24 `URX` flag
+                        // below can be recorded AFTER this arm's own flag --
+                        // `render_flags` joins in recording order, and Envoy
+                        // always shows the specific failure first (e.g.
+                        // `UF,URX`), never the other way around.
+                        let resp = match err {
                             PoolError::Overflow => {
                                 tracing::debug!(response_flag = "UO", cluster = %attempt_cluster, "pool overflow");
                                 dcb.stream_info()
@@ -581,6 +587,8 @@ impl RouterHandler {
                                 local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream reset")
                             }
                         };
+                        record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
+                        return resp;
                     }
                 };
 
@@ -700,6 +708,7 @@ impl RouterHandler {
                             );
                             dcb.stream_info()
                                 .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
+                            record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
                             return local_reply(
                                 StatusCode::GATEWAY_TIMEOUT,
                                 "upstream request timeout",
@@ -726,6 +735,12 @@ impl RouterHandler {
                             sleep_backoff_and_record(state).await;
                             continue;
                         }
+                        // WP-24: this is the one `URX` site that isn't
+                        // paired with a synthesized `local_reply` -- `resp`
+                        // is the real (failing) upstream response, passed
+                        // through unmodified; the only flag it can carry at
+                        // all is this one.
+                        record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
                         // Rust note: the route `timeout` bounds the whole
                         // attempt loop, not just this last attempt's
                         // `send` -- once headers arrive here the timeout is
@@ -766,6 +781,7 @@ impl RouterHandler {
                         tracing::debug!(response_flag = "UC", cluster = %attempt_cluster, "upstream codec error");
                         dcb.stream_info()
                             .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
+                        record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
                         return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
                     }
                 }
@@ -814,6 +830,26 @@ async fn sleep_backoff_and_record(state: &mut RetryState<'_>) {
     let delay = state.backoff_delay(&mut rand::random::<f64>);
     tokio::time::sleep(delay).await;
     state.record_attempt();
+}
+
+/// WP-24: the one call site for `ResponseFlag::UpstreamRetryLimitExceeded`
+/// (`URX`) -- see [`RetryState::retry_limit_exceeded`]'s doc for exactly
+/// which failures qualify. Called from every attempt-loop exit that already
+/// decided not to retry `outcome`, right after that exit's OWN flag (if any)
+/// is set, so a combined line renders `<flag>,URX` -- matching Envoy, which
+/// never puts `URX` first. A no-op when this route has no retry policy at
+/// all (`retry_state` is `None`): there is no budget for anything to exceed.
+fn record_retry_limit_exceeded_if_applicable(
+    retry_state: &Option<RetryState<'_>>,
+    outcome: &AttemptOutcome,
+    dcb: &mut dyn DecoderCallbacks,
+) {
+    if let Some(state) = retry_state {
+        if state.retry_limit_exceeded(outcome) {
+            dcb.stream_info()
+                .set_response_flag(ResponseFlag::UpstreamRetryLimitExceeded);
+        }
+    }
 }
 
 /// Build a fresh, single-use [`StreamBody`] from already-buffered bytes (and,

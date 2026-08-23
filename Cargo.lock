@@ -1454,6 +1454,7 @@ dependencies = [
  "proxy-api",
  "proxy-config",
  "proxy-http",
+ "proxy-observability",
  "ring",
  "serde_json",
  "tracing",

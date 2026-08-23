@@ -241,6 +241,24 @@ impl<'a> RetryState<'a> {
         self.body_retriable && should_retry(self.policy, outcome, self.attempts_used)
     }
 
+    /// WP-24: Envoy's `URX` ("upstream retry limit exceeded") condition --
+    /// `outcome` is one this policy's trigger table (S3.2) WOULD have
+    /// retried, but [`Self::should_retry`] just said no because the S3.1
+    /// attempt budget (`policy.num_retries`) is spent. Deliberately NOT the
+    /// same as "`should_retry` returned false": that's also true when
+    /// `outcome` was never retriable at all (wrong trigger token configured)
+    /// or the body isn't replayable (S3.4) -- neither of those is a retry
+    /// *limit* being exceeded, there was no limit in play. Router.rs calls
+    /// this at exactly the sites that already call `should_retry`, right
+    /// after it returns `false`, so `URX` only ever appears alongside (never
+    /// instead of) the specific failure flag that outcome produces --
+    /// matching Envoy, which renders combinations like `UF,URX`.
+    pub fn retry_limit_exceeded(&self, outcome: &AttemptOutcome) -> bool {
+        self.body_retriable
+            && self.attempts_used >= self.policy.num_retries
+            && trigger_fires(self.policy, outcome)
+    }
+
     /// Compute this attempt's backoff delay (attempt numbers are 1-based:
     /// call this with `attempts_used + 1`, i.e. before `record_attempt`, or
     /// equivalently right after it -- both give the same 1-based number for
@@ -600,5 +618,43 @@ mod tests {
         state.mark_body_not_retriable();
         assert!(!state.should_retry(&AttemptOutcome::Response(500)));
         assert!(!state.should_retry(&AttemptOutcome::ConnectFailure));
+    }
+
+    // ------------------------------------------------------------- WP-24 --
+
+    #[test]
+    fn retry_limit_exceeded_fires_only_once_the_budget_is_actually_spent() {
+        let p = policy("5xx", 1);
+        let mut state = RetryState::new(&p);
+        // Budget not yet spent: this outcome retries instead of exceeding
+        // any limit.
+        assert!(!state.retry_limit_exceeded(&AttemptOutcome::Response(500)));
+        assert!(state.should_retry(&AttemptOutcome::Response(500)));
+        state.record_attempt();
+        // Budget now spent (num_retries=1, one retry already issued) and
+        // this outcome would still have retried -- URX.
+        assert!(state.retry_limit_exceeded(&AttemptOutcome::Response(500)));
+        assert!(!state.should_retry(&AttemptOutcome::Response(500)));
+    }
+
+    #[test]
+    fn retry_limit_exceeded_does_not_fire_for_an_outcome_the_policy_never_retries() {
+        // Budget spent, but a 400 was never retriable under "5xx" in the
+        // first place -- there was no limit to exceed.
+        let p = policy("5xx", 1);
+        let mut state = RetryState::new(&p);
+        state.record_attempt();
+        assert!(!state.retry_limit_exceeded(&AttemptOutcome::Response(400)));
+    }
+
+    #[test]
+    fn retry_limit_exceeded_does_not_fire_when_the_body_made_it_unretriable() {
+        // Budget spent AND the trigger fires, but the body itself ruled out
+        // a retry (S3.4) -- this is "not retriable", not "limit exceeded".
+        let p = policy("5xx", 1);
+        let mut state = RetryState::new(&p);
+        state.record_attempt();
+        state.mark_body_not_retriable();
+        assert!(!state.retry_limit_exceeded(&AttemptOutcome::Response(500)));
     }
 }
