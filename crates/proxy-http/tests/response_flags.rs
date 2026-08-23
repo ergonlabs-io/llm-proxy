@@ -150,6 +150,7 @@ async fn build_router(scenario: Scenario, access_logs: &[AccessLogIR]) -> Filter
             circuit_breakers: scenario.circuit_breakers,
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
+            usage_dialect: None,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;

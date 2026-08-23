@@ -192,7 +192,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
 
     let mut clusters = Vec::new();
     for (name, provider) in &config.providers {
-        clusters.push(lower_provider(name, provider, &mut warnings)?);
+        clusters.push(lower_provider(config, name, provider, &mut warnings)?);
     }
 
     let mut routes = Vec::new();
@@ -338,6 +338,7 @@ fn unsupported_credential_scheme(provider_type: ProviderType) -> Option<String> 
 }
 
 fn lower_provider(
+    config: &SimpleConfig,
     name: &str,
     provider: &Provider,
     warnings: &mut Vec<ConfigWarning>,
@@ -486,13 +487,22 @@ fn lower_provider(
     // identical value via `host_rewrite_literal`, so this is a no-op there,
     // and one rule is simpler than two.
     headers_to_add.push(json!({ "key": "host", "value": up.host }));
-    if !headers_to_add.is_empty() {
-        cluster["metadata"] = json!({
-            "filter_metadata": {
-                PROVIDER_AUTH_METADATA_KEY: { "headers": headers_to_add }
-            }
-        });
-    }
+    // WP-35 increment 1 (ground rule #6's third instance, CLAUDE.md): the
+    // usage-filter dialect is per-provider too, so it rides onto the CLUSTER
+    // alongside credentials and `Host` above rather than staying only on the
+    // route's `typed_per_filter_config` -- that route-level copy is left
+    // completely unchanged by this increment (both carriers must agree; see
+    // `dialect.rs`'s test for that), and the usage filter itself does not
+    // read this one yet. This runs once per provider, exactly like the
+    // credential/Host headers above, so a provider used by five routes still
+    // gets exactly one copy.
+    let dialect = cluster_usage_dialect(config, name, provider)?;
+    cluster["metadata"] = json!({
+        "filter_metadata": {
+            PROVIDER_AUTH_METADATA_KEY: { "headers": headers_to_add },
+            USAGE_DIALECT_METADATA_KEY: { "dialect": dialect },
+        }
+    });
 
     Ok(cluster)
 }
@@ -506,6 +516,15 @@ fn lower_provider(
 /// same reason `USAGE_FILTER_TYPE_URL` above is pinned by a dev-dependency
 /// test rather than trusted to stay in sync.
 const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
+
+/// Namespace key under `Cluster.metadata.filter_metadata` this dialect uses
+/// to carry the usage-filter dialect -- must match
+/// `proxy_config::lower::USAGE_DIALECT_METADATA_KEY` exactly, for the same
+/// "the two crates only agree by convention" reason as
+/// [`PROVIDER_AUTH_METADATA_KEY`] above (protos never cross the
+/// `proxy-config`/`proxy-xds` boundary, so there is no shared Rust type to
+/// pin either string to).
+const USAGE_DIALECT_METADATA_KEY: &str = "io.llmproxy.usage";
 
 /// The auth header this provider type expects, if a key is configured.
 fn auth_header(
@@ -548,6 +567,81 @@ fn auth_header(
 /// fed OpenAI SSE simply finds nothing and reports `None`, but the OpenAI
 /// parser on an Anthropic body can *partially* match — which would bill a
 /// customer against a number nobody computed correctly.
+/// The single dialect this provider's CLUSTER carries, for ground rule #6's
+/// per-provider carrier.
+///
+/// This deliberately does NOT call [`usage_dialect`] directly, and that
+/// distinction is the whole point of this function. `usage_dialect` derives
+/// the dialect from the provider *type* alone, which is only correct for
+/// types where the type determines the wire format. For a
+/// dialect-ambiguous type ([`ProviderType::dialect_is_ambiguous`]: Vertex
+/// and Bedrock, both of which host Anthropic-shaped models alongside
+/// others) the type says nothing, and the real answer lives in the explicit
+/// `dialect` on a `models.<name>.providers[i]` entry -- exactly what
+/// [`resolved_dialect`] reads and what the ROUTE-level carrier
+/// (`lower_model_route`) already uses. Deriving the cluster's copy from the
+/// type while the route's copy honours the explicit value makes the two
+/// carriers disagree precisely for Anthropic-on-Bedrock/Vertex: the cluster
+/// would claim `openai`, the usage filter would parse an OpenAI-shaped
+/// `usage` object that is not there, read `None`, and -- per the token
+/// limiter's fail-open rule -- charge nothing. A silent quota bypass and
+/// wrong billing, which is the exact failure mode moving this onto the
+/// cluster exists to prevent.
+///
+/// So: every `models` entry naming this provider is consulted, and they must
+/// agree. Disagreement is a hard error with both offending paths named
+/// (ground rule #1) rather than a silent pick, because one cluster cannot
+/// carry two dialects -- a provider whose endpoint really does speak both
+/// wire formats has to be declared as two providers. A provider no `models`
+/// entry references falls back to the type-derived answer, which is what the
+/// `routes:` surface (no per-entry `dialect` field) uses anyway.
+///
+/// Known gap, deliberately not widened here: the `routes:` surface never
+/// rejects a dialect-ambiguous provider type, so `usage_dialect` silently
+/// answers `openai` for a Vertex/Bedrock provider reached only through
+/// `routes:`. That is pre-existing behaviour of the route-level carrier, not
+/// something this function introduces, and fixing it is a separate change to
+/// `validate_semantics`.
+fn cluster_usage_dialect(
+    config: &SimpleConfig,
+    provider_name: &str,
+    provider: &Provider,
+) -> Result<&'static str, ConfigError> {
+    // Rust note: `models` is a `BTreeMap`, so this walk is in sorted key
+    // order -- the error below names a deterministic "first" path rather
+    // than whichever entry a hash seed happened to yield.
+    let mut found: Option<(String, &'static str)> = None;
+    for (model_name, model) in &config.models {
+        for (i, entry) in model.providers.iter().enumerate() {
+            if entry.provider() != provider_name {
+                continue;
+            }
+            // `validate_semantics` already rejected an unresolvable dialect
+            // at this exact path, via this exact function -- see
+            // `parse.rs`'s `resolved_dialect(..).is_none()` check.
+            let Some(dialect) = resolved_dialect(provider_name, provider, entry.dialect()) else {
+                continue;
+            };
+            let path = format!("models.{model_name}.providers[{i}]");
+            match &found {
+                None => found = Some((path, dialect)),
+                Some((first_path, first)) if *first != dialect => {
+                    return Err(ConfigError::InvalidValue {
+                        field_path: path,
+                        reason: format!(
+                            "provider `{provider_name}` is used with dialect `{dialect}` here                              but with `{first}` at `{first_path}`; a provider's wire format is                              a property of the upstream itself, so it must be the same                              everywhere the provider is used -- declare two providers if the                              endpoint really serves both"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(found
+        .map(|(_, dialect)| dialect)
+        .unwrap_or_else(|| usage_dialect(provider_name, provider)))
+}
+
 fn usage_dialect(name: &str, provider: &Provider) -> &'static str {
     match provider.effective_type(name) {
         ProviderType::Anthropic => "anthropic",

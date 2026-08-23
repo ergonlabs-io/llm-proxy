@@ -1438,6 +1438,7 @@ mod tests {
                 circuit_breakers,
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
                 request_headers_to_add: Vec::new(),
+                usage_dialect: None,
             }),
         );
         manager.update_from_snapshot(&snapshot).await;
@@ -1503,6 +1504,7 @@ mod tests {
                 circuit_breakers: CircuitBreakers::default(),
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http2,
                 request_headers_to_add: Vec::new(),
+                usage_dialect: None,
             }),
         );
         manager.update_from_snapshot(&snapshot).await;

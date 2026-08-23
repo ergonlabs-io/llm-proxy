@@ -124,6 +124,7 @@ async fn build_router_with_stats(
             circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
+            usage_dialect: None,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;
@@ -227,6 +228,7 @@ async fn build_router_with_access_logs(
             circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
+            usage_dialect: None,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;
@@ -554,6 +556,7 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                     circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
                     upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
                     request_headers_to_add: Vec::new(),
+                    usage_dialect: None,
                 }),
             );
             manager.update_from_snapshot(&snapshot).await;

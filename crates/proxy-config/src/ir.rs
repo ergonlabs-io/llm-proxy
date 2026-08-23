@@ -422,6 +422,44 @@ pub struct ClusterConfig {
     /// credentials here keeps them out of the access log — the same guarantee
     /// route-level injection had, and for the same reason.
     pub request_headers_to_add: Vec<HeaderMutation>,
+    /// Which wire dialect this cluster's upstream speaks, for the usage
+    /// filter's token accounting -- ground rule #6's third instance (see
+    /// `CLAUDE.md`), following credentials (`request_headers_to_add`) and
+    /// `host_rewrite_literal`. The dialect is a property of the *provider
+    /// actually dialled*, not of the route that picked an aggregate; the
+    /// route still carries its own `typed_per_filter_config` copy today
+    /// (increment 1, additive only), but a value that varies per provider
+    /// and lives on the route follows the routing decision instead of the
+    /// connection, and reaches the wrong provider on failover -- exactly the
+    /// credentials and `Host` bugs, just for token accounting instead of
+    /// secrecy or connection identity. The usage filter does not read this
+    /// field yet (WP-35 increment 2 plumbs it through); until then it rides
+    /// along unused, same as `request_headers_to_add` did before the router
+    /// grew retries.
+    ///
+    /// `None` on an ordinary Envoy-mode cluster (no proto field maps here,
+    /// same reasoning as `request_headers_to_add`'s doc above); `Some` only
+    /// when the `llmproxy` dialect populates
+    /// `Cluster.metadata.filter_metadata["io.llmproxy.usage"]`. Always `None`
+    /// on an aggregate -- `metadata` itself is a hard load error there (see
+    /// `convert_cluster`), so the member that actually serves a request is
+    /// the one that must carry it.
+    pub usage_dialect: Option<UsageDialect>,
+}
+
+/// The wire dialect a provider cluster speaks, for the usage filter's request
+/// and response parsing. Kept as its own IR type rather than reusing
+/// `proxy_filters::usage::Dialect`: `proxy-config` cannot depend on
+/// `proxy-filters` (that edge is dev-only in the other direction, and adding
+/// a real one would cycle), so the two dialects are deliberately separate
+/// types that happen to agree on their variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageDialect {
+    /// OpenAI's request/response and SSE shapes (also openai-compatible
+    /// upstreams: vLLM, Ollama, TGI).
+    OpenAi,
+    /// Anthropic's Messages API request/response and SSE shapes.
+    Anthropic,
 }
 
 /// Which HTTP protocol version the proxy speaks to a cluster's upstreams.

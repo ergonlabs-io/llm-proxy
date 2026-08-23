@@ -2280,3 +2280,181 @@ mod body_routing_e2e {
             .await;
     }
 }
+
+// ---------------------------------------------------------------- WP-35 --
+// Ground rule #6's third instance: the usage dialect on the CLUSTER.
+
+/// The regression test for the defect this carrier was introduced with: the
+/// route-level copy resolves through `resolved_dialect` (which honours an
+/// explicit `dialect` on a `models` entry), while the first cut of the
+/// cluster-level copy derived it from the provider *type* alone. They
+/// therefore disagreed for any entry that states a dialect its type would
+/// not have implied -- and nothing constrains `dialect` to agree with
+/// `type`, so this is reachable today on an ordinary `openai` provider, not
+/// only on the still-unbuilt Vertex/Bedrock types where the field is
+/// mandatory.
+///
+/// Asserted on the built IR, not the lowered YAML: `ClusterConfig::usage_dialect`
+/// is what a later increment actually reads, so proving the value survives
+/// `metadata.filter_metadata` -> strict loader -> IR is the contract that
+/// matters. Checking the YAML alone would pass even if the Envoy-side
+/// reader dropped it.
+#[test]
+fn an_explicit_dialect_reaches_the_cluster_and_not_only_the_route() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  myopenai: { type: openai, api_key: k }
+models:
+  m:
+    providers:
+      - { provider: myopenai, dialect: anthropic }
+routes:
+  - { model: "*", provider: myopenai }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    assert_eq!(
+        snapshot.clusters["provider:myopenai"].usage_dialect,
+        Some(proxy_config::ir::UsageDialect::Anthropic),
+        "the cluster must carry the dialect the `models` entry stated, not the one its \
+         provider `type` would have implied -- deriving it from the type is what made the \
+         two carriers disagree"
+    );
+}
+
+/// The complement, so the test above cannot pass by simply hardcoding
+/// `Anthropic`: with no explicit `dialect` anywhere, the cluster falls back
+/// to the type-derived answer.
+#[test]
+fn with_no_explicit_dialect_the_cluster_falls_back_to_the_provider_type() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  myopenai: { type: openai, api_key: k }
+  myanthropic: { type: anthropic, api_key: k }
+routes:
+  - { model: "claude*", provider: myanthropic }
+  - { model: "*", provider: myopenai }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    assert_eq!(
+        snapshot.clusters["provider:myopenai"].usage_dialect,
+        Some(proxy_config::ir::UsageDialect::OpenAi)
+    );
+    assert_eq!(
+        snapshot.clusters["provider:myanthropic"].usage_dialect,
+        Some(proxy_config::ir::UsageDialect::Anthropic)
+    );
+}
+
+/// One cluster cannot carry two dialects, so two `models` entries that
+/// resolve the same provider differently is a hard load error naming both
+/// paths (ground rule #1) rather than a silent pick of whichever the walk
+/// reached first.
+#[test]
+fn two_model_entries_disagreeing_on_a_providers_dialect_is_a_hard_error() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  shared: { type: openai, api_key: k }
+models:
+  a:
+    providers:
+      - { provider: shared, dialect: openai }
+  b:
+    providers:
+      - { provider: shared, dialect: anthropic }
+routes:
+  - { model: "*", provider: shared }
+"#,
+    )
+    .expect("must parse -- the disagreement is a lowering-time error");
+    let err = lower_to_loaded(&config)
+        .expect_err("a provider used with two different dialects must fail to lower");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "models.b.providers[0]");
+    assert!(
+        reason.contains("models.a.providers[0]"),
+        "the error must name the OTHER offending path too, or the user cannot tell what it \
+         disagrees with: {reason}"
+    );
+}
+
+/// The two carriers must not drift apart again: for every provider cluster
+/// the example config produces, the dialect on the cluster equals the
+/// dialect on the route that selects it.
+#[test]
+fn both_dialect_carriers_agree_on_the_example_config() {
+    let config = parse(proxy_simple_config::SAMPLE_CONFIG).expect("example must parse");
+    let loaded = lower_to_loaded(&config).expect("example must lower");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("example must build IR");
+    let lowered = proxy_simple_config::lower(&config).expect("example must lower");
+    let routes = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes")
+        .clone();
+
+    let name_of = |d: proxy_config::ir::UsageDialect| match d {
+        proxy_config::ir::UsageDialect::OpenAi => "openai",
+        proxy_config::ir::UsageDialect::Anthropic => "anthropic",
+    };
+
+    let mut checked = 0;
+    for route in &routes {
+        let cluster = route["route"]["cluster"]
+            .as_str()
+            .expect("every example route targets a named cluster");
+        let route_dialect = route["typed_per_filter_config"]["llmproxy.usage"]["inline_string"]
+            .as_str()
+            .expect("every route carries a usage dialect");
+
+        // A route targeting an aggregate is the case ground rule #6 is
+        // actually about: the route picks the aggregate, but the MEMBER is
+        // what gets dialled, so every member must agree with the route's
+        // dialect -- otherwise failover silently meters the fallback with
+        // the primary's parser. The aggregate itself carries no dialect
+        // (`metadata` on an aggregate is a hard load error precisely so it
+        // cannot), so this checks through to the members.
+        let member_clusters: Vec<&str> = match &snapshot.clusters[cluster].kind {
+            proxy_config::ir::ClusterKind::Aggregate { members } => {
+                members.iter().map(String::as_str).collect()
+            }
+            _ => vec![cluster],
+        };
+
+        for member in member_clusters {
+            let cluster_dialect = name_of(
+                snapshot.clusters[member]
+                    .usage_dialect
+                    .expect("every provider cluster carries a usage dialect"),
+            );
+            assert_eq!(
+                route_dialect, cluster_dialect,
+                "route targeting `{cluster}` says `{route_dialect}` but member `{member}` \
+                 says `{cluster_dialect}` -- the two carriers have drifted, which is exactly \
+                 the wrong-billing failure moving this onto the cluster exists to prevent"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 4,
+        "expected at least 4 (route, cluster) pairs from the example -- three provider \
+         routes plus the fallback route's second member; checked {checked}, so this test \
+         has gone vacuous"
+    );
+}
