@@ -9,10 +9,13 @@
 //! `LocalSet` on a `current_thread` runtime.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::Read as _;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
@@ -20,15 +23,16 @@ use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::resolver::FakeResolver;
 use proxy_config::ir::{
-    ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, ForwardAction,
-    ForwardTarget, LbPolicy, PathMatch, RetryBackOff, RetryOn, RetryPolicyIR, RouteActionIR,
-    RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
+    AccessLogFormat, AccessLogIR, AccessLogSink, ClusterConfig, ClusterKind, ClusterName,
+    DiscoveryType, EndpointIR, ForwardAction, ForwardTarget, LbPolicy, PathMatch, RetryBackOff,
+    RetryOn, RetryPolicyIR, RouteActionIR, RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
 };
 use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
 use proxy_http::stat_handles::{RouterStats, StatHandles};
+use proxy_observability::access_log::parse_format;
 use proxy_observability::stats::{StatsControl, WorkerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -157,6 +161,108 @@ async fn build_router_with_stats(
         ),
         stats,
     )
+}
+
+/// A unique path under the OS temp dir -- same technique as
+/// `router_access_log.rs`'s own `temp_path`, duplicated rather than shared
+/// (this crate's test-file convention: each integration-test binary is
+/// self-contained).
+fn temp_path(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "proxy-http-router-retry-test-{}-{}-{}",
+        std::process::id(),
+        name,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    p
+}
+
+fn read_to_string(path: &Path) -> String {
+    let mut s = String::new();
+    File::open(path).unwrap().read_to_string(&mut s).unwrap();
+    s
+}
+
+fn text_logger(path: &Path, format: &str) -> AccessLogIR {
+    AccessLogIR {
+        sink: AccessLogSink::File {
+            path: path.to_string_lossy().into_owned(),
+        },
+        format: AccessLogFormat::Text(parse_format(format).unwrap()),
+        filter: None,
+    }
+}
+
+/// Like [`build_router`], but resolving `access_logs` into live sinks
+/// (mirrors `router_access_log.rs`'s `build_router`) -- what the WP-24 `URX`
+/// test below needs to observe the rendered `%RESPONSE_FLAGS%` line, not
+/// just the response the router returns.
+async fn build_router_with_access_logs(
+    addr: SocketAddr,
+    fwd: ForwardAction,
+    access_logs: &[AccessLogIR],
+) -> FilterChainHandler {
+    let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+    let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
+    snapshot.insert(
+        "up".to_string(),
+        Arc::new(ClusterConfig {
+            name: "up".to_string(),
+            discovery: DiscoveryType::Static,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints: vec![EndpointIR {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                weight: 1,
+                priority: 0,
+            }],
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+        }),
+    );
+    manager.update_from_snapshot(&snapshot).await;
+
+    let route_table = RouteTable::new(
+        "test-routes".to_string(),
+        vec![VirtualHostIR {
+            name: "vh".to_string(),
+            domains: vec!["*".to_string()],
+            routes: vec![Arc::new(RouteEntry {
+                name: None,
+                matcher: prefix_matcher("/v1/"),
+                action: RouteActionIR::Forward(fwd),
+                request_headers_to_add: Vec::new(),
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
+            })],
+            typed_per_filter_config: BTreeMap::new(),
+        }],
+        BTreeMap::new(),
+    )
+    .unwrap();
+
+    let stats = test_router_stats(&["up"]);
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+        Arc::new(RouterFilterFactory::new(Arc::new(manager), stats));
+    FilterChainHandler::new_with_access_logs(
+        Vec::new(),
+        terminal_factory,
+        Arc::new(route_table),
+        false,
+        false,
+        0,
+        access_logs,
+    )
+    .expect("test access-log sinks (temp files) always open cleanly")
 }
 
 fn request_with_body(path: &'static str, body: &'static [u8]) -> HttpRequestParts {
@@ -327,6 +433,81 @@ async fn retries_stop_at_num_retries_and_return_the_last_failure() {
                 3,
                 "expected num_retries + 1 == 3 attempts to reach the upstream"
             );
+        })
+        .await;
+}
+
+/// WP-24: the response flag half of
+/// [`retries_stop_at_num_retries_and_return_the_last_failure`] above -- once
+/// the retry budget (S3.1) is spent AND the final attempt is still a
+/// triggering outcome, `%RESPONSE_FLAGS%` must render `URX`. A plain
+/// passed-through 503 response carries no OTHER flag of its own (unlike a
+/// connect failure or a synthesized local reply), so this is the cleanest
+/// site to see `URX` completely alone rather than combined with something
+/// else -- see `RetryState::retry_limit_exceeded`'s doc for why this is
+/// deliberately NOT the same condition as "should_retry returned false".
+#[tokio::test(flavor = "current_thread")]
+async fn retry_limit_exceeded_renders_the_urx_response_flag() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, count, _rx) = spawn_upstream_fails_then_succeeds(usize::MAX, 503).await;
+            let path = temp_path("urx-flag");
+            let router = build_router_with_access_logs(
+                addr,
+                forward_to_up(Some(retry_policy("5xx", 2))),
+                &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
+            )
+            .await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            resp.body.collect().await.unwrap();
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                3,
+                "expected num_retries + 1 == 3 attempts to reach the upstream"
+            );
+
+            let logged = read_to_string(&path);
+            assert_eq!(
+                logged, "503 URX\n",
+                "the retry budget was exhausted against a still-failing (retriable) \
+                 outcome -- URX must render alone"
+            );
+
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+/// The budget-not-yet-spent half of the same condition: a request that
+/// succeeds on its one allowed retry must never carry `URX` -- there was a
+/// retry, but no LIMIT was ever exceeded.
+#[tokio::test(flavor = "current_thread")]
+async fn a_successful_retry_never_renders_urx() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, _count, _rx) = spawn_upstream_fails_then_succeeds(1, 503).await;
+            let path = temp_path("no-urx-on-success");
+            let router = build_router_with_access_logs(
+                addr,
+                forward_to_up(Some(retry_policy("5xx", 2))),
+                &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
+            )
+            .await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            resp.body.collect().await.unwrap();
+
+            let logged = read_to_string(&path);
+            assert_eq!(
+                logged, "200 -\n",
+                "a request that eventually succeeds within its retry budget must \
+                 carry no response flags at all"
+            );
+
+            std::fs::remove_file(&path).unwrap();
         })
         .await;
 }

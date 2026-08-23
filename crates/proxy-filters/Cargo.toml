@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
+# WP-24: `ResponseFlag` (`%RESPONSE_FLAGS%`) -- `token_limit_filter` sets `RL`
+# on its own 429 path, same as `proxy-http::router` does for its own flags.
+proxy-observability = { workspace = true }
 # WP-34 (Lane H): usage/token extraction from provider responses.
 bytes = { workspace = true }
 http = { workspace = true }

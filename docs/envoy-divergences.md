@@ -7,6 +7,7 @@ undocumented divergence found by the rig is a bug.
 | # | Area | Envoy behavior | Our behavior | Justification | Pinned fixture |
 |---|------|----------------|--------------|---------------|----------------|
 | 1 | `--drain-strategy` | `gradual` ramps the probability an in-flight response is closed linearly over the drain window; `immediate` closes at 100% from the start of the drain. | `gradual` and `immediate` are byte-identical: the drain sequence only ever waits for the connection registry to empty or the drain deadline to pass, then flips a plain shutdown signal hyper's `graceful_shutdown()` reacts to. `DrainState::drain_close_probability` implements the ramp but has no call site. | Wiring it properly requires the HTTP codecs (`proxy-http`) to consult a per-response close probability, which is its own work package, not a contained fix — see "Drain strategy" below. A silent no-op would violate ground rule #1, so this is a loud startup `tracing::warn!` instead (`crates/proxy/src/main.rs`, `serve`). | none yet — tracked by `crates/proxy-core/src/drain.rs`'s own unit tests on `drain_close_probability` plus the startup warning; no diff-rig fixture exists for drain timing yet. |
+| 2 | `%RESPONSE_FLAGS%` | All 20 documented flags can fire under the conditions Envoy defines for them. | 6 of 20 are genuinely unreachable (no corresponding feature exists) and 2 more are declared and apparently wired but are dead code (their only producer is never actually constructed) — see "Response flags (WP-24)" below for the full per-flag table. | Most of the 6 name features not yet built (`ext_authz`, gRPC ratelimit service, strict header validation, `max_stream_duration`, a downstream/upstream health-check surface) — see ground rule #1's spirit: rather than silently claim coverage, each is documented with the specific reason so the next audit doesn't re-derive it. | `crates/proxy-observability/src/flags.rs`'s per-variant doc comments (normative); `crates/proxy-http/tests/response_flags.rs`, `router_retry.rs`, `router_access_log.rs`, and `proxy-filters`' `token_limit_filter.rs` pin the 11 reachable flags. |
 
 ## CLI flag policy
 
@@ -89,3 +90,42 @@ Separately: we reject a `tls_inspector` config that sets `enable_ja3_fingerprint
 `close_connection_on_client_hello_parsing_errors` (naming the field path)
 rather than silently accepting and ignoring them — ground rule #2. Only
 `max_client_hello_size` is implemented.
+
+## Response flags (WP-24)
+
+WP-24's acceptance criterion is "every response flag reachable by at least
+one test." Re-audited flag by flag (2026-08-22) against what this codebase
+actually builds — a `grep` for `set_response_flag` is not proof of
+reachability, as two rows below found the hard way. The normative version of
+this table is the per-variant doc comments on `ResponseFlag` itself
+(`crates/proxy-observability/src/flags.rs`); this is the narrative form.
+
+| Flag | Code | Status | Detail |
+|---|---|---|---|
+| `NoHealthyUpstream` | `UH` | Reachable, tested | Zero endpoints (or every host filtered) makes `select_host` return `None`. `response_flags::zero_endpoints_records_and_renders_the_uh_flag`. |
+| `UpstreamConnectionFailure` | `UF` | Reachable, tested | Refused TCP connect, or a TLS handshake failure (folded into the same code). `response_flags::a_refused_connection_records_and_renders_the_uf_flag`. |
+| `UpstreamOverflow` | `UO` | Reachable, tested | The S5 `max_requests` circuit breaker. `router.rs` also has a `PoolError::Overflow` arm for this flag, but nothing ever constructs that variant — the breaker is the only live producer. `response_flags::max_requests_zero_records_and_renders_the_uo_flag`. |
+| `NoRouteFound` | `NR` | Reachable, tested | A request path matching no configured route. `response_flags::no_route_matched_records_and_renders_the_nr_flag`. |
+| `UpstreamRetryLimitExceeded` | `URX` | Reachable, was unwired — now fixed | The S3 retry engine exists, but nothing ever set this flag when its budget ran out. Fixed by `RetryState::retry_limit_exceeded` (`proxy_http::retry`) plus `router.rs`'s `record_retry_limit_exceeded_if_applicable`, called at every attempt-failure exit right after that exit's own flag, so a combined line renders `<flag>,URX` (matching Envoy, which never puts `URX` first). Deliberately distinct from "`should_retry` returned false": that's also true for an outcome the policy was never configured to retry, or a body S3.4 ruled unretriable — neither of those is a *limit* being exceeded. `router_retry::retry_limit_exceeded_renders_the_urx_response_flag` and the negative case `a_successful_retry_never_renders_urx`. |
+| `NoClusterFound` | `NC` | Reachable, tested | A route forwarding to an unregistered cluster name. `router_access_log::unknown_cluster_records_and_renders_the_nc_flag`. |
+| `DownstreamConnectionTermination` | `DC` | **Looks wired, unreachable today** | `BodyError::Downstream` is constructed in exactly one place — `codec.rs`, reading the incoming *request* body — and `filter_manager.rs`'s `collect_request` discards that error entirely (`.map_err(\|_\| ())`) before any `StreamInfo` exists to flag; the resulting 400 carries no flag. `access_logging.rs`'s `LoggingBody::classify` does map this variant to `DC` and has its own unit test (`downstream_body_error_mid_stream_logs_dc`), but that test hand-constructs a `BodyError::Downstream` directly — nothing in the real response-body pipeline `LoggingBody` wraps can ever produce one (it only ever sees `BodyError::Upstream`). **Fix candidate for a future batch**: thread the real error through `collect_request` (instead of `Result<_, ()>`) and set `DC` on the resulting 400, in `filter_manager.rs` — out of this batch's file scope. |
+| `FailedLocalHealthCheck` | `LH` | Unreachable | No downstream health-check filter or admin/maintenance-mode surface exists. |
+| `UpstreamRequestTimeout` | `UT` | Reachable, tested | The route's whole-loop `timeout`, or a `per_try_timeout` on a single attempt. `response_flags::a_route_timeout_records_and_renders_the_ut_flag`. |
+| `LocalReset` | `LR` | Unreachable | No code path resets a connection on the proxy's own initiative outside the cases other flags already model (client gone is `DC`'s condition, an idle upstream is `SI`, an upstream failure is `UF`/`UC`/`UR`). |
+| `UpstreamRemoteReset` | `UR` | **Declared, never produced** | `PoolError::ResetBeforeHeaders` — the only value `router.rs`'s `UR` arm matches — is never constructed by `ConnectPool::new_stream` (h1) or the h2 connection cache; both only ever return `ConnectFailure`/`ConnectTimeout`/`TlsHandshake`. A genuine post-connect reset is indistinguishable from those today, so this arm is dead code. Buildable (match `ECONNRESET` specifically after a successful connect) but a classification decision, not a wiring fix. |
+| `UpstreamConnectionTermination` | `UC` | Reachable, tested | Any hyper-level failure sending the request or parsing the response. `response_flags::a_garbled_upstream_response_records_and_renders_the_uc_flag`. |
+| `RateLimited` | `RL` | Reachable, was unwired — now fixed | `token_limit_filter` denied requests with **zero** occurrences of `ResponseFlag` in the file — its own refusal was indistinguishable from any other 429 in the access log. Fixed: set on the deny path only (never on the fail-open paths, which admit the request). `token_limit_filter::tests::a_denied_request_renders_the_rl_response_flag`. |
+| `UnauthorizedExternalService` | `UAEX` | Unreachable | No `ext_authz` filter exists (WP-32, not yet built). |
+| `RateLimitServiceError` | `RLSE` | Unreachable | No external gRPC ratelimit service (Envoy's RLS protocol, WP-32) is implemented; `token_limit_filter` is a local/in-process limiter with no remote service to fail. |
+| `InvalidEnvoyRequestHeaders` | `IH` | Unreachable | No strict-header-validation feature exists. |
+| `StreamIdleTimeout` | `SI` | Reachable, tested | A route's `idle_timeout` firing while an upstream response body has gone quiet. `response_flags::an_idle_response_body_records_and_renders_the_si_flag`. |
+| `DownstreamProtocolError` | `DPE` | Unreachable | A malformed downstream request is a connection-level failure inside `codec.rs`'s `serve_http1`/`serve_http2` (`CodecError`), returned before any per-request `StreamInfo` exists — there is no stream to flag. |
+| `UpstreamProtocolError` | `UPE` | Unreachable today | `UpstreamCodecError` does not classify `hyper::Error` by kind; a genuine protocol violation and a plain connection drop both collapse into the same variants, already mapped uniformly to `UC`. Buildable via `hyper::Error::is_parse()`, but which hyper error kinds count as "protocol" versus "connection" (matching Envoy's own `UPE`/`UC` split) is a classification decision. |
+| `UpstreamMaxStreamDurationReached` | `UMSDR` | Unreachable | No `max_stream_duration` feature (distinct from `timeout`/`idle_timeout`, both of which exist) is implemented. |
+
+Two rows above (`DC`, `UR`) are the reason this table exists rather than a
+comment saying "see the code": both look reachable from a `grep` for
+`set_response_flag` — the flag-setting `match` arm is right there — and
+both are dead code once you trace back to what actually constructs the
+value that arm matches on. A future audit that only greps for the flag name
+will reach the same wrong conclusion these did on the first pass.
