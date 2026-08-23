@@ -7,7 +7,7 @@
 
 use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
-use crate::lower::resolved_dialect;
+use crate::lower::{dialect_from_models, resolved_dialect};
 use crate::model::{
     is_valid_provider_name, Listen, ModelProviderRef, ProviderModelRef, SimpleConfig, RESERVED_KEYS,
 };
@@ -260,6 +260,25 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
         }
     }
 
+    // `routes:` references, checked only now that the `models:` loop above has
+    // validated every entry -- `dialect_from_models` reads those entries, and
+    // a models-surface error deserves its own more specific message first.
+    //
+    // A `ProviderModelRef` is `{ provider, model }` and nothing else: only
+    // `models:`'s object form carries `dialect`. So for a dialect-ambiguous
+    // type the wire format has to come from a `models:` entry, and when none
+    // pins it the old behaviour was to answer `openai` silently. That sends an
+    // Anthropic-shaped response to the OpenAI usage parser, which reads no
+    // usage at all, which lets the token limiter fail open (it warns now, but
+    // it still admits the request uncharged) -- a quota bypass produced by a
+    // config the loader accepted. Ground rule #1: name the path and refuse.
+    for (i, route) in config.routes.iter().enumerate() {
+        check_route_ref_dialect(config, &route.provider, &format!("routes[{i}].provider"))?;
+        for (j, fallback) in route.fallbacks.iter().enumerate() {
+            check_route_ref_dialect(config, fallback, &format!("routes[{i}].fallbacks[{j}]"))?;
+        }
+    }
+
     for (i, limit) in config.limits.iter().enumerate() {
         if limit.tokens_per_minute.is_none()
             && limit.requests_per_minute.is_none()
@@ -308,6 +327,40 @@ fn check_provider_ref(
         });
     }
     Ok(())
+}
+
+/// A `routes:` provider reference must end up with a wire format that was
+/// *stated*, not guessed. For unambiguous types the type states it; for
+/// Vertex/Bedrock only a `models:` entry can, since the route surface has no
+/// `dialect` field -- see the call site for what guessing costs.
+fn check_route_ref_dialect(
+    config: &SimpleConfig,
+    reference: &ProviderModelRef,
+    path: &str,
+) -> Result<(), ConfigError> {
+    // `check_provider_ref` already ran for this same path, so the name resolves.
+    let Some(provider) = config.providers.get(&reference.provider) else {
+        return Ok(());
+    };
+    let provider_type = provider.effective_type(&reference.provider);
+    if !provider_type.dialect_is_ambiguous() {
+        return Ok(());
+    }
+    if dialect_from_models(config, &reference.provider)?.is_some() {
+        return Ok(());
+    }
+    Err(ConfigError::InvalidValue {
+        field_path: path.to_string(),
+        reason: format!(
+            "`{}` providers serve more than one wire format under one type (e.g. Vertex \
+             hosts Anthropic-, Google-, and OpenAI-shaped models), so the dialect cannot be \
+             derived here, and a `routes:` provider reference has no `dialect` field to \
+             carry it -- add a `models:` entry for `{}` using the object form \
+             ({{ provider, model, dialect }}), which states it explicitly",
+            provider_type.as_str(),
+            reference.provider
+        ),
+    })
 }
 
 /// Parse `host:port` (IPv6 in brackets) into (host, port).

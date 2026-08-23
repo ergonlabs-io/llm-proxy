@@ -596,20 +596,47 @@ fn auth_header(
 /// entry references falls back to the type-derived answer, which is what the
 /// `routes:` surface (no per-entry `dialect` field) uses anyway.
 ///
-/// Known gap, deliberately not widened here: the `routes:` surface never
-/// rejects a dialect-ambiguous provider type, so `usage_dialect` silently
-/// answers `openai` for a Vertex/Bedrock provider reached only through
-/// `routes:`. That is pre-existing behaviour of the route-level carrier, not
-/// something this function introduces, and fixing it is a separate change to
-/// `validate_semantics`.
+/// That fallback is safe because `validate_semantics` now rejects a
+/// dialect-ambiguous provider type wherever `routes:` references it
+/// (`check_provider_ref`), so a Vertex/Bedrock provider can only reach
+/// lowering through a `models:` entry that stated `dialect` explicitly --
+/// which the walk above finds. Before that check existed this function's
+/// fallback answered `openai` for such a provider silently, and the usage
+/// parser then read nothing off an Anthropic-shaped response.
 fn cluster_usage_dialect(
     config: &SimpleConfig,
     provider_name: &str,
     provider: &Provider,
 ) -> Result<&'static str, ConfigError> {
+    Ok(dialect_from_models(config, provider_name)?
+        .map(|(_, dialect)| dialect)
+        .unwrap_or_else(|| usage_dialect(provider_name, provider)))
+}
+
+/// The `models:`-walk half of [`cluster_usage_dialect`], split out so the
+/// validator can ask the question the carriers answer: *does any `models:`
+/// entry pin this provider's dialect, and if so which?* `None` means no
+/// entry references it at all, and the caller decides what that means --
+/// [`cluster_usage_dialect`] falls back to the type-derived answer, while
+/// `parse.rs` treats it as fatal for a dialect-ambiguous type, since for
+/// those the type-derived answer is a guess (`openai`) rather than a fact.
+///
+/// Returns the path of the first entry that pinned it alongside the dialect,
+/// so an error can name a real location.
+pub(crate) fn dialect_from_models(
+    config: &SimpleConfig,
+    provider_name: &str,
+) -> Result<Option<(String, &'static str)>, ConfigError> {
     // Rust note: `models` is a `BTreeMap`, so this walk is in sorted key
     // order -- the error below names a deterministic "first" path rather
     // than whichever entry a hash seed happened to yield.
+    // `validate_semantics` already rejected an unknown provider name at every
+    // path that can produce one, so this lookup cannot miss for a config that
+    // reached lowering; the validator itself calls this only after its own
+    // unknown-provider check.
+    let Some(provider) = config.providers.get(provider_name) else {
+        return Ok(None);
+    };
     let mut found: Option<(String, &'static str)> = None;
     for (model_name, model) in &config.models {
         for (i, entry) in model.providers.iter().enumerate() {
@@ -637,9 +664,7 @@ fn cluster_usage_dialect(
             }
         }
     }
-    Ok(found
-        .map(|(_, dialect)| dialect)
-        .unwrap_or_else(|| usage_dialect(provider_name, provider)))
+    Ok(found)
 }
 
 fn usage_dialect(name: &str, provider: &Provider) -> &'static str {
@@ -764,7 +789,13 @@ fn lower_route(
     let provider_name = &rule.provider.provider;
     let provider = &config.providers[provider_name];
     let up = provider_upstream(provider_name, provider)?;
-    let primary_dialect = usage_dialect(provider_name, provider);
+    // Through `cluster_usage_dialect`, NOT `usage_dialect` directly. The
+    // `routes:` surface has no `dialect` field of its own, so the only place
+    // a Vertex/Bedrock provider's wire format can be stated is a `models:`
+    // entry -- and this walks those. `usage_dialect` alone would answer
+    // `openai` for such a provider and silently mis-dialect it; the
+    // validator guarantees an ambiguous type has a `models:` entry to find.
+    let primary_dialect = cluster_usage_dialect(config, provider_name, provider)?;
 
     if rule.provider.model.is_some() {
         warnings.push(warning(
@@ -784,7 +815,8 @@ fn lower_route(
         // `fallbacks[j].provider` via `check_provider_ref`, so this index is
         // safe.
         let fallback_provider = &config.providers[&fallback.provider];
-        let fallback_dialect = usage_dialect(&fallback.provider, fallback_provider);
+        let fallback_dialect =
+            cluster_usage_dialect(config, &fallback.provider, fallback_provider)?;
         // A hard error, not a warning: an OpenAI-shaped request body is not
         // valid for Anthropic (and vice versa), and the response would be
         // scanned for tokens by the wrong dialect's parser -- silently
@@ -1466,7 +1498,8 @@ fn lower_listener(
         .first()
         .map(|rule| {
             let name = &rule.provider.provider;
-            usage_dialect(name, &config.providers[name])
+            cluster_usage_dialect(config, name, &config.providers[name])
+                .expect("validated: routes[0].provider's dialect resolves")
         })
         .unwrap_or("openai");
 

@@ -1655,6 +1655,15 @@ models:
 /// one of those types is a hard error naming the gap, caught at LOWERING
 /// (not parse) time, since it's a "can we produce a working Envoy resource"
 /// question, not a shape question.
+///
+/// The vertex/bedrock configs here carry a `models:` entry pinning `dialect`
+/// only so they get PAST `validate_semantics`, which rejects a
+/// dialect-ambiguous type reached from `routes:` with nothing to state its
+/// wire format (`check_route_ref_dialect`). Without it the parse-time error
+/// fires first and this lowering-time error becomes unreachable -- so the
+/// entry is what makes this test still test what it says it does, and it
+/// strengthens the claim: the unbuilt-type error survives an otherwise
+/// fully-specified config.
 #[test]
 fn unbuilt_provider_types_are_hard_load_errors() {
     for (type_name, must_contain) in [
@@ -1662,6 +1671,12 @@ fn unbuilt_provider_types_are_hard_load_errors() {
         ("bedrock", "SigV4"),
         ("azure-openai", "URL path templating"),
     ] {
+        let models = if type_name == "azure-openai" {
+            String::new()
+        } else {
+            "\nmodels:\n  m1:\n    providers:\n      - { provider: p1, model: m, dialect: anthropic }\n"
+                .to_string()
+        };
         let config = parse(&format!(
             r#"
 version: 0
@@ -1669,7 +1684,7 @@ providers:
   p1: {{ type: {type_name}, base_url: "https://example.com", api_key: k }}
 routes:
   - {{ model: "*", provider: p1 }}
-"#
+{models}"#
         ))
         .unwrap_or_else(|e| panic!("{type_name}: must parse, got {e}"));
         let err =
@@ -2457,4 +2472,119 @@ fn both_dialect_carriers_agree_on_the_example_config() {
          routes plus the fallback route's second member; checked {checked}, so this test \
          has gone vacuous"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `routes:`-surface dialect resolution (the route carrier's half of WP-35
+// increment 1). `models:` got this check when WP-49 landed; `routes:` did
+// not, and a `ProviderModelRef` is `{ provider, model }` with no `dialect`
+// field, so a Vertex/Bedrock provider reached through `routes:` silently
+// lowered as `openai`.
+//
+// Why that matters even though `lower()` currently refuses Vertex/Bedrock
+// outright (`unbuilt_provider_types_are_hard_load_errors`): the guess is
+// wrong the day those types become loadable, and what it produces is not a
+// loud failure. The OpenAI usage parser finds no usage object in an
+// Anthropic-shaped response, `StreamInfo::llm.usage` stays `None`, and the
+// token limiter fails open -- it warns now (ground rule 17) but still admits
+// the request uncharged. This is the check that has to exist before either
+// type ships, not after.
+
+/// A dialect-ambiguous provider reached only through `routes:`, with no
+/// `models:` entry to state its wire format, must be refused by name and
+/// path rather than silently answered `openai`.
+#[test]
+fn a_routes_only_ambiguous_provider_is_rejected_with_its_path() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+routes:
+  - { model: "*", provider: vertex-us }
+"#,
+    )
+    .expect_err("an ambiguous provider with no dialect anywhere must fail");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "routes[0].provider");
+    assert!(reason.contains("vertex"), "names the type: {reason}");
+    assert!(
+        reason.contains("models:"),
+        "points at the surface that can fix it: {reason}"
+    );
+}
+
+/// The same rule applies to a fallback, at the fallback's own path -- a
+/// fallback is dialled on failover, so a wrong dialect there mis-meters
+/// exactly the requests that were already having a bad time.
+#[test]
+fn a_routes_fallback_to_an_ambiguous_provider_is_rejected_at_its_own_path() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  main: { type: anthropic, base_url: "https://a.example.com", api_key: k }
+  bedrock-w: { type: bedrock, base_url: "https://b.example.com", api_key: k }
+routes:
+  - model: "*"
+    provider: main
+    fallbacks: [bedrock-w]
+"#,
+    )
+    .expect_err("an ambiguous fallback with no dialect anywhere must fail");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "routes[0].fallbacks[0]");
+    assert!(reason.contains("bedrock"), "names the type: {reason}");
+}
+
+/// The check must NOT make Vertex/Bedrock unusable: `routes:` is
+/// unconditionally required, so a blanket rejection would mean no valid
+/// config could ever name one. A `models:` entry stating `dialect` is what
+/// makes the route reference resolvable, and the route must then be accepted
+/// AND carry the stated dialect -- not the `openai` the type would derive.
+#[test]
+fn a_models_entry_makes_an_ambiguous_routes_provider_resolvable() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+routes:
+  - { model: "*", provider: vertex-us }
+models:
+  claude-sonnet-4-5:
+    providers:
+      - { provider: vertex-us, model: "claude-sonnet-4-5@20250929", dialect: anthropic }
+"#,
+    )
+    .expect("a models entry pinning dialect must make this parse");
+    // Lowering still refuses the type itself (no OAuth2 yet), which is the
+    // *other* fatal error and proves parse got past the dialect check rather
+    // than the config being wrong in some third way.
+    let err =
+        proxy_simple_config::lower(&config).expect_err("vertex is still unbuilt at lowering time");
+    let ConfigError::Unimplemented { field_path, .. } = &err else {
+        panic!("expected the unbuilt-type Unimplemented, got: {err}");
+    };
+    assert_eq!(field_path, "providers.vertex-us.type");
+}
+
+/// An unambiguous type in `routes:` is untouched by any of this -- the type
+/// alone states the wire format, so no `models:` entry is needed.
+#[test]
+fn an_unambiguous_routes_provider_needs_no_models_entry() {
+    parse(
+        r#"
+version: 0
+providers:
+  main: { type: anthropic, base_url: "https://a.example.com", api_key: k }
+routes:
+  - { model: "*", provider: main }
+"#,
+    )
+    .expect("an anthropic provider derives its own dialect");
 }
