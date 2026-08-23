@@ -869,8 +869,9 @@ Each WP references its normative spec sections.
 > outcome the policy never retried; a body that was not replayable) — neither is
 > a limit being exceeded.
 >
-> **The audit's more useful output is the list of what CANNOT happen.** `UR` and
-> `DC` are declared, look wired, and are dead code: `PoolError::ResetBeforeHeaders`
+> **The audit's more useful output was the list of what CANNOT happen.** `UR` and
+> `DC` were declared, looked wired, and were dead code (both fixed 2026-08-23,
+> see the end of this block): `PoolError::ResetBeforeHeaders`
 > is constructed by neither pool, and `BodyError::Downstream` is discarded in
 > `filter_manager::collect_request` before any flag can be set — its existing unit
 > test fabricates the condition rather than driving it, which is why the gap
@@ -882,6 +883,26 @@ Each WP references its normative spec sections.
 > **Transferable:** a fabricated-condition test is worse than no test — it makes
 > an unreachable path look covered. When a flag has a test, check whether the test
 > *drives* the condition or *constructs* it.
+>
+> **Both are now closed (2026-08-23).** `UR` got its producer from the WP-15
+> h2 refused-stream decode: a refused stream is a deliberate remote reset, so
+> the router flags it `UR` rather than `UC`. `DC` got its own fix here --
+> `collect_request` no longer flattens its body error to `()`, so a
+> `BodyError::Downstream` survives long enough to flag. Its test refuses to
+> fabricate: it runs the real downstream codec and behaves like a client that
+> dies mid-upload (announce `Content-Length: 100`, send 10 bytes, close the
+> write half), which is the one and only way `BodyError::Downstream` is
+> constructed. Mutation-checked -- without the flag it renders `400 -`.
+>
+> Each flag is still only *partly* wired where a second route exists:
+> `PoolError::ResetBeforeHeaders` remains unconstructed, so a post-connect TCP
+> reset still reports `UF` rather than `UR`.
+>
+> **Counting correction.** The audit's prose said "6 of 20 unreachable"; the
+> actual table has always had **8** unreachable, plus the 2 dead on top --
+> 10 non-working, not 8. With `UR` and `DC` fixed the split is 8 unreachable /
+> 12 reachable. The table is authoritative and the summary line had drifted
+> from it; count the rows, don't trust the last summary.
 - Format-string engine: default format ✅ (`[%START_TIME%] "%REQ(:METHOD)% …"`) and the
   operator set: `%REQ(X?Y):Z%`, `%RESP%`, `%TRAILER%`, `%DURATION%`, `%REQUEST_DURATION%`,
   `%RESPONSE_DURATION%`, `%RESPONSE_FLAGS%` (full flag vocabulary — UH,UF,UO,NR,URX,NC,DC,LH,

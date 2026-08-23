@@ -1038,7 +1038,24 @@ impl FilterManager {
             // S2.5: routed through the encoder chain like any other response —
             // no filters have run yet, but the still-fresh `filters`/`ctx` are
             // exactly what `respond_with_local_reply` needs.
-            Err(()) => {
+            Err(err) => {
+                // WP-24 `DC`: a `BodyError::Downstream` means the CLIENT's
+                // connection failed while its request body was being read --
+                // Envoy's "downstream connection termination". Any other
+                // variant is a malformed body, which is a plain 400 with no
+                // flag. This is the only site that can tell them apart: the
+                // distinction exists in `codec.rs`, and before the error was
+                // propagated out of `collect_request` it was destroyed here.
+                //
+                // Set before `respond_with_local_reply` so a `%RESPONSE_FLAGS%`
+                // logger reading `StreamInfo` afterwards already sees it --
+                // the same ordering `router.rs` uses for its own flags.
+                if matches!(err, BodyError::Downstream(_)) {
+                    tracing::debug!(response_flag = "DC", "downstream request body read failed");
+                    ctx.stream_info.borrow_mut().set_response_flag(
+                        proxy_observability::ResponseFlag::DownstreamConnectionTermination,
+                    );
+                }
                 let reply = LocalReply::new(
                     http::StatusCode::BAD_REQUEST,
                     "invalid request body",
@@ -2700,7 +2717,7 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
 /// Collect a request into head + optional trailers + buffered body bytes.
 async fn collect_request(
     req: HttpRequestParts,
-) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), ()> {
+) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), BodyError> {
     // `downstream` is only used by `FilterChainHandler::handle` (XFF/S9,
     // access-log peer address), all of which runs before `FilterManager::run`
     // is even called -- this function only needs head + body.
@@ -2709,7 +2726,11 @@ async fn collect_request(
         body,
         downstream: _,
     } = req;
-    let collected = body.collect().await.map_err(|_| ())?;
+    // WP-24: the error is propagated rather than flattened to `()`. It used
+    // to be discarded here, which is what made `DC` unreachable -- by the
+    // time the caller saw the failure there was nothing left to say whether
+    // the client had gone away or the body was merely malformed.
+    let collected = body.collect().await?;
     let trailers = collected.trailers().cloned().map(RequestTrailers);
     Ok((head, trailers, collected.to_bytes()))
 }

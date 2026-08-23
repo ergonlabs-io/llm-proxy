@@ -19,12 +19,15 @@
 //!
 //! That audit found two flags declared, apparently wired, and yet **dead
 //! code**: `UpstreamRemoteReset` and `DownstreamConnectionTermination`. Both
-//! matched on an error variant nothing ever constructed. `UpstreamRemoteReset`
-//! has since gained a real producer (the h2 refused-stream decode), leaving
-//! `DownstreamConnectionTermination`. Worth reading before trusting a `grep`
-//! for `set_response_flag` as a reachability proof — that is exactly the
-//! mistake that undercounted them the first time. A flag is reachable when
-//! something can construct the condition, not when something matches on it.
+//! matched on an error variant nothing ever constructed. Both have since
+//! been fixed — the h2 refused-stream decode gave `UR` a producer, and
+//! `collect_request` stopped discarding its body error, giving `DC` one.
+//!
+//! Keep the lesson even though the instances are closed: a `grep` for
+//! `set_response_flag` is not a reachability proof, and neither is a passing
+//! test. Both of those flags had one. A flag is reachable when something can
+//! construct the *condition*, so a test that fabricates the error proves the
+//! mapping and nothing else.
 
 /// Why a request ended the way it did. See the module doc's WP-24 audit for
 /// which variants are reachable (and where their test lives) versus
@@ -68,20 +71,22 @@ pub enum ResponseFlag {
     /// to a cluster name absent from the cluster manager's snapshot. See
     /// `proxy_http`'s `router_access_log::unknown_cluster_records_and_renders_the_nc_flag`.
     NoClusterFound,
-    /// DC: downstream connection terminated (a client's own request body
-    /// read fails mid-stream). **Unreachable today, despite existing
-    /// plumbing that looks wired**: `BodyError::Downstream` is constructed
-    /// in exactly one place (`codec.rs`, reading the incoming request body),
-    /// and `filter_manager.rs`'s `collect_request` discards that error
-    /// entirely (`.map_err(|_| ())`) before any `StreamInfo` exists to flag
-    /// -- the resulting 400 carries no flag at all. `access_logging.rs`'s
-    /// `LoggingBody::classify` DOES map this variant to `DC`, and has its
-    /// own unit test (`downstream_body_error_mid_stream_logs_dc`), but that
-    /// test hand-constructs a `BodyError::Downstream` directly; nothing in
-    /// the real response-body pipeline this wraps can ever produce one (the
-    /// response body only ever carries `BodyError::Upstream`). See
-    /// `docs/envoy-divergences.md`'s response-flags section for the fix
-    /// this implies in `filter_manager.rs` (out of this audit's file scope).
+    /// DC: downstream connection terminated -- the client's own request body
+    /// read failed mid-stream. **Reachable and tested**; it was not always.
+    /// `filter_manager.rs`'s `collect_request` used to flatten its body error
+    /// to `()` before any `StreamInfo` existed to flag, so the resulting 400
+    /// carried nothing; it now propagates the real `BodyError` and flags a
+    /// `Downstream` one here.
+    /// `response_flags::a_client_that_dies_mid_upload_records_and_renders_the_dc_flag`
+    /// drives the genuine condition (announce `Content-Length: 100`, send 10
+    /// bytes, close the write half) through the real downstream codec.
+    ///
+    /// Worth remembering how this hid: `access_logging.rs`'s
+    /// `LoggingBody::classify` mapped the variant and had a passing unit
+    /// test the whole time -- but that test hand-constructs the error, and
+    /// the response-body pipeline it wraps only ever carries
+    /// `BodyError::Upstream`. A test that fabricates its condition proves the
+    /// mapping, never the reachability.
     DownstreamConnectionTermination,
     /// LH: local service failed health check (maintenance mode). Unreachable:
     /// there is no downstream health-check filter or admin/maintenance-mode

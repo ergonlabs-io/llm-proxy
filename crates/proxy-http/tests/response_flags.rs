@@ -561,3 +561,71 @@ async fn a_refused_h2_stream_records_and_renders_the_ur_flag() {
         })
         .await;
 }
+
+// --- DC: downstream connection termination ----------------------------------
+
+/// `DC` was the second flag the WP-24 audit found declared, apparently
+/// wired, and unreachable. `access_logging.rs` maps `BodyError::Downstream`
+/// to it and has always had a unit test -- but that test **hand-constructs**
+/// the error, and nothing in the real pipeline could produce one, because
+/// `filter_manager::collect_request` flattened its body error to `()` before
+/// any `StreamInfo` existed to flag. A fabricated-condition test is worse
+/// than no test: it makes an unreachable path look covered.
+///
+/// So this test refuses to fabricate anything. It runs the real downstream
+/// codec (`serve_http1`) over a real pipe and behaves like a client that dies
+/// mid-upload: announce `Content-Length: 100`, send 10 bytes, then close the
+/// write half. hyper's `Incoming` surfaces the truncation as an error,
+/// `codec.rs` wraps it as `BodyError::Downstream` (the one and only site that
+/// constructs it), and the flag must reach the rendered access log.
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_that_dies_mid_upload_records_and_renders_the_dc_flag() {
+    use tokio::io::AsyncWriteExt;
+
+    LocalSet::new()
+        .run_until(async {
+            let addr = spawn_upstream_ok().await;
+            let path = temp_path("dc-flag");
+            let handler = build_router(
+                Scenario::forwarding_to(addr, forward_to(ForwardTarget::Cluster("up".into()))),
+                &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
+            )
+            .await;
+
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let served = tokio::task::spawn_local(async move {
+                let _ = proxy_http::codec::serve_http1(
+                    server,
+                    std::rc::Rc::new(handler) as std::rc::Rc<dyn StreamHandler>,
+                    proxy_http::codec::Http1Options { keep_alive: true },
+                    std::future::pending::<()>(),
+                    DownstreamInfo::loopback(),
+                )
+                .await;
+            });
+
+            // Promise 100 bytes, send 10, then EOF the write half -- the
+            // truncation hyper reports as a body error. The read half stays
+            // open so the server can still write its 400 rather than failing
+            // on a broken pipe, which would be a different condition.
+            client
+                .write_all(
+                    b"POST /v1/chat HTTP/1.1\r\nHost: test.local\r\nContent-Length: 100\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            client.write_all(b"0123456789").await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let _ = served.await;
+
+            assert_eq!(
+                read_to_string(&path),
+                "400 DC\n",
+                "a client that vanished mid-upload must render DC -- a bare `400` here means \
+                 the body error was still being discarded before anything could flag it"
+            );
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
