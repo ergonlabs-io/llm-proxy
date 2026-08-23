@@ -112,8 +112,8 @@ use crate::access_logging::{
 };
 use crate::filter::{
     BufferedBody, DecoderCallbacks, EncoderCallbacks, FilterDataStatus, FilterHeadersStatus,
-    FilterInstanceFactory, HeaderMutationFn, HttpFilter, HttpFilterFactory, PerRouteConfig,
-    RequestHeaders, RequestTrailers, ResponseHeaders, ResponseTrailers,
+    FilterInstanceFactory, FilterTrailersStatus, HeaderMutationFn, HttpFilter, HttpFilterFactory,
+    PerRouteConfig, RequestHeaders, RequestTrailers, ResponseHeaders, ResponseTrailers,
     TerminalFilterInstanceFactory, TerminalHttpFilter,
 };
 use crate::handler::{
@@ -2306,7 +2306,7 @@ async fn drive_decode(
         if data_consumed[i] {
             continue;
         }
-        deliver_decode_data(
+        let continued = deliver_decode_data(
             filters,
             ctx,
             buffer_limit,
@@ -2321,6 +2321,17 @@ async fn drive_decode(
         // S2.5: stop the trailing-data phase too if a local reply was requested.
         if ctx.local_reply.is_some() {
             return Ok(());
+        }
+        // S2.4 (chunk 4): `deliver_decode_data` returns `false` when either
+        // `decode_data` or (this filter's own) `decode_trailers` held --
+        // "iteration toward the terminal stops" (S2.4/S2.2) applies here
+        // exactly as it already does in the header-phase loop above,
+        // which already `break`s on the same signal. Before this fix the
+        // return value was discarded outright, so a filter that held here
+        // (never resuming) still let every later filter see data AND
+        // trailers -- the actual bug this task closes.
+        if !continued {
+            break;
         }
     }
     Ok(())
@@ -2374,7 +2385,21 @@ async fn poll_async_resumption(
 }
 
 /// Deliver the buffered body (and, if the filter continues, trailers) to filter
-/// `idx` exactly once. Returns whether it continued. Marks `data_consumed[idx]`.
+/// `idx` exactly once. Returns whether iteration continued PAST `idx` --
+/// either because both `decode_data` and (when trailers are present)
+/// `decode_trailers` returned `Continue`, or because the filter called
+/// `continue_decoding()` itself. Marks `data_consumed[idx]`.
+///
+/// S2.4 (chunk 4): `decode_trailers` returning `StopIteration` "HOLDS state
+/// and doesn't invoke any more filter functions with this filter's data"
+/// (`envoy/http/filter.h`, `FilterTrailersStatus::StopIteration`'s doc) --
+/// the trailer-hold counterpart to `decode_headers`/`decode_data`'s
+/// `StopIteration`. `continue_decoding()` is the only way out; there is no
+/// S2.2-style gotcha here (no callback after `decode_trailers` to keep
+/// firing on the same filter), so a held trailer hold is indistinguishable,
+/// from the caller's point of view, from a held DATA hold -- both simply mean
+/// "this filter did not continue", so both feed the same `bool` this function
+/// already returns for the data case.
 ///
 /// `head` (S2.8, ADR-0004 step 1) is the one addition over the pre-S2.8
 /// signature -- bundling it with the other split-storage borrows into a
@@ -2435,11 +2460,24 @@ async fn deliver_decode_data(
                 sync_route_head(ctx, head);
                 // WP-45 increment 2b: same real-borrow pattern -- no
                 // `headers` parameter on `decode_trailers` either.
+                //
+                // S2.4 (chunk 4): reset `continue_requested` right before the
+                // call (not just once at the top of this function) so it
+                // reflects ONLY what happens inside `decode_trailers` itself
+                // -- a leftover `true` from the `decode_data` call above
+                // (which is exactly how we got into this `if continued`
+                // branch) must not be mistaken for this filter having
+                // resumed its OWN trailer hold.
+                ctx.decode.continue_requested = false;
                 let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
                 let mut owned = RequestTrailers(t.0.clone());
-                let _ = filters[idx].decode_trailers(&mut cb, &mut owned);
+                let tstatus = filters[idx].decode_trailers(&mut cb, &mut owned);
                 // S2.7: same for an injection from `decode_trailers`.
                 drain_decode_injections(filters, ctx, buffer_limit, head)?;
+                let trailers_continued = matches!(tstatus, FilterTrailersStatus::Continue)
+                    || ctx.decode.continue_requested;
+                ctx.decode.continue_requested = false;
+                return Ok(trailers_continued);
             }
             return Ok(true);
         }
