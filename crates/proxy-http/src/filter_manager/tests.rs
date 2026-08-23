@@ -1652,28 +1652,153 @@ fn local_reply_encoder_chain_runs_from_the_correct_position() {
 
 // --- IGNORE cases: WP-11 chunk 4 gaps, written as the target spec ----------
 
-/// S2.2 (I1): `ContinueAndDontEndStream` on `decode_headers` should forward
-/// headers with `end_stream=false` even though the request had no body — the
-/// filter must later supply data via `inject_decoded_data_to_filter_chain`
-/// with `end_stream=true`. Today it's treated as plain `Continue` (module doc,
-/// filter_manager.rs L1246-1248).
+/// A filter that returns `ContinueAndDontEndStream` from `decode_headers` and
+/// supplies the body itself, out of band, exactly as S2.2 (I1) requires.
+struct DontEndStreamThenInjectFilter {
+    injected: Bytes,
+}
+
+impl HttpFilter for DontEndStreamThenInjectFilter {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _h: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        cb.inject_decoded_data_to_filter_chain(self.injected.clone(), true);
+        FilterHeadersStatus::ContinueAndDontEndStream
+    }
+}
+
+/// Records the `end_stream` flag it was handed on `decode_headers`, which is
+/// the whole observable of I1 and the one thing `ProbeFilter` throws away.
+struct RecordsHeaderEndStreamFilter {
+    seen: Arc<Mutex<Option<bool>>>,
+}
+
+impl HttpFilter for RecordsHeaderEndStreamFilter {
+    fn decode_headers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        _h: &mut RequestHeaders,
+        end_stream: bool,
+    ) -> FilterHeadersStatus {
+        *self.seen.lock().unwrap() = Some(end_stream);
+        FilterHeadersStatus::Continue
+    }
+}
+
+/// S2.2 (I1): `ContinueAndDontEndStream` on `decode_headers` forwards headers
+/// with `end_stream=false` even though the request had no body -- the filter
+/// has taken responsibility for supplying it via
+/// `inject_decoded_data_to_filter_chain` with `end_stream=true`.
+///
+/// The bodiless request is what makes this a real test rather than a tautology:
+/// `end_stream_on_headers` is `body.is_empty() && trailers.is_none()`, so
+/// without the status it is unambiguously `true` here. Treating the status as
+/// plain `Continue` -- which is what the driver did until this landed -- leaves
+/// it `true`, and the filter behind gets told the stream is over while data is
+/// still on its way.
 #[test]
-#[ignore = "WP-11 chunk 4: ContinueAndDontEndStream"]
 fn continue_and_dont_end_stream_forwards_headers_with_end_stream_false() {
     block_on(async {
-        let mut a = ProbeFilter::new("a", log_of());
-        a.decode_headers_status = FilterHeadersStatus::ContinueAndDontEndStream;
-        // There is no observable "end_stream" flag surfaced to this harness's
-        // `ProbeFilter` (it ignores the `_end_stream` parameter) — a real
-        // assertion here needs a probe that records `_end_stream` from
-        // `decode_headers` and checks it is `false` even for a bodiless
-        // request, then drives an `inject_decoded_data_to_filter_chain` call
-        // with `end_stream=true` and asserts the terminal sees it. Left as a
-        // `todo!()`-free placeholder since the callback itself panics today
-        // (see I6) — there is nothing reachable to assert without it.
-        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a)];
-        run_chain(filters, log_of(), b"", DEFAULT_BUFFER_LIMIT).await;
-        unimplemented!("needs inject_decoded_data_to_filter_chain (I6) to complete the scenario");
+        let seen = Arc::new(Mutex::new(None));
+        let filters: Vec<Box<dyn HttpFilter>> = vec![
+            Box::new(DontEndStreamThenInjectFilter {
+                injected: Bytes::from_static(b"late body"),
+            }),
+            Box::new(RecordsHeaderEndStreamFilter { seen: seen.clone() }),
+        ];
+        // `b""` -- no request body at all.
+        let (status, seen_body, _) = run_chain(filters, log_of(), b"", DEFAULT_BUFFER_LIMIT).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(false),
+            "the filter behind the sender must be told the stream is NOT over, \
+             even though the request carried no body"
+        );
+        assert_eq!(
+            seen_body,
+            Bytes::from_static(b"late body"),
+            "the out-of-band injection must still reach the terminal as the body"
+        );
+    });
+}
+
+/// A terminal that records the `end_stream` it was handed on `decode_headers`.
+/// `RecordingTerminal` discards it, and the terminal's flag is computed at a
+/// SEPARATE site in `run()` from the one `drive_decode` uses -- so observing
+/// the filters' view proves nothing about the terminal's.
+struct EndStreamRecordingTerminal {
+    seen: Arc<Mutex<Option<bool>>>,
+}
+
+impl HttpFilter for EndStreamRecordingTerminal {
+    fn decode_headers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        _h: &mut RequestHeaders,
+        end_stream: bool,
+    ) -> FilterHeadersStatus {
+        *self.seen.lock().unwrap() = Some(end_stream);
+        FilterHeadersStatus::Continue
+    }
+}
+
+impl TerminalHttpFilter for EndStreamRecordingTerminal {
+    fn respond<'a>(
+        &'a mut self,
+        _cb: &'a mut dyn DecoderCallbacks,
+    ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
+        Box::pin(async move {
+            HttpResponseParts {
+                head: ResponseHeaders {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                },
+                body: bytes_to_seam_body(Bytes::from_static(b"resp"), None),
+            }
+        })
+    }
+}
+
+/// The terminal is the last filter in the decode chain (ADR-0004 step 3), so it
+/// must see the same `end_stream=false` the configured filters behind the
+/// sender saw. Its flag is computed at its own site in `run()`, so it is
+/// genuinely possible to fix one and not the other -- hence its own test, with
+/// a terminal that actually records the flag rather than a filter standing in
+/// for one.
+///
+/// The injection is deliberately EMPTY, and that is the whole design of this
+/// test. A non-empty one lands in the decode buffer, which makes
+/// `decoded_body.is_empty()` false and hands the terminal `end_stream=false`
+/// for a reason that has nothing to do with the status -- the first version of
+/// this test did exactly that and stayed green when the clause under test was
+/// deleted. An empty injection is still a legitimate filter: it said it would
+/// supply the body and supplied an empty one, so headers must go out with
+/// `end_stream=false` and the empty end-stream frame follows.
+#[test]
+fn continue_and_dont_end_stream_also_reaches_the_terminal() {
+    block_on(async {
+        let seen = Arc::new(Mutex::new(None));
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(DontEndStreamThenInjectFilter {
+            injected: Bytes::new(),
+        })];
+        let mgr = FilterManager {
+            filters,
+            ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
+            terminal: Box::new(EndStreamRecordingTerminal { seen: seen.clone() }),
+            buffer_limit: DEFAULT_BUFFER_LIMIT,
+        };
+        let resp = mgr.run(request(b"")).await;
+        assert_eq!(resp.head.status, StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(false),
+            "the terminal must be told the stream is NOT over either"
+        );
     });
 }
 

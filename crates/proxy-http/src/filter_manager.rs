@@ -720,6 +720,16 @@ struct DirectionState {
     /// re-entering it), and without touching `continue_requested`, so
     /// injecting never itself resumes the originator's own held iteration.
     injected: VecDeque<(usize, Bytes, bool)>,
+    /// S2.2 (I1): a filter returned `ContinueAndDontEndStream` from
+    /// `decode_headers`, so every filter AFTER it -- and the terminal -- must
+    /// see `end_stream=false` on headers even though the request carried no
+    /// body. The filter has taken responsibility for ending the stream itself,
+    /// via `inject_decoded_data_to_filter_chain` with `end_stream=true`.
+    ///
+    /// Sticky for the rest of the direction rather than per-filter: the point
+    /// of the status is that the stream is no longer known to be over, and
+    /// that is a fact about the stream, not about one filter's view of it.
+    dont_end_stream: bool,
 }
 
 /// Encode-side counterpart to [`DirectionState`]. Unlike decode, encode is
@@ -1131,7 +1141,12 @@ impl FilterManager {
         // along ahead of the original body, same as it always reached the
         // terminal.
         let mut decoded_body = join_buffer(&ctx.decode.buffer, &body);
-        let end_stream_on_headers = decoded_body.is_empty() && req_trailers.is_none();
+        // S2.2 (I1): `dont_end_stream` outranks an empty body -- a filter said
+        // the stream is not over at headers, and the terminal is just the last
+        // filter in the decode chain (ADR-0004 step 3), so it sees what the
+        // filters after the sender saw.
+        let end_stream_on_headers =
+            decoded_body.is_empty() && req_trailers.is_none() && !ctx.decode.dont_end_stream;
         ctx.decode.current_idx = filters.len();
         sync_route_head(&mut ctx, &head);
         {
@@ -2166,7 +2181,9 @@ async fn drive_decode(
     body: &mut Bytes,
     trailers: Option<&RequestTrailers>,
 ) -> Result<(), http::StatusCode> {
-    let end_stream_on_headers = body.is_empty() && trailers.is_none();
+    // Mutable: a filter returning `ContinueAndDontEndStream` (S2.2 I1) clears
+    // it for everyone after it -- see `DirectionState::dont_end_stream`.
+    let mut end_stream_on_headers = body.is_empty() && trailers.is_none();
     let mut data_consumed = vec![false; filters.len()];
     // ADR-0004 step 2: how many times each filter has been given an async
     // resumption so far, this direction — see `poll_async_resumption`'s doc
@@ -2213,9 +2230,20 @@ async fn drive_decode(
         }
 
         match status {
-            FilterHeadersStatus::Continue | FilterHeadersStatus::ContinueAndDontEndStream => {
-                // ContinueAndDontEndStream: TODO(WP-11 chunk 4) forward with
-                // end_stream=false + require inject_*; treated as Continue here.
+            FilterHeadersStatus::Continue => {
+                idx += 1;
+                header_reach = idx;
+            }
+            // S2.2 (I1): iterate on like `Continue`, but every filter after
+            // this one -- and the terminal, via `ctx.decode.dont_end_stream`
+            // -- sees `end_stream=false` on headers. The filter is asserting
+            // it will supply the body itself with
+            // `inject_decoded_data_to_filter_chain(.., end_stream=true)`.
+            // Note the injection has ALREADY been drained above if it happened
+            // inside this very callback, which is the normal shape.
+            FilterHeadersStatus::ContinueAndDontEndStream => {
+                end_stream_on_headers = false;
+                ctx.decode.dont_end_stream = true;
                 idx += 1;
                 header_reach = idx;
             }
