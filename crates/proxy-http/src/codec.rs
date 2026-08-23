@@ -9,12 +9,16 @@
 //! Scope: downstream h1 and h2 (`serve_http1`/`serve_http2`), plus the
 //! upstream (proxy-to-origin) h1/h2 codecs (`send_upstream_http1`/
 //! `send_upstream_http2`). HTTP upgrades (Appendix S10) are a later WP-10/11
-//! chunk, as is h2c (cleartext HTTP/2, prior-knowledge or upgrade-from-h1;
-//! see `serve_http2`'s doc comment) -- ALPN-negotiated `h2` over TLS is the
-//! only way a downstream connection reaches `serve_http2` today
-//! (`proxy-core`'s listener dispatches on the negotiated protocol). This
-//! module is tested standalone, over an in-memory pipe, in
-//! `tests/http1_codec.rs` and `tests/http2_codec.rs`.
+//! chunk. `serve_http2` itself is transport-agnostic -- HTTP/2 framing (and
+//! its client connection preface, RFC 9113 S3.4) is identical whether the
+//! bytes arrived over an ALPN-negotiated TLS stream or plaintext "prior
+//! knowledge" h2c, so this module needed no change to serve the latter; it's
+//! `proxy-core`'s listener that decides *whether* to call `serve_http2` at
+//! all for a given connection (ALPN for TLS, a preface peek for plaintext --
+//! see `HttpConnectionManagerConfig::codec_type` and its dispatch). The h1
+//! `Upgrade: h2c` mechanism remains out of scope. This module is tested
+//! standalone, over an in-memory pipe, in `tests/http1_codec.rs` and
+//! `tests/http2_codec.rs`.
 
 use std::future::Future;
 use std::rc::Rc;
@@ -142,10 +146,13 @@ where
 /// so two concurrent streams on this connection never share a `StreamInfo` or
 /// filter-chain instance.
 ///
-/// Out of scope (see the module doc and WP-10's plan entry): h2c (cleartext
-/// HTTP/2, prior-knowledge or upgrade-from-h1) is not implemented -- this
-/// function is only ever driven over an already-ALPN-negotiated `h2` TLS
-/// stream by `proxy-core`'s listener.
+/// Transport-agnostic (see the module doc): driven over an
+/// already-ALPN-negotiated `h2` TLS stream, or over a plaintext connection
+/// `proxy-core`'s listener detected as h2 prior-knowledge by peeking for the
+/// client connection preface -- either way this function reads the same
+/// framing starting with that same preface, so it needed no h2c-specific
+/// code. The h1 `Upgrade: h2c` mechanism (a *different* connection starting
+/// out speaking h1) remains out of scope.
 pub async fn serve_http2<IO>(
     io: IO,
     handler: Rc<dyn StreamHandler>,

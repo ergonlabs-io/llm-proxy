@@ -929,6 +929,112 @@ fn hcm_use_remote_address_and_trusted_hops_default() {
     assert_eq!(hcm.xff_num_trusted_hops, 0);
 }
 
+/// WP-10: `codec_type` is unset by default and lowers to Envoy's default
+/// (`AUTO`, proto zero-value) -- must also be accepted by the surface check
+/// rather than rejected as an unsupported HCM field (ground rule #1: the
+/// allowlist and the IR must agree).
+#[test]
+fn hcm_codec_type_defaults_to_auto() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#,
+    );
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert_eq!(hcm.codec_type, CodecType::Auto);
+}
+
+/// WP-10: `codec_type: HTTP1`/`codec_type: HTTP2` both round-trip through
+/// the real loader into the matching IR variant (not silently dropped, per
+/// ground rule #1).
+#[test]
+fn hcm_codec_type_explicit_http1_and_http2_lower() {
+    for (proto_value, expected) in [("HTTP1", CodecType::Http1), ("HTTP2", CodecType::Http2)] {
+        let yaml = format!(
+            r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                codec_type: {proto_value}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{{ match: {{ prefix: "/" }}, route: {{ cluster: c }} }}]
+"#
+        );
+        let snapshot = snapshot_from(&yaml)
+            .unwrap_or_else(|e| panic!("codec_type: {proto_value} must lower: {e}"));
+        let listener = snapshot.listeners.get("http").expect("listener");
+        let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+        else {
+            panic!("expected HCM filter");
+        };
+        assert_eq!(
+            hcm.codec_type, expected,
+            "codec_type: {proto_value} should lower to {expected:?}"
+        );
+    }
+}
+
+/// WP-10: `codec_type: HTTP3` has no IR variant (no QUIC/UDP listener in
+/// this proxy -- see `CodecType`'s doc) and must be rejected with its full
+/// dotted path, not silently accepted and treated as `AUTO` (ground rule #1
+/// applies to values with no implementation, not just unrecognized fields).
+#[test]
+fn hcm_codec_type_http3_is_rejected_with_path() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: hcm
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                codec_type: HTTP3
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes: [{ match: { prefix: "/" }, route: { cluster: c } }]
+"#;
+    let err = snapshot_from(yaml).expect_err("codec_type: HTTP3 must be rejected");
+    let ConfigError::UnsupportedField { field_path, .. } = &err else {
+        panic!("expected UnsupportedField, got: {err}");
+    };
+    assert!(
+        field_path.ends_with(".codec_type"),
+        "expected the dotted path to name codec_type, got: {field_path}"
+    );
+}
+
 /// A two-filter chain preserves config order and decodes each non-router
 /// filter's own `typed_config` (here `tls_inspector`, reused purely as a
 /// stand-in for "some non-router HTTP filter with real config" -- lowering

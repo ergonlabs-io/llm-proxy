@@ -218,6 +218,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "max_connect_attempts",
         ],
         "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager" => &[
+            "codec_type",
             "stat_prefix",
             "route_config",
             "http_filters",
@@ -1074,6 +1075,7 @@ fn convert_hcm(
     hcm: &hcm_v3::HttpConnectionManager,
     path: &str,
 ) -> Result<HttpConnectionManagerConfig, ConfigError> {
+    use hcm_v3::http_connection_manager::CodecType as ProtoCodecType;
     use hcm_v3::http_connection_manager::RouteSpecifier;
     // (see `check_lane_h_filter_order` below for the ordering rules these
     // three type URLs participate in)
@@ -1163,6 +1165,31 @@ fn convert_hcm(
 
     check_lane_h_filter_order(&http_filters, path)?;
 
+    // WP-10: `codec_type` is a plain (non-wrapped) proto3 enum, so its
+    // zero-value (0 == AUTO) IS the Envoy default -- no `unwrap_or` needed,
+    // unlike the `BoolValue`s just below. `HTTP3` has no IR variant at all
+    // (see `CodecType`'s doc): this proxy has no QUIC listener to speak it
+    // over, so accepting the value and quietly falling back to `AUTO` would
+    // be exactly the silent-drop ground rule #1 forbids -- it must error with
+    // its dotted path instead.
+    let codec_type = match ProtoCodecType::try_from(hcm.codec_type) {
+        Ok(ProtoCodecType::Auto) => CodecType::Auto,
+        Ok(ProtoCodecType::Http1) => CodecType::Http1,
+        Ok(ProtoCodecType::Http2) => CodecType::Http2,
+        Ok(ProtoCodecType::Http3) => {
+            return Err(unsupported(
+                format!("{path}.codec_type"),
+                "HTTP3 is not implemented (this proxy has no QUIC/UDP listener)",
+            ))
+        }
+        Err(_) => {
+            return Err(invalid(
+                format!("{path}.codec_type"),
+                "unknown codec_type value",
+            ))
+        }
+    };
+
     // Envoy default true; the proto field is a `BoolValue`, so unset means
     // "generate" and a present value takes precedence, including an explicit
     // `false`.
@@ -1181,6 +1208,7 @@ fn convert_hcm(
         stat_prefix: hcm.stat_prefix.clone(),
         route_table: Arc::new(route_table),
         http_filters,
+        codec_type,
         generate_request_id,
         use_remote_address,
         access_logs,
