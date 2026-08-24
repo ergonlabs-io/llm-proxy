@@ -2173,8 +2173,23 @@ here rather than deleted, because "the doc comment described the intent and the 
 up" is a different and much less alarming story than the one this note originally told, and a
 reader who finds the old note elsewhere should be able to see it was closed.
 
-- **Increment 1 — semconv naming for the LLM access-log operators. DECLINED by the owner,
-  2026-08-21. Do not re-propose without reading this first.**
+- **Increment 1 — RE-SCOPED and RESOLVED by owner decision, 2026-08-24: name our own
+  honest `llm.*` namespace, do not borrow `gen_ai.*` semconv.** The token buckets are
+  disjoint (input excludes cached), semconv's are inclusive, so a `gen_ai.*` name carries a
+  meaning we do not have. Rather than convert, we keep honest names under our own prefix on
+  BOTH surfaces: the `%LLM_*%` log operators (already so) and the metric, renamed
+  `gen_ai.client.token.usage` → `llm.client.token.usage` (const `GEN_AI_CLIENT_TOKEN_USAGE`
+  → `LLM_CLIENT_TOKEN_USAGE`; `type` values `input`/`output`/`cached`/`cache_creation`
+  unchanged). **Accepted trade-off, made consciously:** `llm.*` metrics are not recognized
+  by off-the-shelf OTel GenAI dashboards — the "OTel-ready" value comes from the transport
+  (OTLP, increment 3) and trace participation (increment 2), not from semconv metric names.
+  The inclusive↔disjoint conversion is deliberately NOT done; if a future consumer needs
+  `gen_ai.*` on the wire it is a one-time explicit mapping at the export boundary, not an
+  alias. The declined-alias analysis below is retained because its arithmetic is exactly why
+  this decision is correct.
+
+- **Increment 1 (superseded analysis) — semconv aliasing of the LLM access-log operators.
+  DECLINED by the owner, 2026-08-21; superseded by the re-scope above.**
 
   Implemented, reviewed, and reverted the same day. The blocker is not naming, it is
   arithmetic. Our `TokenUsage` models **disjoint buckets that sum to a total**:

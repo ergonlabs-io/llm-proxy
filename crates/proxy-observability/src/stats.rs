@@ -432,20 +432,31 @@ pub mod instruments {
     /// nothing in the increment-3 `/stats` text output; it exists in
     /// Prometheus/OTLP output only (design brief, Decision 4, point 2).
     ///
-    /// The real OTel GenAI semantic conventions define
-    /// `gen_ai.client.token.usage` as a *histogram* (a per-request token
-    /// count distribution), not a counter. This starter still models it as a
-    /// running-total `Counter` rather than switching it to a `Histogram` now
-    /// that increment 2 has landed — that switch needs its own bucket
-    /// boundaries (OTel doesn't mandate Envoy's millisecond `rq_time` set
-    /// for a token count) and is increment 5's call, not this one's. Keeping
-    /// it a `Counter` here avoids guessing at that number now. Attribute
-    /// keys (`provider`, `type`) match the design brief's own table rather
-    /// than the semconv's fully qualified `gen_ai.provider.name` /
-    /// `gen_ai.token.type`; the increment-4 Prometheus renderer is where
-    /// full key names matter.
-    pub const GEN_AI_CLIENT_TOKEN_USAGE: Instrument = Instrument {
-        name: "gen_ai.client.token.usage",
+    /// WP-51 increment 1: this is deliberately our own `llm.*` name, not the
+    /// OTel GenAI semconv name for the equivalent instrument. Semconv's
+    /// `gen_ai.usage.input_tokens` attribute is INCLUSIVE of the cached
+    /// portion; our `type="input"` bucket (like `TokenUsage::input_tokens`,
+    /// `proxy-filters/src/usage.rs:45`) deliberately EXCLUDES it so that
+    /// `input`/`output`/`cached`/`cache_creation` sum to the total without
+    /// double-counting. Shipping this under the semconv name would
+    /// under-count input by exactly the cached portion on the field people
+    /// bill from — the same "standard name, non-standard meaning" problem
+    /// already rejected for the `%LLM_*%` access-log operators (see
+    /// `access_log.rs`). Hence a proprietary `llm.*` name, not a borrowed
+    /// semconv one.
+    ///
+    /// The upstream semconv equivalent is defined as a *histogram* (a
+    /// per-request token count distribution), not a counter. This starter
+    /// still models it as a running-total `Counter` rather than switching it
+    /// to a `Histogram` now that increment 2 has landed — that switch needs
+    /// its own bucket boundaries (OTel doesn't mandate Envoy's millisecond
+    /// `rq_time` set for a token count) and is increment 5's call, not this
+    /// one's. Keeping it a `Counter` here avoids guessing at that number
+    /// now. Attribute keys (`provider`, `type`) match the design brief's own
+    /// table rather than semconv's fully qualified attribute names; the
+    /// increment-4 Prometheus renderer is where full key names matter.
+    pub const LLM_CLIENT_TOKEN_USAGE: Instrument = Instrument {
+        name: "llm.client.token.usage",
         kind: InstrumentKind::Counter,
         unit: "{token}",
         attribute_keys: &["provider", "type"],
@@ -1347,9 +1358,9 @@ mod tests {
     #[should_panic(expected = "attribute keys don't match")]
     fn missing_expected_attribute_key_is_rejected_loudly() {
         let control = StatsControl::new(1);
-        // GEN_AI_CLIENT_TOKEN_USAGE expects both "provider" and "type".
+        // LLM_CLIENT_TOKEN_USAGE expects both "provider" and "type".
         control.resolve(
-            &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
             &[("provider", "openai")],
         );
     }
@@ -1360,11 +1371,11 @@ mod tests {
     fn attribute_order_does_not_affect_handle_identity() {
         let control = StatsControl::new(1);
         let a = control.resolve(
-            &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
             &[("provider", "openai"), ("type", "input")],
         );
         let b = control.resolve(
-            &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
             &[("type", "input"), ("provider", "openai")],
         );
         assert_eq!(a, b, "attribute order must not affect handle identity");

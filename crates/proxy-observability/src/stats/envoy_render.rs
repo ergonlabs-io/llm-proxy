@@ -13,7 +13,7 @@
 //! | `upstream_rq` `{cluster, status_class}` | `cluster.<cluster>.upstream_rq_<class>` |
 //! | `upstream_rq` `{cluster}` | `cluster.<cluster>.upstream_rq_total` |
 //! | `upstream_rq_time` `{cluster}` | `cluster.<cluster>.upstream_rq_time` |
-//! | anything else (e.g. `gen_ai.client.token.usage`) | *(no Envoy equivalent — omitted)* |
+//! | anything else (e.g. `llm.client.token.usage`) | *(no Envoy equivalent — omitted)* |
 //!
 //! [`envoy_counter_name`]/[`envoy_histogram_name`] are the only functions
 //! that know this table; nothing else in this module inspects an
@@ -147,7 +147,7 @@ const ENVOY_STATS_TEXT_PERCENTILES: [(&str, f64); 10] = [
 /// Envoy name (see the module doc's table), and a percentile line (see
 /// [`render_histogram_line`]) for every histogram that does — one line per
 /// stat, each `\n`-terminated, sorted by rendered name. Instruments with no
-/// Envoy equivalent (e.g. `gen_ai.client.token.usage`) contribute no line
+/// Envoy equivalent (e.g. `llm.client.token.usage`) contribute no line
 /// at all.
 ///
 /// **Reads only.** This walks already-resolved handles and sums
@@ -225,14 +225,14 @@ fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Op
         // rebind where an address is not.
         //
         // This is "rendered under a different key", not "invented": the stat
-        // itself is Envoy's, unlike `gen_ai.*` below. Rule 2 forbids making
+        // itself is Envoy's, unlike `llm.*` below. Rule 2 forbids making
         // up a stat that has no Envoy equivalent, not choosing between two
         // real Envoy key schemes.
         "downstream_cx_total" => {
             let listener = attr(attrs, "listener")?;
             Some(format!("listener.{listener}.downstream_cx_total"))
         }
-        // Everything else (gen_ai.*, and any future counter this table
+        // Everything else (llm.*, and any future counter this table
         // hasn't been taught about yet) has no Envoy /stats equivalent —
         // omitted, not invented. See the module doc's Rule 2.
         _ => None,
@@ -365,7 +365,7 @@ mod tests {
     fn instrument_with_no_envoy_template_is_absent() {
         let control = StatsControl::new(1);
         let h = control.resolve(
-            &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
             &[("provider", "openai"), ("type", "input")],
         );
         let registry = control.registry();
@@ -373,8 +373,8 @@ mod tests {
 
         let output = render(&registry);
         assert!(
-            !output.contains("gen_ai"),
-            "gen_ai.* has no Envoy /stats equivalent and must be omitted entirely, got: \
+            !output.contains("llm_client_token_usage") && !output.contains("llm.client.token.usage"),
+            "llm.client.token.usage has no Envoy /stats equivalent and must be omitted entirely, got: \
              {output:?}"
         );
         assert_eq!(

@@ -367,7 +367,7 @@ struct WorkerShared<'a> {
     /// factory since the instrument it records is about the accept loop
     /// itself, not routing.
     downstream_stats: &'a Arc<DownstreamStats>,
-    /// This worker's `gen_ai.client.token.usage` recorder -- same per-worker
+    /// This worker's `llm.client.token.usage` recorder -- same per-worker
     /// cadence and construction site as `router_stats`, threaded down to
     /// [`build_hcm_handler`], which wires it into the built
     /// `FilterChainHandler` via
@@ -511,7 +511,7 @@ struct AcceptLoopShared {
     /// WP-23 increment 6b: this worker's `downstream_cx_total` recorder --
     /// see [`WorkerShared::downstream_stats`].
     downstream_stats: Arc<DownstreamStats>,
-    /// This worker's `gen_ai.client.token.usage` recorder -- see
+    /// This worker's `llm.client.token.usage` recorder -- see
     /// [`WorkerShared::token_stats`]; needed here (not just at
     /// [`spawn_bound`] time) because the accept loop's own runtime HCM
     /// rebuild (on a snapshot version change) calls [`build_listener_hcm`]
@@ -1137,7 +1137,7 @@ fn build_hcm_handler(
     // `FilterChainHandler::with_token_stats`'s own doc says this is exactly
     // what this function is supposed to do; before this, the field it sets
     // was wired end to end everywhere except here, so `token_stats` was
-    // always `None` and `gen_ai.client.token.usage` was never recorded no
+    // always `None` and `llm.client.token.usage` was never recorded no
     // matter what a route configured.
     Ok(Rc::new(
         FilterChainHandler::new_with_filters_and_access_logs(
@@ -1908,7 +1908,7 @@ mod tests {
         ))
     }
 
-    /// [`router_stats_for`]'s counterpart for `gen_ai.client.token.usage` --
+    /// [`router_stats_for`]'s counterpart for `llm.client.token.usage` --
     /// see that function's doc for why this shares `control` rather than
     /// building its own. Resolved for every cluster (= provider, ground
     /// rule #6) in `snapshot`.

@@ -58,7 +58,7 @@ use super::{instruments, StatsControl, WorkerId};
 const EXPECTED_METRIC_FAMILIES: &[&str] = &[
     "envoy_upstream_rq",
     "envoy_downstream_cx_total",
-    "envoy_gen_ai_client_token_usage",
+    "envoy_llm_client_token_usage",
     "envoy_upstream_rq_time",
 ];
 
@@ -75,7 +75,7 @@ fn renderer_produces_a_series_for_every_known_instrument() {
         &[("listener", "ingress")],
     );
     let tokens = control.resolve(
-        &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+        &instruments::LLM_CLIENT_TOKEN_USAGE,
         &[("provider", "openai"), ("type", "input")],
     );
     let latency =

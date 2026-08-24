@@ -58,6 +58,10 @@ pub enum FormatOp {
     // `%LLM_INPUT_TOKENS%`). Investigated 2026-08-21 and deliberately NOT
     // done -- decision recorded here so the next attempt starts from the
     // analysis instead of redoing it and landing the bug this avoided.
+    // (Re-scoped 2026-08-24: the same disjoint-vs-inclusive mismatch is why
+    // the `llm.client.token.usage` metric in `proxy-observability::stats`
+    // was renamed off the semconv name `gen_ai.client.token.usage` instead
+    // of being fixed by adding aliases here.)
     //
     // The mismatch is not one field, it's the family relationship. Our
     // `TokenUsage` (`proxy-filters/src/usage.rs:45`) models disjoint buckets

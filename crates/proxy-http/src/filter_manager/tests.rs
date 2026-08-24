@@ -4306,7 +4306,7 @@ fn modify_decoded_headers_is_a_no_op_once_headers_are_forwarded() {
 //
 // `FilterChainHandler::handle` wraps the response in `LoggingBody`, and
 // `LoggingBody::finish` does two independent jobs at end-of-stream: it renders
-// access-log lines, and it records GEN_AI_CLIENT_TOKEN_USAGE (WP-23 increment
+// access-log lines, and it records LLM_CLIENT_TOKEN_USAGE (WP-23 increment
 // 6b). The wrap used to be gated on `access_loggers.is_empty()` alone, so a
 // listener that configured `llmproxy.usage` for token metrics but no
 // `access_log` silently recorded nothing -- the instrument was wired end to

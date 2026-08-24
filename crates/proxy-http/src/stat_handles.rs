@@ -42,7 +42,7 @@
 //! [`StatHandles`]/[`RouterStats`]'s shape exactly (same
 //! resolve-once-at-boot, `ArcSwap`-not-`Mutex`, warn-once-on-a-miss rules),
 //! just for `DOWNSTREAM_CX_TOTAL{listener}` (`crate::listener`'s accept
-//! loop, `proxy-core`) and `GEN_AI_CLIENT_TOKEN_USAGE{provider,type}`
+//! loop, `proxy-core`) and `LLM_CLIENT_TOKEN_USAGE{provider,type}`
 //! (`crate::access_logging::LoggingBody::finish`) respectively, instead of
 //! `UPSTREAM_RQ`/`UPSTREAM_RQ_TIME`. See each type's own doc for what's
 //! different: a single instrument keyed by listener name for the first, and
@@ -410,7 +410,7 @@ impl DownstreamStats {
     }
 }
 
-/// One provider's four pre-resolved `gen_ai.client.token.usage` handles, one
+/// One provider's four pre-resolved `llm.client.token.usage` handles, one
 /// per token bucket `LlmTokenUsage`/[`LlmTokens`] carries.
 #[derive(Debug, Clone, Copy)]
 pub struct TokenUsageHandles {
@@ -428,7 +428,7 @@ pub struct TokenUsageStatHandles {
 }
 
 impl TokenUsageStatHandles {
-    /// Resolves all four `gen_ai.client.token.usage` series for every name
+    /// Resolves all four `llm.client.token.usage` series for every name
     /// in `provider_names` (the boot snapshot's cluster names -- any
     /// cluster can be the member a request actually dials, ground rule #6)
     /// against `control`. Called once, at boot.
@@ -465,7 +465,7 @@ impl TokenUsageStatHandles {
             // lines.
             let resolve_bucket = |bucket: &str| {
                 control.resolve(
-                    &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+                    &instruments::LLM_CLIENT_TOKEN_USAGE,
                     &[("provider", name), ("type", bucket)],
                 )
             };
@@ -491,7 +491,7 @@ impl TokenUsageStatHandles {
 }
 
 /// `crate::access_logging::LoggingBody::finish`'s recorder for
-/// `gen_ai.client.token.usage`: one instance per worker (bakes in that
+/// `llm.client.token.usage`: one instance per worker (bakes in that
 /// worker's own `WorkerId`, same shape as [`RouterStats`]/[`DownstreamStats`]),
 /// reached via `crate::filter_manager::FilterChainHandler`'s stored
 /// `Arc<GenAiTokenStats>` (see [`crate::filter_manager::FilterChainHandler::with_token_stats`]).
@@ -549,7 +549,7 @@ impl GenAiTokenStats {
         if warned.insert(provider.to_string()) {
             tracing::warn!(
                 provider,
-                "stats: no resolved gen_ai.client.token.usage handles for this provider -- \
+                "stats: no resolved llm.client.token.usage handles for this provider -- \
                  token usage will not be counted in /stats (the cluster was not present in the \
                  config snapshot the stats handle table was built from)"
             );

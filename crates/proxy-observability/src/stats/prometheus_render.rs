@@ -14,7 +14,7 @@
 //! copied over: **every attribute becomes a label**, and the metric name is
 //! just the instrument's own (sanitized, `envoy_`-prefixed) name. This is
 //! also why, unlike `envoy_render`, this renderer has **no per-instrument
-//! name table and omits nothing** — `gen_ai.*` (no Envoy `/stats` text
+//! name table and omits nothing** — `llm.*` (no Envoy `/stats` text
 //! equivalent at all) renders here exactly like `upstream_rq` does, which is
 //! the module doc's point 2 for Decision 4: those instruments "exist in
 //! Prometheus/OTLP output only".
@@ -380,8 +380,8 @@ mod tests {
     fn metric_name_sanitizes_disallowed_characters() {
         assert_eq!(sanitize_metric_name("upstream_rq"), "upstream_rq");
         assert_eq!(
-            sanitize_metric_name("gen_ai.client.token.usage"),
-            "gen_ai_client_token_usage"
+            sanitize_metric_name("llm.client.token.usage"),
+            "llm_client_token_usage"
         );
         assert_eq!(sanitize_metric_name("a-b c/d"), "a_b_c_d");
     }
@@ -420,7 +420,7 @@ mod tests {
     fn label_value_is_escaped_not_sanitized_in_full_output() {
         let control = StatsControl::new(1);
         let h = control.resolve(
-            &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
             &[("provider", "openai\"evil"), ("type", "input")],
         );
         let registry = control.registry();
@@ -476,13 +476,13 @@ mod tests {
         assert!(output.contains("# TYPE envoy_connections_open gauge\n"));
     }
 
-    // ---- 4: no per-instrument omission -- gen_ai renders here -----------
+    // ---- 4: no per-instrument omission -- llm.* renders here -----------
 
     #[test]
-    fn gen_ai_instrument_with_no_envoy_text_equivalent_still_renders_in_prometheus() {
+    fn llm_instrument_with_no_envoy_text_equivalent_still_renders_in_prometheus() {
         let control = StatsControl::new(1);
         let h = control.resolve(
-            &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
             &[("provider", "openai"), ("type", "input")],
         );
         let registry = control.registry();
@@ -490,7 +490,7 @@ mod tests {
 
         let output = render(&registry);
         assert!(
-            output.contains("envoy_gen_ai_client_token_usage"),
+            output.contains("envoy_llm_client_token_usage"),
             "Prometheus output must include instruments envoy_render omits: {output}"
         );
         assert!(output.contains(r#"provider="openai""#));

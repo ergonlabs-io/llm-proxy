@@ -241,7 +241,7 @@ pub(crate) struct AccessLogContext {
     pub(crate) response_headers: HeaderMap,
     pub(crate) response_code: u16,
     pub(crate) downstream_remote_address: String,
-    /// WP-23 increment 6b: this stream's `gen_ai.client.token.usage`
+    /// WP-23 increment 6b: this stream's `llm.client.token.usage`
     /// recorder, if the HCM has one wired (`FilterChainHandler::with_token_stats`)
     /// -- `None` on any handler nothing attached one to (every pre-existing
     /// caller, and any HCM `proxy-core` never resolved provider handles
@@ -476,7 +476,7 @@ impl LoggingBody {
             )
         };
 
-        // WP-23 increment 6b: record GEN_AI_CLIENT_TOKEN_USAGE here, at the
+        // WP-23 increment 6b: record LLM_CLIENT_TOKEN_USAGE here, at the
         // same "stream has ended, exactly once" point access logging itself
         // uses. `provider` is the cluster ACTUALLY DIALLED
         // (`upstream_cluster`), never the routed cluster name -- ground rule
@@ -742,7 +742,7 @@ mod tests {
         );
     }
 
-    // --- WP-23 increment 6b: gen_ai token-usage recording plumbing --------
+    // --- WP-23 increment 6b: llm token-usage recording plumbing -----------
     //
     // These prove `LoggingBody::finish` actually calls into a wired
     // `GenAiTokenStats` with the right provider and per-bucket values -- not
@@ -797,7 +797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_reaches_gen_ai_token_stats_against_the_dialled_provider() {
+    async fn usage_reaches_llm_token_stats_against_the_dialled_provider() {
         let (token_stats, handles, registry) = token_stats_for("openai-fallback");
 
         drive_with_usage_and_provider(

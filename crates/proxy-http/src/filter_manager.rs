@@ -424,7 +424,7 @@ pub struct FilterChainHandler {
     /// default (`per_route_config()` then always returns `None`, this
     /// handler's pre-increment-2 behavior).
     per_route: Arc<PerRouteTable>,
-    /// WP-23 increment 6b: this HCM's `gen_ai.client.token.usage` recorder,
+    /// WP-23 increment 6b: this HCM's `llm.client.token.usage` recorder,
     /// if the boot/reload wiring set one (`proxy-core`'s `build_hcm_handler`
     /// always does for a real HCM build -- see [`Self::with_token_stats`]).
     /// `None` is the constructors' baseline (every existing `new*` call site
@@ -567,7 +567,7 @@ impl FilterChainHandler {
         self
     }
 
-    /// WP-23 increment 6b: attaches this HCM's `gen_ai.client.token.usage`
+    /// WP-23 increment 6b: attaches this HCM's `llm.client.token.usage`
     /// recorder -- a builder method (not a constructor parameter) so every
     /// existing `new*` call site, in this crate and its dependents, is
     /// unaffected. `proxy-core`'s `build_hcm_handler` calls this for every
@@ -676,7 +676,7 @@ impl StreamHandler for FilterChainHandler {
 
             // The wrap is what runs `finish()` at end-of-stream, and `finish()`
             // does TWO jobs: it renders the access log AND it records the
-            // GEN_AI_CLIENT_TOKEN_USAGE instrument (WP-23 increment 6b). Gating
+            // LLM_CLIENT_TOKEN_USAGE instrument (WP-23 increment 6b). Gating
             // it on access loggers alone meant a listener that configured
             // `llmproxy.usage` for token metrics but no `access_log` recorded no
             // tokens at all -- the stat was wired end to end and then skipped by

@@ -802,7 +802,7 @@ async fn reload(
         .resolve_missing(stats_control, snapshot.listeners.keys().map(String::as_str));
     // WP-23 increment 6b: same reasoning again, for the provider(=cluster)-
     // keyed token-usage table -- a cluster a reload introduces must have its
-    // four `gen_ai.client.token.usage` handles resolved before it can dial
+    // four `llm.client.token.usage` handles resolved before it can dial
     // its first request.
     tables
         .token_usage

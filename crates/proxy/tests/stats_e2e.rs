@@ -17,10 +17,10 @@
 //! `StatsControl`/`StatHandles`/`RouterStats` construction in `run_serve`/
 //! `worker_main`) is to run the actual binary.
 //!
-//! # `downstream_cx_total`/`gen_ai.client.token.usage`: `/stats/prometheus`, not `/stats`
+//! # `downstream_cx_total`/`llm.client.token.usage`: `/stats/prometheus`, not `/stats`
 //!
-//! `gen_ai.client.token.usage` is asserted against `/stats/prometheus` only:
-//! `proxy_observability::stats::instruments::GEN_AI_CLIENT_TOKEN_USAGE`'s own
+//! `llm.client.token.usage` is asserted against `/stats/prometheus` only:
+//! `proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE`'s own
 //! doc says it "has no Envoy equivalent" and renders to nothing in the
 //! Envoy-text format by design, so asserting it on `/stats` would be
 //! asserting a bug.
@@ -148,7 +148,7 @@ fn get(addr: SocketAddr, path: &str, host: &str) -> String {
 }
 
 /// [`get`]'s `POST`-with-a-JSON-body counterpart -- what the
-/// `gen_ai.client.token.usage` test below needs to reach `llmproxy.usage`'s
+/// `llm.client.token.usage` test below needs to reach `llmproxy.usage`'s
 /// dialect parser at all (it only ever looks at `POST` bodies).
 fn post(addr: SocketAddr, path: &str, host: &str, body: &str) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect");
@@ -173,7 +173,7 @@ fn post(addr: SocketAddr, path: &str, host: &str, body: &str) -> String {
 }
 
 /// Kills and reaps a child process on drop -- used for the two child
-/// processes the `gen_ai.client.token.usage` test below spawns
+/// processes the `llm.client.token.usage` test below spawns
 /// (`mock-upstream` and `llm-proxy`), so an assertion failure partway through
 /// the test still leaves nothing running (CLAUDE.md rule 15's corollary: a
 /// hand-run process that outlives its test is a leak, not just a red test).
@@ -240,7 +240,7 @@ fn mock_upstream_bin_path() -> PathBuf {
 /// `prompt_tokens`/`tokens` (its `--prompt-tokens`/`--tokens` flags) in every
 /// OpenAI-shaped response -- unlike [`spawn_mock_upstream`]'s bare `200 OK`,
 /// this is a real provider response body the `llmproxy.usage` filter can
-/// parse, which is what lets `gen_ai.client.token.usage` have anything to
+/// parse, which is what lets `llm.client.token.usage` have anything to
 /// record. Returns a [`ChildGuard`] (so the process can't outlive the test)
 /// and the address it bound -- read off its own first stdout line, the same
 /// contract `main.rs`'s doc comment describes.
@@ -467,7 +467,7 @@ static_resources:
     let _ = std::fs::remove_file(&config_path);
 }
 
-/// WP-23 increment 6b, task 2: `GEN_AI_CLIENT_TOKEN_USAGE{provider,type}`
+/// WP-23 increment 6b, task 2: `LLM_CLIENT_TOKEN_USAGE{provider,type}`
 /// through the same real-binary/real-upstream/rendered-body shape as
 /// [`served_requests_are_reflected_in_stats`] above. This needs a real
 /// upstream that returns an OpenAI-shaped `usage` object (the plain
@@ -613,7 +613,7 @@ static_resources:
 
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
     // Deliberately `/stats/prometheus`, not `/stats` -- see this file's
-    // module doc for why `gen_ai.client.token.usage` has no Envoy-text
+    // module doc for why `llm.client.token.usage` has no Envoy-text
     // rendering to assert against at all.
     let prometheus_response = get(admin_addr, "/stats/prometheus", "admin.local");
     assert!(
@@ -626,14 +626,14 @@ static_resources:
         .expect("response has a body separated from headers by a blank line");
     assert!(
         body.contains(&format!(
-            "envoy_gen_ai_client_token_usage{{provider=\"llm_backend\",type=\"input\"}} {PROMPT_TOKENS}"
+            "envoy_llm_client_token_usage{{provider=\"llm_backend\",type=\"input\"}} {PROMPT_TOKENS}"
         )),
         "expected /stats/prometheus to report {PROMPT_TOKENS} input tokens for provider \
          \"llm_backend\", got body:\n{body}\n(full response: {prometheus_response})"
     );
     assert!(
         body.contains(&format!(
-            "envoy_gen_ai_client_token_usage{{provider=\"llm_backend\",type=\"output\"}} {COMPLETION_TOKENS}"
+            "envoy_llm_client_token_usage{{provider=\"llm_backend\",type=\"output\"}} {COMPLETION_TOKENS}"
         )),
         "expected /stats/prometheus to report {COMPLETION_TOKENS} output tokens for provider \
          \"llm_backend\", got body:\n{body}\n(full response: {prometheus_response})"
