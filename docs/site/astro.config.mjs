@@ -71,13 +71,13 @@ export default defineConfig({
 				// 		{ label: 'Anthropic Messages', slug: 'api-compatibility/anthropic-messages' },
 				// 	],
 				// },
-				// {
-				// 	label: 'Authentication',
-				// 	items: [
-				// 		{ label: 'Virtual keys', slug: 'authentication/virtual-keys' },
-				// 		{ label: 'Managing secrets', slug: 'authentication/managing-secrets' },
-				// 	],
-				// },
+				{
+					label: 'Authentication',
+					items: [
+						{ label: 'Virtual keys', slug: 'authentication/virtual-keys' },
+						{ label: 'Managing secrets', slug: 'authentication/managing-secrets' },
+					],
+				},
 				// {
 				// 	label: 'Limits and budgets',
 				// 	items: [
