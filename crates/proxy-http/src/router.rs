@@ -68,6 +68,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
+use proxy_cluster::outlier::RequestResult;
 use proxy_cluster::{
     ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol, UpstreamStream,
 };
@@ -525,6 +526,7 @@ impl RouterHandler {
                         self.stats
                             .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         let outcome = AttemptOutcome::from_pool_error(&err);
+                        report_outlier(attempt_entry, host.address, &outcome);
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome) {
                                 sleep_backoff_and_record(state).await;
@@ -694,6 +696,7 @@ impl RouterHandler {
                                 attempt_dispatched_at,
                             );
                             let outcome = AttemptOutcome::PerTryTimeout;
+                            report_outlier(attempt_entry, host.address, &outcome);
                             if let Some(state) = &mut retry_state {
                                 if state.should_retry(&outcome) {
                                     sleep_backoff_and_record(state).await;
@@ -723,6 +726,7 @@ impl RouterHandler {
                         self.stats
                             .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         let outcome = AttemptOutcome::Response(resp.head.status.as_u16());
+                        report_outlier(attempt_entry, host.address, &outcome);
                         let retriable = retry_state
                             .as_ref()
                             .is_some_and(|state| state.should_retry(&outcome));
@@ -772,6 +776,7 @@ impl RouterHandler {
                             self.conn_cache.invalidate(key);
                         }
                         let outcome = AttemptOutcome::from_codec_error(&err);
+                        report_outlier(attempt_entry, host.address, &outcome);
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome) {
                                 sleep_backoff_and_record(state).await;
@@ -864,6 +869,49 @@ fn record_retry_limit_exceeded_if_applicable(
                 .set_response_flag(ResponseFlag::UpstreamRetryLimitExceeded);
         }
     }
+}
+
+/// Report one attempt's outcome to the dialed cluster's S6 outlier detector
+/// (WP-19). Called once per attempt, right where each `AttemptOutcome` is
+/// computed and BEFORE the retry decision, so a failed attempt that is then
+/// retried still counts against its host -- exactly what Envoy's detector
+/// does (every upstream response feeds it, retried or not).
+///
+/// The mapping is the S6 one:
+/// - a real response: 502/503/504 is a `GatewayFailure` (a subset of 5xx that
+///   also feeds the gateway detector), any other 5xx is `Http5xx`, everything
+///   else is `Success`;
+/// - a connect failure, per-try timeout, reset, or refused stream is a
+///   `LocalOriginFailure` (folded into the 5xx path, since
+///   `split_external_local_origin_errors` is not implemented);
+/// - a pool/circuit-breaker overflow is NOT reported at all -- the request was
+///   never dispatched to the host, so it is not evidence about the host's
+///   health (Envoy counts only issued requests).
+fn report_outlier(entry: &dyn ClusterEntry, addr: std::net::SocketAddr, outcome: &AttemptOutcome) {
+    if let Some(result) = outlier_result_for(outcome) {
+        entry.report_outlier_result(addr, result);
+    }
+}
+
+/// The pure S6 classification `report_outlier` applies. `None` means "do not
+/// report" -- a pool/circuit-breaker overflow was never dispatched to a host,
+/// so it is not evidence about that host's health (Envoy counts only issued
+/// requests). Split out from [`report_outlier`] so the mapping is unit-testable
+/// without a live [`ClusterEntry`].
+fn outlier_result_for(outcome: &AttemptOutcome) -> Option<RequestResult> {
+    Some(match outcome {
+        AttemptOutcome::Response(status) => match status {
+            502..=504 => RequestResult::GatewayFailure,
+            s if (500..600).contains(s) => RequestResult::Http5xx,
+            _ => RequestResult::Success,
+        },
+        AttemptOutcome::ConnectFailure
+        | AttemptOutcome::ResetBeforeHeaders
+        | AttemptOutcome::ResetAfterHeaders
+        | AttemptOutcome::RefusedStream
+        | AttemptOutcome::PerTryTimeout => RequestResult::LocalOriginFailure,
+        AttemptOutcome::PoolOverflow => return None,
+    })
 }
 
 /// Build a fresh, single-use [`StreamBody`] from already-buffered bytes (and,
@@ -1085,6 +1133,71 @@ mod tests {
     use tokio::task::LocalSet;
 
     use super::*;
+
+    /// WP-19: the S6 classification the router applies to each attempt before
+    /// feeding the outlier detector. A silently-wrong arm here would eject (or
+    /// fail to eject) on the wrong signal, so it is pinned directly.
+    #[test]
+    fn outlier_result_for_maps_every_outcome() {
+        use AttemptOutcome::*;
+        // 502/503/504 are gateway failures (also bump the 5xx detector).
+        assert_eq!(
+            outlier_result_for(&Response(502)),
+            Some(RequestResult::GatewayFailure)
+        );
+        assert_eq!(
+            outlier_result_for(&Response(503)),
+            Some(RequestResult::GatewayFailure)
+        );
+        assert_eq!(
+            outlier_result_for(&Response(504)),
+            Some(RequestResult::GatewayFailure)
+        );
+        // Other 5xx are plain 5xx.
+        assert_eq!(
+            outlier_result_for(&Response(500)),
+            Some(RequestResult::Http5xx)
+        );
+        assert_eq!(
+            outlier_result_for(&Response(501)),
+            Some(RequestResult::Http5xx)
+        );
+        assert_eq!(
+            outlier_result_for(&Response(599)),
+            Some(RequestResult::Http5xx)
+        );
+        // Anything below 500 is a success as far as host health goes -- a 4xx
+        // is the client's fault, not the host's.
+        assert_eq!(
+            outlier_result_for(&Response(200)),
+            Some(RequestResult::Success)
+        );
+        assert_eq!(
+            outlier_result_for(&Response(404)),
+            Some(RequestResult::Success)
+        );
+        assert_eq!(
+            outlier_result_for(&Response(429)),
+            Some(RequestResult::Success)
+        );
+        // Connection-level failures fold into the local-origin bucket.
+        for o in [
+            ConnectFailure,
+            ResetBeforeHeaders,
+            ResetAfterHeaders,
+            RefusedStream,
+            PerTryTimeout,
+        ] {
+            assert_eq!(
+                outlier_result_for(&o),
+                Some(RequestResult::LocalOriginFailure),
+                "{o:?}"
+            );
+        }
+        // A circuit-breaker overflow never reached the host -> not reported.
+        assert_eq!(outlier_result_for(&PoolOverflow), None);
+    }
+
     use crate::filter::{FilterInstanceFactory, RequestHeaders};
     use crate::filter_manager::FilterChainHandler;
     use crate::handler::{DownstreamInfo, StreamHandler};

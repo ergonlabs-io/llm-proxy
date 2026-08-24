@@ -3,21 +3,22 @@
 //! their peers -- from load-balancer selection, without waiting for active
 //! health checking (WP-18) to notice.
 //!
-//! **This module is the detection engine only.** Wiring the router to call
-//! [`OutlierDetector::report_result`] on every real request/response is a
-//! deliberate follow-up (WP-19b, out of scope here); every test in this file
-//! drives the engine directly through its public API instead of through live
-//! traffic.
+//! **This module is the detection engine.** As of WP-19 it is fully wired:
+//! [`crate::manager::ClusterManager`] builds an [`OutlierDetector`] per
+//! cluster from the lowered `outlier_detection` config, spawns its sweep, and
+//! the router feeds it one [`OutlierDetector::report_result`] per upstream
+//! attempt through [`crate::ClusterEntry::report_outlier_result`]. The tests
+//! in this file still drive the engine directly through its public API (that
+//! is the right level to pin the S6 state machine); the end-to-end path is
+//! covered by the manager tests (`outlier_detection_ejects_a_host_after_consecutive_5xx`)
+//! and the router tests.
 //!
-//! **IR wiring is outstanding**, exactly as `health_check.rs` documents for
-//! itself: `proxy_config::ir::ClusterConfig` has no `outlier_detection`
-//! field yet, so [`OutlierDetectionConfig`] is defined here with Envoy's own
-//! S6 defaults via `Default`, rather than in the IR (ground rule #2's
-//! proto/IR boundary is a different agent's call to make). Once the IR grows
-//! an `outlier_detection` field, wiring it into
-//! [`crate::manager::ClusterManager`] is additive: build an
-//! [`OutlierDetector`] per cluster from the lowered config and call
-//! [`OutlierDetector::spawn`].
+//! The IR carries the config as `proxy_config::ir::OutlierDetectionIR`;
+//! [`OutlierDetectionConfig`] here is the runtime twin, built from it via
+//! `From<&OutlierDetectionIR>`. The two hold Envoy's S6 defaults independently
+//! (`proxy-config` cannot depend on `proxy-cluster`), and
+//! `ir_defaults_match_runtime_defaults` in this file's tests pins that they
+//! agree so they cannot silently drift.
 //!
 //! # Design notes worth reading before touching this file
 //!
@@ -90,7 +91,7 @@ pub enum RequestResult {
 /// Timing + thresholds for one cluster's outlier detector (Envoy's
 /// `OutlierDetection` message). Every field is commented with its S6 default;
 /// [`Default`] reproduces those defaults exactly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutlierDetectionConfig {
     /// How often the success-rate and failure-percentage detectors re-run
     /// over the whole host set. S6 default: 10s.
@@ -197,6 +198,42 @@ impl Default for OutlierDetectionConfig {
             failure_percentage_request_volume: 50,
             split_external_local_origin_errors: false,
             uneject_on_healthy_active_hc: true,
+        }
+    }
+}
+
+impl From<&proxy_config::ir::OutlierDetectionIR> for OutlierDetectionConfig {
+    /// WP-19 runtime wiring: the lowered IR is this config minus
+    /// `split_external_local_origin_errors` (which lowering rejects unless
+    /// `false` -- see the IR type's doc), so that field always takes its only
+    /// implemented value here. Every other field maps 1:1; the two field-name
+    /// differences (`success_rate_min_hosts` / `failure_percentage_min_hosts`)
+    /// are spelled out below. The `ir_defaults_match_runtime_defaults` test in
+    /// this module pins that the two sides' defaults agree, so this mapping
+    /// and the IR cannot silently drift apart.
+    fn from(ir: &proxy_config::ir::OutlierDetectionIR) -> Self {
+        Self {
+            interval: ir.interval,
+            base_ejection_time: ir.base_ejection_time,
+            max_ejection_time: ir.max_ejection_time,
+            max_ejection_percent: ir.max_ejection_percent,
+            always_eject_one_host: ir.always_eject_one_host,
+            consecutive_5xx: ir.consecutive_5xx,
+            enforcing_consecutive_5xx: ir.enforcing_consecutive_5xx,
+            consecutive_gateway_failure: ir.consecutive_gateway_failure,
+            enforcing_consecutive_gateway_failure: ir.enforcing_consecutive_gateway_failure,
+            success_rate_min_hosts: ir.success_rate_min_hosts,
+            success_rate_request_volume: ir.success_rate_request_volume,
+            success_rate_stdev_factor: ir.success_rate_stdev_factor,
+            enforcing_success_rate: ir.enforcing_success_rate,
+            failure_percentage_threshold: ir.failure_percentage_threshold,
+            enforcing_failure_percentage: ir.enforcing_failure_percentage,
+            failure_percentage_min_hosts: ir.failure_percentage_min_hosts,
+            failure_percentage_request_volume: ir.failure_percentage_request_volume,
+            // Only `false` is implemented; lowering guarantees a `true` never
+            // reaches here (`convert_outlier_detection` rejects it).
+            split_external_local_origin_errors: false,
+            uneject_on_healthy_active_hc: ir.uneject_on_healthy_active_hc,
         }
     }
 }
@@ -795,6 +832,20 @@ mod tests {
     use crate::LoadBalancerContext;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::AtomicU64;
+
+    /// The IR duplicates every S6 default because `proxy-config` cannot
+    /// depend on `proxy-cluster` (the dependency runs the other way). This
+    /// crate can see both, so it is the only place that can prove the two
+    /// independent copies agree -- and that the IR->config `From` mapping
+    /// wires each field to its namesake. Without this, a default changed on
+    /// one side alone would silently give a config-built detector different
+    /// behavior from a `Default`-built one.
+    #[test]
+    fn ir_defaults_match_runtime_defaults() {
+        let from_ir =
+            OutlierDetectionConfig::from(&proxy_config::ir::OutlierDetectionIR::default());
+        assert_eq!(from_ir, OutlierDetectionConfig::default());
+    }
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), 80)

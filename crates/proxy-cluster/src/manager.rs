@@ -24,6 +24,7 @@ use crate::discovery;
 use crate::health_check::HealthCheckEngine;
 use crate::host_set::{carry_over_health_flags, diff_host_sets, HostSet, HostSetDiff};
 use crate::load_balancer::{self, HostPicker, LbError};
+use crate::outlier::{OutlierDetector, RequestResult, TracingEventSink};
 use crate::resolver::HostResolver;
 use crate::transport::{
     self, TransportSocketBuilder, TransportSocketError, UpstreamTransportSocket,
@@ -140,6 +141,21 @@ struct ManagedCluster {
     /// drain, so there's no `.await` under the lock to require the async
     /// variant (same reasoning as `resolver::FakeResolver::records`).
     probes: Mutex<HashMap<SocketAddr, JoinHandle<()>>>,
+    /// S6 passive outlier detection (WP-19), or `None` when the config
+    /// configures none. Fed one [`RequestResult`] per upstream attempt by the
+    /// router (via [`ClusterEntry::report_outlier_result`]); it ejects a host
+    /// by setting `failed_outlier_check` on it in this same cluster's
+    /// `host_set`, so ejections and active-health-check failures share one
+    /// snapshot (see `HealthFlags`). Holds an `Arc<ArcSwap<HostSet>>` clone of
+    /// `host_set` below, so it always ejects into the current membership even
+    /// across a DNS re-resolution.
+    outlier_detector: Option<Arc<OutlierDetector>>,
+    /// The detector's periodic success-rate / failure-percentage sweep task
+    /// ([`OutlierDetector::spawn`]). Aborted on `Drop` for the identical
+    /// reason as `probes` -- a dropped `JoinHandle` detaches rather than
+    /// stops, so without this a config reload leaks one sweep loop per
+    /// cluster, forever.
+    outlier_sweep: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for ManagedCluster {
@@ -157,6 +173,14 @@ impl Drop for ManagedCluster {
         // double-panic during unwind aborts the whole process).
         if let Ok(mut probes) = self.probes.lock() {
             for (_, handle) in probes.drain() {
+                handle.abort();
+            }
+        }
+        // Same reasoning for the outlier-detection sweep: a dropped handle
+        // detaches, so without this a config reload leaks one sweep loop per
+        // cluster that configures outlier detection.
+        if let Ok(mut sweep) = self.outlier_sweep.lock() {
+            if let Some(handle) = sweep.take() {
                 handle.abort();
             }
         }
@@ -195,9 +219,29 @@ impl ManagedCluster {
                 // `None` means the config configures no health check at all
                 // (Envoy's own default), not that this cluster is exempt.
                 let health_engine = config.health_check.as_ref().map(HealthCheckEngine::from_ir);
+                // WP-19 runtime wiring: the detector must eject into the SAME
+                // `host_set` the router picks from, so build the `Arc` here
+                // and hand the detector a clone. It ejects by publishing a new
+                // snapshot with `failed_outlier_check` set, which the picker
+                // then skips -- see `OutlierDetector`. Its periodic sweep is
+                // spawned now and its handle stashed for `Drop` to abort.
+                let host_set = Arc::new(ArcSwap::from_pointee(HostSet::default()));
+                let (outlier_detector, outlier_sweep) = match &config.outlier_detection {
+                    Some(od) => {
+                        let detector = OutlierDetector::new(
+                            od.into(),
+                            config.name.clone(),
+                            Arc::clone(&host_set),
+                            Arc::new(TracingEventSink),
+                        );
+                        let sweep = detector.spawn();
+                        (Some(detector), Some(sweep))
+                    }
+                    None => (None, None),
+                };
                 Ok(Self {
                     source: ClusterSource::Config(config),
-                    host_set: Arc::new(ArcSwap::from_pointee(HostSet::default())),
+                    host_set,
                     initialized: AtomicBool::new(false),
                     host_picker: HostPicker::new(policy),
                     default_cb,
@@ -207,6 +251,8 @@ impl ManagedCluster {
                     connect_timeout,
                     health_engine,
                     probes: Mutex::new(HashMap::new()),
+                    outlier_detector,
+                    outlier_sweep: Mutex::new(outlier_sweep),
                 })
             }
             ClusterKind::Aggregate { .. } => {
@@ -243,6 +289,10 @@ impl ManagedCluster {
                     connect_timeout,
                     health_engine: None,
                     probes: Mutex::new(HashMap::new()),
+                    // An aggregate has no hosts of its own to eject -- outlier
+                    // detection runs on the member cluster, same as probing.
+                    outlier_detector: None,
+                    outlier_sweep: Mutex::new(None),
                 })
             }
         }
@@ -297,6 +347,10 @@ impl ManagedCluster {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             health_engine: None,
             probes: Mutex::new(HashMap::new()),
+            // EDS clusters have no `ClusterConfig` to read an
+            // `outlier_detection` block from (see `ClusterSource::Eds`).
+            outlier_detector: None,
+            outlier_sweep: Mutex::new(None),
         }
     }
 
@@ -699,6 +753,17 @@ impl ClusterEntry for ClusterHandle {
             ClusterSource::Eds => &[],
         }
     }
+
+    fn report_outlier_result(&self, addr: SocketAddr, result: RequestResult) {
+        // No-op unless this cluster configures outlier detection. For an
+        // aggregate the router calls this on the *member's* entry (the one
+        // that owns the dialed host), never the aggregate's own, so this
+        // reaches the member's detector -- the same routing `request_headers_to_add`
+        // above relies on.
+        if let Some(detector) = &self.managed.outlier_detector {
+            detector.report_result(addr, result);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +797,39 @@ mod tests {
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,
+        })
+    }
+
+    /// A STATIC cluster carrying an outlier-detection config that ejects on
+    /// `consecutive_5xx` consecutive 5xx, enforced 100%, with a 100% ejection
+    /// cap so a single-host cluster can eject its only host (the default 10%
+    /// rounds down to zero for one host).
+    fn cluster_config_with_outlier(
+        name: &str,
+        endpoints: Vec<EndpointIR>,
+        consecutive_5xx: u32,
+    ) -> Arc<ClusterConfig> {
+        let od = proxy_config::ir::OutlierDetectionIR {
+            consecutive_5xx,
+            enforcing_consecutive_5xx: 100,
+            max_ejection_percent: 100,
+            ..proxy_config::ir::OutlierDetectionIR::ENVOY_DEFAULT
+        };
+        Arc::new(ClusterConfig {
+            name: name.to_string(),
+            discovery: DiscoveryType::Static,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints,
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+            usage_dialect: None,
+            health_check: None,
+            outlier_detection: Some(od),
         })
     }
 
@@ -1364,5 +1462,127 @@ mod tests {
              single-generation baseline ({baseline} hits/250ms) -- earlier \
              generations' probes were never aborted and are still running"
         );
+    }
+
+    /// WP-19 runtime acceptance: a cluster configured with outlier detection
+    /// ejects a host once it has returned `consecutive_5xx` consecutive 5xx --
+    /// fed through the exact `ClusterEntry::report_outlier_result` seam the
+    /// router uses. Before this wiring, no configuration could produce an
+    /// ejection at all.
+    #[tokio::test]
+    async fn outlier_detection_ejects_a_host_after_consecutive_5xx() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "od-svc".to_string(),
+            cluster_config_with_outlier("od-svc", vec![endpoint("10.0.0.1", 80)], 3),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("od-svc").unwrap();
+        let target = SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80);
+
+        let healthy = || {
+            manager
+                .clusters
+                .load()
+                .get("od-svc")
+                .unwrap()
+                .host_set
+                .load()
+                .all_healthy_hosts()
+                .iter()
+                .any(|h| h.address == target)
+        };
+        assert!(healthy(), "host starts healthy");
+
+        // Two 5xx below the threshold: still healthy.
+        entry.report_outlier_result(target, RequestResult::Http5xx);
+        entry.report_outlier_result(target, RequestResult::Http5xx);
+        assert!(
+            healthy(),
+            "two 5xx is below the consecutive_5xx=3 threshold"
+        );
+
+        // The third crosses it and ejects (enforced 100%, 100% cap).
+        entry.report_outlier_result(target, RequestResult::Http5xx);
+        assert!(
+            !healthy(),
+            "three consecutive 5xx must eject the host via report_outlier_result"
+        );
+    }
+
+    /// A `Success` in the middle of a 5xx run resets the consecutive counter,
+    /// so the host is NOT ejected -- proving the report seam carries the
+    /// result kind through, not just "something happened".
+    #[tokio::test]
+    async fn a_success_through_the_report_seam_resets_the_run() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "od-svc".to_string(),
+            cluster_config_with_outlier("od-svc", vec![endpoint("10.0.0.1", 80)], 3),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("od-svc").unwrap();
+        let target = SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80);
+
+        entry.report_outlier_result(target, RequestResult::Http5xx);
+        entry.report_outlier_result(target, RequestResult::Http5xx);
+        entry.report_outlier_result(target, RequestResult::Success); // resets
+        entry.report_outlier_result(target, RequestResult::Http5xx);
+        entry.report_outlier_result(target, RequestResult::Http5xx);
+
+        let healthy = manager
+            .clusters
+            .load()
+            .get("od-svc")
+            .unwrap()
+            .host_set
+            .load()
+            .all_healthy_hosts()
+            .iter()
+            .any(|h| h.address == target);
+        assert!(
+            healthy,
+            "a Success reset the run, so two more 5xx must not reach the threshold of 3"
+        );
+    }
+
+    /// A cluster with no `outlier_detection` builds no detector, so reporting
+    /// against it is a harmless no-op -- the router calls the seam
+    /// unconditionally after every attempt.
+    #[tokio::test]
+    async fn report_is_a_noop_without_outlier_detection_configured() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "plain".to_string(),
+            cluster_config(
+                "plain",
+                DiscoveryType::Static,
+                vec![endpoint("10.0.0.1", 80)],
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("plain").unwrap();
+        let target = SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80);
+
+        for _ in 0..10 {
+            entry.report_outlier_result(target, RequestResult::Http5xx);
+        }
+        let healthy = manager
+            .clusters
+            .load()
+            .get("plain")
+            .unwrap()
+            .host_set
+            .load()
+            .all_healthy_hosts()
+            .iter()
+            .any(|h| h.address == target);
+        assert!(healthy, "no detector configured -> reporting is a no-op");
     }
 }

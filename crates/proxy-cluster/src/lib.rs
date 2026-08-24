@@ -458,6 +458,14 @@ pub trait ClusterEntry: Send + Sync {
     /// attempt dialed. Carries provider credentials under the `llmproxy`
     /// dialect -- see `ClusterConfig::request_headers_to_add`.
     fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation];
+
+    /// Feed one upstream attempt's outcome to this cluster's S6 outlier
+    /// detector (WP-19). `addr` is the host the attempt actually dialed. A
+    /// no-op when the cluster configures no outlier detection, so the router
+    /// can call it unconditionally after every attempt. Takes `&self` (not
+    /// `&mut`) because the detector owns its own interior locking -- the
+    /// router holds only a shared `&dyn ClusterEntry`.
+    fn report_outlier_result(&self, addr: std::net::SocketAddr, result: outlier::RequestResult);
 }
 
 #[cfg(test)]
