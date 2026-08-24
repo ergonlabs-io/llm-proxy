@@ -16,6 +16,13 @@ tracing = { workspace = true }
 # registry under `&self`, surviving a config swap -- the same pattern
 # `ClusterManager` uses for host sets and the auth filter uses for key sets.
 arc-swap = { workspace = true }
+# WP-51 increment 2: TraceContext::new_root/child need random trace/span
+# ids. Already a workspace dependency (proxy-cluster's load balancers,
+# proxy-http's request-id generation); this crate had no prior use for it.
+rand = { workspace = true }
+# WP-51 increment 2: SpanSink is a worker -> control mpsc handoff, the same
+# shape as the rest of this crate's stats/access-log control-side plumbing.
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

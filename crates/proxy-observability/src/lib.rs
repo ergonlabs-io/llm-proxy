@@ -10,5 +10,8 @@ pub mod sink;
 /// renderer (`stats::envoy_render`). Prometheus rendering (`/stats/prometheus`)
 /// lands in a later increment; see `docs/wp-23-stats-design-brief.md`.
 pub mod stats;
+/// WP-51 increment 2 foundation: our own span model plus W3C `traceparent`
+/// parsing. Pure library, not wired into the request path yet.
+pub mod trace;
 
 pub use flags::ResponseFlag;

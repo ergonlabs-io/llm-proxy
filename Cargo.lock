@@ -1490,7 +1490,9 @@ dependencies = [
  "arc-swap",
  "chrono",
  "http",
+ "rand",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
