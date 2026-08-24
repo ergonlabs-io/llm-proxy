@@ -159,6 +159,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "typed_extension_protocol_options",
             "metadata",
             "health_checks",
+            "outlier_detection",
         ],
         // WP-35 increment 2b-i: the only custom cluster type implemented is
         // `envoy.clusters.aggregate` (see `convert_cluster`'s
@@ -247,6 +248,39 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.config.core.v3.HealthCheck.TcpHealthCheck" => &["send", "receive"],
         "envoy.config.core.v3.HealthCheck.Payload" => &["text", "binary"],
         "envoy.type.v3.Int64Range" => &["start", "end"],
+        // S6 passive outlier detection (WP-19). The local-origin split
+        // (`consecutive_local_origin_failure`,
+        // `enforcing_consecutive_local_origin_failure`,
+        // `enforcing_local_origin_success_rate`,
+        // `enforcing_failure_percentage_local_origin`), `max_ejection_time_jitter`,
+        // `monitors`, and `detect_degraded_hosts` are not implemented and stay
+        // off this list on purpose -- setting any of them must fail loudly.
+        // `split_external_local_origin_errors` IS listed even though only its
+        // `false` value is honored: `convert_outlier_detection` rejects `true`
+        // with an operator-facing message, and that only fires if the surface
+        // walk lets the field through first -- same pattern as
+        // `grpc_health_check` above.
+        "envoy.config.cluster.v3.OutlierDetection" => &[
+            "consecutive_5xx",
+            "interval",
+            "base_ejection_time",
+            "max_ejection_time",
+            "max_ejection_percent",
+            "always_eject_one_host",
+            "enforcing_consecutive_5xx",
+            "consecutive_gateway_failure",
+            "enforcing_consecutive_gateway_failure",
+            "success_rate_minimum_hosts",
+            "success_rate_request_volume",
+            "success_rate_stdev_factor",
+            "enforcing_success_rate",
+            "failure_percentage_threshold",
+            "enforcing_failure_percentage",
+            "failure_percentage_minimum_hosts",
+            "failure_percentage_request_volume",
+            "split_external_local_origin_errors",
+            "successful_active_health_check_uneject_host",
+        ],
         "envoy.config.endpoint.v3.ClusterLoadAssignment" => &["cluster_name", "endpoints"],
         "envoy.config.endpoint.v3.LocalityLbEndpoints" => &["lb_endpoints", "priority"],
         "envoy.config.endpoint.v3.LbEndpoint" => &["endpoint", "load_balancing_weight"],
@@ -2255,6 +2289,18 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         ));
     }
     let health_check = convert_health_check(&c.health_checks, path)?;
+    // S6 passive outlier detection (WP-19): same aggregate reasoning as
+    // `health_checks` just above -- ejection acts on a cluster's own hosts,
+    // and an aggregate has none, so an `outlier_detection` block on one is
+    // inert and rejected rather than silently ignored.
+    if is_aggregate && c.outlier_detection.is_some() {
+        return Err(invalid(
+            format!("{path}.outlier_detection"),
+            "inert on an aggregate cluster: it has no hosts of its own to eject -- outlier \
+             detection belongs on the member cluster that actually serves the request",
+        ));
+    }
+    let outlier_detection = convert_outlier_detection(c.outlier_detection.as_ref(), path)?;
 
     Ok(ClusterConfig {
         name: c.name.clone(),
@@ -2272,13 +2318,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         request_headers_to_add,
         usage_dialect,
         health_check,
-        // WP-19 part 1 is shape-only: `outlier_detection` is not yet on the
-        // surface-walk allow-list (see `allowed_fields`), so a config that
-        // sets it is a strict-mode rejection with its dotted path, never a
-        // silent drop -- exactly how `health_check` was staged in 847c253
-        // before its own lowering landed. `convert_outlier_detection` and the
-        // allow-list entry are the next increment.
-        outlier_detection: None,
+        outlier_detection,
     })
 }
 
@@ -2898,6 +2938,136 @@ fn decode_hex_payload(hex: &str, path: &str) -> Result<Vec<u8>, ConfigError> {
                 .map_err(|_| invalid(path, format!("`{hex}` is not valid hex")))
         })
         .collect()
+}
+
+/// S6: lower `envoy.config.cluster.v3.OutlierDetection` to the IR's
+/// [`OutlierDetectionIR`]. `None` in → `None` out (no passive ejection).
+/// A present-but-empty block means **all S6 defaults**, never Rust zeros --
+/// a zero `max_ejection_percent` or `enforcing_consecutive_5xx` would
+/// silently disable ejection, so every field falls back to
+/// [`OutlierDetectionIR::ENVOY_DEFAULT`], not to `0`.
+///
+/// Two of the enforcing-percent defaults are **0**, not 100 --
+/// `enforcing_consecutive_gateway_failure` and `enforcing_failure_percentage`
+/// -- so those two detectors are tracked but never eject out of the box. That
+/// is Envoy's own default and the one most implementations get wrong; it is
+/// preserved here, not "helpfully" raised to 100.
+fn convert_outlier_detection(
+    od: Option<&cluster_v3::OutlierDetection>,
+    path: &str,
+) -> Result<Option<OutlierDetectionIR>, ConfigError> {
+    let Some(od) = od else {
+        return Ok(None);
+    };
+    let od_path = format!("{path}.outlier_detection");
+    let d = OutlierDetectionIR::ENVOY_DEFAULT;
+
+    // Only `false` (Envoy's own default) is implemented -- see the IR type's
+    // doc and `OutlierDetectionConfig::split_external_local_origin_errors`.
+    // `true` would need a whole separate local-origin failure axis the
+    // detector folds into the 5xx path instead, so it is rejected rather
+    // than accepted-and-ignored (ground rule #1).
+    if od.split_external_local_origin_errors {
+        return Err(unsupported(
+            format!("{od_path}.split_external_local_origin_errors"),
+            "only `false` is implemented: local-origin failures are folded into the 5xx path, \
+             not tracked as a separate axis",
+        ));
+    }
+
+    let interval = match &od.interval {
+        Some(v) => to_std_duration(v, &format!("{od_path}.interval"))?,
+        None => d.interval,
+    };
+    let base_ejection_time = match &od.base_ejection_time {
+        Some(v) => to_std_duration(v, &format!("{od_path}.base_ejection_time"))?,
+        None => d.base_ejection_time,
+    };
+    // Envoy documents `max_ejection_time` as defaulting to
+    // `max(300s, base_ejection_time)`, and a configured value below the base
+    // is meaningless (an ejection can never last less than its own first
+    // step), so clamp up to `base_ejection_time` either way. Silently letting
+    // `max < base` through would mean "every ejection lasts base, not the
+    // configured max" -- a value that reads as configured but is not honored.
+    let max_ejection_time = match &od.max_ejection_time {
+        Some(v) => to_std_duration(v, &format!("{od_path}.max_ejection_time"))?,
+        None => d.max_ejection_time,
+    }
+    .max(base_ejection_time);
+
+    Ok(Some(OutlierDetectionIR {
+        interval,
+        base_ejection_time,
+        max_ejection_time,
+        max_ejection_percent: percent(
+            od.max_ejection_percent,
+            d.max_ejection_percent,
+            &format!("{od_path}.max_ejection_percent"),
+        )?,
+        always_eject_one_host: od.always_eject_one_host.unwrap_or(d.always_eject_one_host),
+        consecutive_5xx: od.consecutive_5xx.unwrap_or(d.consecutive_5xx),
+        enforcing_consecutive_5xx: percent(
+            od.enforcing_consecutive_5xx,
+            d.enforcing_consecutive_5xx,
+            &format!("{od_path}.enforcing_consecutive_5xx"),
+        )?,
+        consecutive_gateway_failure: od
+            .consecutive_gateway_failure
+            .unwrap_or(d.consecutive_gateway_failure),
+        enforcing_consecutive_gateway_failure: percent(
+            od.enforcing_consecutive_gateway_failure,
+            d.enforcing_consecutive_gateway_failure,
+            &format!("{od_path}.enforcing_consecutive_gateway_failure"),
+        )?,
+        success_rate_min_hosts: od
+            .success_rate_minimum_hosts
+            .unwrap_or(d.success_rate_min_hosts),
+        success_rate_request_volume: od
+            .success_rate_request_volume
+            .unwrap_or(d.success_rate_request_volume),
+        success_rate_stdev_factor: od
+            .success_rate_stdev_factor
+            .unwrap_or(d.success_rate_stdev_factor),
+        enforcing_success_rate: percent(
+            od.enforcing_success_rate,
+            d.enforcing_success_rate,
+            &format!("{od_path}.enforcing_success_rate"),
+        )?,
+        failure_percentage_threshold: percent(
+            od.failure_percentage_threshold,
+            d.failure_percentage_threshold,
+            &format!("{od_path}.failure_percentage_threshold"),
+        )?,
+        enforcing_failure_percentage: percent(
+            od.enforcing_failure_percentage,
+            d.enforcing_failure_percentage,
+            &format!("{od_path}.enforcing_failure_percentage"),
+        )?,
+        failure_percentage_min_hosts: od
+            .failure_percentage_minimum_hosts
+            .unwrap_or(d.failure_percentage_min_hosts),
+        failure_percentage_request_volume: od
+            .failure_percentage_request_volume
+            .unwrap_or(d.failure_percentage_request_volume),
+        uneject_on_healthy_active_hc: od
+            .successful_active_health_check_uneject_host
+            .unwrap_or(d.uneject_on_healthy_active_hc),
+    }))
+}
+
+/// A percent field (0–100) that the IR holds as `u8`. `None` → `default`;
+/// a value above 100 is rejected with its path rather than truncated, since
+/// the proto carries it as `u32` and a silent wrap would mean an
+/// enforcement percentage the operator never wrote.
+fn percent(value: Option<u32>, default: u8, path: &str) -> Result<u8, ConfigError> {
+    match value {
+        None => Ok(default),
+        Some(v) if v <= 100 => Ok(v as u8),
+        Some(v) => Err(invalid(
+            path,
+            format!("must be a percentage in [0, 100], got {v}"),
+        )),
+    }
 }
 
 fn convert_endpoint(

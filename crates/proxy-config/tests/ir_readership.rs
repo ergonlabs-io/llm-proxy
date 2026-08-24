@@ -94,17 +94,15 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "ClusterConfig",
         field_name: "outlier_detection",
         kind: EntryKind::KnownInert,
-        reason: "WP-19 part 1 is shape-only: the OutlierDetectionIR type and \
-                  this field land in ir.rs, but no lowering populates it (it is \
-                  not on the surface-walk allow-list yet, so a config setting \
-                  it is a strict-mode rejection) and no proxy-cluster code \
-                  builds an OutlierDetector from it. The next increment adds \
-                  convert_outlier_detection and the runtime wiring; delete this \
-                  entry then. NOTE the inner OutlierDetectionIR fields are NOT \
-                  flagged today because the type is never constructed (always \
-                  None), so the scan does not descend into it -- once lowering \
-                  constructs one, those fields resolve against the runtime \
-                  mapping in proxy-cluster and still need no entry.",
+        reason: "WP-19: `convert_outlier_detection` now lowers this field from \
+                  config, but no proxy-cluster code builds an OutlierDetector \
+                  from a ClusterConfig yet -- lowering populating a field is \
+                  not a runtime read. The runtime-wiring increment (the twin of \
+                  WP-18's `2b087f0`) is what reads it; delete this entry then. \
+                  The inner OutlierDetectionIR fields are not flagged: their \
+                  names collide with the identically-named, genuinely-read \
+                  fields on proxy-cluster's OutlierDetectionConfig, which the \
+                  text-based scan cannot tell apart.",
     },
     AllowlistEntry {
         struct_name: "ClusterConfig",
