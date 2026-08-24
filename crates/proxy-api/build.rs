@@ -42,6 +42,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // root NOT under `vendor/envoy`: `scripts/vendor-protos.sh` does not
         // manage it, because it is ours and is not re-fetched on a proto bump.
         "llmproxy/filters/v0/auth.proto",
+        // WP-51 increment 3: OTLP export. The collector gRPC services; protoc
+        // pulls the transitive trace/metrics/common/resource messages. We
+        // hand-roll the exporter over these (build_client) and the in-test
+        // mock collector over the generated servers (build_server), rather
+        // than pulling in the opentelemetry SDK crates -- see the WP-51 plan
+        // for why (the SDK's Send+Sync async providers fight the !Send data
+        // plane, ADR-0003; these plain prost/tonic types do not).
+        "opentelemetry/proto/collector/trace/v1/trace_service.proto",
+        "opentelemetry/proto/collector/metrics/v1/metrics_service.proto",
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
