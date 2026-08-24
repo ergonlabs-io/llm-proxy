@@ -221,6 +221,39 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   proxy-config); TlsSecret's own doc comment already names \
                   these WPs.",
     },
+    AllowlistEntry {
+        struct_name: "ConfigSnapshot",
+        field_name: "tracing",
+        kind: EntryKind::KnownInert,
+        reason: "WP-51 increment 3: config surface only. No runtime crate runs \
+                  an OTLP exporter or mints/propagates a span yet -- a later \
+                  increment wires that and deletes this entry, plus the three \
+                  TracingConfig entries below. Field's own doc comment already \
+                  names the increment.",
+    },
+    AllowlistEntry {
+        struct_name: "TracingConfig",
+        field_name: "otlp_endpoint",
+        kind: EntryKind::KnownInert,
+        reason: "Same WP-51 increment 3 gap as ConfigSnapshot.tracing above -- \
+                  delete alongside it once an exporter reads this field.",
+    },
+    AllowlistEntry {
+        struct_name: "TracingConfig",
+        field_name: "service_name",
+        kind: EntryKind::KnownInert,
+        reason: "Same WP-51 increment 3 gap as ConfigSnapshot.tracing above -- \
+                  delete alongside it once an exporter reads this field.",
+    },
+    AllowlistEntry {
+        struct_name: "TracingConfig",
+        field_name: "sample_ratio",
+        kind: EntryKind::KnownInert,
+        reason: "Same WP-51 increment 3 gap as ConfigSnapshot.tracing above -- \
+                  delete alongside it once the runtime that mints root spans \
+                  reads this field (see TracingConfig's doc for the sampling \
+                  contract it must satisfy).",
+    },
 ];
 
 /// A `pub struct` block parsed out of `ir.rs`, with its `pub` field names.

@@ -338,6 +338,46 @@ pub struct Observability {
     /// -- see `default_force_usage_reporting`.
     #[serde(default = "default_force_usage_reporting")]
     pub force_usage_reporting: bool,
+    /// OTLP trace export (WP-51 increment 3): config surface only, see
+    /// `proxy_config::ir::TracingConfig`'s doc for what does (and does not)
+    /// consume this yet. `None` -- both when this key is absent and when the
+    /// whole `observability` block is absent -- means tracing is off.
+    #[serde(default)]
+    pub tracing: Option<Tracing>,
+}
+
+/// `observability.tracing`. The top-level `tracing` key is RESERVED and
+/// rejected in v0 (see [`RESERVED_KEYS`]) precisely so this nested block can
+/// exist without a collision once tracing has more than config-surface
+/// behavior.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tracing {
+    /// Required (and must be non-empty) when this block is present -- there
+    /// is no sensible destination to guess. `Option` rather than a plain
+    /// (serde-required) `String` so `crate::lower` can report a full
+    /// `observability.tracing.otlp_endpoint` path on both "missing" and
+    /// "empty", instead of serde's coarser "missing field" error scoped only
+    /// to the enclosing `tracing` block -- same reasoning as `Auth`'s
+    /// `hmac_secret`/`hmac_secret_file` choice.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// OTLP resource attribute `service.name`. Default: `"llm-proxy"`.
+    #[serde(default = "default_tracing_service_name")]
+    pub service_name: String,
+    /// Head-sampling ratio for a newly minted root span, checked against
+    /// `0.0..=1.0` at lowering (this type only parses a plain `f64`).
+    /// Default: `1.0`.
+    #[serde(default = "default_tracing_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+fn default_tracing_service_name() -> String {
+    "llm-proxy".to_string()
+}
+
+fn default_tracing_sample_ratio() -> f64 {
+    1.0
 }
 
 /// `pub(crate)`, not private: `lower.rs`'s `force_usage_reporting` needs the

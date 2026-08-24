@@ -63,6 +63,10 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         snapshot.admin = Some(SocketAddr::new(ip, port));
     }
 
+    // WP-51 increment 3: see `convert_tracing_metadata`'s doc for why this
+    // reads `node.metadata` rather than a `static_resources`-adjacent field.
+    snapshot.tracing = convert_tracing_metadata(b.node.as_ref(), "node")?;
+
     let Some(sr) = &b.static_resources else {
         return Ok(snapshot);
     };
@@ -300,7 +304,28 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "use_remote_address",
             "xff_num_trusted_hops",
             "access_log",
+            // WP-51 increment 3: listed so a config setting it gets
+            // `convert_hcm`'s specific "not implemented, see the dialect"
+            // message instead of the generic surface-check one -- see
+            // `HttpConnectionManager.Tracing`'s entry just below for why the
+            // rejection happens there rather than mapping anything.
+            "tracing",
         ],
+        // `tracing`'s own message: `&[]` (nothing mapped, same shape as the
+        // Router filter's own entry above) because `envoy.config.trace.v3.
+        // OpenTelemetryConfig` -- the tracer extension the real `provider`
+        // field would point `typed_config` at -- is not compiled into the
+        // descriptor pool (`proxy-api/build.rs`'s `roots` doesn't list
+        // `envoy/config/trace/v3/opentelemetry.proto`, and nothing else pulls
+        // it in transitively; confirmed by querying `descriptor_pool()`
+        // directly). Vendoring it without a real mapping behind it would just
+        // move the failure from a clean `unsupported()` here to an opaque
+        // `UnknownTypeUrl` two layers deeper, so `convert_hcm` rejects the
+        // whole `tracing` block outright instead -- see its comment. The
+        // `llmproxy` dialect's `observability.tracing` is the supported
+        // surface for now; it builds `TracingConfig` directly rather than
+        // through this proto (see `convert_tracing_metadata` below).
+        "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.Tracing" => &[],
         "envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter" => {
             &["name", "typed_config"]
         }
@@ -1279,6 +1304,26 @@ fn convert_hcm(
     let xff_num_trusted_hops = hcm.xff_num_trusted_hops;
 
     let access_logs = convert_access_logs(&hcm.access_log, &format!("{path}.access_log"))?;
+
+    // WP-51 increment 3: `tracing.provider.typed_config` would need to
+    // resolve `envoy.config.trace.v3.OpenTelemetryConfig`, which is not
+    // compiled into the descriptor pool -- see the allow-list comment on
+    // `HttpConnectionManager.Tracing` above for how that was confirmed.
+    // Rejecting here (rather than leaving `tracing` off the allow list
+    // entirely, which would produce this same class of error) means the
+    // message can point an operator at the actual supported path instead of
+    // the generic "not implemented yet" text -- same reasoning as the
+    // RING_HASH/MAGLEV rejection in `convert_cluster`.
+    if hcm.tracing.is_some() {
+        return Err(unsupported(
+            format!("{path}.tracing"),
+            "OTLP tracing is not implemented in Envoy mode yet (the \
+             `envoy.config.trace.v3.OpenTelemetryConfig` tracer extension proto is not \
+             compiled into the descriptor pool). Use the `llmproxy` dialect's \
+             `observability.tracing` block instead, which builds the same IR without going \
+             through this proto.",
+        ));
+    }
 
     Ok(HttpConnectionManagerConfig {
         stat_prefix: hcm.stat_prefix.clone(),
@@ -2556,6 +2601,115 @@ fn convert_usage_dialect_metadata(
             format!("unrecognized dialect `{other}`; expected `openai` or `anthropic`"),
         )),
     }
+}
+
+// ------------------------------------------------------------------ tracing --
+
+/// Namespace key the `llmproxy` dialect uses to carry [`TracingConfig`]
+/// through `Bootstrap.node.metadata` -- see [`convert_tracing_metadata`]'s
+/// doc for why this carrier (rather than the real `HttpConnectionManager.
+/// tracing.provider` field, which Envoy mode rejects outright -- see
+/// `convert_hcm`) is what actually produces the IR value today.
+const TRACING_METADATA_KEY: &str = "io.llmproxy.tracing";
+
+/// Lower `Bootstrap.node.metadata["io.llmproxy.tracing"]` into
+/// [`ConfigSnapshot::tracing`]. The expected shape is
+/// `{ otlp_endpoint: "..." (required), service_name: "..." (optional,
+/// default "llm-proxy"), sample_ratio: 0.0..=1.0 (optional, default 1.0) }`.
+///
+/// `Node.metadata` (unlike `Cluster.metadata`) is a bare
+/// `google.protobuf.Struct`, not wrapped in a `filter_metadata` map -- so
+/// this reads the namespace key directly out of it rather than through a
+/// `filter_metadata` lookup, but is otherwise the same
+/// re-implementation-by-hand pattern as
+/// `convert_provider_auth_metadata`/`convert_usage_dialect_metadata`:
+/// `google.protobuf.Struct` is opaque to the reflective surface walk, so
+/// ground rule #1 has to be enforced here directly, and any error names its
+/// full dotted path rather than a silent skip. A real Envoy config's
+/// `node.metadata` may carry anything else under any other key; only this
+/// one namespace is ever inspected, and nothing else there is touched.
+fn convert_tracing_metadata(
+    node: Option<&core_v3::Node>,
+    path: &str,
+) -> Result<Option<TracingConfig>, ConfigError> {
+    let Some(tracing) = node
+        .and_then(|n| n.metadata.as_ref())
+        .and_then(|m| m.fields.get(TRACING_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let tracing_path = format!("{path}.metadata[\"{TRACING_METADATA_KEY}\"]");
+    let Some(prost_types::value::Kind::StructValue(tracing)) = &tracing.kind else {
+        return Err(invalid(&tracing_path, "must be an object"));
+    };
+
+    // Rust note: `Struct::fields` is a `HashMap`, so sort keys before
+    // reporting one to keep the error deterministic across runs.
+    let mut unknown: Vec<&String> = tracing
+        .fields
+        .keys()
+        .filter(|k| {
+            !matches!(
+                k.as_str(),
+                "otlp_endpoint" | "service_name" | "sample_ratio"
+            )
+        })
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{tracing_path}.{key}"),
+            format!(
+                "`{TRACING_METADATA_KEY}` only supports `otlp_endpoint`, `service_name`, and \
+                 `sample_ratio`"
+            ),
+        ));
+    }
+
+    let endpoint_path = format!("{tracing_path}.otlp_endpoint");
+    let otlp_endpoint = match tracing
+        .fields
+        .get("otlp_endpoint")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::StringValue(v)) if !v.is_empty() => v.clone(),
+        Some(prost_types::value::Kind::StringValue(_)) => {
+            return Err(invalid(&endpoint_path, "must not be empty"))
+        }
+        Some(_) => return Err(invalid(&endpoint_path, "must be a string")),
+        None => return Err(invalid(&endpoint_path, "is required")),
+    };
+
+    let service_name_path = format!("{tracing_path}.service_name");
+    let service_name = match tracing
+        .fields
+        .get("service_name")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::StringValue(v)) => v.clone(),
+        Some(_) => return Err(invalid(&service_name_path, "must be a string")),
+        None => "llm-proxy".to_string(),
+    };
+
+    let ratio_path = format!("{tracing_path}.sample_ratio");
+    let sample_ratio = match tracing
+        .fields
+        .get("sample_ratio")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::NumberValue(v)) => *v,
+        Some(_) => return Err(invalid(&ratio_path, "must be a number")),
+        None => 1.0,
+    };
+    if !(0.0..=1.0).contains(&sample_ratio) {
+        return Err(invalid(&ratio_path, "must be between 0.0 and 1.0"));
+    }
+
+    Ok(Some(TracingConfig {
+        otlp_endpoint,
+        service_name,
+        sample_ratio,
+    }))
 }
 
 /// Type URL key Envoy expects for the one `typed_extension_protocol_options`

@@ -44,7 +44,55 @@ pub struct ConfigSnapshot {
     pub secrets: HashMap<SecretName, Arc<TlsSecret>>,
     /// Admin endpoint bind address (WP-25), when configured.
     pub admin: Option<SocketAddr>,
+    /// OTLP trace export (WP-51 increment 3), when configured. `None` (the
+    /// default) means tracing is off entirely -- no exporter runs, and no
+    /// span is ever created, regardless of an inbound `traceparent`.
+    ///
+    /// This lives at the snapshot root rather than per-HCM even though the
+    /// Envoy field it would otherwise mirror
+    /// (`HttpConnectionManager.tracing.provider`) is per-HCM: Envoy mode does
+    /// not implement that field yet (see `convert_hcm` in `lower.rs` for
+    /// why -- the tracer extension proto isn't compiled into the descriptor
+    /// pool), so nothing there produces a value to place per-HCM in the first
+    /// place, and one exporter per process is what every present caller
+    /// (dialect and, later, the runtime) actually wants. See
+    /// [`TracingConfig`]'s doc for the config shape and the sampling
+    /// contract.
+    pub tracing: Option<TracingConfig>,
     pub version: SnapshotVersion,
+}
+
+// ---------------------------------------------------------------- tracing --
+
+/// OTLP trace-export configuration (WP-51 increment 3) -- config surface
+/// only. Nothing in the data plane consumes this yet; a later increment
+/// wires an actual exporter and starts minting/propagating spans. See
+/// `crates/proxy-config/tests/ir_readership.rs` for the allowlist entries
+/// that must be deleted when that lands.
+///
+/// # The sampling contract
+///
+/// `sample_ratio` governs head sampling **only for a request that starts a
+/// new trace** (no inbound `traceparent`, or one that arrives unsampled).
+/// An inbound `traceparent` whose sampled flag is already set MUST always be
+/// honored regardless of `sample_ratio` -- this proxy is a participant in
+/// someone else's trace at that point, not the one deciding whether the
+/// trace exists, and dropping a span the caller already committed to
+/// recording breaks the trace they're assembling. The runtime that consumes
+/// this field is required to satisfy that contract; it cannot be checked at
+/// config-lowering time, so it is recorded here as the interface's promise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TracingConfig {
+    /// The OTLP/gRPC collector endpoint, e.g. `"http://localhost:4317"`.
+    /// Validated non-empty at lowering; no default -- there is no sensible
+    /// destination to guess.
+    pub otlp_endpoint: String,
+    /// OTLP resource attribute `service.name`. Default: `"llm-proxy"`.
+    pub service_name: String,
+    /// Head-sampling ratio for a newly minted ROOT span, `0.0..=1.0`.
+    /// Default: `1.0` (sample everything). See this type's doc for what this
+    /// does and does not govern.
+    pub sample_ratio: f64,
 }
 
 // ---------------------------------------------------------------- listeners --

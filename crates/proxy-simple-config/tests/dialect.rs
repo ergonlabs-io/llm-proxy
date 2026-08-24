@@ -847,6 +847,172 @@ observability:
     }
 }
 
+// ---------------------------------------------------- WP-51 increment 3: tracing --
+
+/// No `observability.tracing` at all -- the overwhelming majority of
+/// configs -- must mean no `node` key at all on the lowered bootstrap, and
+/// `ConfigSnapshot::tracing` stays `None` all the way through.
+#[test]
+fn no_tracing_block_emits_no_node_key() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    assert!(
+        lowered.bootstrap.get("node").is_none(),
+        "no tracing configured must mean no node key at all, got {:?}",
+        lowered.bootstrap
+    );
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    assert_eq!(snapshot.tracing, None);
+}
+
+/// The load-bearing check: `observability.tracing` lowers all the way
+/// through the real Envoy-mode loader (which rejects the real
+/// `HttpConnectionManager.tracing` field outright -- see `convert_hcm`) and
+/// into `ConfigSnapshot::tracing`, with the dialect's own defaults applied.
+#[test]
+fn tracing_block_lowers_end_to_end() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://localhost:4317"
+    service_name: "my-gateway"
+    sample_ratio: 0.5
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    assert_eq!(
+        snapshot.tracing,
+        Some(proxy_config::ir::TracingConfig {
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            service_name: "my-gateway".to_string(),
+            sample_ratio: 0.5,
+        })
+    );
+}
+
+/// `service_name` and `sample_ratio` both default when omitted -- only
+/// `otlp_endpoint` is required.
+#[test]
+fn tracing_block_defaults_service_name_and_sample_ratio() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://collector:4317"
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    assert_eq!(
+        snapshot.tracing,
+        Some(proxy_config::ir::TracingConfig {
+            otlp_endpoint: "http://collector:4317".to_string(),
+            service_name: "llm-proxy".to_string(),
+            sample_ratio: 1.0,
+        })
+    );
+}
+
+/// Ground rule #1: a missing `otlp_endpoint` is a hard error naming the exact
+/// field, not a silently-off tracing block -- the operator wrote
+/// `observability.tracing`, so something must have been meant by it.
+#[test]
+fn tracing_block_without_otlp_endpoint_is_a_hard_error() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing: {}
+"#,
+    )
+    .expect("must parse");
+    let err = proxy_simple_config::lower(&config)
+        .expect_err("a tracing block with no otlp_endpoint must not lower");
+    let ConfigError::InvalidValue { field_path, .. } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "observability.tracing.otlp_endpoint");
+}
+
+/// An out-of-range `sample_ratio` is rejected with its own dotted path,
+/// never silently clamped.
+#[test]
+fn tracing_block_sample_ratio_out_of_range_is_a_hard_error() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://localhost:4317"
+    sample_ratio: 1.5
+"#,
+    )
+    .expect("must parse");
+    let err =
+        proxy_simple_config::lower(&config).expect_err("sample_ratio above 1.0 must not lower");
+    let ConfigError::InvalidValue { field_path, .. } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "observability.tracing.sample_ratio");
+}
+
+/// The top-level `tracing:` key stays reserved -- this feature nests under
+/// `observability` on purpose (see `RESERVED_KEYS`'s doc in `model.rs`), and
+/// this guards against silently un-reserving it while adding the nested
+/// block.
+#[test]
+fn top_level_tracing_key_is_still_reserved() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+tracing:
+  otlp_endpoint: "http://localhost:4317"
+"#,
+    )
+    .expect_err("top-level tracing must still be rejected");
+    let ConfigError::UnsupportedField { field_path, reason } = &err else {
+        panic!("expected UnsupportedField, got: {err}");
+    };
+    assert_eq!(field_path, "tracing");
+    assert!(reason.contains("reserved"), "got: {reason}");
+}
+
 // ------------------------------------------------------- WP-33: usage filter --
 
 /// `lower.rs` duplicates the usage filter's type URL as a literal instead of

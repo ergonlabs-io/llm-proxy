@@ -363,6 +363,31 @@
           "description": "Forces `stream_options.include_usage` onto streaming OpenAI-dialect requests that didn't already ask for it, so token usage can be logged/accounted for streamed responses. This makes the provider emit one extra final SSE frame carrying usage; well-behaved SDKs handle it, but a hand-rolled client that iterates `choices[0]` without a guard can trip over that frame. Set to `false` for strict passthrough if that's a concern.",
           "default": true,
           "examples": [true, false]
+        },
+        "tracing": {
+          "type": "object",
+          "description": "OTLP trace export (WP-51 increment 3): config surface only -- nothing exports a span yet. Omit entirely to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.",
+          "additionalProperties": false,
+          "required": ["otlp_endpoint"],
+          "properties": {
+            "otlp_endpoint": {
+              "type": "string",
+              "description": "The OTLP/gRPC collector endpoint.",
+              "examples": ["http://localhost:4317"]
+            },
+            "service_name": {
+              "type": "string",
+              "description": "OTLP resource attribute `service.name`.",
+              "default": "llm-proxy"
+            },
+            "sample_ratio": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0,
+              "description": "Head-sampling ratio for a newly minted root span (no inbound `traceparent`, or one that arrives unsampled).",
+              "default": 1.0
+            }
+          }
         }
       }
     }

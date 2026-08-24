@@ -129,6 +129,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         routes: HashMap::new(),
         secrets: HashMap::new(),
         admin: Some("127.0.0.1:9901".parse().unwrap()),
+        tracing: None,
         version: SnapshotVersion(1),
     })
 }

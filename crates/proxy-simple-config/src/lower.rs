@@ -263,6 +263,15 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             "address": { "socket_address": { "address": host, "port_value": port } }
         });
     }
+    if let Some(tracing) = config
+        .observability
+        .as_ref()
+        .and_then(|o| o.tracing.as_ref())
+    {
+        bootstrap["node"] = json!({
+            "metadata": { TRACING_METADATA_KEY: lower_tracing(tracing)? }
+        });
+    }
 
     Ok(Lowered {
         bootstrap,
@@ -1465,6 +1474,64 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
             },
         }),
     }
+}
+
+// ------------------------------------------------------------------ tracing --
+
+/// Namespace key under `Bootstrap.node.metadata` this dialect uses to carry
+/// `observability.tracing` -- must equal
+/// `proxy_config::lower::TRACING_METADATA_KEY` exactly, for the same
+/// dependency-tree reason as `USAGE_FILTER_TYPE_URL` above (this crate never
+/// links `proxy-config`'s internals, only its JSON surface). Unlike the
+/// filter type URLs above, there is no separate string-literal pin test for
+/// this constant (nor for `PROVIDER_AUTH_METADATA_KEY`/
+/// `USAGE_DIALECT_METADATA_KEY` in `lower_provider` below, which use the same
+/// pattern): `dialect.rs`'s end-to-end tests call `proxy_config::build_snapshot`
+/// directly on this crate's lowered output, so a drift here shows up as that
+/// round trip failing to populate `ConfigSnapshot::tracing` at all, which is
+/// a stronger signal than a literal string compare.
+const TRACING_METADATA_KEY: &str = "io.llmproxy.tracing";
+
+/// `observability.tracing` -> `Bootstrap.node.metadata["io.llmproxy.tracing"]`
+/// (JSON object), read back out by
+/// `proxy_config::lower::convert_tracing_metadata` into
+/// `ConfigSnapshot::tracing` on the way through the identical strict-parse
+/// -> PGV -> IR pipeline every Envoy-mode config also goes through. There is
+/// no Envoy `Bootstrap` field for this -- `HttpConnectionManager.tracing.
+/// provider` is the real Envoy field, and Envoy mode rejects it outright
+/// (see `convert_hcm`'s comment: the tracer extension proto isn't compiled
+/// into the descriptor pool) -- so this smuggles the value through
+/// `Node.metadata` instead, the same channel `lower_provider` uses for
+/// per-provider credentials/usage-dialect via `Cluster.metadata`. `Node`
+/// (unlike `Cluster`) has no `filter_metadata` wrapper -- its `metadata` is a
+/// bare `Struct` -- so the key sits directly under it.
+///
+/// `otlp_endpoint` non-empty and `sample_ratio` in `0.0..=1.0` are validated
+/// here (not left to serde or to the Envoy-mode reader) so a bad dialect
+/// value gets a `observability.tracing.<field>` path rather than one scoped
+/// to the enclosing block.
+fn lower_tracing(tracing: &crate::model::Tracing) -> Result<Value, ConfigError> {
+    let endpoint = match &tracing.otlp_endpoint {
+        Some(e) if !e.is_empty() => e,
+        _ => {
+            return Err(ConfigError::InvalidValue {
+                field_path: "observability.tracing.otlp_endpoint".to_string(),
+                reason: "is required and must not be empty when `observability.tracing` is set"
+                    .to_string(),
+            })
+        }
+    };
+    if !(0.0..=1.0).contains(&tracing.sample_ratio) {
+        return Err(ConfigError::InvalidValue {
+            field_path: "observability.tracing.sample_ratio".to_string(),
+            reason: "must be between 0.0 and 1.0".to_string(),
+        });
+    }
+    Ok(json!({
+        "otlp_endpoint": endpoint,
+        "service_name": tracing.service_name,
+        "sample_ratio": tracing.sample_ratio,
+    }))
 }
 
 // ----------------------------------------------------------------- listener --
