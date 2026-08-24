@@ -354,9 +354,18 @@ served by the admin endpoint, plus a config swap under live traffic with zero dr
 streams.
 
 **In scope:** WP-23 (stats registry), WP-25 (admin server), WP-30 (perf — phases 1+2 done,
-the ceiling is unpublished), WP-06's swap-under-load gate, IR wiring for WP-18/WP-19
-(health checking and outlier detection are both built and green but neither is reachable
-from config yet), WP-15 remainder, WP-14 retry budgets, and **WP-51 (OpenTelemetry)**.
+the capacity report is now published, `054b809`), WP-06's swap-under-load gate,
+~~IR wiring for WP-18/WP-19~~ **(DONE 2026-08-23: both health checking (`2b087f0`) and
+outlier detection (`d52555f`) are reachable from config and run — lowering plus runtime,
+each with its wiring hazards found and mutation-pinned)**, WP-15 remainder, WP-14 retry
+budgets, and **WP-51 (OpenTelemetry)**.
+
+**Ship-gate status (2026-08-23):** all three gate clauses are met — the capacity report is
+published from a not-harness-bound run (`054b809`), `/config_dump` and `/stats` are served
+(closed 2026-08-09), and the config swap under live traffic with zero dropped streams is
+proven (`swap_under_load.rs`, 2026-08-09). The milestone is **not** owner-declarable as
+shipped, because WP-51 (OpenTelemetry) remains in scope and unstarted. The gate is a floor,
+the in-scope list is the ceiling; tagging is the owner's call.
 
 **Found 2026-08-09 — the swap clause has a prerequisite nobody had written down: a running
 proxy cannot be told to swap its config.** The machinery is all there and all tested —

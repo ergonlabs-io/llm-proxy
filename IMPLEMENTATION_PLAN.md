@@ -737,7 +737,17 @@ Each WP references its normative spec sections.
   distribution within 1% of Envoy's; ring-hash/maglev: **exact** pick agreement on 10k random
   hash keys (this catches hash mismatches).
 
-#### WP-18 — Active health checking  (Size: M)  — **Priority: P1**
+#### WP-18 — Active health checking  (Size: M)  — **Priority: P1**  — **REACHABLE + RUNNING 2026-08-23 (`2b087f0`)**
+- **Wired end to end**: `Cluster.health_checks` → `HealthCheckIR` (lowering, `847c253`),
+  and `ManagedCluster` builds a `HealthCheckEngine` per cluster and reconciles probes off
+  the host-set diff. HTTP + TCP only; gRPC/custom rejected at load. Two wiring hazards found
+  and mutation-pinned: a dropped `JoinHandle` does not abort its task (every SIGHUP leaked a
+  probe loop per host — fixed by `Drop for ManagedCluster`), and `discovery::resolve` rebuilt
+  hosts with default `HealthFlags` (DNS refresh silently un-failed a checked-down host —
+  fixed by `carry_over_health_flags` on `diff.unchanged`). Two lowering traps pinned:
+  `Payload.text` is hex, `expected_statuses` is a half-open `Int64Range`. Still outstanding:
+  `no_traffic_interval` accepted-but-inert (no traffic signal yet), first-check-immediate,
+  and the differential acceptance timeline below.
 - HTTP (`path`, expected statuses default 200 ✅, host header), TCP (send/expect bytes),
   gRPC (`grpc.health.v1.Health/Check`). Timing: `interval`, `timeout`,
   `unhealthy_threshold`/`healthy_threshold`, `no_traffic_interval` (default 60s ⚠️), jitter
@@ -747,7 +757,20 @@ Each WP references its normative spec sections.
 - **Acceptance:** scripted upstream (healthy↔unhealthy sequences) → transition timeline
   (edge counts, timing windows) matches Envoy; panic-threshold interaction test with WP-17.
 
-#### WP-19 — Outlier detection  (Size: M)  — **Priority: P1**
+#### WP-19 — Outlier detection  (Size: M)  — **Priority: P1**  — **REACHABLE + EJECTING 2026-08-23 (`b67270f` shape, `3cf0246` lowering, `d52555f` runtime)**
+- **Wired end to end**: `Cluster.outlier_detection` → `OutlierDetectionIR` → a per-cluster
+  `OutlierDetector`, fed one `RequestResult` per upstream attempt through the new
+  `ClusterEntry::report_outlier_result` from `router.rs`. The router maps `AttemptOutcome`
+  → S6 `RequestResult` (502/503/504 = GatewayFailure, other 5xx = Http5xx, sub-500 =
+  Success, connect/reset/refused/per-try-timeout = LocalOriginFailure, circuit-breaker
+  overflow not reported). Same sweep-leak `Drop` guard as WP-18. Two lowering traps pinned
+  (empty block = all S6 defaults not zeros; `max_ejection_time` clamps up to base), and
+  `split_external_local_origin_errors: true` is rejected (only `false` is implemented). A
+  cross-crate test pins the IR defaults against the runtime config's. Fixed a stale
+  `outlier.rs` doc that claimed Envoy does not expose
+  `successful_active_health_check_uneject_host` (it is field 23). Still outstanding: the
+  un-eject-on-active-HC-pass path is not wired to the live `HealthCheckEngine`, and the
+  differential acceptance log below.
 - Implements S6 with exact defaults (verified table): consecutive-5xx (5 ✅), interval 10s ✅,
   base ejection 30s ✅, `max_ejection_percent` 10% ✅ (note: Envoy always allows ejecting ≥1
   host only if `always_eject_one_host` — default false ✅), ejection time growth = base ×
