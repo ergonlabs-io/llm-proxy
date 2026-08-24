@@ -478,6 +478,13 @@ pub struct ClusterConfig {
     /// none, which is Envoy's own default (no probing, every host healthy).
     /// Singular though the proto field is repeated — see [`HealthCheckIR`].
     pub health_check: Option<HealthCheckIR>,
+    /// S6 passive outlier detection (WP-19); `None` when the config configures
+    /// none, which is Envoy's own default (no passive ejection at all — every
+    /// host stays eligible regardless of the error rate it's returning).
+    /// Shape-only as of WP-19 part 1: nothing in `proxy-cluster` builds an
+    /// [`crate::ir::OutlierDetectionIR`]-backed detector from this field yet
+    /// (see `crates/proxy-config/tests/ir_readership.rs`'s allowlist entry).
+    pub outlier_detection: Option<OutlierDetectionIR>,
 }
 
 // ---------------------------------------------------------- health checks --
@@ -531,6 +538,143 @@ pub enum HealthCheckKindIR {
     /// read `expect.len()` bytes and require an exact match. Both empty means
     /// a bare TCP connect is the whole check.
     Tcp { send: Vec<u8>, expect: Vec<u8> },
+}
+
+// ------------------------------------------------------- outlier detection --
+
+/// IR for `envoy.config.cluster.v3.OutlierDetection` (supported surface) —
+/// WP-19. Mirrors `proxy_cluster::outlier::OutlierDetectionConfig` field for
+/// field; see that type's doc for the full S6 semantics (edge-triggered
+/// counters, the gateway-failure/5xx interaction, enforcement-percent dice
+/// roll). Every field here is commented with its S6 default, duplicated from
+/// that type rather than shared with it: `proxy-config` cannot depend on
+/// `proxy-cluster` (the dependency runs the other way — the data plane
+/// consumes the IR, not the reverse), so [`OutlierDetectionIR::ENVOY_DEFAULT`]
+/// and `OutlierDetectionConfig::default()` are two independent sources of
+/// truth for the same numbers. `crates/proxy-cluster/src/outlier.rs` carries
+/// a test asserting they agree field for field — see that test before
+/// changing either side.
+///
+/// Two deliberate differences from `OutlierDetectionConfig`:
+/// - `split_external_local_origin_errors` is **not** carried here at all.
+///   Only `false` (Envoy's own default) is implemented anywhere in this
+///   project — see `OutlierDetectionConfig::split_external_local_origin_errors`'s
+///   doc — so lowering rejects `true` outright with its dotted path rather
+///   than accepting a field the IR would then silently ignore (ground rule
+///   #1's exact shape: accepted-but-inert is still a P0).
+/// - `uneject_on_healthy_active_hc` maps a real Envoy field,
+///   `successful_active_health_check_uneject_host` (field 23, a `BoolValue`
+///   defaulting to true) — `OutlierDetectionConfig`'s own doc comment used to
+///   claim Envoy does not expose this as configurable; that was wrong, and is
+///   fixed there as part of this same change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutlierDetectionIR {
+    /// How often the success-rate and failure-percentage detectors re-run
+    /// over the whole host set. S6 default: 10s.
+    pub interval: Duration,
+    /// First ejection's duration; later ejections grow by this amount per
+    /// consecutive ejection. S6 default: 30s.
+    pub base_ejection_time: Duration,
+    /// Ceiling on ejection duration regardless of growth. Envoy documents
+    /// this as `max(300s, base_ejection_time)` when unset — lowering clamps
+    /// an explicit value below `base_ejection_time` up to it too, since a
+    /// cap tighter than the base would silently mean "every ejection lasts
+    /// `base_ejection_time`, not the configured max" (see `convert_outlier_detection`).
+    pub max_ejection_time: Duration,
+    /// Percent of a cluster's hosts that may be simultaneously ejected. S6
+    /// default: 10. 0–100.
+    pub max_ejection_percent: u8,
+    /// If true, at least one host may always be ejected even if
+    /// `max_ejection_percent` would otherwise round down to zero for a small
+    /// cluster. S6 default: false — there is deliberately no "at least one"
+    /// exemption.
+    pub always_eject_one_host: bool,
+
+    /// Consecutive 5xx (or folded local-origin failure) responses required
+    /// to trip this detector. S6 default: 5.
+    pub consecutive_5xx: u32,
+    /// Percent chance a tripped consecutive-5xx detection is actually
+    /// enforced (ejects the host) rather than merely logged/counted. S6
+    /// default: 100. 0–100.
+    pub enforcing_consecutive_5xx: u8,
+    /// Consecutive gateway-failure (502/503/504) responses required to trip
+    /// this detector. S6 default: 5.
+    pub consecutive_gateway_failure: u32,
+    /// Percent chance a tripped consecutive-gateway-failure detection is
+    /// enforced. S6 default: **0** — tracked but never enforced out of the
+    /// box; this is one of the two defaults most implementations get wrong
+    /// (see `enforcing_failure_percentage` below for the other). 0–100.
+    pub enforcing_consecutive_gateway_failure: u8,
+
+    /// Minimum number of hosts (with at least `success_rate_request_volume`
+    /// requests in the interval) required before the success-rate detector
+    /// runs at all. S6 default: 5.
+    pub success_rate_min_hosts: u32,
+    /// Minimum requests a host must have seen in the interval to be eligible
+    /// for success-rate detection. S6 default: 100.
+    pub success_rate_request_volume: u32,
+    /// Ejection threshold in thousandths of a standard deviation below the
+    /// mean success rate (1900 == 1.9 sigma). S6 default: 1900.
+    pub success_rate_stdev_factor: u32,
+    /// Percent chance a tripped success-rate detection is enforced. S6
+    /// default: 100. 0–100.
+    pub enforcing_success_rate: u8,
+
+    /// Failure-percentage threshold above which a host is a candidate for
+    /// ejection. S6 default: 85. 0–100.
+    pub failure_percentage_threshold: u8,
+    /// Percent chance a tripped failure-percentage detection is enforced. S6
+    /// default: **0** — see `enforcing_consecutive_gateway_failure` above,
+    /// the other default most implementations get wrong. 0–100.
+    pub enforcing_failure_percentage: u8,
+    /// Minimum number of eligible hosts required before the
+    /// failure-percentage detector runs. S6 default: 5.
+    pub failure_percentage_min_hosts: u32,
+    /// Minimum requests a host must have seen in the interval to be eligible
+    /// for failure-percentage detection. S6 default: 50.
+    pub failure_percentage_request_volume: u32,
+
+    /// Whether a host un-ejects the moment it passes an active health check
+    /// (WP-18), independent of its outlier ejection timer. S6 default: true
+    /// — maps `successful_active_health_check_uneject_host`
+    /// (`envoy.config.cluster.v3.OutlierDetection`, field 23).
+    pub uneject_on_healthy_active_hc: bool,
+}
+
+impl OutlierDetectionIR {
+    /// Envoy's documented S6 defaults, applied field-by-field when the config
+    /// omits `outlier_detection` entirely (`ClusterConfig::outlier_detection`
+    /// stays `None` in that case — this constant is for the *present-but-
+    /// empty-block* case, where every field must still take its real
+    /// default rather than the Rust zero value; a zero `max_ejection_percent`
+    /// or `enforcing_consecutive_5xx`, for instance, would silently disable
+    /// ejection outright).
+    pub const ENVOY_DEFAULT: Self = Self {
+        interval: Duration::from_secs(10),
+        base_ejection_time: Duration::from_secs(30),
+        max_ejection_time: Duration::from_secs(300),
+        max_ejection_percent: 10,
+        always_eject_one_host: false,
+        consecutive_5xx: 5,
+        enforcing_consecutive_5xx: 100,
+        consecutive_gateway_failure: 5,
+        enforcing_consecutive_gateway_failure: 0,
+        success_rate_min_hosts: 5,
+        success_rate_request_volume: 100,
+        success_rate_stdev_factor: 1900,
+        enforcing_success_rate: 100,
+        failure_percentage_threshold: 85,
+        enforcing_failure_percentage: 0,
+        failure_percentage_min_hosts: 5,
+        failure_percentage_request_volume: 50,
+        uneject_on_healthy_active_hc: true,
+    };
+}
+
+impl Default for OutlierDetectionIR {
+    fn default() -> Self {
+        Self::ENVOY_DEFAULT
+    }
 }
 
 /// The wire dialect a provider cluster speaks, for the usage filter's request

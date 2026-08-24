@@ -138,6 +138,7 @@ fn member_cluster(name: &str, addr: SocketAddr, mutations: Vec<HeaderMutation>) 
         request_headers_to_add: mutations,
         usage_dialect: None,
         health_check: None,
+        outlier_detection: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn aggregate_cluster() -> ClusterConfig {
         request_headers_to_add: Vec::new(),
         usage_dialect: None,
         health_check: None,
+        outlier_detection: None,
     }
 }
 

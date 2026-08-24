@@ -619,6 +619,7 @@ async fn strict_mode_cluster_manager_rejects_a_tls_cluster_without_a_transport_s
         request_headers_to_add: Vec::new(),
         usage_dialect: None,
         health_check: None,
+        outlier_detection: None,
     };
     let mut snapshot = std::collections::HashMap::new();
     snapshot.insert("secure".to_string(), Arc::new(cluster));

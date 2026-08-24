@@ -1454,6 +1454,7 @@ mod tests {
                 request_headers_to_add: Vec::new(),
                 usage_dialect: None,
                 health_check: None,
+                outlier_detection: None,
             }),
         );
         manager.update_from_snapshot(&snapshot).await;
@@ -1521,6 +1522,7 @@ mod tests {
                 request_headers_to_add: Vec::new(),
                 usage_dialect: None,
                 health_check: None,
+                outlier_detection: None,
             }),
         );
         manager.update_from_snapshot(&snapshot).await;

@@ -2272,6 +2272,13 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         request_headers_to_add,
         usage_dialect,
         health_check,
+        // WP-19 part 1 is shape-only: `outlier_detection` is not yet on the
+        // surface-walk allow-list (see `allowed_fields`), so a config that
+        // sets it is a strict-mode rejection with its dotted path, never a
+        // silent drop -- exactly how `health_check` was staged in 847c253
+        // before its own lowering landed. `convert_outlier_detection` and the
+        // allow-list entry are the next increment.
+        outlier_detection: None,
     })
 }
 

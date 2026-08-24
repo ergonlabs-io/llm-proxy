@@ -126,6 +126,7 @@ async fn build_router_with_stats(
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
             health_check: None,
+            outlier_detection: None,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;
@@ -231,6 +232,7 @@ async fn build_router_with_access_logs(
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
             health_check: None,
+            outlier_detection: None,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;
@@ -560,6 +562,7 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                     request_headers_to_add: Vec::new(),
                     usage_dialect: None,
                     health_check: None,
+                    outlier_detection: None,
                 }),
             );
             manager.update_from_snapshot(&snapshot).await;

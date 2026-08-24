@@ -731,6 +731,7 @@ mod tests {
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
             health_check: None,
+            outlier_detection: None,
         })
     }
 
@@ -755,6 +756,7 @@ mod tests {
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
             health_check: None,
+            outlier_detection: None,
         })
     }
 
@@ -793,6 +795,7 @@ mod tests {
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
             health_check: Some(health_check),
+            outlier_detection: None,
         })
     }
 

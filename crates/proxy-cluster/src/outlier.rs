@@ -165,11 +165,13 @@ pub struct OutlierDetectionConfig {
     pub split_external_local_origin_errors: bool,
     /// Whether a host un-ejects the moment it passes an active health check
     /// (WP-18), independent of its outlier ejection timer. S6 default: true.
-    /// Envoy itself does not expose this as a configurable field (it is
-    /// unconditional whenever active health checking is configured); it is
-    /// modeled as a field here purely so [`OutlierDetector`] stays testable
-    /// without requiring a real [`crate::health_check::HealthCheckEngine`]
-    /// wired up (see [`OutlierDetector::on_active_health_check_pass`]).
+    /// Envoy *does* expose this as a configurable field --
+    /// `envoy.config.cluster.v3.OutlierDetection.successful_active_health_check_uneject_host`
+    /// (field 23, a `BoolValue` defaulting to true) -- this doc previously
+    /// claimed otherwise; it is modeled here purely so [`OutlierDetector`]
+    /// stays testable without requiring a real
+    /// [`crate::health_check::HealthCheckEngine`] wired up (see
+    /// [`OutlierDetector::on_active_health_check_pass`]).
     pub uneject_on_healthy_active_hc: bool,
 }
 

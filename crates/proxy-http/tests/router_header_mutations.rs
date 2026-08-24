@@ -119,6 +119,7 @@ async fn build_router_with_cluster_mutations(
             request_headers_to_add: cluster_mutations,
             usage_dialect: None,
             health_check: None,
+            outlier_detection: None,
         }),
     );
     manager.update_from_snapshot(&snapshot).await;

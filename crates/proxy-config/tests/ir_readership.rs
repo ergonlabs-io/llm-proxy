@@ -92,6 +92,22 @@ struct AllowlistEntry {
 const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "ClusterConfig",
+        field_name: "outlier_detection",
+        kind: EntryKind::KnownInert,
+        reason: "WP-19 part 1 is shape-only: the OutlierDetectionIR type and \
+                  this field land in ir.rs, but no lowering populates it (it is \
+                  not on the surface-walk allow-list yet, so a config setting \
+                  it is a strict-mode rejection) and no proxy-cluster code \
+                  builds an OutlierDetector from it. The next increment adds \
+                  convert_outlier_detection and the runtime wiring; delete this \
+                  entry then. NOTE the inner OutlierDetectionIR fields are NOT \
+                  flagged today because the type is never constructed (always \
+                  None), so the scan does not descend into it -- once lowering \
+                  constructs one, those fields resolve against the runtime \
+                  mapping in proxy-cluster and still need no entry.",
+    },
+    AllowlistEntry {
+        struct_name: "ClusterConfig",
         field_name: "usage_dialect",
         kind: EntryKind::KnownInert,
         reason: "WP-35 increment 1 lands the per-provider carrier (ground rule \

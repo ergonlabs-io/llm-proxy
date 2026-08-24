@@ -120,6 +120,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         request_headers_to_add: Vec::new(),
         usage_dialect: None,
         health_check: None,
+        outlier_detection: None,
     };
 
     Arc::new(ConfigSnapshot {
