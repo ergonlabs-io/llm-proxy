@@ -320,7 +320,16 @@ impl ManagedCluster {
             }
         }
         for &addr in &diff.added {
-            let handle = engine.spawn_for_host(addr, Arc::clone(&self.host_set));
+            // WP-19 gap closed: hand the probe a clone of this cluster's own
+            // detector (if any) so a recovery here also clears an outlier
+            // ejection -- see `HealthCheckEngine::spawn_for_host`'s doc for
+            // why this is one-way (active HC recovery -> un-eject, never the
+            // reverse).
+            let handle = engine.spawn_for_host(
+                addr,
+                Arc::clone(&self.host_set),
+                self.outlier_detector.clone(),
+            );
             probes.insert(addr, handle);
         }
     }
@@ -919,6 +928,43 @@ mod tests {
                 expect: Vec::new(),
             },
         }
+    }
+
+    /// A cluster carrying BOTH a health check and outlier detection (the last
+    /// WP-19 gap's acceptance shape): `uneject_on_healthy_active_hc` is the
+    /// one field the two tests below vary. `consecutive_5xx: 2`,
+    /// `enforcing_consecutive_5xx: 100`, `max_ejection_percent: 100` mirror
+    /// `cluster_config_with_outlier` -- enforced deterministically, and able
+    /// to eject a single-host cluster's only host.
+    fn cluster_config_with_health_check_and_outlier(
+        name: &str,
+        endpoints: Vec<EndpointIR>,
+        health_check: proxy_config::ir::HealthCheckIR,
+        uneject_on_healthy_active_hc: bool,
+    ) -> Arc<ClusterConfig> {
+        let od = proxy_config::ir::OutlierDetectionIR {
+            consecutive_5xx: 2,
+            enforcing_consecutive_5xx: 100,
+            max_ejection_percent: 100,
+            uneject_on_healthy_active_hc,
+            ..proxy_config::ir::OutlierDetectionIR::ENVOY_DEFAULT
+        };
+        Arc::new(ClusterConfig {
+            name: name.to_string(),
+            discovery: DiscoveryType::Static,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints,
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+            usage_dialect: None,
+            health_check: Some(health_check),
+            outlier_detection: Some(od),
+        })
     }
 
     /// Spawns a task that accepts connections forever and counts each one --
@@ -1584,5 +1630,179 @@ mod tests {
             .iter()
             .any(|h| h.address == target);
         assert!(healthy, "no detector configured -> reporting is a no-op");
+    }
+
+    // ---------------------------- last WP-19 gap: active-HC clears outlier --
+
+    /// The acceptance test for the last WP-19 gap: a host outlier-ejected via
+    /// `report_outlier_result` must be un-ejected once a REAL active health
+    /// check against it passes -- not just have `failed_active_hc` flip, but
+    /// the whole host must rejoin `all_healthy_hosts()`.
+    ///
+    /// The address starts with nothing listening (bind, then drop -- the
+    /// same "dead, then stood up later" shape `health_check.rs`'s own
+    /// `a_transition_publishes_a_host_set_the_picker_then_observes` uses),
+    /// so the probe's first check fails and its `ConsecutiveTracker` (see
+    /// `health_check.rs`) actually crosses into `Unhealthy` -- that edge is
+    /// what makes the *later* recovery a real `Some(Healthy)` transition,
+    /// which is the only thing `HealthCheckEngine::run_host_loop` calls
+    /// `on_active_health_check_pass` on. `report_outlier_result` then ejects
+    /// the same host independently through the outlier path, so it carries
+    /// both flags (`failed_active_hc` from the real failing probe,
+    /// `failed_outlier_check` from the manual report) before a real listener
+    /// stands up and both must clear.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn active_health_check_recovery_also_clears_an_outlier_ejection() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe); // nothing listens yet -> connect fails -> first check fails
+
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "hc-od-svc".to_string(),
+            cluster_config_with_health_check_and_outlier(
+                "hc-od-svc",
+                vec![endpoint(&addr.ip().to_string(), addr.port())],
+                tcp_health_check(1, 1, Duration::from_millis(10)),
+                true, // uneject_on_healthy_active_hc (S6 default)
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("hc-od-svc").unwrap();
+
+        let flags = || {
+            manager
+                .clusters
+                .load()
+                .get("hc-od-svc")
+                .unwrap()
+                .host_set
+                .load()
+                .all_hosts()
+                .into_iter()
+                .find(|h| h.address == addr)
+                .expect("host must still be present")
+                .health_flags
+        };
+
+        // The real probe crosses `unhealthy_threshold: 1` against the dead
+        // address -- confirms the edge this test depends on actually fires
+        // before layering the outlier ejection on top.
+        wait_until(Duration::from_secs(5), || flags().failed_active_hc).await;
+
+        // Eject via the outlier path too, independent of the active check.
+        entry.report_outlier_result(addr, RequestResult::Http5xx);
+        entry.report_outlier_result(addr, RequestResult::Http5xx);
+        assert!(
+            flags().failed_outlier_check,
+            "two consecutive 5xx (consecutive_5xx: 2) must eject via report_outlier_result"
+        );
+
+        // Now stand up a real listener at the same address so the probe
+        // starts passing.
+        let listener = TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+
+        wait_until(Duration::from_secs(5), || {
+            manager
+                .clusters
+                .load()
+                .get("hc-od-svc")
+                .unwrap()
+                .host_set
+                .load()
+                .all_healthy_hosts()
+                .iter()
+                .any(|h| h.address == addr)
+        })
+        .await;
+    }
+
+    /// The negative half of the same acceptance test: with
+    /// `uneject_on_healthy_active_hc: false`, the identical recovery must
+    /// flip `failed_active_hc` back to `false` (the active-HC engine itself
+    /// doesn't know or care about outlier state) but must NOT touch
+    /// `failed_outlier_check` -- the host stays out of `all_healthy_hosts()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uneject_on_healthy_active_hc_false_leaves_the_outlier_ejection_in_place() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "hc-od-svc-2".to_string(),
+            cluster_config_with_health_check_and_outlier(
+                "hc-od-svc-2",
+                vec![endpoint(&addr.ip().to_string(), addr.port())],
+                tcp_health_check(1, 1, Duration::from_millis(10)),
+                false, // uneject_on_healthy_active_hc disabled
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("hc-od-svc-2").unwrap();
+
+        let flags = || {
+            manager
+                .clusters
+                .load()
+                .get("hc-od-svc-2")
+                .unwrap()
+                .host_set
+                .load()
+                .all_hosts()
+                .into_iter()
+                .find(|h| h.address == addr)
+                .expect("host must still be present")
+                .health_flags
+        };
+
+        wait_until(Duration::from_secs(5), || flags().failed_active_hc).await;
+
+        entry.report_outlier_result(addr, RequestResult::Http5xx);
+        entry.report_outlier_result(addr, RequestResult::Http5xx);
+        assert!(flags().failed_outlier_check, "must eject via outlier path");
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+
+        // The active-HC side recovers on its own regardless of the outlier
+        // config -- the two subsystems are independent.
+        wait_until(Duration::from_secs(5), || !flags().failed_active_hc).await;
+
+        // But the outlier ejection must survive: give the (now-passing)
+        // probe several more ticks so a wiring bug that ignores the config
+        // flag has ample opportunity to un-eject anyway, then assert it
+        // didn't.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            flags().failed_outlier_check,
+            "uneject_on_healthy_active_hc: false must leave the outlier ejection in place"
+        );
+        assert!(
+            !manager
+                .clusters
+                .load()
+                .get("hc-od-svc-2")
+                .unwrap()
+                .host_set
+                .load()
+                .all_healthy_hosts()
+                .iter()
+                .any(|h| h.address == addr),
+            "host must stay out of all_healthy_hosts() while outlier-ejected"
+        );
     }
 }

@@ -32,6 +32,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use crate::host_set::HostSet;
+use crate::outlier::OutlierDetector;
 use crate::{HealthFlags, HealthStatus, Host};
 
 /// Envoy's documented default expected HTTP status for an HTTP health check
@@ -226,16 +227,33 @@ impl HealthCheckEngine {
     /// there's no separate "host removed" signal today because nothing in
     /// this crate yet drives membership changes into a live engine (see the
     /// module doc's IR-wiring note).
+    ///
+    /// `outlier_detector` is the last WP-19 gap: active HC (this module,
+    /// WP-18) and outlier detection (WP-19) are otherwise independent, but a
+    /// host that recovers here should also clear an outlier ejection --
+    /// [`OutlierDetector::on_active_health_check_pass`] already implements
+    /// that (including its own `uneject_on_healthy_active_hc` check), it
+    /// just had nothing calling it. `None` when the cluster configures no
+    /// outlier detection at all, in which case this is a no-op. The
+    /// direction is one-way: an *unhealthy* active-check transition never
+    /// touches the detector, and outlier ejection never touches
+    /// `failed_active_hc`.
     pub fn spawn_for_host(
         self: &Arc<Self>,
         addr: SocketAddr,
         host_set: Arc<ArcSwap<HostSet>>,
+        outlier_detector: Option<Arc<OutlierDetector>>,
     ) -> JoinHandle<()> {
         let engine = Arc::clone(self);
-        tokio::spawn(async move { engine.run_host_loop(addr, host_set).await })
+        tokio::spawn(async move { engine.run_host_loop(addr, host_set, outlier_detector).await })
     }
 
-    async fn run_host_loop(&self, addr: SocketAddr, host_set: Arc<ArcSwap<HostSet>>) {
+    async fn run_host_loop(
+        &self,
+        addr: SocketAddr,
+        host_set: Arc<ArcSwap<HostSet>>,
+        outlier_detector: Option<Arc<OutlierDetector>>,
+    ) {
         let mut tracker = ConsecutiveTracker::new(
             self.config.healthy_threshold,
             self.config.unhealthy_threshold,
@@ -244,6 +262,13 @@ impl HealthCheckEngine {
             let passed = self.run_single_check(addr).await;
             if let Some(new_status) = tracker.record(passed) {
                 apply_health_transition(&host_set, addr, new_status);
+                // Recovery only -- see this method's doc for why an
+                // `Unhealthy` transition must not reach the detector.
+                if new_status == HealthStatus::Healthy {
+                    if let Some(detector) = &outlier_detector {
+                        detector.on_active_health_check_pass(addr);
+                    }
+                }
             }
             tokio::time::sleep(self.next_delay()).await;
         }
@@ -634,7 +659,7 @@ mod tests {
         let host_set = Arc::new(ArcSwap::from_pointee(HostSet::from_hosts(vec![host(
             addr, 0,
         )])));
-        engine.spawn_for_host(addr, host_set);
+        engine.spawn_for_host(addr, host_set, None);
 
         // If the first check waited a full `interval` before firing, this
         // would time out (the interval is an hour); it must resolve almost
@@ -760,7 +785,7 @@ mod tests {
         let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
         let ctx = LoadBalancerContext::default();
 
-        engine.spawn_for_host(flaky_addr, Arc::clone(&host_set));
+        engine.spawn_for_host(flaky_addr, Arc::clone(&host_set), None);
 
         // Two consecutive failed connects (unhealthy_threshold=2) must flip
         // `flaky`, and once it does, every pick over a wider sample should
@@ -834,9 +859,9 @@ mod tests {
         let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
         let ctx = LoadBalancerContext::default();
 
-        engine.spawn_for_host(bad1_addr, Arc::clone(&host_set));
-        engine.spawn_for_host(bad2_addr, Arc::clone(&host_set));
-        engine.spawn_for_host(good_addr, Arc::clone(&host_set));
+        engine.spawn_for_host(bad1_addr, Arc::clone(&host_set), None);
+        engine.spawn_for_host(bad2_addr, Arc::clone(&host_set), None);
+        engine.spawn_for_host(good_addr, Arc::clone(&host_set), None);
 
         wait_until(Duration::from_secs(2), || {
             let seen: std::collections::HashSet<_> = (0..50)
