@@ -2760,6 +2760,20 @@ async fn deliver_decode_data(
             // `decode_data` — deliver it to filters after `idx` before
             // deciding anything else.
             drain_decode_injections(filters, ctx, buffer_limit, head)?;
+            // S2.3: `StopIterationNoBuffer` DISCARDS the stopped chunk — it is
+            // neither replayed to subsequent filters and the terminal (unlike
+            // `StopIterationAndBuffer`/`Watermark`, which do), nor re-shown to
+            // this filter on resume. Decode is fully buffered into `body`
+            // rather than streamed (see `drain_decode_injections`'s doc), so
+            // "drop the chunk" is simply clearing `body` here. Done whether or
+            // not the filter also continued: `NoBuffer` drops the bytes
+            // either way, and iteration then proceeds (if it continued) with
+            // nothing left to deliver. Mirrors the encode side's
+            // `StopKind::NoBuffer` arm, which clears its position buffer for
+            // the identical reason.
+            if matches!(status, FilterDataStatus::StopIterationNoBuffer) {
+                *body = Bytes::new();
+            }
             matches!(status, FilterDataStatus::Continue) || ctx.decode.continue_requested
         };
 

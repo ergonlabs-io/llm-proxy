@@ -1492,7 +1492,6 @@ fn decode_stop_iteration_and_buffer_replays_intact_to_subsequent_and_terminal() 
 // per-chunk drop to make. The encode-side `StreamingEncoder` implements it and
 // is covered green by `encode_stop_iteration_no_buffer_discards_the_chunk`.
 #[test]
-#[ignore = "WP-11 chunk 4: StopIterationNoBuffer drop on the (still-buffered) decode path"]
 fn decode_stop_iteration_no_buffer_drops_the_stopped_chunk() {
     block_on(async {
         let log = log_of();
