@@ -50,7 +50,6 @@
 //! - Connection-level circuit breakers (`max_connections`,
 //!   `max_pending_requests`) -- WP-15 slice D; this router still only
 //!   enforces the S5 `max_requests` per-cluster budget above.
-//! - `RouteActionIR::Redirect` (returns 501 below).
 //!
 //! WP-24 chunk 3: response flags are recorded onto a per-request
 //! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below --
@@ -73,7 +72,7 @@ use proxy_cluster::outlier::RequestResult;
 use proxy_cluster::{
     ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol, UpstreamStream,
 };
-use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher};
+use proxy_config::ir::{DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, TraceContext};
 use proxy_observability::ResponseFlag;
 
@@ -362,15 +361,7 @@ impl RouterHandler {
                 RouteActionIR::DirectResponse { status, body } => {
                     direct_response(*status, body.as_ref())
                 }
-                RouteActionIR::Redirect(_) => {
-                    tracing::debug!(
-                        "TODO(WP-13 follow-up: redirects) -- redirect action not yet implemented"
-                    );
-                    local_reply(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "redirect actions are not yet implemented",
-                    )
-                }
+                RouteActionIR::Redirect(redirect) => redirect_response(redirect, &head),
             },
         }
     }
@@ -1319,6 +1310,76 @@ fn direct_response(status: u16, body: Option<&DataSourceIR>) -> HttpResponsePart
             )
         }
     }
+}
+
+/// Synthesize a `Redirect` action's reply (Envoy S1 redirect actions,
+/// limited to `RedirectIR`'s four fields -- no scheme/port-only rewrite
+/// variants). Builds `Location: <scheme>://<authority><path>` and returns it
+/// with an empty body and `redirect.response_code` (already defaulted to
+/// 301 at lowering).
+fn redirect_response(redirect: &RedirectIR, head: &RequestHeaders) -> HttpResponseParts {
+    // Rust note: Envoy forwards the *original downstream* scheme through a
+    // redirect unless `https_redirect` forces it. We don't reliably have
+    // that here -- h1 requests carry no scheme header, and this router
+    // doesn't know the listener's TLS state -- so we default to "http"
+    // whenever `https_redirect` is false. This under-serves an https
+    // downstream connection redirected without `https_redirect` set (the
+    // client would see an http Location); flagged rather than guessed at.
+    let scheme = if redirect.https_redirect {
+        "https"
+    } else {
+        "http"
+    };
+
+    // Same authority precedence `sync_route_head` (filter_manager.rs) uses
+    // for route resolution (S1.1/S1.2): prefer the request's
+    // `:authority`/absolute-form URI, fall back to the `Host` header.
+    let host_header = head
+        .headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let request_authority = head.uri.authority().map(|a| a.as_str()).or(host_header);
+
+    let authority = match redirect.host_redirect.as_deref().or(request_authority) {
+        Some(authority) => authority,
+        None => return local_reply(StatusCode::BAD_REQUEST, "no host to redirect to"),
+    };
+
+    // `path_redirect` replaces the whole path (Envoy semantics: it is not a
+    // prefix rewrite), so the original query string is dropped along with
+    // the rest of the original path whenever it's set.
+    let path = redirect
+        .path_redirect
+        .as_deref()
+        .or_else(|| head.uri.path_and_query().map(|p| p.as_str()))
+        .unwrap_or("/");
+
+    let location = format!("{scheme}://{authority}{path}");
+    let location_value = match HeaderValue::from_str(&location) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(error = %err, location, "redirect Location is not a valid header value");
+            return local_reply(StatusCode::BAD_REQUEST, "malformed redirect target");
+        }
+    };
+
+    let status = StatusCode::from_u16(redirect.response_code).unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            code = redirect.response_code,
+            "RedirectIR::response_code failed StatusCode conversion after config-time validation, falling back to 301"
+        );
+        StatusCode::MOVED_PERMANENTLY
+    });
+
+    let mut resp = local_reply_with_status(status, Bytes::new());
+    resp.head
+        .headers
+        .insert(http::header::LOCATION, location_value);
+    resp.head
+        .headers
+        .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    resp
 }
 
 /// A locally-synthesized error reply (no upstream involved) with a
@@ -2558,6 +2619,155 @@ mod tests {
                      onto route /b (status 202), not the originally-matched \
                      route /a (status 201)"
                 );
+            })
+            .await;
+    }
+
+    // ---------------------------------------- WP-13 follow-up: redirects --
+
+    /// Two `Redirect` routes, distinguished by prefix: `/foo` forces https
+    /// and preserves the request's host+path (`RedirectIR::host_redirect`/
+    /// `path_redirect` both `None`); `/rewrite` replaces both host and path
+    /// literally. Mirrors [`direct_response_route_table`]'s shape.
+    fn redirect_route_table() -> RouteTable {
+        fn route(prefix: &str, redirect: RedirectIR) -> Arc<RouteEntry> {
+            Arc::new(RouteEntry {
+                name: None,
+                matcher: prefix_matcher(prefix),
+                action: RouteActionIR::Redirect(redirect),
+                request_headers_to_add: Vec::new(),
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
+                include_request_attempt_count: false,
+                include_attempt_count_in_response: false,
+            })
+        }
+        RouteTable::new(
+            "test-routes".to_string(),
+            vec![VirtualHostIR {
+                name: "vh".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![
+                    route(
+                        "/foo",
+                        RedirectIR {
+                            host_redirect: None,
+                            path_redirect: None,
+                            https_redirect: true,
+                            response_code: 301,
+                        },
+                    ),
+                    route(
+                        "/rewrite",
+                        RedirectIR {
+                            host_redirect: Some("new.example.com".to_string()),
+                            path_redirect: Some("/bar".to_string()),
+                            https_redirect: false,
+                            response_code: 302,
+                        },
+                    ),
+                ],
+                typed_per_filter_config: BTreeMap::new(),
+            }],
+            BTreeMap::new(),
+        )
+        .expect("two non-overlapping prefixes on one domain is a valid table")
+    }
+
+    /// Like [`request`], but with a caller-chosen `Host` header -- the
+    /// redirect tests below need `example.com` rather than `request`'s
+    /// hardcoded `test.local` so the expected `Location` reads naturally.
+    fn request_with_host(path: &'static str, host: &'static str) -> HttpRequestParts {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_str(host).unwrap());
+        HttpRequestParts {
+            head: RequestHeaders {
+                method: Method::GET,
+                uri: Uri::from_static(path),
+                headers,
+            },
+            body: local_boxed(
+                Full::new(Bytes::new())
+                    .map_err(|infallible: std::convert::Infallible| match infallible {}),
+            ),
+            downstream: DownstreamInfo::loopback(),
+        }
+    }
+
+    fn redirect_handler() -> FilterChainHandler {
+        let route_table = redirect_route_table();
+        let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+        let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
+            RouterFilterFactory::new(Arc::new(manager), test_router_stats(&[])),
+        );
+        FilterChainHandler::new(
+            vec![],
+            terminal_factory,
+            Arc::new(route_table),
+            false,
+            false,
+            0,
+        )
+    }
+
+    /// `https_redirect: true` with no `host_redirect`/`path_redirect`: the
+    /// scheme is forced to https, but the request's own host and full path
+    /// (including query) ride through unchanged -- Envoy S1's "redirect to
+    /// https" case.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_https_redirect_forces_scheme_and_preserves_host_and_path() {
+        LocalSet::new()
+            .run_until(async {
+                let handler = redirect_handler();
+                let resp = handler
+                    .handle(request_with_host("/foo?x=1", "example.com"))
+                    .await;
+
+                assert_eq!(
+                    resp.head.status.as_u16(),
+                    301,
+                    "RedirectIR default response_code"
+                );
+                assert_eq!(
+                    resp.head.headers.get(http::header::LOCATION).unwrap(),
+                    "https://example.com/foo?x=1"
+                );
+                assert_eq!(
+                    resp.head.headers.get(http::header::CONTENT_LENGTH).unwrap(),
+                    "0"
+                );
+                let body = resp.body.collect().await.unwrap().to_bytes();
+                assert!(body.is_empty(), "redirect body must be empty, got {body:?}");
+            })
+            .await;
+    }
+
+    /// `host_redirect` + `path_redirect` both set: both are used literally,
+    /// `path_redirect` replaces the WHOLE path (Envoy semantics -- not a
+    /// prefix rewrite), so the original query string is dropped along with
+    /// the rest of the original path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_host_and_path_redirect_replace_the_whole_target() {
+        LocalSet::new()
+            .run_until(async {
+                let handler = redirect_handler();
+                let resp = handler
+                    .handle(request_with_host("/rewrite?ignored=1", "example.com"))
+                    .await;
+
+                assert_eq!(resp.head.status.as_u16(), 302);
+                assert_eq!(
+                    resp.head.headers.get(http::header::LOCATION).unwrap(),
+                    "http://new.example.com/bar",
+                    "path_redirect replaces the whole path -- the original \
+                     query string must not survive"
+                );
+                assert_eq!(
+                    resp.head.headers.get(http::header::CONTENT_LENGTH).unwrap(),
+                    "0"
+                );
+                let body = resp.body.collect().await.unwrap().to_bytes();
+                assert!(body.is_empty(), "redirect body must be empty, got {body:?}");
             })
             .await;
     }
