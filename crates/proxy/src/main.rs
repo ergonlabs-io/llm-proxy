@@ -611,6 +611,7 @@ async fn run_serve(
             spans_rx,
             cfg.otlp_endpoint.clone(),
             cfg.service_name.clone(),
+            registry.clone(),
         ));
         proxy_core::listener::TracingHandles {
             sink,

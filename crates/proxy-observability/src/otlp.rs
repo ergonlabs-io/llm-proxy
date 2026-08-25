@@ -23,21 +23,31 @@
 //!   `SpanSink` for its whole life; returns once every `SpanSink` clone has
 //!   been dropped (workers gone) and the last batch is flushed.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::Receiver;
 use tonic::transport::{Channel, Endpoint};
 
+use proxy_api::opentelemetry::proto::collector::metrics::v1::{
+    metrics_service_client::MetricsServiceClient, ExportMetricsServiceRequest,
+};
 use proxy_api::opentelemetry::proto::collector::trace::v1::{
     trace_service_client::TraceServiceClient, ExportTraceServiceRequest,
 };
 use proxy_api::opentelemetry::proto::common::v1::{any_value, AnyValue, KeyValue};
+use proxy_api::opentelemetry::proto::metrics::v1::{
+    metric, number_data_point, AggregationTemporality, Histogram, HistogramDataPoint, Metric,
+    NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+};
 use proxy_api::opentelemetry::proto::resource::v1::Resource;
 use proxy_api::opentelemetry::proto::trace::v1::{
     span::SpanKind as OtlpSpanKind, status::StatusCode as OtlpStatusCode, ResourceSpans,
     ScopeSpans, Span, Status,
 };
 
+use crate::stats::{Instrument, InstrumentKind, Registry};
 use crate::trace::{FinishedSpan, SpanKind, SpanStatus};
 
 /// Flush whichever comes first: this many buffered spans, or
@@ -135,6 +145,121 @@ fn build_resource(service_name: &str) -> Resource {
     }
 }
 
+/// Convert every resolved instrument in `registry` into an OTLP
+/// [`ExportMetricsServiceRequest`]. Pure -- no I/O, so unit-tested directly
+/// (mirroring [`map_span`]) rather than only through [`run_exporter`]'s
+/// network path.
+///
+/// # Grouping
+///
+/// [`Registry::counters`]/[`Registry::histograms`] yield one row per
+/// `(instrument, attribute set)` pair -- exactly OTel's own measurement
+/// model (module doc, `stats.rs` Decision 1), but OTLP wants the opposite
+/// shape: **one [`Metric`] per instrument NAME**, carrying one data point per
+/// attribute set. Two `upstream_rq` rows (`cluster=openai`,
+/// `cluster=anthropic`) must become ONE `Metric` named `upstream_rq` with two
+/// [`NumberDataPoint`]s, not two separate `Metric`s that would each look like
+/// a distinct time series to a collector.
+///
+/// Rust note: `group` is a `HashMap` keyed by `instrument.name` whose value
+/// is `(&'static Instrument, Vec<data point>)` -- the first row seen for a
+/// name creates the entry (`or_insert_with`) and every later row for the
+/// same name only pushes a data point, never touches the key again. `order`
+/// is a plain `Vec<&str>` of names in first-seen order: a `HashMap`'s
+/// iteration order is unspecified, and this function's own doc promises a
+/// deterministic (first-seen) order so a test can assert on it.
+pub fn map_metrics(registry: &Registry, resource: &Resource) -> ExportMetricsServiceRequest {
+    let now = unix_nanos(SystemTime::now());
+
+    let mut counter_groups: HashMap<&'static str, (&'static Instrument, Vec<NumberDataPoint>)> =
+        HashMap::new();
+    let mut counter_order: Vec<&'static str> = Vec::new();
+    for (instrument, attrs, value) in registry.counters() {
+        let data_point = NumberDataPoint {
+            attributes: attrs.iter().map(|(k, v)| string_attribute(k, v)).collect(),
+            time_unix_nano: now,
+            value: Some(number_data_point::Value::AsInt(value as i64)),
+            ..Default::default()
+        };
+        counter_groups
+            .entry(instrument.name)
+            .or_insert_with(|| {
+                counter_order.push(instrument.name);
+                (instrument, Vec::new())
+            })
+            .1
+            .push(data_point);
+    }
+
+    let mut histogram_groups: HashMap<
+        &'static str,
+        (&'static Instrument, Vec<HistogramDataPoint>),
+    > = HashMap::new();
+    let mut histogram_order: Vec<&'static str> = Vec::new();
+    for (handle, instrument, attrs) in registry.histograms() {
+        let snapshot = registry.histogram_snapshot(handle);
+        let explicit_bounds = instrument
+            .buckets
+            .expect("otlp::map_metrics: Histogram instrument with no bucket boundaries")
+            .to_vec();
+        let data_point = HistogramDataPoint {
+            attributes: attrs.iter().map(|(k, v)| string_attribute(k, v)).collect(),
+            time_unix_nano: now,
+            count: snapshot.count,
+            sum: Some(snapshot.sum),
+            bucket_counts: snapshot.bucket_counts,
+            explicit_bounds,
+            ..Default::default()
+        };
+        histogram_groups
+            .entry(instrument.name)
+            .or_insert_with(|| {
+                histogram_order.push(instrument.name);
+                (instrument, Vec::new())
+            })
+            .1
+            .push(data_point);
+    }
+
+    let mut metrics: Vec<Metric> = Vec::with_capacity(counter_order.len() + histogram_order.len());
+    for name in counter_order {
+        let (instrument, data_points) = counter_groups.remove(name).expect("just inserted");
+        metrics.push(Metric {
+            name: instrument.name.to_string(),
+            unit: instrument.unit.to_string(),
+            data: Some(metric::Data::Sum(Sum {
+                data_points,
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: instrument.kind == InstrumentKind::Counter,
+            })),
+            ..Default::default()
+        });
+    }
+    for name in histogram_order {
+        let (instrument, data_points) = histogram_groups.remove(name).expect("just inserted");
+        metrics.push(Metric {
+            name: instrument.name.to_string(),
+            unit: instrument.unit.to_string(),
+            data: Some(metric::Data::Histogram(Histogram {
+                data_points,
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            })),
+            ..Default::default()
+        });
+    }
+
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(resource.clone()),
+            scope_metrics: vec![ScopeMetrics {
+                metrics,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
 /// The batching export loop. Runs until `rx` is closed (every clone of the
 /// `SpanSink` that fed it has been dropped) and its last batch is flushed --
 /// `crates/proxy/src/main.rs` spawns this on the control runtime only when
@@ -160,6 +285,7 @@ pub async fn run_exporter(
     mut rx: Receiver<FinishedSpan>,
     otlp_endpoint: String,
     service_name: String,
+    registry: Arc<Registry>,
 ) {
     let channel = match Endpoint::from_shared(otlp_endpoint.clone()) {
         Ok(endpoint) => endpoint.connect_lazy(),
@@ -181,7 +307,12 @@ pub async fn run_exporter(
             return;
         }
     };
-    let mut client = TraceServiceClient::new(channel);
+    // Rust note: `Channel` is cheaply `Clone` (an `Arc`-backed handle onto
+    // the same underlying connection pool -- tonic's own doc says as much),
+    // so both clients share one lazily-established connection to the same
+    // collector endpoint rather than each dialing their own.
+    let mut client = TraceServiceClient::new(channel.clone());
+    let mut metrics_client = MetricsServiceClient::new(channel);
     let resource = build_resource(&service_name);
 
     let mut batch: Vec<FinishedSpan> = Vec::with_capacity(MAX_BATCH);
@@ -207,13 +338,23 @@ pub async fn run_exporter(
                     None => {
                         // Every `SpanSink` clone is gone -- drain whatever's
                         // left, then this task has nothing further to do.
+                        // One last metric export too, same "final flush on
+                        // shutdown" contract as spans.
                         flush(&mut client, &resource, &mut batch).await;
+                        flush_metrics(&mut metrics_client, &registry, &resource).await;
                         return;
                     }
                 }
             }
             _ = ticker.tick() => {
+                // Metrics are exported on the tick only, never on `rx.recv()`
+                // -- unlike spans (which arrive one at a time and get
+                // batched), a metric export always reads the registry's
+                // CURRENT cumulative state, so there is nothing to batch and
+                // no reason to export more often than the interval already
+                // driving the span flush.
                 flush(&mut client, &resource, &mut batch).await;
+                flush_metrics(&mut metrics_client, &registry, &resource).await;
             }
         }
     }
@@ -253,6 +394,22 @@ async fn flush(
         );
     }
     batch.clear();
+}
+
+/// Export the registry's current cumulative state. Same best-effort contract
+/// as [`flush`]: a failure logs and moves on -- a metrics collector being
+/// unreachable must never take the proxy down or hold any state hostage
+/// (there is nothing to hold anyway; [`map_metrics`] reads the registry
+/// fresh on every call, it doesn't accumulate a batch the way spans do).
+async fn flush_metrics(
+    client: &mut MetricsServiceClient<Channel>,
+    registry: &Registry,
+    resource: &Resource,
+) {
+    let request = map_metrics(registry, resource);
+    if let Err(err) = client.export(request).await {
+        tracing::warn!(error = %err, "OTLP metrics export failed");
+    }
 }
 
 #[cfg(test)]
@@ -364,4 +521,122 @@ mod tests {
     // this crate's existing split (e.g. `access_log::render` is unit-tested
     // here; the sink it writes through is exercised by whatever owns real
     // I/O).
+
+    use crate::stats::{instruments, StatsControl, WorkerId};
+
+    #[test]
+    fn map_metrics_produces_one_sum_metric_per_counter_instrument() {
+        let control = StatsControl::new(1);
+        let openai = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let registry = control.registry();
+        registry.incr(WorkerId(0), openai, 7);
+
+        let resource = build_resource("test-service");
+        let request = map_metrics(&registry, &resource);
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+
+        let upstream_rq = metrics
+            .iter()
+            .find(|m| m.name == "upstream_rq")
+            .expect("upstream_rq metric present");
+        assert_eq!(upstream_rq.unit, "{request}");
+        let sum = match upstream_rq.data.as_ref().expect("data present") {
+            metric::Data::Sum(sum) => sum,
+            other => panic!("expected Data::Sum, got {other:?}"),
+        };
+        assert!(sum.is_monotonic);
+        assert_eq!(
+            sum.aggregation_temporality,
+            AggregationTemporality::Cumulative as i32
+        );
+        assert_eq!(sum.data_points.len(), 1);
+        let point = &sum.data_points[0];
+        match point.value {
+            Some(number_data_point::Value::AsInt(v)) => assert_eq!(v, 7),
+            other => panic!("expected AsInt, got {other:?}"),
+        }
+        assert_eq!(point.attributes.len(), 1);
+        assert_eq!(point.attributes[0].key, "cluster");
+        match &point.attributes[0].value.as_ref().unwrap().value {
+            Some(any_value::Value::StringValue(s)) => assert_eq!(s, "openai"),
+            other => panic!("expected StringValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_metrics_groups_two_attribute_sets_into_one_metric_with_two_data_points() {
+        let control = StatsControl::new(1);
+        let openai = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "openai")]);
+        let anthropic = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "anthropic")]);
+        let registry = control.registry();
+        registry.incr(WorkerId(0), openai, 3);
+        registry.incr(WorkerId(0), anthropic, 5);
+
+        let resource = build_resource("test-service");
+        let request = map_metrics(&registry, &resource);
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+
+        let upstream_rq_metrics: Vec<&Metric> =
+            metrics.iter().filter(|m| m.name == "upstream_rq").collect();
+        assert_eq!(
+            upstream_rq_metrics.len(),
+            1,
+            "two attribute sets on one instrument must collapse into ONE Metric, got {metrics:#?}"
+        );
+        let sum = match upstream_rq_metrics[0].data.as_ref().expect("data present") {
+            metric::Data::Sum(sum) => sum,
+            other => panic!("expected Data::Sum, got {other:?}"),
+        };
+        assert_eq!(sum.data_points.len(), 2);
+    }
+
+    #[test]
+    fn map_metrics_produces_one_histogram_metric_matching_the_snapshot() {
+        let control = StatsControl::new(1);
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
+        let registry = control.registry();
+        registry.observe(WorkerId(0), h, 12.0);
+        registry.observe(WorkerId(0), h, 4000.0);
+        let expected = registry.histogram_snapshot(h);
+
+        let resource = build_resource("test-service");
+        let request = map_metrics(&registry, &resource);
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+
+        let upstream_rq_time = metrics
+            .iter()
+            .find(|m| m.name == "upstream_rq_time")
+            .expect("upstream_rq_time metric present");
+        assert_eq!(upstream_rq_time.unit, "ms");
+        let histogram = match upstream_rq_time.data.as_ref().expect("data present") {
+            metric::Data::Histogram(histogram) => histogram,
+            other => panic!("expected Data::Histogram, got {other:?}"),
+        };
+        assert_eq!(
+            histogram.aggregation_temporality,
+            AggregationTemporality::Cumulative as i32
+        );
+        assert_eq!(histogram.data_points.len(), 1);
+        let point = &histogram.data_points[0];
+        assert_eq!(point.count, expected.count);
+        assert_eq!(point.sum, Some(expected.sum));
+        assert_eq!(point.bucket_counts, expected.bucket_counts);
+        assert_eq!(
+            point.explicit_bounds,
+            instruments::UPSTREAM_RQ_TIME.buckets.unwrap().to_vec()
+        );
+        assert_eq!(point.attributes.len(), 1);
+        assert_eq!(point.attributes[0].key, "cluster");
+    }
+
+    #[test]
+    fn map_metrics_on_an_empty_registry_produces_no_metrics() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let resource = build_resource("test-service");
+        let request = map_metrics(&registry, &resource);
+        assert!(request.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .is_empty());
+    }
 }

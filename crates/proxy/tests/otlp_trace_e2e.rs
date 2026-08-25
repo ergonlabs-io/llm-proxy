@@ -32,12 +32,19 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use proxy_api::opentelemetry::proto::collector::metrics::v1::metrics_service_server::{
+    MetricsService, MetricsServiceServer,
+};
+use proxy_api::opentelemetry::proto::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 use proxy_api::opentelemetry::proto::collector::trace::v1::trace_service_server::{
     TraceService, TraceServiceServer,
 };
 use proxy_api::opentelemetry::proto::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
+use proxy_api::opentelemetry::proto::metrics::v1::{metric, ResourceMetrics};
 use proxy_api::opentelemetry::proto::trace::v1::span::SpanKind as OtlpSpanKind;
 use proxy_api::opentelemetry::proto::trace::v1::status::StatusCode as OtlpStatusCode;
 use proxy_api::opentelemetry::proto::trace::v1::Span;
@@ -188,6 +195,11 @@ fn get_with_traceparent(addr: SocketAddr, path: &str, host: &str, traceparent: &
 #[derive(Clone, Default)]
 struct MockCollector {
     spans: Arc<Mutex<Vec<Span>>>,
+    // WP-51 increment 3b: same capture, for the parallel `MetricsService`
+    // implementation below -- one `ResourceMetrics` per export call, kept
+    // whole (rather than flattened like `spans`) because a test needs to
+    // read a specific named `Metric` back out of its `scope_metrics`.
+    metrics: Arc<Mutex<Vec<ResourceMetrics>>>,
 }
 
 #[tonic::async_trait]
@@ -207,24 +219,107 @@ impl TraceService for MockCollector {
     }
 }
 
+#[tonic::async_trait]
+impl MetricsService for MockCollector {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let mut metrics = self.metrics.lock().expect("mock collector mutex poisoned");
+        metrics.extend(req.resource_metrics);
+        Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
+    }
+}
+
 /// Binds an ephemeral port synchronously (so the caller can embed it in the
 /// proxy's config before the collector itself finishes starting -- same
 /// "reserve, then let the real server rebind" pattern `free_port` documents
 /// elsewhere in this file), then spawns the mock collector on the current
-/// (multi-thread) tokio runtime. Returns the collector's shared span buffer
-/// and its address.
-fn spawn_mock_collector() -> (Arc<Mutex<Vec<Span>>>, SocketAddr) {
+/// (multi-thread) tokio runtime. Returns the collector's shared span buffer,
+/// its shared `ResourceMetrics` buffer (WP-51 increment 3b), and its
+/// address. Both `TraceService` and `MetricsService` are registered on the
+/// SAME `tonic` router/port -- exactly what a real OTLP/gRPC collector
+/// exposes (one endpoint, multiple services multiplexed by gRPC method
+/// path), and what `otlp::run_exporter` connects to: one `Channel`, two
+/// clients built from it.
+/// Named purely to keep [`spawn_mock_collector`]'s signature readable --
+/// clippy's `type_complexity` lint flagged the inline three-tuple form, same
+/// reasoning as `stats.rs`'s own `ResolveKey` alias.
+type MockCollectorHandles = (
+    Arc<Mutex<Vec<Span>>>,
+    Arc<Mutex<Vec<ResourceMetrics>>>,
+    SocketAddr,
+);
+
+fn spawn_mock_collector() -> MockCollectorHandles {
     let collector = MockCollector::default();
     let spans = collector.spans.clone();
+    let metrics = collector.metrics.clone();
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(collector))
+            .add_service(TraceServiceServer::new(collector.clone()))
+            .add_service(MetricsServiceServer::new(collector))
             .serve(addr)
             .await;
     });
-    (spans, addr)
+    (spans, metrics, addr)
+}
+
+/// Polls `metrics` for a `Sum`-typed `Metric` named `name` whose data points'
+/// `AsInt` values total at least `min_total`, or until `deadline` (wall-clock)
+/// passes. Returns that `Metric`, cloned, once found.
+///
+/// Every export the mock collector receives is a FULL, CUMULATIVE snapshot of
+/// the registry at that tick, not a delta (`otlp::map_metrics` reads
+/// `Registry::counters` fresh on every call) -- and
+/// `tokio::time::interval`'s first tick fires immediately (`otlp.rs`'s own
+/// doc on `run_exporter`), so the collector's FIRST captured export can
+/// easily predate the request this test just sent. Matching on "a `Metric`
+/// with this name exists" (as a naive first-found search would) is therefore
+/// a race: it can return that too-early, all-zero snapshot. Scanning from the
+/// MOST RECENT export backward and requiring the total to clear `min_total`
+/// waits out that race instead of merely tolerating it.
+async fn wait_for_metric_totaling(
+    metrics: &Arc<Mutex<Vec<ResourceMetrics>>>,
+    name: &str,
+    min_total: i64,
+    deadline: Duration,
+) -> Option<proxy_api::opentelemetry::proto::metrics::v1::Metric> {
+    use proxy_api::opentelemetry::proto::metrics::v1::number_data_point::Value;
+
+    let start = std::time::Instant::now();
+    loop {
+        {
+            let collected = metrics.lock().expect("mutex poisoned");
+            for resource_metrics in collected.iter().rev() {
+                for scope_metrics in &resource_metrics.scope_metrics {
+                    if let Some(found) = scope_metrics.metrics.iter().find(|m| m.name == name) {
+                        let total: i64 = match found.data.as_ref() {
+                            Some(metric::Data::Sum(sum)) => sum
+                                .data_points
+                                .iter()
+                                .map(|p| match p.value {
+                                    Some(Value::AsInt(v)) => v,
+                                    _ => 0,
+                                })
+                                .sum(),
+                            _ => 0,
+                        };
+                        if total >= min_total {
+                            return Some(found.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if start.elapsed() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Polls `spans` until it holds at least `min_count` entries or `deadline`
@@ -387,7 +482,7 @@ fn terminate(child: &mut ChildGuard) {
 async fn traceparent_join_and_fallback_produce_the_right_span_tree() {
     let (fallback_addr, captured_traceparent) = spawn_capturing_mock_upstream();
     let primary_addr = dead_addr();
-    let (spans, collector_addr) = spawn_mock_collector();
+    let (spans, _metrics, collector_addr) = spawn_mock_collector();
     // Give the collector's `tonic::transport::Server` a moment to actually
     // bind before the proxy (whose exporter connects lazily anyway, but
     // there's no reason to race it) starts.
@@ -555,7 +650,7 @@ fn hex(bytes: &[u8]) -> String {
 async fn tracing_off_sends_nothing_to_the_collector() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
     let primary_addr = dead_addr();
-    let (spans, collector_addr) = spawn_mock_collector();
+    let (spans, _metrics, collector_addr) = spawn_mock_collector();
     assert!(
         wait_for_connectable(("127.0.0.1", collector_addr.port()), STARTUP_TIMEOUT),
         "mock OTLP collector never became connectable"
@@ -596,6 +691,133 @@ async fn tracing_off_sends_nothing_to_the_collector() {
         "tracing-off config must send nothing to the collector, got: {collected:#?}"
     );
     drop(collected);
+
+    terminate(&mut child);
+}
+
+/// WP-51 increment 3b acceptance: the same real proxy, driven by the same
+/// real traffic as `traceparent_join_and_fallback_produce_the_right_span_tree`
+/// above, also exports OTLP **metrics** to the collector on the SAME
+/// connection -- `otlp::run_exporter`'s tick branch flushes both spans and
+/// the stats [`proxy_observability::stats::Registry`]'s current cumulative
+/// state. `upstream_rq` (`RouterStats::record_attempt`) is the counter the
+/// served request actually increments: one attempt against `primary`
+/// (connect-failure) and one against `fallback` (the 200), so its two
+/// per-cluster data points should sum to 2 -- proving both the wiring
+/// (`main.rs`'s `registry.clone()` reaching `run_exporter`) and the grouping
+/// (`otlp::map_metrics` collapsing the two `cluster` attribute sets into one
+/// `Metric`).
+#[tokio::test(flavor = "multi_thread")]
+async fn served_traffic_exports_upstream_rq_metric_to_the_collector() {
+    let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
+    let primary_addr = dead_addr();
+    let (_spans, metrics, collector_addr) = spawn_mock_collector();
+    assert!(
+        wait_for_connectable(("127.0.0.1", collector_addr.port()), STARTUP_TIMEOUT),
+        "mock OTLP collector never became connectable"
+    );
+
+    let listener_port = free_port();
+    let admin_port = free_port();
+    let config_path = write_config(
+        listener_port,
+        admin_port,
+        primary_addr,
+        fallback_addr,
+        Some(&format!("http://127.0.0.1:{}", collector_addr.port())),
+    );
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+
+    let listener_ready = wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT);
+    assert!(
+        listener_ready,
+        "listener at 127.0.0.1:{listener_port} did not become connectable in time \
+         (stderr so far: {:?})",
+        drain_available_lines(&stderr_rx)
+    );
+
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let response = get_with_traceparent(
+        listener_addr,
+        "/v1/chat/completions",
+        "test.local",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected the retried request to eventually succeed against `fallback`, got:\n{response}"
+    );
+
+    // Same 5s ticker as the span batch -- give it comfortable headroom over
+    // that, same as `wait_for_spans` above. `write_config`'s boot snapshot
+    // names three clusters (`primary`, `fallback`, and the aggregate `agg`
+    // itself -- `StatHandles::build` resolves a handle for every cluster in
+    // the snapshot, per its own doc), so `upstream_rq` carries THREE
+    // per-cluster data points; only `primary` and `fallback` are ever
+    // actually dispatched to (`agg` is a routing target, never dialed
+    // itself), so their two attempts are what this waits for.
+    let upstream_rq = wait_for_metric_totaling(&metrics, "upstream_rq", 2, Duration::from_secs(20))
+        .await
+        .expect(
+            "expected an \"upstream_rq\" Metric totaling at least 2 to arrive at the mock \
+             collector within the wait window -- either the exporter task never got the \
+             registry, or map_metrics never ran",
+        );
+
+    let sum = match upstream_rq.data.as_ref().expect("Metric.data present") {
+        metric::Data::Sum(sum) => sum,
+        other => panic!("expected upstream_rq to be Data::Sum, got {other:?}"),
+    };
+    assert!(
+        sum.is_monotonic,
+        "upstream_rq is a Counter instrument -- its Sum must be monotonic"
+    );
+
+    // Three resolved clusters (`primary`, `fallback`, `agg`), each a
+    // DIFFERENT `cluster` attribute value -- so this must be ONE Metric
+    // (asserted above by `wait_for_metric_totaling` finding exactly the name
+    // "upstream_rq") carrying multiple data points, not one Metric per
+    // cluster. This is exactly the grouping `otlp::map_metrics`'s module doc
+    // calls out.
+    assert_eq!(
+        sum.data_points.len(),
+        3,
+        "expected one data point per resolved cluster (primary, fallback, agg), got {:#?}",
+        sum.data_points
+    );
+    let total: i64 = sum
+        .data_points
+        .iter()
+        .map(|p| match p.value {
+            Some(
+                proxy_api::opentelemetry::proto::metrics::v1::number_data_point::Value::AsInt(v),
+            ) => v,
+            other => panic!("expected AsInt, got {other:?}"),
+        })
+        .sum();
+    assert_eq!(
+        total, 2,
+        "expected exactly 2 total upstream_rq attempts (1 primary + 1 fallback; \"agg\" is \
+         never dialed itself), got {total}"
+    );
+
+    let cluster_values: Vec<String> = sum
+        .data_points
+        .iter()
+        .flat_map(|p| p.attributes.iter())
+        .filter(|kv| kv.key == "cluster")
+        .filter_map(|kv| match &kv.value.as_ref()?.value {
+            Some(proxy_api::opentelemetry::proto::common::v1::any_value::Value::StringValue(s)) => {
+                Some(s.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        cluster_values.contains(&"primary".to_string())
+            && cluster_values.contains(&"fallback".to_string()),
+        "expected data points for both \"primary\" and \"fallback\" clusters, got {cluster_values:?}"
+    );
 
     terminate(&mut child);
 }
