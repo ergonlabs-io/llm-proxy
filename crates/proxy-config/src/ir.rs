@@ -1043,6 +1043,17 @@ pub struct RouteEntry {
     /// per-route filter configs (which are `proxy-http` types and so cannot
     /// live in the IR) indexed by route, without hashing pointers.
     pub route_index: usize,
+    /// `VirtualHost.include_request_attempt_count` (Envoy default false),
+    /// denormalized from the owning vhost at lowering: when true the router
+    /// sets `x-envoy-attempt-count` on the upstream request to this attempt's
+    /// 1-based number. Vhost-level in Envoy, copied onto every route here
+    /// because the router only holds an `Arc<RouteEntry>` (S2.8 cache), never
+    /// the vhost.
+    pub include_request_attempt_count: bool,
+    /// `VirtualHost.include_attempt_count_in_response` (Envoy default false):
+    /// when true the router sets `x-envoy-attempt-count` on the response to
+    /// the TOTAL attempts made. Same denormalization as above.
+    pub include_attempt_count_in_response: bool,
 }
 
 #[derive(Debug)]

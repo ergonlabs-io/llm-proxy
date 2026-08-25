@@ -58,6 +58,8 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         }],
         typed_per_filter_config: BTreeMap::new(),
         route_index: 0,
+        include_request_attempt_count: false,
+        include_attempt_count_in_response: false,
     });
     let vhost = VirtualHostIR {
         name: "default".to_string(),

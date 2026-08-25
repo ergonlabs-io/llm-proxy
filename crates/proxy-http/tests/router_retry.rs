@@ -143,6 +143,8 @@ async fn build_router_with_stats(
                 request_headers_to_add: Vec::new(),
                 typed_per_filter_config: BTreeMap::new(),
                 route_index: 0,
+                include_request_attempt_count: false,
+                include_attempt_count_in_response: false,
             })],
             typed_per_filter_config: BTreeMap::new(),
         }],
@@ -249,6 +251,8 @@ async fn build_router_with_access_logs(
                 request_headers_to_add: Vec::new(),
                 typed_per_filter_config: BTreeMap::new(),
                 route_index: 0,
+                include_request_attempt_count: false,
+                include_attempt_count_in_response: false,
             })],
             typed_per_filter_config: BTreeMap::new(),
         }],
@@ -582,6 +586,8 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                         request_headers_to_add: Vec::new(),
                         typed_per_filter_config: BTreeMap::new(),
                         route_index: 0,
+                        include_request_attempt_count: false,
+                        include_attempt_count_in_response: false,
                     })],
                     typed_per_filter_config: BTreeMap::new(),
                 }],
@@ -950,6 +956,230 @@ async fn the_replayed_request_carries_the_same_body_as_the_original() {
                 second_body.as_ref(),
                 b"hello retry world",
                 "the replayed attempt must carry the identical body"
+            );
+        })
+        .await;
+}
+
+// ------------------------------------------------------------ WP-13 --
+
+/// Like [`build_router`], but sets the route's WP-13
+/// `include_request_attempt_count`/`include_attempt_count_in_response`
+/// flags (`RouteEntry`'s own doc explains the denormalization) -- kept as
+/// its own helper, rather than a parameter threaded through `build_router`
+/// itself, so every existing call site stays untouched.
+async fn build_router_with_attempt_count_flags(
+    addr: SocketAddr,
+    fwd: ForwardAction,
+    include_request_attempt_count: bool,
+    include_attempt_count_in_response: bool,
+) -> FilterChainHandler {
+    let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+    let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
+    snapshot.insert(
+        "up".to_string(),
+        Arc::new(ClusterConfig {
+            name: "up".to_string(),
+            discovery: DiscoveryType::Static,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints: vec![EndpointIR {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                weight: 1,
+                priority: 0,
+            }],
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+            usage_dialect: None,
+            health_check: None,
+            outlier_detection: None,
+        }),
+    );
+    manager.update_from_snapshot(&snapshot).await;
+
+    let route_table = RouteTable::new(
+        "test-routes".to_string(),
+        vec![VirtualHostIR {
+            name: "vh".to_string(),
+            domains: vec!["*".to_string()],
+            routes: vec![Arc::new(RouteEntry {
+                name: None,
+                matcher: prefix_matcher("/v1/"),
+                action: RouteActionIR::Forward(fwd),
+                request_headers_to_add: Vec::new(),
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
+                include_request_attempt_count,
+                include_attempt_count_in_response,
+            })],
+            typed_per_filter_config: BTreeMap::new(),
+        }],
+        BTreeMap::new(),
+    )
+    .unwrap();
+
+    let stats = test_router_stats(&["up"]);
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+        Arc::new(RouterFilterFactory::new(Arc::new(manager), stats));
+    FilterChainHandler::new(
+        Vec::new(),
+        terminal_factory,
+        Arc::new(route_table),
+        false,
+        false,
+        0,
+    )
+}
+
+/// Like [`spawn_upstream_fails_then_succeeds`], but records each accepted
+/// request's raw header text (not just its body) -- what the WP-13
+/// "increments on retry" test needs, to see what each individual attempt
+/// actually carried on the wire, in order.
+async fn spawn_upstream_fails_then_succeeds_capturing_headers(
+    fail_count: usize,
+    fail_status: u16,
+) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut attempt = 0usize;
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (header_text, _body) = read_one_request(&mut stream).await;
+            let _ = tx.send(header_text);
+            if attempt < fail_count {
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {fail_status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            } else {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+            attempt += 1;
+        }
+    });
+    (addr, rx)
+}
+
+/// `include_request_attempt_count: true`, no retry: the single upstream
+/// attempt must carry `x-envoy-attempt-count: 1` (1-based).
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_count_request_header_is_1_on_the_first_attempt() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, mut rx) = spawn_upstream_fails_then_succeeds_capturing_headers(0, 503).await;
+            let router =
+                build_router_with_attempt_count_flags(addr, forward_to_up(None), true, false).await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+
+            let header_text = rx.recv().await.unwrap().to_ascii_lowercase();
+            assert!(
+                header_text.contains("x-envoy-attempt-count: 1"),
+                "expected the first attempt to carry attempt count 1, got: {header_text:?}"
+            );
+        })
+        .await;
+}
+
+/// `include_request_attempt_count: true` with a retry that succeeds on the
+/// second try: the first upstream attempt must see `1`, the retried one `2`.
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_count_request_header_increments_on_retry() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, mut rx) = spawn_upstream_fails_then_succeeds_capturing_headers(1, 503).await;
+            let router = build_router_with_attempt_count_flags(
+                addr,
+                forward_to_up(Some(retry_policy("5xx", 1))),
+                true,
+                false,
+            )
+            .await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+
+            let first = rx.recv().await.unwrap().to_ascii_lowercase();
+            let second = rx.recv().await.unwrap().to_ascii_lowercase();
+            assert!(
+                first.contains("x-envoy-attempt-count: 1"),
+                "expected the first attempt to carry attempt count 1, got: {first:?}"
+            );
+            assert!(
+                second.contains("x-envoy-attempt-count: 2"),
+                "expected the retried attempt to carry attempt count 2, got: {second:?}"
+            );
+        })
+        .await;
+}
+
+/// `include_attempt_count_in_response: true` with one retry: the downstream
+/// response must carry the TOTAL attempts made (2), not just be present at
+/// all -- the request-side tests above are what actually distinguish "total"
+/// from "last attempt's own number" (both happen to read 2 here); this
+/// test's job is proving the response gets the header in the first place.
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_count_response_header_carries_the_total_attempts_made() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, _count, _rx) = spawn_upstream_fails_then_succeeds(1, 503).await;
+            let router = build_router_with_attempt_count_flags(
+                addr,
+                forward_to_up(Some(retry_policy("5xx", 1))),
+                false,
+                true,
+            )
+            .await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            assert_eq!(
+                resp.head.headers.get("x-envoy-attempt-count"),
+                Some(&HeaderValue::from_static("2")),
+                "expected the downstream response to carry the TOTAL attempts made"
+            );
+        })
+        .await;
+}
+
+/// Both flags default false: neither the upstream request nor the
+/// downstream response carries `x-envoy-attempt-count` at all.
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_count_headers_are_absent_when_both_flags_are_off() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, mut rx) = spawn_upstream_fails_then_succeeds_capturing_headers(0, 503).await;
+            let router =
+                build_router_with_attempt_count_flags(addr, forward_to_up(None), false, false)
+                    .await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            assert!(
+                !resp.head.headers.contains_key("x-envoy-attempt-count"),
+                "response must not carry x-envoy-attempt-count when \
+                 include_attempt_count_in_response is false"
+            );
+
+            let header_text = rx.recv().await.unwrap().to_ascii_lowercase();
+            assert!(
+                !header_text.contains("x-envoy-attempt-count"),
+                "upstream request must not carry x-envoy-attempt-count when \
+                 include_request_attempt_count is false, got: {header_text:?}"
             );
         })
         .await;

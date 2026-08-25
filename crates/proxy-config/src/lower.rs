@@ -352,9 +352,14 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.config.route.v3.RouteConfiguration" => {
             &["name", "virtual_hosts", "typed_per_filter_config"]
         }
-        "envoy.config.route.v3.VirtualHost" => {
-            &["name", "domains", "routes", "typed_per_filter_config"]
-        }
+        "envoy.config.route.v3.VirtualHost" => &[
+            "name",
+            "domains",
+            "routes",
+            "typed_per_filter_config",
+            "include_request_attempt_count",
+            "include_attempt_count_in_response",
+        ],
         "envoy.config.route.v3.Route" => &[
             "name",
             "match",
@@ -3327,6 +3332,8 @@ fn convert_route_table(
             routes.push(Arc::new(convert_route(
                 r,
                 &format!("{vh_path}.routes[{j}]"),
+                vh.include_request_attempt_count,
+                vh.include_attempt_count_in_response,
             )?));
         }
         let vh_typed_per_filter_config = convert_typed_per_filter_config(
@@ -3352,7 +3359,12 @@ fn convert_route_table(
     })
 }
 
-fn convert_route(r: &route_v3::Route, path: &str) -> Result<RouteEntry, ConfigError> {
+fn convert_route(
+    r: &route_v3::Route,
+    path: &str,
+    include_request_attempt_count: bool,
+    include_attempt_count_in_response: bool,
+) -> Result<RouteEntry, ConfigError> {
     let m = r
         .r#match
         .as_ref()
@@ -3410,6 +3422,8 @@ fn convert_route(r: &route_v3::Route, path: &str) -> Result<RouteEntry, ConfigEr
         // `Arc::get_mut`) once every route in the table has been built --
         // this constructor doesn't know the table-wide ordering yet.
         route_index: 0,
+        include_request_attempt_count,
+        include_attempt_count_in_response,
     })
 }
 

@@ -302,6 +302,20 @@ struct ClientSpanOutcome<'a> {
     extra_attributes: Vec<(&'static str, String)>,
 }
 
+/// WP-13: `RouteEntry::include_request_attempt_count`/
+/// `include_attempt_count_in_response` (Envoy S9, `x-envoy-attempt-count`),
+/// bundled into one struct purely to keep `apply_forward`'s parameter count
+/// under clippy's `too_many_arguments` threshold -- same motivation
+/// `ClientSpanOutcome` above documents for itself.
+struct AttemptCountCfg {
+    /// Set `x-envoy-attempt-count` on the upstream request, to this
+    /// attempt's 1-based number.
+    request: bool,
+    /// Set `x-envoy-attempt-count` on the downstream response, to the total
+    /// number of attempts made.
+    response: bool,
+}
+
 impl RouterHandler {
     async fn route_and_forward(&mut self, dcb: &mut dyn DecoderCallbacks) -> HttpResponseParts {
         // S2.8: the filter manager already resolved (and cached) the route
@@ -338,6 +352,10 @@ impl RouterHandler {
                         &route.request_headers_to_add,
                         head,
                         dcb,
+                        AttemptCountCfg {
+                            request: route.include_request_attempt_count,
+                            response: route.include_attempt_count_in_response,
+                        },
                     )
                     .await
                 }
@@ -405,6 +423,7 @@ impl RouterHandler {
         request_headers_to_add: &[proxy_config::ir::HeaderMutation],
         head: RequestHeaders,
         dcb: &mut dyn DecoderCallbacks,
+        attempt_count: AttemptCountCfg,
     ) -> HttpResponseParts {
         let draw = match &fwd.target {
             ForwardTarget::Weighted(w) if w.total_weight > 0 => {
@@ -475,6 +494,16 @@ impl RouterHandler {
         // needs to see the first attempt's pick to skip it. `mut` because
         // the loop pushes onto it after every pick.
         let mut ctx = LoadBalancerContext::default();
+
+        // WP-13: this attempt loop's own 1-based attempt counter, for
+        // `x-envoy-attempt-count` (S9) -- incremented at the same point as
+        // `self.stats.record_attempt` below ("the attempt is actually
+        // dispatched"), so a circuit-breaker or host-selection rejection
+        // (which `return`s before that point) never counts as an attempt.
+        // Mutated only inside `attempt_loop` below, same as `ctx` and
+        // `retry_state`; read again once `attempt_loop` has been consumed
+        // (see the Rust note just below for why that's sound).
+        let mut attempt_number: u32 = 0;
 
         // Rust note: this `async` block (no `move`) captures `dcb` (a `&mut
         // dyn DecoderCallbacks`) by unique reborrow, not by value -- so once
@@ -567,6 +596,7 @@ impl RouterHandler {
                 // `record_attempt_duration_since` call, so the two
                 // instruments stay in lockstep per attempt.
                 self.stats.record_attempt(attempt_cluster);
+                attempt_number += 1;
                 let attempt_dispatched_at = std::time::Instant::now();
 
                 let proto = attempt_entry.upstream_protocol();
@@ -753,6 +783,16 @@ impl RouterHandler {
                     if let Ok(value) = HeaderValue::from_str(&child_ctx.to_traceparent()) {
                         attempt_head.headers.insert("traceparent", value);
                     }
+                }
+                // WP-13 (S9): `VirtualHost.include_request_attempt_count`,
+                // denormalized onto the route (`RouteEntry`'s own doc). Set
+                // per attempt, not once outside the loop, so a retry
+                // overwrites it with the new attempt number rather than
+                // resending the first attempt's.
+                if attempt_count.request {
+                    attempt_head
+                        .headers
+                        .insert("x-envoy-attempt-count", HeaderValue::from(attempt_number));
                 }
                 // Rust note: `body_bytes` is plain `Bytes`, cheap
                 // (refcounted) to `.clone()` fresh for every attempt --
@@ -996,7 +1036,7 @@ impl RouterHandler {
             Some(d) => tokio::time::timeout(d, attempt_loop).await,
             None => Ok(attempt_loop.await),
         };
-        match outcome {
+        let mut resp = match outcome {
             Ok(resp) => resp,
             Err(_elapsed) => {
                 tracing::debug!(
@@ -1009,7 +1049,18 @@ impl RouterHandler {
                     .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
                 local_reply(StatusCode::GATEWAY_TIMEOUT, "upstream request timeout")
             }
+        };
+        // WP-13 (S9): `VirtualHost.include_attempt_count_in_response`,
+        // denormalized onto the route. Set here -- the one place every
+        // `attempt_loop` exit (success, exhausted retries, or the whole-route
+        // `fwd.timeout` above) converges into the response this function
+        // returns -- to the TOTAL attempts made, not just the last one's.
+        if attempt_count.response {
+            resp.head
+                .headers
+                .insert("x-envoy-attempt-count", HeaderValue::from(attempt_number));
         }
+        resp
     }
 }
 
@@ -1761,6 +1812,8 @@ mod tests {
                     request_headers_to_add: Vec::new(),
                     typed_per_filter_config: BTreeMap::new(),
                     route_index: 0,
+                    include_request_attempt_count: false,
+                    include_attempt_count_in_response: false,
                 })],
                 typed_per_filter_config: BTreeMap::new(),
             }],
@@ -1829,6 +1882,8 @@ mod tests {
                     request_headers_to_add: Vec::new(),
                     typed_per_filter_config: BTreeMap::new(),
                     route_index: 0,
+                    include_request_attempt_count: false,
+                    include_attempt_count_in_response: false,
                 })],
                 typed_per_filter_config: BTreeMap::new(),
             }],
@@ -2443,6 +2498,8 @@ mod tests {
                 request_headers_to_add: Vec::new(),
                 typed_per_filter_config: BTreeMap::new(),
                 route_index: 0,
+                include_request_attempt_count: false,
+                include_attempt_count_in_response: false,
             })
         }
         RouteTable::new(

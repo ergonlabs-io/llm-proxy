@@ -136,6 +136,8 @@ async fn build_router_with_cluster_mutations(
                 request_headers_to_add: mutations,
                 typed_per_filter_config: BTreeMap::new(),
                 route_index: 0,
+                include_request_attempt_count: false,
+                include_attempt_count_in_response: false,
             })],
             typed_per_filter_config: BTreeMap::new(),
         }],
