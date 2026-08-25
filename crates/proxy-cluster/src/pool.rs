@@ -60,6 +60,36 @@ impl ConnectPool {
     }
 }
 
+/// Project a failed `TcpStream::connect` onto the right [`PoolError`].
+///
+/// Almost every connect failure is a genuine "never got a connection" and
+/// maps to [`PoolError::ConnectFailure`] -> Envoy `UF` (connection refused,
+/// host unreachable, timeout surfaced as an error, ...). Two kinds are
+/// different: `ConnectionReset` (`ECONNRESET`) and `ConnectionAborted`
+/// (`ECONNABORTED`) mean the peer accepted or half-accepted the connection
+/// and then *reset* it, rather than never answering -- which is Envoy's `UR`
+/// (upstream remote reset), not `UF`. Splitting them out is what finally
+/// *constructs* [`PoolError::ResetBeforeHeaders`]: the variant, its
+/// `from_pool_error` -> `ResetBeforeHeaders` mapping, and the router arm that
+/// turns it into `UR` all already existed, but nothing produced it, so a
+/// connect-time reset reported `UF`. A reset before any response headers is
+/// retriable under S3.2's `reset`, whereas a plain connect failure is
+/// retriable under `connect-failure` -- so the distinction changes retry
+/// behaviour, not only the logged flag.
+///
+/// Rust note: `io::Error` is matched on its `ErrorKind` (a `Copy` enum) via
+/// `.kind()`, leaving the original error owned to move into the
+/// `ConnectFailure` arm unchanged -- so the `{0}` in `PoolError`'s `#[error]`
+/// still carries the OS message.
+fn classify_connect_error(err: std::io::Error) -> PoolError {
+    match err.kind() {
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+            PoolError::ResetBeforeHeaders
+        }
+        _ => PoolError::ConnectFailure(err),
+    }
+}
+
 impl HttpConnPool for ConnectPool {
     fn new_stream(&self) -> BoxFuture<'static, Result<UpstreamStream, PoolError>> {
         // Rust note: the returned future is `'static` (it may outlive this
@@ -81,7 +111,7 @@ impl HttpConnPool for ConnectPool {
             let connected = tokio::time::timeout(connect_timeout, async {
                 let tcp = tokio::net::TcpStream::connect(addr)
                     .await
-                    .map_err(PoolError::ConnectFailure)?;
+                    .map_err(classify_connect_error)?;
                 let io = transport
                     .wrap(tcp, &server_name)
                     .await
@@ -107,6 +137,32 @@ mod tests {
     /// enough that it never fires under normal test-machine load, so it
     /// can't be the reason a non-timeout test flakes.
     const AMPLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn classify_connect_error_splits_reset_from_plain_failure() {
+        // A peer that reset the (half-)connection -> `ResetBeforeHeaders`
+        // (Envoy `UR`), NOT `ConnectFailure`. This is the one behaviour that
+        // makes `PoolError::ResetBeforeHeaders` reachable at all from the
+        // connect path -- see `classify_connect_error`'s own doc.
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted] {
+            match classify_connect_error(std::io::Error::from(kind)) {
+                PoolError::ResetBeforeHeaders => {}
+                other => panic!("expected ResetBeforeHeaders for {kind:?}, got {other}"),
+            }
+        }
+        // Everything else stays a connect failure (Envoy `UF`) and carries
+        // the original OS error through for the log line.
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::HostUnreachable,
+            ErrorKind::TimedOut,
+        ] {
+            match classify_connect_error(std::io::Error::from(kind)) {
+                PoolError::ConnectFailure(io_err) => assert_eq!(io_err.kind(), kind),
+                other => panic!("expected ConnectFailure for {kind:?}, got {other}"),
+            }
+        }
+    }
 
     fn plaintext_pool(addr: SocketAddr) -> ConnectPool {
         ConnectPool::new(
