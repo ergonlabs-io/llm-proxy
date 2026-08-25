@@ -371,6 +371,66 @@ where
     Ok(HttpResponseParts { head, body })
 }
 
+/// Handshake a fresh HTTP/1.1 client connection over `io` and spawn its
+/// connection-driving task, returning the request sender AND that task's
+/// `JoinHandle` -- the "dial" half of what `send_upstream_http1` does in one
+/// shot, split out (WP-15 slice B) so `crate::upstream_pool::H1ConnCache` can
+/// hold a handshaken connection alive **between** requests, handing the very
+/// same connection to the next lease instead of every request handshaking
+/// (and tearing down) its own. h1 has no multiplexing, so unlike
+/// [`handshake_upstream_http2`]'s sender (cloned out to many *concurrent*
+/// requests), this connection's `SendRequest` is only ever leased to one
+/// request at a time -- see `H1ConnCache`'s doc for the full reuse rule.
+///
+/// Divergence from `handshake_upstream_http2`, which drops its `JoinHandle`:
+/// this one is returned rather than detached. The h2 cache never needs to
+/// end a connection's task itself -- dropping every clone of its
+/// `SendRequest` is enough to let hyper wind the connection down on its own.
+/// `H1ConnCache` needs to tear a specific IDLE connection down on demand (a
+/// dead one found while scanning for something to reuse, or a live one that
+/// just finished a response but turned out not to be safe to reuse) without
+/// waiting for that to happen naturally, so the caller needs the handle to
+/// call `.abort()` on.
+///
+/// Rust note: the task's own `Result<(), hyper::Error>` output is folded into
+/// `()` right here (spawning an `async move { let _ = conn.await; }` block,
+/// rather than `conn` itself) purely so the return type is the plain
+/// `JoinHandle<()>` this module's callers actually want -- nothing downstream
+/// of this function reads a connection-level error today, the same
+/// simplification `send_upstream_http1`'s own already-dropped `JoinHandle`
+/// makes; a connection error still surfaces to whichever request was in
+/// flight when it happened, via that request's own `send_request` failing.
+pub async fn handshake_upstream_http1<IO>(
+    io: IO,
+) -> Result<
+    (
+        hyper::client::conn::http1::SendRequest<StreamBody>,
+        tokio::task::JoinHandle<()>,
+    ),
+    UpstreamCodecError,
+>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let io = TokioIo::new(io);
+
+    let builder = hyper::client::conn::http1::Builder::new();
+    let (sender, conn) = builder
+        .handshake::<_, StreamBody>(io)
+        .await
+        .map_err(UpstreamCodecError::Handshake)?;
+
+    // Rust note: same `spawn_local` reasoning as `send_upstream_http1`'s own
+    // `conn_task` -- the `Connection` future is `!Send` because it drives our
+    // deliberately `!Send` `StreamBody` (ADR-0003) -- but unlike that
+    // function, the handle is kept (see this function's doc for why).
+    let conn_task = tokio::task::spawn_local(async move {
+        let _ = conn.await;
+    });
+
+    Ok((sender, conn_task))
+}
+
 /// Rust note: h2's hyper client needs an `Executor` to drive the internal
 /// future that pumps frames out of the *request body* onto the h2 connection
 /// (hyper's `H2ClientFuture`). That future is `!Send` whenever the request

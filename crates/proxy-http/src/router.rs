@@ -5,17 +5,22 @@
 //! filter chain (mirroring Envoy's `envoy.filters.http.router`, which is
 //! simply the terminal `StreamDecoderFilter`) -- matches a route (`crate::route`), picks a cluster + host through
 //! `proxy_cluster::manager::ClusterManager`, dials/reuses an upstream
-//! connection, and proxies the request over it with
-//! [`crate::codec::send_upstream_http1`].
+//! connection, and proxies the request over it -- HTTP/1.1 via
+//! `crate::upstream_pool::H1ConnCache` (which sends over
+//! [`crate::codec::send_upstream_http1`]'s split "dial"/"send" halves),
+//! HTTP/2 via `crate::upstream_pool::UpstreamConnCache`.
 //!
 //! ## v1 scope
 //!
 //! In scope: `Forward` routing to a `Cluster`/`ClusterHeader`/`Weighted`
-//! target, both HTTP/1.1 and HTTP/2 upstreams. HTTP/1.1 is connect-per-stream
-//! (no pooling/reuse -- see `proxy_cluster::pool`); HTTP/2 reuses one
-//! connection per (cluster, address) across concurrent/sequential requests
-//! via `crate::upstream_pool::UpstreamConnCache` (WP-15 slice A -- see that
-//! module's doc). `DirectResponse` for inline bodies, the
+//! target, both HTTP/1.1 and HTTP/2 upstreams. HTTP/1.1 reuses one IDLE
+//! keep-alive connection at a time per (cluster, address) via
+//! `crate::upstream_pool::H1ConnCache` (WP-15 slice B -- see that type's doc
+//! for the conservative reuse-vs-discard rule); HTTP/2 reuses a small bounded
+//! *set* of connections per (cluster, address), multiplexed across
+//! concurrent/sequential requests, via `crate::upstream_pool::UpstreamConnCache`
+//! (WP-15 slice A/C -- see that module's doc). `DirectResponse` for inline
+//! bodies, the
 //! upstream request transforms `prefix_rewrite`/`host_rewrite_literal`/
 //! `x-envoy-expected-rq-timeout-ms`, the S4 route timeout
 //! (`ForwardAction::timeout`, bounding time-to-response-headers only), and
@@ -44,9 +49,9 @@
 //!   HCM `stream_idle_timeout` field yet, so a `None` route `idle_timeout`
 //!   means "no idle timeout" for now, not "inherit the listener's".
 //! - The retry & hedging engine (S3, WP-14).
-//! - HTTP/1.1 connection reuse (keep-alive) -- WP-15 slice B; h1 stays
-//!   connect-per-stream through `ConnectPool` even after slice A, which only
-//!   covers HTTP/2 (see `crate::upstream_pool`'s module doc for why).
+//! - HTTP/1.1 idle-connection eviction (an idle-timeout that closes a cached
+//!   h1 connection nobody's leased in a while) -- WP-15 slice B scoped this
+//!   out deliberately; see `crate::upstream_pool::H1ConnCache`'s doc.
 //! - Connection-level circuit breakers (`max_connections`,
 //!   `max_pending_requests`) -- WP-15 slice D; this router still only
 //!   enforces the S5 `max_requests` per-cluster budget above.
@@ -70,13 +75,13 @@ use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::outlier::RequestResult;
 use proxy_cluster::{
-    ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol, UpstreamStream,
+    ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
 };
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, TraceContext};
 use proxy_observability::ResponseFlag;
 
-use crate::codec::{send_upstream_http1, Http1Options, UpstreamCodecError};
+use crate::codec::UpstreamCodecError;
 use crate::filter::{
     DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
     RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
@@ -88,22 +93,23 @@ use crate::handler::{
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, select_cluster};
 use crate::stat_handles::RouterStats;
-use crate::upstream_pool::{ConnKey, PooledSendRequest, UpstreamConnCache};
+use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 
 /// What `apply_forward`'s attempt loop got back from connecting to the
-/// picked host: an h1 [`UpstreamStream`] for a fresh connect-per-stream dial,
-/// or a [`PooledSendRequest`] leased from the worker's bounded h2 connection
-/// set -- possibly a clone of an already-cached, already-handshaken sender,
-/// possibly a freshly dialed one (WP-15 slice A, extended to a bounded set
-/// of connections by slice C -- see `crate::upstream_pool`'s module doc).
-/// One `Result<Connected, PoolError>` for both protocols keeps the shared
-/// connect-failure handling (S3 retry classification, circuit-breaker
-/// outcome, response-flag mapping) a single match arm instead of two
-/// near-duplicate ones.
+/// picked host: a [`LeasedH1`] from the worker's bounded-idle h1 connection
+/// cache -- possibly a reused, already-handshaken connection, possibly a
+/// freshly dialed one (WP-15 slice B) -- or a [`PooledSendRequest`] leased
+/// from the worker's bounded h2 connection set -- possibly a clone of an
+/// already-cached, already-handshaken sender, possibly a freshly dialed one
+/// (WP-15 slice A, extended to a bounded set of connections by slice C -- see
+/// `crate::upstream_pool`'s module doc). One `Result<Connected, PoolError>`
+/// for both protocols keeps the shared connect-failure handling (S3 retry
+/// classification, circuit-breaker outcome, response-flag mapping) a single
+/// match arm instead of two near-duplicate ones.
 enum Connected {
-    Http1(UpstreamStream),
+    Http1(LeasedH1),
     Http2(PooledSendRequest),
 }
 
@@ -199,6 +205,12 @@ pub struct RouterHandler {
     /// Fetched fresh per stream (a cheap `Rc` clone -- pointer bump), so
     /// every request this worker serves shares the one underlying cache.
     conn_cache: Rc<UpstreamConnCache>,
+    /// WP-15 slice B: this worker's h1 keep-alive connection cache -- same
+    /// `Rc`/`thread_local!` shape as `conn_cache` above, for the same reason
+    /// (`RouterFilterFactory` must stay `Send + Sync`, so it can't hold this
+    /// `!Send` cache directly; see `upstream_pool::worker_h1_conn_cache`'s
+    /// doc).
+    h1_cache: Rc<H1ConnCache>,
     /// Captured in `decode_headers` (cloned, since `RequestHeaders` isn't
     /// `Clone` and the callback only lends us `&mut`); consumed by
     /// `respond()`.
@@ -230,6 +242,7 @@ impl RouterHandler {
             clusters,
             stats,
             conn_cache: crate::upstream_pool::worker_conn_cache(),
+            h1_cache: crate::upstream_pool::worker_h1_conn_cache(),
             captured_head: None,
             captured_body: Bytes::new(),
             captured_trailers: None,
@@ -630,22 +643,30 @@ impl RouterHandler {
                     (info.trace.map(|ctx| ctx.child()), SystemTime::now())
                 };
                 let pool = attempt_entry.http_pool(&host, proto);
-                // WP-15 slice A: h2 upstreams are reused across requests via
-                // this worker's `UpstreamConnCache` -- one TCP connection
-                // (and handshake) per (cluster, address, protocol),
-                // multiplexed by hyper's h2 `SendRequest`. h1 stays
-                // connect-per-stream (`pool.new_stream()` directly),
-                // unchanged from before this slice -- see
-                // `crate::upstream_pool`'s module doc for why h2 only.
-                let conn_key = matches!(proto, UpstreamProtocol::Http2)
-                    .then(|| ConnKey::new(attempt_cluster, host.address, proto));
-                let connect_result: Result<Connected, PoolError> = match &conn_key {
-                    Some(key) => self
+                // WP-15 slice A/B: both protocols are now cache-key'd --
+                // h2 upstreams are reused across requests via this worker's
+                // `UpstreamConnCache` (one TCP connection, or a small bounded
+                // set of them, per (cluster, address, protocol), multiplexed
+                // by hyper's h2 `SendRequest`); h1 upstreams reuse one IDLE
+                // keep-alive connection at a time via this worker's
+                // `H1ConnCache` -- see `crate::upstream_pool`'s module doc
+                // and `H1ConnCache`'s own doc for the conservative
+                // reuse-vs-discard rule that makes that safe. `ConnKey`'s
+                // `protocol` field is what keeps the two caches' entries from
+                // ever being confused with each other.
+                let conn_key = ConnKey::new(attempt_cluster, host.address, proto);
+                let connect_result: Result<Connected, PoolError> = match proto {
+                    UpstreamProtocol::Http2 => self
                         .conn_cache
-                        .get_or_connect(key.clone(), pool.as_ref())
+                        .get_or_connect(conn_key.clone(), pool.as_ref())
                         .await
                         .map(Connected::Http2),
-                    None => pool.new_stream().await.map(Connected::Http1),
+                    UpstreamProtocol::Http1 => self
+                        .h1_cache
+                        .clone()
+                        .get_or_connect_h1(conn_key.clone(), pool.as_ref())
+                        .await
+                        .map(Connected::Http1),
                 };
                 let connected = match connect_result {
                     Ok(connected) => connected,
@@ -803,15 +824,18 @@ impl RouterHandler {
                 // `Result<HttpResponseParts, UpstreamCodecError>`; box the
                 // future so the two arms share one type. h2 here is
                 // prior-knowledge cleartext (h2c) over the pool's raw TCP
-                // stream -- no per-request `Connection: close`, so it takes
-                // no `Http1Options`. WP-15 slice A/C: the h2 arm sends over
-                // whatever connection `connected` was leased from -- possibly
-                // a clone of an already-cached, already-handshaken sender,
-                // not a fresh one this attempt just dialed --
-                // `PooledSendRequest::send` (not `codec::send_on_http2`
-                // directly) so the stream stays counted as in-flight against
-                // that connection for the whole response, not just until
-                // headers arrive.
+                // stream -- no per-request `Connection: close` concept at
+                // all. WP-15 slice A/B/C: BOTH arms now send over whatever
+                // connection `connected` was leased from -- possibly a
+                // reused, already-handshaken one, possibly a fresh one this
+                // attempt just dialed -- via each cache's own `.send()`
+                // (`LeasedH1::send`/`PooledSendRequest::send`, not
+                // `codec::send_upstream_http1`/`codec::send_on_http2`
+                // directly), so the h2 side stays counted as in-flight
+                // against its connection for the whole response, and the h1
+                // side can decide (in `H1ReuseBody`'s `Drop`) whether the
+                // connection it just used is safe to hand to the NEXT
+                // request.
                 let send: std::pin::Pin<
                     Box<
                         dyn std::future::Future<
@@ -819,11 +843,7 @@ impl RouterHandler {
                         >,
                     >,
                 > = match connected {
-                    Connected::Http1(upstream) => Box::pin(send_upstream_http1(
-                        upstream.io,
-                        upstream_req,
-                        Http1Options { keep_alive: false },
-                    )),
+                    Connected::Http1(leased) => Box::pin(leased.send(upstream_req)),
                     Connected::Http2(pooled) => Box::pin(pooled.send(upstream_req)),
                 };
 
@@ -963,9 +983,12 @@ impl RouterHandler {
                         // right as we sent) -- evict it so the next
                         // request/retry redials rather than risking the same
                         // now-dead sender again before its `is_closed()`
-                        // catches up.
-                        if let Some(key) = &conn_key {
-                            self.conn_cache.invalidate(key);
+                        // catches up. h1 needs no equivalent call: a `LeasedH1`
+                        // that fails to send is never returned to `H1ConnCache`
+                        // in the first place (see `LeasedH1::send`'s `Err` arm),
+                        // so there is nothing cached left to invalidate.
+                        if matches!(proto, UpstreamProtocol::Http2) {
+                            self.conn_cache.invalidate(&conn_key);
                         }
                         let outcome = AttemptOutcome::from_codec_error(&err);
                         report_outlier(attempt_entry, host.address, &outcome);
@@ -1172,7 +1195,8 @@ fn body_with_trailers(bytes: Bytes, trailers: Option<HeaderMap>) -> StreamBody {
 }
 
 /// Apply the S13/S4 upstream request transforms to the outgoing request
-/// head, in place, before it's handed to `send_upstream_http1`:
+/// head, in place, before it's handed to the upstream send path
+/// (`crate::upstream_pool::LeasedH1::send`/`PooledSendRequest::send`):
 /// `prefix_rewrite` (rewrites `head.uri`), `host_rewrite_literal` (rewrites
 /// the `Host` header, which is what carries `:authority` over h1), the
 /// `x-envoy-expected-rq-timeout-ms` header Envoy sets from the route's S4
@@ -1735,9 +1759,10 @@ mod tests {
     }
 
     /// Like [`spawn_upstream_answers_ok_repeatedly`], but counts how many TCP
-    /// connections it has accepted -- what `h1_stays_connect_per_stream`
-    /// asserts against to prove slice A's h2 cache didn't accidentally start
-    /// reusing h1 connections too.
+    /// connections it has accepted, and every response carries `Connection:
+    /// close` -- what `connection_close_response_is_not_reused` asserts
+    /// against to prove the WP-15 slice B h1 cache honors an explicit
+    /// `Connection: close` and never reuses that connection.
     async fn spawn_counting_h1_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1758,6 +1783,64 @@ mod tests {
                             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         )
                         .await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// Like [`spawn_counting_h1_upstream`], but genuinely keep-alive
+    /// capable: each accepted connection is served in a loop that reads and
+    /// answers as many bodyless-GET requests as arrive on it (no
+    /// `Connection: close`, plain HTTP/1.1 -- persistent by default), rather
+    /// than closing after one. What the WP-15 slice B reuse tests
+    /// (`reuse_across_two_requests_opens_one_connection`,
+    /// `truncated_or_errored_response_is_not_reused`) assert against: with a
+    /// peer willing to stay open, whether a SECOND request opens a new
+    /// connection or not is entirely down to `H1ConnCache`'s own reuse
+    /// decision, not anything the peer forced.
+    async fn spawn_counting_h1_keepalive_upstream(
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_clone = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        let mut request_buf = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        loop {
+                            let n = match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return, // peer closed
+                                Ok(n) => n,
+                            };
+                            request_buf.extend_from_slice(&chunk[..n]);
+                            // These test requests are always bodyless GETs,
+                            // so the header terminator is also the end of
+                            // the whole request.
+                            if request_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        // Loop back for the NEXT request on this same
+                        // connection -- what makes this mock actually
+                        // keep-alive, unlike `spawn_counting_h1_upstream`'s
+                        // one-shot-per-connection task.
+                    }
                 });
             }
         });
@@ -2975,10 +3058,54 @@ mod tests {
             .await;
     }
 
-    /// h1 is unchanged by this slice: an h1 cluster still opens one
-    /// connection per request (`build_router`'s default cluster is h1).
+    /// WP-15 slice B's own core proof: two SEQUENTIAL requests against a
+    /// keep-alive-capable h1 upstream must open exactly ONE TCP connection --
+    /// the second request reuses the first, rather than dialing fresh. Must
+    /// FAIL if reuse is removed (i.e. reverts to two accepts).
     #[tokio::test(flavor = "current_thread")]
-    async fn h1_stays_connect_per_stream() {
+    async fn reuse_across_two_requests_opens_one_connection() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_counting_h1_keepalive_upstream().await;
+                let router =
+                    build_router(addr, prefix_matcher("/"), forward_to_up(None, None, None)).await;
+
+                let resp1 = router.handle(request("/")).await;
+                assert_eq!(resp1.head.status, StatusCode::OK);
+                // Drain to a clean EOF -- the ONE thing that makes this
+                // connection eligible to go back into `H1ConnCache` at all
+                // (see `H1ReuseBody`'s doc).
+                resp1
+                    .body
+                    .collect()
+                    .await
+                    .expect("first response body drains cleanly");
+
+                let resp2 = router.handle(request("/")).await;
+                assert_eq!(resp2.head.status, StatusCode::OK);
+                resp2
+                    .body
+                    .collect()
+                    .await
+                    .expect("second response body drains cleanly");
+
+                assert_eq!(
+                    accepted.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "a second request against a keep-alive-capable upstream must reuse the \
+                     first connection, not open a new one"
+                );
+            })
+            .await;
+    }
+
+    /// The conservative guard, checked directly: a response that explicitly
+    /// asks for `Connection: close` must never be handed back to the next
+    /// request, even against an otherwise ordinary upstream.
+    /// `build_router`'s default cluster is h1 (see `build_router_h2` for the
+    /// h2 variant of these helpers).
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_close_response_is_not_reused() {
         LocalSet::new()
             .run_until(async {
                 let (addr, accepted) = spawn_counting_h1_upstream().await;
@@ -2987,13 +3114,67 @@ mod tests {
 
                 let resp1 = router.handle(request("/")).await;
                 assert_eq!(resp1.head.status, StatusCode::OK);
+                resp1
+                    .body
+                    .collect()
+                    .await
+                    .expect("first response body drains cleanly");
+
                 let resp2 = router.handle(request("/")).await;
                 assert_eq!(resp2.head.status, StatusCode::OK);
+                resp2
+                    .body
+                    .collect()
+                    .await
+                    .expect("second response body drains cleanly");
 
                 assert_eq!(
                     accepted.load(std::sync::atomic::Ordering::SeqCst),
                     2,
-                    "an h1 cluster must still open one connection per request (no reuse)"
+                    "a `Connection: close` response must never be reused, even though it was \
+                     drained cleanly"
+                );
+            })
+            .await;
+    }
+
+    /// The other conservative guard: a response whose body was NOT fully
+    /// consumed before the next request went out (a truncated read, a
+    /// client that hung up, an idle timeout giving up early -- all look the
+    /// same from this cache's point of view: the body was dropped before
+    /// reaching a clean EOF) must never be reused either, even against a
+    /// upstream that is itself perfectly willing to keep the connection
+    /// open. Proves a not-cleanly-finished connection never returns to the
+    /// pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncated_or_errored_response_is_not_reused() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_counting_h1_keepalive_upstream().await;
+                let router =
+                    build_router(addr, prefix_matcher("/"), forward_to_up(None, None, None)).await;
+
+                let resp1 = router.handle(request("/")).await;
+                assert_eq!(resp1.head.status, StatusCode::OK);
+                // Deliberately drop the body WITHOUT draining it to EOF --
+                // `H1ReuseBody::completed` never gets set, so its `Drop`
+                // must discard the connection rather than risk handing the
+                // next request a connection whose peer may still be
+                // mid-write of THIS response.
+                drop(resp1.body);
+
+                let resp2 = router.handle(request("/")).await;
+                assert_eq!(resp2.head.status, StatusCode::OK);
+                resp2
+                    .body
+                    .collect()
+                    .await
+                    .expect("second response body drains cleanly");
+
+                assert_eq!(
+                    accepted.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "a response body dropped before EOF must never be reused"
                 );
             })
             .await;

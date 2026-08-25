@@ -38,11 +38,14 @@
 //! (or new) connection; hyper's real per-connection queue is still what
 //! ultimately keeps everything safe if that guess runs a little high.
 //!
-//! h1 is untouched by this slice: it stays connect-per-stream through
-//! `proxy_cluster::pool::ConnectPool`, exactly as before (see `router.rs`'s
-//! module doc). Keep-alive reuse for h1 has its own hazards (draining the
-//! body before reuse, `Connection: close`, idle timeouts) and is WP-15
-//! slice B.
+//! h1 was untouched by slices A/C: h1 has no multiplexing (one request in
+//! flight per connection, ever), so none of the stream-accounting machinery
+//! above applies to it. Keep-alive reuse for h1 is [`H1ConnCache`] (WP-15
+//! slice B, below) -- a much smaller cache in shape (one IDLE connection
+//! leased to one request at a time, never shared concurrently) but with its
+//! own hazard the h2 cache never has to think about: an h1 connection is
+//! only safe to hand to the NEXT request after its CURRENT response body has
+//! reached a clean end of stream. See that type's doc for the full rule.
 //!
 //! This cache lives here, in `proxy-http`, and not in `proxy-cluster`
 //! alongside [`proxy_cluster::HttpConnPool`], because hyper's h2
@@ -55,7 +58,7 @@
 //! today (dial raw bytes); this cache sits on top of it, worker-side.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -63,11 +66,16 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
+use hyper::client::conn::http1::SendRequest as Http1SendRequest;
 use hyper::client::conn::http2::SendRequest;
 use proxy_cluster::{HttpConnPool, PoolError, UpstreamProtocol};
 
-use crate::codec::{handshake_upstream_http2, send_on_http2, UpstreamCodecError};
+use crate::codec::{
+    handshake_upstream_http1, handshake_upstream_http2, send_on_http2, UpstreamCodecError,
+};
+use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody};
 
 /// The cache key -- and a security boundary, not just a lookup convenience.
@@ -500,6 +508,453 @@ thread_local! {
 /// need to hold the cache across `.await` points.
 pub fn worker_conn_cache() -> Rc<UpstreamConnCache> {
     WORKER_CONN_CACHE.with(Rc::clone)
+}
+
+// ---------------------------------------------------------------------
+// WP-15 slice B: HTTP/1.1 upstream keep-alive connection reuse.
+// ---------------------------------------------------------------------
+
+/// How many IDLE h1 connections [`H1ConnCache`] will hold open, at most, for
+/// one [`ConnKey`], waiting for a future request to lease them. Deliberately
+/// small: unlike the h2 cache's [`MAX_CONNECTIONS_PER_KEY`] (which bounds
+/// *concurrently in-use* connections), every one of these is doing nothing
+/// but holding a socket open on the CHANCE the next request happens to be
+/// for the same upstream soon -- 8 is enough to smooth out a bursty
+/// sequential workload against one provider without accumulating a large
+/// number of sockets that just sit there between bursts. There is
+/// deliberately no idle-timeout eviction in this slice (see this module's
+/// doc and `router.rs`'s "Deferred" list) -- an idle connection nobody
+/// leases again just waits until the peer closes it, and the next
+/// `get_or_connect_h1` call's `is_closed()` check on it catches that.
+const MAX_IDLE_PER_KEY: usize = 8;
+
+/// One IDLE h1 connection [`H1ConnCache`] is holding onto between requests --
+/// handshaken, currently unleased, and (as far as this cache last checked)
+/// still open.
+struct IdleH1Conn {
+    sender: Http1SendRequest<StreamBody>,
+    conn_task: tokio::task::JoinHandle<()>,
+    /// The S5 `max_connections` slot (WP-15) this physical connection holds,
+    /// exactly like [`PooledConn::_cb_guard`] -- moved out of the
+    /// `proxy_cluster::UpstreamStream` `pool.new_stream()` returned, and kept
+    /// alive for as long as this connection is cached, releasing the slot
+    /// only when [`IdleH1Conn::discard`] runs (or the connection is leased
+    /// back out and later discarded from `H1ReuseBody`).
+    cb_guard: Option<proxy_cluster::CbGuard>,
+}
+
+impl IdleH1Conn {
+    /// Explicitly tear this idle connection down: abort `conn_task` (which
+    /// stops it being polled, dropping the underlying IO), then let
+    /// `sender`/`cb_guard` drop normally as this method returns -- `cb_guard`
+    /// dropping is what releases the WP-15 `max_connections` slot.
+    ///
+    /// Rust note: this is a plain consuming method, not a `Drop` impl.
+    /// `Drop::drop` only ever gets `&mut self`, and Rust forbids moving a
+    /// field out of a value that implements `Drop` at all -- but the REUSE
+    /// path (`H1ConnCache::get_or_connect_h1`, below) needs to move
+    /// `sender`/`conn_task`/`cb_guard` out of an `IdleH1Conn` wholesale, by
+    /// value, into a [`LeasedH1`]. Giving this type a `Drop` impl would make
+    /// that move illegal. An explicit `discard(self)`, called at every site
+    /// that decides NOT to keep an idle entry, gets the same guarantee (a
+    /// discarded connection is always torn down promptly, never left
+    /// dangling) without that conflict -- the reuse path just destructures
+    /// the value directly instead, which is only legal because there's no
+    /// `Drop` impl in the way.
+    fn discard(self) {
+        self.conn_task.abort();
+    }
+}
+
+/// Per-worker cache of IDLE, reusable HTTP/1.1 upstream connections, keyed by
+/// [`ConnKey`]. Reached via [`worker_h1_conn_cache`]; see [`UpstreamConnCache`]'s
+/// doc for why this lives in `proxy-http` (not `proxy-cluster`) and why a
+/// `thread_local!`, not a `RouterFilterFactory` field.
+///
+/// h1 has no multiplexing: one connection carries exactly one request at a
+/// time, ever. So unlike [`UpstreamConnCache`] (which hands out CLONES of a
+/// live `SendRequest` to run concurrently), this cache only ever holds
+/// connections that are between requests, and a lease removes an entry from
+/// here entirely rather than incrementing an in-flight counter -- there's
+/// nothing to share while a lease is out. That also means there's no
+/// thundering-herd hazard to guard against the way [`UpstreamConnCache::get_or_connect`]'s
+/// per-key `tokio::sync::Mutex` does: two requests racing for the same key
+/// with an empty idle set just both dial their own connection, which is
+/// correct h1 behavior (one connection can't serve two requests at once
+/// anyway), not a bug -- so a plain `RefCell` is enough here.
+///
+/// The hazard this cache DOES have to guard, that the h2 cache doesn't: an
+/// h1 connection is only safe to reuse once its CURRENT response body has
+/// reached a clean end of stream. Handing out a connection whose response is
+/// still mid-flight (or that ended in an error, or that the caller gave up
+/// reading before EOF) would let the next request's bytes land while the
+/// peer is still mid-write of the previous response -- a real
+/// response/request desync, not just a wasted connection. See [`H1ReuseBody`]
+/// for where that decision is made, and why it's made in `Drop`.
+pub struct H1ConnCache {
+    slots: RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>,
+}
+
+impl Default for H1ConnCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H1ConnCache {
+    pub fn new() -> Self {
+        Self {
+            slots: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Return a leased h1 connection for `key`: the front of the idle queue
+    /// if it holds anything still open, dialing (and handshaking) a fresh
+    /// one otherwise. Every dead entry encountered while scanning (`sender.
+    /// is_closed()`) is discarded on the way past -- see [`IdleH1Conn::discard`]
+    /// -- rather than left in the queue to be found again.
+    ///
+    /// Rust note: `self: Rc<Self>`, not `&self` -- this is one of Rust's
+    /// stable "arbitrary self types" (alongside plain `self`/`&self`/
+    /// `&mut self`/`Box<Self>`/`Arc<Self>`). Taking the `Rc` itself, by
+    /// value, is what lets this method hand the SAME `Rc` straight into the
+    /// returned [`LeasedH1`] (its `cache` field) without a second,
+    /// redundant clone -- `LeasedH1`/`H1ReuseBody` need to push a finished
+    /// connection back into this exact cache from `Drop`, long after this
+    /// call returns, so they need to own a cheap (`Rc`, pointer-bump) handle
+    /// to it. Callers pass `self.h1_cache.clone()` (see `router.rs`'s
+    /// attempt loop) rather than `&self.h1_cache`.
+    pub async fn get_or_connect_h1(
+        self: Rc<Self>,
+        key: ConnKey,
+        pool: &dyn HttpConnPool,
+    ) -> Result<LeasedH1, PoolError> {
+        loop {
+            let candidate = self
+                .slots
+                .borrow_mut()
+                .get_mut(&key)
+                .and_then(VecDeque::pop_front);
+            let Some(idle) = candidate else {
+                break;
+            };
+            if idle.sender.is_closed() {
+                idle.discard();
+                continue;
+            }
+            let IdleH1Conn {
+                sender,
+                conn_task,
+                cb_guard,
+            } = idle;
+            return Ok(LeasedH1 {
+                sender,
+                conn_task,
+                cb_guard,
+                cache: self,
+                key,
+            });
+        }
+
+        // Nothing reusable was cached for this key -- dial fresh. Same
+        // destructure-for-independent-moves reasoning as
+        // `UpstreamConnCache::get_or_connect`'s own dial branch: `io` moves
+        // into the handshake below, `cb_guard` has to survive that move.
+        let proxy_cluster::UpstreamStream { io, cb_guard } = pool.new_stream().await?;
+        // A handshake failure folds into `PoolError::TlsHandshake`, same
+        // "never got a usable connection" bucket `UpstreamConnCache::get_or_connect`
+        // already folds its own h2 handshake failure into -- see that call
+        // site's comment for why there's no dedicated `PoolError` variant
+        // for this.
+        let (sender, conn_task) = handshake_upstream_http1(io)
+            .await
+            .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))?;
+        Ok(LeasedH1 {
+            sender,
+            conn_task,
+            cb_guard,
+            cache: self,
+            key,
+        })
+    }
+}
+
+/// A leased h1 connection, ready to carry exactly one request -- returned by
+/// [`H1ConnCache::get_or_connect_h1`] instead of a bare `SendRequest` so the
+/// cache/key/task travel with it, for [`Self::send`] to hand to
+/// [`H1ReuseBody`] once the response comes back.
+pub struct LeasedH1 {
+    sender: Http1SendRequest<StreamBody>,
+    conn_task: tokio::task::JoinHandle<()>,
+    cb_guard: Option<proxy_cluster::CbGuard>,
+    cache: Rc<H1ConnCache>,
+    key: ConnKey,
+}
+
+impl LeasedH1 {
+    /// Send `req` over this leased connection and return the response,
+    /// head-first with a streaming body -- the reuse-aware counterpart to
+    /// `codec::send_upstream_http1`. Builds the outgoing request the same
+    /// way that function does, with one deliberate omission: it never sets
+    /// `Connection: close`. Sending that header is exactly what made every
+    /// prior h1 request connect-per-stream; leaving it off is the entire
+    /// point of this cache existing.
+    pub async fn send(
+        self,
+        req: HttpRequestParts,
+    ) -> Result<HttpResponseParts, UpstreamCodecError> {
+        let LeasedH1 {
+            mut sender,
+            conn_task,
+            cb_guard,
+            cache,
+            key,
+        } = self;
+
+        let RequestHeaders {
+            method,
+            uri,
+            headers,
+        } = req.head;
+        let mut builder = http::Request::builder().method(method).uri(uri);
+        *builder.headers_mut().expect("builder not yet finalized") = headers;
+        let request = builder
+            .body(req.body)
+            .expect("method/uri were already valid; building can't fail here");
+
+        let response = match sender.send_request(request).await {
+            Ok(response) => response,
+            Err(send_err) => {
+                // Never returned to the pool: a failed `send_request` means
+                // this connection is suspect (the peer may have closed it
+                // right as we wrote, or mid-write of the request itself) --
+                // reusing it would be exactly the "poisoned connection"
+                // outcome this whole design exists to prevent. Abort the
+                // conn task explicitly (tears the connection down); `sender`/
+                // `cb_guard` drop normally right after, releasing the
+                // `max_connections` slot.
+                conn_task.abort();
+                drop(sender);
+                drop(cb_guard);
+                return Err(UpstreamCodecError::Send(send_err));
+            }
+        };
+
+        // The ONE thing decided up front, from the response head: is the
+        // peer even willing to keep this connection open? HTTP/1.0 has no
+        // persistent-connection default, and any HTTP version can opt out
+        // explicitly with `Connection: close`. This is a necessary
+        // condition for reuse, not sufficient -- `H1ReuseBody`'s `Drop`
+        // still requires a CLEAN end of stream on top of it (see that type's
+        // doc) before actually returning the connection to the cache.
+        let reusable = response.version() >= http::Version::HTTP_11
+            && !response_has_connection_close(&response);
+
+        let (parts, incoming) = response.into_parts();
+        let head = ResponseHeaders {
+            status: parts.status,
+            headers: parts.headers,
+        };
+        // Rust note: same adaptation `codec::send_upstream_http1` does for
+        // its own response body -- adapt `Incoming`'s error type to
+        // `BodyError`, then box it into a `StreamBody` -- before wrapping
+        // that (already-erased) body in `H1ReuseBody` below. This keeps
+        // `H1ReuseBody` itself generic over "any `StreamBody`" rather than
+        // needing to name `Incoming`, and matches `GuardedBody`'s existing
+        // shape in this same file (wrap the adapted `StreamBody`, not the
+        // raw hyper body).
+        let inner: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
+
+        let body: StreamBody = local_boxed(H1ReuseBody {
+            inner,
+            sender: Some(sender),
+            conn_task: Some(conn_task),
+            cb_guard,
+            cache,
+            key,
+            reusable,
+            completed: false,
+            errored: false,
+        });
+
+        Ok(HttpResponseParts { head, body })
+    }
+}
+
+/// Does `response`'s `Connection` header carry a `close` token
+/// (case-insensitively, tolerating a comma-separated list)? Generic over the
+/// body type so it works directly on the still-unsplit
+/// `http::Response<hyper::body::Incoming>` `LeasedH1::send` has in hand
+/// right after `send_request` returns.
+fn response_has_connection_close<B>(response: &http::Response<B>) -> bool {
+    response
+        .headers()
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("close"))
+}
+
+/// The response body wrapper that makes h1 reuse safe: it delegates every
+/// poll to `inner`, tracking along the way whether the stream reached a
+/// CLEAN end (`completed`) or an error (`errored`) -- and defers the actual
+/// "is this connection safe to hand to the next request?" decision to
+/// [`Drop`], which is the only place that can see the FINAL state of both
+/// flags together with how the body was actually consumed (fully drained,
+/// vs. dropped early by a caller that stopped reading).
+///
+/// Every field this type needs to move out of itself on drop (`sender`,
+/// `conn_task`) is wrapped in `Option` for exactly that reason -- see
+/// `Drop`'s own doc below for why, and contrast with [`IdleH1Conn::discard`]'s
+/// note, which solves the same underlying conflict (Rust forbids moving a
+/// field out of a `Drop` type) the opposite way, because a consuming method
+/// had the freedom to take `self` by value and this `Drop` impl doesn't.
+struct H1ReuseBody {
+    inner: StreamBody,
+    sender: Option<Http1SendRequest<StreamBody>>,
+    conn_task: Option<tokio::task::JoinHandle<()>>,
+    cb_guard: Option<proxy_cluster::CbGuard>,
+    cache: Rc<H1ConnCache>,
+    key: ConnKey,
+    /// Decided once, from the response head, in `LeasedH1::send` -- see that
+    /// method's doc for what makes a response reusable at all.
+    reusable: bool,
+    /// Set by `poll_frame` the moment `inner` reports a clean end of stream
+    /// (`Poll::Ready(None)`). Never set at all if the body is dropped before
+    /// that happens -- which is exactly the "client hung up mid-read, or we
+    /// gave up early" case `Drop` below must never reuse.
+    completed: bool,
+    /// Set by `poll_frame` the moment `inner` reports an error frame. A body
+    /// can report a frame error and STILL later reach `Poll::Ready(None)`
+    /// depending on the underlying codec, so this flag -- not just
+    /// `completed` -- is what `Drop` checks; `completed && errored` must
+    /// never be treated as safe to reuse.
+    errored: bool,
+}
+
+impl Body for H1ReuseBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        // Rust note: same "get_mut + Pin::new on the one non-`Copy` field"
+        // shape `GuardedBody::poll_frame` uses in this same file, and sound
+        // for the same reason -- `inner` is a `StreamBody`
+        // (`Pin<Box<dyn Body<..>>>`, `Unpin` regardless of what it boxes),
+        // and every other field here is a plain owned value with no
+        // self-references, so `H1ReuseBody` as a whole is `Unpin` and no
+        // manual (`unsafe`) pin projection is needed.
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_frame(cx);
+        match &poll {
+            Poll::Ready(Some(Err(_))) => this.errored = true,
+            Poll::Ready(None) => this.completed = true,
+            _ => {}
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for H1ReuseBody {
+    /// The return-to-pool decision. This is where it has to live, not
+    /// `poll_frame`: only `Drop` sees the body's FINAL state -- whether it
+    /// was actually drained to `completed`, or abandoned mid-stream --
+    /// together with whatever `poll_frame` observed along the way. Deciding
+    /// any earlier (e.g. the instant `completed` flips true) would be wrong
+    /// in the opposite direction too: nothing stops a caller from reading
+    /// past EOF-detection and still holding the body value around, and
+    /// nothing here needs it to stop -- `Drop` firing IS "this body is
+    /// completely done, one way or the other", which is exactly the
+    /// question being answered.
+    ///
+    /// Rust note: `Drop::drop` only ever gets `&mut self`, so `sender`/
+    /// `conn_task` must come out via `Option::take()` rather than a
+    /// wholesale destructure (illegal here -- see `IdleH1Conn::discard`'s
+    /// doc for the general rule this and that are opposite sides of).
+    /// `cb_guard` is already `Option<CbGuard>` in its own right (a cluster
+    /// with no `max_connections` limit configured has no guard to hold at
+    /// all), so `.take()` on it needs no extra wrapping.
+    fn drop(&mut self) {
+        let (Some(sender), Some(conn_task)) = (self.sender.take(), self.conn_task.take()) else {
+            // `Drop::drop` only ever runs once per value, so this is
+            // unreachable in practice -- kept `Option`-typed (rather than
+            // plain fields moved out via `unsafe`) specifically so this
+            // stays a safe, total match instead of a bare `.unwrap()`.
+            return;
+        };
+        let cb_guard = self.cb_guard.take();
+
+        // The ONE safe-to-reuse condition, checked in full: the response
+        // body reached a CLEAN end of stream (no error anywhere along the
+        // way), the response head said the peer is willing to keep the
+        // connection open (`reusable`, decided in `LeasedH1::send`), and the
+        // connection hasn't since been observed closed. Every branch below
+        // this `if` is a deliberate DISCARD -- see the comment just above
+        // `conn_task.abort()` for why each of those cases is unsafe to
+        // reuse.
+        if self.completed && !self.errored && self.reusable && !sender.is_closed() {
+            let mut slots = self.cache.slots.borrow_mut();
+            let idle_conns = slots.entry(self.key.clone()).or_default();
+            if idle_conns.len() < MAX_IDLE_PER_KEY {
+                idle_conns.push_back(IdleH1Conn {
+                    sender,
+                    conn_task,
+                    cb_guard,
+                });
+                return;
+            }
+            // This key's idle queue is already at `MAX_IDLE_PER_KEY` --
+            // drop the borrow before falling through to the discard path
+            // below (nothing there needs it, but there's no reason to hold
+            // it a moment longer than necessary).
+            drop(slots);
+        }
+        // Every other case lands here, and all of them share one reason:
+        // returning THIS connection to the pool risks handing a future
+        // request a connection that is still mid-response, in an unknown
+        // state, or about to be closed by the peer --
+        //   - body dropped before `completed` (client hung up, or a caller
+        //     upstream of this one -- e.g. a route `idle_timeout` --  gave
+        //     up early): the peer may still be mid-write of this response,
+        //     so the next byte on this connection could be more of THIS
+        //     response, not the start of a fresh one;
+        //   - `errored`: same "unknown mid-response state" reasoning, just
+        //     via a decode error instead of an early drop;
+        //   - `!reusable`: the peer explicitly said (HTTP/1.0, or
+        //     `Connection: close`) that it's closing this connection after
+        //     this response, so a reuse attempt would just fail anyway;
+        //   - `sender.is_closed()`: already gone, nothing to return;
+        //   - the idle queue was full: not unsafe, just no room -- discarded
+        //     rather than grown unbounded (see `MAX_IDLE_PER_KEY`'s doc).
+        // In every one of these, abort the connection task (tears the
+        // connection down) and let `sender`/`cb_guard` drop normally right
+        // after, releasing the `max_connections` slot.
+        conn_task.abort();
+    }
+}
+
+thread_local! {
+    // Rust note: one `H1ConnCache` per worker OS thread -- same reasoning as
+    // `WORKER_CONN_CACHE` just above.
+    static WORKER_H1_CONN_CACHE: Rc<H1ConnCache> = Rc::new(H1ConnCache::new());
+}
+
+/// This worker's [`H1ConnCache`]. Same "`Rc` clone, not a borrow" shape as
+/// [`worker_conn_cache`] -- see that function's doc for why.
+pub fn worker_h1_conn_cache() -> Rc<H1ConnCache> {
+    WORKER_H1_CONN_CACHE.with(Rc::clone)
 }
 
 #[cfg(test)]
