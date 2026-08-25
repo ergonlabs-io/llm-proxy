@@ -955,16 +955,21 @@ impl RouterHandler {
                                 continue;
                             }
                         }
-                        // A refused stream is a REMOTE RESET, not a codec
-                        // failure -- the peer deliberately bounced the
-                        // stream, which is exactly what Envoy's `UR` means.
-                        // Every other codec error stays `UC`. Before the
-                        // refused-stream decode landed, `UR` was declared and
-                        // never produced by anything (docs/envoy-divergences.md
-                        // recorded it as dead code); this is its first real
-                        // producer.
-                        if matches!(err, UpstreamCodecError::RefusedStream) {
-                            tracing::debug!(response_flag = "UR", cluster = %attempt_cluster, "upstream refused the stream");
+                        // An explicit REMOTE RESET by the peer is `UR`, not a
+                        // codec failure -- a refused stream, but also any
+                        // other h2 `RST_STREAM` reason (CANCEL, INTERNAL_ERROR,
+                        // ...), all of which mean the peer deliberately reset
+                        // the stream. That is exactly what Envoy's `UR` means;
+                        // see `codec::is_remote_reset` for why REFUSED_STREAM
+                        // has its own variant while the rest ride in on a
+                        // `Send`/`Connection` with the h2 reason still
+                        // recoverable. A connection that merely closed (no h2
+                        // reason -- a FIN, or an h1 termination) stays `UC`.
+                        // Flag-only: retry classification is unchanged (a
+                        // reset before headers is retriable under `reset`
+                        // either way).
+                        if crate::codec::is_remote_reset(&err) {
+                            tracing::debug!(response_flag = "UR", cluster = %attempt_cluster, "upstream reset the stream");
                             dcb.stream_info()
                                 .set_response_flag(ResponseFlag::UpstreamRemoteReset);
                         } else {

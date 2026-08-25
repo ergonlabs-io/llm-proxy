@@ -564,6 +564,69 @@ async fn a_refused_h2_stream_records_and_renders_the_ur_flag() {
         .await;
 }
 
+/// An h2 upstream that resets every stream with `RST_STREAM(CANCEL)` -- a
+/// deliberate reset, but NOT `REFUSED_STREAM`, so it rides in on
+/// `UpstreamCodecError::Send` rather than the dedicated `RefusedStream`
+/// variant. Same raw-`h2::server` shape as the refuse harness above.
+async fn spawn_h2_upstream_that_cancels_every_stream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        loop {
+            let Ok((io, _peer)) = listener.accept().await else {
+                return;
+            };
+            tokio::task::spawn_local(async move {
+                let Ok(mut conn) = h2::server::handshake(io).await else {
+                    return;
+                };
+                while let Some(accepted) = conn.accept().await {
+                    let Ok((_req, mut respond)) = accepted else {
+                        return;
+                    };
+                    respond.send_reset(h2::Reason::CANCEL);
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A non-`REFUSED_STREAM` reset (here `CANCEL`) is still a deliberate remote
+/// reset -> `UR`, not `UC`. Before `codec::is_remote_reset` landed, only
+/// `REFUSED_STREAM` rendered `UR` and every other reset reason fell through to
+/// `UC`, mislabelling a peer-initiated reset as a plain connection failure.
+/// Flag-only: with no retry policy the reset surfaces as a rendered flag.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancelled_h2_stream_records_and_renders_the_ur_flag() {
+    LocalSet::new()
+        .run_until(async {
+            let addr = spawn_h2_upstream_that_cancels_every_stream().await;
+            let path = temp_path("ur-flag-cancel");
+            let mut scenario =
+                Scenario::forwarding_to(addr, forward_to(ForwardTarget::Cluster("up".into())));
+            scenario.protocol = proxy_config::ir::UpstreamProtocol::Http2;
+            let handler = build_router(
+                scenario,
+                &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
+            )
+            .await;
+
+            let resp = handler.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::BAD_GATEWAY);
+            resp.body.collect().await.unwrap();
+
+            assert_eq!(
+                read_to_string(&path),
+                "502 UR\n",
+                "an h2 RST_STREAM(CANCEL) is a remote reset -- `UC` here would mean the router \
+                 still treats every non-refused reset reason as a plain connection failure"
+            );
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
 // --- DC: downstream connection termination ----------------------------------
 
 /// `DC` was the second flag the WP-24 audit found declared, apparently

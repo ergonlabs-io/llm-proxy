@@ -250,6 +250,35 @@ fn h2_reason(err: &hyper::Error) -> Option<h2::Reason> {
     None
 }
 
+/// Does `err` represent an explicit REMOTE RESET by the upstream (Envoy `UR`),
+/// as opposed to a connection that merely terminated (`UC`) or a local /
+/// handshake failure?
+///
+/// An h2 peer that answers with a `RST_STREAM` -- for ANY reason, not only
+/// `REFUSED_STREAM` -- has deliberately reset the stream, which is exactly
+/// what `UR` means. [`UpstreamCodecError::RefusedStream`] already has its own
+/// variant (it carries an extra unconditional-retry guarantee no other reset
+/// does), but every OTHER reason (`CANCEL`, `INTERNAL_ERROR`, ...) is folded
+/// into [`Send`](UpstreamCodecError::Send)/[`Connection`](UpstreamCodecError::Connection)
+/// with the h2 reason still recoverable via [`h2_reason`] -- which is what
+/// this reads. A `Send`/`Connection` error with NO h2 reason is a plain
+/// connection close (a FIN / broken pipe, or an h1 termination that has no
+/// stream-level reset at all) and stays `UC`; a `Handshake` failure and a
+/// local `MissingAuthority` are not remote resets either.
+///
+/// Flag-only: this does not change retry classification. A reset before
+/// headers is already retriable under S3.2's `reset`
+/// ([`AttemptOutcome::from_codec_error`](crate::retry::AttemptOutcome::from_codec_error)
+/// maps `Send`/`Connection` to `ResetBeforeHeaders` regardless); this only
+/// decides whether the rendered response flag is `UR` or `UC`.
+pub fn is_remote_reset(err: &UpstreamCodecError) -> bool {
+    match err {
+        UpstreamCodecError::RefusedStream => true,
+        UpstreamCodecError::Send(e) | UpstreamCodecError::Connection(e) => h2_reason(e).is_some(),
+        UpstreamCodecError::Handshake(_) | UpstreamCodecError::MissingAuthority => false,
+    }
+}
+
 /// Send one request upstream over `io` as HTTP/1.1 and return the response,
 /// head-first with a streaming body -- the client-side mirror of
 /// `serve_http1`/`serve_one`.
