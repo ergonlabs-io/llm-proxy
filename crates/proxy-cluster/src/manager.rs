@@ -729,11 +729,21 @@ impl ClusterEntry for ClusterHandle {
             .hostname
             .clone()
             .unwrap_or_else(|| host.address.ip().to_string());
+        // Rust note: this slice enforces the DEFAULT-priority connection
+        // budget only. `RoutingPriority::High` is a rare path and the router
+        // doesn't thread priority into `http_pool` today, so a HIGH-priority
+        // route's dials are still counted against `default_cb` here; wiring
+        // per-priority connection budgets through is a follow-up, not this
+        // slice. `.clone()` shares the same gauge (`CircuitBreakerState`'s
+        // `Arc`-backed handles) across every per-call `ConnectPool` this
+        // method builds for the cluster, so the count stays global per
+        // cluster as intended.
         Arc::new(crate::pool::ConnectPool::new(
             host.address,
             Arc::clone(&self.managed.transport),
             server_name,
             self.managed.connect_timeout,
+            self.circuit_breaker(RoutingPriority::Default).clone(),
         ))
     }
 

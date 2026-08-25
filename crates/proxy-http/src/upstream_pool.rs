@@ -172,6 +172,13 @@ const MAX_CONNECTIONS_PER_KEY: usize = 4;
 struct PooledConn {
     sender: SendRequest<StreamBody>,
     in_flight: Rc<Cell<usize>>,
+    /// The S5 `max_connections` slot (WP-15) this physical connection holds
+    /// -- moved out of the [`proxy_cluster::UpstreamStream`] `pool.new_stream()`
+    /// returned, rather than dropped at the end of `get_or_connect`, so it
+    /// lives exactly as long as this cached connection does and releases the
+    /// slot only when the connection is evicted (dead-connection `retain`,
+    /// `invalidate`, or `clear`). Never read -- it's a pure RAII drop-guard.
+    _cb_guard: Option<proxy_cluster::CbGuard>,
 }
 
 /// One cache slot: the bounded set of connections currently held for a
@@ -391,7 +398,13 @@ impl UpstreamConnCache {
         // as long as the set is still under the hard cap on how many
         // physical connections this key is allowed to hold.
         if conns.len() < MAX_CONNECTIONS_PER_KEY {
-            let upstream = pool.new_stream().await?;
+            // Rust note: destructure rather than binding `upstream` whole --
+            // `upstream.io` moves into `handshake_upstream_http2` below and
+            // `upstream.cb_guard` must survive that move to ride into the
+            // `PooledConn` we push, so both fields need to come out
+            // independently instead of through a struct that would otherwise
+            // still be holding the guard when `io` is consumed.
+            let proxy_cluster::UpstreamStream { io, cb_guard } = pool.new_stream().await?;
             // A handshake failure is folded into `PoolError::TlsHandshake`:
             // there's no dedicated pool-error variant for "connected, but
             // the h2 preface/settings exchange failed" (`PoolError` lives in
@@ -399,12 +412,13 @@ impl UpstreamConnCache {
             // the same "never got a usable connection" bucket the retry
             // engine already treats a real TLS handshake failure as
             // (`AttemptOutcome::from_pool_error`).
-            let sender = handshake_upstream_http2(upstream.io)
+            let sender = handshake_upstream_http2(io)
                 .await
                 .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))?;
             conns.push(PooledConn {
                 sender,
                 in_flight: Rc::new(Cell::new(0)),
+                _cb_guard: cb_guard,
             });
             let conn = conns.last().expect("just pushed one line above");
             return Ok(lease(conn));
@@ -647,6 +661,7 @@ mod tests {
             Arc::new(RawTransportSocket),
             addr.ip().to_string(),
             std::time::Duration::from_secs(30),
+            proxy_cluster::CircuitBreakerState::default(),
         )
     }
 

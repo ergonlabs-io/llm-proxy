@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 
 use crate::transport::UpstreamTransportSocket;
-use crate::{HttpConnPool, PoolError, UpstreamStream};
+use crate::{CircuitBreakerState, HttpConnPool, PoolError, UpstreamStream};
 
 /// One pool per (worker, host, protocol) in the real design; v1 is just a
 /// dialer for a single fixed address plus the cluster's transport socket.
@@ -42,6 +42,13 @@ pub struct ConnectPool {
     /// TCP-only timeout; wrapping both phases in the same deadline closes
     /// that gap.
     connect_timeout: Duration,
+    /// The cluster's S5 `max_connections` budget (WP-15). A whole
+    /// [`CircuitBreakerState`] clone, not a borrow -- it shares the same
+    /// underlying gauge (`CircuitBreakerState` is `Clone`-and-shared, see its
+    /// own doc), so every per-call `ConnectPool` built for a cluster
+    /// (`ClusterHandle::http_pool` makes a fresh one per call) still enforces
+    /// one global count.
+    connections: CircuitBreakerState,
 }
 
 impl ConnectPool {
@@ -50,12 +57,14 @@ impl ConnectPool {
         transport: Arc<dyn UpstreamTransportSocket>,
         server_name: String,
         connect_timeout: Duration,
+        connections: CircuitBreakerState,
     ) -> Self {
         Self {
             addr,
             transport,
             server_name,
             connect_timeout,
+            connections,
         }
     }
 }
@@ -100,7 +109,18 @@ impl HttpConnPool for ConnectPool {
         let transport = Arc::clone(&self.transport);
         let server_name = self.server_name.clone();
         let connect_timeout = self.connect_timeout;
+        let connections = self.connections.clone();
         Box::pin(async move {
+            // S5's `max_connections`: claimed before the dial so an
+            // over-budget cluster never opens the socket. `CbGuard` is
+            // `Send + 'static`, so it's fine to hold across the `.await`s
+            // below; if anything after this returns early via `?`
+            // (connect/handshake failure, timeout), the guard drops right
+            // here and releases the slot -- exactly the "failed dial doesn't
+            // leak budget" behaviour this exists for.
+            let guard = connections
+                .try_acquire_connection()
+                .ok_or(PoolError::Overflow)?;
             // Rust note: `tokio::time::timeout` races the given future
             // against a deadline and returns `Err(Elapsed)` if the deadline
             // wins; it does not cancel/abort anything on its own, but
@@ -120,7 +140,10 @@ impl HttpConnPool for ConnectPool {
             })
             .await
             .map_err(|_elapsed| PoolError::ConnectTimeout)??;
-            Ok(UpstreamStream { io: connected })
+            Ok(UpstreamStream {
+                io: connected,
+                cb_guard: Some(guard),
+            })
         })
     }
 }
@@ -170,6 +193,7 @@ mod tests {
             Arc::new(RawTransportSocket),
             addr.ip().to_string(),
             AMPLE_TIMEOUT,
+            CircuitBreakerState::default(),
         )
     }
 
@@ -233,6 +257,7 @@ mod tests {
             Arc::new(FailingTransport),
             "host".to_string(),
             AMPLE_TIMEOUT,
+            CircuitBreakerState::default(),
         );
 
         match pool.new_stream().await {
@@ -266,6 +291,7 @@ mod tests {
             transport.clone(),
             "api.example.com".to_string(),
             AMPLE_TIMEOUT,
+            CircuitBreakerState::default(),
         );
 
         pool.new_stream().await.expect("connect should succeed");
@@ -305,6 +331,7 @@ mod tests {
             Arc::new(RawTransportSocket),
             "host".to_string(),
             short_timeout,
+            CircuitBreakerState::default(),
         );
 
         let started = tokio::time::Instant::now();
@@ -358,6 +385,7 @@ mod tests {
             Arc::new(HangingTransport),
             "host".to_string(),
             short_timeout,
+            CircuitBreakerState::default(),
         );
 
         let started = tokio::time::Instant::now();
@@ -371,5 +399,42 @@ mod tests {
             Err(other) => panic!("expected ConnectTimeout, got {other}"),
             Ok(_) => panic!("a hanging transport socket must never resolve"),
         }
+    }
+
+    #[tokio::test]
+    async fn max_connections_is_enforced_at_dial_and_released_on_drop() {
+        // S5's `max_connections` (WP-15): a cluster with a budget of 1 must
+        // reject a second concurrent dial with `PoolError::Overflow`, and
+        // must accept a new dial again once the first connection is dropped
+        // -- acquire, reject-at-limit, and release-on-drop, in one test.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let one_connection = proxy_config::ir::CircuitBreakerThresholds {
+            max_connections: 1,
+            ..proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT
+        };
+        let pool = ConnectPool::new(
+            addr,
+            Arc::new(RawTransportSocket),
+            addr.ip().to_string(),
+            AMPLE_TIMEOUT,
+            CircuitBreakerState::from_thresholds(one_connection),
+        );
+
+        let first = pool.new_stream().await.expect("first dial is under budget");
+        let (_accepted1, _client_addr1) = listener.accept().await.unwrap();
+
+        match pool.new_stream().await {
+            Err(PoolError::Overflow) => {}
+            Err(other) => panic!("expected Overflow, got {other}"),
+            Ok(_) => panic!("second dial must be shed (max_connections is 1)"),
+        }
+
+        // Dropping the first connection's stream releases its `CbGuard`,
+        // freeing the slot for a third dial.
+        drop(first);
+        let third = pool.new_stream().await;
+        let (_accepted2, _client_addr2) = listener.accept().await.unwrap();
+        third.expect("dial must succeed again once the slot was released");
     }
 }

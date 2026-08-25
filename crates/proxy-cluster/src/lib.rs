@@ -297,8 +297,10 @@ impl CircuitBreakerState {
         self.requests.try_acquire()
     }
 
-    // TODO(WP-15 pooling): check max_connections in the pool on dial.
-    #[allow(dead_code)]
+    /// The `max_connections` budget: acquired in [`pool::ConnectPool::new_stream`]
+    /// before dialing (so an over-budget cluster never opens the socket), and
+    /// held for the life of the physical connection -- see
+    /// [`UpstreamStream::cb_guard`].
     pub fn try_acquire_connection(&self) -> Option<CbGuard> {
         self.connections.try_acquire()
     }
@@ -334,9 +336,21 @@ pub struct UpstreamStream {
     /// the upstream h1/h2 codec over it, and both codecs are generic over
     /// `AsyncRead + AsyncWrite + Unpin`, so they don't care which it is.
     pub io: BoxedUpstreamIo,
-    // TODO(WP-15): release-on-drop pool guard + `active_requests` dec, and
-    // (for keep-alive reuse) hold the codec `SendRequest` handle rather than
-    // a raw transport -- at which point this seam changes shape.
+    /// The S5 `max_connections` slot this physical connection holds (see
+    /// [`CircuitBreakerState::try_acquire_connection`]). Dropping it releases
+    /// the slot, so it must live exactly as long as `io`'s underlying
+    /// connection does -- for h1 (connect-per-stream) that's this struct's
+    /// own lifetime; for the h2 cache (`proxy-http`'s `UpstreamConnCache`)
+    /// the caller moves it into the cached connection's own entry so it
+    /// outlives this `UpstreamStream`, not the other way round.
+    ///
+    /// `None` only on paths with no real budget to acquire against (test
+    /// helpers, or a caller that never runs `new_stream` through a
+    /// `ConnectPool`) -- every real dial sets it.
+    pub cb_guard: Option<CbGuard>,
+    // TODO(WP-15): (for keep-alive reuse on the h1 path) hold the codec
+    // `SendRequest` handle rather than a raw transport -- at which point
+    // this seam changes shape. The pool-guard half of this TODO is done.
 }
 
 /// The byte transport under an upstream HTTP stream, type-erased so a cluster
