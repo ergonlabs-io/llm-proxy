@@ -310,6 +310,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         router: router_stats,
         downstream: downstream_stats,
         token: token_stats,
+        tracing: None,
     };
 
     let bound = initial_bind(

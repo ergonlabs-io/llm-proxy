@@ -18,6 +18,9 @@ bytes = { workspace = true }
 core_affinity = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+# WP-51 increment 2: `SpanSink`/`TraceContext` -- the listener manager threads
+# these down to `build_hcm_handler` alongside `RouterStats`/`GenAiTokenStats`.
+proxy-observability = { workspace = true }
 prost-reflect = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -34,9 +37,11 @@ x509-parser = { workspace = true }
 proxy-api = { workspace = true }
 # WP-23 increment 6a: test helpers build a `StatsControl` to resolve the
 # `RouterStats` `initial_bind`/`build_listener_hcm` now require -- production
-# code only ever consumes `proxy_http::stat_handles::RouterStats`, already
-# reachable via the `proxy-http` dependency above, so this stays dev-only.
-proxy-observability = { workspace = true }
+# code only ever consumed `proxy_http::stat_handles::RouterStats`, already
+# reachable via the `proxy-http` dependency above, so this stayed dev-only
+# until WP-51 increment 2 promoted `proxy-observability` itself to a real
+# `[dependencies]` entry above (`SpanSink`/`TraceContext`); kept here too
+# would be a duplicate-key error, not a stricter dev-only bound.
 rcgen = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "io-util"] }

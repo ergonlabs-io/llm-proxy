@@ -1335,6 +1335,7 @@ dependencies = [
  "clap",
  "http",
  "proxy-admin",
+ "proxy-api",
  "proxy-cluster",
  "proxy-config",
  "proxy-core",
@@ -1345,6 +1346,7 @@ dependencies = [
  "ring",
  "serde_json",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1490,9 +1492,11 @@ dependencies = [
  "arc-swap",
  "chrono",
  "http",
+ "proxy-api",
  "rand",
  "thiserror 2.0.18",
  "tokio",
+ "tonic",
  "tracing",
 ]
 

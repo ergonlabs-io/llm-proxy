@@ -63,6 +63,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -73,6 +74,7 @@ use proxy_cluster::{
     ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol, UpstreamStream,
 };
 use proxy_config::ir::{DataSourceIR, ForwardTarget, RouteActionIR, RouteMatcher};
+use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, TraceContext};
 use proxy_observability::ResponseFlag;
 
 use crate::codec::{send_upstream_http1, Http1Options, UpstreamCodecError};
@@ -138,11 +140,28 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 pub struct RouterFilterFactory {
     clusters: Arc<ClusterManager>,
     stats: Arc<RouterStats>,
+    /// WP-51 increment 2: this HCM's span sink, if boot/reload wired one --
+    /// see [`RouterHandler::span_sink`]'s doc for where it's read.
+    span_sink: Option<SpanSink>,
 }
 
 impl RouterFilterFactory {
     pub fn new(clusters: Arc<ClusterManager>, stats: Arc<RouterStats>) -> Self {
-        Self { clusters, stats }
+        Self {
+            clusters,
+            stats,
+            span_sink: None,
+        }
+    }
+
+    /// WP-51 increment 2: attaches this HCM's span sink -- a builder method,
+    /// same shape as `FilterChainHandler::with_tracing` one layer up (every
+    /// existing `new` call site stays unaffected; `proxy-core`'s
+    /// `build_hcm_handler` calls this whenever `ConfigSnapshot::tracing` is
+    /// `Some`).
+    pub fn with_tracing(mut self, span_sink: SpanSink) -> Self {
+        self.span_sink = Some(span_sink);
+        self
     }
 }
 
@@ -151,6 +170,7 @@ impl TerminalFilterInstanceFactory for RouterFilterFactory {
         Box::new(RouterHandler::new(
             self.clusters.clone(),
             self.stats.clone(),
+            self.span_sink.clone(),
         ))
     }
 }
@@ -190,10 +210,23 @@ pub struct RouterHandler {
     captured_body: Bytes,
     /// Captured in `decode_trailers`, when present.
     captured_trailers: Option<RequestTrailers>,
+    /// WP-51 increment 2: this HCM's span sink, if tracing is on --
+    /// `apply_forward`'s attempt loop derives a CLIENT [`TraceContext::child`]
+    /// of `StreamInfo::trace` (the SERVER context) for each attempt when
+    /// this is `Some`, injects its `to_traceparent()` into that attempt's
+    /// upstream request headers, and emits a [`FinishedSpan`] through this
+    /// sink at the same 4 sites [`report_outlier`] is already called from --
+    /// a retry/fallback is a fresh attempt, so it gets a fresh child span
+    /// under the SAME server span, never a fresh trace.
+    span_sink: Option<SpanSink>,
 }
 
 impl RouterHandler {
-    pub fn new(clusters: Arc<ClusterManager>, stats: Arc<RouterStats>) -> Self {
+    pub fn new(
+        clusters: Arc<ClusterManager>,
+        stats: Arc<RouterStats>,
+        span_sink: Option<SpanSink>,
+    ) -> Self {
         Self {
             clusters,
             stats,
@@ -201,6 +234,7 @@ impl RouterHandler {
             captured_head: None,
             captured_body: Bytes::new(),
             captured_trailers: None,
+            span_sink,
         }
     }
 }
@@ -250,6 +284,22 @@ impl TerminalHttpFilter for RouterHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move { self.route_and_forward(cb).await })
     }
+}
+
+/// [`RouterHandler::emit_client_span`]'s payload, bundled purely to keep
+/// that method's argument count under clippy's `too_many_arguments`
+/// threshold -- the same motivation `proxy-core`'s `RunTerminalFilterCtx`
+/// documents for its own bundling. `attempt_trace` (the one thing that
+/// decides whether anything happens at all) stays a separate parameter
+/// rather than folding into this struct, so a call site's `None`-check
+/// reads at the call, not one field deeper.
+struct ClientSpanOutcome<'a> {
+    cluster: &'a str,
+    addr: std::net::SocketAddr,
+    start: SystemTime,
+    status: SpanStatus,
+    outcome: &'a str,
+    extra_attributes: Vec<(&'static str, String)>,
 }
 
 impl RouterHandler {
@@ -305,6 +355,47 @@ impl RouterHandler {
                 }
             },
         }
+    }
+
+    /// WP-51 increment 2: emit one CLIENT span for a concluded attempt --
+    /// called from the same 4 sites [`report_outlier`] already is, right
+    /// after it (see [`Self::span_sink`]'s doc for why the two are
+    /// deliberately kept in lockstep). A no-op whenever tracing is off
+    /// (`self.span_sink: None`), this attempt had no trace context at all
+    /// (`attempt_trace: None` -- only possible when `StreamInfo::trace`
+    /// itself was `None`, i.e. tracing off), or this stream's trace was
+    /// never sampled -- matching the SERVER span's own sampled-gate in
+    /// `access_logging::LoggingBody::finish`.
+    fn emit_client_span(&self, attempt_trace: Option<TraceContext>, o: ClientSpanOutcome<'_>) {
+        let (Some(sink), Some(ctx)) = (self.span_sink.as_ref(), attempt_trace) else {
+            return;
+        };
+        if !ctx.sampled {
+            return;
+        }
+        let ClientSpanOutcome {
+            cluster,
+            addr,
+            start,
+            status,
+            outcome,
+            extra_attributes,
+        } = o;
+        let mut attributes = vec![
+            ("upstream.cluster", cluster.to_string()),
+            ("upstream.host", addr.to_string()),
+            ("outcome", outcome.to_string()),
+        ];
+        attributes.extend(extra_attributes);
+        sink.emit(FinishedSpan {
+            context: ctx,
+            name: format!("upstream {cluster}"),
+            kind: SpanKind::Client,
+            start,
+            end: SystemTime::now(),
+            attributes,
+            status,
+        });
     }
 
     async fn apply_forward(
@@ -490,7 +581,21 @@ impl RouterHandler {
                 // names `attempt_cluster` (the cluster actually dialed), not
                 // the routed `cluster_name` -- matching Envoy's own
                 // `upstream_host->cluster().name()`.
-                {
+                // WP-51 increment 2: this attempt's CLIENT trace context --
+                // a fresh `TraceContext::child` of the SERVER span
+                // (`StreamInfo::trace`) for EVERY attempt, including a
+                // retry/fallback, so each one gets its own child span while
+                // all of them stay under the one server span (same
+                // trace_id, same parent). `None` when tracing is off, or
+                // this stream's server span was itself never minted
+                // (impossible once tracing is on, but `StreamInfo::trace`'s
+                // type doesn't know that). `attempt_started_system` is this
+                // same attempt's wall-clock start, for the CLIENT span's own
+                // `start` -- distinct from `attempt_dispatched_at` (an
+                // `Instant`, used only for the duration stat) because a span
+                // timestamp has to be an absolute epoch offset (see
+                // `FinishedSpan`'s own doc for why).
+                let (attempt_trace, attempt_started_system) = {
                     let mut info = dcb.stream_info();
                     info.upstream_cluster = Some(attempt_cluster.to_string());
                     info.upstream_host = Some(host.address.to_string());
@@ -501,7 +606,8 @@ impl RouterHandler {
                         }
                         .to_string(),
                     );
-                }
+                    (info.trace.map(|ctx| ctx.child()), SystemTime::now())
+                };
                 let pool = attempt_entry.http_pool(&host, proto);
                 // WP-15 slice A: h2 upstreams are reused across requests via
                 // this worker's `UpstreamConnCache` -- one TCP connection
@@ -527,6 +633,17 @@ impl RouterHandler {
                             .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         let outcome = AttemptOutcome::from_pool_error(&err);
                         report_outlier(attempt_entry, host.address, &outcome);
+                        self.emit_client_span(
+                            attempt_trace,
+                            ClientSpanOutcome {
+                                cluster: attempt_cluster,
+                                addr: host.address,
+                                start: attempt_started_system,
+                                status: SpanStatus::Error,
+                                outcome: "connect_failure",
+                                extra_attributes: Vec::new(),
+                            },
+                        );
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome) {
                                 sleep_backoff_and_record(state).await;
@@ -622,6 +739,21 @@ impl RouterHandler {
                     attempt_entry.request_headers_to_add(),
                     &mut attempt_head.headers,
                 );
+                // WP-51 increment 2: propagate this attempt's CLIENT trace
+                // context to the upstream leg -- `HeaderMap::insert`
+                // deliberately (not `append`), so this OVERWRITES any
+                // `traceparent` the downstream caller sent, rather than
+                // sending both. The inbound header already did its job (the
+                // JOIN in `FilterChainHandler::handle`, which is what
+                // `attempt_trace` is a `child()` of); forwarding it
+                // unchanged would have every attempt claim to BE the
+                // downstream caller's span instead of a child of this
+                // proxy's own server span.
+                if let Some(child_ctx) = attempt_trace {
+                    if let Ok(value) = HeaderValue::from_str(&child_ctx.to_traceparent()) {
+                        attempt_head.headers.insert("traceparent", value);
+                    }
+                }
                 // Rust note: `body_bytes` is plain `Bytes`, cheap
                 // (refcounted) to `.clone()` fresh for every attempt --
                 // there's no separate "streaming" body anymore (see this
@@ -697,6 +829,17 @@ impl RouterHandler {
                             );
                             let outcome = AttemptOutcome::PerTryTimeout;
                             report_outlier(attempt_entry, host.address, &outcome);
+                            self.emit_client_span(
+                                attempt_trace,
+                                ClientSpanOutcome {
+                                    cluster: attempt_cluster,
+                                    addr: host.address,
+                                    start: attempt_started_system,
+                                    status: SpanStatus::Error,
+                                    outcome: "per_try_timeout",
+                                    extra_attributes: Vec::new(),
+                                },
+                            );
                             if let Some(state) = &mut retry_state {
                                 if state.should_retry(&outcome) {
                                     sleep_backoff_and_record(state).await;
@@ -727,6 +870,24 @@ impl RouterHandler {
                             .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         let outcome = AttemptOutcome::Response(resp.head.status.as_u16());
                         report_outlier(attempt_entry, host.address, &outcome);
+                        self.emit_client_span(
+                            attempt_trace,
+                            ClientSpanOutcome {
+                                cluster: attempt_cluster,
+                                addr: host.address,
+                                start: attempt_started_system,
+                                status: if resp.head.status.is_server_error() {
+                                    SpanStatus::Error
+                                } else {
+                                    SpanStatus::Ok
+                                },
+                                outcome: "response",
+                                extra_attributes: vec![(
+                                    "http.response.status_code",
+                                    resp.head.status.as_u16().to_string(),
+                                )],
+                            },
+                        );
                         let retriable = retry_state
                             .as_ref()
                             .is_some_and(|state| state.should_retry(&outcome));
@@ -777,6 +938,17 @@ impl RouterHandler {
                         }
                         let outcome = AttemptOutcome::from_codec_error(&err);
                         report_outlier(attempt_entry, host.address, &outcome);
+                        self.emit_client_span(
+                            attempt_trace,
+                            ClientSpanOutcome {
+                                cluster: attempt_cluster,
+                                addr: host.address,
+                                start: attempt_started_system,
+                                status: SpanStatus::Error,
+                                outcome: "codec_error",
+                                extra_attributes: Vec::new(),
+                            },
+                        );
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome) {
                                 sleep_backoff_and_record(state).await;

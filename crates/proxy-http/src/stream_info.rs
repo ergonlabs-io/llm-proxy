@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use proxy_observability::trace::TraceContext;
 use proxy_observability::ResponseFlag;
 
 /// WP-33/34: tokens billed for one LLM request, as reported by the provider.
@@ -142,6 +143,16 @@ pub struct StreamInfo {
     /// auth filter is configured — see [`AuthInfo`] for why that case must
     /// never be papered over with a default identity.
     pub auth: AuthInfo,
+    /// WP-51 increment 2: this stream's SERVER span context, set by
+    /// `filter_manager::FilterChainHandler::handle` right after `StreamInfo`
+    /// is built -- `None` whenever tracing is off (`ConfigSnapshot::tracing`
+    /// is `None`), regardless of whether an inbound request carried a
+    /// `traceparent`. `router::RouterHandler` reads this to mint each
+    /// attempt's CLIENT span as a [`TraceContext::child`] of it, so a
+    /// retry/fallback stays under the same trace. See `TracingConfig`'s doc
+    /// (`proxy-config`) for the sampling contract this field's `sampled` bit
+    /// must satisfy.
+    pub trace: Option<TraceContext>,
 }
 
 impl StreamInfo {

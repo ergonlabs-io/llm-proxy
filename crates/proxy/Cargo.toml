@@ -41,6 +41,13 @@ http = { workspace = true }
 # than guessing a `target/` layout that a per-worktree `CARGO_TARGET_DIR`
 # (see CLAUDE.md) could change out from under a hardcoded guess.
 serde_json = { workspace = true }
+# tests/otlp_trace_e2e.rs's mock OTLP collector: a real `TraceServiceServer`
+# (generated in `proxy-api`) served over a real ephemeral `tonic` endpoint --
+# the only way to prove spans actually cross the wire in the shape a real
+# collector expects, rather than asserting against `FinishedSpan` (which
+# `otlp::map_span` already unit-tests without any network at all).
+proxy-api = { workspace = true }
+tonic = { workspace = true }
 
 [lints]
 workspace = true

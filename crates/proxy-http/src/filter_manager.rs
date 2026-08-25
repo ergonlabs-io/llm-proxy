@@ -141,6 +141,7 @@ use crate::handler::{
 use crate::route::{match_route, RouteMatch, RouteRequest};
 use crate::stat_handles::GenAiTokenStats;
 use crate::stream_info::StreamInfo;
+use proxy_observability::trace::{SpanSink, TraceContext};
 
 /// Default per-direction buffer limit (Envoy's
 /// `per_connection_buffer_limit_bytes` default is 1 MiB). Overflow of a filter
@@ -434,6 +435,28 @@ pub struct FilterChainHandler {
     /// happens once, at stream end, from `access_logging::LoggingBody::finish`
     /// -- never here.
     token_stats: Option<Arc<GenAiTokenStats>>,
+    /// WP-51 increment 2: this HCM's span sink + head-sampling ratio, if
+    /// boot/reload wired one (`proxy-core`'s `build_hcm_handler` does so
+    /// whenever `ConfigSnapshot::tracing` is `Some` -- see
+    /// [`Self::with_tracing`]). `None` is both the constructors' baseline
+    /// (every existing `new*` caller is unaffected) and the correct steady
+    /// state when tracing is off: [`Self::handle`] mints no `TraceContext`
+    /// at all in that case, so the per-request cost is exactly one `is_none`
+    /// check.
+    tracing: Option<TracingWiring>,
+}
+
+/// [`FilterChainHandler::tracing`]'s payload -- bundled rather than two
+/// separate `Option` fields because they're always set (or unset) together,
+/// from the same [`FilterChainHandler::with_tracing`] call.
+struct TracingWiring {
+    sink: SpanSink,
+    /// `TracingConfig::sample_ratio` (`proxy-config`) -- head-sampling ratio
+    /// for a newly minted ROOT span only; an inbound `traceparent` that is
+    /// already sampled is always honored regardless of this value. See that
+    /// field's own doc for the full contract [`FilterChainHandler::handle`]
+    /// must satisfy.
+    sample_ratio: f64,
 }
 
 impl FilterChainHandler {
@@ -457,6 +480,7 @@ impl FilterChainHandler {
             access_loggers: Rc::new(Vec::new()),
             per_route: Arc::new(PerRouteTable::default()),
             token_stats: None,
+            tracing: None,
         }
     }
 
@@ -578,6 +602,17 @@ impl FilterChainHandler {
         self.token_stats = Some(token_stats);
         self
     }
+
+    /// WP-51 increment 2: attaches this HCM's span sink and head-sampling
+    /// ratio -- a builder method, same shape and reasoning as
+    /// [`Self::with_token_stats`] right above (every existing `new*` call
+    /// site stays unaffected; `proxy-core`'s `build_hcm_handler` calls this
+    /// for every real HCM build/rebuild whenever `ConfigSnapshot::tracing`
+    /// is `Some`).
+    pub fn with_tracing(mut self, sink: SpanSink, sample_ratio: f64) -> Self {
+        self.tracing = Some(TracingWiring { sink, sample_ratio });
+        self
+    }
 }
 
 impl StreamHandler for FilterChainHandler {
@@ -657,6 +692,37 @@ impl StreamHandler for FilterChainHandler {
             // every filter (including an encode filter's end-of-stream
             // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
+            // WP-51 increment 2: mint (or join) this stream's SERVER trace
+            // context right here, before any filter runs, so
+            // `DecoderCallbacks::stream_info()` sees `trace` already set for
+            // the whole decode/encode chain -- including the router
+            // terminal, which reads it to derive each attempt's CLIENT span.
+            // Tracing off (`self.tracing: None`) costs exactly this one
+            // check; nothing below runs.
+            if let Some(wiring) = &self.tracing {
+                let inbound = req
+                    .head
+                    .headers
+                    .get("traceparent")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(TraceContext::parse_traceparent);
+                let ctx = match inbound {
+                    // JOIN, not replace: this proxy becomes a CHILD of the
+                    // caller's span -- same trace_id, same sampled decision
+                    // (an already-sampled inbound trace must stay sampled
+                    // regardless of `sample_ratio`, see `TracingConfig`'s
+                    // doc in `proxy-config`), fresh span_id, parented to the
+                    // inbound span. `TraceContext::child` is exactly this.
+                    Some(inbound_ctx) => inbound_ctx.child(),
+                    // No (or malformed) inbound header: a fresh trace,
+                    // subject to head sampling.
+                    None => {
+                        let sampled = rand::random::<f64>() < wiring.sample_ratio;
+                        TraceContext::new_root(sampled)
+                    }
+                };
+                stream_info.borrow_mut().trace = Some(ctx);
+            }
             let mgr = FilterManager {
                 filters,
                 ctx: ChainCtx::new(stream_info.clone())
@@ -682,7 +748,16 @@ impl StreamHandler for FilterChainHandler {
             // tokens at all -- the stat was wired end to end and then skipped by
             // the one branch that decides whether anything runs. Neither reason
             // implies the other, so this is an OR.
-            if self.access_loggers.is_empty() && self.token_stats.is_none() {
+            //
+            // WP-51 increment 2: `self.tracing.is_some()` joins the OR for
+            // the identical reason -- the SERVER span (if this stream is
+            // sampled) is also only known complete at end-of-stream, and
+            // `LoggingBody::finish` is that one place, same as the other two
+            // instruments.
+            if self.access_loggers.is_empty()
+                && self.token_stats.is_none()
+                && self.tracing.is_none()
+            {
                 return resp;
             }
 
@@ -705,6 +780,7 @@ impl StreamHandler for FilterChainHandler {
                 response_code: resp.head.status.as_u16(),
                 downstream_remote_address,
                 token_stats: self.token_stats.clone(),
+                span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
             };
             HttpResponseParts {
                 head: resp.head,

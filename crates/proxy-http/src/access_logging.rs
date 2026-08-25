@@ -44,6 +44,7 @@ use hyper::body::{Body, Frame};
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
 use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
+use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
 use proxy_observability::ResponseFlag;
 
 use crate::handler::{BodyError, StreamBody};
@@ -247,6 +248,12 @@ pub(crate) struct AccessLogContext {
     /// caller, and any HCM `proxy-core` never resolved provider handles
     /// for). See [`LoggingBody::finish`] for the one call site.
     pub(crate) token_stats: Option<Arc<GenAiTokenStats>>,
+    /// WP-51 increment 2: this stream's span sink, if the HCM has one wired
+    /// (`FilterChainHandler::with_tracing`) -- `None` on any handler tracing
+    /// is off for. [`LoggingBody::finish`] emits the SERVER span through
+    /// this, using `stream_info.trace` (set at stream start, `None` when
+    /// this is also `None`) as its context.
+    pub(crate) span_sink: Option<SpanSink>,
 }
 
 /// Wraps a response [`StreamBody`] so that -- regardless of whether the
@@ -448,6 +455,7 @@ impl LoggingBody {
             llm_ttft,
             llm_max_stall,
             llm_response_chunks,
+            trace,
         ) = {
             let mut info = ctx.stream_info.borrow_mut();
             info.bytes_sent = self.bytes_sent;
@@ -473,6 +481,7 @@ impl LoggingBody {
                 info.llm.time_to_first_byte,
                 info.llm.max_inter_chunk,
                 info.llm.response_chunks,
+                info.trace,
             )
         };
 
@@ -492,6 +501,51 @@ impl LoggingBody {
             upstream_cluster.as_deref(),
         ) {
             token_stats.record_usage(provider, tokens);
+        }
+
+        // WP-51 increment 2: emit the SERVER span here -- the same
+        // "stream has ended, exactly once" point the two instruments above
+        // use. `trace` is `None` whenever tracing is off; `span_ctx.sampled`
+        // is `false` for an unsampled root this stream's own head-sampling
+        // decided against (an inbound `traceparent` that arrived sampled is
+        // always honored -- see `FilterChainHandler::handle`'s join logic --
+        // so this check is really "was this stream's trace ever going to be
+        // recorded", not a second sampling decision).
+        if let (Some(sink), Some(span_ctx)) = (ctx.span_sink.as_ref(), trace) {
+            if span_ctx.sampled {
+                let mut attributes = vec![
+                    ("http.request.method", ctx.request.method.clone()),
+                    ("http.route", ctx.request.path.clone()),
+                    (
+                        "response_flags",
+                        proxy_observability::flags::render_flags(&response_flags),
+                    ),
+                ];
+                if let Some(cluster) = upstream_cluster.as_deref() {
+                    attributes.push(("upstream.cluster", cluster.to_string()));
+                }
+                if let Some(request_id) = ctx
+                    .request
+                    .headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    attributes.push(("x-request-id", request_id.to_string()));
+                }
+                sink.emit(FinishedSpan {
+                    context: span_ctx,
+                    name: format!("{} {}", ctx.request.method, ctx.request.path),
+                    kind: SpanKind::Server,
+                    start: ctx.start_time,
+                    end: SystemTime::now(),
+                    attributes,
+                    status: if ctx.response_code >= 500 {
+                        SpanStatus::Error
+                    } else {
+                        SpanStatus::Ok
+                    },
+                });
+            }
         }
 
         // A stats-only stream (token_stats wired, no access loggers) has
@@ -700,6 +754,7 @@ mod tests {
             response_code: StatusCode::OK.as_u16(),
             downstream_remote_address: "127.0.0.1:0".to_string(),
             token_stats: None,
+            span_sink: None,
         };
 
         let body = local_boxed(
@@ -986,6 +1041,7 @@ mod tests {
             // recorder wired" case, which is also what an HCM without stats
             // produces in production.
             token_stats: None,
+            span_sink: None,
         }
     }
 

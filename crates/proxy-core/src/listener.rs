@@ -36,6 +36,7 @@ use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
 use proxy_http::stat_handles::{DownstreamStats, GenAiTokenStats, RouterStats};
+use proxy_observability::trace::SpanSink;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -214,6 +215,7 @@ fn build_listener_hcm(
     cluster_manager: &Arc<ClusterManager>,
     router_stats: &Arc<RouterStats>,
     token_stats: &Arc<GenAiTokenStats>,
+    tracing_handles: Option<&TracingHandles>,
 ) -> Result<ListenerHcm, HttpFilterChainBuildError> {
     let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
     for (i, chain) in listener.filter_chains.iter().enumerate() {
@@ -226,6 +228,7 @@ fn build_listener_hcm(
                     cluster_manager,
                     router_stats,
                     token_stats,
+                    tracing_handles,
                 )?)
             }
             _ => None,
@@ -245,6 +248,7 @@ fn build_listener_hcm(
                 cluster_manager,
                 router_stats,
                 token_stats,
+                tracing_handles,
             )?)
         }
         _ => None,
@@ -332,10 +336,37 @@ fn bind_listener(listener: &ListenerConfig) -> io::Result<TcpListener> {
 /// is built -- `WorkerShared` keeps them separate because it predates this
 /// bundle (WP-23 increment 6a) and its own field count was never close to
 /// the threshold.
+///
+/// WP-51 increment 2: `tracing` rides along in this same bundle rather than
+/// as a fifth threaded parameter, for the identical reason the other three
+/// are bundled here -- it reaches [`build_hcm_handler`] on the exact same
+/// path (`initial_bind`/`reconcile` -> [`WorkerShared`] -> `spawn_bound` ->
+/// [`build_listener_hcm`]) that `token` already does.
 pub struct StatsRecorders {
     pub router: Arc<RouterStats>,
     pub downstream: Arc<DownstreamStats>,
     pub token: Arc<GenAiTokenStats>,
+    /// This worker's span sink + head-sampling ratio, if
+    /// `ConfigSnapshot::tracing` is `Some` -- `None` (tracing off) means
+    /// [`build_hcm_handler`] never calls `FilterChainHandler::with_tracing`/
+    /// `RouterFilterFactory::with_tracing` at all, so every handler it
+    /// builds costs nothing extra per request (see those methods' own docs).
+    pub tracing: Option<TracingHandles>,
+}
+
+/// [`StatsRecorders::tracing`]'s payload: a span sink plus the head-sampling
+/// ratio a newly minted root span must apply (`TracingConfig::sample_ratio`,
+/// `proxy-config`) -- always set (or unset) together, so this is one
+/// `Option<TracingHandles>` rather than two independently-`Option` fields.
+///
+/// Rust note: `#[derive(Clone)]`, not `Copy` -- `SpanSink` wraps a
+/// `tokio::sync::mpsc::Sender` (not `Copy`), so neither can this. Cloning is
+/// cheap either way (a channel handle + an `Arc<AtomicU64>`, same as cloning
+/// the `SpanSink` alone).
+#[derive(Clone)]
+pub struct TracingHandles {
+    pub sink: SpanSink,
+    pub sample_ratio: f64,
 }
 
 /// Bind `listener_ir` and spawn its accept loop, returning the [`BoundListener`]
@@ -373,6 +404,12 @@ struct WorkerShared<'a> {
     /// `FilterChainHandler` via
     /// [`proxy_http::filter_manager::FilterChainHandler::with_token_stats`].
     token_stats: &'a Arc<GenAiTokenStats>,
+    /// WP-51 increment 2: this worker's span sink + head-sampling ratio, if
+    /// `ConfigSnapshot::tracing` is `Some` -- same per-worker cadence as
+    /// `token_stats` above, threaded down to [`build_hcm_handler`], which
+    /// wires it into both the `FilterChainHandler` (SERVER span) and the
+    /// `RouterFilterFactory` (CLIENT spans) it builds.
+    tracing: &'a Option<TracingHandles>,
 }
 
 fn spawn_bound(
@@ -390,6 +427,7 @@ fn spawn_bound(
         shared.cluster_manager,
         shared.router_stats,
         shared.token_stats,
+        shared.tracing.as_ref(),
     )?;
     let tcp_listener = bind_listener(listener_ir).map_err(|source| InitialBindError::Bind {
         name: name.clone(),
@@ -411,6 +449,7 @@ fn spawn_bound(
             router_stats: shared.router_stats.clone(),
             downstream_stats: shared.downstream_stats.clone(),
             token_stats: shared.token_stats.clone(),
+            tracing_handles: shared.tracing.clone(),
         },
     );
     Ok(BoundListener { addr, task })
@@ -467,6 +506,7 @@ pub fn initial_bind(
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
         token_stats: &stats.token,
+        tracing: &stats.tracing,
     };
     let mut bound: HashMap<ListenerName, BoundListener> = HashMap::new();
     for (name, listener_ir) in snapshot.listeners.iter() {
@@ -517,6 +557,13 @@ struct AcceptLoopShared {
     /// rebuild (on a snapshot version change) calls [`build_listener_hcm`]
     /// again directly.
     token_stats: Arc<GenAiTokenStats>,
+    /// This worker's span sink + head-sampling ratio -- see
+    /// [`WorkerShared::tracing`]; needed here for the identical reason
+    /// `token_stats` is (the runtime HCM rebuild below). Named
+    /// `tracing_handles`, not `tracing`, so destructuring this struct below
+    /// doesn't shadow the `tracing` crate this whole module logs through
+    /// (`tracing::warn!` a few lines below the destructure).
+    tracing_handles: Option<TracingHandles>,
 }
 
 /// One accept loop per bound listener, spawned with `spawn_local` (this
@@ -541,6 +588,7 @@ fn spawn_accept_loop(
         router_stats,
         downstream_stats,
         token_stats,
+        tracing_handles,
     } = shared;
     tokio::task::spawn_local(async move {
         // Rust note: `mut` locals, not behind a lock -- this whole task is
@@ -608,7 +656,13 @@ fn spawn_accept_loop(
                     // Same rebuild cadence and same "whole-listener fallback"
                     // tradeoff as the TLS cache just above, for the HTTP
                     // filter-chain handlers.
-                    match build_listener_hcm(l, &cluster_manager, &router_stats, &token_stats) {
+                    match build_listener_hcm(
+                        l,
+                        &cluster_manager,
+                        &router_stats,
+                        &token_stats,
+                        tracing_handles.as_ref(),
+                    ) {
                         Ok(rebuilt) => hcm_cache = Rc::new(rebuilt),
                         Err(err) => {
                             tracing::warn!(listener = %name, error = %err, "failed to rebuild HTTP filter chain after config change; HCM chains on this listener will reset connections until fixed");
@@ -1066,6 +1120,7 @@ fn build_hcm_handler(
     cluster_manager: &Arc<ClusterManager>,
     router_stats: &Arc<RouterStats>,
     token_stats: &Arc<GenAiTokenStats>,
+    tracing_handles: Option<&TracingHandles>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
     let factory_ctx = FactoryContext {};
@@ -1110,9 +1165,17 @@ fn build_hcm_handler(
         });
     }
 
-    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
-        RouterFilterFactory::new(cluster_manager.clone(), router_stats.clone()),
-    );
+    // WP-51 increment 2: `.with_tracing` on the router factory whenever
+    // tracing is on -- every attempt this HCM's router dispatches gets a
+    // CLIENT span sink to emit through (see `RouterFilterFactory::with_tracing`'s
+    // doc). `None` costs nothing; see this function's own `.with_tracing`
+    // call below for the FilterChainHandler half of the same wiring.
+    let mut router_factory =
+        RouterFilterFactory::new(cluster_manager.clone(), router_stats.clone());
+    if let Some(t) = tracing_handles {
+        router_factory = router_factory.with_tracing(t.sink.clone());
+    }
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(router_factory);
 
     // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
     // bind/rebuild cadence as everything else in this function (a fresh
@@ -1139,22 +1202,28 @@ fn build_hcm_handler(
     // was wired end to end everywhere except here, so `token_stats` was
     // always `None` and `llm.client.token.usage` was never recorded no
     // matter what a route configured.
-    Ok(Rc::new(
-        FilterChainHandler::new_with_filters_and_access_logs(
-            filters,
-            terminal_factory,
-            hcm.route_table.clone(),
-            hcm.generate_request_id,
-            hcm.use_remote_address,
-            hcm.xff_num_trusted_hops,
-            &hcm.access_logs,
-        )
-        .map_err(|e| HttpFilterChainBuildError {
-            context: context.to_string(),
-            reason: format!("failed to build filter chain: {e}"),
-        })?
-        .with_token_stats(token_stats.clone()),
-    ))
+    let mut handler = FilterChainHandler::new_with_filters_and_access_logs(
+        filters,
+        terminal_factory,
+        hcm.route_table.clone(),
+        hcm.generate_request_id,
+        hcm.use_remote_address,
+        hcm.xff_num_trusted_hops,
+        &hcm.access_logs,
+    )
+    .map_err(|e| HttpFilterChainBuildError {
+        context: context.to_string(),
+        reason: format!("failed to build filter chain: {e}"),
+    })?
+    .with_token_stats(token_stats.clone());
+    // WP-51 increment 2: `.with_tracing` on the FilterChainHandler half of
+    // this build -- see the `router_factory` one above for the other half
+    // (the CLIENT-span-emitting router terminal); this half is what mints
+    // the SERVER span and joins/propagates an inbound `traceparent`.
+    if let Some(t) = tracing_handles {
+        handler = handler.with_tracing(t.sink.clone(), t.sample_ratio);
+    }
+    Ok(Rc::new(handler))
 }
 
 /// Everything [`run_terminal_filter`] needs beyond `stream`/`filter`/
@@ -1281,6 +1350,7 @@ fn reconcile(
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
         token_stats: &stats.token,
+        tracing: &stats.tracing,
     };
     // Removed: present in `bound`, absent from the new snapshot. Stop
     // accepting; established connections under the old listener keep their
@@ -1938,6 +2008,7 @@ mod tests {
             router: router_stats_for(&stats_control, &initial),
             downstream: downstream_stats_for(&stats_control, &initial),
             token: token_stats_for(&stats_control, &initial),
+            tracing: None,
         };
 
         let bound = initial_bind(
@@ -2910,6 +2981,7 @@ mod tests {
                 router: router_stats_for(&stats_control, &snapshot),
                 downstream: downstream_stats_for(&stats_control, &snapshot),
                 token: token_stats_for(&stats_control, &snapshot),
+                tracing: None,
             };
 
             let result = initial_bind(
@@ -3913,13 +3985,18 @@ static_resources:
         let router_stats = router_stats_for(&stats_control, &snapshot);
         let token_stats = token_stats_for(&stats_control, &snapshot);
 
-        let err =
-            match build_listener_hcm(listener_ir, &cluster_manager, &router_stats, &token_stats) {
-                Ok(_) => {
-                    panic!("an invalid per-route dialect must fail the build, is_optional or not")
-                }
-                Err(err) => err,
-            };
+        let err = match build_listener_hcm(
+            listener_ir,
+            &cluster_manager,
+            &router_stats,
+            &token_stats,
+            None,
+        ) {
+            Ok(_) => {
+                panic!("an invalid per-route dialect must fail the build, is_optional or not")
+            }
+            Err(err) => err,
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("typed_config.inline_string") || msg.contains("gemini"),

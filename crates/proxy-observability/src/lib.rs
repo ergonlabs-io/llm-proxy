@@ -4,6 +4,9 @@
 
 pub mod access_log;
 pub mod flags;
+/// WP-51 increment 3a: maps [`trace::FinishedSpan`] to the OTLP wire types
+/// and drains a [`trace::SpanSink`]'s receiver into a real collector.
+pub mod otlp;
 pub mod sink;
 /// WP-23 increments 1–3: the stats registry core (instruments, `Handle`
 /// resolution, sharded counters/histograms) and the Envoy `/stats` text

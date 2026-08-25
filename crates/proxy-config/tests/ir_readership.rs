@@ -222,37 +222,31 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   these WPs.",
     },
     AllowlistEntry {
-        struct_name: "ConfigSnapshot",
-        field_name: "tracing",
-        kind: EntryKind::KnownInert,
-        reason: "WP-51 increment 3: config surface only. No runtime crate runs \
-                  an OTLP exporter or mints/propagates a span yet -- a later \
-                  increment wires that and deletes this entry, plus the three \
-                  TracingConfig entries below. Field's own doc comment already \
-                  names the increment.",
-    },
-    AllowlistEntry {
         struct_name: "TracingConfig",
         field_name: "otlp_endpoint",
         kind: EntryKind::KnownInert,
-        reason: "Same WP-51 increment 3 gap as ConfigSnapshot.tracing above -- \
-                  delete alongside it once an exporter reads this field.",
+        reason: "WP-51 increment 3a: the OTLP exporter that reads this field \
+                  (`proxy_observability::otlp::run_exporter`, called from \
+                  `crates/proxy/src/main.rs`'s `run_serve`) lives on the \
+                  control side, in `proxy-observability`/`proxy` -- neither is \
+                  a RUNTIME_CRATES entry (see this file's module doc for why: \
+                  `proxy-config` and `proxy-admin` are excluded for the same \
+                  'displaying/config-holding is not acting on it' reason, and \
+                  `proxy-observability`/`proxy` were never added because \
+                  nothing in them consumed IR fields before this one). The \
+                  field genuinely has a real reader now -- `ConfigSnapshot.tracing` \
+                  and `TracingConfig::sample_ratio` (both read inside \
+                  `proxy-http`) prove that by no longer needing an entry here \
+                  at all -- this is a known limitation of the text-based scan, \
+                  not a second inert field.",
     },
     AllowlistEntry {
         struct_name: "TracingConfig",
         field_name: "service_name",
         kind: EntryKind::KnownInert,
-        reason: "Same WP-51 increment 3 gap as ConfigSnapshot.tracing above -- \
-                  delete alongside it once an exporter reads this field.",
-    },
-    AllowlistEntry {
-        struct_name: "TracingConfig",
-        field_name: "sample_ratio",
-        kind: EntryKind::KnownInert,
-        reason: "Same WP-51 increment 3 gap as ConfigSnapshot.tracing above -- \
-                  delete alongside it once the runtime that mints root spans \
-                  reads this field (see TracingConfig's doc for the sampling \
-                  contract it must satisfy).",
+        reason: "Same as `otlp_endpoint` immediately above: read by \
+                  `proxy_observability::otlp::build_resource`, which \
+                  `run_exporter` calls -- control-side, outside RUNTIME_CRATES.",
     },
 ];
 

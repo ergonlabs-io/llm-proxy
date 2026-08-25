@@ -489,6 +489,13 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
 /// close.
 const INITIAL_BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// WP-51 increment 3a: how many finished spans [`proxy_observability::trace::SpanSink`]
+/// buffers between the exporter's batches before [`proxy_observability::trace::SpanSink::emit`]
+/// starts dropping. Generous relative to `otlp::MAX_BATCH` (512) -- several
+/// batches' worth of headroom for a slow or momentarily unreachable
+/// collector, without holding an unbounded amount of memory.
+const SPAN_SINK_CAPACITY: usize = 4096;
+
 async fn run_serve(
     concurrency: usize,
     drain_time: Duration,
@@ -575,6 +582,41 @@ async fn run_serve(
             snapshot.clusters.keys().map(String::as_str),
         ));
     let registry = stats_control.registry();
+
+    // WP-51 increment 2+3a: one `SpanSink` shared across every worker, same
+    // "control computes, workers get a cheap handle" shape as `registry`
+    // just above -- built (and its exporter task spawned) only when the boot
+    // snapshot's `tracing` is `Some`. `None` means no sink is ever
+    // constructed and no exporter task ever runs: every `FilterChainHandler`/
+    // `RouterFilterFactory` `proxy-core`'s `build_hcm_handler` builds gets
+    // `tracing_handles: None`, so tracing-off costs nothing beyond the one
+    // `is_none` check each of those already documents.
+    //
+    // The exporter task is spawned with a plain `tokio::spawn`, not
+    // `tokio::task::spawn_local` -- it holds no `!Send` data-plane state
+    // (ADR-0003 governs workers, not this control-runtime-only task), and
+    // `run_serve` itself is already running ON the control runtime (this
+    // function is `control_rt.block_on`'d from `main`), so `tokio::spawn`
+    // here lands the task on that same runtime, alongside the config
+    // reload/signal loop below -- never on a worker's `LocalSet`.
+    let tracing_handles = snapshot.tracing.as_ref().map(|cfg| {
+        let (sink, spans_rx) = proxy_observability::trace::SpanSink::new(SPAN_SINK_CAPACITY);
+        tracing::info!(
+            otlp_endpoint = %cfg.otlp_endpoint,
+            service_name = %cfg.service_name,
+            sample_ratio = cfg.sample_ratio,
+            "OTLP trace export enabled"
+        );
+        tokio::spawn(proxy_observability::otlp::run_exporter(
+            spans_rx,
+            cfg.otlp_endpoint.clone(),
+            cfg.service_name.clone(),
+        ));
+        proxy_core::listener::TracingHandles {
+            sink,
+            sample_ratio: cfg.sample_ratio,
+        }
+    });
 
     // Every consumer that must observe a SIGHUP-published snapshot registers
     // its `WorkerConfigHandle` into this ONE registry -- the admin server
@@ -664,6 +706,7 @@ async fn run_serve(
                 stat_handles.clone(),
                 downstream_stat_handles.clone(),
                 token_usage_stat_handles.clone(),
+                tracing_handles.clone(),
             )
         },
     );
@@ -926,6 +969,14 @@ async fn start_admin(
 /// comment), so this worker does nothing further but wait for the control
 /// runtime's `shutdown` signal, which `run_serve` sends promptly once it
 /// sees the failure.
+// Rust note: a spawn entrypoint handed one worker every boot-resolved
+// dependency it needs. It already sat at clippy's 7-arg ceiling before WP-51;
+// the optional `tracing_handles` (8th) tips it over. These are each a
+// distinct per-worker handle with no shared identity to bundle under -- the
+// three stat tables are already bundled for `reload` via `StatHandleTables`,
+// and re-bundling them here purely to dodge the lint would fragment that one
+// owner -- so this leaf allows the extra arg rather than inventing a bag type.
+#[allow(clippy::too_many_arguments)]
 async fn worker_main(
     ctx: WorkerContext,
     bind_tx: mpsc::UnboundedSender<(WorkerId, Result<(), String>)>,
@@ -934,6 +985,7 @@ async fn worker_main(
     stat_handles: Arc<proxy_http::stat_handles::StatHandles>,
     downstream_stat_handles: Arc<proxy_http::stat_handles::DownstreamStatHandles>,
     token_usage_stat_handles: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
+    tracing_handles: Option<proxy_core::listener::TracingHandles>,
 ) {
     let registry = ConnectionRegistry::new();
     // WP-23 increment 6a: built fresh per worker -- `stats_registry`/
@@ -974,6 +1026,7 @@ async fn worker_main(
         router: router_stats,
         downstream: downstream_stats,
         token: token_stats,
+        tracing: tracing_handles,
     };
 
     let bound = match initial_bind(

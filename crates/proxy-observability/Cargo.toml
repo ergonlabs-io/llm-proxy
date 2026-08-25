@@ -23,6 +23,18 @@ rand = { workspace = true }
 # WP-51 increment 2: SpanSink is a worker -> control mpsc handoff, the same
 # shape as the rest of this crate's stats/access-log control-side plumbing.
 tokio = { workspace = true, features = ["sync"] }
+# WP-51 increment 3a: the OTLP/gRPC trace exporter -- `proxy-api` for the
+# vendored collector/trace/common/resource message types (see its `build.rs`
+# comment on why these cross out of `proxy-api` at all: a hand-rolled
+# exporter over the plain generated types, not the opentelemetry SDK, whose
+# Send+Sync async providers fight the !Send data plane, ADR-0003), `tonic`
+# for the client transport this control-side-only module drives. Ground rule
+# #2 ("protos never escape proxy-config/proxy-xds") is about ENVOY config
+# protos reaching the data plane; this is an outbound telemetry sink the
+# control runtime alone drives (see `otlp::run_exporter`'s doc), a different
+# protocol serving a different rule.
+proxy-api = { workspace = true }
+tonic = { workspace = true }
 
 [lints]
 workspace = true
