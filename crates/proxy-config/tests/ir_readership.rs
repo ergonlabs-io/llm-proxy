@@ -173,38 +173,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   outcome classifier never consults it.",
     },
     AllowlistEntry {
-        struct_name: "RedirectIR",
-        field_name: "host_redirect",
-        kind: EntryKind::KnownInert,
-        reason: "WP-13 follow-up: `RouteActionIR::Redirect` returns 501 \
-                  unconditionally today (crates/proxy-http/src/router.rs, \
-                  literally tagged `TODO(WP-13 follow-up: redirects)`), so \
-                  none of RedirectIR's fields are read yet.",
-    },
-    AllowlistEntry {
-        struct_name: "RedirectIR",
-        field_name: "path_redirect",
-        kind: EntryKind::KnownInert,
-        reason: "Same WP-13 follow-up gap as RedirectIR.host_redirect above.",
-    },
-    AllowlistEntry {
-        struct_name: "RedirectIR",
-        field_name: "https_redirect",
-        kind: EntryKind::KnownInert,
-        reason: "Same WP-13 follow-up gap as RedirectIR.host_redirect above.",
-    },
-    AllowlistEntry {
-        struct_name: "RedirectIR",
-        field_name: "response_code",
-        kind: EntryKind::KnownInertNameCollision,
-        reason: "Same WP-13 follow-up gap as RedirectIR.host_redirect above, \
-                  AND `response_code` collides with an unrelated, genuinely-read \
-                  field of the same name on router/logging.rs's AccessLogContext \
-                  (`ctx.response_code`) — verify by hand, not via this test's \
-                  automated staleness recheck, that RouteActionIR::Redirect is \
-                  still unimplemented before deleting this entry.",
-    },
-    AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "admin",
         kind: EntryKind::KnownInert,
