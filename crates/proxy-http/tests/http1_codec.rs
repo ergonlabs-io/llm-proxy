@@ -409,6 +409,141 @@ impl StreamHandler for SlowHandler {
     }
 }
 
+/// A handler that records whether the `HttpRequestParts` it received carried
+/// an extracted `on_upgrade` handle, then returns a fixed 200 -- S10 (WP-10
+/// increment 2a) is plumbing + detection only, so this stub doesn't touch the
+/// handle itself, just proves `serve_one` threaded it through correctly.
+struct UpgradeRecordingHandler {
+    // Rust note: `Rc<Cell<..>>` rather than a plain field -- `handle` takes
+    // `&self` (see `StreamHandler`'s doc), and the codec calls `handler`
+    // through an `Rc<dyn StreamHandler>` it clones per connection, so the
+    // recorder needs interior mutability to be written from inside `handle`.
+    // `Cell` (not `RefCell`) is enough since `Option<bool>` is `Copy`.
+    saw_on_upgrade: Rc<std::cell::Cell<Option<bool>>>,
+}
+
+impl StreamHandler for UpgradeRecordingHandler {
+    fn handle<'a>(
+        &'a self,
+        req: HttpRequestParts,
+    ) -> std::pin::Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
+        Box::pin(async move {
+            self.saw_on_upgrade.set(Some(req.on_upgrade.is_some()));
+            let _ = req.body.collect().await;
+            let body: StreamBody = local_boxed(
+                Full::new(Bytes::from_static(b"ok"))
+                    .map_err(|infallible: Infallible| match infallible {}),
+            );
+            HttpResponseParts {
+                head: ResponseHeaders {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                },
+                body,
+            }
+        })
+    }
+}
+
+#[test]
+fn upgrade_shaped_request_hands_handler_a_some_on_upgrade() {
+    run_local(async {
+        let (client_io, server_io) = duplex(64 * 1024);
+
+        let saw_on_upgrade = Rc::new(std::cell::Cell::new(None));
+        let handler: Rc<dyn StreamHandler> = Rc::new(UpgradeRecordingHandler {
+            saw_on_upgrade: saw_on_upgrade.clone(),
+        });
+
+        tokio::task::spawn_local(async move {
+            serve_http1(
+                server_io,
+                handler,
+                Http1Options { keep_alive: true },
+                never_shutdown(),
+                DownstreamInfo::loopback(),
+            )
+            .await
+            .expect("server connection");
+        });
+
+        let io = TokioIo::new(client_io);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(io)
+            .await
+            .expect("client handshake");
+        tokio::task::spawn_local(async move {
+            let _ = conn.await;
+        });
+
+        // 2a is detection-only -- the stub handler above answers a plain 200
+        // rather than actually switching protocols, so this deliberately
+        // doesn't assert on the response status; it only proves the
+        // `OnUpgrade` handle reached the handler.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "localhost")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let _ = sender.send_request(req).await.expect("send_request");
+
+        assert_eq!(
+            saw_on_upgrade.get(),
+            Some(true),
+            "an Upgrade+Connection:Upgrade request should hand the handler a Some(on_upgrade)"
+        );
+    });
+}
+
+#[test]
+fn plain_request_hands_handler_a_none_on_upgrade() {
+    run_local(async {
+        let (client_io, server_io) = duplex(64 * 1024);
+
+        let saw_on_upgrade = Rc::new(std::cell::Cell::new(None));
+        let handler: Rc<dyn StreamHandler> = Rc::new(UpgradeRecordingHandler {
+            saw_on_upgrade: saw_on_upgrade.clone(),
+        });
+
+        tokio::task::spawn_local(async move {
+            serve_http1(
+                server_io,
+                handler,
+                Http1Options { keep_alive: true },
+                never_shutdown(),
+                DownstreamInfo::loopback(),
+            )
+            .await
+            .expect("server connection");
+        });
+
+        let io = TokioIo::new(client_io);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(io)
+            .await
+            .expect("client handshake");
+        tokio::task::spawn_local(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "localhost")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(req).await.expect("send_request");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            saw_on_upgrade.get(),
+            Some(false),
+            "a plain request should hand the handler a None on_upgrade"
+        );
+    });
+}
+
 #[test]
 fn drain_completes_in_flight_request_then_closes() {
     run_local(async {

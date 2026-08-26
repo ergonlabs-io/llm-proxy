@@ -3148,11 +3148,14 @@ async fn collect_request(
 ) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), BodyError> {
     // `downstream` is only used by `FilterChainHandler::handle` (XFF/S9,
     // access-log peer address), all of which runs before `FilterManager::run`
-    // is even called -- this function only needs head + body.
+    // is even called -- this function only needs head + body. `on_upgrade`
+    // (S10, WP-10 increment 2a) isn't consumed here either; the tunnel that
+    // will pair it with an upstream `OnUpgrade` is a later increment.
     let HttpRequestParts {
         head,
         body,
         downstream: _,
+        on_upgrade: _,
     } = req;
     // WP-24: the error is propagated rather than flattened to `()`. It used
     // to be discarded here, which is what made `DC` unreachable -- by the

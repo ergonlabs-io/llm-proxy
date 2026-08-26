@@ -289,6 +289,7 @@ fn request_with_body(path: &'static str, body: &'static [u8]) -> HttpRequestPart
                 .map_err(|infallible: std::convert::Infallible| match infallible {}),
         ),
         downstream: DownstreamInfo::loopback(),
+        on_upgrade: None,
     }
 }
 

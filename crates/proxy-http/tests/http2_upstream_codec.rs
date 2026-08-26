@@ -113,6 +113,7 @@ async fn h2_round_trip_streams_response_with_non_send_request_body() {
                 },
                 body,
                 downstream: DownstreamInfo::loopback(),
+                on_upgrade: None,
             };
 
             let response = send_upstream_http2(io, req)
@@ -157,6 +158,7 @@ async fn connect_to_nothing_yields_handshake_error() {
                     },
                     body,
                     downstream: DownstreamInfo::loopback(),
+                    on_upgrade: None,
                 };
                 let result = send_upstream_http2(io, req).await;
                 assert!(matches!(
@@ -218,6 +220,7 @@ fn refused_stream_request() -> HttpRequestParts {
         },
         body,
         downstream: DownstreamInfo::loopback(),
+        on_upgrade: None,
     }
 }
 

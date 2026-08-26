@@ -211,6 +211,7 @@ fn request(path: &'static str) -> HttpRequestParts {
                 .map_err(|infallible: std::convert::Infallible| match infallible {}),
         ),
         downstream: DownstreamInfo::loopback(),
+        on_upgrade: None,
     }
 }
 

@@ -817,6 +817,12 @@ impl RouterHandler {
                     head: attempt_head,
                     body: attempt_body,
                     downstream: DownstreamInfo::loopback(),
+                    // S10 (WP-10 increment 2a): this router-synthesised
+                    // upstream request has no downstream connection of its
+                    // own to hand an `OnUpgrade` off from -- the real
+                    // downstream one is threaded separately once the tunnel
+                    // exists (increment 2b/2c).
+                    on_upgrade: None,
                 };
 
                 // Dispatch on the cluster's configured upstream protocol.
@@ -2096,6 +2102,7 @@ mod tests {
                     .map_err(|infallible: std::convert::Infallible| match infallible {}),
             ),
             downstream: DownstreamInfo::loopback(),
+            on_upgrade: None,
         }
     }
 
@@ -2769,6 +2776,7 @@ mod tests {
                 uri: Uri::from_static(path),
                 headers,
             },
+            on_upgrade: None,
             body: local_boxed(
                 Full::new(Bytes::new())
                     .map_err(|infallible: std::convert::Infallible| match infallible {}),

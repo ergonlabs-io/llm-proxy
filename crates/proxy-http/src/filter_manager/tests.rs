@@ -299,6 +299,7 @@ fn request(body: &'static [u8]) -> HttpRequestParts {
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
+        on_upgrade: None,
     }
 }
 
@@ -313,6 +314,7 @@ fn request_with_trailers(body: &'static [u8], trailers: HeaderMap) -> HttpReques
         },
         body: bytes_to_seam_body(Bytes::from_static(body), Some(trailers)),
         downstream: DownstreamInfo::loopback(),
+        on_upgrade: None,
     }
 }
 
@@ -2407,6 +2409,7 @@ fn request_with_path(path: &'static str, body: &'static [u8]) -> HttpRequestPart
         },
         body: bytes_to_seam_body(Bytes::from_static(body), None),
         downstream: DownstreamInfo::loopback(),
+        on_upgrade: None,
     }
 }
 

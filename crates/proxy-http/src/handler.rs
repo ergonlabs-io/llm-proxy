@@ -77,6 +77,14 @@ pub struct HttpRequestParts {
     pub head: RequestHeaders,
     pub body: StreamBody,
     pub downstream: DownstreamInfo,
+    /// S10 (WP-10): the downstream connection's pending HTTP upgrade, if this
+    /// request asked for one (`Upgrade` + `Connection: upgrade`). Extracted by
+    /// `codec::serve_one` via `hyper::upgrade::on` before the request body is
+    /// taken, and carried here so the router (increment 2b) can pair it with
+    /// the upstream's own `OnUpgrade` and tunnel between them (increment 2c).
+    /// `None` for a normal request, and for every internally-synthesised
+    /// request (a router's upstream request has no downstream upgrade).
+    pub on_upgrade: Option<hyper::upgrade::OnUpgrade>,
 }
 
 /// Downstream (client-facing) connection provenance, captured when the

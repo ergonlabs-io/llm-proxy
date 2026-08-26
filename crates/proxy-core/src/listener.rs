@@ -1251,7 +1251,7 @@ struct RunTerminalFilterCtx<'a> {
 /// hands `stream` back so the caller can decide how to close it (a plaintext
 /// `TcpStream` can be `reset`; a `TlsStream` is just dropped -- see the call
 /// sites).
-async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + 'static>(
+async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: IO,
     filter: Option<TerminalFilter>,
     snapshot: Arc<ConfigSnapshot>,

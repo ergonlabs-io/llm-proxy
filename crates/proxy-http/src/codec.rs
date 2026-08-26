@@ -78,7 +78,16 @@ pub async fn serve_http1<IO>(
     downstream: DownstreamInfo,
 ) -> Result<(), CodecError>
 where
-    IO: AsyncRead + AsyncWrite + Unpin + 'static,
+    // Rust note: `Send` here is a new addition (S10, WP-10 increment 2a),
+    // required by hyper's own `Connection::with_upgrades` bound below -- NOT
+    // a reversal of ADR-0003's "the data plane never hops threads" (that's
+    // about the `!Send` service/body/filter state this function's `handler`
+    // and `StreamBody` still carry, untouched here). `IO` itself is just the
+    // raw byte stream (`TcpStream`, a TLS-terminated stream, or a test
+    // `tokio::io::duplex` half) -- every concrete type this crate ever
+    // instantiates it with already is `Send`, so this only narrows what
+    // *could* be passed in, not what actually is.
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(io);
 
@@ -94,7 +103,16 @@ where
 
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.keep_alive(options.keep_alive);
-    let conn = builder.serve_connection(io, service);
+    // Rust note: `.with_upgrades()` wraps the `Connection` future so that, if
+    // `serve_one` pulled an `OnUpgrade` handle out of a request (below), that
+    // handle actually resolves once hyper finishes writing the 101 response
+    // and hands the raw duplex stream over. Without it, `hyper::upgrade::on`
+    // still returns a handle, but it never completes (spike finding (e)).
+    // Per the spike, this only changes `conn`'s concrete type
+    // (`UpgradeableConnection` instead of `Connection`) -- it keeps the same
+    // `Future` + `graceful_shutdown(Pin<&mut Self>)` surface, so nothing below
+    // this line changes.
+    let conn = builder.serve_connection(io, service).with_upgrades();
 
     // Rust note: `tokio::pin!` puts `conn` on the stack and shadows it with a
     // `Pin<&mut _>` -- required because `graceful_shutdown` (below) takes
@@ -591,14 +609,44 @@ where
     send_on_http2(sender, req).await
 }
 
+/// Does this request ask for a protocol upgrade -- a non-empty `Upgrade`
+/// header AND a `Connection` header whose comma-separated tokens include
+/// `upgrade` (case-insensitive, per RFC 9110 S7.6.1: `Connection` is a
+/// comma-separated list of tokens, not a single value)?
+///
+/// Both headers are required: `Upgrade` alone names the desired protocol but
+/// doesn't ask hop-by-hop-ly for the switch, and `Connection: upgrade` alone
+/// (with no `Upgrade` header) names nothing to switch to.
+fn request_wants_upgrade(headers: &http::HeaderMap) -> bool {
+    if !headers.contains_key(http::header::UPGRADE) {
+        return false;
+    }
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
 /// Convert one `hyper::Request<Incoming>` into [`HttpRequestParts`], hand it
 /// to `handler`, and convert the resulting [`HttpResponseParts`] back into a
 /// `hyper::Response<StreamBody>`.
 async fn serve_one(
     handler: &dyn StreamHandler,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     downstream: DownstreamInfo,
 ) -> Response<StreamBody> {
+    // Rust note: `hyper::upgrade::on` doesn't itself *detect* an upgrade --
+    // it only *removes* the `OnUpgrade` handle hyper already stashed in the
+    // request's `Extensions` while parsing. Calling it unconditionally would
+    // still type-check and still hand back a handle, but on a request that
+    // never asked for (or gets) a 101 response that handle would simply never
+    // resolve -- so `request_wants_upgrade` gates this to the requests where
+    // it can. Must run before `req.into_parts()` below: that consumes `req`,
+    // taking the `Extensions` (and any `OnUpgrade` inside them) with it.
+    let on_upgrade = request_wants_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
+
     let (parts, incoming) = req.into_parts();
     let head = RequestHeaders {
         method: parts.method,
@@ -618,6 +666,7 @@ async fn serve_one(
             head,
             body,
             downstream,
+            on_upgrade,
         })
         .await;
     build_response(response)
@@ -638,4 +687,66 @@ fn build_response(parts: HttpResponseParts) -> Response<StreamBody> {
     builder
         .body(body)
         .expect("status was already a valid http::StatusCode; building can't fail here")
+}
+
+#[cfg(test)]
+mod tests {
+    use http::HeaderMap;
+
+    use super::request_wants_upgrade;
+
+    #[test]
+    fn upgrade_plus_connection_upgrade_is_true() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        headers.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+        assert!(request_wants_upgrade(&headers));
+    }
+
+    #[test]
+    fn keep_alive_only_is_false() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        headers.insert(http::header::CONNECTION, "keep-alive".parse().unwrap());
+        assert!(!request_wants_upgrade(&headers));
+    }
+
+    /// RFC 9110 S7.6.1: `Connection` is a comma-separated list of tokens, not
+    /// a single value -- a real client may send `Connection: keep-alive,
+    /// Upgrade` rather than `Connection: Upgrade` alone.
+    #[test]
+    fn multi_token_connection_header_is_true() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        headers.insert(
+            http::header::CONNECTION,
+            "keep-alive, Upgrade".parse().unwrap(),
+        );
+        assert!(request_wants_upgrade(&headers));
+    }
+
+    #[test]
+    fn no_upgrade_header_is_false() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+        assert!(!request_wants_upgrade(&headers));
+    }
+
+    #[test]
+    fn case_insensitive_on_both_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        headers.insert(http::header::CONNECTION, "UPGRADE".parse().unwrap());
+        assert!(request_wants_upgrade(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        headers.insert(http::header::CONNECTION, "upgrade".parse().unwrap());
+        assert!(request_wants_upgrade(&headers));
+    }
+
+    #[test]
+    fn no_headers_at_all_is_false() {
+        assert!(!request_wants_upgrade(&HeaderMap::new()));
+    }
 }

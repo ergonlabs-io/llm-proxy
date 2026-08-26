@@ -2401,6 +2401,7 @@ mod body_routing_e2e {
                     .map_err(|infallible: std::convert::Infallible| match infallible {}),
             ),
             downstream: DownstreamInfo::loopback(),
+            on_upgrade: None,
         }
     }
 
