@@ -85,6 +85,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         use_remote_address: false,
         xff_num_trusted_hops: 0,
         access_logs: vec![],
+        upgrade_configs: vec![],
     };
 
     let listener = ListenerConfig {

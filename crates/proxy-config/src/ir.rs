@@ -303,6 +303,24 @@ pub struct HttpConnectionManagerConfig {
     /// wires the actual per-request render + write; this crate only builds
     /// the IR.
     pub access_logs: Vec<AccessLogIR>,
+    /// S10 (WP-10): the upgrade types this HCM will proxy (`Upgrade:
+    /// <type>` requests are tunnelled upstream). Empty = upgrades disabled
+    /// (the Envoy default — no `upgrade_configs` means no upgrades). Each
+    /// entry names a type and whether it is enabled by default; a route may
+    /// override `enabled` per type (S10.1, wired later). Per-upgrade filter
+    /// chains (`UpgradeConfig.filters`) are rejected at lowering as
+    /// unimplemented — the current tunnel is transparent (S10.2 deferred).
+    pub upgrade_configs: Vec<UpgradeConfig>,
+}
+
+/// S10 (WP-10): one entry of an HCM's `upgrade_configs`. `upgrade_type` is
+/// stored lowercased because Envoy matches it case-insensitively against the
+/// request's `Upgrade` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeConfig {
+    pub upgrade_type: String,
+    /// Envoy default true (the proto field is a `BoolValue`; absent => true).
+    pub enabled: bool,
 }
 
 // -------------------------------------------------------------- access log --

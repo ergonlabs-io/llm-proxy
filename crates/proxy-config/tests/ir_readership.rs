@@ -91,6 +91,36 @@ struct AllowlistEntry {
 
 const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
+        struct_name: "HttpConnectionManagerConfig",
+        field_name: "upgrade_configs",
+        kind: EntryKind::KnownInert,
+        reason: "WP-10 S10 increment 1: config surface only. The downstream \
+                  codec + router that read this to tunnel an upgrade land in \
+                  increments 2/3 (crates/proxy-http); until then no runtime \
+                  crate reads it. Delete this entry (and the two UpgradeConfig \
+                  entries below) once serve_one/router consume it.",
+    },
+    AllowlistEntry {
+        struct_name: "UpgradeConfig",
+        field_name: "upgrade_type",
+        kind: EntryKind::KnownInert,
+        reason: "Same WP-10 S10 increment 1 config-surface gap as \
+                  HttpConnectionManagerConfig.upgrade_configs above.",
+    },
+    AllowlistEntry {
+        struct_name: "UpgradeConfig",
+        field_name: "enabled",
+        kind: EntryKind::KnownInertNameCollision,
+        reason: "Same WP-10 S10 increment 1 config-surface gap as \
+                  HttpConnectionManagerConfig.upgrade_configs above, AND \
+                  `enabled` is a common field name that the text-based scan \
+                  sees read on unrelated structs (health-check/outlier \
+                  `enabled`), so the automated staleness recheck can't tell \
+                  this one apart — verify by hand that no runtime crate reads \
+                  UpgradeConfig::enabled before deleting (increments 2/3 wire \
+                  it, and remove this then).",
+    },
+    AllowlistEntry {
         struct_name: "ClusterConfig",
         field_name: "usage_dialect",
         kind: EntryKind::KnownInert,

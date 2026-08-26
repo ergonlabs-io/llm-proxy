@@ -310,7 +310,19 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             // `HttpConnectionManager.Tracing`'s entry just below for why the
             // rejection happens there rather than mapping anything.
             "tracing",
+            // WP-10 S10: the upgrade types this HCM will tunnel. Lowered by
+            // `convert_hcm` into `HttpConnectionManagerConfig::upgrade_configs`.
+            "upgrade_configs",
         ],
+        // WP-10 S10: `filters` is deliberately NOT listed -- per-upgrade
+        // filter chains are unimplemented (the tunnel is transparent, S10.2
+        // deferred), so a config setting them is rejected right here by the
+        // surface walk with the generic "not implemented yet" message rather
+        // than needing a convert-time check. `upgrade_type`/`enabled` are the
+        // supported surface.
+        "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.UpgradeConfig" => {
+            &["upgrade_type", "enabled"]
+        }
         // `tracing`'s own message: `&[]` (nothing mapped, same shape as the
         // Router filter's own entry above) because `envoy.config.trace.v3.
         // OpenTelemetryConfig` -- the tracer extension the real `provider`
@@ -1330,6 +1342,9 @@ fn convert_hcm(
         ));
     }
 
+    let upgrade_configs =
+        convert_upgrade_configs(&hcm.upgrade_configs, &format!("{path}.upgrade_configs"))?;
+
     Ok(HttpConnectionManagerConfig {
         stat_prefix: hcm.stat_prefix.clone(),
         route_table: Arc::new(route_table),
@@ -1339,7 +1354,45 @@ fn convert_hcm(
         use_remote_address,
         access_logs,
         xff_num_trusted_hops,
+        upgrade_configs,
     })
+}
+
+/// WP-10 S10: lower an HCM's `upgrade_configs`. `upgrade_type` is required and
+/// stored lowercased (Envoy matches it case-insensitively); `enabled` is a
+/// `BoolValue` defaulting to true; a duplicate `upgrade_type` is a config
+/// error, as it is in Envoy. Per-upgrade `filters` are already rejected by the
+/// surface walk (see the `UpgradeConfig` allow-list entry), so they never
+/// reach here.
+fn convert_upgrade_configs(
+    protos: &[hcm_v3::http_connection_manager::UpgradeConfig],
+    path: &str,
+) -> Result<Vec<UpgradeConfig>, ConfigError> {
+    let mut out = Vec::with_capacity(protos.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, uc) in protos.iter().enumerate() {
+        let p = format!("{path}[{i}]");
+        if uc.upgrade_type.is_empty() {
+            return Err(invalid(
+                format!("{p}.upgrade_type"),
+                "upgrade_type is required and must be non-empty",
+            ));
+        }
+        let upgrade_type = uc.upgrade_type.to_ascii_lowercase();
+        if !seen.insert(upgrade_type.clone()) {
+            return Err(invalid(
+                format!("{p}.upgrade_type"),
+                format!("duplicate upgrade_type `{upgrade_type}` (matched case-insensitively)"),
+            ));
+        }
+        // `enabled` is a `BoolValue` -> prost `Option<bool>`; absent = true.
+        let enabled = uc.enabled.unwrap_or(true);
+        out.push(UpgradeConfig {
+            upgrade_type,
+            enabled,
+        });
+    }
+    Ok(out)
 }
 
 // --------------------------------------------------- Lane-H filter ordering --

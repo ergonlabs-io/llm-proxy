@@ -1638,6 +1638,7 @@ mod tests {
             use_remote_address: false,
             xff_num_trusted_hops: 0,
             access_logs: vec![],
+            upgrade_configs: vec![],
         })
     }
 
@@ -1714,6 +1715,7 @@ mod tests {
             use_remote_address: false,
             xff_num_trusted_hops: 0,
             access_logs: vec![],
+            upgrade_configs: vec![],
         })
     }
 
@@ -2520,6 +2522,7 @@ mod tests {
             use_remote_address: false,
             xff_num_trusted_hops: 0,
             access_logs: vec![],
+            upgrade_configs: vec![],
         })
     }
 
@@ -3530,6 +3533,7 @@ mod tests {
             use_remote_address: false,
             xff_num_trusted_hops: 0,
             access_logs: vec![],
+            upgrade_configs: vec![],
         })
     }
 
