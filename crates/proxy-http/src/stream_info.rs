@@ -153,6 +153,20 @@ pub struct StreamInfo {
     /// (`proxy-config`) for the sampling contract this field's `sampled` bit
     /// must satisfy.
     pub trace: Option<TraceContext>,
+    /// S10 (WP-10 increment 2b/2c): the downstream connection's pending HTTP
+    /// upgrade, moved here from `HttpRequestParts::on_upgrade` by
+    /// `filter_manager::FilterChainHandler::handle` right after this
+    /// `StreamInfo` is built -- see that call site's Rust note for why it
+    /// has to happen there (before `req` moves into the filter chain) rather
+    /// than wherever the request eventually reaches the router. `None` for a
+    /// normal request. The router terminal reads this to decide whether to
+    /// gate/tunnel an upgrade, and `.take()`s it once the upstream answers
+    /// `101` -- pairing it with the upstream's own `OnUpgrade` into a
+    /// `handler::UpgradeTunnel` that `codec::serve_one` bridges after the
+    /// `101` response reaches hyper. Left unfulfilled (simply dropped) on
+    /// every path that does NOT end in a tunnel, which is the correct signal
+    /// to hyper that no upgrade happened.
+    pub on_upgrade: Option<hyper::upgrade::OnUpgrade>,
 }
 
 impl StreamInfo {

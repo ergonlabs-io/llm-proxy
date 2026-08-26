@@ -692,6 +692,21 @@ impl StreamHandler for FilterChainHandler {
             // every filter (including an encode filter's end-of-stream
             // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
+            // S10 (WP-10 increment 2b/2c): move the downstream `OnUpgrade`
+            // handle (if this request asked for one) off `req` and onto the
+            // just-built `StreamInfo`, before `req` moves into `mgr.run(req)`
+            // below. Rust note: `Option::take` both reads the handle out and
+            // leaves `None` behind on `req.on_upgrade` -- there's nothing
+            // downstream of this point that still needs to read it off `req`
+            // itself (`collect_request`'s own destructure always sees `None`
+            // from here on; see its comment). Doing this here, rather than in
+            // the router terminal once the decode chain reaches it, is what
+            // lets an ordinary decode filter observe/act on the request
+            // without needing to know about upgrades at all -- the router
+            // reads the handle back out through the shared `StreamInfo`,
+            // exactly like every other piece of per-stream state it reads via
+            // `DecoderCallbacks::stream_info()`.
+            stream_info.borrow_mut().on_upgrade = req.on_upgrade.take();
             // WP-51 increment 2: mint (or join) this stream's SERVER trace
             // context right here, before any filter runs, so
             // `DecoderCallbacks::stream_info()` sees `trace` already set for
@@ -785,6 +800,13 @@ impl StreamHandler for FilterChainHandler {
             HttpResponseParts {
                 head: resp.head,
                 body: local_boxed(LoggingBody::new(resp.body, log_ctx)),
+                // S10 (WP-10 increment 2b/2c): preserved, not dropped -- a
+                // `101` tunnel response must keep carrying both `OnUpgrade`
+                // handles through this outermost wrap (access logging is
+                // orthogonal to the tunnel: it logs the `101` head/empty
+                // body, and never sees the raw bytes the tunnel bridges
+                // afterward over its own sockets).
+                upgrade: resp.upgrade,
             }
         })
     }
@@ -1338,7 +1360,19 @@ impl FilterManager {
             let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
             terminal.respond(&mut cb).await
         };
-        let HttpResponseParts { mut head, mut body } = resp;
+        // S10 (WP-10 increment 2b/2c): `upgrade` is carried straight through
+        // to this function's own return below, past the encode header phase
+        // and the `StreamingEncoder` wrap -- it's set only by the router
+        // terminal's own `101` path, and every encoder filter still gets to
+        // see (and, in principle, mutate) the `101` head/empty body exactly
+        // like any other response; the tunnel itself only cares about the
+        // head this function eventually hands back to `codec::serve_one`,
+        // not about `head`/`body`'s trip through the chain in between.
+        let HttpResponseParts {
+            mut head,
+            mut body,
+            upgrade,
+        } = resp;
 
         // --- encode header phase (async: a header hold may need to consume
         // upstream frames to resolve it, S2.2) ---
@@ -1405,6 +1439,7 @@ impl FilterManager {
         HttpResponseParts {
             head,
             body: local_boxed(encoder),
+            upgrade,
         }
     }
 }
@@ -1496,6 +1531,13 @@ async fn respond_with_local_reply(
             HttpResponseParts {
                 head,
                 body: local_boxed(encoder),
+                // A local reply never carries a tunnel -- see `LocalReply`'s
+                // doc; whatever `on_upgrade` handle this stream's `StreamInfo`
+                // may still be holding (a route that isn't `Forward`, or an
+                // upgrade the router judged not allowed) is simply left
+                // unfulfilled, correctly telling the client no upgrade
+                // happened.
+                upgrade: None,
             }
         }
         Err(status) => {
@@ -3149,8 +3191,11 @@ async fn collect_request(
     // `downstream` is only used by `FilterChainHandler::handle` (XFF/S9,
     // access-log peer address), all of which runs before `FilterManager::run`
     // is even called -- this function only needs head + body. `on_upgrade`
-    // (S10, WP-10 increment 2a) isn't consumed here either; the tunnel that
-    // will pair it with an upstream `OnUpgrade` is a later increment.
+    // is always `None` by the time it reaches here (S10, WP-10 increment
+    // 2b/2c): `FilterChainHandler::handle` already moved it onto the shared
+    // `StreamInfo` before calling `mgr.run(req)`, which is what lets the
+    // router terminal read it back out later without this function -- or any
+    // decode filter in between -- needing to know upgrades exist at all.
     let HttpRequestParts {
         head,
         body,
@@ -3209,6 +3254,7 @@ fn synth_response(status: http::StatusCode, message: &str) -> HttpResponseParts 
     HttpResponseParts {
         head: ResponseHeaders { status, headers },
         body: bytes_to_seam_body(Bytes::from(body), None),
+        upgrade: None,
     }
 }
 

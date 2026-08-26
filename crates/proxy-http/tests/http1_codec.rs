@@ -192,6 +192,7 @@ impl StreamHandler for SlowChunkedHandler {
                     headers: HeaderMap::new(),
                 },
                 body,
+                upgrade: None,
             }
         })
     }
@@ -404,6 +405,7 @@ impl StreamHandler for SlowHandler {
                     headers: HeaderMap::new(),
                 },
                 body,
+                upgrade: None,
             }
         })
     }
@@ -440,6 +442,7 @@ impl StreamHandler for UpgradeRecordingHandler {
                     headers: HeaderMap::new(),
                 },
                 body,
+                upgrade: None,
             }
         })
     }

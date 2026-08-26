@@ -196,6 +196,7 @@ impl StreamHandler for SlowChunkedHandler {
                     headers: HeaderMap::new(),
                 },
                 body,
+                upgrade: None,
             }
         })
     }
@@ -302,6 +303,7 @@ impl StreamHandler for CapturingHandler {
                     headers,
                 },
                 body,
+                upgrade: None,
             }
         })
     }
@@ -433,6 +435,7 @@ impl StreamHandler for StreamTaggedHandler {
                     headers: HeaderMap::new(),
                 },
                 body,
+                upgrade: None,
             }
         })
     }

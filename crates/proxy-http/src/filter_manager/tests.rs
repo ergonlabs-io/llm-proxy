@@ -470,6 +470,7 @@ impl TerminalHttpFilter for RecordingTerminal {
                     headers: HeaderMap::new(),
                 },
                 body: bytes_to_seam_body(Bytes::from_static(b"resp"), None),
+                upgrade: None,
             }
         })
     }
@@ -1842,6 +1843,7 @@ impl TerminalHttpFilter for EndStreamRecordingTerminal {
                     headers: HeaderMap::new(),
                 },
                 body: bytes_to_seam_body(Bytes::from_static(b"resp"), None),
+                upgrade: None,
             }
         })
     }
@@ -4269,6 +4271,7 @@ impl TerminalHttpFilter for LateHeaderMutationTerminal {
                     headers: HeaderMap::new(),
                 },
                 body: bytes_to_seam_body(Bytes::from_static(b"resp"), None),
+                upgrade: None,
             }
         })
     }

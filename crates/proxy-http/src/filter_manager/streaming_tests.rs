@@ -205,6 +205,7 @@ impl TerminalHttpFilter for FixedBodyTerminal {
                     headers: self.headers.clone(),
                 },
                 body,
+                upgrade: None,
             }
         })
     }

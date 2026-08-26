@@ -118,6 +118,48 @@ impl DownstreamInfo {
 pub struct HttpResponseParts {
     pub head: ResponseHeaders,
     pub body: StreamBody,
+    /// S10 (WP-10 increment 2b/2c): set only by the router's own `101`
+    /// path (`router::RouterHandler::handle_upgrade`) once the upstream has
+    /// answered `101` -- every other constructor of this struct sets `None`.
+    /// `codec::serve_one` is the one place this is read: it must be pulled
+    /// out BEFORE the head/body are handed to `build_response` (which only
+    /// knows about those two fields), and the actual bridging has to happen
+    /// in a task spawned AFTER the `101` response is returned to hyper -- see
+    /// that call site's Rust note for why the ordering is load-bearing, not
+    /// incidental.
+    pub upgrade: Option<UpgradeTunnel>,
+}
+
+/// The pair of raw byte-stream handles a completed `101` handshake hands
+/// back -- one per side of the tunnel `codec::serve_one` bridges with
+/// `tokio::io::copy_bidirectional`. Neither handle is usable yet at the
+/// point this is constructed: each `OnUpgrade` only resolves once its own
+/// peer has actually finished writing/processing the `101` (downstream:
+/// once hyper has sent our `101` response out; upstream: already resolved
+/// by the time the router builds this, since the upstream's `101` was
+/// already read to get here -- but kept as an `OnUpgrade`, not an already
+/// -awaited `Upgraded`, so both sides are handled uniformly by the one
+/// `tokio::try_join!` in `serve_one`).
+pub struct UpgradeTunnel {
+    /// The downstream (client-facing) half -- `HttpRequestParts::on_upgrade`,
+    /// relayed through `StreamInfo::on_upgrade` (see that field's doc) and
+    /// `.take()`n by the router once it decides to tunnel.
+    pub downstream: hyper::upgrade::OnUpgrade,
+    /// The upstream (origin-facing) half, returned by
+    /// `codec::send_upstream_http1_upgrade` alongside the `101` response
+    /// that triggered this whole struct's construction.
+    pub upstream: hyper::upgrade::OnUpgrade,
+    /// The S5 `max_connections` slot the router's `pool.new_stream()` dial
+    /// acquired for this physical connection (see
+    /// `proxy_cluster::UpstreamStream::cb_guard`'s doc: "must live exactly
+    /// as long as the physical connection does"). An upgraded connection is
+    /// never returned to a cache -- there is no `H1ReuseBody`/`IdleH1Conn`
+    /// to carry it for the tunnel's whole lifetime the way a pooled h1
+    /// response would -- so it rides here instead, and
+    /// `codec::bridge_upgrade` holds it until `copy_bidirectional` returns.
+    /// `None` only when the dial had no real budget to acquire against (see
+    /// that same doc).
+    pub cb_guard: Option<proxy_cluster::CbGuard>,
 }
 
 /// One per HTTP connection manager instance. The codec calls `handle` once
@@ -189,6 +231,7 @@ pub mod stub {
                         headers: self.headers.clone(),
                     },
                     body,
+                    upgrade: None,
                 }
             })
         }
@@ -215,6 +258,7 @@ pub mod stub {
                         headers: HeaderMap::new(),
                     },
                     body: req.body,
+                    upgrade: None,
                 }
             })
         }

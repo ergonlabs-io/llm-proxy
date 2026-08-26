@@ -65,6 +65,7 @@
 //! INSIDE the encode filter chain, so logging from here can never observe
 //! what an encode filter does at end-of-stream).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -77,7 +78,9 @@ use proxy_cluster::outlier::RequestResult;
 use proxy_cluster::{
     ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
 };
-use proxy_config::ir::{DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher};
+use proxy_config::ir::{
+    DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher, UpgradeConfig,
+};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, TraceContext};
 use proxy_observability::ResponseFlag;
 
@@ -88,7 +91,7 @@ use crate::filter::{
     TerminalHttpFilter,
 };
 use crate::handler::{
-    local_boxed, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody,
+    local_boxed, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, UpgradeTunnel,
 };
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, select_cluster};
@@ -148,6 +151,20 @@ pub struct RouterFilterFactory {
     /// WP-51 increment 2: this HCM's span sink, if boot/reload wired one --
     /// see [`RouterHandler::span_sink`]'s doc for where it's read.
     span_sink: Option<SpanSink>,
+    /// S10 (WP-10 increment 2b/2c): this HCM's `upgrade_configs`, resolved
+    /// once (at `with_upgrade_configs`, not per-stream) into "is this
+    /// upgrade type enabled?" -- keyed by `UpgradeConfig::upgrade_type`
+    /// (already lowercased at lowering, `proxy-config`'s doc on that field).
+    /// `Arc<HashMap<..>>`, not `Rc`: `RouterFilterFactory` must stay
+    /// `Send + Sync` (every other per-worker field on it is `Arc` for the
+    /// same reason -- see `clusters`/`stats` above), but the map itself is
+    /// plain, immutable, `Send + Sync` data, so an `Arc` clone into every
+    /// stream's `RouterHandler` (see `create_terminal_filter`) costs nothing
+    /// `RouterHandler`'s own `!Send` fields (`conn_cache`/`h1_cache`) would.
+    /// Empty (the default, and every pre-S10 caller's steady state) means no
+    /// upgrade type is ever allowed -- matching Envoy's "no `upgrade_configs`
+    /// means no upgrades" default.
+    upgrade_configs: Arc<HashMap<String, bool>>,
 }
 
 impl RouterFilterFactory {
@@ -156,6 +173,7 @@ impl RouterFilterFactory {
             clusters,
             stats,
             span_sink: None,
+            upgrade_configs: Arc::new(HashMap::new()),
         }
     }
 
@@ -168,6 +186,23 @@ impl RouterFilterFactory {
         self.span_sink = Some(span_sink);
         self
     }
+
+    /// S10 (WP-10 increment 2b/2c): attaches this HCM's `upgrade_configs` --
+    /// a builder method, same "every existing `new` call site stays
+    /// unaffected" shape as [`Self::with_tracing`]. `proxy-core`'s
+    /// `build_hcm_handler` calls this for every real HCM build/rebuild with
+    /// `hcm.upgrade_configs`; every other caller (tests, and any pre-S10
+    /// code path) leaves this unset and gets the empty-map default (no
+    /// upgrade type ever allowed).
+    pub fn with_upgrade_configs(mut self, configs: Vec<UpgradeConfig>) -> Self {
+        self.upgrade_configs = Arc::new(
+            configs
+                .into_iter()
+                .map(|c| (c.upgrade_type, c.enabled))
+                .collect(),
+        );
+        self
+    }
 }
 
 impl TerminalFilterInstanceFactory for RouterFilterFactory {
@@ -176,6 +211,7 @@ impl TerminalFilterInstanceFactory for RouterFilterFactory {
             self.clusters.clone(),
             self.stats.clone(),
             self.span_sink.clone(),
+            self.upgrade_configs.clone(),
         ))
     }
 }
@@ -230,6 +266,11 @@ pub struct RouterHandler {
     /// a retry/fallback is a fresh attempt, so it gets a fresh child span
     /// under the SAME server span, never a fresh trace.
     span_sink: Option<SpanSink>,
+    /// S10 (WP-10 increment 2b/2c): this HCM's resolved `upgrade_configs`,
+    /// cloned (an `Arc` bump) from [`RouterFilterFactory::upgrade_configs`]
+    /// at stream construction -- see that field's doc. Read by
+    /// [`Self::upgrade_allowed`].
+    upgrade_configs: Arc<HashMap<String, bool>>,
 }
 
 impl RouterHandler {
@@ -237,6 +278,7 @@ impl RouterHandler {
         clusters: Arc<ClusterManager>,
         stats: Arc<RouterStats>,
         span_sink: Option<SpanSink>,
+        upgrade_configs: Arc<HashMap<String, bool>>,
     ) -> Self {
         Self {
             clusters,
@@ -247,7 +289,20 @@ impl RouterHandler {
             captured_body: Bytes::new(),
             captured_trailers: None,
             span_sink,
+            upgrade_configs,
         }
+    }
+
+    /// S10.1: is `upgrade_type` (already lowercased by the caller -- see
+    /// [`requested_upgrade_type`]) both PRESENT in this HCM's
+    /// `upgrade_configs` and `enabled` there? Absent entirely, or present
+    /// with `enabled: false`, are both "not allowed" -- there is no
+    /// third state.
+    fn upgrade_allowed(&self, upgrade_type: &str) -> bool {
+        self.upgrade_configs
+            .get(upgrade_type)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -349,6 +404,27 @@ impl RouterHandler {
             }
         });
 
+        // S10 (WP-10 increment 2b/2c): this request asked for an HTTP
+        // upgrade -- `on_upgrade` was moved onto the shared `StreamInfo` by
+        // `FilterChainHandler::handle`, right after it was built (see that
+        // call site's Rust note). Handled here, before the ordinary
+        // per-action match below, on purpose: the S10.1 gate (allowed
+        // upgrade type, or 403) has nothing to do with routing at all, and a
+        // tunnel only ever makes sense against a `Forward` route -- there's
+        // no upstream to tunnel to for a `DirectResponse`/`Redirect`.
+        if dcb.stream_info().on_upgrade.is_some() {
+            if let Some(resp) = self.handle_upgrade_if_applicable(&head, &route, dcb).await {
+                return resp;
+            }
+            // Fell through: the gate already passed (or there would be a
+            // `Some(403)` above), but the route doesn't lead anywhere
+            // tunnel-able (no match, or a `DirectResponse`/`Redirect`
+            // action). Ordinary per-action handling below runs exactly as it
+            // would for a non-upgrade request; the downstream `OnUpgrade`
+            // still sitting in `StreamInfo` is simply left unfulfilled,
+            // which correctly tells the client no upgrade happened.
+        }
+
         match route {
             None => {
                 tracing::debug!(response_flag = "NR", "no route matched");
@@ -376,6 +452,273 @@ impl RouterHandler {
                 }
                 RouteActionIR::Redirect(redirect) => redirect_response(redirect, &head),
             },
+        }
+    }
+
+    /// S10 (WP-10 increment 2b/2c): the S10.1 gate, plus dispatch to
+    /// [`Self::handle_upgrade`] when there's a `Forward` route to tunnel to.
+    /// `Some(_)` means this call decided the request's fate outright (a
+    /// `403` from the gate, or whatever [`Self::handle_upgrade`] returned);
+    /// `None` means "not applicable" -- the caller falls through to ordinary
+    /// per-action handling (see its call site's comment for the two cases
+    /// that land here: no route matched, or the route isn't `Forward`).
+    async fn handle_upgrade_if_applicable(
+        &self,
+        head: &RequestHeaders,
+        route: &Option<Arc<proxy_config::ir::RouteEntry>>,
+        dcb: &mut dyn DecoderCallbacks,
+    ) -> Option<HttpResponseParts> {
+        let requested_type = requested_upgrade_type(&head.headers);
+        let allowed = requested_type
+            .as_deref()
+            .is_some_and(|t| self.upgrade_allowed(t));
+        if !allowed {
+            tracing::debug!(
+                response_flag = "none",
+                requested_type = ?requested_type,
+                "S10.1: upgrade refused -- no enabled upgrade_configs entry for the \
+                 requested type (or no Upgrade header at all)"
+            );
+            return Some(local_reply(StatusCode::FORBIDDEN, "upgrade not allowed"));
+        }
+
+        let route = route.as_ref()?;
+        let RouteActionIR::Forward(fwd) = &route.action else {
+            return None;
+        };
+        Some(
+            self.handle_upgrade(
+                fwd,
+                &route.matcher,
+                &route.request_headers_to_add,
+                head,
+                dcb,
+            )
+            .await,
+        )
+    }
+
+    /// S10 (WP-10 increment 2b/2c): forward an ALLOWED upgrade request to the
+    /// picked cluster/host, dialing a FRESH connection via `pool.new_stream()`
+    /// -- bypassing BOTH `H1ConnCache` and `UpstreamConnCache` -- and build
+    /// the tunnel response if (and only if) the upstream answers `101`.
+    ///
+    /// Single attempt, no retries at all (S10.1): unlike [`Self::apply_forward`],
+    /// there is no `retry_state`/attempt loop here. An upgrade tunnel isn't an
+    /// idempotent request/response exchange that's safe to replay on a
+    /// different host -- once a `101` has gone out, the client may already be
+    /// writing tunnel bytes downstream, and there is no well-defined way to
+    /// "retry" a byte stream that's already in flight.
+    ///
+    /// Bypassing both caches (rather than just the h1 one) is deliberate even
+    /// though this v1 tunnel only ever dials h1 upstreams (h2 is rejected
+    /// below): an upgraded connection is consumed whole by the tunnel and can
+    /// never be handed back for a future request to reuse, on EITHER
+    /// protocol, so there is nothing for either cache to gain by seeing it.
+    async fn handle_upgrade(
+        &self,
+        fwd: &proxy_config::ir::ForwardAction,
+        matcher: &RouteMatcher,
+        request_headers_to_add: &[proxy_config::ir::HeaderMutation],
+        head: &RequestHeaders,
+        dcb: &mut dyn DecoderCallbacks,
+    ) -> HttpResponseParts {
+        let draw = match &fwd.target {
+            ForwardTarget::Weighted(w) if w.total_weight > 0 => {
+                rand::random::<u64>() % w.total_weight
+            }
+            _ => 0,
+        };
+        let Some(cluster_name) = select_cluster(&fwd.target, &head.headers, draw) else {
+            dcb.stream_info()
+                .set_response_flag(ResponseFlag::NoClusterFound);
+            return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no cluster");
+        };
+        let cluster_name = cluster_name.to_string();
+
+        let Some(entry) = self.clusters.cluster(&cluster_name) else {
+            dcb.stream_info()
+                .set_response_flag(ResponseFlag::NoClusterFound);
+            return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
+        };
+
+        // Single host pick, no `LoadBalancerContext::attempted_clusters`
+        // accumulation -- there is no second attempt to steer away from the
+        // first one's pick.
+        let ctx = LoadBalancerContext::default();
+        let Some(sel) = entry.select_host(&ctx) else {
+            dcb.stream_info()
+                .set_response_flag(ResponseFlag::NoHealthyUpstream);
+            return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
+        };
+        let host = sel.host;
+        // WP-35: same "the member, not the routed aggregate, owns
+        // credentials/protocol" reasoning `apply_forward`'s own attempt loop
+        // documents at length -- see there for the full explanation.
+        let (attempt_cluster, attempt_entry): (&str, &dyn ClusterEntry) = match &sel.member {
+            Some(m) => (m.name.as_str(), m.entry.as_ref()),
+            None => (cluster_name.as_str(), entry.as_ref()),
+        };
+
+        let proto = attempt_entry.upstream_protocol();
+        {
+            let mut info = dcb.stream_info();
+            info.upstream_cluster = Some(attempt_cluster.to_string());
+            info.upstream_host = Some(host.address.to_string());
+            info.protocol = Some(
+                match proto {
+                    UpstreamProtocol::Http1 => "HTTP/1.1",
+                    UpstreamProtocol::Http2 => "HTTP/2",
+                }
+                .to_string(),
+            );
+        }
+
+        // h2 extended CONNECT (RFC 8441, S10.2) is a later increment -- this
+        // tunnel only speaks h1 on both sides (module doc).
+        if matches!(proto, UpstreamProtocol::Http2) {
+            tracing::debug!(
+                cluster = %attempt_cluster,
+                "S10: upgrade requested against an h2 upstream, not yet supported"
+            );
+            return local_reply(
+                StatusCode::BAD_GATEWAY,
+                "websocket upstream must be http/1.1",
+            );
+        }
+
+        let mut attempt_head = RequestHeaders {
+            method: head.method.clone(),
+            uri: head.uri.clone(),
+            headers: head.headers.clone(),
+        };
+        apply_request_transforms(fwd, matcher, request_headers_to_add, &mut attempt_head);
+        apply_header_mutations(
+            attempt_entry.request_headers_to_add(),
+            &mut attempt_head.headers,
+        );
+
+        // Bypass BOTH connection caches: `pool.new_stream()` dials a
+        // connection this tunnel will own exclusively (see this method's
+        // doc), never `H1ConnCache::get_or_connect_h1`/
+        // `UpstreamConnCache::get_or_connect`.
+        let pool = attempt_entry.http_pool(&host, proto);
+        let upstream_stream = match pool.new_stream().await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let (flag, msg): (ResponseFlag, &str) = match &err {
+                    PoolError::Overflow => (ResponseFlag::UpstreamOverflow, "upstream overloaded"),
+                    PoolError::ConnectFailure(_) | PoolError::ConnectTimeout => (
+                        ResponseFlag::UpstreamConnectionFailure,
+                        "upstream connect failure",
+                    ),
+                    PoolError::TlsHandshake(_) => (
+                        ResponseFlag::UpstreamConnectionFailure,
+                        "upstream TLS handshake failure",
+                    ),
+                    PoolError::ResetBeforeHeaders => {
+                        (ResponseFlag::UpstreamRemoteReset, "upstream reset")
+                    }
+                };
+                tracing::debug!(cluster = %attempt_cluster, error = %err, "S10: upgrade dial failed");
+                dcb.stream_info().set_response_flag(flag);
+                return local_reply(StatusCode::SERVICE_UNAVAILABLE, msg);
+            }
+        };
+        let proxy_cluster::UpstreamStream { io, cb_guard } = upstream_stream;
+
+        let body_bytes = self.captured_body.clone();
+        dcb.stream_info().bytes_received = body_bytes.len() as u64;
+        let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
+        let attempt_body: StreamBody = body_with_trailers(body_bytes, trailers);
+
+        let upstream_req = HttpRequestParts {
+            head: attempt_head,
+            body: attempt_body,
+            downstream: DownstreamInfo::loopback(),
+            // No downstream connection of its own -- this is the router's
+            // own synthesised upstream request, same as `apply_forward`'s.
+            on_upgrade: None,
+        };
+
+        let (resp, upstream_on_upgrade) = match crate::codec::send_upstream_http1_upgrade(
+            io,
+            upstream_req,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                if crate::codec::is_remote_reset(&err) {
+                    dcb.stream_info()
+                        .set_response_flag(ResponseFlag::UpstreamRemoteReset);
+                } else {
+                    dcb.stream_info()
+                        .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
+                }
+                tracing::debug!(cluster = %attempt_cluster, error = %err, "S10: upgrade send failed");
+                return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
+            }
+        };
+
+        if resp.head.status != StatusCode::SWITCHING_PROTOCOLS {
+            // The upstream declined the upgrade -- pass its response
+            // straight through (S10.1), no tunnel. `resp.upgrade` is already
+            // `None` (set by `send_upstream_http1_upgrade`), and the
+            // downstream `OnUpgrade` still in `StreamInfo` is simply never
+            // `.take()`n -- correctly telling the CLIENT no upgrade
+            // happened. `cb_guard` still has to ride along with this
+            // response's body (not just get dropped here): the connection
+            // this dial opened is still alive for as long as the body is
+            // being read, same reasoning `H1ReuseBody`/`GuardedBody`
+            // document for their own guards.
+            let mut resp = resp;
+            resp.body = local_boxed(GuardedBody::new(resp.body, cb_guard));
+            return resp;
+        }
+
+        // Rust note: both `.take()`s below use a defensive `let...else`
+        // rather than `.expect()` -- true panics are avoided even where the
+        // invariant SHOULD hold (see each arm's comment for why it should),
+        // per this crate's general preference for a safe fallback response
+        // over a crashed worker.
+        let Some(downstream_on_upgrade) = dcb.stream_info().on_upgrade.take() else {
+            // Unreachable in practice: `route_and_forward` only calls
+            // `handle_upgrade_if_applicable` (and so this method) when
+            // `on_upgrade.is_some()`, and nothing between there and here
+            // `.await`s anything that could observe/take it out from under
+            // us (single-threaded, no re-entrancy into this stream's
+            // `StreamInfo`).
+            tracing::error!(
+                "S10: upstream answered 101 but the downstream OnUpgrade was already gone"
+            );
+            return local_reply(StatusCode::BAD_GATEWAY, "upgrade handshake failed");
+        };
+        let Some(upstream_on_upgrade) = upstream_on_upgrade else {
+            // Also unreachable: `send_upstream_http1_upgrade` always returns
+            // `Some` alongside a `101` response -- see its doc.
+            tracing::error!(
+                "S10: upstream answered 101 but send_upstream_http1_upgrade returned no \
+                 OnUpgrade"
+            );
+            return local_reply(StatusCode::BAD_GATEWAY, "upgrade handshake failed");
+        };
+
+        // Empty body: the tunnel carries every byte from here on over the
+        // raw `OnUpgrade` streams, not through this response's `StreamBody`
+        // (see `codec::serve_one`'s bridging).
+        let body: StreamBody = local_boxed(
+            Full::new(Bytes::new())
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        HttpResponseParts {
+            head: resp.head,
+            body,
+            upgrade: Some(UpgradeTunnel {
+                downstream: downstream_on_upgrade,
+                upstream: upstream_on_upgrade,
+                cb_guard,
+            }),
         }
     }
 
@@ -1318,6 +1661,23 @@ fn apply_header_mutations(
     }
 }
 
+/// S10.1: the single upgrade type this request is asking for, to gate
+/// against `upgrade_configs` -- the first, lowercased token of the
+/// `Upgrade` header, or `None` if there isn't one (no header, or an empty
+/// value). RFC 9110 doesn't define `Upgrade` as a strict preference-ordered
+/// list the way `Connection` is, but a real WebSocket client sends exactly
+/// one token (`websocket`), and Envoy itself gates on a single configured
+/// `upgrade_type` string per entry -- so "the first token" is what there is
+/// to compare against `upgrade_allowed`.
+fn requested_upgrade_type(headers: &http::HeaderMap) -> Option<String> {
+    let value = headers.get(http::header::UPGRADE)?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    Some(first.to_ascii_lowercase())
+}
+
 /// Synthesize a `DirectResponse` action's reply. `DataSourceIR::Inline` is
 /// the only body variant handled for v1; a `File` body is non-trivial
 /// (loading + caching file contents isn't wired anywhere in this WP) so it
@@ -1429,6 +1789,7 @@ fn local_reply_with_status(status: StatusCode, body: Bytes) -> HttpResponseParts
             headers: http::HeaderMap::new(),
         },
         body,
+        upgrade: None,
     }
 }
 

@@ -777,7 +777,11 @@ impl LeasedH1 {
             errored: false,
         });
 
-        Ok(HttpResponseParts { head, body })
+        Ok(HttpResponseParts {
+            head,
+            body,
+            upgrade: None,
+        })
     }
 }
 

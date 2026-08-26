@@ -33,7 +33,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{
     local_boxed, BodyError, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody,
-    StreamHandler,
+    StreamHandler, UpgradeTunnel,
 };
 
 /// Per-connection h1 options. Room to grow (header/body size limits) as
@@ -386,7 +386,111 @@ where
     // proxy-to-origin side of the seam.
     let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
 
-    Ok(HttpResponseParts { head, body })
+    Ok(HttpResponseParts {
+        head,
+        body,
+        upgrade: None,
+    })
+}
+
+/// Send one HTTP/1.1 request upstream as an **Upgrade** -- the client-side
+/// half of the S10 tunnel (WP-10 increment 2b/2c). Like [`send_upstream_http1`]
+/// (builds a client `Connection` from scratch, sends `req`, returns head-first
+/// with a streaming body) with two differences: the `Connection` is built
+/// with `.with_upgrades()` (spike finding (e): required on the CLIENT side
+/// too, or `hyper::upgrade::on` below silently never resolves), and the
+/// return value ALSO carries the upstream's own [`hyper::upgrade::OnUpgrade`]
+/// handle whenever the response is `101 Switching Protocols` -- `None` for
+/// any other status, meaning the upstream declined the upgrade and this is
+/// just an ordinary response to pass through.
+///
+/// No [`Http1Options`]/keep-alive parameter, unlike `send_upstream_http1`:
+/// this never goes through `crate::upstream_pool::H1ConnCache` -- `router.rs`'s
+/// upgrade path dials `io` fresh via `pool.new_stream()` specifically so this
+/// call never touches that cache. An upgraded connection is consumed whole by
+/// the tunnel (or, on a non-101 response, simply dropped once its response
+/// body is drained) and must never be handed back for a future request to
+/// reuse.
+pub async fn send_upstream_http1_upgrade<IO>(
+    io: IO,
+    req: HttpRequestParts,
+) -> Result<(HttpResponseParts, Option<hyper::upgrade::OnUpgrade>), UpstreamCodecError>
+where
+    // Rust note: same `Send` bound `serve_http1`'s `IO` carries, and for the
+    // identical reason -- required by `Connection::with_upgrades()` below,
+    // not a reversal of ADR-0003 (see `serve_http1`'s own Rust note for the
+    // full reasoning; every concrete `IO` this crate instantiates this with
+    // already is `Send`).
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(io);
+
+    let builder = hyper::client::conn::http1::Builder::new();
+    let (mut sender, conn) = builder
+        .handshake::<_, StreamBody>(io)
+        .await
+        .map_err(UpstreamCodecError::Handshake)?;
+
+    // Rust note: same "why `spawn_local`, why the `JoinHandle` is only used
+    // to `.abort()` on a send failure, never otherwise awaited" reasoning as
+    // `send_upstream_http1`'s own `conn_task` -- see its comment. The only
+    // difference here is `.with_upgrades()`, which changes the future's
+    // concrete type (`UpgradeableConnection`, not `Connection`) but not this
+    // shape at all -- same as the server side (spike finding (e) caveat (2)).
+    let conn_task = tokio::task::spawn_local(conn.with_upgrades());
+
+    let RequestHeaders {
+        method,
+        uri,
+        headers,
+    } = req.head;
+    let mut builder = Request::builder().method(method).uri(uri);
+    *builder.headers_mut().expect("builder not yet finalized") = headers;
+    let request = builder
+        .body(req.body)
+        .expect("method/uri were already valid; building can't fail here");
+
+    let mut response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(send_err) => {
+            conn_task.abort();
+            return Err(UpstreamCodecError::Send(send_err));
+        }
+    };
+
+    // Rust note: `hyper::upgrade::on` must run before `response.into_parts()`
+    // below consumes `response` (and the `Extensions` it stashed the
+    // `OnUpgrade` in while parsing) -- same ordering rule
+    // `codec::serve_one`'s own call documents, and spike finding (e)'s
+    // caveat (3). Gated on the status, not called unconditionally: on
+    // anything other than `101` hyper never populated an `OnUpgrade` at all
+    // (the response wasn't an upgrade handshake), so there'd be nothing for
+    // this to pull out.
+    let on_upgrade = if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+        Some(hyper::upgrade::on(&mut response))
+    } else {
+        None
+    };
+
+    let (parts, incoming) = response.into_parts();
+    let head = ResponseHeaders {
+        status: parts.status,
+        headers: parts.headers,
+    };
+    let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
+
+    Ok((
+        HttpResponseParts {
+            head,
+            body,
+            // The router (`route_and_forward`/`handle_upgrade`) is what
+            // pairs `on_upgrade` above with the DOWNSTREAM `OnUpgrade` into
+            // an `UpgradeTunnel` -- this function only ever hands both halves
+            // back separately, since it has no view of the downstream side.
+            upgrade: None,
+        },
+        on_upgrade,
+    ))
 }
 
 /// Handshake a fresh HTTP/1.1 client connection over `io` and spawn its
@@ -579,7 +683,11 @@ pub async fn send_on_http2(
     };
     let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
 
-    Ok(HttpResponseParts { head, body })
+    Ok(HttpResponseParts {
+        head,
+        body,
+        upgrade: None,
+    })
 }
 
 /// Send one request upstream over `io` as HTTP/2 and return the response,
@@ -661,7 +769,7 @@ async fn serve_one(
     // `StreamBody`.
     let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Downstream(Box::new(e))));
 
-    let response = handler
+    let mut response = handler
         .handle(HttpRequestParts {
             head,
             body,
@@ -669,7 +777,82 @@ async fn serve_one(
             on_upgrade,
         })
         .await;
-    build_response(response)
+
+    // S10 (WP-10 increment 2b/2c): the router's `101` path is the only
+    // producer of `response.upgrade` -- every other response leaves it
+    // `None`. Pull it out (`Option::take`, leaving `None` behind) BEFORE
+    // handing `response` to `build_response` below, which only knows about
+    // `head`/`body`: `HttpResponseParts` carries no `Drop` impl, so this
+    // partial move is sound, and it's what lets the tunnel handles survive
+    // past that call.
+    let upgrade = response.upgrade.take();
+
+    let built = build_response(response);
+
+    // Rust note: the bridging work is a task, not an `.await` right here --
+    // and that ordering is load-bearing, not a style choice. Each side's
+    // `OnUpgrade` only resolves once ITS OWN peer has finished processing the
+    // `101`: hyper resolves the downstream one only after it has actually
+    // written `built` (the response this function is about to return) out
+    // to the client, and this function hasn't returned it yet. Awaiting the
+    // tunnel inline here, before `return built`, would deadlock every
+    // upgrade: `built` would never be sent, so `downstream` would never
+    // resolve, so this `.await` would hang forever. Spawning lets hyper
+    // finish writing `built` (the caller -- `serve_http1`'s `Connection`
+    // future -- drives that) while this task waits on both halves
+    // independently in the background.
+    if let Some(UpgradeTunnel {
+        downstream,
+        upstream,
+        cb_guard,
+    }) = upgrade
+    {
+        tokio::task::spawn_local(bridge_upgrade(downstream, upstream, cb_guard));
+    }
+
+    built
+}
+
+/// S10 (WP-10 increment 2b/2c): await both halves of an established upgrade
+/// handshake and copy raw bytes between them until either side closes --
+/// the actual WebSocket-agnostic tunnel `serve_one` exists to set up. Spawned
+/// (never awaited inline) by `serve_one`; see its Rust note for why.
+///
+/// `cb_guard` rides along purely to be held alive (never read -- see
+/// `UpgradeTunnel::cb_guard`'s doc) for exactly this function's duration: it
+/// represents the S5 `max_connections` slot the router's dial acquired for
+/// this physical connection, and that connection is alive for as long as
+/// this tunnel is running.
+async fn bridge_upgrade(
+    downstream: hyper::upgrade::OnUpgrade,
+    upstream: hyper::upgrade::OnUpgrade,
+    _cb_guard: Option<proxy_cluster::CbGuard>,
+) {
+    // Rust note: `tokio::try_join!` polls both futures concurrently and
+    // resolves as soon as either errors, or once both have resolved
+    // successfully -- exactly what's needed here: each side's `OnUpgrade` is
+    // independent (see `serve_one`'s note on why they resolve at different,
+    // peer-driven times), and there's nothing useful this tunnel can do with
+    // only one of the two raw streams in hand.
+    let (downstream, upstream) = match tokio::try_join!(downstream, upstream) {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::debug!(error = %err, "upgrade tunnel: failed to obtain one or both upgraded streams");
+            return;
+        }
+    };
+    let mut downstream = TokioIo::new(downstream);
+    let mut upstream = TokioIo::new(upstream);
+    match tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
+        Ok((down_to_up, up_to_down)) => {
+            tracing::debug!(down_to_up, up_to_down, "upgrade tunnel closed");
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "upgrade tunnel: copy_bidirectional failed");
+        }
+    }
+    // `_cb_guard` drops here, releasing the `max_connections` slot exactly
+    // when the physical connection this tunnel owned is actually done with.
 }
 
 /// Convert [`HttpResponseParts`] into a `hyper::Response<StreamBody>`. Split
@@ -678,6 +861,9 @@ fn build_response(parts: HttpResponseParts) -> Response<StreamBody> {
     let HttpResponseParts {
         head: ResponseHeaders { status, headers },
         body,
+        // S10: already `.take()`n by `serve_one` above (see its comment) --
+        // this function only ever builds head+body into a hyper `Response`.
+        upgrade: _,
     } = parts;
     let mut builder = Response::builder().status(status);
     // Rust note: `Response::builder().status(..)` starts with a fresh, empty

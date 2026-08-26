@@ -1175,6 +1175,11 @@ fn build_hcm_handler(
     if let Some(t) = tracing_handles {
         router_factory = router_factory.with_tracing(t.sink.clone());
     }
+    // S10 (WP-10 increment 2b/2c): thread this HCM's `upgrade_configs` into
+    // the router -- empty is the common case (no upgrades configured) and
+    // costs nothing beyond an empty `HashMap`; see
+    // `RouterFilterFactory::with_upgrade_configs`'s doc.
+    router_factory = router_factory.with_upgrade_configs(hcm.upgrade_configs.clone());
     let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(router_factory);
 
     // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
