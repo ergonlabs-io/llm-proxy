@@ -370,7 +370,10 @@ pub struct UpstreamStream {
 // `StreamBody`, `Rc`/`RefCell` data-plane state), not the raw upstream byte
 // stream. Making the stream `Send` only ALLOWS thread-hopping; the workers
 // still run on per-worker current_thread runtimes.
-pub trait UpstreamIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {}
+pub trait UpstreamIo:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
 
 impl<T> UpstreamIo for T where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
