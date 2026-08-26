@@ -2193,7 +2193,14 @@ fn stop_all_iteration_and_watermark_applies_backpressure_on_overflow() {
 /// later `encode_data`. There is no 1xx flow through this harness at all
 /// today — `encode_1xx_headers` is never called anywhere in `filter_manager.rs`.
 #[test]
-#[ignore = "WP-11 chunk 4: 1xx (S2.6)"]
+#[ignore = "WP-11 chunk 4: 1xx (S2.6) — BLOCKED on hyper. The hyper_spike.rs \
+            finding (f) proved (expect_err) that hyper's low-level h1 SERVER \
+            hard-rejects a 1xx from a service_fn (substitutes 500, errors \
+            'response has 1xx status code, not supported by server'), so the \
+            proxy cannot relay a 1xx to its own client. Upstream-observed 1xx \
+            works (hyper::ext::on_informational), but transparent passthrough — \
+            what this test needs — needs hyper server-side 1xx support or a \
+            hand-rolled raw write. Deferred; not a code gap on our side."]
 fn informational_1xx_response_runs_a_separate_encode_callback() {
     // No reachable path exists yet to drive a 1xx response through
     // `FilterManager` — there is no `send_1xx`-equivalent seam. The correct
