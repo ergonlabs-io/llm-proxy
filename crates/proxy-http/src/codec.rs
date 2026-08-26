@@ -190,7 +190,17 @@ where
         async move { Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream).await) }
     });
 
-    let builder = hyper::server::conn::http2::Builder::new(LocalExec);
+    let mut builder = hyper::server::conn::http2::Builder::new(LocalExec);
+    // S10.2 (WP-10/11 h2 tunnel): the ONLY opt-in an h2 server needs to
+    // accept an RFC 8441 extended CONNECT at all -- unlike h1's
+    // `.with_upgrades()`, there is no separate per-connection "allow
+    // upgrades" builder method; this alone advertises
+    // `SETTINGS_ENABLE_CONNECT_PROTOCOL` to the peer and makes hyper stash an
+    // `OnUpgrade` (plus the `:protocol` pseudo-header as a `hyper::ext::
+    // Protocol` extension) on a `:method CONNECT` request, exactly as
+    // `tests/hyper_spike.rs` finding (g) proved. Without it, a peer sending
+    // `:protocol` is a protocol violation the h2 layer is entitled to reject.
+    builder.enable_connect_protocol();
     let conn = builder.serve_connection(io, service);
 
     // Rust note: same `tokio::pin!` + `graceful_shutdown` shape as
@@ -717,6 +727,130 @@ where
     send_on_http2(sender, req).await
 }
 
+/// Send one WebSocket-tunnel request upstream over `io` as an **h2 extended
+/// CONNECT** (RFC 8441 S4) -- the h2 mirror of
+/// [`send_upstream_http1_upgrade`], and `router.rs`'s h2 counterpart to
+/// [`send_upstream_http1_upgrade`] on the same S10.2 tunnel path. Like that
+/// function: dials nothing itself (`handshake_upstream_http2` does), sends
+/// one request, and returns the response head-first ALONGSIDE the upstream's
+/// own [`hyper::upgrade::OnUpgrade`] handle whenever the response is the h2
+/// accept status -- exactly `200`, not any `2xx` (finding (g) caveat (1): the
+/// h2 CLIENT is stricter than the SERVER side here). `None` for any other
+/// status, meaning the upstream declined the extended CONNECT and this is
+/// just an ordinary response to pass through.
+///
+/// Never touches `crate::upstream_pool::UpstreamConnCache`, for the same
+/// reason `send_upstream_http1_upgrade` never touches `H1ConnCache`: an
+/// upgraded/tunneled connection is consumed whole and must never be handed
+/// back for a future request to reuse. `router.rs`'s upgrade path dials `io`
+/// fresh via `pool.new_stream()` specifically so this call never touches
+/// that cache.
+pub async fn send_upstream_h2_connect<IO>(
+    io: IO,
+    req: HttpRequestParts,
+) -> Result<(HttpResponseParts, Option<hyper::upgrade::OnUpgrade>), UpstreamCodecError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let mut sender = handshake_upstream_http2(io).await?;
+
+    let RequestHeaders {
+        method: _,
+        uri,
+        mut headers,
+    } = req.head;
+
+    // Rust note: the inverse of `serve_one`'s normalization -- that call
+    // site synthesizes an `Upgrade: <protocol>` header from the h2
+    // `:protocol` pseudo-header so the router's gate can read it uniformly;
+    // this is where it gets turned back INTO the real wire mechanism (the
+    // `:protocol` pseudo-header, sent via a `hyper::ext::Protocol` request
+    // Extension -- see below). h1's hop-by-hop `Upgrade`/`Connection`
+    // headers have no h2 analog at all, so both are stripped rather than
+    // forwarded: sending them as ordinary h2 headers would be inert at best
+    // and could confuse a strict peer at worst. `.remove` (not `.get`) is
+    // what does the stripping -- it both reads and deletes in one call.
+    let protocol = headers
+        .remove(http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok().map(str::to_string))
+        .unwrap_or_else(|| "websocket".to_string());
+    headers.remove(http::header::CONNECTION);
+
+    // h2 gotcha, same as `send_on_http2`: every h2 request needs `:scheme`
+    // and `:authority` pseudo-headers, which hyper derives from the request
+    // URI -- reconstruct an absolute URI from `Host` when the router handed
+    // us an origin-form (path-only) one. See `send_on_http2`'s own comment
+    // for the empirical justification.
+    let uri = if uri.authority().is_some() {
+        uri
+    } else {
+        let host = headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(UpstreamCodecError::MissingAuthority)?;
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        format!("http://{host}{path_and_query}")
+            .parse::<http::Uri>()
+            .map_err(|_| UpstreamCodecError::MissingAuthority)?
+    };
+
+    let mut builder = Request::builder().method(http::Method::CONNECT).uri(uri);
+    *builder.headers_mut().expect("builder not yet finalized") = headers;
+    let mut request = builder
+        .body(req.body)
+        .expect("method/uri were already valid; building can't fail here");
+    // Rust note: `hyper::ext::Protocol::from` (a `&str` impl), not
+    // `::from_static` -- `protocol` is a runtime `String` recovered from the
+    // synthetic `Upgrade` header above, not a compile-time constant, unlike
+    // `tests/hyper_spike.rs` finding (g)'s hand-built test request.
+    request
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from(protocol.as_str()));
+
+    let mut response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(send_err) => {
+            // Same S3.2 `refused-stream` reasoning `send_on_http2` documents:
+            // REFUSED_STREAM is the one reset that's unconditionally safe to
+            // retry.
+            if h2_reason(&send_err) == Some(h2::Reason::REFUSED_STREAM) {
+                return Err(UpstreamCodecError::RefusedStream);
+            }
+            return Err(UpstreamCodecError::Send(send_err));
+        }
+    };
+
+    // Finding (g) caveat (1): the h2 CLIENT only wires the response up as an
+    // upgrade for status EXACTLY `200` -- not `is_success()`/any `2xx`, the
+    // way the SERVER side treats acceptance. Gate identically here so
+    // `on_upgrade` is `None` in precisely the cases hyper itself would never
+    // resolve it.
+    let on_upgrade = if response.status() == http::StatusCode::OK {
+        Some(hyper::upgrade::on(&mut response))
+    } else {
+        None
+    };
+
+    let (parts, incoming) = response.into_parts();
+    let head = ResponseHeaders {
+        status: parts.status,
+        headers: parts.headers,
+    };
+    let body: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
+
+    Ok((
+        HttpResponseParts {
+            head,
+            body,
+            // Same reasoning as `send_upstream_http1_upgrade`'s own `upgrade:
+            // None` -- pairing this with the DOWNSTREAM `OnUpgrade` into an
+            // `UpgradeTunnel` is `router.rs`'s job, not this function's.
+            upgrade: None,
+        },
+        on_upgrade,
+    ))
+}
+
 /// Does this request ask for a protocol upgrade -- a non-empty `Upgrade`
 /// header AND a `Connection` header whose comma-separated tokens include
 /// `upgrade` (case-insensitive, per RFC 9110 S7.6.1: `Connection` is a
@@ -749,17 +883,49 @@ async fn serve_one(
     // it only *removes* the `OnUpgrade` handle hyper already stashed in the
     // request's `Extensions` while parsing. Calling it unconditionally would
     // still type-check and still hand back a handle, but on a request that
-    // never asked for (or gets) a 101 response that handle would simply never
-    // resolve -- so `request_wants_upgrade` gates this to the requests where
-    // it can. Must run before `req.into_parts()` below: that consumes `req`,
-    // taking the `Extensions` (and any `OnUpgrade` inside them) with it.
-    let on_upgrade = request_wants_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
+    // never asked for (or gets) an accept response that handle would simply
+    // never resolve -- so the two checks below gate this to the requests
+    // where it can. Must run before `req.into_parts()` below: that consumes
+    // `req`, taking the `Extensions` (and any `OnUpgrade`/`hyper::ext::
+    // Protocol` inside them) with it.
+    //
+    // S10.2 (WP-10/11 h2 tunnel): a SECOND, distinct way a request can ask
+    // for an upgrade, alongside the h1 `request_wants_upgrade` check above --
+    // an h2 RFC 8441 extended CONNECT. h2 has no `Upgrade`/`Connection`
+    // headers at all (h1's hop-by-hop mechanism has no h2 analog); instead
+    // the desired protocol arrives as a `:protocol` PSEUDO-HEADER, which
+    // hyper surfaces as a `hyper::ext::Protocol` request Extension rather
+    // than a real header (`tests/hyper_spike.rs` finding (g)). `serve_http2`
+    // (this connection's builder) only reaches this state at all once
+    // `.enable_connect_protocol()` has been set -- see its own comment.
+    let h2_protocol = req.extensions().get::<hyper::ext::Protocol>().cloned();
+    let is_h2_connect = req.method() == http::Method::CONNECT && h2_protocol.is_some();
+    let on_upgrade = (request_wants_upgrade(req.headers()) || is_h2_connect)
+        .then(|| hyper::upgrade::on(&mut req));
 
     let (parts, incoming) = req.into_parts();
+    let mut headers = parts.headers;
+    // Rust note: normalize the h2 `:protocol` pseudo-header into a
+    // SYNTHETIC `Upgrade: <protocol>` header on the request head we hand the
+    // router, purely so `router.rs`'s existing `is_upgrade_allowed`/
+    // `requested_upgrade_type` gate (which reads the `Upgrade` header) works
+    // UNCHANGED for both h1 and h2 -- one code path serving two wire
+    // representations of "what upgrade type is this?" `parts.method` is left
+    // as `CONNECT`, not rewritten to anything h1-shaped: that is deliberately
+    // the signal `router::RouterHandler::handle_upgrade` reads to tell an h2
+    // upgrade from an h1 one (a real client would never send a bare
+    // `Upgrade` header alongside `CONNECT`), so the router can enforce
+    // same-protocol tunneling without re-deriving "was this h2" from the
+    // (feature-gated, connection-local) `hyper::ext::Protocol` type itself.
+    if let Some(protocol) = h2_protocol {
+        if let Ok(value) = http::HeaderValue::from_str(protocol.as_str()) {
+            headers.insert(http::header::UPGRADE, value);
+        }
+    }
     let head = RequestHeaders {
         method: parts.method,
         uri: parts.uri,
-        headers: parts.headers,
+        headers,
     };
     // Rust note: `BodyExt::map_err` adapts `Incoming`'s error type
     // (`hyper::Error`) to our `BodyError`, then `local_boxed` erases the

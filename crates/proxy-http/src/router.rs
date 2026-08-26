@@ -71,7 +71,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::outlier::RequestResult;
@@ -498,10 +498,23 @@ impl RouterHandler {
         )
     }
 
-    /// S10 (WP-10 increment 2b/2c): forward an ALLOWED upgrade request to the
-    /// picked cluster/host, dialing a FRESH connection via `pool.new_stream()`
-    /// -- bypassing BOTH `H1ConnCache` and `UpstreamConnCache` -- and build
-    /// the tunnel response if (and only if) the upstream answers `101`.
+    /// S10 (WP-10 increment 2b/2c, extended by S10.2 for h2): forward an
+    /// ALLOWED upgrade request to the picked cluster/host, dialing a FRESH
+    /// connection via `pool.new_stream()` -- bypassing BOTH `H1ConnCache` and
+    /// `UpstreamConnCache` -- and build the tunnel response if (and only if)
+    /// the upstream answers the accept status for its protocol (h1: `101`;
+    /// h2: exactly `200`, RFC 8441 S4/finding (g) caveat (1)).
+    ///
+    /// S10.2 (this increment): TRANSPARENT, same-protocol only. The
+    /// downstream mechanism the client used (`head.method == CONNECT` means
+    /// h2 extended CONNECT; an ordinary `Upgrade` header means h1) must match
+    /// the picked upstream's protocol -- an h1 client can only tunnel to an
+    /// h1 upstream, an h2 client only to an h2 upstream. Cross-protocol
+    /// bridging (h1 client <-> h2 upstream, or the reverse) would need this
+    /// proxy to synthesize/translate the actual WebSocket handshake (compute
+    /// `Sec-WebSocket-Accept`, or fabricate the `:protocol` pseudo-header
+    /// from nothing) -- deliberately out of scope this increment, so it is
+    /// rejected outright with a `502` rather than attempted half-correctly.
     ///
     /// Single attempt, no retries at all (S10.1): unlike [`Self::apply_forward`],
     /// there is no `retry_state`/attempt loop here. An upgrade tunnel isn't an
@@ -574,16 +587,28 @@ impl RouterHandler {
             );
         }
 
-        // h2 extended CONNECT (RFC 8441, S10.2) is a later increment -- this
-        // tunnel only speaks h1 on both sides (module doc).
-        if matches!(proto, UpstreamProtocol::Http2) {
+        // Rust note: `head.method` is how `codec::serve_one` preserves "this
+        // downstream request arrived as h2 extended CONNECT" through to
+        // here -- it deliberately leaves `CONNECT` on the request head even
+        // though it also synthesizes an `Upgrade` header (see that call
+        // site's own Rust note) so this comparison, not header sniffing,
+        // is what tells the two downstream mechanisms apart.
+        let downstream_is_h2_connect = head.method == Method::CONNECT;
+        let upstream_is_h2 = matches!(proto, UpstreamProtocol::Http2);
+        // S10.2: TRANSPARENT, same-protocol only -- see this method's doc.
+        // `!=` here is the same as `downstream XOR upstream`: it is true for
+        // exactly the two disallowed cross combinations (h1->h2, h2->h1) and
+        // false for the two allowed same-protocol ones (h1->h1, h2->h2).
+        if downstream_is_h2_connect != upstream_is_h2 {
             tracing::debug!(
                 cluster = %attempt_cluster,
-                "S10: upgrade requested against an h2 upstream, not yet supported"
+                downstream_h2 = downstream_is_h2_connect,
+                upstream_h2 = upstream_is_h2,
+                "S10.2: cross-protocol websocket bridging requested, rejected"
             );
             return local_reply(
                 StatusCode::BAD_GATEWAY,
-                "websocket upstream must be http/1.1",
+                "cross-protocol websocket bridging (h1<->h2) is not supported",
             );
         }
 
@@ -641,12 +666,24 @@ impl RouterHandler {
             on_upgrade: None,
         };
 
-        let (resp, upstream_on_upgrade) = match crate::codec::send_upstream_http1_upgrade(
-            io,
-            upstream_req,
-        )
-        .await
-        {
+        // S10.2: same request/response shape (`HttpRequestParts` in,
+        // `(HttpResponseParts, Option<OnUpgrade>)` out), different codec
+        // function and different accept status per protocol -- `send` here
+        // is a runtime branch on a boxed, already-dialed `io`, not a generic
+        // dispatch, so the two codec functions' slightly different `IO`
+        // bounds (h1's needs `Send`, h2's doesn't -- `BoxedUpstreamIo` is
+        // `Send` regardless) never collide.
+        let expected_status = if upstream_is_h2 {
+            StatusCode::OK
+        } else {
+            StatusCode::SWITCHING_PROTOCOLS
+        };
+        let send_result = if upstream_is_h2 {
+            crate::codec::send_upstream_h2_connect(io, upstream_req).await
+        } else {
+            crate::codec::send_upstream_http1_upgrade(io, upstream_req).await
+        };
+        let (resp, upstream_on_upgrade) = match send_result {
             Ok(pair) => pair,
             Err(err) => {
                 if crate::codec::is_remote_reset(&err) {
@@ -661,17 +698,17 @@ impl RouterHandler {
             }
         };
 
-        if resp.head.status != StatusCode::SWITCHING_PROTOCOLS {
+        if resp.head.status != expected_status {
             // The upstream declined the upgrade -- pass its response
-            // straight through (S10.1), no tunnel. `resp.upgrade` is already
-            // `None` (set by `send_upstream_http1_upgrade`), and the
-            // downstream `OnUpgrade` still in `StreamInfo` is simply never
-            // `.take()`n -- correctly telling the CLIENT no upgrade
-            // happened. `cb_guard` still has to ride along with this
-            // response's body (not just get dropped here): the connection
-            // this dial opened is still alive for as long as the body is
-            // being read, same reasoning `H1ReuseBody`/`GuardedBody`
-            // document for their own guards.
+            // straight through (S10.1/S10.2), no tunnel. `resp.upgrade` is
+            // already `None` (set by both `send_upstream_http1_upgrade` and
+            // `send_upstream_h2_connect`), and the downstream `OnUpgrade`
+            // still in `StreamInfo` is simply never `.take()`n -- correctly
+            // telling the CLIENT no upgrade happened. `cb_guard` still has
+            // to ride along with this response's body (not just get dropped
+            // here): the connection this dial opened is still alive for as
+            // long as the body is being read, same reasoning
+            // `H1ReuseBody`/`GuardedBody` document for their own guards.
             let mut resp = resp;
             resp.body = local_boxed(GuardedBody::new(resp.body, cb_guard));
             return resp;
@@ -690,15 +727,17 @@ impl RouterHandler {
             // us (single-threaded, no re-entrancy into this stream's
             // `StreamInfo`).
             tracing::error!(
-                "S10: upstream answered 101 but the downstream OnUpgrade was already gone"
+                "S10: upstream answered its accept status but the downstream OnUpgrade was \
+                 already gone"
             );
             return local_reply(StatusCode::BAD_GATEWAY, "upgrade handshake failed");
         };
         let Some(upstream_on_upgrade) = upstream_on_upgrade else {
-            // Also unreachable: `send_upstream_http1_upgrade` always returns
-            // `Some` alongside a `101` response -- see its doc.
+            // Also unreachable: both `send_upstream_http1_upgrade` (`101`)
+            // and `send_upstream_h2_connect` (`200`) always return `Some`
+            // alongside their respective accept status -- see their docs.
             tracing::error!(
-                "S10: upstream answered 101 but send_upstream_http1_upgrade returned no \
+                "S10: upstream answered its accept status but the send codec returned no \
                  OnUpgrade"
             );
             return local_reply(StatusCode::BAD_GATEWAY, "upgrade handshake failed");
