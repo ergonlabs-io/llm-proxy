@@ -21,17 +21,36 @@
 //!
 //! | f | HTTP/1.1 interim (1xx) responses, S2.6's `encode_1xx_headers` seam | **Split verdict -- client: Works. Server: Not exposed (rejected).** | Client: `hyper::ext::on_informational(&mut req, callback)` -- a `Fn(hyper::ext::Response<'_>) + Send + Sync + 'static` registered as a request extension, read back out by `Conn::encode_head` (`proto/h1/conn.rs`) into `ConnState::on_informational`, and invoked by `role::Client::parse` (`proto/h1/role.rs`) for every 1xx head the low-level h1 parser sees, *before* it goes on to parse the final response. Server: no `send_informational`/`SendInformational` API exists anywhere in the crate; `role::Server::encode` (`proto/h1/role.rs`) explicitly special-cases `msg.head.subject.is_informational()`, replaces the head with `500 Internal Server Error`, and returns `Error::new_user_unsupported_status_code()` (message: `"response has 1xx status code, not supported by server"`) -- the source comment says why: `Service` only allows returning a single `Response`, so a 1xx has "no way of replying with the latter status code response." | Client side: none found -- callback fires for `103` in this spike exactly as documented. Server side: this is a *hard* rejection, not a missing convenience method; confirmed by triggering it for real below rather than reading the comment. Unrelated to 1xx specifically but found while building this spike: a raw-bytes peer on the *other* end of a low-level client connection must drain the request head before writing anything, even a plain 200 -- the client's background `Connection` future starts polling for a read as soon as it's spawned, and unsolicited bytes on an otherwise-idle connection surface as `hyper::Error(Canceled, hyper::Error(UnexpectedMessage))` out of `send_request` (`Conn::require_empty_read`, `proto/h1/conn.rs`), which briefly looked 1xx-specific before a control test (plain 200, no 1xx) reproduced the same error. |
 //!
+//! | g | HTTP/2 extended CONNECT (RFC 8441 -- WebSocket over h2) hands both peers a raw bidirectional stream | **Works cleanly, on both server and client** | Server: `hyper::server::conn::http2::Builder::enable_connect_protocol()` (`server/conn/http2.rs`) turns on `SETTINGS_ENABLE_CONNECT_PROTOCOL`; a `:method: CONNECT` request then gets the *same* `OnUpgrade`-in-`Extensions` treatment as an h1 upgrade (`proto/h2/server.rs`: `crate::upgrade::pending()` inserted into the request's `Extensions` before the service is called), and the `:protocol` pseudo-header arrives as `hyper::ext::Protocol` (`req.extensions().get::<hyper::ext::Protocol>()`) via the same code path (it strips the raw `h2::ext::Protocol` extension `h2` inserted and rewraps it). Returning any `2xx` (`res.status().is_success()`) fulfills the pending upgrade and hands the service a real `Upgraded` via `hyper::upgrade::on(&mut req)`, exactly as in finding (e). Client: `hyper::client::conn::http2` request built with `Method::CONNECT` plus `req.extensions_mut().insert(hyper::ext::Protocol::from_static("websocket"))` (matches `hyper::ext::Protocol`'s own doc example verbatim) sends the `:protocol` pseudo-header; `hyper::upgrade::on(&mut response)` -> `Upgraded` the same way as the client side of finding (e). | **(1)** The client side is stricter than the server: `proto/h2/client.rs`'s `ResponseFutMap::poll` only treats the response as an upgrade when the status is *exactly* `StatusCode::OK` (`200`) -- `if let (Some(send_stream), StatusCode::OK) = (send_stream, res.status())` -- not `is_success()`, so a `204`/`201` accept would parse as a normal (odd, zero-body) h2 response on the client instead of handing back the tunnel, even though the server-side code that fulfills it treats any `2xx` as acceptance. Use exactly `200` on the extended-CONNECT accept path. **(2)** No new Cargo feature needed -- same `["http1","http2","client","server"]` set as finding (e); `hyper::ext::Protocol` is gated on `feature = "http2"` only, already enabled. **(3)** Unlike h1 Upgrade, neither side needs a `.with_upgrades()` opt-in -- h2's upgrade handling is unconditional in the low-level `http2::Builder`/`client::conn::http2` API; the only opt-in is the server's `enable_connect_protocol()`, and it is a *connection*-level (not per-request) setting, so (per finding (d)'s reasoning) it is naturally a per-accepted-connection knob in a real server loop. **(4)** Found by the test hanging before this was added: an h2 CONNECT stream, unlike an h1 Upgrade's connection, does not end on its own -- it is an ordinary h2 stream and closes only once *both* directions have sent `END_STREAM`, so each peer must explicitly half-close its `Upgraded` (`AsyncWriteExt::shutdown`, which drives `H2Upgraded::poll_shutdown` in `proto/h2/upgrade.rs` to `close_channel()` the internal send-pump, which then sends `send_data(SendBuf::None, true)`) once it is done writing. Without both half-closes, the server's `serve_connection` future (and a naive test awaiting it) blocks forever even though the byte round-trip already succeeded. |
+//!
 //! Net: no fallback to `httparse` + raw `h2` is needed for capabilities
-//! (a)-(e); hyper 1.x's low-level `conn` API supports all of them directly.
-//! Finding (f) is the one exception: **hyper has a real client-side hook
-//! for 1xx, but no server-side one at all.**
+//! (a)-(e) or (g); hyper 1.x's low-level `conn` API supports all of them
+//! directly. Finding (f) is the one exception: **hyper has a real
+//! client-side hook for 1xx, but no server-side one at all.**
+//!
+//! **Implication for WP-10 S10 (finding g):** both the h2-server-accepts and
+//! the h2-client-sends halves of RFC 8441 extended CONNECT are available
+//! through the same low-level API surface finding (e) already validated for
+//! h1 Upgrade, and both produce the identical `hyper::upgrade::Upgraded` type
+//! (wrapped in `TokioIo` to get back a plain `AsyncRead + AsyncWrite`). That
+//! means a codec translating between h1 `Upgrade: websocket` and h2 extended
+//! CONNECT only has to bridge *request/response shape* (`101` + `Upgrade`
+//! header <-> `2xx` + `:protocol` pseudo-header), not the byte-tunnel
+//! primitive underneath -- both directions (h1->h2 and h2->h1) and the
+//! pass-through case (h2->h2, e.g. an h2 downstream and an h2 upstream) are
+//! buildable on the types this spike already exercised. The one concrete
+//! constraint to carry into the codec: the accept response toward an h2
+//! *client* must be exactly `200`, per caveat (1) above -- translating an h1
+//! `101` (or any other h1 success-ish status a caller might be tempted to
+//! map loosely) to anything other than h2 `200` would silently fail to
+//! upgrade on the client side while looking like a normal response.
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
@@ -759,4 +778,204 @@ async fn f2_server_cannot_send_1xx_from_service_fn() {
         "expected hyper's own 'response has 1xx status code, not supported by server' \
          error, got: {err}"
     );
+}
+
+/// (g) HTTP/2 extended CONNECT (RFC 8441 -- the WebSocket-over-h2 handshake
+/// shape: `:method: CONNECT` + `:protocol: websocket` pseudo-headers,
+/// accepted with a `200`) hands *both* peers a raw bidirectional byte
+/// stream via the low-level `conn` API, mirroring finding (e)'s h1 Upgrade
+/// but with no `.with_upgrades()` opt-in needed -- only a connection-level
+/// `enable_connect_protocol()` on the server.
+///
+/// Unlike an h1 Upgrade, an h2 CONNECT stream does not end on its own once
+/// the demo bytes are exchanged -- it is an ordinary h2 stream, and h2
+/// streams close only once *both* directions have sent `END_STREAM` (or one
+/// side resets it). So each peer here does an explicit half-close
+/// (`AsyncWriteExt::shutdown`) on its own `Upgraded` after writing its
+/// message, exactly like closing one direction of a TCP half-duplex --
+/// without it, the stream (and so the connection, which is watching for it
+/// via `graceful_shutdown`) would stay open forever, and this test found
+/// that the hard way before adding the shutdown calls below.
+#[tokio::test]
+async fn g_h2_extended_connect_tunnels_bidirectionally() {
+    const CLIENT_MSG: &[u8] = b"ping-through-the-h2-tunnel";
+    const SERVER_MSG: &[u8] = b"pong-back-through-the-h2-tunnel";
+
+    let (client_io, server_io) = duplex(64 * 1024);
+
+    // Rust note: same interior-mutability-across-a-closure shape as findings
+    // (b)/(f.1) above -- the service handler (an `Fn`, called from inside
+    // hyper) hands the `:protocol` value it observed back out to this test's
+    // assertions.
+    let seen_protocol: Arc<Mutex<Option<hyper::ext::Protocol>>> = Arc::new(Mutex::new(None));
+    let seen_protocol_in_service = seen_protocol.clone();
+
+    // Same one-shot drain-signal shape as finding (e): fired as soon as the
+    // service is invoked, so the server connection's `graceful_shutdown()`
+    // is already requested by the time the CONNECT stream is created. This
+    // does not close the stream early -- `graceful_shutdown` only refuses
+    // *new* streams and waits for in-flight ones to finish -- but it does
+    // mean the connection future resolves the moment both sides half-close
+    // the tunnel below, instead of idling forever waiting for a next
+    // request that will never come.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx = Mutex::new(Some(shutdown_tx));
+
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        let seen_protocol = seen_protocol_in_service.clone();
+        if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        async move {
+            // The `:protocol` pseudo-header RFC 8441 adds arrives as a
+            // `hyper::ext::Protocol` request extension -- confirmed against
+            // hyper 1.10.1's source (`proto/h2/server.rs`): it strips the
+            // raw `h2::ext::Protocol` extension the `h2` crate inserted and
+            // reinserts hyper's newtype wrapper around it before the
+            // request ever reaches the service.
+            *seen_protocol.lock().unwrap() =
+                req.extensions().get::<hyper::ext::Protocol>().cloned();
+
+            // Same ordering rule as finding (e): `hyper::upgrade::on` must
+            // be called on the request before this handler returns its
+            // response -- for a CONNECT request, hyper's h2 server plumbing
+            // has already stashed a pending `OnUpgrade` in the request's
+            // `Extensions` (the identical mechanism finding (e) uses for
+            // h1), it does not manufacture one afterwards.
+            let on_upgrade = hyper::upgrade::on(&mut req);
+            tokio::spawn(async move {
+                let upgraded = on_upgrade
+                    .await
+                    .expect("server obtains the upgraded h2 stream");
+                let mut io = TokioIo::new(upgraded);
+                let mut buf = [0u8; CLIENT_MSG.len()];
+                io.read_exact(&mut buf)
+                    .await
+                    .expect("server reads the client's tunnel bytes");
+                assert_eq!(&buf, CLIENT_MSG);
+                io.write_all(SERVER_MSG)
+                    .await
+                    .expect("server writes its reply over the same tunnel");
+                io.flush().await.unwrap();
+                // Half-close the server -> client direction -- see the
+                // function doc comment for why this is required for an h2
+                // CONNECT stream specifically (it does not end on its own
+                // the way an h1 Upgrade's connection close does).
+                io.shutdown()
+                    .await
+                    .expect("server half-closes its send direction");
+            });
+
+            // RFC 8441 S4: any `2xx` accepts the extended CONNECT --
+            // `proto/h2/server.rs` gates the upgrade fulfillment on
+            // `res.status().is_success()`. `200` is used here because the
+            // *client* side is stricter (see finding (g) caveat (1)): it
+            // only wires the response up as an upgrade for exactly `200`.
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            Ok::<_, Infallible>(resp)
+        }
+    });
+
+    let server_conn = tokio::spawn(async move {
+        let io = TokioIo::new(server_io);
+        let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        // The one capability finding (g) exists to prove on the server side:
+        // without this, the server never advertises
+        // `SETTINGS_ENABLE_CONNECT_PROTOCOL`, and (per RFC 8441 S3) a peer
+        // sending `:protocol` without that setting enabled is a protocol
+        // violation the h2 layer is entitled to reject.
+        builder.enable_connect_protocol();
+        // No `.with_upgrades()` call exists on this `Builder` at all --
+        // unlike h1, the low-level h2 API's upgrade handling is
+        // unconditional; the only opt-in is `enable_connect_protocol()`
+        // above. `graceful_shutdown` on the h2 `Connection`, on the other
+        // hand, has the identical shape to finding (d)/(e)'s h1 drain: pin,
+        // `select!` against the shutdown signal, request the shutdown, then
+        // keep polling to completion.
+        let conn = builder.serve_connection(io, service);
+        tokio::pin!(conn);
+        tokio::select! {
+            result = &mut conn => {
+                return result;
+            }
+            _ = &mut shutdown_rx => {
+                conn.as_mut().graceful_shutdown();
+            }
+        }
+        conn.await
+    });
+
+    let io = TokioIo::new(client_io);
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(TokioExecutor::new(), io)
+            .await
+            .expect("client handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut req = Request::builder()
+        .method(Method::CONNECT)
+        .uri("https://localhost/ws")
+        .header("host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    // The client-side surface RFC 8441 needs: set `:protocol` via a
+    // `hyper::ext::Protocol` request extension (matching that type's own
+    // doc example verbatim) alongside `Method::CONNECT`. hyper's h2 client
+    // plumbing (`proto/h2/client.rs`) strips this extension back out and
+    // hands the inner `h2::ext::Protocol` to `h2::SendRequest`, which is
+    // what actually encodes `:protocol` on the wire.
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+
+    let mut response = sender.send_request(req).await.expect("send_request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let client_upgraded = hyper::upgrade::on(&mut response)
+        .await
+        .expect("client obtains the upgraded h2 stream");
+    let mut client_upgraded = TokioIo::new(client_upgraded);
+
+    // Bytes flow both ways over the tunnel, after the `200` -- the actual
+    // capability finding (g) exists to prove. No WebSocket framing library
+    // is involved; raw bytes are the point, same as finding (e).
+    client_upgraded
+        .write_all(CLIENT_MSG)
+        .await
+        .expect("client writes its half of the tunnel");
+    client_upgraded.flush().await.unwrap();
+    // Half-close the client -> server direction -- see the function doc
+    // comment; the read below still works after this (half-close, not a
+    // full close).
+    client_upgraded
+        .shutdown()
+        .await
+        .expect("client half-closes its send direction");
+
+    let mut reply = [0u8; SERVER_MSG.len()];
+    client_upgraded
+        .read_exact(&mut reply)
+        .await
+        .expect("client reads the server's reply over the same tunnel");
+    assert_eq!(&reply, SERVER_MSG);
+
+    let observed = seen_protocol
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server observed a :protocol extension on the CONNECT request");
+    assert_eq!(observed.as_str(), "websocket");
+
+    // Both tunnel directions are now closed and the server's
+    // `graceful_shutdown()` was already requested, so the server connection
+    // future resolves on its own -- proving the h2 CONNECT stream (and the
+    // connection watching it) actually ends, not just that bytes moved.
+    server_conn
+        .await
+        .unwrap()
+        .expect("server connection completes cleanly");
 }
