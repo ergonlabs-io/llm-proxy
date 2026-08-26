@@ -19,9 +19,12 @@
 //! | d | h1 keep-alive can be disabled per-connection (for drain) | **Works cleanly** | `hyper::server::conn::http1::Builder::keep_alive(false)` -- a `Builder` is already a fresh, per-accepted-connection value in the intended server loop, so this is naturally a per-connection knob, not a process-global one. Hyper also auto-inserts `Connection: close` on the response (see `fix_keep_alive`/`enforce_version` in `hyper::proto::h1::conn`) and the `Connection` future for that peer resolves `Ok(())` once the one in-flight request is served | An alternative, coarser-grained mechanism is `Connection::graceful_shutdown()` (drains in-flight requests but immediately rejects a next request on the *same* connection); `keep_alive(false)` was simpler to prove per-connection intent for a fresh connection and is what this spike exercises. |
 //! | e | HTTP/1.1 Upgrade (WebSocket-shaped `101` handshake) hands both peers a raw bidirectional stream, on both the server *and* client low-level APIs, and coexists with the drain `select!`/`graceful_shutdown` shape | **Works cleanly, with two "must-call-`.with_upgrades()`" caveats** | Server: `hyper::server::conn::http1::Builder::serve_connection(io, service).with_upgrades()`. Client: `hyper::client::conn::http1::handshake(io)` gives `(SendRequest, Connection)`, and that `Connection` *also* needs `.with_upgrades()`. Both sides call `hyper::upgrade::on(&mut req_or_resp)` to get an `OnUpgrade` future that resolves to `hyper::upgrade::Upgraded`, wrapped in `hyper_util::rt::TokioIo` to get back a plain `AsyncRead + AsyncWrite`. | **(1)** `.with_upgrades()` is required on **both** ends, not just the server -- easy to miss since only the server side is commonly documented. Skip it on either side and `Dispatched::Upgrade` takes the `pending.manual()` path (`hyper::proto::Pending::manual`, `src/upgrade.rs`) instead of `pending.fulfill(..)`, so `hyper::upgrade::on(..).await` resolves to an `Err` ("upgrades cannot be used with `Connection::without_upgrades`" case) rather than the raw stream, on whichever side forgot it. **(2)** `.with_upgrades()` returns a *different type* (`UpgradeableConnection<T, S>`, distinct from the plain `Connection<T, S>`) but with an identical API surface for the drain path: it still implements `Future<Output = crate::Result<()>>` and has its own inherent `graceful_shutdown(self: Pin<&mut Self>)`, so `tokio::pin!` + `tokio::select!` + `.as_mut().graceful_shutdown()` -- the exact shape `serve_http1` (`codec.rs`) uses -- needed no changes at all; only the local variable's type changes, not the pattern. **(3)** Ordering: `hyper::upgrade::on` must be called on the request (server) / response (client) *before* it is otherwise consumed or the 101 response is returned -- it removes an `OnUpgrade` value hyper already stashed in the message's `Extensions` during parsing (server: set because the request carried `Upgrade`+HTTP/1.1; client: set once the `101` response is parsed), it does not manufacture one after the fact. **(4)** No extra Cargo feature was needed -- the workspace's existing `["http1","http2","client","server"]` hyper features are sufficient; `hyper::upgrade` is compiled in whenever any of `client`/`server` is paired with `http1`/`http2`. |
 //!
-//! Net: no fallback to `httparse` + raw `h2` is needed for any of the five
-//! capabilities; hyper 1.x's low-level `conn` API supports all of them
-//! directly.
+//! | f | HTTP/1.1 interim (1xx) responses, S2.6's `encode_1xx_headers` seam | **Split verdict -- client: Works. Server: Not exposed (rejected).** | Client: `hyper::ext::on_informational(&mut req, callback)` -- a `Fn(hyper::ext::Response<'_>) + Send + Sync + 'static` registered as a request extension, read back out by `Conn::encode_head` (`proto/h1/conn.rs`) into `ConnState::on_informational`, and invoked by `role::Client::parse` (`proto/h1/role.rs`) for every 1xx head the low-level h1 parser sees, *before* it goes on to parse the final response. Server: no `send_informational`/`SendInformational` API exists anywhere in the crate; `role::Server::encode` (`proto/h1/role.rs`) explicitly special-cases `msg.head.subject.is_informational()`, replaces the head with `500 Internal Server Error`, and returns `Error::new_user_unsupported_status_code()` (message: `"response has 1xx status code, not supported by server"`) -- the source comment says why: `Service` only allows returning a single `Response`, so a 1xx has "no way of replying with the latter status code response." | Client side: none found -- callback fires for `103` in this spike exactly as documented. Server side: this is a *hard* rejection, not a missing convenience method; confirmed by triggering it for real below rather than reading the comment. Unrelated to 1xx specifically but found while building this spike: a raw-bytes peer on the *other* end of a low-level client connection must drain the request head before writing anything, even a plain 200 -- the client's background `Connection` future starts polling for a read as soon as it's spawned, and unsolicited bytes on an otherwise-idle connection surface as `hyper::Error(Canceled, hyper::Error(UnexpectedMessage))` out of `send_request` (`Conn::require_empty_read`, `proto/h1/conn.rs`), which briefly looked 1xx-specific before a control test (plain 200, no 1xx) reproduced the same error. |
+//!
+//! Net: no fallback to `httparse` + raw `h2` is needed for capabilities
+//! (a)-(e); hyper 1.x's low-level `conn` API supports all of them directly.
+//! Finding (f) is the one exception: **hyper has a real client-side hook
+//! for 1xx, but no server-side one at all.**
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -582,4 +585,178 @@ async fn e_h1_upgrade_tunnels_bidirectionally() {
     assert_eq!(&reply, SERVER_MSG);
 
     server_conn.await.unwrap();
+}
+
+/// (f.1) CLIENT side: does the low-level `hyper::client::conn::http1` API
+/// give the caller any programmatic access to an upstream's `1xx`
+/// informational response sent ahead of the final response?
+///
+/// The peer here is hand-written raw bytes (not hyper's server) because the
+/// server side cannot produce a real 1xx at all -- see finding (f.2) below --
+/// so this is the only way to put a genuine "103-then-200" sequence on the
+/// wire to observe the client's behavior against.
+#[tokio::test]
+async fn f1_client_observes_upstream_1xx_via_on_informational() {
+    let (client_io, server_io) = duplex(64 * 1024);
+
+    // Raw peer: write a real "103 Early Hints" head immediately followed by
+    // the final "200 OK" -- exactly the sequence RFC 9110 S15.2 describes --
+    // directly onto the wire. No hyper server is involved on this side.
+    tokio::spawn(async move {
+        let mut io = server_io;
+        // The low-level client's background `Connection` future starts
+        // polling for a read as soon as it is spawned below, and treats any
+        // bytes that show up before it has a request in flight as a
+        // malformed peer (`Conn::require_empty_read` in
+        // `proto/h1/conn.rs`) -- surfacing as `hyper::Error(Canceled,
+        // hyper::Error(UnexpectedMessage))` out of `send_request`, found by
+        // writing the response unconditionally and seeing that error even
+        // for a plain 200 with no 1xx involved at all. So: read (and
+        // discard) the request head first, exactly like a real peer would
+        // have to before it could compose a response.
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = io.read(&mut buf).await.expect("read request head");
+            assert!(n > 0, "client closed before sending a request head");
+            if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        io.write_all(
+            b"HTTP/1.1 103 Early Hints\r\n\
+              link: </style.css>; rel=preload\r\n\
+              \r\n\
+              HTTP/1.1 200 OK\r\n\
+              content-length: 5\r\n\
+              \r\n\
+              hello",
+        )
+        .await
+        .expect("write raw 103-then-200 bytes");
+        io.flush().await.unwrap();
+        // Leave the connection open until the client side is done reading;
+        // dropping `io` here would race the client's read of the body.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let io = TokioIo::new(client_io);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(io)
+        .await
+        .expect("client handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Rust note: `hyper::ext::on_informational` takes an `Fn`, not `FnOnce`,
+    // because hyper may in principle see more than one 1xx before the final
+    // response -- so the shared `Vec` (not a one-shot `oneshot::Sender`) is
+    // the natural fit, same interior-mutability-across-a-closure shape as
+    // finding (b)'s `Arc<Mutex<Option<HeaderMap>>>` above.
+    let seen_informational: Arc<Mutex<Vec<StatusCode>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_informational_in_callback = seen_informational.clone();
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    hyper::ext::on_informational(&mut req, move |res| {
+        seen_informational_in_callback
+            .lock()
+            .unwrap()
+            .push(res.status());
+    });
+
+    let mut response = sender.send_request(req).await.expect("send_request");
+
+    // The callback fired for the 103 -- hyper does NOT swallow it -- and the
+    // final response the caller actually receives is the 200, not the 103.
+    assert_eq!(
+        seen_informational.lock().unwrap().as_slice(),
+        &[StatusCode::from_u16(103).unwrap()],
+        "on_informational callback must observe exactly the one 103, \
+         separate from the final response"
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .body_mut()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes();
+    assert_eq!(&body[..], b"hello");
+}
+
+/// (f.2) SERVER side: does the low-level `hyper::server::conn::http1` API
+/// let a `service_fn` emit an interim `1xx` response? There is no
+/// `send_informational`-style API to look for -- so this test instead
+/// answers the fallback question the task poses: what happens if the
+/// service just returns a `Response` with a `1xx` status?
+///
+/// Answer, proven rather than assumed from the source comment in
+/// `role::Server::encode` ("hyper currently doesn't support returning 1xx
+/// status codes as a Response"): hyper substitutes a `500 Internal Server
+/// Error` for the 1xx the service tried to send, and the *server*
+/// connection future resolves to an `Err` describing exactly that -- this is
+/// a supported-shaped rejection, not a panic or a silent drop.
+#[tokio::test]
+async fn f2_server_cannot_send_1xx_from_service_fn() {
+    let (client_io, server_io) = duplex(64 * 1024);
+
+    let service = service_fn(|_req: Request<Incoming>| async move {
+        // A service handed back a bare `1xx` as if it were the whole
+        // response -- exactly the shape S2.6's `encode_1xx_headers` would
+        // need the low-level server API to support.
+        Ok::<_, Infallible>(
+            Response::builder()
+                .status(StatusCode::from_u16(103).unwrap())
+                .header("link", "</style.css>; rel=preload")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+    });
+
+    let server_conn = tokio::spawn(async move {
+        let io = TokioIo::new(server_io);
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await
+    });
+
+    let io = TokioIo::new(client_io);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(io)
+        .await
+        .expect("client handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    // Whatever the client actually observes on the wire (hyper still writes
+    // the substituted 500's head into its send buffer before returning the
+    // `Err` -- see `Conn::encode_head` in `proto/h1/conn.rs` -- so the client
+    // may see a real 500 response, a connection error, or both depending on
+    // exactly when the abrupt close lands), the deliverable fact for S2.6 is
+    // the SERVER side's own outcome, asserted below. This call is not
+    // asserted on for that reason.
+    let _ = sender.send_request(req).await;
+
+    let server_result = server_conn.await.unwrap();
+    let err = server_result.expect_err(
+        "hyper's low-level h1 server must refuse to send a service's 1xx response \
+         (no send_informational API exists, and returning a 1xx StatusCode is not \
+         silently accepted)",
+    );
+    assert!(
+        err.to_string().contains("1xx"),
+        "expected hyper's own 'response has 1xx status code, not supported by server' \
+         error, got: {err}"
+    );
 }
