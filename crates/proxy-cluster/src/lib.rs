@@ -361,9 +361,21 @@ pub struct UpstreamStream {
 /// `dyn AsyncRead + AsyncWrite + Unpin` is not a legal trait object (only one
 /// non-auto trait per object), so we declare a single trait with the three as
 /// supertraits and blanket-impl it for everything that qualifies.
-pub trait UpstreamIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static {}
+// Rust note: `Send` (WP-10 S10 increment 2b) is required by hyper's low-level
+// CLIENT upgrade API (`http1::Connection::with_upgrades`), symmetric to
+// increment 2a adding it to the downstream `serve_http1`. It is a pure
+// bound-widening, not an ADR-0003 breach: `UpstreamTransportSocket::wrap` only
+// ever boxes a `TcpStream` or a rustls-wrapped `TcpStream` (both already
+// `Send`), and ADR-0003's `!Send` rule governs handler/body/filter STATE (the
+// `StreamBody`, `Rc`/`RefCell` data-plane state), not the raw upstream byte
+// stream. Making the stream `Send` only ALLOWS thread-hopping; the workers
+// still run on per-worker current_thread runtimes.
+pub trait UpstreamIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {}
 
-impl<T> UpstreamIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static {}
+impl<T> UpstreamIo for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
 
 /// A boxed [`UpstreamIo`]. `Box<T>` itself implements `AsyncRead`/`AsyncWrite`
 /// (tokio provides those forwarding impls for `Box<T: ?Sized>`), so the box is
