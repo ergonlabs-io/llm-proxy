@@ -61,6 +61,7 @@ export default defineConfig({
 						{ label: 'Failover and aggregates', slug: 'providers-and-routing/failover-and-aggregates' },
 						{ label: 'Load balancing', slug: 'providers-and-routing/load-balancing' },
 						{ label: 'Timeouts and retries', slug: 'providers-and-routing/timeouts-and-retries' },
+						{ label: 'WebSocket and other upgrades', slug: 'providers-and-routing/websocket-and-upgrades' },
 					],
 				},
 				// {

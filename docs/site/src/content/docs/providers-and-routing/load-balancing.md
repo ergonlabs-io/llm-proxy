@@ -3,7 +3,7 @@ title: Load balancing
 summary: Which `lb_policy` values a cluster can actually run, why two are
   rejected at load time rather than approximated, and why load balancing has
   nothing to choose between in the plain configuration format.
-last_updated: 2026-08-23
+last_updated: 2026-08-26
 related:
   - ../providers-and-routing/providers-and-clusters/
   - ../providers-and-routing/failover-and-aggregates/
@@ -84,6 +84,21 @@ concurrent requests, 3 concurrent retries) and never probes a host's health
 on its own. A host only ever looks unhealthy to the picker above through
 active health-check fields written directly into a bootstrap configuration,
 which this page does not cover further.
+
+Of the four circuit-breaker budgets, only two are wired to a real call site
+today: `max_requests` (acquired per request, held for the full response
+stream — LLM streaming keeps a request "active" far longer than
+time-to-headers) and `max_connections`, enforced at the dial itself so an
+over-budget cluster never opens the socket
+(`crates/proxy-cluster/src/pool.rs`'s `ConnectPool::new_stream`, proven by
+`max_connections_is_enforced_at_dial_and_released_on_drop`). Either budget
+being exhausted produces the same outcome: `503`, the `UO` response flag, and
+an `x-envoy-overloaded: true` response header
+(`max_requests_zero_records_and_renders_the_uo_flag` in
+`crates/proxy-http/tests/response_flags.rs`). `max_pending_requests` and
+`max_retries` are parsed and recorded but not enforced by anything yet
+(`CircuitBreakerState::try_acquire_pending`/`try_acquire_retry` in
+`crates/proxy-cluster/src/lib.rs` are unused dead code today).
 
 ## Bootstrap configuration: a worked weighted example
 

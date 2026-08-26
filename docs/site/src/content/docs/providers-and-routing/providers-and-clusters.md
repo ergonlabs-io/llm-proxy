@@ -3,7 +3,7 @@ title: Providers and clusters
 summary: How a configuration `provider` becomes an engine cluster, what
   identity (TLS, credentials, headers) travels with it, and how the `models`
   catalogue differs from `routes`.
-last_updated: 2026-08-23
+last_updated: 2026-08-26
 related:
   - ../configuration/configuration-file/
   - ../providers-and-routing/failover-and-aggregates/
@@ -79,6 +79,18 @@ plaintext (`http://`) provider is ignored and produces a load-time warning.
 `protocol: http2` (default `http1`) reuses one multiplexed connection per
 worker to that provider instead of connecting fresh on every request; most
 hosted providers support it, many local plaintext servers do not.
+
+`http1` reuses connections too, automatically, with no field to configure it.
+Each worker keeps up to 8 idle keep-alive connections per (cluster, address);
+a request that finds one reuses it instead of dialing fresh, and a
+connection is only ever returned to that idle pool once its current response
+body has reached a clean, error-free end of stream — a truncated body, a
+`Connection: close` response, or a full idle pool all cause the connection to
+be dropped rather than reused (`H1ConnCache`/`H1ReuseBody` in
+`crates/proxy-http/src/upstream_pool.rs`; proven end to end by
+`reuse_across_two_requests_opens_one_connection` and
+`connection_close_response_is_not_reused` in
+`crates/proxy-http/src/router.rs`'s test module).
 
 ## `routes` vs. the `models` catalogue
 

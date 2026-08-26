@@ -3,7 +3,7 @@ title: Timeouts and retries
 summary: The two timeouts a route actually has, exactly which failures
   trigger a retry, and a real gap worth knowing before you rely on this
   configuration format alone to bound a slow provider.
-last_updated: 2026-08-23
+last_updated: 2026-08-26
 related:
   - ../providers-and-routing/providers-and-clusters/
   - ../providers-and-routing/failover-and-aggregates/
@@ -123,3 +123,27 @@ higher value would parse and do nothing) and the `envoy-ratelimited`
 `retry_on` token (nothing sets the `x-envoy-ratelimited` response header it
 watches for). Both fail at config load naming the field, not at request time
 (`crates/proxy-config/src/lower.rs`).
+
+### `x-envoy-attempt-count`
+
+A raw bootstrap configuration's `VirtualHost` has two more fields with no
+equivalent in this configuration format's schema, both `bool`, both default
+`false`:
+
+| Field | What it does |
+|---|---|
+| `include_request_attempt_count` | Sets `x-envoy-attempt-count` on the request forwarded upstream, to this attempt's own number (`1` on the first try, `2` on the first retry, and so on). |
+| `include_attempt_count_in_response` | Sets `x-envoy-attempt-count` on the response sent to the downstream client, to the *total* number of attempts the request took. |
+
+Both flags are denormalized onto every route under the vhost at config-lower
+time (`RouteEntry::include_request_attempt_count`/
+`include_attempt_count_in_response` in `crates/proxy-config/src/ir.rs`) and
+proven end to end by `crates/proxy-http/tests/router_retry.rs`:
+`attempt_count_request_header_is_1_on_the_first_attempt`,
+`attempt_count_request_header_increments_on_retry`,
+`attempt_count_response_header_carries_the_total_attempts_made`, and
+`attempt_count_headers_are_absent_when_both_flags_are_off` for the default
+case. A retry that lands on a `fallbacks` member (see
+[Failover and aggregates](../providers-and-routing/failover-and-aggregates/))
+increments the same counter — a fallback attempt is a retry against a
+different member, not a separate count.

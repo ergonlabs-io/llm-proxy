@@ -4,7 +4,7 @@ summary: Field-by-field reference for the llm-proxy configuration file
   (--config), derived from schema/llmproxy-v0.schema.json, the normative
   source. Covers what each field does, its default, and whether it is
   enforced yet.
-last_updated: 2026-08-09
+last_updated: 2026-08-26
 related:
   - ../getting-started/introduction/
   - ../getting-started/quickstart/
@@ -74,6 +74,26 @@ substituting the rewritten name into the request body needs a body rewriter
 not yet built, so a route or fallback using this form produces a
 load-time warning naming its exact path, and the client's original model
 name is forwarded unchanged.
+
+### Route redirects are bootstrap-only
+
+Every route this configuration format produces is a `Forward` action — it
+always names a provider to reach. A raw bootstrap configuration's route can
+instead be a `Redirect` action, replying with a `3xx` and a `Location`
+header instead of forwarding anything; there is no dialect field to produce one.
+It is worth naming here since `routes[]` above cannot reach it:
+
+| `RedirectAction` field | Type | Default | What it does |
+|---|---|---|---|
+| `host_redirect` | string | the request's own `Host`/authority | Replaces the authority in the `Location`. |
+| `path_redirect` | string | the request's own path and query | Replaces the *entire* path — not a prefix rewrite, so the original query string is dropped along with it when set. |
+| `https_redirect` | boolean | `false` | Forces the `Location` scheme to `https`. When `false`, the scheme is always `http` — llm-proxy does not track a downstream listener's own TLS state at this point in the pipeline, so it cannot echo "redirect to the same scheme the client used" (`crates/proxy-http/src/router.rs`'s `redirect_response`, its Rust-note comment). |
+| `response_code` | one of `301`, `302`, `303`, `307`, `308` | `301` | The status code of the redirect response. |
+
+Proven by `redirect_https_redirect_forces_scheme_and_preserves_host_and_path`
+and `redirect_host_and_path_redirect_replace_the_whole_target` in
+`crates/proxy-http/src/router.rs`'s test module. The response body is always
+empty, `Content-Length: 0`.
 
 ## `auth` (`Auth`) and `auth.keys[]` (`AuthKey`)
 
