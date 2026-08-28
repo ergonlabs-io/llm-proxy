@@ -448,7 +448,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     // flips the plain shutdown signal hyper's `graceful_shutdown()` reacts
     // to. Neither step reads `strategy` at all, so `gradual` and `immediate`
     // are byte-identical today. The CLI flag policy
-    // (`docs/envoy-divergences.md`) requires that to be loud rather than
+    // (`internal-docs/envoy-divergences.md`) requires that to be loud rather than
     // silently accepted -- wiring it properly means teaching the HTTP codecs
     // (`proxy-http`) to consult a per-response close probability, which is
     // its own work package, not a one-line fix here.
@@ -456,7 +456,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
         drain_strategy = ?strategy,
         "--drain-strategy is accepted but not enforced during drain: connections are not \
          proactively closed until the drain deadline passes or every connection ends on its \
-         own, regardless of `gradual` vs `immediate` (see docs/envoy-divergences.md, \
+         own, regardless of `gradual` vs `immediate` (see internal-docs/envoy-divergences.md, \
          \"Drain strategy\")"
     );
 

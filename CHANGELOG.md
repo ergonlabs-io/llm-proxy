@@ -1,8 +1,8 @@
 # Changelog
 
 All notable changes to this project are recorded here. Releases and their ship gates are
-defined in [`docs/MILESTONES.md`](docs/MILESTONES.md); work packages are defined in
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md). This file records *what shipped*, not
+defined in [`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md); work packages are defined in
+[`internal-docs/IMPLEMENTATION_PLAN.md`](internal-docs/IMPLEMENTATION_PLAN.md). This file records _what shipped_, not
 what is planned.
 
 The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
@@ -11,12 +11,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Nothing yet. Work toward **v0.2.0** — see `docs/MILESTONES.md`.
+Nothing yet. Work toward **v0.2.0** — see `internal-docs/MILESTONES.md`.
 
 ## [0.1.0] — 2026-08-08
 
 **The pipe gets smart.** v0.0.1 proved a request could go all the way through. This release
-is about the proxy *understanding* what is going through it.
+is about the proxy _understanding_ what is going through it.
 
 ### The gate
 
@@ -28,23 +28,23 @@ All three clauses are verified end to end against the real binary over real sock
 merely implemented — **against mock upstreams**. Unlike v0.0.1, this release was tagged
 without executing its live-provider drill; that drill exists
 (`testing/diffrig/tests/live_gate_v0_1_0.rs`, one command, three billable calls) and the
-departure from v0.0.1's standard is recorded in `docs/MILESTONES.md`.
+departure from v0.0.1's standard is recorded in `internal-docs/MILESTONES.md`.
 
 - **Token counts + TTFT/TPOT** — QA-10 (`testing/qa/scenarios/qa10_llm_latency_test.go`)
   against a mock paced at 400ms TTFT / 150ms inter-chunk: `ttft=402ms tpot=122.129ms
-  max_stall=152ms`. QA-1 covers per-route counts for both providers from one config.
+max_stall=152ms`. QA-1 covers per-route counts for both providers from one config.
 - **Provider failover** — `testing/diffrig/tests/failover_e2e.rs`: primary forced to 429,
   fallback serves, attempt accounting exact, and the standby receives its own credential
   with the primary's appearing nowhere.
 - **Token rate limiting** — `testing/diffrig/tests/auth_e2e.rs`: a tenant's budget is
-  exhausted and a *second, different* key belonging to that tenant is refused with 429.
+  exhausted and a _second, different_ key belonging to that tenant is refused with 429.
 
 **Read this clause carefully, because the obvious version of it is not what shipped.** A
 token limit was already enforced in code before this release, and that was not enough. The
 limiter bucketed on the client's own `Authorization` header, and nothing verified that
 header — so any caller who exhausted a quota changed one string and received a fresh one.
 The limit was advisory by construction. Closing this clause required giving callers an
-identity the *proxy* assigns, which is why downstream authentication is in this release at
+identity the _proxy_ assigns, which is why downstream authentication is in this release at
 all. It was not planned scope; it was the precondition.
 
 ### Added
@@ -57,10 +57,10 @@ all. It was not planned scope; it was the precondition.
   implementation without reshaping anything above it.
 - **Token budgets keyed on tenant.** The rate limiter now buckets on the authenticated
   tenant when there is one, and on the hashed credential only when no auth filter ran. The
-  two key spaces are distinguished by descriptor *name*, so they cannot collide.
+  two key spaces are distinguished by descriptor _name_, so they cannot collide.
 - **`auth:` in the `llmproxy` dialect**, plus `limits: key: tenant`.
 - **Provider fallback (WP-35).** `fallbacks:` in the dialect lowers to an Envoy aggregate
-  cluster with member-order failover, and per-provider credentials travel on the *cluster*
+  cluster with member-order failover, and per-provider credentials travel on the _cluster_
   so a failover cannot send provider A's key to provider B's endpoint. Same-dialect chains
   only; a cross-dialect chain is a config-time error, not a silent drop.
 - **Body-based model routing and forced usage reporting (WP-45).** A bounded request-body
@@ -106,7 +106,7 @@ all. It was not planned scope; it was the precondition.
   it needs request/response translation (WP-52, v1.0.0).
 - Every gate verification runs against mock upstreams. v0.0.1's gate was closed by a manual
   live run against real OpenAI and Anthropic endpoints; the equivalent for this release's
-  two new clauses is recorded in `docs/MILESTONES.md` as a judgment call rather than a
+  two new clauses is recorded in `internal-docs/MILESTONES.md` as a judgment call rather than a
   completed step.
 
 ## [0.0.1] — 2026-08-01
@@ -169,10 +169,10 @@ working path through them was.
   `RouteEntry` by both config front-ends and read by nothing, so every request arrived at
   its provider unauthenticated. It survived a full plan audit because the config parsed,
   validated, and translated correctly — and then evaporated. Found only because an
-  end-to-end test's mock *required* the header and returned 401.
+  end-to-end test's mock _required_ the header and returned 401.
 - **Two upstream certificate-verification holes in the `llmproxy` dialect.** A provider with
-  no `ca_file` emitted no validation context at all, which on the rustls side means *accept
-  any server certificate*; and the `ca_file` path verified chain trust without verifying
+  no `ca_file` emitted no validation context at all, which on the rustls side means _accept
+  any server certificate_; and the `ca_file` path verified chain trust without verifying
   identity. Both branches now emit a validation context and a DNS-exact SAN matcher on the
   provider host. Envoy-mode parity is deliberately unchanged — Envoy really does default to
   accept-any, so the fix belongs in our own surface, not in the compatibility layer.

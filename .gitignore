@@ -1,4 +1,5 @@
 /target
+/.vscode/
 *.pb.bin
 testing/diffrig/captures/
 
@@ -8,7 +9,7 @@ testing/diffrig/captures/
 #
 # The planning docs were local-only until 2026-08-01. That stopped being
 # tenable once the code started citing them — `git grep` counts ADR-0004 55
-# times, ADR-0003 34, IMPLEMENTATION_PLAN.md 30, docs/envoy-divergences.md 13.
+# times, ADR-0003 34, internal-docs/IMPLEMENTATION_PLAN.md 30, internal-docs/envoy-divergences.md 13.
 # A `// see ADR-0004` comment pointing at a file nobody else has is worse than
 # no comment. They also had no backup: WP-45's design existed in exactly one
 # place, on one laptop, which is the same failure mode as CLAUDE.md rule 10
@@ -16,7 +17,7 @@ testing/diffrig/captures/
 *.md
 !README.md
 !CLAUDE.md
-# The release record. Cited by docs/MILESTONES.md and by the v0.0.1 tag.
+# The release record. Cited by internal-docs/MILESTONES.md and by the v0.0.1 tag.
 !CHANGELOG.md
 # The security policy. Needs an entry here for the same reason everything else
 # in this list does -- `*.md` denies by default, so a new root-level Markdown
@@ -30,6 +31,6 @@ testing/diffrig/captures/
 # that cite its case IDs.
 !testing/qa/SCENARIOS.md
 # Normative plan, milestone/ship-gate definitions, and architecture decisions.
-!PLAN.md
-!IMPLEMENTATION_PLAN.md
-!docs/**/*.md
+!internal-docs/**/*.md
+!internal-docs/**/*.yaml
+!internal-docs/**/*.json

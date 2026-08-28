@@ -1,5 +1,5 @@
 //! The HTTP filter API — a Rust mirror of Envoy's `envoy/http/filter.h`, with the
-//! exact iteration semantics specified in IMPLEMENTATION_PLAN.md Appendix S2.
+//! exact iteration semantics specified in internal-docs/IMPLEMENTATION_PLAN.md Appendix S2.
 //!
 //! This is a frozen shared surface (ground rule #4): the filter manager (WP-11),
 //! the router (WP-13), the WP-31/32 filter batches, and the Lane H LLM filters all

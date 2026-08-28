@@ -1,6 +1,6 @@
 //! HTTP data plane (Lane C).
 //!
-//! Work packages (see IMPLEMENTATION_PLAN.md):
+//! Work packages (see internal-docs/IMPLEMENTATION_PLAN.md):
 //! - WP-10: h1/h2 codec integration (downstream + upstream), including WebSocket
 //!   upgrades: 101 tunnel mode and h2 extended CONNECT translation (Appendix S10).
 //!   Chunk A ([`hyper_spike` test](../tests/hyper_spike.rs)) de-risked the

@@ -12,7 +12,7 @@ bootstrap configs (`configs/`) through both real Envoy's `--mode validate`
 - `agree-accept` — both accept.
 - `agree-reject` — both reject.
 - `gap-we-reject` — Envoy accepts, we reject: a known compat gap (ground rule
-  #2's *good* failure mode — a real gap named with a field path, not silently
+  #2's _good_ failure mode — a real gap named with a field path, not silently
   dropped).
 - `BUG-we-accept` — Envoy rejects, we accept: we are dangerously lenient where
   Envoy is strict. A P1 finding; the CLI exits nonzero if any show up.
@@ -41,4 +41,4 @@ Every scenario will run in BOTH config modes: static/file-watch and gRPC xDS
 (PLAN.md Part 9.6 anti-rot rule).
 
 Divergences are either failures or pinned with justification in
-`docs/envoy-divergences.md`.
+`internal-docs/envoy-divergences.md`.

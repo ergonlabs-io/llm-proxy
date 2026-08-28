@@ -1,7 +1,7 @@
 //! Configuration pipeline: bootstrap loading (WP-03), PGV validation (WP-04),
 //! and the proto -> internal IR conversion (WP-05).
 //!
-//! Ground rule #3 (IMPLEMENTATION_PLAN.md): protobuf types do not escape this
+//! Ground rule #3 (internal-docs/IMPLEMENTATION_PLAN.md): protobuf types do not escape this
 //! crate (and `proxy-xds`) — except through [`loader::LoadedBootstrap`], which
 //! WP-05 will consume to build the IR the data plane actually runs on.
 //!

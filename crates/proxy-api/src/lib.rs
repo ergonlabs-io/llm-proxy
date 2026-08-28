@@ -1,7 +1,7 @@
 //! Generated Envoy v3 API protos + embedded `FileDescriptorSet` (WP-02).
 //!
 //! This crate is the ONLY place Envoy protos are generated. It pins the Envoy
-//! API version for the whole project (IMPLEMENTATION_PLAN.md ground rule #1);
+//! API version for the whole project (internal-docs/IMPLEMENTATION_PLAN.md ground rule #1);
 //! the vendored `.proto` sources and their dependency pins live in `vendor/`,
 //! maintained by `scripts/vendor-protos.sh`.
 //!

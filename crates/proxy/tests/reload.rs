@@ -1,4 +1,4 @@
-//! SIGHUP config-reload acceptance tests: the trigger `docs/MILESTONES.md`'s
+//! SIGHUP config-reload acceptance tests: the trigger `internal-docs/MILESTONES.md`'s
 //! v0.2.0 section (paragraph beginning "Found 2026-08-09") calls the missing
 //! prerequisite for the config-swap ship-gate clause. `crates/proxy/src/main.rs`
 //! (`reload`, `ConfigSource`, `ControlSignals`) is what this drives; the

@@ -1,7 +1,7 @@
 //! Defect 2 (found writing user documentation, 2026-08-09): `--drain-strategy
 //! gradual` and `immediate` behave identically today (`DrainState::
 //! drain_close_probability` has no production call site -- see
-//! `docs/envoy-divergences.md`'s "Drain strategy" section). Ground rule #1
+//! `internal-docs/envoy-divergences.md`'s "Drain strategy" section). Ground rule #1
 //! forbids leaving that silent, so `serve` emits a startup `tracing::warn!`
 //! instead of wiring up the full per-response close-probability feature
 //! (out of scope for a contained fix -- see the same doc section for why).

@@ -8,7 +8,7 @@
 //! live connection's remote address/transport into these functions.
 //!
 //! ⚠️ marks below correspond 1:1 to the `⚠️` marks in S9 of
-//! `IMPLEMENTATION_PLAN.md`: the plan itself says "verify against Envoy docs"
+//! `internal-docs/IMPLEMENTATION_PLAN.md`: the plan itself says "verify against Envoy docs"
 //! at these points. Where the plan text does not resolve the ambiguity, the
 //! choice made here is written down next to the `⚠️`.
 

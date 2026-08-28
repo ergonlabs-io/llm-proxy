@@ -1,7 +1,7 @@
 //! Non-core filters, registered by Envoy extension type URL (or, for Lane H,
 //! under `type.llmproxy.dev/...`).
 //!
-//! Work packages (see IMPLEMENTATION_PLAN.md):
+//! Work packages (see internal-docs/IMPLEMENTATION_PLAN.md):
 //! - WP-31: cors, local_ratelimit, header mutation.
 //! - WP-32: ext_authz, ratelimit (gRPC RLS), ext_proc (client side).
 //! - Lane H (LLM layer):

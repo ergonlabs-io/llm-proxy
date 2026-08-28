@@ -218,7 +218,7 @@ fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Op
         // (`listener.0.0.0.0_80.downstream_cx_total`), falling back to a
         // configured `Listener.stat_prefix` when one is set. This renders the
         // configured listener NAME instead, unconditionally — see
-        // docs/envoy-divergences.md for the reasoning. The short version:
+        // internal-docs/envoy-divergences.md for the reasoning. The short version:
         // the attribute this instrument carries IS the name
         // (`DOWNSTREAM_CX_TOTAL.attribute_keys`), the address is not
         // available at the recording site, and a name is stable across a
@@ -344,7 +344,7 @@ mod tests {
     /// while appearing normally on `/stats/prometheus` -- so the Envoy-text
     /// endpoint silently under-reported. Keyed by listener NAME, which is a
     /// deliberate divergence from Envoy's address-keyed default; see
-    /// `envoy_counter_name` and docs/envoy-divergences.md.
+    /// `envoy_counter_name` and internal-docs/envoy-divergences.md.
     #[test]
     fn downstream_cx_total_renders_under_the_listener_name() {
         let control = StatsControl::new(1);

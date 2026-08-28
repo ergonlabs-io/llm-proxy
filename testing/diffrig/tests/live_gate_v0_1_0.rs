@@ -1,4 +1,4 @@
-//! **v0.1.0 live ship-gate drill.** `docs/MILESTONES.md` holds v0.1.0 at
+//! **v0.1.0 live ship-gate drill.** `internal-docs/MILESTONES.md` holds v0.1.0 at
 //! `current`, not `shipped`, for one reason: its clauses are verified only
 //! against mock upstreams (`auth_e2e.rs`, `failover_e2e.rs`). v0.0.1 did not
 //! ship on code-complete either -- it shipped on `live_smoke.rs`, a live run

@@ -1,5 +1,5 @@
 //! The v0.2.0 ship-gate clause this closes: "a config swap under live
-//! traffic with zero dropped streams." `docs/MILESTONES.md` names WP-26's
+//! traffic with zero dropped streams." `internal-docs/MILESTONES.md` names WP-26's
 //! traffic-replay topology as a prerequisite -- it is not one. Three pieces
 //! that already exist compose into exactly this scenario:
 //!

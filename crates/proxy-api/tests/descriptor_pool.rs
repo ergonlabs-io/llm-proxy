@@ -1,6 +1,6 @@
 //! WP-02 acceptance tests.
 //!
-//! Gate (IMPLEMENTATION_PLAN.md): `Bootstrap`, `Listener`, `Cluster`,
+//! Gate (internal-docs/IMPLEMENTATION_PLAN.md): `Bootstrap`, `Listener`, `Cluster`,
 //! `RouteConfiguration`, `ClusterLoadAssignment`, `HttpConnectionManager`,
 //! `Router`, ADS service types all addressable; the descriptor pool resolves
 //! every `type.googleapis.com/envoy.*` URL used in the config corpus.

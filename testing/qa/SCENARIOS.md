@@ -6,18 +6,18 @@ can be reviewed alongside the tests that cite its case IDs.
 
 ## Status
 
-| Case | Property | State |
-|------|----------|-------|
-| QA-1 | Per-route token counts, both providers, one config | passing — fully, including tokens, since 2026-08-01 |
-| QA-2 | Bad config fails loudly with the field path, exits nonzero | passing |
-| QA-3 | Streamed response arrives incrementally | passing |
-| QA-4 | Credentials reach upstream, never reach the log | passing |
-| QA-5 | Non-streaming responses log real bytes and tokens | approved |
-| QA-6 | Upstream dying mid-stream errors, and is not retried | passing |
-| QA-7 | SIGTERM during an active stream drains to completion | passing |
-| QA-8 | Circuit-breaker rejection fails fast, does not queue | approved |
-| QA-10 | TTFT and TPOT reach the access log with sane values | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
-| QA-9 | ~~Content-type parameter tolerance~~ | rejected — see below |
+| Case  | Property                                                   | State                                                   |
+| ----- | ---------------------------------------------------------- | ------------------------------------------------------- |
+| QA-1  | Per-route token counts, both providers, one config         | passing — fully, including tokens, since 2026-08-01     |
+| QA-2  | Bad config fails loudly with the field path, exits nonzero | passing                                                 |
+| QA-3  | Streamed response arrives incrementally                    | passing                                                 |
+| QA-4  | Credentials reach upstream, never reach the log            | passing                                                 |
+| QA-5  | Non-streaming responses log real bytes and tokens          | approved                                                |
+| QA-6  | Upstream dying mid-stream errors, and is not retried       | passing                                                 |
+| QA-7  | SIGTERM during an active stream drains to completion       | passing                                                 |
+| QA-8  | Circuit-breaker rejection fails fast, does not queue       | approved                                                |
+| QA-10 | TTFT and TPOT reach the access log with sane values        | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
+| QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
 `approved`.
@@ -30,22 +30,22 @@ configured access-log file was never created at all**. Two separate things were
 in the way:
 
 1. ~~**The `llmproxy` dialect never wires `observability.access_logs` into the
-   generated Envoy config.**~~ **FIXED** — commit *"Emit access logs from the
-   llmproxy dialect"*. `crates/proxy-simple-config/src/lower.rs` used to emit
-   only a warning (*"access logging is recorded but not emitted yet (WP-24)"*)
+   generated Envoy config.**~~ **FIXED** — commit _"Emit access logs from the
+   llmproxy dialect"_. `crates/proxy-simple-config/src/lower.rs` used to emit
+   only a warning (_"access logging is recorded but not emitted yet (WP-24)"_)
    and never add an `access_log` entry to the HCM. That warning was **stale**:
    WP-24 had landed and access logging worked fully in Envoy mode; only the
    dialect lowering was missing, so a proxy configured the way users actually
    configure it produced **no access logs whatsoever**.
 2. ~~**WP-33 — the usage filter isn't in the dialect's generated
    `http_filters`**, so every `%LLM_*_TOKENS%` operator renders as the
-   absent-value `-`.~~ **FIXED 2026-08-01** — commits *"Teach the usage filter
-   to read a per-route dialect"* (`7e296e3`) and *"Emit the usage filter from
-   the llmproxy dialect, per route"* (`72c7fc8`). The filter now sits ahead of
+   absent-value `-`.~~ **FIXED 2026-08-01** — commits _"Teach the usage filter
+   to read a per-route dialect"_ (`7e296e3`) and _"Emit the usage filter from
+   the llmproxy dialect, per route"_ (`72c7fc8`). The filter now sits ahead of
    the router in the dialect's chain, and each route carries a
    `typed_per_filter_config` override naming its own provider's dialect — which
    is what lets one proxy meter OpenAI and Anthropic correctly from one config.
-   See `docs/wp-33-design-brief.md`.
+   See `internal-docs/wp-33-design-brief.md`.
 
 Gap 1 was not anticipated by the code review that produced the WP-33 brief —
 an independently written black-box test found it from the outside. That is the
@@ -87,12 +87,12 @@ injected `x-envoy-original-path` into the logged snapshot.
 
 This mattered well beyond the dialect: **Envoy's own default access-log format
 uses `%REQ(:METHOD)%`**, so every access log the proxy wrote in Envoy mode was
-missing the request method too. Fixed in *"Resolve Envoy pseudo-headers in
-access-log REQ/RESP operators"* — `LogContext` now carries the pseudo-headers
+missing the request method too. Fixed in _"Resolve Envoy pseudo-headers in
+access-log REQ/RESP operators"_ — `LogContext` now carries the pseudo-headers
 as typed fields, `%RESP(:STATUS)%` works, and the unfaithful
 `x-envoy-original-path` injection is gone.
 
-Worth noting how this one hid: `header_lookup`'s own doc comment *described*
+Worth noting how this one hid: `header_lookup`'s own doc comment _described_
 the behavior as intended ("those simply never match today"), so two passes of
 code review read it as a known limitation rather than a live defect. The
 black-box test had no such prior and just saw a missing method.
@@ -117,13 +117,13 @@ Every `set_response_flag` call site in `proxy-http` (all twelve of them, in
 connect failure, TLS handshake failure, reset-before-headers, request
 timeout, codec error before headers. Once headers (and, for a stream, the
 first body frames) had already reached the client, nothing set a
-`ResponseFlag` when the response *body* subsequently errored —
+`ResponseFlag` when the response _body_ subsequently errored —
 `LoggingBody::poll_frame` discarded the error outright (`Err(_)`), so the line
 rendered `response_flags` as the absent-value `-` even though the request had
 definitely failed mid-stream. On the SSE path — most of this proxy's traffic —
 a network death was therefore byte-identical in the log to a short completion.
 
-**FIXED** — commit *"Record a response flag when a stream fails mid-flight"*.
+**FIXED** — commit _"Record a response flag when a stream fails mid-flight"_.
 `LoggingBody` now classifies the body error and sets a flag before its log
 line is snapshotted: an upstream that hung up is `UC`, a client that went away
 is `DC`, and a body abandoned before end-of-stream is `DC` too (previously it
@@ -134,11 +134,11 @@ is legible from one line.
 Two calls worth recording, because the obvious answer was wrong on both:
 
 - **Not `UPE`.** The first analysis proposed `UpstreamProtocolError`, which
-  reads plausibly but means a protocol *violation*. A TCP connection dying
-  mid-body is a *termination* — `UC`.
+  reads plausibly but means a protocol _violation_. A TCP connection dying
+  mid-body is a _termination_ — `UC`.
 - **The S4 idle timeout must not collapse into `UC`.** It surfaces as
   `BodyError::Upstream(IdleTimeoutError)`, so matching on the variant alone
-  reports a *stalled but alive* upstream as a dead connection. It needs a
+  reports a _stalled but alive_ upstream as a dead connection. It needs a
   `downcast_ref` to report `SI`. For LLM traffic these are entirely different
   diagnoses — a slow model versus a broken link — and merging them would have
   produced confidently wrong operator signal. Mutation-verified: removing the
@@ -199,7 +199,7 @@ off the agent's judgment alone.
 ### QA-1 — Per-route token counts are correct for both providers, from one proxy and one config
 
 **Why:** this is v0.1.0's per-route dialect claim and the acceptance criterion
-in `docs/wp-33-design-brief.md`. A per-listener dialect physically cannot pass
+in `internal-docs/wp-33-design-brief.md`. A per-listener dialect physically cannot pass
 it, which is what makes it proof rather than coverage.
 
 **Config:** `llmproxy` dialect, two providers, two routes — `gpt-*` → openai,
@@ -207,7 +207,7 @@ it, which is what makes it proof rather than coverage.
 `%LLM_*_TOKENS%` operators.
 
 **Steps:** one request routed to each provider, against mocks returning known,
-*different* usage values per provider.
+_different_ usage values per provider.
 
 **Expected:** two access-log lines, each carrying the token counts of the
 provider its route targeted. Deliberately use different numbers per provider so
@@ -259,7 +259,7 @@ instant. Use generous tolerances — assert the shape, never tight equality.
 **Why:** two shipped P0s on the same request path, never verified together.
 `request_headers_to_add` was once lowered by both front-ends and read by
 nothing, so every request reached its provider with no credentials; separately,
-access logging snapshots headers *before* auth injection specifically so
+access logging snapshots headers _before_ auth injection specifically so
 credentials cannot leak into logs.
 
 **Config:** a provider with a canary key, e.g. `api_key: sk-test-canary-value`;
@@ -368,7 +368,7 @@ carries the `UO` response flag.
   `application/json; charset=utf-8` would silently fall inert and stop billing.
   `usage_filter.rs`'s `classify_body` already splits on `;` and trims, and
   `json_content_type_with_parameters_still_parses_as_json` covers it; the SSE
-  path uses the same value. The *reasoning* was right — a silent-by-design
+  path uses the same value. The _reasoning_ was right — a silent-by-design
   failure mode is exactly what QA should hunt — but this instance is handled.
 
 Also excluded by the analyst, correctly: outlier detection and active health
@@ -388,7 +388,7 @@ nothing to configure black-box), retry budgets (unimplemented), ALPN defaults
 - `make qa` builds the binary, then runs `go test ./...`. `make ci` invokes
   `make qa`, **skipping loudly with a visible notice if the Go toolchain is
   absent** rather than failing. The loud part is not cosmetic — a silent skip
-  would let the suite rot. (Go *is* installed on the primary dev machine as of
+  would let the suite rot. (Go _is_ installed on the primary dev machine as of
   2026-08-08: go1.26.5, and `make qa` runs green in ~5s. This note previously
   said it was absent.)
 - Timing assertions (QA-3, QA-7, QA-8) must assert shape with generous
@@ -398,8 +398,8 @@ nothing to configure black-box), retry budgets (unimplemented), ALPN defaults
 
 ### QA-10 — TTFT and TPOT reach the access log, with values that match the upstream's pacing
 
-**Why:** v0.1.0's ship gate names these explicitly — "token counts *and
-TTFT/TPOT* reach the access log for live traffic" — and until 2026-08-08 the
+**Why:** v0.1.0's ship gate names these explicitly — "token counts _and
+TTFT/TPOT_ reach the access log for live traffic" — and until 2026-08-08 the
 TPOT half could not be satisfied at all through the `llmproxy` dialect: WP-46
 built `%LLM_TPOT%`, `%LLM_MAX_STALL%` and `%LLM_RESPONSE_CHUNKS%`, and no
 dialect log format ever emitted them. QA-1 reads the token fields out of the
@@ -410,7 +410,7 @@ bug of exactly the shape a black-box test catches:** it divided in integer
 milliseconds, so it rendered `0` for fast providers (1000–2000 tok/s) —
 reading zero precisely when performance was best. It was fixed by dividing in
 micros, but nothing outside a unit test guards it, and `0` in a log field looks
-entirely plausible to a reader. Only an assertion against a mock with *known*
+entirely plausible to a reader. Only an assertion against a mock with _known_
 pacing can tell a real measurement from a broken one.
 
 **Config:** `llmproxy` dialect, single provider, JSON access log to a file —
@@ -422,6 +422,7 @@ time-to-first-token and a known inter-chunk delay across several chunks (QA-3's
 pacing setup is the template).
 
 **Expected:** the request's access-log line carries
+
 - `llm_ttft_ms` at roughly the configured TTFT (generous lower bound),
 - `llm_tpot_ms` **strictly greater than zero** and in the neighbourhood of the
   configured inter-chunk delay — the non-zero half is the load-bearing

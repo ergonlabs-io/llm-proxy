@@ -126,7 +126,7 @@ pub struct ListenerConfig {
 /// when a filter chain matches on `server_names`, `application_protocols`, or
 /// `transport_protocol: tls` but no `tls_inspector` was configured — omitting
 /// it would silently make those criteria never match TLS traffic, a worse
-/// divergence than the injection. Recorded in `docs/envoy-divergences.md`.
+/// divergence than the injection. Recorded in `internal-docs/envoy-divergences.md`.
 #[derive(Debug)]
 pub enum ListenerFilterSpec {
     TlsInspector(TlsInspectorConfig),

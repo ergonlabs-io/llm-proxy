@@ -9,7 +9,7 @@ holding it, rewriting it, and republishing -- one refresh cost roughly 200k
 tokens, and the edits landed in presentation code where a stray CSS change
 once made the entire board render as a single blank header.
 
-So the data moved out. `docs/boards/*.yaml` is now the source of truth for
+So the data moved out. `internal-docs/boards/*.yaml` is now the source of truth for
 board STATE; the templates own presentation and nobody edits them to record a
 status change. A status flip is a two-line diff.
 
@@ -21,9 +21,9 @@ That keeps the design byte-identical to what is already live -- these are
 working instruments the owner reads at a glance, and a re-render that quietly
 restyles them is a regression even when it looks nicer.
 
-`docs/boards/backlog.yaml` holds only STATE (id, status, priority, milestone,
+`internal-docs/boards/backlog.yaml` holds only STATE (id, status, priority, milestone,
 lane, the card's bullet lines). Normative prose stays in
-`IMPLEMENTATION_PLAN.md`, joined on the WP id. Duplicating the prose here would
+`internal-docs/IMPLEMENTATION_PLAN.md`, joined on the WP id. Duplicating the prose here would
 create two things to drift.
 
 Usage:  make boards          (or: python3 scripts/render-boards.py)
@@ -42,8 +42,8 @@ except ImportError:
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 TEMPLATES = REPO / "scripts/board-templates"
-DATA = REPO / "docs/boards"
-OUT = REPO / "docs/boards"
+DATA = REPO / "internal-docs/boards"
+OUT = REPO / "internal-docs/boards"
 
 MARKER = "/*__DATA__*/"
 

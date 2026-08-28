@@ -32,7 +32,7 @@
 //! it, so the Envoy-text endpoint silently under-reported while Prometheus
 //! looked fine. Two renderers over one registry can disagree, and only
 //! checking both catches it. Note the key is the listener NAME, a deliberate
-//! divergence from Envoy's address-keyed default (docs/envoy-divergences.md).
+//! divergence from Envoy's address-keyed default (internal-docs/envoy-divergences.md).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

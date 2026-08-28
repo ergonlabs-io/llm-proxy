@@ -11,7 +11,7 @@
 //! a real access logger and drives an actual failing condition (a refused
 //! TCP connect, a hung upstream, a zero-endpoint cluster, ...) through it --
 //! never `set_response_flag` called directly. A flag that cannot be driven
-//! this way belongs in `docs/envoy-divergences.md`'s response-flags table,
+//! this way belongs in `internal-docs/envoy-divergences.md`'s response-flags table,
 //! not here (see that doc for the full per-flag audit).
 //!
 //! Rust note: same shape as `router_access_log.rs`/`router.rs`'s own tests
@@ -531,7 +531,7 @@ async fn spawn_h2_upstream_that_refuses_every_stream() -> SocketAddr {
 /// `UR` had no producer at all until the h2 codec learned to decode
 /// RST_STREAM reasons -- `PoolError::ResetBeforeHeaders`, the only value
 /// `router.rs`'s old `UR` arm matched, is constructed by neither pool, so the
-/// flag was dead code (recorded as such in docs/envoy-divergences.md). A
+/// flag was dead code (recorded as such in internal-docs/envoy-divergences.md). A
 /// refused stream is a deliberate remote reset, which is precisely what Envoy
 /// means by `UR`; every other codec failure stays `UC`.
 ///

@@ -14,7 +14,7 @@
 //!   doc below for its test.
 //! - **Unreachable**: the condition cannot occur in what's built today. Each
 //!   such variant's doc says why, so the next audit doesn't start from
-//!   scratch. `docs/envoy-divergences.md` carries the same table with the
+//!   scratch. `internal-docs/envoy-divergences.md` carries the same table with the
 //!   fuller narrative.
 //!
 //! That audit found two flags declared, apparently wired, and yet **dead
@@ -119,7 +119,7 @@ pub enum ResponseFlag {
     /// post-connect TCP reset is still indistinguishable from a connect
     /// failure and reports as `UF`. Distinguishing it (matching `ECONNRESET`
     /// specifically after a successful connect) remains a classification
-    /// decision -- see `docs/envoy-divergences.md`.
+    /// decision -- see `internal-docs/envoy-divergences.md`.
     UpstreamRemoteReset,
     /// UC: upstream connection termination. Reachable: any hyper-level
     /// failure sending the request or parsing the response (a malformed
@@ -170,7 +170,7 @@ pub enum ResponseFlag {
     /// exposes `is_parse()`), but deciding exactly which hyper error kinds
     /// count as "protocol" versus "connection" (matching Envoy's own
     /// `UPE`/`UC` split) is a classification design decision, not a wiring
-    /// fix -- see `docs/envoy-divergences.md`.
+    /// fix -- see `internal-docs/envoy-divergences.md`.
     UpstreamProtocolError,
     /// UMSDR: upstream request reached max stream duration. Unreachable: no
     /// `max_stream_duration` feature (distinct from the route `timeout` and

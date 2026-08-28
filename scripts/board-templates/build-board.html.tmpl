@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">IMPLEMENTATION_PLAN.md · docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-23 · 1222 tests passed, 23 skipped as of 2026-08-23 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-23 · 1222 tests passed, 23 skipped as of 2026-08-23 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -209,7 +209,7 @@
     changing its own <code>Authorization</code> header. <b>Unlike v0.0.1, this release was tagged
     without running its live-provider drill</b> — it exists
     (<code>testing/diffrig/tests/live_gate_v0_1_0.rs</code>, one command, three billable calls) and
-    was deliberately not run before tagging; recorded in <code>docs/MILESTONES.md</code> as a named
+    was deliberately not run before tagging; recorded in <code>internal-docs/MILESTONES.md</code> as a named
     departure, not a gap that was missed. WP-35's scope closed narrower than its title:
     same-dialect fallback only — cross-dialect (openai → anthropic) is a deliberate hard error,
     split into new WP-52 (v1.0.0) rather than left as a silent gap.</span>
@@ -341,7 +341,7 @@
     (at most once per budget key per minute) but still admits the request uncharged — an owner
     decision, not a partial fix. Root cause is architectural: <code>body_rewrite</code>'s
     anti-spoofing rewrite can re-route a request onto a route whose usage dialect no longer
-    matches the response shape, and <code>IMPLEMENTATION_PLAN.md</code>'s WP-35 section now
+    matches the response shape, and <code>internal-docs/IMPLEMENTATION_PLAN.md</code>'s WP-35 section now
     carries the prerequisite this forces — the usage dialect must move from the route to the
     cluster before WP-52 makes cross-dialect fallback legal, see WP-34/WP-35/WP-52's cards.
     Re-run directly this refresh: 4 of 7 <code>local_openai_smoke.rs</code> cases pass, 3

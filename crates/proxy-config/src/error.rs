@@ -25,7 +25,7 @@ pub enum ConfigError {
     },
 
     #[error(
-        "unsupported field `{field_path}`: {reason} (strict mode; see docs/envoy-divergences.md)"
+        "unsupported field `{field_path}`: {reason} (strict mode; see internal-docs/envoy-divergences.md)"
     )]
     UnsupportedField { field_path: String, reason: String },
 

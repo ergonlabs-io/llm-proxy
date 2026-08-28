@@ -852,7 +852,7 @@ fn convert_listener(l: &listener_v3::Listener, path: &str) -> Result<ListenerCon
 /// auto-injection: if no `tls_inspector` was configured explicitly but a
 /// filter chain matches on SNI/ALPN/`transport_protocol: tls`, Envoy inserts
 /// a default one so that matching still works — see the doc comment on
-/// [`ListenerFilterSpec`] and `docs/envoy-divergences.md`.
+/// [`ListenerFilterSpec`] and `internal-docs/envoy-divergences.md`.
 fn convert_listener_filters(
     l: &listener_v3::Listener,
     filter_chains: &[FilterChainSpec],

@@ -2,7 +2,7 @@
 //! downstream HTTP codec ([`crate::codec`]) and whatever produces a response
 //! for a request. This is **provisional**: WP-11's filter manager will
 //! implement (and likely refine) this trait behind the S2 iteration state
-//! machine described in IMPLEMENTATION_PLAN.md. Until then, [`stub`] provides
+//! machine described in internal-docs/IMPLEMENTATION_PLAN.md. Until then, [`stub`] provides
 //! two concrete handlers ([`stub::FixedResponseHandler`],
 //! [`stub::EchoHandler`]) that exercise the seam end-to-end for the codec's
 //! own tests.
