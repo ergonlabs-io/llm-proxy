@@ -100,6 +100,17 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         // that registering it does NOT enable authentication anywhere; only a
         // listener that configures the filter authenticates.
         registry.register(Arc::new(proxy_filters::auth_filter::AuthFilterFactory));
+        // WP-50 increment 3a (Lane H): per-tenant model allow-lists. Must be
+        // configured AFTER BOTH `llmproxy.auth` (needs the tenant) and
+        // `llmproxy.body_rewrite` (needs the extracted model) in any
+        // listener's `http_filters` list -- `proxy_config::lower::
+        // check_lane_h_filter_order` enforces both at config load. Also
+        // registered unconditionally, same reasoning as the filters above:
+        // registering it does NOT enable model authorization anywhere; only
+        // a listener that configures the filter enforces an allow-list.
+        registry.register(Arc::new(
+            proxy_filters::model_authz_filter::ModelAuthzFilterFactory,
+        ));
         Arc::new(registry)
     })
 }

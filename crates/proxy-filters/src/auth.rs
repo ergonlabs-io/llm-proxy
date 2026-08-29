@@ -183,11 +183,11 @@ impl fmt::Debug for KeyId {
 
 /// Per-tenant authorization policy.
 ///
-/// Deliberately EMPTY in this increment -- WP-50 increment 3 is where model
-/// allow-lists and budgets land. It exists now, carried by [`Principal`]
-/// behind an `Arc`, so that adding the first policy field is a change to
-/// this one struct rather than a signature change through every call site
-/// that carries a `Principal`.
+/// WP-50 increment 3a adds the first field, [`Self::model_access`] --
+/// exactly the shape this doc predicted before any field existed, carried by
+/// [`Principal`] behind an `Arc`, so that adding it was a change to this one
+/// struct rather than a signature change through every call site that
+/// carries a `Principal`.
 ///
 /// # The default grants everything (owner decision, 2026-08-08)
 ///
@@ -199,33 +199,36 @@ impl fmt::Debug for KeyId {
 /// revoked credential is a 401, always. *Authorization* defaults open — once
 /// we know who you are, absent any configured restriction, you may proceed.
 ///
-/// # The trap this creates, for whoever adds the first field
+/// # The trap this creates, for whoever adds a field
 ///
 /// "No policy configured" and "a configured policy that failed to load" must
 /// **not** produce the same value. The first is this `Default` and grants
 /// everything; the second is a config error and must fail loudly with its
 /// dotted path (ground rule #1), because silently substituting the permissive
 /// default for a policy the operator *wrote* would turn a typo into a
-/// privilege escalation.
-///
-/// For the same reason, express access as an explicit enum rather than a
-/// collection whose emptiness has to be interpreted:
-///
-/// ```ignore
-/// enum ModelAccess { All, Only(Vec<ModelPattern>) }   // do this
-/// models: Vec<ModelPattern>                            // NOT this
-/// ```
-///
-/// With a bare `Vec`, `vec![]` has to mean either "everything" or "nothing",
-/// and whichever you pick, the other becomes inexpressible — while
-/// `ModelAccess::Only(vec![])` says "deny all" unambiguously and
-/// `ModelAccess::All` is the documented default.
+/// privilege escalation. [`crate::model_authz_filter::parse_config`] is the
+/// one place that loads this struct's `model_access` field from configuration,
+/// and it is careful about exactly this: see that function's doc.
 #[derive(Clone, Default)]
-pub struct TenantPolicy {}
+pub struct TenantPolicy {
+    /// Which models this tenant may use. See
+    /// [`crate::model_authz::ModelAccess`]'s doc for why this is an explicit
+    /// enum (`All` / `Only(Vec<ModelPattern>)`) rather than a bare `Vec`
+    /// whose emptiness would have to be interpreted as either "everything" or
+    /// "nothing".
+    pub model_access: crate::model_authz::ModelAccess,
+}
 
 impl fmt::Debug for TenantPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TenantPolicy").finish()
+        // Rust note: unlike every other hand-written `Debug` in this module,
+        // `model_access` IS included -- it is configuration (a list of model
+        // name patterns), not a secret, and an operator debugging "why was
+        // this tenant refused" needs to see it. Contrast `KeyRecord`/`KeySet`,
+        // which redact exactly because their fields ARE key-material-adjacent.
+        f.debug_struct("TenantPolicy")
+            .field("model_access", &self.model_access)
+            .finish()
     }
 }
 

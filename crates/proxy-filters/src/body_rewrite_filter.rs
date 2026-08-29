@@ -437,6 +437,16 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // (S2.8) always follows, so a route match against the OLD header
         // value is never reused.
         let model = facts.model.clone();
+        // WP-50 increment 3a: publish the same extracted `model` onto
+        // `StreamInfo::requested_model` for `model_authz_filter` to read --
+        // reuses this scan rather than adding a second body buffer (see the
+        // design brief's "load-bearing seam" section). Rust note: scoped so
+        // the `RefMut` guard drops before `modify_decoded_headers` below --
+        // `stream_info()` must not be held across another call on `cb` (see
+        // its doc), same pattern `auth_filter`/`token_limit_filter` use.
+        {
+            cb.stream_info().requested_model = model.clone();
+        }
         cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
             apply_model_header(&mut headers.headers, model.as_deref());
         });
@@ -1024,6 +1034,31 @@ mod tests {
             1,
             "a decision was reached, so the route cache must be invalidated exactly once"
         );
+    }
+
+    /// WP-50 increment 3a: the same scanned `model` is published onto
+    /// `StreamInfo::requested_model`, not only the routing header --
+    /// `model_authz_filter` reads the `StreamInfo` field, never the header.
+    #[test]
+    fn body_model_publishes_stream_info_requested_model() {
+        let body = br#"{"model":"gpt-4o","messages":[],"stream":false}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        let (_out, cb) = run(Dialect::OpenAi, headers, &[body]);
+        assert_eq!(
+            cb.stream_info.borrow().requested_model.as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    /// A body with no extractable model must leave `StreamInfo::requested_model`
+    /// at `None` -- the same "no proof, don't trust" rule the routing header
+    /// already follows (WP-45 decision 4), now checked for the WP-50 seam too.
+    #[test]
+    fn body_with_no_model_leaves_stream_info_requested_model_none() {
+        let body = br#"{"messages":[],"stream":false}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        let (_out, cb) = run(Dialect::OpenAi, headers, &[body]);
+        assert_eq!(cb.stream_info.borrow().requested_model, None);
     }
 
     /// The Anthropic dialect gets no `include_usage` splice, but model

@@ -1,0 +1,85 @@
+// Per-tenant model allow-lists for the llm-proxy data plane (WP-50 increment
+// 3a). See `internal-docs/wp-50-inc3-design-brief.md`'s "3a" and "The
+// load-bearing seam" sections -- normative for this filter.
+//
+// Vendored for its own sake, same reasoning as `auth.proto`: a per-tenant
+// allow-list is a REPEATED STRUCTURED record (tenant, access mode, patterns),
+// which no existing compiled Envoy message shapes, and it decides who gets to
+// talk to which model -- not something to carry as an unvalidated JSON blob
+// inside a borrowed field.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+// Configures the model-scoped authorization filter (`llmproxy.model_authz`).
+//
+// The filter is fail CLOSED on both axes that feed it -- an unauthenticated
+// stream (no `StreamInfo::auth.tenant`) and a request with no extractable
+// `model` (no `StreamInfo::requested_model`) are both refused, never admitted
+// -- but it defaults OPEN with respect to authorization itself: a tenant with
+// no entry in `policies` here is a config/consistency error (refused, NOT
+// implicitly granted every model), while simply not adding this filter to a
+// listener's `http_filters` at all is the actual "no restriction configured"
+// state, which never reaches this filter in the first place. See the design
+// brief for why those two are not the same axis and must not be confused.
+message ModelAuthz {
+  // The configured tenants' model access policies. A tenant authenticated by
+  // an earlier `llmproxy.auth` filter but absent from this list is refused --
+  // this is deliberately NOT the same as granting it every model. An empty
+  // list is legal and refuses every tenant, exactly as `Authentication` with
+  // no `virtual_keys` authenticates nobody (see that message's doc).
+  repeated TenantModelPolicy policies = 1;
+}
+
+// One tenant's model access policy. `tenant` must match a value the
+// `llmproxy.auth` filter writes onto `StreamInfo::auth.tenant` for this
+// policy to ever apply.
+message TenantModelPolicy {
+  // Required. Must be unique within one filter config.
+  string tenant = 1;
+
+  // Required (exactly one branch must be set).
+  //
+  // A oneof, not an `enum mode` + `repeated string models` pair: the design
+  // brief's `TenantPolicy` doc (see `proxy-filters/src/auth.rs`) already
+  // settled this exact question for the Rust-side `ModelAccess` enum --
+  // `enum ModelAccess { All, Only(Vec<ModelPattern>) }`, never a bare `Vec`
+  // whose emptiness has to be interpreted as either "everything" or
+  // "nothing". An enum+repeated-strings encoding reopens precisely that
+  // ambiguity at the wire level (does an unset/empty `models` next to
+  // `mode: ONLY` mean "deny all" or "field omitted, fall back to ALL"?); a
+  // oneof does not, because the oneof's own discriminant -- which branch is
+  // set -- IS the answer, with nothing left for an absent/empty list to be
+  // read two ways. It also maps 1:1 onto the Rust enum with no translation
+  // step that could itself introduce the ambiguity back in.
+  oneof access {
+    // Every model is permitted for this tenant.
+    AllModels all = 2;
+    // Only a model matching one of `OnlyModels.patterns` is permitted.
+    OnlyModels only = 3;
+  }
+}
+
+// Grants every model. An explicit (empty) message rather than a bare `bool`
+// flag on `TenantModelPolicy`, so that setting `access.all` and never
+// setting it are the two states the oneof already distinguishes -- no
+// separate "is this flag meaningful" question to ask.
+message AllModels {}
+
+// Grants only the models matching at least one of `patterns`.
+message OnlyModels {
+  // Each entry is either an exact model name (e.g. `gpt-4o`), or a name
+  // ending in exactly one trailing `*` glob (e.g. `gpt-4*`, which matches
+  // `gpt-4o`, `gpt-4-turbo`, and the literal string `gpt-4` itself). No other
+  // wildcard or regex syntax is supported -- see the design brief's 3a
+  // section ("do not invent a regex surface"). A `*` anywhere other than the
+  // final character, or more than one `*`, is rejected at config load with
+  // its dotted field path.
+  //
+  // An EMPTY list is legal here and denies every model for this tenant --
+  // `OnlyModels` with zero patterns is a real, deliberate "no models
+  // permitted yet" policy, not a misconfiguration to rescue by falling back
+  // to `AllModels`.
+  repeated string patterns = 1;
+}

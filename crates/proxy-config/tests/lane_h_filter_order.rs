@@ -19,7 +19,9 @@ use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, S
 // a test that re-declared these literals would pin itself to the filters and
 // leave `lower.rs` free to drift from both.
 use proxy_config::lower::{
-    AUTH_FILTER_TYPE as AUTH, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT, USAGE_FILTER_TYPE as USAGE,
+    AUTH_FILTER_TYPE as AUTH, BODY_REWRITE_FILTER_TYPE as BODY_REWRITE,
+    MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT,
+    USAGE_FILTER_TYPE as USAGE,
 };
 
 /// `lower.rs` cannot import the filters' constants — `proxy-filters` depends
@@ -56,6 +58,20 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
          proxy-config/src/lower.rs or the token_limit-before-usage ordering rule \
          silently stops firing"
     );
+    assert_eq!(
+        BODY_REWRITE,
+        proxy_filters::body_rewrite_filter::TYPE_URL,
+        "the body_rewrite filter's type URL changed; update `BODY_REWRITE_FILTER_TYPE` in \
+         proxy-config/src/lower.rs or the body_rewrite-before-model_authz ordering rule \
+         silently stops firing"
+    );
+    assert_eq!(
+        MODEL_AUTHZ,
+        proxy_filters::model_authz_filter::TYPE_URL,
+        "the model_authz filter's type URL changed; update `MODEL_AUTHZ_FILTER_TYPE` in \
+         proxy-config/src/lower.rs or BOTH new WP-50 increment 3a ordering rules silently \
+         stop firing"
+    );
 }
 
 /// One `http_filters` entry. The configs are the minimum each message needs to
@@ -67,6 +83,8 @@ fn filter_entry(name: &str, type_url: &str) -> String {
         }
         TOKEN_LIMIT => "\n                      max_tokens: 10\n                      fill_rate: 1.0",
         USAGE => "\n                      inline_string: \"\"",
+        BODY_REWRITE => "\n                      default_value: true\n                      runtime_key: openai",
+        MODEL_AUTHZ => "\n                      policies: []",
         other => panic!("unexpected type url {other}"),
     };
     format!(
@@ -205,6 +223,76 @@ fn usage_before_token_limit_is_rejected_because_the_limiter_would_record_zero_to
     );
 }
 
+// --- rule 3: auth before model_authz (both decode-side, WP-50 inc 3a) ------
+
+#[test]
+fn auth_before_model_authz_is_accepted() {
+    chain(&[
+        ("llmproxy.auth", AUTH),
+        ("llmproxy.model_authz", MODEL_AUTHZ),
+    ])
+    .expect("auth ahead of model_authz is the correct order");
+}
+
+/// Reversed, `model_authz`'s `decode_headers` runs before the auth filter has
+/// written `StreamInfo::auth.tenant`, reads `None`, and (per its fail-closed
+/// design) refuses every request.
+#[test]
+fn model_authz_before_auth_is_rejected_because_the_authz_filter_would_see_no_tenant() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.model_authz", MODEL_AUTHZ),
+        ("llmproxy.auth", AUTH),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
+    assert!(
+        reason.contains("llmproxy.auth") && reason.contains("BEFORE"),
+        "the reason must name the filter and the required direction: {reason}"
+    );
+    assert!(
+        reason.contains("no tenant"),
+        "the reason must say what actually goes wrong: {reason}"
+    );
+}
+
+// --- rule 4: body_rewrite before model_authz (both decode-side) ------------
+
+#[test]
+fn body_rewrite_before_model_authz_is_accepted() {
+    chain(&[
+        ("llmproxy.body_rewrite", BODY_REWRITE),
+        ("llmproxy.model_authz", MODEL_AUTHZ),
+    ])
+    .expect("body_rewrite ahead of model_authz is the correct order");
+}
+
+/// Reversed, `model_authz`'s `decode_headers` runs before body_rewrite has
+/// published `StreamInfo::requested_model`, reads `None`, and refuses every
+/// request.
+#[test]
+fn model_authz_before_body_rewrite_is_rejected_because_the_authz_filter_would_see_no_model() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.model_authz", MODEL_AUTHZ),
+        ("llmproxy.body_rewrite", BODY_REWRITE),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
+    assert!(
+        reason.contains("llmproxy.body_rewrite") && reason.contains("BEFORE"),
+        "the reason must name the filter and the required direction: {reason}"
+    );
+    assert!(
+        reason.contains("no model"),
+        "the reason must say what actually goes wrong: {reason}"
+    );
+}
+
 // --- a rule applies only when both of its filters are present --------------
 
 #[test]
@@ -213,6 +301,8 @@ fn each_lane_h_filter_alone_is_a_valid_chain() {
         ("llmproxy.auth", AUTH),
         ("llmproxy.token_limit", TOKEN_LIMIT),
         ("llmproxy.usage", USAGE),
+        ("llmproxy.body_rewrite", BODY_REWRITE),
+        ("llmproxy.model_authz", MODEL_AUTHZ),
     ] {
         chain(&[(name, url)])
             .unwrap_or_else(|e| panic!("`{name}` alone must be a valid chain, got {e:?}"));

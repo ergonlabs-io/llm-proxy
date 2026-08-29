@@ -1403,9 +1403,9 @@ fn convert_upgrade_configs(
 // which is the crate that actually defines them: `proxy-filters` depends on
 // `proxy-config`, so the dependency cannot point this way (ground rule #2).
 // The canonical definitions are `proxy_filters::{auth_filter, usage_filter,
-// token_limit_filter}::TYPE_URL`; `tests::lane_h_type_urls_match_the_filters`
-// in `proxy-filters` pins them equal, so a rename cannot silently disable
-// these checks.
+// token_limit_filter, body_rewrite_filter, model_authz_filter}::TYPE_URL`;
+// `tests::lane_h_type_urls_match_the_filters` in `proxy-filters` pins them
+// equal, so a rename cannot silently disable these checks.
 // `pub` solely so `tests/lane_h_filter_order.rs` can assert THESE constants
 // equal to the filters' own -- pinning a private copy the test re-declares
 // would pin nothing.
@@ -1413,6 +1413,9 @@ pub const AUTH_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authen
 pub const TOKEN_LIMIT_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
 pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+pub const BODY_REWRITE_FILTER_TYPE: &str =
+    "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
+pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
 
 /// Rejects Lane-H filter chains whose order silently disables a filter.
 ///
@@ -1445,8 +1448,24 @@ pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.Data
 ///   **later** in config order. Reversed, every request records **zero**
 ///   tokens against its budget: the limit exists and never fires.
 ///
+/// # WP-50 increment 3a: two more decode-side rules for `llmproxy.model_authz`
+///
+/// `llmproxy.model_authz` needs BOTH the tenant `llmproxy.auth` resolves
+/// (`StreamInfo::auth.tenant`) and the model `llmproxy.body_rewrite`
+/// extracts (`StreamInfo::requested_model`). All three are decode-side, so
+/// both required orderings run the same direction as the auth/token_limit
+/// rule above: `llmproxy.auth` and `llmproxy.body_rewrite` must each come
+/// BEFORE `llmproxy.model_authz`. Reversed, the authz filter reads `None` for
+/// whichever fact came from the reordered filter and — per its fail-closed
+/// design (`proxy_filters::model_authz_filter`'s module doc) — refuses EVERY
+/// request rather than silently admitting one it can't check; still a config
+/// error, because "authorization now refuses 100% of traffic" is exactly the
+/// kind of surprise ground rule #1 exists to catch at load time instead of
+/// in production.
+///
 /// Both rules are stated at their own call sites too
-/// (`token_limit_filter`'s module doc); this function is the enforcement.
+/// (`token_limit_filter`'s and `model_authz_filter`'s module docs); this
+/// function is the enforcement.
 fn check_lane_h_filter_order(
     http_filters: &[HttpFilterSpec],
     path: &str,
@@ -1476,6 +1495,25 @@ fn check_lane_h_filter_order(
              config order, so the usage filter must come LATER in config order for its \
              report to exist by then; with this order reversed every request silently \
              records zero tokens against its budget",
+        ),
+        (
+            AUTH_FILTER_TYPE,
+            "llmproxy.auth",
+            MODEL_AUTHZ_FILTER_TYPE,
+            "llmproxy.model_authz",
+            "the model-authz filter reads the tenant the auth filter resolves from \
+             StreamInfo::auth.tenant, and decode callbacks run in config order; with this \
+             order reversed the authz filter would see no tenant and refuse every request",
+        ),
+        (
+            BODY_REWRITE_FILTER_TYPE,
+            "llmproxy.body_rewrite",
+            MODEL_AUTHZ_FILTER_TYPE,
+            "llmproxy.model_authz",
+            "the model-authz filter reads the requested model body_rewrite publishes onto \
+             StreamInfo::requested_model, and decode callbacks run in config order; with \
+             this order reversed the authz filter would see no model and refuse every \
+             request",
         ),
     ];
 

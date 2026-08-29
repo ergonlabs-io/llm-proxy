@@ -143,6 +143,17 @@ pub struct StreamInfo {
     /// auth filter is configured — see [`AuthInfo`] for why that case must
     /// never be papered over with a default identity.
     pub auth: AuthInfo,
+    /// WP-50 increment 3a: the request body's `model` field, published by
+    /// the body_rewrite filter (`proxy_filters::body_rewrite_filter`) on the
+    /// decode path once it has scanned the body -- the same scan that filter
+    /// already performs for its own `x-llmproxy-model` routing header, never
+    /// a second body buffer. `None` until that filter has run, and also
+    /// `None` for a request with no extractable model (no body, non-JSON
+    /// content type, or the body's top-level object never named one within
+    /// the scan window). `proxy_filters::model_authz_filter` reads this to
+    /// authorize a request against a tenant's model allow-list, and fails
+    /// closed on `None` -- see that filter's module doc.
+    pub requested_model: Option<String>,
     /// WP-51 increment 2: this stream's SERVER span context, set by
     /// `filter_manager::FilterChainHandler::handle` right after `StreamInfo`
     /// is built -- `None` whenever tracing is off (`ConfigSnapshot::tracing`

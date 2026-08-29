@@ -33,12 +33,19 @@
 //!     it into a real decode-path `HttpFilter` under
 //!     `type.llmproxy.dev/llmproxy.filters.v0.Authentication`. The token
 //!     limiter is not yet re-keyed onto `Principal.tenant` -- see
-//!     `docs/wp-50-auth-design-brief.md`.
+//!     `docs/wp-50-auth-design-brief.md`. Increment 3a ([`model_authz`] +
+//!     [`model_authz_filter`]) adds per-tenant model allow-lists: a pure
+//!     `ModelAccess`/`ModelPattern` matcher plus a decode-path `HttpFilter`
+//!     (`llmproxy.model_authz`) that must run after both `llmproxy.auth`
+//!     (needs the tenant) and `llmproxy.body_rewrite` (needs the model) --
+//!     see `internal-docs/wp-50-inc3-design-brief.md`.
 
 pub mod auth;
 pub mod auth_filter;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
+pub mod model_authz;
+pub mod model_authz_filter;
 pub mod token_limit;
 pub mod token_limit_filter;
 pub mod usage;

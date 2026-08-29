@@ -1,0 +1,201 @@
+//! WP-50 increment 3a — per-tenant model allow-lists, as a pure library.
+//!
+//! This module answers one question: **given a tenant's [`crate::auth::TenantPolicy`],
+//! is a requested model permitted?** It does not touch `HttpFilter`, proto
+//! decoding, or `StreamInfo` — those are [`crate::model_authz_filter`]. See
+//! `internal-docs/wp-50-inc3-design-brief.md`'s "3a" section, which is
+//! normative here.
+//!
+//! # Matching rule: exact match, or one trailing `*` glob — no regex
+//!
+//! [`ModelPattern::matches`] is deliberately this simple. `gpt-4*` matches
+//! `gpt-4o`, `gpt-4-turbo`, and the literal string `gpt-4` itself (the `*`
+//! also matches zero characters); anything not ending in `*` must match a
+//! model name exactly. There is no other wildcard syntax, no character
+//! classes, no regex — see the design brief's 3a section ("do not invent a
+//! regex surface"). [`crate::model_authz_filter::parse_config`] rejects a
+//! pattern with a `*` anywhere but the final character (or more than one)
+//! at config load, so a [`ModelPattern`] built from a validated config
+//! always has at most one trailing `*`; [`ModelPattern::matches`] itself
+//! stays total (never panics) even if handed something that validation
+//! wouldn't have allowed, treating any `*` that isn't trailing as a literal
+//! character no real model name will ever contain.
+//!
+//! # `ModelAccess::All` vs `Only(vec![])`, restated
+//!
+//! See [`crate::auth::TenantPolicy`]'s doc for why this is an explicit enum:
+//! in short, a bare `Vec` cannot express "deny every model for this tenant"
+//! and "grant every model" as two different values without one of them being
+//! an interpretation of emptiness. [`ModelAccess::Only`] with an empty
+//! pattern list is a real, legal, distinct policy — "no models yet" — from
+//! [`ModelAccess::All`].
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::auth::TenantPolicy;
+
+/// One configured model-name pattern. See the module doc's "Matching rule"
+/// section.
+///
+/// Rust note: a newtype around `String`, not a bare `String` passed around --
+/// same reasoning as [`crate::auth::TenantId`]/[`crate::auth::KeyId`]: a
+/// pattern and a plain model name are easy to swap by accident at a call
+/// site, and the newtype makes the compiler catch it instead of a reviewer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ModelPattern(String);
+
+impl std::fmt::Debug for ModelPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ModelPattern").field(&self.0).finish()
+    }
+}
+
+impl ModelPattern {
+    /// Rust note: takes an owned `String`-like value rather than borrowing —
+    /// every caller (config parsing, in `model_authz_filter`) already has an
+    /// owned `String` handed back by `prost_reflect`, so there is nothing to
+    /// avoid copying.
+    pub fn new(pattern: impl Into<String>) -> Self {
+        ModelPattern(pattern.into())
+    }
+
+    /// Exact match, or -- if this pattern ends in `*` -- a prefix match
+    /// against everything before that `*`. See the module doc's "Matching
+    /// rule" section.
+    pub fn matches(&self, model: &str) -> bool {
+        match self.0.strip_suffix('*') {
+            Some(prefix) => model.starts_with(prefix),
+            None => self.0 == model,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Per-tenant model authorization policy. See [`crate::auth::TenantPolicy`]'s
+/// doc for why this is an explicit enum rather than a bare `Vec`, and the
+/// module doc above for the `All` vs `Only(vec![])` distinction.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ModelAccess {
+    /// Every model is permitted. The default -- see `TenantPolicy`'s doc:
+    /// "no policy configured" must grant everything.
+    All,
+    /// Only a model matching at least one of these patterns is permitted. An
+    /// EMPTY `Vec` here is not the same as `All` -- it denies every model for
+    /// this tenant, which is a legitimate, deliberate policy.
+    Only(Vec<ModelPattern>),
+}
+
+impl std::fmt::Debug for ModelAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelAccess::All => write!(f, "All"),
+            ModelAccess::Only(patterns) => f.debug_tuple("Only").field(patterns).finish(),
+        }
+    }
+}
+
+impl Default for ModelAccess {
+    /// See `TenantPolicy`'s doc: "no policy configured" grants everything,
+    /// and this `Default` is precisely that state -- never the "configured
+    /// but failed to load" state, which must be a hard [`proxy_config::ConfigError`]
+    /// instead (see `model_authz_filter::parse_config`).
+    fn default() -> Self {
+        ModelAccess::All
+    }
+}
+
+impl ModelAccess {
+    /// Whether `model` is permitted under this policy.
+    pub fn permits(&self, model: &str) -> bool {
+        match self {
+            ModelAccess::All => true,
+            ModelAccess::Only(patterns) => patterns.iter().any(|p| p.matches(model)),
+        }
+    }
+}
+
+/// tenant id -> that tenant's configured policy.
+///
+/// Built once, at filter-config time, from `typed_config` -- see
+/// `model_authz_filter::parse_config` -- and shared via one `Arc` per
+/// (filter config, listener) across every stream, exactly like
+/// `token_limit_filter`'s `Arc<dyn BudgetStore>`. Keyed on a plain `String`,
+/// not `crate::auth::TenantId`: the tenant identity crossing from the auth
+/// filter arrives via `StreamInfo::auth.tenant: Option<String>` (see that
+/// field's doc for why `proxy_http::StreamInfo` cannot carry the richer
+/// type), so this map's key type matches what a lookup actually has in hand
+/// at request time rather than requiring a pointless `TenantId::new` wrap.
+///
+/// Values are `Arc<TenantPolicy>`, not `TenantPolicy`, for the same reason
+/// `Principal::policy` is: the hot path clones a pointer, not a `Vec` of
+/// patterns, on every request.
+pub type TenantPolicyMap = HashMap<String, Arc<TenantPolicy>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- ModelPattern::matches ------------------------------------------
+
+    #[test]
+    fn exact_pattern_matches_only_the_exact_name() {
+        let p = ModelPattern::new("gpt-4o");
+        assert!(p.matches("gpt-4o"));
+        assert!(!p.matches("gpt-4o-mini"));
+        assert!(!p.matches("gpt-4"));
+    }
+
+    #[test]
+    fn trailing_glob_matches_the_prefix_and_the_bare_prefix_itself() {
+        let p = ModelPattern::new("gpt-4*");
+        assert!(p.matches("gpt-4o"));
+        assert!(p.matches("gpt-4-turbo"));
+        assert!(
+            p.matches("gpt-4"),
+            "the `*` also matches zero characters -- the bare prefix itself must match"
+        );
+        assert!(!p.matches("gpt-3.5-turbo"));
+        assert!(!p.matches("claude-3"));
+    }
+
+    #[test]
+    fn a_bare_star_matches_every_model() {
+        let p = ModelPattern::new("*");
+        assert!(p.matches("gpt-4o"));
+        assert!(p.matches(""));
+    }
+
+    // --- ModelAccess::permits --------------------------------------------
+
+    #[test]
+    fn all_permits_every_model() {
+        assert!(ModelAccess::All.permits("gpt-4o"));
+        assert!(ModelAccess::All.permits("anything-at-all"));
+    }
+
+    #[test]
+    fn only_permits_a_matching_pattern_and_denies_the_rest() {
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        assert!(access.permits("gpt-4o"));
+        assert!(!access.permits("claude-3"));
+    }
+
+    #[test]
+    fn only_with_an_empty_pattern_list_denies_every_model() {
+        let access = ModelAccess::Only(vec![]);
+        assert!(!access.permits("gpt-4o"));
+        assert!(
+            !access.permits("anything"),
+            "Only(vec![]) must deny everything -- it is NOT the same as All"
+        );
+    }
+
+    #[test]
+    fn default_model_access_is_all() {
+        assert_eq!(ModelAccess::default(), ModelAccess::All);
+    }
+}
