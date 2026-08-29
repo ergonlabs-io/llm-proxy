@@ -42,12 +42,14 @@ pub struct ConnectPool {
     /// TCP-only timeout; wrapping both phases in the same deadline closes
     /// that gap.
     connect_timeout: Duration,
-    /// The cluster's S5 `max_connections` budget (WP-15). A whole
-    /// [`CircuitBreakerState`] clone, not a borrow -- it shares the same
-    /// underlying gauge (`CircuitBreakerState` is `Clone`-and-shared, see its
-    /// own doc), so every per-call `ConnectPool` built for a cluster
-    /// (`ClusterHandle::http_pool` makes a fresh one per call) still enforces
-    /// one global count.
+    /// The cluster's S5 `max_connections` AND `max_pending_requests` budgets
+    /// (WP-15). A whole [`CircuitBreakerState`] clone, not a borrow -- it
+    /// shares the same underlying gauge (`CircuitBreakerState` is
+    /// `Clone`-and-shared, see its own doc), so every per-call `ConnectPool`
+    /// built for a cluster (`ClusterHandle::http_pool` makes a fresh one per
+    /// call) still enforces one global count. `new_stream` uses both: a
+    /// caller that can't get a connection slot right away parks, holding a
+    /// pending slot, until one frees or `connect_timeout` elapses.
     connections: CircuitBreakerState,
 }
 
@@ -111,24 +113,67 @@ impl HttpConnPool for ConnectPool {
         let connect_timeout = self.connect_timeout;
         let connections = self.connections.clone();
         Box::pin(async move {
-            // S5's `max_connections`: claimed before the dial so an
-            // over-budget cluster never opens the socket. `CbGuard` is
-            // `Send + 'static`, so it's fine to hold across the `.await`s
-            // below; if anything after this returns early via `?`
-            // (connect/handshake failure, timeout), the guard drops right
-            // here and releases the slot -- exactly the "failed dial doesn't
-            // leak budget" behaviour this exists for.
-            let guard = connections
-                .try_acquire_connection()
-                .ok_or(PoolError::Overflow)?;
-            // Rust note: `tokio::time::timeout` races the given future
-            // against a deadline and returns `Err(Elapsed)` if the deadline
-            // wins; it does not cancel/abort anything on its own, but
-            // dropping the future it was racing (which happens here, since
-            // we never poll it again) drops the in-flight `connect`/`wrap`
-            // and releases its resources -- same as any other dropped
-            // future in Rust's async model.
-            let connected = tokio::time::timeout(connect_timeout, async {
+            // S5's `max_connections` and `max_pending_requests` (WP-15): a
+            // connection slot is claimed before the dial so an over-budget
+            // cluster never opens the socket, but a caller that loses that
+            // race no longer overflows immediately -- it parks, holding a
+            // pending-queue slot, until either a slot frees or the deadline
+            // below elapses. `CbGuard` is `Send + 'static`, so it's fine to
+            // hold across the `.await`s here; if anything after acquiring it
+            // returns early via `?` (connect/handshake failure, timeout),
+            // the guard drops right there and releases the slot -- exactly
+            // the "failed dial doesn't leak budget" behaviour this exists
+            // for.
+            //
+            // Rust note: the whole "acquire-or-park, then dial" job runs
+            // inside one `tokio::time::timeout`, so a park that never gets a
+            // slot fails through the exact same path as a dial that never
+            // connects -- `PoolError::ConnectTimeout`, not a new variant.
+            // This is a deliberate MVP simplification: Envoy bounds a
+            // pending request by the *request* timeout, not the connect
+            // timeout, so a request configured with a long request timeout
+            // but a short `connect_timeout` will shed load here sooner than
+            // Envoy would. Flagged for a later increment, not a gap anyone
+            // is meant to rely on.
+            let (guard, connected) = tokio::time::timeout(connect_timeout, async {
+                let guard = match connections.try_acquire_connection() {
+                    Some(guard) => guard,
+                    None => {
+                        // Saturated: try to park instead of shedding
+                        // immediately. This acquire has its own bound
+                        // (`max_pending_requests`), so a cluster that's both
+                        // fully connected AND fully queued still overflows
+                        // right here rather than growing an unbounded
+                        // waiter list.
+                        let pending_guard = connections
+                            .try_acquire_pending()
+                            .ok_or(PoolError::Overflow)?;
+                        let notify = connections.connections_notify();
+                        let guard = loop {
+                            // Rust note: `notify.notified()` must be created
+                            // (armed) BEFORE re-checking
+                            // `try_acquire_connection`, not after. If we
+                            // checked first and only then armed `notified`,
+                            // a slot released in between the two would call
+                            // `notify_one()` while nobody was listening yet
+                            // -- that wakeup is simply lost, and we'd wait
+                            // for a release that already happened.
+                            // Registering the waiter first means any release
+                            // from this point onward is guaranteed to
+                            // resolve `notified`.
+                            let notified = notify.notified();
+                            tokio::pin!(notified);
+                            if let Some(guard) = connections.try_acquire_connection() {
+                                break guard;
+                            }
+                            notified.await;
+                        };
+                        // Holding an active connection slot now -- the
+                        // pending slot served its purpose.
+                        drop(pending_guard);
+                        guard
+                    }
+                };
                 let tcp = tokio::net::TcpStream::connect(addr)
                     .await
                     .map_err(classify_connect_error)?;
@@ -136,7 +181,7 @@ impl HttpConnPool for ConnectPool {
                     .wrap(tcp, &server_name)
                     .await
                     .map_err(PoolError::TlsHandshake)?;
-                Ok(io)
+                Ok((guard, io))
             })
             .await
             .map_err(|_elapsed| PoolError::ConnectTimeout)??;
@@ -407,10 +452,17 @@ mod tests {
         // reject a second concurrent dial with `PoolError::Overflow`, and
         // must accept a new dial again once the first connection is dropped
         // -- acquire, reject-at-limit, and release-on-drop, in one test.
+        //
+        // `max_pending_requests: 0` here is deliberate: this test is about
+        // `max_connections` specifically, not the parking queue (that's
+        // `second_request_parks_...` and friends, below), so it closes the
+        // pending queue to keep the old "saturated connections overflow
+        // immediately" behaviour rather than parking.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let one_connection = proxy_config::ir::CircuitBreakerThresholds {
             max_connections: 1,
+            max_pending_requests: 0,
             ..proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT
         };
         let pool = ConnectPool::new(
@@ -436,5 +488,144 @@ mod tests {
         let third = pool.new_stream().await;
         let (_accepted2, _client_addr2) = listener.accept().await.unwrap();
         third.expect("dial must succeed again once the slot was released");
+    }
+
+    /// Builds a pool with a `max_connections: 1, max_pending_requests: 1`
+    /// budget -- the fixture shared by the parking-queue tests below.
+    fn one_connection_one_pending(addr: SocketAddr, connect_timeout: Duration) -> ConnectPool {
+        let thresholds = proxy_config::ir::CircuitBreakerThresholds {
+            max_connections: 1,
+            max_pending_requests: 1,
+            ..proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT
+        };
+        ConnectPool::new(
+            addr,
+            Arc::new(RawTransportSocket),
+            addr.ip().to_string(),
+            connect_timeout,
+            CircuitBreakerState::from_thresholds(thresholds),
+        )
+    }
+
+    #[tokio::test]
+    async fn second_request_parks_then_completes_when_a_connection_slot_frees() {
+        // WP-15: with the connection budget saturated but a pending slot
+        // free, a second concurrent request must PARK rather than overflow
+        // immediately, and must complete once the first connection's
+        // `CbGuard` drops and wakes it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = one_connection_one_pending(addr, AMPLE_TIMEOUT);
+
+        let first = pool.new_stream().await.expect("first dial is under budget");
+        let (_accepted1, _client_addr1) = listener.accept().await.unwrap();
+
+        // Spawn so the main task can keep running while the second request
+        // parks -- `new_stream()`'s returned future is already `'static`
+        // and boxed, so it can be handed to `tokio::spawn` directly without
+        // moving `pool` itself.
+        let second_handle = tokio::spawn(pool.new_stream());
+
+        // Give it a moment to actually reach the parked state, then confirm
+        // it's still pending -- proving this exercises the park path rather
+        // than a lucky race where it happened to finish first.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second_handle.is_finished(),
+            "second request should still be parked while the only connection slot is held"
+        );
+
+        // Freeing the held connection's `CbGuard` must wake the parked
+        // waiter -- bound the join with an outer timeout so a broken wakeup
+        // fails the test instead of hanging it. Unwrap all the way down to
+        // the `UpstreamStream` BEFORE touching `listener` again: if the
+        // parked dial never actually happened (e.g. it failed instead of
+        // succeeding), there's nothing incoming for `accept()` to receive,
+        // and calling it first would trade a clear assertion failure for a
+        // second, unrelated hang.
+        drop(first);
+        let second = tokio::time::timeout(AMPLE_TIMEOUT, second_handle)
+            .await
+            .expect("parked request must not hang once a slot frees")
+            .expect("spawned task must not panic")
+            .expect("parked dial must succeed once woken");
+        let (_accepted2, _client_addr2) = listener.accept().await.unwrap();
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn third_concurrent_request_overflows_once_pending_queue_is_also_full() {
+        // WP-15: connections AND pending both saturated (1 held, 1 parked)
+        // must shed a third concurrent request immediately with
+        // `PoolError::Overflow`, not grow the waiter list further.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = one_connection_one_pending(addr, AMPLE_TIMEOUT);
+
+        let first = pool.new_stream().await.expect("first dial is under budget");
+        let (_accepted1, _client_addr1) = listener.accept().await.unwrap();
+
+        let second_handle = tokio::spawn(pool.new_stream());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second_handle.is_finished(),
+            "second request should be parked, holding the one pending slot"
+        );
+
+        match pool.new_stream().await {
+            Err(PoolError::Overflow) => {}
+            Err(other) => panic!("expected Overflow, got {other}"),
+            Ok(_) => panic!("third request must be shed once the pending queue is also full"),
+        }
+
+        // Clean up: free the connection so the parked second request (and
+        // its background task) don't outlive the test. Unwrap fully before
+        // touching `listener` again -- see the sibling test's comment on
+        // why that ordering matters.
+        drop(first);
+        let second = tokio::time::timeout(AMPLE_TIMEOUT, second_handle)
+            .await
+            .expect("parked second request must not hang")
+            .expect("spawned task must not panic")
+            .expect("second request must still succeed once freed");
+        let (_accepted2, _client_addr2) = listener.accept().await.unwrap();
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn parked_request_times_out_if_a_connection_slot_never_frees() {
+        // A parked request is bounded by `connect_timeout`, not left to
+        // wait forever -- see `new_stream`'s doc for why `connect_timeout`
+        // rather than a request timeout is the (deliberately stricter) MVP
+        // bound.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let short_timeout = Duration::from_millis(200);
+        let pool = one_connection_one_pending(addr, short_timeout);
+
+        // Hold the only connection slot for the rest of the test -- never
+        // dropped -- so the second request has nothing to wake it.
+        let _first = pool.new_stream().await.expect("first dial is under budget");
+        let (_accepted1, _client_addr1) = listener.accept().await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        // Outer bound is defensive only: if the implementation regresses
+        // back to an unbounded park, fail the test instead of hanging the
+        // suite (nextest's `terminate-after` would otherwise be what
+        // catches this, minutes later).
+        match tokio::time::timeout(Duration::from_secs(5), pool.new_stream()).await {
+            Ok(Err(PoolError::ConnectTimeout)) => {
+                assert!(
+                    started.elapsed() >= short_timeout,
+                    "timeout fired before the configured duration elapsed"
+                );
+            }
+            Ok(Err(other)) => panic!("expected ConnectTimeout, got {other}"),
+            Ok(Ok(_)) => panic!("a parked request with no freed slot must never succeed"),
+            Err(_) => panic!(
+                "parked request hung past the test's own outer bound -- connect_timeout \
+                 did not fire for a parked waiter"
+            ),
+        }
     }
 }

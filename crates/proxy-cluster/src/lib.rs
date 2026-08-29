@@ -224,6 +224,19 @@ pub struct CircuitBreakerState {
 struct BudgetHandle {
     active: Arc<std::sync::atomic::AtomicU32>,
     limit: u32,
+    /// Wakes a parked waiter when a slot frees (WP-15: `max_pending_requests`
+    /// as a real parking queue in front of `max_connections`). `Some` only
+    /// for the `connections` budget -- `pending`/`requests`/`retries` have no
+    /// parking behaviour, so a `Notify` nobody ever `.notified()`s would just
+    /// be dead weight on every guard.
+    ///
+    /// Rust note: `Arc<Notify>`, not a bare `Notify`. The caller that needs
+    /// to wait for a freed slot (`pool::ConnectPool::new_stream`) doesn't
+    /// hold a `CbGuard` yet -- that's the whole problem, it's waiting for
+    /// one -- so it can't reach a `Notify` through a guard's borrow. It has
+    /// to clone an owned handle out of the budget itself before it has
+    /// anything else to hold onto.
+    notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl BudgetHandle {
@@ -231,6 +244,17 @@ impl BudgetHandle {
         Self {
             active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             limit,
+            notify: None,
+        }
+    }
+
+    /// Same as [`Self::new`], but wired with a [`tokio::sync::Notify`] a
+    /// parked caller can wait on for a released slot.
+    fn new_with_notify(limit: u32) -> Self {
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            limit,
+            notify: Some(Arc::new(tokio::sync::Notify::new())),
         }
     }
 
@@ -259,6 +283,7 @@ impl BudgetHandle {
         }
         Some(CbGuard {
             active: Arc::clone(&self.active),
+            notify: self.notify.clone(),
         })
     }
 }
@@ -269,12 +294,26 @@ impl BudgetHandle {
 #[derive(Debug)]
 pub struct CbGuard {
     active: Arc<std::sync::atomic::AtomicU32>,
+    /// Set only on a `max_connections` slot (WP-15's pending queue): wakes
+    /// one parked waiter after this guard's `Drop` frees the slot. `None`
+    /// for every other budget's guard.
+    notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Drop for CbGuard {
     fn drop(&mut self) {
         self.active
             .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        // Rust note: the release above MUST come before `notify_one` below,
+        // not after -- ordering, not just "eventually both happen". If we
+        // notified first, a waiter woken early could re-run
+        // `try_acquire_connection`, observe the gauge still at its old
+        // (full) value, lose that race, and go back to sleep having gained
+        // nothing from the wakeup. Releasing first guarantees whoever we
+        // wake sees the freed slot.
+        if let Some(notify) = &self.notify {
+            notify.notify_one();
+        }
     }
 }
 
@@ -282,7 +321,7 @@ impl CircuitBreakerState {
     /// Builds all four budgets from a cluster's lowered [`CircuitBreakerThresholds`].
     pub fn from_thresholds(t: proxy_config::ir::CircuitBreakerThresholds) -> Self {
         Self {
-            connections: BudgetHandle::new(t.max_connections),
+            connections: BudgetHandle::new_with_notify(t.max_connections),
             pending: BudgetHandle::new(t.max_pending_requests),
             requests: BudgetHandle::new(t.max_requests),
             retries: BudgetHandle::new(t.max_retries),
@@ -305,10 +344,30 @@ impl CircuitBreakerState {
         self.connections.try_acquire()
     }
 
-    // TODO: max_pending_requests engages once there's a real pending queue (WP-15).
-    #[allow(dead_code)]
+    /// The `max_pending_requests` budget (WP-15): a bounded parking queue in
+    /// front of `max_connections`. [`pool::ConnectPool::new_stream`] acquires
+    /// this only after `try_acquire_connection` fails, holds it only for the
+    /// duration of the park, and drops it the instant a connection slot
+    /// actually opens up -- so "pending" and "active" never double-count the
+    /// same request.
     pub fn try_acquire_pending(&self) -> Option<CbGuard> {
         self.pending.try_acquire()
+    }
+
+    /// A clone of the `connections` budget's wake channel (WP-15). A caller
+    /// that fails `try_acquire_connection` clones this out *before* parking
+    /// and awaits `.notified()` on its own clone, so a later
+    /// `CbGuard::Drop` on that same budget (releasing a connection slot)
+    /// wakes it back up. Only the `connections` budget carries a `Notify`
+    /// (`BudgetHandle::notify`'s field doc), so this never returns `None` in
+    /// practice; it panics rather than silently handing back a handle
+    /// nobody will ever wake, which would be a hang, not a bug that shows up
+    /// as a compile error.
+    pub(crate) fn connections_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.connections
+            .notify
+            .clone()
+            .expect("the connections budget always carries a Notify (see from_thresholds)")
     }
 
     // TODO(WP-14 retries): check max_retries in the retry engine.
