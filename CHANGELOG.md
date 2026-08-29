@@ -11,7 +11,54 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Nothing yet. Work toward **v0.2.0** — see `internal-docs/MILESTONES.md`.
+Nothing yet. Work toward **v0.3.0** — see `internal-docs/MILESTONES.md`.
+
+## [0.2.0] — 2026-08-29
+
+**Production-ready serving.** v0.1.0 made the proxy understand its traffic; this release
+makes it safe to run unattended and honest about its own performance.
+
+### The gate
+
+A published capacity report (p99, tokens/sec ceiling, RSS under sustained long-lived
+streams) from a run that is not harness-bound, plus `/config_dump` and `/stats` served by
+the admin endpoint, plus a config swap under live traffic with zero dropped streams. All
+three clauses are met.
+
+- **Admin + stats** — `/config_dump`, `/stats` (Envoy text), and `/stats/prometheus` are
+  served and report real traffic, proven by `crates/proxy/tests/stats_e2e.rs` against the
+  real binary and a real HTTP scrape.
+- **Capacity report** — published from a not-harness-bound run (`054b809`), unblocked by
+  HTTP/1.1 and HTTP/2 upstream connection reuse.
+- **Config swap under load** — SIGHUP re-reads the config file and publishes a new
+  snapshot; a parse failure keeps the previous snapshot serving and logs the full
+  dotted-path detail. Proven by `testing/diffrig/tests/swap_under_load.rs`: streams in
+  flight at the swap, all SSE streams reaching their terminal frame, zero transport errors.
+
+### Added
+
+- **Metrics registry (WP-23)** — an OpenTelemetry-native internal model (instruments plus
+  attribute sets) rendered to Envoy-exact `/stats` text and to Prometheus, with histograms
+  on Envoy's default buckets.
+- **Admin server (WP-25)** — `/config_dump`, `/clusters`, `/stats`, `/stats/prometheus`,
+  each resolving the live snapshot after a reload rather than the boot snapshot.
+- **Active health checking (WP-18)** and **outlier detection (WP-19)** — reachable from
+  config and running; an active-health-check recovery clears an outlier ejection.
+- **Circuit breakers and connection reuse (WP-15)** — `max_connections` enforced at the
+  dial site; per-worker HTTP/2 multiplexing and HTTP/1.1 keep-alive upstream connection
+  pools.
+- **OpenTelemetry (WP-51)** — distributed spans (W3C trace-context join/propagation) plus
+  OTLP/gRPC export of both traces and metrics, zero-cost when unconfigured.
+- **HTTP upgrades and WebSocket tunneling (WP-10, S10)** — transparent HTTP/1.1 Upgrade
+  and HTTP/2 extended CONNECT (RFC 8441) tunnels, gated by `upgrade_configs`, with an idle
+  timeout on the tunnel.
+- **Routing (WP-13)** — `x-envoy-attempt-count`, redirect route actions.
+
+### Changed
+
+- `loadgen` percentiles now describe successful requests only, and the driver detects SSE
+  truncation (a cut-short stream is no longer counted as success) — both were measurement
+  defects that would have skewed a published capacity number.
 
 ## [0.1.0] — 2026-08-08
 
