@@ -61,6 +61,7 @@ use crate::auth::{
     AuthError, AuthOutcome, Authenticator, AuthenticatorChain, HmacSecret, KeyId, KeyRecord,
     KeySet, TenantId, VirtualKeyAuthenticator,
 };
+use crate::control::{ControlPlane, InMemoryControlPlaneStore};
 
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
@@ -168,11 +169,19 @@ fn parse_digest_hex(raw: &str, index: usize) -> Result<Vec<u8>, ConfigError> {
 }
 
 /// Reads `typed_config` (an `llmproxy.filters.v0.Authentication`) into the
-/// secret + key set the filter needs at request time. Strict mode: every
-/// field either maps in or errors with its dotted path (ground rule #1).
-fn parse_config(config: &DynamicMessage) -> Result<(HmacSecret, KeySet), ConfigError> {
+/// secret bytes + bootstrap key set the filter needs at request time. Strict
+/// mode: every field either maps in or errors with its dotted path (ground
+/// rule #1).
+///
+/// Returns raw secret **bytes**, not an [`HmacSecret`] -- as of WP-50
+/// increment 3b-i, [`AuthFilterFactory::create`] needs TWO independent
+/// `HmacSecret`s from the same bytes (one for the request-time authenticator,
+/// one retained by [`crate::control::ControlPlane`] for a future key-mint
+/// endpoint), and `HmacSecret` deliberately has no accessor back to its bytes
+/// once constructed (see its doc) -- so the bytes have to be the thing that
+/// crosses this boundary, and each caller constructs its own `HmacSecret`.
+fn parse_config(config: &DynamicMessage) -> Result<(Vec<u8>, KeySet), ConfigError> {
     let secret_bytes = parse_hmac_secret(config)?;
-    let secret = HmacSecret::new(&secret_bytes);
 
     let mut key_set = KeySet::new();
     // Rust note: `HashMap<String, usize>` / `HashMap<Vec<u8>, usize>` remember
@@ -260,7 +269,7 @@ fn parse_config(config: &DynamicMessage) -> Result<(HmacSecret, KeySet), ConfigE
         );
     }
 
-    Ok((secret, key_set))
+    Ok((secret_bytes, key_set))
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override —
@@ -279,9 +288,39 @@ impl HttpFilterFactory for AuthFilterFactory {
         config: &DynamicMessage,
         _ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let (secret, key_set) = parse_config(config)?;
-        let authenticator: Box<dyn Authenticator> =
-            Box::new(VirtualKeyAuthenticator::new(secret, Arc::new(key_set)));
+        let (secret_bytes, bootstrap_keys) = parse_config(config)?;
+
+        // WP-50 increment 3b-i: config keys now flow through the same
+        // published-snapshot machinery a future store will use, rather than
+        // sitting in a static `KeySet` the authenticator owns outright. The
+        // store here is an empty `InMemoryControlPlaneStore` -- there is no
+        // admin write API or persistent backend wired up yet (3b-ii); its
+        // `load()` never fails, so the merged snapshot is exactly the
+        // bootstrap keys, but it now runs through `ControlPlane::rebuild`'s
+        // real merge/publish path instead of a shortcut. See
+        // `crate::control`'s module doc.
+        //
+        // Rust note: two independent `HmacSecret`s built from the SAME bytes
+        // -- see `parse_config`'s doc for why bytes (not an `HmacSecret`)
+        // cross that function's boundary. `ControlPlane` retains one for a
+        // future key-mint endpoint (3b-ii); the authenticator below keeps the
+        // other for verifying every request. Neither is derivable from the
+        // other.
+        let control_plane = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(&secret_bytes),
+            bootstrap_keys,
+        )
+        .map_err(|e| {
+            invalid(
+                "typed_config",
+                format!("control-plane snapshot could not be built: {e}"),
+            )
+        })?;
+        let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
+            HmacSecret::new(&secret_bytes),
+            control_plane.handle(),
+        ));
         // One chain per (filter config, listener), shared by every per-stream
         // instance below via `Arc::clone` -- see `token_limit_filter`'s
         // `TokenLimitFilterFactory::create` for the same one-store-per-listener
@@ -388,6 +427,8 @@ mod tests {
     use proxy_config::ir::RouteEntry;
     use proxy_http::filter::{BufferedBody, EncoderCallbacks, HeaderMutationFn, PerRouteConfig};
     use proxy_http::stream_info::StreamInfo;
+
+    use crate::control::test_snapshot_handle;
 
     // --- config-message scaffolding ------------------------------------------
 
@@ -498,8 +539,11 @@ mod tests {
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
 
-        let (secret, key_set) = parse_config(&config).expect("valid config must parse");
-        let authenticator = VirtualKeyAuthenticator::new(secret, Arc::new(key_set));
+        let (secret_bytes, key_set) = parse_config(&config).expect("valid config must parse");
+        let authenticator = VirtualKeyAuthenticator::new(
+            HmacSecret::new(&secret_bytes),
+            test_snapshot_handle(key_set),
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -569,8 +613,12 @@ mod tests {
             filename_secret(&path),
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
-        let (secret, key_set) = parse_config(&config).expect("valid filename config must parse");
-        let authenticator = VirtualKeyAuthenticator::new(secret, Arc::new(key_set));
+        let (secret_bytes, key_set) =
+            parse_config(&config).expect("valid filename config must parse");
+        let authenticator = VirtualKeyAuthenticator::new(
+            HmacSecret::new(&secret_bytes),
+            test_snapshot_handle(key_set),
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -624,8 +672,12 @@ mod tests {
             filename_secret(&path),
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
-        let (secret, key_set) = parse_config(&config).expect("valid filename config must parse");
-        let authenticator = VirtualKeyAuthenticator::new(secret, Arc::new(key_set));
+        let (secret_bytes, key_set) =
+            parse_config(&config).expect("valid filename config must parse");
+        let authenticator = VirtualKeyAuthenticator::new(
+            HmacSecret::new(&secret_bytes),
+            test_snapshot_handle(key_set),
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -756,8 +808,11 @@ mod tests {
     #[test]
     fn empty_virtual_keys_parses_and_the_filter_401s_every_key() {
         let config = authentication(inline_secret("secret"), vec![]);
-        let (secret, key_set) = parse_config(&config).expect("empty virtual_keys is legal");
-        let authenticator = VirtualKeyAuthenticator::new(secret, Arc::new(key_set));
+        let (secret_bytes, key_set) = parse_config(&config).expect("empty virtual_keys is legal");
+        let authenticator = VirtualKeyAuthenticator::new(
+            HmacSecret::new(&secret_bytes),
+            test_snapshot_handle(key_set),
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -982,8 +1037,10 @@ mod tests {
                 revoked,
             },
         );
-        let authenticator: Box<dyn Authenticator> =
-            Box::new(VirtualKeyAuthenticator::new(secret, Arc::new(key_set)));
+        let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
+            HmacSecret::new(secret_bytes),
+            test_snapshot_handle(key_set),
+        ));
         AuthFilterInstance {
             chain: Arc::new(AuthenticatorChain::new(vec![authenticator])),
         }

@@ -109,8 +109,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use http::header::AUTHORIZATION;
 use http::HeaderMap;
+
+use crate::control::ControlPlaneSnapshot;
 
 /// Scheme prefix this authenticator recognizes on the `authorization`
 /// header. Anything else (no header, a different scheme, a bare token) is
@@ -500,6 +503,25 @@ impl KeySet {
             .ok()
             .map(|()| record)
     }
+
+    /// Iterates this set's `(digest, record)` pairs.
+    ///
+    /// Used only by `crate::control::ControlPlane::rebuild`'s bootstrap/store
+    /// merge, which needs to re-key a bootstrap `KeySet` (digest-keyed) by
+    /// `key_id` in order to detect a `key_id` collision against the store --
+    /// something a `find`-by-digest lookup cannot answer. Not a general-purpose
+    /// accessor: nothing else in this module needs to walk every entry, and
+    /// this still leaks nothing `KeySet::find`'s doc doesn't already call
+    /// non-sensitive (the digest itself, never a plaintext key).
+    ///
+    /// Rust note: `impl Iterator` rather than a named type -- the caller only
+    /// ever `for`-loops or `.collect()`s this, so there is nothing gained by
+    /// naming the concrete `std::collections::hash_map::Iter` type.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&[u8], &KeyRecord)> {
+        self.entries
+            .iter()
+            .map(|(digest, record)| (digest.as_slice(), record))
+    }
 }
 
 impl Default for KeySet {
@@ -522,23 +544,31 @@ impl fmt::Debug for KeySet {
 /// [`KeySet`]. See the module doc for the full reasoning.
 pub struct VirtualKeyAuthenticator {
     secret: HmacSecret,
-    keys: Arc<KeySet>,
+    // Rust note: an `Arc<ArcSwap<T>>`, not an owned `ArcSwap<T>` -- the swap
+    // itself is owned by `crate::control::ControlPlane` (which republishes
+    // into it), and this authenticator only ever needs a cheap, cloneable
+    // *handle* to the same swap. `ArcSwap::load` is a lock-free `Arc` clone
+    // (see `authenticate` below), so this field costs nothing on the hot
+    // path beyond that one atomic load -- no store I/O happens here. See
+    // `crate::control`'s module doc for the full publish/read seam.
+    snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
 }
 
 impl VirtualKeyAuthenticator {
-    pub fn new(secret: HmacSecret, keys: Arc<KeySet>) -> Self {
-        VirtualKeyAuthenticator { secret, keys }
+    pub fn new(secret: HmacSecret, snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>) -> Self {
+        VirtualKeyAuthenticator { secret, snapshot }
     }
 }
 
 impl fmt::Debug for VirtualKeyAuthenticator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `load()` here is the same lock-free `Arc` clone `authenticate` uses
+        // -- reused only to reach `KeySet`'s own redacted `Debug` (count
+        // only). `HmacSecret`'s own redacted `Debug` covers the secret.
+        let snapshot = self.snapshot.load();
         f.debug_struct("VirtualKeyAuthenticator")
-            // `HmacSecret`'s own redacted `Debug` covers the secret; `KeySet`'s
-            // covers the digests. Neither field is skipped -- both are just
-            // safe to print because their own impls already redact.
             .field("secret", &self.secret)
-            .field("keys", &self.keys)
+            .field("keys", &snapshot.keys)
             .finish()
     }
 }
@@ -565,7 +595,14 @@ impl Authenticator for VirtualKeyAuthenticator {
             return AuthOutcome::NoCredential;
         }
 
-        match self.keys.find(&self.secret, presented) {
+        // Rust note: `ArcSwap::load` returns a guard that derefs to the
+        // currently-published `Arc<ControlPlaneSnapshot>` without taking any
+        // lock -- this is the ONLY place the hot path touches the control
+        // plane, and it never blocks on (or even reaches) the store. See
+        // `crate::control::ControlPlane::rebuild` for where a new snapshot
+        // actually gets published.
+        let snapshot = self.snapshot.load();
+        match snapshot.keys.find(&self.secret, presented) {
             Some(record) if record.revoked => AuthOutcome::Rejected(AuthError::RevokedKey),
             Some(record) => AuthOutcome::Authenticated(Principal {
                 tenant: record.tenant.clone(),
@@ -642,6 +679,8 @@ mod tests {
 
     use http::HeaderValue;
 
+    use crate::control::test_snapshot_handle;
+
     fn headers_with_authorization(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
@@ -656,7 +695,7 @@ mod tests {
         let secret = HmacSecret::new(secret_bytes);
         let mut keys = KeySet::new();
         keys.insert(&secret, plaintext_key, record);
-        VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), Arc::new(keys))
+        VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), test_snapshot_handle(keys))
     }
 
     // --- 1: a correct key authenticates with the right tenant and key_id ---
@@ -805,7 +844,10 @@ mod tests {
                 revoked: false,
             },
         );
-        let auth = VirtualKeyAuthenticator::new(HmacSecret::new(b"secret-two"), Arc::new(keys));
+        let auth = VirtualKeyAuthenticator::new(
+            HmacSecret::new(b"secret-two"),
+            test_snapshot_handle(keys),
+        );
 
         let headers = headers_with_authorization("Bearer llmp_same-plaintext-key");
         match auth.authenticate(&headers) {
@@ -833,9 +875,9 @@ mod tests {
         };
         let mut keys = KeySet::new();
         keys.insert(&secret, plaintext_key, record);
-        let keys = Arc::new(keys);
+        let handle = test_snapshot_handle(keys);
 
-        let auth = VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), Arc::clone(&keys));
+        let auth = VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), Arc::clone(&handle));
 
         let headers = headers_with_authorization(&format!("Bearer {plaintext_key}"));
         let outcome = auth.authenticate(&headers);
@@ -848,9 +890,10 @@ mod tests {
         let digest = ring::hmac::sign(&HmacSecret::new(secret_bytes).0, plaintext_key.as_bytes());
         let digest_hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
 
+        let keys_debug = format!("{:?}", handle.load().keys);
         let rendered = [
             format!("{:?}", auth),
-            format!("{keys:?}"),
+            keys_debug,
             format!("{principal:?}"),
             format!("{:?}", HmacSecret::new(secret_bytes)),
         ]

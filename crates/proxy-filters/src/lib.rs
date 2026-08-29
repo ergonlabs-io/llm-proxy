@@ -38,12 +38,18 @@
 //!     `ModelAccess`/`ModelPattern` matcher plus a decode-path `HttpFilter`
 //!     (`llmproxy.model_authz`) that must run after both `llmproxy.auth`
 //!     (needs the tenant) and `llmproxy.body_rewrite` (needs the model) --
-//!     see `internal-docs/wp-50-inc3-design-brief.md`.
+//!     see `internal-docs/wp-50-inc3-design-brief.md`. Increment 3b-i
+//!     ([`control`]) adds the `ControlPlaneStore` trait, an in-memory impl,
+//!     and the published `ControlPlaneSnapshot` `VirtualKeyAuthenticator` now
+//!     reads instead of a static `KeySet` -- see
+//!     `internal-docs/wp-50-3b-store-design-brief.md`. `redb` and the admin
+//!     write API are 3b-ii, not built here.
 
 pub mod auth;
 pub mod auth_filter;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
+pub mod control;
 pub mod model_authz;
 pub mod model_authz_filter;
 pub mod token_limit;

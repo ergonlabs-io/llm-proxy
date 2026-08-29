@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# WP-50 increment 3b-i: the `ControlPlane` publishes an immutable snapshot
+# workers `load()` lock-free -- the same crate `proxy-core::WorkerConfigHandle`
+# and WP-23's `StatHandles` already use for this exact shape.
+arc-swap = { workspace = true }
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
 # WP-24: `ResponseFlag` (`%RESPONSE_FLAGS%`) -- `token_limit_filter` sets `RL`
