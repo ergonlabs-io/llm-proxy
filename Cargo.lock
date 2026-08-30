@@ -1453,6 +1453,7 @@ name = "proxy-filters"
 version = "0.2.0"
 dependencies = [
  "arc-swap",
+ "base64",
  "bytes",
  "http",
  "prost-reflect",

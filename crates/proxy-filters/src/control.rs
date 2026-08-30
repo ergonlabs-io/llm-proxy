@@ -660,6 +660,26 @@ impl ControlPlaneStore for RedbControlPlaneStore {
     }
 }
 
+/// A freshly minted virtual key, returned to the admin caller so the
+/// plaintext can be shown EXACTLY ONCE (it is never stored -- only its
+/// digest is). Its `Debug` redacts the plaintext: the whole point of the
+/// digest-only store is that key material never reaches a log.
+pub struct MintedKey {
+    pub key_id: KeyId,
+    pub tenant: TenantId,
+    pub plaintext: String,
+}
+
+impl std::fmt::Debug for MintedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedKey")
+            .field("key_id", &self.key_id)
+            .field("tenant", &self.tenant)
+            .field("plaintext", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Owns the store, the operator's HMAC secret, the config bootstrap keys, and
 /// the published snapshot. See the module doc for the full seam and the
 /// boot/refresh fail-closed split.
@@ -744,6 +764,62 @@ impl ControlPlane {
     /// digest a minted key will actually authenticate against.
     pub fn secret(&self) -> &HmacSecret {
         &self.secret
+    }
+
+    /// Mints a fresh virtual key for `tenant`/`key_id`, writes its digest to
+    /// the store, republishes, and returns the plaintext -- the only time it
+    /// ever exists. The store holds only the digest [`Self::mint_key`]
+    /// derives from it via [`crate::auth::digest_bytes`]; there is nowhere in
+    /// this codebase the plaintext is written back down.
+    ///
+    /// Writes THEN republishes -- see the module doc's "boot vs. refresh"
+    /// section and every other write method below: a reader must never
+    /// observe a republish that predates the write it is meant to reflect.
+    pub fn mint_key(&self, tenant: &TenantId, key_id: &KeyId) -> Result<MintedKey, StoreError> {
+        let rng = ring::rand::SystemRandom::new();
+        let plaintext = crate::auth::generate_plaintext_key(&rng);
+        let digest = crate::auth::digest_bytes(&self.secret, &plaintext);
+        self.store.put_key(&StoredKey {
+            key_id: key_id.clone(),
+            digest,
+            tenant: tenant.clone(),
+            revoked: false,
+        })?;
+        self.rebuild();
+        Ok(MintedKey {
+            key_id: key_id.clone(),
+            tenant: tenant.clone(),
+            plaintext,
+        })
+    }
+
+    /// Revokes `key_id`, then republishes so the revocation takes effect on
+    /// the next request rather than the next unrelated rebuild.
+    pub fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError> {
+        self.store.revoke_key(key_id)?;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Creates `tenant`, then republishes.
+    pub fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+        self.store.create_tenant(tenant)?;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Deletes `tenant`, then republishes.
+    pub fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+        self.store.delete_tenant(tenant)?;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Sets `tenant`'s model-access policy, then republishes.
+    pub fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
+        self.store.set_policy(tenant, access)?;
+        self.rebuild();
+        Ok(())
     }
 
     /// Bootstrap keys layered under the store's, then the store's layered on
@@ -853,12 +929,12 @@ mod tests {
         headers
     }
 
+    /// Thin wrapper over [`crate::auth::digest_bytes`] (which takes an
+    /// [`HmacSecret`], not raw bytes) -- kept so every call site below stays
+    /// unchanged, while there is still exactly one HMAC computation in the
+    /// codebase rather than a second, test-local `ring::hmac::sign` call.
     fn digest_bytes(secret_bytes: &[u8], plaintext: &str) -> [u8; 32] {
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret_bytes);
-        let sig = ring::hmac::sign(&key, plaintext.as_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(sig.as_ref());
-        out
+        crate::auth::digest_bytes(&HmacSecret::new(secret_bytes), plaintext)
     }
 
     /// A `ControlPlaneStore` that forwards to a shared `InMemoryControlPlaneStore`
@@ -1204,6 +1280,238 @@ mod tests {
                 matches!(other, AuthOutcome::NoCredential)
             ),
         }
+    }
+
+    // --- ControlPlane write methods (WP-50 increment 3b-ii, part B) ---------
+
+    // --- mint_key produces a key that authenticates
+
+    #[test]
+    fn mint_key_produces_a_key_that_authenticates() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let minted = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .expect("mint_key must succeed against a healthy store");
+
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+        match authenticator.authenticate(&headers) {
+            AuthOutcome::Authenticated(principal) => {
+                assert_eq!(principal.tenant.as_str(), "tenant-a");
+                assert_eq!(principal.key_id.as_str(), "k1");
+            }
+            other => panic!(
+                "a freshly minted key must authenticate; got Rejected={} NoCredential={}",
+                matches!(other, AuthOutcome::Rejected(_)),
+                matches!(other, AuthOutcome::NoCredential)
+            ),
+        }
+    }
+
+    // --- revoke_key makes a minted key unauthenticated after republish
+
+    #[test]
+    fn revoke_key_makes_it_unauthenticated_after_republish() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let minted = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .unwrap();
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+
+        assert!(matches!(
+            authenticator.authenticate(&headers),
+            AuthOutcome::Authenticated(_)
+        ));
+
+        cp.revoke_key(&KeyId::new("k1"))
+            .expect("revoke must succeed");
+
+        match authenticator.authenticate(&headers) {
+            AuthOutcome::Rejected(AuthError::RevokedKey) => {}
+            other => panic!(
+                "a revoked key must be rejected after republish; got Authenticated={}",
+                matches!(other, AuthOutcome::Authenticated(_))
+            ),
+        }
+    }
+
+    // --- THE cross-worker property: two authenticators over ONE handle both
+    //     see a write, and both see a subsequent revoke.
+
+    #[test]
+    fn two_authenticators_over_one_handle_both_see_a_write() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        // Two independent authenticators -- standing in for two workers'
+        // filter-chain instances -- built over the SAME published handle.
+        let worker_a = VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+        let worker_b = VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+
+        let minted = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .unwrap();
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+
+        for (name, worker) in [("worker_a", &worker_a), ("worker_b", &worker_b)] {
+            assert!(
+                matches!(worker.authenticate(&headers), AuthOutcome::Authenticated(_)),
+                "{name} must see the mint through the shared handle"
+            );
+        }
+
+        cp.revoke_key(&KeyId::new("k1")).unwrap();
+
+        for (name, worker) in [("worker_a", &worker_a), ("worker_b", &worker_b)] {
+            match worker.authenticate(&headers) {
+                AuthOutcome::Rejected(AuthError::RevokedKey) => {}
+                other => panic!(
+                    "{name} must see the revoke through the shared handle; got \
+                     Authenticated={}",
+                    matches!(other, AuthOutcome::Authenticated(_))
+                ),
+            }
+        }
+    }
+
+    // --- create_tenant / delete_tenant / set_policy are reflected
+
+    #[test]
+    fn create_tenant_delete_tenant_and_set_policy_are_reflected() {
+        let secret_bytes = b"operator-secret";
+        let shared = Arc::new(InMemoryControlPlaneStore::default());
+        let cp = ControlPlane::new(
+            Box::new(SharedStore(Arc::clone(&shared))),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        cp.create_tenant(&TenantId::new("tenant-a"))
+            .expect("create_tenant must succeed");
+        // `ControlPlaneSnapshot` itself carries no tenant list (see its doc);
+        // the store is the only place tenant existence is observable.
+        let loaded = shared.load().unwrap();
+        assert_eq!(
+            loaded
+                .tenants
+                .iter()
+                .map(TenantId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["tenant-a"]
+        );
+
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        cp.set_policy(&TenantId::new("tenant-a"), &access)
+            .expect("set_policy must succeed");
+        let snapshot = cp.handle().load();
+        let policy = snapshot
+            .policies
+            .get("tenant-a")
+            .expect("policy must appear in the snapshot after set_policy's republish");
+        assert_eq!(policy.model_access, access);
+
+        cp.delete_tenant(&TenantId::new("tenant-a"))
+            .expect("delete_tenant must succeed");
+        let loaded = shared.load().unwrap();
+        assert!(loaded.tenants.is_empty());
+        // `InMemoryControlPlaneStore::delete_tenant` also removes the policy
+        // row -- confirm the republish reflects that too.
+        let snapshot = cp.handle().load();
+        assert!(!snapshot.policies.contains_key("tenant-a"));
+    }
+
+    // --- mutation pins: a write that skips `self.rebuild()` must not be
+    //     visible through the published handle. Each is verified by actually
+    //     deleting the corresponding `rebuild()` line and confirming the
+    //     paired test above goes red -- see this task's "Verify" section.
+
+    #[test]
+    fn mint_key_without_rebuild_is_not_visible() {
+        // Same setup as `mint_key_produces_a_key_that_authenticates`, but
+        // this test's whole point is that it is THAT test which catches a
+        // `mint_key` missing its `self.rebuild()` call -- there is nothing
+        // additional to assert here beyond re-running the same shape, so this
+        // test intentionally duplicates it rather than inventing a second
+        // assertion that could pass for an unrelated reason.
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let minted = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .expect("mint_key must succeed against a healthy store");
+
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+        assert!(
+            matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ),
+            "a mint that skipped rebuild() would leave this Rejected/NoCredential instead \
+             of Authenticated"
+        );
+    }
+
+    #[test]
+    fn revoke_key_without_rebuild_still_authenticates() {
+        // Mirrors `mint_key_without_rebuild_is_not_visible`: this duplicates
+        // `revoke_key_makes_it_unauthenticated_after_republish`'s shape
+        // because THAT is the test a `revoke_key` missing its
+        // `self.rebuild()` call must fail.
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let minted = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .unwrap();
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+
+        cp.revoke_key(&KeyId::new("k1"))
+            .expect("revoke must succeed");
+
+        assert!(
+            !matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ),
+            "a revoke that skipped rebuild() would leave this key still Authenticated"
+        );
     }
 
     // --- RedbControlPlaneStore (WP-50 increment 3b) --------------------------

@@ -286,37 +286,52 @@ impl HttpFilterFactory for AuthFilterFactory {
     fn create(
         &self,
         config: &DynamicMessage,
-        _ctx: &FactoryContext,
+        ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
         let (secret_bytes, bootstrap_keys) = parse_config(config)?;
 
-        // WP-50 increment 3b-i: config keys now flow through the same
-        // published-snapshot machinery a future store will use, rather than
-        // sitting in a static `KeySet` the authenticator owns outright. The
-        // store here is an empty `InMemoryControlPlaneStore` -- there is no
-        // admin write API or persistent backend wired up yet (3b-ii); its
-        // `load()` never fails, so the merged snapshot is exactly the
-        // bootstrap keys, but it now runs through `ControlPlane::rebuild`'s
-        // real merge/publish path instead of a shortcut. See
-        // `crate::control`'s module doc.
+        // WP-50 increment 3b-ii, part B: the `ControlPlane` is now the ONE
+        // per-serve instance shared across every worker, resolved through
+        // `FactoryContext::shared` (`SharedFactoryState`) keyed on this
+        // filter's own `TYPE_URL`. The HTTP filter chain is rebuilt per
+        // worker (ADR-0003), so `create` runs once per worker -- without this
+        // slot each of those runs would build (and immediately drop) its own
+        // `ControlPlane`, and a mint/revoke through one worker would be
+        // invisible to every other. The closure below runs only on the FIRST
+        // worker for this `type_url`; every later worker's `create` call
+        // reads the same `Arc<ControlPlane>` back out instead of rebuilding
+        // it. The store is still `InMemoryControlPlaneStore` -- persistent-
+        // store selection is a later increment (3b-iii) -- so `load()` never
+        // fails and the merged snapshot is exactly the bootstrap keys on
+        // first build, same as before this change.
         //
         // Rust note: two independent `HmacSecret`s built from the SAME bytes
         // -- see `parse_config`'s doc for why bytes (not an `HmacSecret`)
-        // cross that function's boundary. `ControlPlane` retains one for a
-        // future key-mint endpoint (3b-ii); the authenticator below keeps the
-        // other for verifying every request. Neither is derivable from the
-        // other.
-        let control_plane = ControlPlane::new(
-            Box::new(InMemoryControlPlaneStore::default()),
-            HmacSecret::new(&secret_bytes),
-            bootstrap_keys,
-        )
-        .map_err(|e| {
-            invalid(
-                "typed_config",
-                format!("control-plane snapshot could not be built: {e}"),
-            )
-        })?;
+        // cross that function's boundary. `ControlPlane` retains one for the
+        // key-mint endpoint (3b-ii); the authenticator below keeps the other
+        // for verifying every request. Neither is derivable from the other.
+        // `bootstrap_keys` is moved into the closure (consumed by
+        // `ControlPlane::new`) since it only ever needs to exist once, on the
+        // first worker; `secret_bytes` is only borrowed there, so it is still
+        // available afterward to build the authenticator's own `HmacSecret`.
+        let control_plane = ctx
+            .shared
+            .get_or_try_init(TYPE_URL, || {
+                let cp = ControlPlane::new(
+                    Box::new(InMemoryControlPlaneStore::default()),
+                    HmacSecret::new(&secret_bytes),
+                    bootstrap_keys,
+                )
+                .map_err(|e| {
+                    invalid(
+                        "typed_config",
+                        format!("control-plane snapshot could not be built: {e}"),
+                    )
+                })?;
+                Ok(Arc::new(cp) as Arc<dyn std::any::Any + Send + Sync>)
+            })?
+            .downcast::<ControlPlane>()
+            .expect("auth control-plane singleton is always a ControlPlane");
         let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             control_plane.handle(),
@@ -1246,6 +1261,70 @@ mod tests {
                  though a later authenticator would authenticate -- this is the \
                  probing-oracle test; got Authenticated={}",
                 matches!(other, AuthOutcome::Authenticated(_))
+            ),
+        }
+    }
+
+    // 19: WP-50 increment 3b-ii part B -- the shared-singleton property.
+    // `create` resolves ONE `ControlPlane` through `ctx.shared`, a write
+    // through it is visible to what the factory wired, and a SECOND `create`
+    // over the same `ctx` does not build a second instance.
+    #[test]
+    fn create_resolves_one_shared_control_plane_through_the_slot() {
+        let config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+        let ctx = FactoryContext::default();
+
+        AuthFilterFactory
+            .create(&config, &ctx)
+            .expect("first create must succeed");
+
+        let control_plane = ctx
+            .shared
+            .get(TYPE_URL)
+            .expect("create must register the control plane in the shared slot")
+            .downcast::<ControlPlane>()
+            .expect("the auth control-plane singleton is always a ControlPlane");
+
+        // A write through the slot-resolved ControlPlane...
+        let minted = control_plane
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .expect("mint_key must succeed");
+
+        // ...is visible to what the factory wired: a fresh authenticator over
+        // the SAME control plane's published handle.
+        let authenticator = VirtualKeyAuthenticator::new(
+            HmacSecret::new(b"operator-hmac-secret"),
+            control_plane.handle(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", minted.plaintext)).unwrap(),
+        );
+        assert!(
+            matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ),
+            "a write through the slot-resolved ControlPlane must be visible to what \
+             the factory wired"
+        );
+
+        // A second `create` over the SAME ctx must not build a second
+        // ControlPlane -- the minted key from the first must still be
+        // present afterward.
+        AuthFilterFactory
+            .create(&config, &ctx)
+            .expect("second create must succeed");
+
+        match authenticator.authenticate(&headers) {
+            AuthOutcome::Authenticated(_) => {}
+            other => panic!(
+                "a second create() over the same ctx must reuse the same ControlPlane, \
+                 not build a fresh (empty) one -- the first mint must still authenticate; \
+                 got Rejected={} NoCredential={}",
+                matches!(other, AuthOutcome::Rejected(_)),
+                matches!(other, AuthOutcome::NoCredential)
             ),
         }
     }

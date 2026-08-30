@@ -22,6 +22,10 @@ prost-reflect = { workspace = true }
 # compare). See docs/wp-50-auth-design-brief.md for why a keyed cryptographic
 # hash and NOT `token_limit_filter::hash_credential`'s FNV-1a.
 ring = { workspace = true }
+# WP-50 increment 3b-ii: `auth::generate_plaintext_key` -- the single shared
+# virtual-key generator, moved here from `crates/proxy/src/keygen.rs` so
+# `ControlPlane::mint_key` can call it too.
+base64 = { workspace = true }
 # WP-50 increment 3b: the embedded persistent `ControlPlaneStore` -- see
 # `control.rs`'s `RedbControlPlaneStore`. `serde` (for `Serialize`/
 # `Deserialize` derives on its row types) rides along with it; `serde_json`

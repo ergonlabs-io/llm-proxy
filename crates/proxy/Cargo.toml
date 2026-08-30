@@ -9,10 +9,6 @@ name = "llm-proxy"
 path = "src/main.rs"
 
 [dependencies]
-# WP-50 increment 2a-iv (`--mode keygen`): base64url-encodes the generated
-# key; `ring::rand::SystemRandom` is the CSPRNG that produces its bytes (see
-# `src/keygen.rs`'s Rust note for why not `rand::thread_rng`).
-base64 = { workspace = true }
 clap = { workspace = true }
 proxy-admin = { workspace = true }
 proxy-cluster = { workspace = true }
@@ -28,6 +24,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# tests/keygen.rs decodes the printed key's base64url body directly (the
+# generator itself now lives in `proxy_filters::auth::generate_plaintext_key`,
+# which this crate no longer calls outside that test).
+base64 = { workspace = true }
 # tests/keygen.rs's end-to-end proof (WP-50 acceptance test 4) builds a real
 # `HeaderMap` to hand a `VirtualKeyAuthenticator`.
 http = { workspace = true }

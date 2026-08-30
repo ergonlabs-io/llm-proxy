@@ -26,32 +26,9 @@
 
 use std::path::PathBuf;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
-use ring::rand::{SecureRandom, SystemRandom};
+use ring::rand::SystemRandom;
 
-use proxy_filters::auth::{digest_hex, HmacSecret};
-
-/// Printable prefix every virtual key carries.
-///
-/// Duplicated here (rather than imported) from `proxy_filters::auth`'s
-/// private `KEY_PREFIX`: it is part of the key's *format*, which this
-/// generator has to know independently of the verifier's internals, and
-/// `auth.rs` deliberately keeps that constant module-private (see its own
-/// doc for why: it's part of what makes a `Bearer` value shaped like a
-/// virtual key at all). The two only need to agree, which
-/// `an_unknown_llmp_key_is_rejected` and this module's own tests both cover.
-const KEY_PREFIX: &str = "llmp_";
-
-/// 256 bits: the point past which brute-forcing a key stops being the attack
-/// anyone bothers with.
-///
-/// Rust note: this is also the property `proxy_filters::auth`'s module doc
-/// leans on to justify a fast keyed hash instead of a slow, password-oriented
-/// one -- that argument only holds if a virtual key is actually this hard to
-/// guess, which is exactly what generating it here (instead of leaving key
-/// choice to an operator) delivers.
-const KEY_ENTROPY_BYTES: usize = 32;
+use proxy_filters::auth::{digest_hex, generate_plaintext_key, HmacSecret};
 
 /// Env var carrying the HMAC secret, mirroring the dialect's `hmac_secret:
 /// ${VAR}` idiom (`schema/llmproxy-v0.schema.json`'s `Auth.hmac_secret`).
@@ -98,24 +75,6 @@ fn resolve_secret(hmac_secret_file: Option<&PathBuf>) -> Result<Vec<u8>, String>
     }
 }
 
-/// Generates a fresh plaintext virtual key from the OS CSPRNG: `llmp_` plus
-/// [`KEY_ENTROPY_BYTES`] random bytes, base64url-encoded (RFC 4648 §5)
-/// without padding.
-///
-/// Rust note: `ring::rand::SystemRandom`, not `rand::thread_rng()`. Both are
-/// CSPRNG-backed today, but `rand::thread_rng()`'s CSPRNG guarantee is a
-/// property of that crate's current internals rather than something the
-/// call site can rely on being true forever; `ring::rand::SystemRandom`
-/// documents it as the contract. This is the one place in the tree where the
-/// entropy source is load-bearing enough to name explicitly rather than
-/// reach for whatever RNG is already in scope.
-fn generate_plaintext_key(rng: &SystemRandom) -> String {
-    let mut bytes = [0u8; KEY_ENTROPY_BYTES];
-    rng.fill(&mut bytes)
-        .expect("the OS CSPRNG is unavailable -- cannot generate a virtual key without it");
-    format!("{KEY_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
-}
-
 /// Runs `--mode keygen`: resolves the secret, generates a key, and prints it
 /// once as a paste-ready config fragment.
 ///
@@ -145,23 +104,6 @@ pub fn run(tenant: &str, key_id: &str, hmac_secret_file: Option<&PathBuf>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn generated_key_has_the_llmp_prefix_and_decodes_to_32_bytes() {
-        let rng = SystemRandom::new();
-        let key = generate_plaintext_key(&rng);
-        let encoded = key.strip_prefix(KEY_PREFIX).expect("missing llmp_ prefix");
-        let decoded = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .expect("key body must be valid base64url without padding");
-        assert_eq!(decoded.len(), KEY_ENTROPY_BYTES);
-    }
-
-    #[test]
-    fn two_generated_keys_differ() {
-        let rng = SystemRandom::new();
-        assert_ne!(generate_plaintext_key(&rng), generate_plaintext_key(&rng));
-    }
 
     #[test]
     fn resolve_secret_prefers_file_over_env_var() {

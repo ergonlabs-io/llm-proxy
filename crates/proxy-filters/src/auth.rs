@@ -379,6 +379,24 @@ pub fn secret_bytes_from_file(raw: &[u8]) -> &[u8] {
     &raw[..end]
 }
 
+/// `HMAC-SHA256(secret, plaintext_key)` as a raw 32-byte array -- the value
+/// [`StoredKey::digest`](crate::control::StoredKey) carries and
+/// [`digest_hex`] hex-encodes for config/display. This is the ONE place in
+/// the codebase an HMAC is actually computed over a plaintext key; both
+/// [`digest_hex`] below and [`crate::control::ControlPlane::mint_key`] call
+/// it rather than reaching for `ring::hmac::sign` themselves.
+///
+/// Rust note: `.try_into().expect(..)` converts the `hmac::Tag`'s `&[u8]`
+/// into a fixed `[u8; 32]` -- infallible in practice because HMAC-SHA256
+/// always produces exactly 32 bytes, but the conversion itself is fallible
+/// (a `TryFrom<&[u8]>` for `[u8; N]` checks the length at runtime), so the
+/// `expect` names why this particular call can never actually hit that
+/// branch.
+pub fn digest_bytes(secret: &HmacSecret, plaintext_key: &str) -> [u8; 32] {
+    let digest = ring::hmac::sign(&secret.0, plaintext_key.as_bytes());
+    digest.as_ref().try_into().expect("HMAC-SHA256 is 32 bytes")
+}
+
 /// `hex(HMAC-SHA256(secret, plaintext_key))` -- the value that goes in a
 /// config's `digest` / `digest_hex` field.
 ///
@@ -390,10 +408,44 @@ pub fn secret_bytes_from_file(raw: &[u8]) -> &[u8] {
 /// VERIFY one both call this exact function, so they cannot drift apart.
 /// `HmacSecret`'s inner `ring::hmac::Key` is private to this module, which is
 /// why this has to live here rather than alongside the rest of `--mode
-/// keygen` in `crates/proxy`.
+/// keygen` in `crates/proxy`. Delegates to [`digest_bytes`] for the actual
+/// HMAC computation, so there is exactly one place that call happens.
 pub fn digest_hex(secret: &HmacSecret, plaintext_key: &str) -> String {
-    let digest = ring::hmac::sign(&secret.0, plaintext_key.as_bytes());
-    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    digest_bytes(secret, plaintext_key)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 256 bits of key material -- the point past which brute-forcing a virtual
+/// key stops being the attack anyone bothers with, and the property the
+/// module doc's "high-entropy, proxy-generated, not user-chosen" argument for
+/// a fast keyed hash (over a slow password hash) actually rests on.
+const KEY_ENTROPY_BYTES: usize = 32;
+
+/// Generates a fresh plaintext virtual key from the OS CSPRNG: [`KEY_PREFIX`]
+/// plus [`KEY_ENTROPY_BYTES`] random bytes, base64url-encoded (RFC 4648 §5)
+/// without padding. The single shared generator: `llm-proxy --mode keygen`
+/// (`crates/proxy/src/keygen.rs`) and [`crate::control::ControlPlane::mint_key`]
+/// both call this rather than each rolling their own, so the two paths that
+/// mint a key cannot silently drift in prefix, entropy, or encoding.
+///
+/// Rust note: `ring::rand::SystemRandom`, not `rand::thread_rng()`. Both are
+/// CSPRNG-backed today, but `rand::thread_rng()`'s CSPRNG guarantee is a
+/// property of that crate's current internals rather than something the
+/// call site can rely on being true forever; `ring::rand::SystemRandom`
+/// documents it as the contract. This is the one place in the tree where the
+/// entropy source is load-bearing enough to name explicitly rather than
+/// reach for whatever RNG is already in scope.
+pub fn generate_plaintext_key(rng: &ring::rand::SystemRandom) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use ring::rand::SecureRandom;
+
+    let mut bytes = [0u8; KEY_ENTROPY_BYTES];
+    rng.fill(&mut bytes)
+        .expect("the OS CSPRNG is unavailable -- cannot generate a virtual key without it");
+    format!("{KEY_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Reverses [`digest_hex`]'s formatting. Private and infallible-by-panic
@@ -928,6 +980,28 @@ mod tests {
             !rendered.contains(&digest_hex),
             "Debug output must never contain the digest: {rendered}"
         );
+    }
+
+    // --- generate_plaintext_key: llmp_ prefix, 32-byte body, two draws differ ---
+
+    #[test]
+    fn generated_key_has_the_llmp_prefix_and_decodes_to_32_bytes() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let rng = ring::rand::SystemRandom::new();
+        let key = generate_plaintext_key(&rng);
+        let encoded = key.strip_prefix(KEY_PREFIX).expect("missing llmp_ prefix");
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("key body must be valid base64url without padding");
+        assert_eq!(decoded.len(), KEY_ENTROPY_BYTES);
+    }
+
+    #[test]
+    fn two_generated_keys_differ() {
+        let rng = ring::rand::SystemRandom::new();
+        assert_ne!(generate_plaintext_key(&rng), generate_plaintext_key(&rng));
     }
 
     // --- 8: a key differing only in its last byte -> Rejected ---
