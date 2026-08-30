@@ -190,7 +190,7 @@ mod tests {
         let config = header_value_option("x-mutated", "yes");
         let factory = HeaderMutationFactory;
         let instance_factory = factory
-            .create(&config, &FactoryContext {})
+            .create(&config, &FactoryContext::default())
             .expect("valid config builds a factory");
         let mut filter = instance_factory.create_filter();
 

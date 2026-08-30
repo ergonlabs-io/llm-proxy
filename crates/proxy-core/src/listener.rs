@@ -31,7 +31,9 @@ use proxy_config::ir::{
 };
 use proxy_config::ConfigSnapshot;
 use proxy_http::codec::{serve_http1, serve_http2, Http1Options};
-use proxy_http::filter::{FactoryContext, FilterRegistry, TerminalFilterInstanceFactory};
+use proxy_http::filter::{
+    FactoryContext, FilterRegistry, SharedFactoryState, TerminalFilterInstanceFactory,
+};
 use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
@@ -227,6 +229,7 @@ fn build_listener_hcm(
     router_stats: &Arc<RouterStats>,
     token_stats: &Arc<GenAiTokenStats>,
     tracing_handles: Option<&TracingHandles>,
+    factory_state: &Arc<SharedFactoryState>,
 ) -> Result<ListenerHcm, HttpFilterChainBuildError> {
     let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
     for (i, chain) in listener.filter_chains.iter().enumerate() {
@@ -240,6 +243,7 @@ fn build_listener_hcm(
                     router_stats,
                     token_stats,
                     tracing_handles,
+                    factory_state,
                 )?)
             }
             _ => None,
@@ -260,6 +264,7 @@ fn build_listener_hcm(
                 router_stats,
                 token_stats,
                 tracing_handles,
+                factory_state,
             )?)
         }
         _ => None,
@@ -421,6 +426,12 @@ struct WorkerShared<'a> {
     /// wires it into both the `FilterChainHandler` (SERVER span) and the
     /// `RouterFilterFactory` (CLIENT spans) it builds.
     tracing: &'a Option<TracingHandles>,
+    /// WP-50 3b-ii part B: the ONE per-serve [`SharedFactoryState`] slot,
+    /// shared across every worker's filter-factory build -- same cadence and
+    /// construction site (`crates/proxy/src/main.rs`'s `run_serve`) as
+    /// `cluster_manager` above. Threaded down to [`build_hcm_handler`], which
+    /// hands it to every `HttpFilterFactory::create` via `FactoryContext`.
+    factory_state: &'a Arc<SharedFactoryState>,
 }
 
 fn spawn_bound(
@@ -439,6 +450,7 @@ fn spawn_bound(
         shared.router_stats,
         shared.token_stats,
         shared.tracing.as_ref(),
+        shared.factory_state,
     )?;
     let tcp_listener = bind_listener(listener_ir).map_err(|source| InitialBindError::Bind {
         name: name.clone(),
@@ -461,6 +473,7 @@ fn spawn_bound(
             downstream_stats: shared.downstream_stats.clone(),
             token_stats: shared.token_stats.clone(),
             tracing_handles: shared.tracing.clone(),
+            factory_state: shared.factory_state.clone(),
         },
     );
     Ok(BoundListener { addr, task })
@@ -508,6 +521,7 @@ pub fn initial_bind(
     shutdown: &watch::Receiver<bool>,
     cluster_manager: &Arc<ClusterManager>,
     stats: &StatsRecorders,
+    factory_state: &Arc<SharedFactoryState>,
 ) -> Result<HashMap<ListenerName, BoundListener>, InitialBindError> {
     let shared = WorkerShared {
         config,
@@ -518,6 +532,7 @@ pub fn initial_bind(
         downstream_stats: &stats.downstream,
         token_stats: &stats.token,
         tracing: &stats.tracing,
+        factory_state,
     };
     let mut bound: HashMap<ListenerName, BoundListener> = HashMap::new();
     for (name, listener_ir) in snapshot.listeners.iter() {
@@ -575,6 +590,11 @@ struct AcceptLoopShared {
     /// doesn't shadow the `tracing` crate this whole module logs through
     /// (`tracing::warn!` a few lines below the destructure).
     tracing_handles: Option<TracingHandles>,
+    /// This worker's [`SharedFactoryState`] handle -- see
+    /// [`WorkerShared::factory_state`]; needed here (not just at
+    /// [`spawn_bound`] time) for the identical reason `token_stats` is (the
+    /// runtime HCM rebuild below).
+    factory_state: Arc<SharedFactoryState>,
 }
 
 /// One accept loop per bound listener, spawned with `spawn_local` (this
@@ -600,6 +620,7 @@ fn spawn_accept_loop(
         downstream_stats,
         token_stats,
         tracing_handles,
+        factory_state,
     } = shared;
     tokio::task::spawn_local(async move {
         // Rust note: `mut` locals, not behind a lock -- this whole task is
@@ -673,6 +694,7 @@ fn spawn_accept_loop(
                         &router_stats,
                         &token_stats,
                         tracing_handles.as_ref(),
+                        &factory_state,
                     ) {
                         Ok(rebuilt) => hcm_cache = Rc::new(rebuilt),
                         Err(err) => {
@@ -1132,9 +1154,12 @@ fn build_hcm_handler(
     router_stats: &Arc<RouterStats>,
     token_stats: &Arc<GenAiTokenStats>,
     tracing_handles: Option<&TracingHandles>,
+    factory_state: &Arc<SharedFactoryState>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
-    let factory_ctx = FactoryContext {};
+    let factory_ctx = FactoryContext {
+        shared: factory_state.clone(),
+    };
     let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
     for f in &hcm.http_filters {
         if f.is_router {
@@ -1349,6 +1374,14 @@ fn reset(stream: &TcpStream, listener: &str) {
 /// Reconcile `bound` against `snapshot`: bind new listeners, rebind ones
 /// whose address changed, leave unchanged ones alone, and stop accepting on
 /// ones that were removed.
+// WP-50 3b-ii part B: `factory_state` is the 8th argument, tipping this over
+// clippy's 7-arg ceiling -- it can't fold into `stats` (a `&StatsRecorders`,
+// already a bundle of the actual per-worker *stats recorders*; `factory_state`
+// is a different kind of shared handle) without muddying that bundle's own
+// documented purpose, so this leaf allows the extra arg instead, same
+// tradeoff `crates/proxy/src/main.rs`'s `worker_main` already made for
+// `tracing_handles`.
+#[allow(clippy::too_many_arguments)]
 fn reconcile(
     snapshot: &Arc<ConfigSnapshot>,
     bound: &mut HashMap<ListenerName, BoundListener>,
@@ -1357,6 +1390,7 @@ fn reconcile(
     shutdown: &watch::Receiver<bool>,
     cluster_manager: &Arc<ClusterManager>,
     stats: &StatsRecorders,
+    factory_state: &Arc<SharedFactoryState>,
 ) {
     let shared = WorkerShared {
         config,
@@ -1367,6 +1401,7 @@ fn reconcile(
         downstream_stats: &stats.downstream,
         token_stats: &stats.token,
         tracing: &stats.tracing,
+        factory_state,
     };
     // Removed: present in `bound`, absent from the new snapshot. Stop
     // accepting; established connections under the old listener keep their
@@ -1428,6 +1463,10 @@ fn reconcile(
 /// Established connections are unaffected by any of this: they hold their
 /// own `Arc<ConfigSnapshot>` and their own task, independent of the accept
 /// loop that spawned them.
+// WP-50 3b-ii part B: `factory_state` tips this over clippy's 7-arg ceiling,
+// same reasoning as `reconcile`'s own `#[allow]` just above (this function's
+// only job with it is forwarding it there every reconcile).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_listener_manager(
     mut bound: HashMap<ListenerName, BoundListener>,
     config: Arc<WorkerConfigHandle>,
@@ -1436,6 +1475,7 @@ pub async fn run_listener_manager(
     registry: ConnectionRegistry,
     cluster_manager: Arc<ClusterManager>,
     stats: StatsRecorders,
+    factory_state: Arc<SharedFactoryState>,
 ) {
     loop {
         tokio::select! {
@@ -1452,6 +1492,7 @@ pub async fn run_listener_manager(
                     &shutdown,
                     &cluster_manager,
                     &stats,
+                    &factory_state,
                 );
             }
             _ = shutdown.changed() => {
@@ -2030,6 +2071,7 @@ mod tests {
             token: token_stats_for(&stats_control, &initial),
             tracing: None,
         };
+        let factory_state = Arc::new(SharedFactoryState::default());
 
         let bound = initial_bind(
             &initial,
@@ -2038,6 +2080,7 @@ mod tests {
             &shutdown_rx,
             &cluster_manager,
             &stats,
+            &factory_state,
         )
         .expect("initial_bind should succeed in tests");
 
@@ -2049,6 +2092,7 @@ mod tests {
             registry.clone(),
             cluster_manager,
             stats,
+            factory_state,
         ));
 
         Harness {
@@ -3004,6 +3048,7 @@ mod tests {
                 token: token_stats_for(&stats_control, &snapshot),
                 tracing: None,
             };
+            let factory_state = Arc::new(SharedFactoryState::default());
 
             let result = initial_bind(
                 &snapshot,
@@ -3012,6 +3057,7 @@ mod tests {
                 &shutdown_rx,
                 &cluster_manager,
                 &stats,
+                &factory_state,
             );
             match result {
                 Err(err @ InitialBindError::Tls(_)) => {
@@ -4008,6 +4054,7 @@ static_resources:
         let stats_control = proxy_observability::stats::StatsControl::new(1);
         let router_stats = router_stats_for(&stats_control, &snapshot);
         let token_stats = token_stats_for(&stats_control, &snapshot);
+        let factory_state = Arc::new(SharedFactoryState::default());
 
         let err = match build_listener_hcm(
             listener_ir,
@@ -4015,6 +4062,7 @@ static_resources:
             &router_stats,
             &token_stats,
             None,
+            &factory_state,
         ) {
             Ok(_) => {
                 panic!("an invalid per-route dialect must fail the build, is_optional or not")

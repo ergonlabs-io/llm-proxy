@@ -28,6 +28,7 @@ use proxy_core::runtime::run_local;
 use proxy_core::runtime::SnapshotHandles;
 use proxy_core::tls::DownstreamTlsFactory;
 use proxy_http::codec::{serve_http1, Http1Options};
+use proxy_http::filter::SharedFactoryState;
 use proxy_http::handler::stub::FixedResponseHandler;
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::stat_handles::{
@@ -313,6 +314,8 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         tracing: None,
     };
 
+    let factory_state = Arc::new(SharedFactoryState::default());
+
     let bound = initial_bind(
         &snapshot,
         &config,
@@ -320,6 +323,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         &shutdown_rx,
         &cluster_manager,
         &stats,
+        &factory_state,
     )
     .expect("initial_bind should succeed in tests");
 
@@ -331,6 +335,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         registry,
         cluster_manager,
         stats,
+        factory_state,
     ));
 
     Harness {

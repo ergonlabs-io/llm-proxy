@@ -789,7 +789,7 @@ mod tests {
     fn factory_creates_a_working_filter() {
         let factory = UsageFilterFactory;
         let instance_factory = factory
-            .create(&data_source("openai"), &FactoryContext {})
+            .create(&data_source("openai"), &FactoryContext::default())
             .expect("valid config builds a factory");
         let mut filter = instance_factory.create_filter();
         let mut cb = TestCallbacks::new();

@@ -2330,7 +2330,7 @@ mod body_routing_e2e {
             proxy_filters::body_rewrite_filter::BodyRewriteFilterFactory,
         ));
 
-        let factory_ctx = FactoryContext {};
+        let factory_ctx = FactoryContext::default();
         let mut filters = Vec::new();
         for f in &hcm.http_filters {
             if f.is_router {

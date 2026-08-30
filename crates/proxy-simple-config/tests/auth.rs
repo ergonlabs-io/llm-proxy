@@ -146,7 +146,7 @@ fn auth_config_lowers_through_the_real_loader_and_the_real_filter_accepts_it() {
         .expect("the auth filter's typed_config must survive to the IR");
 
     AuthFilterFactory
-        .create(config, &FactoryContext {})
+        .create(config, &FactoryContext::default())
         .expect("the real auth_filter::parse_config must accept the dialect's emitted config");
 }
 

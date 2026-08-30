@@ -11,9 +11,10 @@
 //! runtime like a C++ virtual call. We use trait objects (not generics) because
 //! the set of filters on a stream is decided by config at runtime.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, Method, StatusCode, Uri};
@@ -466,8 +467,64 @@ pub trait PerRouteConfig: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-/// Context handed to factories at config time. TODO(WP-11): stats scope, runtime.
-pub struct FactoryContext {}
+/// Config-time singletons shared across the per-worker filter-factory
+/// invocations of ONE serve. The HTTP filter chain is rebuilt per worker
+/// (ADR-0003), so a factory that must expose ONE process-wide instance
+/// (e.g. a control plane owning a mutable store) registers it here keyed by
+/// its own `type_url`; every later per-worker `create` for that filter reads
+/// the same instance back, and the control side can read it out too.
+///
+/// proxy-http intentionally knows nothing about what these singletons ARE —
+/// naming a concrete filter type here would invert the crate dependency
+/// (proxy-filters depends on proxy-http, not the reverse). They are
+/// `dyn Any + Send + Sync`, downcast by the crate that owns the concrete type.
+#[derive(Default)]
+pub struct SharedFactoryState {
+    singletons: Mutex<HashMap<&'static str, Arc<dyn Any + Send + Sync>>>,
+}
+
+impl SharedFactoryState {
+    /// Return the singleton under `key`, building and inserting it via `init`
+    /// on the first call for that key. Concurrent first-callers (workers build
+    /// their chains on separate runtimes) serialize on the lock; exactly one
+    /// runs `init`, the rest receive its result. `init` MUST NOT call back
+    /// into this method (it runs while the lock is held).
+    pub fn get_or_try_init(
+        &self,
+        key: &'static str,
+        init: impl FnOnce() -> Result<Arc<dyn Any + Send + Sync>, ConfigError>,
+    ) -> Result<Arc<dyn Any + Send + Sync>, ConfigError> {
+        let mut guard = self
+            .singletons
+            .lock()
+            .expect("SharedFactoryState mutex poisoned");
+        if let Some(existing) = guard.get(key) {
+            return Ok(Arc::clone(existing));
+        }
+        let built = init()?;
+        guard.insert(key, Arc::clone(&built));
+        Ok(built)
+    }
+
+    /// Read a previously-initialized singleton without building one — used by
+    /// the control side (admin server, later increment) to reach an instance a
+    /// worker's factory built. `None` until the first `get_or_try_init`.
+    pub fn get(&self, key: &'static str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.singletons
+            .lock()
+            .expect("SharedFactoryState mutex poisoned")
+            .get(key)
+            .map(Arc::clone)
+    }
+}
+
+/// Context handed to factories at config time. Carries the per-serve shared
+/// singleton slot ([`SharedFactoryState`]); a stateless filter ignores it.
+/// TODO(WP-11): stats scope, runtime.
+#[derive(Default)]
+pub struct FactoryContext {
+    pub shared: Arc<SharedFactoryState>,
+}
 
 /// Created once per (filter config, listener); creates per-stream instances.
 pub trait FilterInstanceFactory: Send + Sync {
@@ -519,5 +576,56 @@ impl FilterRegistry {
 
     pub fn get(&self, type_url: &str) -> Option<&Arc<dyn HttpFilterFactory>> {
         self.factories.get(type_url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_or_try_init_builds_once_and_returns_same_arc() {
+        let state = SharedFactoryState::default();
+        let calls = std::cell::Cell::new(0);
+        let first = state
+            .get_or_try_init("k", || {
+                calls.set(calls.get() + 1);
+                Ok(Arc::new(42u32) as Arc<dyn Any + Send + Sync>)
+            })
+            .expect("first init succeeds");
+        let second = state
+            .get_or_try_init("k", || {
+                calls.set(calls.get() + 1);
+                Ok(Arc::new(99u32) as Arc<dyn Any + Send + Sync>)
+            })
+            .expect("second call succeeds without re-running init");
+        assert_eq!(calls.get(), 1, "init must only run once for the same key");
+        assert!(Arc::ptr_eq(&first, &second));
+        let downcast = first.downcast::<u32>().expect("stored value was a u32");
+        assert_eq!(*downcast, 42);
+    }
+
+    #[test]
+    fn different_keys_build_independently() {
+        let state = SharedFactoryState::default();
+        let a = state
+            .get_or_try_init("a", || Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>))
+            .expect("init a succeeds");
+        let b = state
+            .get_or_try_init("b", || Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>))
+            .expect("init b succeeds");
+        assert_eq!(*a.downcast::<u32>().unwrap(), 1);
+        assert_eq!(*b.downcast::<u32>().unwrap(), 2);
+    }
+
+    #[test]
+    fn get_is_none_before_init_and_some_after() {
+        let state = SharedFactoryState::default();
+        assert!(state.get("k").is_none());
+        state
+            .get_or_try_init("k", || Ok(Arc::new(7u32) as Arc<dyn Any + Send + Sync>))
+            .expect("init succeeds");
+        let found = state.get("k").expect("singleton present after init");
+        assert_eq!(*found.downcast::<u32>().unwrap(), 7);
     }
 }

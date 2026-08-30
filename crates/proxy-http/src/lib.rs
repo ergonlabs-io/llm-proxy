@@ -37,8 +37,8 @@ pub mod upstream_pool;
 
 pub use codec::{serve_http1, CodecError, Http1Options};
 pub use filter::{
-    FilterDataStatus, FilterHeadersStatus, FilterRegistry, FilterTrailersStatus, HttpFilter,
-    HttpFilterFactory,
+    FactoryContext, FilterDataStatus, FilterHeadersStatus, FilterRegistry, FilterTrailersStatus,
+    HttpFilter, HttpFilterFactory, SharedFactoryState,
 };
 pub use filter_manager::{FilterChainHandler, DEFAULT_BUFFER_LIMIT};
 pub use handler::{

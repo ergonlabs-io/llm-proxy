@@ -525,6 +525,17 @@ async fn run_serve(
         Arc::new(proxy_cluster::resolver::TokioResolver),
         proxy_core::tls::transport_socket_builder(),
     ));
+    // WP-50 3b-ii part B: one `SharedFactoryState` shared across every
+    // worker, same "control builds it once, workers get a clone of the same
+    // instance" shape as `cluster_manager` above. The HTTP filter chain is
+    // rebuilt PER WORKER (`proxy_core::listener::build_hcm_handler` runs on
+    // each worker's own `LocalSet`, ADR-0003), so a filter factory that needs
+    // ONE process-wide singleton registers it in this slot on its first
+    // `create()` call and every other worker's `create()` for the same
+    // filter reads the same instance back. Nothing reads or writes it yet
+    // (this increment is pure plumbing) -- a later increment wires the auth
+    // control plane through it.
+    let factory_state = Arc::new(proxy_http::filter::SharedFactoryState::default());
     let rejected = cluster_manager
         .update_from_snapshot(&snapshot.clusters)
         .await;
@@ -708,6 +719,7 @@ async fn run_serve(
                 downstream_stat_handles.clone(),
                 token_usage_stat_handles.clone(),
                 tracing_handles.clone(),
+                factory_state.clone(),
             )
         },
     );
@@ -987,6 +999,10 @@ async fn worker_main(
     downstream_stat_handles: Arc<proxy_http::stat_handles::DownstreamStatHandles>,
     token_usage_stat_handles: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
     tracing_handles: Option<proxy_core::listener::TracingHandles>,
+    // WP-50 3b-ii part B: this worker's clone of the ONE per-serve
+    // `SharedFactoryState` -- see `run_serve`'s own comment on the Arc this
+    // is cloned from.
+    factory_state: Arc<proxy_http::filter::SharedFactoryState>,
 ) {
     let registry = ConnectionRegistry::new();
     // WP-23 increment 6a: built fresh per worker -- `stats_registry`/
@@ -1037,6 +1053,7 @@ async fn worker_main(
         &ctx.shutdown,
         &cluster_manager,
         &stats,
+        &factory_state,
     ) {
         Ok(bound) => {
             let _ = bind_tx.send((ctx.id, Ok(())));
@@ -1062,6 +1079,7 @@ async fn worker_main(
         registry.clone(),
         cluster_manager.clone(),
         stats,
+        factory_state,
     ));
 
     drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
