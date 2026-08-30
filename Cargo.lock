@@ -1459,7 +1459,9 @@ dependencies = [
  "proxy-config",
  "proxy-http",
  "proxy-observability",
+ "redb",
  "ring",
+ "serde",
  "serde_json",
  "tracing",
 ]
@@ -1582,6 +1584,15 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -111,6 +111,13 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # code -- see `rig.rs`.
 rlimit = "0.10"
 
+# WP-50 increment 3b: the embedded, persistent-by-default `ControlPlaneStore`
+# (tenants/keys/policies) -- pure-Rust, ACID, single-file, no C toolchain
+# (unlike SQLite), matching the "hermetic build" property `rustls`/`ring`
+# were chosen for above. See internal-docs/wp-50-3b-store-design-brief.md's
+# "redb data model" section.
+redb = "4.2"
+
 # ---------------------------------------------------------------- profiles --
 # This section is a DISK-SIZE measure, not a speed one. Say so plainly,
 # because the obvious assumption is the opposite.
