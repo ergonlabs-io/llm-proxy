@@ -12,7 +12,6 @@
 //! build time for integration tests -- see `tests/cli.rs`'s identical note.
 
 use std::process::{Command, Output};
-use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -170,7 +169,8 @@ fn printed_key_and_digest_authenticate_together_end_to_end() {
         },
     );
 
-    let authenticator = VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), Arc::new(keys));
+    let authenticator =
+        VirtualKeyAuthenticator::from_static_keys(HmacSecret::new(secret_bytes), keys);
 
     let mut headers = HeaderMap::new();
     headers.insert(

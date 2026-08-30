@@ -558,6 +558,23 @@ impl VirtualKeyAuthenticator {
     pub fn new(secret: HmacSecret, snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>) -> Self {
         VirtualKeyAuthenticator { secret, snapshot }
     }
+
+    /// Build an authenticator over a fixed [`KeySet`] (no policies) whose
+    /// snapshot is never republished. The live path wires the handle from a
+    /// [`crate::control::ControlPlane`] via [`Self::new`] so revocations take
+    /// effect on the next publish; this constructor is for callers that only
+    /// ever verify against one static set of keys -- notably the `keygen`
+    /// end-to-end test, which proves a printed digest authenticates and has
+    /// no store to rebuild from. It also keeps `arc_swap` out of such callers,
+    /// since [`Self::new`]'s handle type would otherwise force them to depend
+    /// on it directly just to wrap the `KeySet`.
+    pub fn from_static_keys(secret: HmacSecret, keys: KeySet) -> Self {
+        let snapshot = Arc::new(ArcSwap::new(Arc::new(ControlPlaneSnapshot {
+            keys,
+            policies: crate::model_authz::TenantPolicyMap::new(),
+        })));
+        VirtualKeyAuthenticator { secret, snapshot }
+    }
 }
 
 impl fmt::Debug for VirtualKeyAuthenticator {
