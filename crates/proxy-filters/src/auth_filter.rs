@@ -61,7 +61,9 @@ use crate::auth::{
     AuthError, AuthOutcome, Authenticator, AuthenticatorChain, HmacSecret, KeyId, KeyRecord,
     KeySet, TenantId, VirtualKeyAuthenticator,
 };
-use crate::control::{ControlPlane, InMemoryControlPlaneStore};
+use crate::control::{
+    ControlPlane, ControlPlaneStore, InMemoryControlPlaneStore, RedbControlPlaneStore,
+};
 
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
@@ -168,10 +170,51 @@ fn parse_digest_hex(raw: &str, index: usize) -> Result<Vec<u8>, ConfigError> {
     Ok(bytes)
 }
 
+/// Which [`crate::control::ControlPlaneStore`] backs this filter's
+/// [`ControlPlane`] -- the parsed shape of `typed_config.store`, before it is
+/// turned into an actual store instance. Kept separate from the store types
+/// themselves so `parse_config` (config parsing) does not have to also decide
+/// WHEN to build one -- see [`AuthFilterFactory::create`], which builds the
+/// real store only inside the shared-singleton closure, so a persistent
+/// store's file is opened exactly once per serve.
+#[derive(Debug)]
+enum StoreSpec {
+    InMemory,
+    Persistent(String),
+}
+
+/// Reads `typed_config.store` (the `oneof` on `llmproxy.filters.v0.Authentication`).
+/// Unset and `in_memory` are indistinguishable here on purpose -- both mean
+/// [`StoreSpec::InMemory`] -- see the proto's doc for why unset defaults to
+/// in-memory rather than erroring.
+fn parse_store(config: &DynamicMessage) -> Result<StoreSpec, ConfigError> {
+    if config.has_field_by_name("persistent") {
+        let persistent = config
+            .get_field_by_name("persistent")
+            .and_then(|v| v.as_message().cloned())
+            .ok_or_else(|| invalid("typed_config.store.persistent", "must be a message"))?;
+        let path = persistent
+            .get_field_by_name("path")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        if path.is_empty() {
+            return Err(invalid(
+                "typed_config.store.persistent.path",
+                "is required and must not be empty",
+            ));
+        }
+        Ok(StoreSpec::Persistent(path))
+    } else {
+        // Covers both `in_memory` explicitly set and the oneof left unset --
+        // the proto's doc makes unset's default explicit.
+        Ok(StoreSpec::InMemory)
+    }
+}
+
 /// Reads `typed_config` (an `llmproxy.filters.v0.Authentication`) into the
-/// secret bytes + bootstrap key set the filter needs at request time. Strict
-/// mode: every field either maps in or errors with its dotted path (ground
-/// rule #1).
+/// secret bytes + bootstrap key set + store selection the filter needs at
+/// request time. Strict mode: every field either maps in or errors with its
+/// dotted path (ground rule #1).
 ///
 /// Returns raw secret **bytes**, not an [`HmacSecret`] -- as of WP-50
 /// increment 3b-i, [`AuthFilterFactory::create`] needs TWO independent
@@ -180,8 +223,9 @@ fn parse_digest_hex(raw: &str, index: usize) -> Result<Vec<u8>, ConfigError> {
 /// endpoint), and `HmacSecret` deliberately has no accessor back to its bytes
 /// once constructed (see its doc) -- so the bytes have to be the thing that
 /// crosses this boundary, and each caller constructs its own `HmacSecret`.
-fn parse_config(config: &DynamicMessage) -> Result<(Vec<u8>, KeySet), ConfigError> {
+fn parse_config(config: &DynamicMessage) -> Result<(Vec<u8>, KeySet, StoreSpec), ConfigError> {
     let secret_bytes = parse_hmac_secret(config)?;
+    let store_spec = parse_store(config)?;
 
     let mut key_set = KeySet::new();
     // Rust note: `HashMap<String, usize>` / `HashMap<Vec<u8>, usize>` remember
@@ -269,7 +313,7 @@ fn parse_config(config: &DynamicMessage) -> Result<(Vec<u8>, KeySet), ConfigErro
         );
     }
 
-    Ok((secret_bytes, key_set))
+    Ok((secret_bytes, key_set, store_spec))
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override —
@@ -288,7 +332,7 @@ impl HttpFilterFactory for AuthFilterFactory {
         config: &DynamicMessage,
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let (secret_bytes, bootstrap_keys) = parse_config(config)?;
+        let (secret_bytes, bootstrap_keys, store_spec) = parse_config(config)?;
 
         // WP-50 increment 3b-ii, part B: the `ControlPlane` is now the ONE
         // per-serve instance shared across every worker, resolved through
@@ -300,29 +344,51 @@ impl HttpFilterFactory for AuthFilterFactory {
         // invisible to every other. The closure below runs only on the FIRST
         // worker for this `type_url`; every later worker's `create` call
         // reads the same `Arc<ControlPlane>` back out instead of rebuilding
-        // it. The store is still `InMemoryControlPlaneStore` -- persistent-
-        // store selection is a later increment (3b-iii) -- so `load()` never
-        // fails and the merged snapshot is exactly the bootstrap keys on
-        // first build, same as before this change.
+        // it. WP-50 increment 3b-ii, part W3: the store itself is now
+        // SELECTABLE (`typed_config.store`) and is built inside this closure
+        // for exactly that reason -- a `persistent` store opens a `redb` file
+        // that takes a file lock, so it must be opened once for the whole
+        // serve, not once per worker (a second, per-worker open of the same
+        // path would fail outright).
+        //
+        // Corollary, and a real limitation worth knowing: because the slot is
+        // per-SERVE and a SIGHUP reload reuses the same `SharedFactoryState`,
+        // the store -- like the HMAC secret and the bootstrap keys -- is
+        // fixed at the first build. Editing `typed_config.store` and
+        // reloading does NOT reopen anything; changing it takes a restart.
         //
         // Rust note: two independent `HmacSecret`s built from the SAME bytes
         // -- see `parse_config`'s doc for why bytes (not an `HmacSecret`)
         // cross that function's boundary. `ControlPlane` retains one for the
         // key-mint endpoint (3b-ii); the authenticator below keeps the other
         // for verifying every request. Neither is derivable from the other.
-        // `bootstrap_keys` is moved into the closure (consumed by
-        // `ControlPlane::new`) since it only ever needs to exist once, on the
-        // first worker; `secret_bytes` is only borrowed there, so it is still
-        // available afterward to build the authenticator's own `HmacSecret`.
+        // `bootstrap_keys` and `store_spec` are moved into the closure
+        // (consumed by `ControlPlane::new`/matched to build the store) since
+        // they only ever need to exist once, on the first worker;
+        // `secret_bytes` is only borrowed there, so it is still available
+        // afterward to build the authenticator's own `HmacSecret`.
         let control_plane = ctx
             .shared
             .get_or_try_init(TYPE_URL, || {
-                let cp = ControlPlane::new(
-                    Box::new(InMemoryControlPlaneStore::default()),
-                    HmacSecret::new(&secret_bytes),
-                    bootstrap_keys,
-                )
-                .map_err(|e| {
+                let store: Box<dyn ControlPlaneStore> = match store_spec {
+                    StoreSpec::InMemory => Box::new(InMemoryControlPlaneStore::default()),
+                    StoreSpec::Persistent(path) => {
+                        // `StoreError`'s `Display` carries only the redb/io
+                        // reason -- never key material (see its doc) -- so
+                        // folding it straight into the reason string here is
+                        // safe. The path is not echoed back either: the
+                        // dotted field path above already names where the
+                        // offending value came from.
+                        Box::new(RedbControlPlaneStore::open(&path).map_err(|e| {
+                            invalid(
+                                "typed_config.store.persistent.path",
+                                format!("could not open the control-plane store: {e}"),
+                            )
+                        })?)
+                    }
+                };
+                let secret = HmacSecret::new(&secret_bytes);
+                let cp = ControlPlane::new(store, secret, bootstrap_keys).map_err(|e| {
                     invalid(
                         "typed_config",
                         format!("control-plane snapshot could not be built: {e}"),
@@ -528,6 +594,48 @@ mod tests {
         msg
     }
 
+    fn in_memory_store_desc() -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.InMemoryStore")
+            .expect("InMemoryStore is compiled into proxy-api")
+    }
+
+    fn persistent_store_desc() -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.PersistentStore")
+            .expect("PersistentStore is compiled into proxy-api")
+    }
+
+    /// Sets `typed_config.store` to `in_memory {}` -- explicit, as opposed to
+    /// leaving the oneof unset entirely (every earlier test's `authentication`
+    /// already covers the unset case).
+    fn with_in_memory_store(mut config: DynamicMessage) -> DynamicMessage {
+        let store = DynamicMessage::new(in_memory_store_desc());
+        config.set_field_by_name("in_memory", prost_reflect::Value::Message(store));
+        config
+    }
+
+    /// Sets `typed_config.store` to `persistent { path }`.
+    fn with_persistent_store(mut config: DynamicMessage, path: &str) -> DynamicMessage {
+        let mut store = DynamicMessage::new(persistent_store_desc());
+        store.set_field_by_name("path", prost_reflect::Value::String(path.to_string()));
+        config.set_field_by_name("persistent", prost_reflect::Value::Message(store));
+        config
+    }
+
+    /// Same convention as `control.rs`'s `temp_db_path` -- this crate has no
+    /// `tempfile` dependency and must not gain one.
+    fn temp_db_path(name_hint: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llm-proxy-auth-filter-test-store-{name_hint}-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     // --- descriptor pool ------------------------------------------------------
 
     #[test]
@@ -554,7 +662,8 @@ mod tests {
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
 
-        let (secret_bytes, key_set) = parse_config(&config).expect("valid config must parse");
+        let (secret_bytes, key_set, _store_spec) =
+            parse_config(&config).expect("valid config must parse");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             test_snapshot_handle(key_set),
@@ -628,7 +737,7 @@ mod tests {
             filename_secret(&path),
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
-        let (secret_bytes, key_set) =
+        let (secret_bytes, key_set, _store_spec) =
             parse_config(&config).expect("valid filename config must parse");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
@@ -687,7 +796,7 @@ mod tests {
             filename_secret(&path),
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
-        let (secret_bytes, key_set) =
+        let (secret_bytes, key_set, _store_spec) =
             parse_config(&config).expect("valid filename config must parse");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
@@ -823,7 +932,8 @@ mod tests {
     #[test]
     fn empty_virtual_keys_parses_and_the_filter_401s_every_key() {
         let config = authentication(inline_secret("secret"), vec![]);
-        let (secret_bytes, key_set) = parse_config(&config).expect("empty virtual_keys is legal");
+        let (secret_bytes, key_set, _store_spec) =
+            parse_config(&config).expect("empty virtual_keys is legal");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             test_snapshot_handle(key_set),
@@ -1326,6 +1436,153 @@ mod tests {
                 matches!(other, AuthOutcome::Rejected(_)),
                 matches!(other, AuthOutcome::NoCredential)
             ),
+        }
+    }
+
+    // --- WP-50 increment 3b-ii, part W3: store selection -----------------------
+
+    // 20: the oneof left UNSET builds successfully -- back-compat, this is
+    // what every config written before `store` existed still does.
+    #[test]
+    fn an_unset_store_builds_with_the_default_in_memory_store() {
+        let config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+        let ctx = FactoryContext::default();
+
+        AuthFilterFactory
+            .create(&config, &ctx)
+            .expect("an unset `store` oneof must default to in_memory and build successfully");
+    }
+
+    // 21: `in_memory` set explicitly builds the same way.
+    #[test]
+    fn an_explicit_in_memory_store_builds() {
+        let config = with_in_memory_store(authentication(
+            inline_secret("operator-hmac-secret"),
+            vec![],
+        ));
+        let ctx = FactoryContext::default();
+
+        AuthFilterFactory
+            .create(&config, &ctx)
+            .expect("an explicit `in_memory` store must build successfully");
+    }
+
+    // 22: `persistent` with an empty path is a config error naming the exact
+    // field path, not just any error.
+    #[test]
+    fn a_persistent_store_with_an_empty_path_is_rejected_with_its_field_path() {
+        let config = with_persistent_store(
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            "",
+        );
+        let ctx = FactoryContext::default();
+
+        // Rust note: not `.expect_err` -- that requires the `Ok` type
+        // (`Box<dyn FilterInstanceFactory>`) to implement `Debug`, which it
+        // deliberately does not (it is a trait object with no derive). A
+        // plain `match` sidesteps that bound entirely.
+        let err = match AuthFilterFactory.create(&config, &ctx) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty `persistent.path` must be rejected"),
+        };
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.store.persistent.path");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // 23: the acceptance test -- a `persistent` store actually persists
+    // across two independent factories/`FactoryContext`s pointed at the same
+    // path. An in-memory store would make this fail.
+    #[test]
+    fn a_persistent_store_survives_a_fresh_factory_context_over_the_same_path() {
+        let path = temp_db_path("survives-fresh-context");
+        let path_str = path.to_string_lossy().to_string();
+
+        {
+            let config = with_persistent_store(
+                authentication(inline_secret("operator-hmac-secret"), vec![]),
+                &path_str,
+            );
+            let ctx = FactoryContext::default();
+            AuthFilterFactory
+                .create(&config, &ctx)
+                .expect("first create over a persistent store must succeed");
+
+            let control_plane = ctx
+                .shared
+                .get(TYPE_URL)
+                .expect("create must register the control plane in the shared slot")
+                .downcast::<ControlPlane>()
+                .expect("the auth control-plane singleton is always a ControlPlane");
+
+            control_plane
+                .mint_key(&TenantId::new("tenant-a"), &KeyId::new("persisted-key"))
+                .expect("mint_key must succeed against a healthy persistent store");
+
+            // Everything above -- factory, ctx, control plane, and the redb
+            // `Database` handle it owns -- is dropped at the end of this
+            // block, before the second factory below opens the same file.
+        }
+
+        let config = with_persistent_store(
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            &path_str,
+        );
+        let ctx2 = FactoryContext::default();
+        AuthFilterFactory
+            .create(&config, &ctx2)
+            .expect("a second, fresh factory/context over the same path must succeed");
+
+        let control_plane2 = ctx2
+            .shared
+            .get(TYPE_URL)
+            .expect("the second create must also register a control plane")
+            .downcast::<ControlPlane>()
+            .expect("the auth control-plane singleton is always a ControlPlane");
+
+        let snapshot = control_plane2.handle().load();
+        let found = snapshot
+            .keys
+            .iter()
+            .any(|(_, record)| record.key_id.as_str() == "persisted-key");
+
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            found,
+            "a key minted through a persistent store must still be present after \
+             reopening the same path from a fresh factory + FactoryContext -- an \
+             in-memory store would lose it"
+        );
+    }
+
+    // 24: a persistent path that cannot be opened is a config error, not a
+    // panic.
+    #[test]
+    fn a_persistent_store_with_an_unopenable_path_is_a_config_error_not_a_panic() {
+        // A path inside a directory that does not exist -- `Database::create`
+        // cannot create the parent directory for us.
+        let bad_path = std::env::temp_dir()
+            .join("llm-proxy-auth-filter-test-store-nonexistent-dir-does-not-exist")
+            .join("store.redb");
+        let config = with_persistent_store(
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            &bad_path.to_string_lossy(),
+        );
+        let ctx = FactoryContext::default();
+
+        let err = match AuthFilterFactory.create(&config, &ctx) {
+            Err(e) => e,
+            Ok(_) => panic!("a persistent path inside a nonexistent directory must be rejected"),
+        };
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.store.persistent.path");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 }

@@ -1,4 +1,8 @@
 /target
+# Per-worktree CARGO_TARGET_DIR (CLAUDE.md rule 13). Not covered by `/target`,
+# and a `git add -A` inside an agent worktree otherwise stages ~3600 build
+# artifacts along with the change.
+/target-agent
 /.vscode/
 *.pb.bin
 testing/diffrig/captures/

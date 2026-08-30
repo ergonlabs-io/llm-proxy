@@ -64,6 +64,41 @@ message Authentication {
   // of "authentication is enabled, and no credential is valid", not a
   // misconfiguration to be rescued by admitting traffic.
   repeated VirtualKey virtual_keys = 2;
+
+  // Where the control plane's minted keys, revocations, and tenant policy
+  // live. UNSET means `in_memory` -- every config written before this field
+  // existed keeps working unchanged, with the same behavior it always had.
+  //
+  // Exactly one `ControlPlane` is built per serve, not per worker: the HTTP
+  // filter chain is rebuilt once per worker (ADR-0003), but `AuthFilterFactory`
+  // resolves this store through the shared per-serve slot
+  // (`SharedFactoryState`, see `auth_filter.rs`) so it is opened exactly once
+  // regardless of worker count. This matters concretely for `persistent`:
+  // `redb` takes a file lock on open, so a second, per-worker open of the same
+  // path would fail outright rather than share the first one.
+  oneof store {
+    InMemoryStore in_memory = 3;
+    PersistentStore persistent = 4;
+  }
+}
+
+// Keeps every minted key, revocation, and tenant policy only in process
+// memory -- nothing survives a restart. This is the right default for a
+// single-process deployment that bootstraps its keys entirely from
+// `virtual_keys` above and never mints or revokes at runtime; it is the wrong
+// choice for anything that does, since every key minted through an admin API
+// is lost the moment the process exits.
+message InMemoryStore {}
+
+// Persists every minted key, revocation, and tenant policy to an embedded
+// `redb` database file, surviving a restart.
+message PersistentStore {
+  // Required. Path to the `redb` database file. It is created if it does not
+  // already exist. Must not be empty -- an empty path is a configuration
+  // error, not a fallback to `in_memory`: silently downgrading durability
+  // because of a typo'd path would lose every key minted at runtime with
+  // nothing in the logs to explain why.
+  string path = 1;
 }
 
 // One virtual key. The plaintext key NEVER appears in configuration.
