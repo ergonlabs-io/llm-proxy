@@ -26,6 +26,11 @@ hyper = { workspace = true }
 # see `--protocol` in `main.rs`), so the extra features are additive here
 # rather than promoted onto the workspace default.
 hyper-util = { workspace = true, features = ["server", "server-auto"] }
+# Scale-test extension: per-request response-shape sampling (`profiles.rs`,
+# `handler.rs`) needs `SmallRng`, which isn't part of `rand`'s default
+# feature set -- see `handler.rs`'s "Rust note" on why `SmallRng` over
+# `thread_rng`/`StdRng`.
+rand = { workspace = true, features = ["small_rng"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "signal"] }

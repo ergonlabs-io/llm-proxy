@@ -1,33 +1,39 @@
 //! Pre-rendered response fragments for both dialects, streaming and
 //! non-streaming.
 //!
-//! # Why frames are rendered once at startup, not per request
+//! # Why the content chunk is rendered once, never per token
 //!
-//! Every constant piece of a streamed response -- the `--tokens`
-//! content-delta chunks, the terminal usage/`[DONE]` frames -- is fully
-//! determined by the CLI flags, which never change after startup. This
-//! module builds every one of those pieces exactly once, as `Bytes`, in
-//! [`OpenAiFrames::new`]/[`AnthropicFrames::new`], and shares them across
-//! every request (and every one of the `--tokens` chunks *within* a
-//! request) behind an `Arc` -- cloning a `Step` is a refcount bump, not a
-//! JSON serialization.
+//! WP scale-test extension: response length and inter-token timing now vary
+//! per request (drawn from a [`crate::profiles::Profile`]), so the number of
+//! content-delta chunks and their pacing are no longer startup constants.
+//! What *hasn't* changed is the content chunk's bytes -- every position in
+//! every stream this process ever serves emits the exact same
+//! `CONTENT_CHUNK_TEXT` fragment (see the pre-scale-test doc below, which
+//! this inherits). So [`OpenAiFrames::new`]/[`AnthropicFrames::new`] still
+//! render that one fragment exactly once, as `Bytes`, at startup; a request
+//! wanting `k` content chunks clones it `k` times (a refcount bump each,
+//! never a JSON serialization) rather than re-rendering anything. This is
+//! the "pre-render at the profile's max length" idea taken to its logical
+//! end: since every position is byte-identical, there is no upper bound to
+//! pre-render *to* -- one fragment already covers any `k`.
 //!
-//! The one thing that genuinely varies per request is the client-supplied
-//! `model` string (see `crate::request::parse_request_meta`). Splicing it
-//! into every repeated content-delta chunk would mean paying a JSON
-//! serialization `--tokens` times per request -- precisely the per-request
-//! formatting cost this crate exists to keep off the hot path. The decision
-//! made here: `model` is echoed exactly once per stream, in the leading
-//! role-delta / `message_start` frame (and in the non-streaming body,
-//! which is only ever built once per request regardless). Every repeated
-//! per-token chunk stays 100% pre-rendered and model-free -- real providers
-//! do repeat `model` on every chunk, but nothing that reads these frames
-//! (`crates/proxy-filters/src/usage.rs`, `testing/loadgen`'s SSE classifier)
-//! looks at it there, so the fidelity gap costs nothing while the
-//! performance win is real.
+//! The per-request terminal frame (the usage/`message_delta` chunk) is
+//! rebuilt fresh every request because its `completion_tokens`/
+//! `output_tokens` field must equal the `k` actually drawn -- exactly the
+//! same one-JSON-render-per-request cost the non-streaming bodies below
+//! already pay, and nothing like the `k`-times-per-request cost the content
+//! chunk avoids.
+//!
+//! The one thing that varies per request besides length/timing is the
+//! client-supplied `model` string (see `crate::request::parse_request_meta`).
+//! It is echoed exactly once per stream, in the leading role-delta /
+//! `message_start` frame (and in the non-streaming body, built fresh per
+//! request regardless) -- real providers repeat `model` on every chunk, but
+//! nothing that reads these frames (`crates/proxy-filters/src/usage.rs`,
+//! `testing/loadgen`'s SSE classifier) looks at it there, so the fidelity
+//! gap costs nothing.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -43,20 +49,12 @@ use serde_json::json;
 /// conversion.
 pub type ResponseBody = BoxBody<Bytes, Infallible>;
 
-/// The CLI knobs that shape every rendered frame, converted once from raw
-/// `u64` milliseconds into `Duration`s so nothing downstream repeats that
-/// conversion.
+/// The process-wide knobs that never vary per request: only the reported
+/// input token count. Everything that *does* vary per request -- TTFT,
+/// inter-token delay, output length -- comes from the resolved
+/// [`crate::profiles::Profile`] instead; see `handler.rs`.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamConfig {
-    /// Delay before the very first frame of a stream (the role-delta /
-    /// `message_start` frame). Zero means "no delay", handled by skipping
-    /// the sleep entirely -- see [`maybe_sleep`].
-    pub ttft: Duration,
-    /// Delay before each content-bearing chunk.
-    pub inter_token: Duration,
-    /// Number of content-delta chunks to stream, and the reported
-    /// `output_tokens`/`completion_tokens`.
-    pub tokens: u32,
     /// Reported input token count.
     pub prompt_tokens: u32,
 }
@@ -65,6 +63,22 @@ pub struct StreamConfig {
 /// zero), then emit `.1` as one already-framed SSE chunk (`data: ...\n\n` or
 /// `event: ...\ndata: ...\n\n`).
 pub type Step = (Duration, Bytes);
+
+/// This request's draw from a [`crate::profiles::Profile`]: how long to
+/// wait before the first frame, and one freshly-drawn inter-token delay per
+/// content chunk (its length is `k`, the number of chunks to stream).
+pub struct Draw {
+    pub ttft: Duration,
+    pub inter_token_delays: Vec<Duration>,
+}
+
+impl Draw {
+    /// Number of content-delta chunks this draw calls for -- also the
+    /// reported `output_tokens`/`completion_tokens`.
+    pub fn k(&self) -> u32 {
+        self.inter_token_delays.len() as u32
+    }
+}
 
 const CONTENT_CHUNK_TEXT: &str = "token ";
 const NON_STREAMING_CONTENT: &str = "This is a mock response from mock-upstream.";
@@ -81,17 +95,16 @@ fn sse_event_frame(event: &str, value: &serde_json::Value) -> Bytes {
 
 /// Pre-rendered OpenAI `chat.completion.chunk` fragments.
 pub struct OpenAiFrames {
-    ttft: Duration,
     created: i64,
-    /// The model-independent tail of every stream this process serves:
-    /// `tokens` content-delta chunks (each preceded by `inter_token`), the
-    /// final usage chunk, then `data: [DONE]`. Built once; shared by every
-    /// request via `Arc`.
-    tail: Arc<Vec<Step>>,
+    /// The single content-delta fragment shared by every stream this
+    /// process serves, at every position -- see the module doc. Cloning it
+    /// `k` times per request is a refcount bump each, not a re-render.
+    content_delta: Bytes,
+    done: Bytes,
 }
 
 impl OpenAiFrames {
-    pub fn new(cfg: &StreamConfig) -> Self {
+    pub fn new() -> Self {
         let created = unix_time_secs();
         let content_delta = sse_data_frame(&json!({
             "id": "chatcmpl-mock",
@@ -103,30 +116,12 @@ impl OpenAiFrames {
                 "finish_reason": null,
             }],
         }));
-        let final_usage = sse_data_frame(&json!({
-            "id": "chatcmpl-mock",
-            "object": "chat.completion.chunk",
-            "created": created,
-            "choices": [],
-            "usage": {
-                "prompt_tokens": cfg.prompt_tokens,
-                "completion_tokens": cfg.tokens,
-                "total_tokens": cfg.prompt_tokens + cfg.tokens,
-            },
-        }));
         let done = Bytes::from_static(b"data: [DONE]\n\n");
 
-        let mut tail = Vec::with_capacity(cfg.tokens as usize + 2);
-        for _ in 0..cfg.tokens {
-            tail.push((cfg.inter_token, content_delta.clone()));
-        }
-        tail.push((Duration::ZERO, final_usage));
-        tail.push((Duration::ZERO, done));
-
         Self {
-            ttft: cfg.ttft,
             created,
-            tail: Arc::new(tail),
+            content_delta,
+            done,
         }
     }
 
@@ -144,18 +139,49 @@ impl OpenAiFrames {
         }))
     }
 
+    fn final_usage(&self, prompt_tokens: u32, k: u32) -> Bytes {
+        sse_data_frame(&json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": k,
+                "total_tokens": prompt_tokens + k,
+            },
+        }))
+    }
+
     /// Build this request's streaming response body: the `ttft`-delayed,
-    /// model-bearing leading chunk, followed by the shared static tail.
-    pub fn stream_body(&self, model: &str) -> ResponseBody {
-        steps_body((self.ttft, self.role_delta(model)), self.tail.clone())
+    /// model-bearing leading chunk; `draw.k()` content-delta chunks, each
+    /// preceded by its own freshly-drawn inter-token delay; a usage chunk
+    /// reporting `draw.k()` completion tokens; then `data: [DONE]`. Every
+    /// content-delta chunk is a clone of the one fragment rendered in
+    /// [`Self::new`] -- see the module doc.
+    pub fn stream_body(&self, model: &str, prompt_tokens: u32, draw: Draw) -> ResponseBody {
+        let k = draw.k();
+        let mut tail = Vec::with_capacity(draw.inter_token_delays.len() + 2);
+        for delay in draw.inter_token_delays {
+            tail.push((delay, self.content_delta.clone()));
+        }
+        tail.push((Duration::ZERO, self.final_usage(prompt_tokens, k)));
+        tail.push((Duration::ZERO, self.done.clone()));
+        steps_body((draw.ttft, self.role_delta(model)), tail)
+    }
+}
+
+impl Default for OpenAiFrames {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// Non-streaming `chat.completion` body. Built fresh per request (one
-/// `serde_json` allocation, not looped over `--tokens`) since it is only
-/// ever rendered once -- unlike the streaming tail above, there is no
+/// `serde_json` allocation, not looped over `k`) since it is only ever
+/// rendered once regardless -- unlike the streaming tail above, there is no
 /// repeated-per-chunk cost to avoid here.
-pub fn openai_completion_body(cfg: &StreamConfig, model: &str) -> Bytes {
+pub fn openai_completion_body(prompt_tokens: u32, k: u32, model: &str) -> Bytes {
     let value = json!({
         "id": "chatcmpl-mock",
         "object": "chat.completion",
@@ -167,9 +193,9 @@ pub fn openai_completion_body(cfg: &StreamConfig, model: &str) -> Bytes {
             "finish_reason": "stop",
         }],
         "usage": {
-            "prompt_tokens": cfg.prompt_tokens,
-            "completion_tokens": cfg.tokens,
-            "total_tokens": cfg.prompt_tokens + cfg.tokens,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": k,
+            "total_tokens": prompt_tokens + k,
         },
     });
     Bytes::from(serde_json::to_vec(&value).expect("value is always serializable"))
@@ -179,13 +205,13 @@ pub fn openai_completion_body(cfg: &StreamConfig, model: &str) -> Bytes {
 
 /// Pre-rendered Anthropic Messages fragments.
 pub struct AnthropicFrames {
-    ttft: Duration,
     prompt_tokens: u32,
-    /// The model-independent tail: `content_block_start`, `tokens` ×
-    /// `content_block_delta` (each preceded by `inter_token`),
-    /// `content_block_stop`, `message_delta` (carrying the final
-    /// `output_tokens`), then `message_stop`. Built once; shared via `Arc`.
-    tail: Arc<Vec<Step>>,
+    content_block_start: Bytes,
+    /// The single content-delta fragment shared by every stream this
+    /// process serves, at every position -- see the module doc.
+    content_block_delta: Bytes,
+    content_block_stop: Bytes,
+    message_stop: Bytes,
 }
 
 impl AnthropicFrames {
@@ -210,29 +236,14 @@ impl AnthropicFrames {
             "content_block_stop",
             &json!({"type": "content_block_stop", "index": 0}),
         );
-        let message_delta = sse_event_frame(
-            "message_delta",
-            &json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                "usage": {"output_tokens": cfg.tokens},
-            }),
-        );
         let message_stop = sse_event_frame("message_stop", &json!({"type": "message_stop"}));
 
-        let mut tail = Vec::with_capacity(cfg.tokens as usize + 4);
-        tail.push((Duration::ZERO, content_block_start));
-        for _ in 0..cfg.tokens {
-            tail.push((cfg.inter_token, content_block_delta.clone()));
-        }
-        tail.push((Duration::ZERO, content_block_stop));
-        tail.push((Duration::ZERO, message_delta));
-        tail.push((Duration::ZERO, message_stop));
-
         Self {
-            ttft: cfg.ttft,
             prompt_tokens: cfg.prompt_tokens,
-            tail: Arc::new(tail),
+            content_block_start,
+            content_block_delta,
+            content_block_stop,
+            message_stop,
         }
     }
 
@@ -253,18 +264,41 @@ impl AnthropicFrames {
         )
     }
 
+    fn message_delta(&self, k: u32) -> Bytes {
+        sse_event_frame(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": k},
+            }),
+        )
+    }
+
     /// Build this request's streaming response body: the `ttft`-delayed,
-    /// model-bearing `message_start` frame, followed by the shared static
-    /// tail.
-    pub fn stream_body(&self, model: &str) -> ResponseBody {
-        steps_body((self.ttft, self.message_start(model)), self.tail.clone())
+    /// model-bearing `message_start` frame; `content_block_start`;
+    /// `draw.k()` content-delta chunks, each preceded by its own
+    /// freshly-drawn inter-token delay; `content_block_stop`;
+    /// `message_delta` (carrying `draw.k()` as `output_tokens`); then
+    /// `message_stop`.
+    pub fn stream_body(&self, model: &str, draw: Draw) -> ResponseBody {
+        let k = draw.k();
+        let mut tail = Vec::with_capacity(draw.inter_token_delays.len() + 4);
+        tail.push((Duration::ZERO, self.content_block_start.clone()));
+        for delay in draw.inter_token_delays {
+            tail.push((delay, self.content_block_delta.clone()));
+        }
+        tail.push((Duration::ZERO, self.content_block_stop.clone()));
+        tail.push((Duration::ZERO, self.message_delta(k)));
+        tail.push((Duration::ZERO, self.message_stop.clone()));
+        steps_body((draw.ttft, self.message_start(model)), tail)
     }
 }
 
 /// Non-streaming Anthropic `message` body. Same reasoning as
 /// `openai_completion_body`: built fresh per request since it is rendered
 /// exactly once, not looped.
-pub fn anthropic_message_body(cfg: &StreamConfig, model: &str) -> Bytes {
+pub fn anthropic_message_body(prompt_tokens: u32, k: u32, model: &str) -> Bytes {
     let value = json!({
         "id": "msg_mock",
         "type": "message",
@@ -273,8 +307,8 @@ pub fn anthropic_message_body(cfg: &StreamConfig, model: &str) -> Bytes {
         "content": [{"type": "text", "text": NON_STREAMING_CONTENT}],
         "stop_reason": "end_turn",
         "usage": {
-            "input_tokens": cfg.prompt_tokens,
-            "output_tokens": cfg.tokens,
+            "input_tokens": prompt_tokens,
+            "output_tokens": k,
         },
     });
     Bytes::from(serde_json::to_vec(&value).expect("value is always serializable"))
@@ -283,7 +317,10 @@ pub fn anthropic_message_body(cfg: &StreamConfig, model: &str) -> Bytes {
 // -------------------------------------------------------- shared plumbing --
 
 /// A cursor over one request's frame sequence: the request-specific leading
-/// step (carrying the echoed model), then the shared, `Arc`-held tail.
+/// step (carrying the echoed model), then the request-specific tail built in
+/// `stream_body` above (owned outright now -- it embeds this request's own
+/// drawn delays and token count, so unlike the pre-scale-test version there
+/// is nothing left to share across requests via `Arc`).
 ///
 /// Rust note: this is the state type for the [`futures::stream::unfold`]
 /// below -- `unfold` builds a `Stream` out of a plain "given the current
@@ -292,8 +329,8 @@ pub fn anthropic_message_body(cfg: &StreamConfig, model: &str) -> Bytes {
 /// own `Future`/`Stream` impls (both of which would need unsafe-free but
 /// fiddly manual `Pin` handling to write by hand).
 enum StepCursor {
-    Leading(Step, Arc<Vec<Step>>),
-    Tail(Arc<Vec<Step>>, usize),
+    Leading(Step, Vec<Step>),
+    Tail(Vec<Step>, usize),
 }
 
 async fn maybe_sleep(delay: Duration) {
@@ -308,7 +345,7 @@ async fn maybe_sleep(delay: Duration) {
 
 fn step_stream(
     leading: Step,
-    tail: Arc<Vec<Step>>,
+    tail: Vec<Step>,
 ) -> impl Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + 'static {
     stream::unfold(StepCursor::Leading(leading, tail), |cursor| async move {
         match cursor {
@@ -325,9 +362,10 @@ fn step_stream(
     })
 }
 
-/// Turn a leading step plus a shared tail into a boxed streaming response
-/// body. Shared by both dialects above since the cursor shape is identical.
-fn steps_body(leading: Step, tail: Arc<Vec<Step>>) -> ResponseBody {
+/// Turn a leading step plus this request's tail into a boxed streaming
+/// response body. Shared by both dialects above since the cursor shape is
+/// identical.
+fn steps_body(leading: Step, tail: Vec<Step>) -> ResponseBody {
     StreamBody::new(step_stream(leading, tail)).boxed()
 }
 
@@ -353,11 +391,17 @@ mod tests {
     use super::*;
 
     fn cfg() -> StreamConfig {
-        StreamConfig {
+        StreamConfig { prompt_tokens: 10 }
+    }
+
+    /// A fixed, no-jitter draw of exactly `k` content chunks -- most tests
+    /// here care about frame *shape* and token *counts*, not timing, so this
+    /// keeps them fast and deterministic. Timing/length variation itself is
+    /// covered in `handler.rs`'s tests, which exercise the RNG draw path.
+    fn fixed_draw(k: u32) -> Draw {
+        Draw {
             ttft: Duration::ZERO,
-            inter_token: Duration::ZERO,
-            tokens: 3,
-            prompt_tokens: 10,
+            inter_token_delays: vec![Duration::ZERO; k as usize],
         }
     }
 
@@ -375,8 +419,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_stream_shape_and_counts() {
-        let frames = OpenAiFrames::new(&cfg());
-        let chunks = collect_frames(frames.stream_body("gpt-4o-mini")).await;
+        let frames = OpenAiFrames::new();
+        let chunks = collect_frames(frames.stream_body("gpt-4o-mini", 10, fixed_draw(3))).await;
         // role-delta + 3 content-delta + usage + [DONE]
         assert_eq!(chunks.len(), 6);
         let role = String::from_utf8(chunks[0].to_vec()).unwrap();
@@ -394,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_non_streaming_echoes_model_and_usage() {
-        let body = openai_completion_body(&cfg(), "gpt-4o-mini");
+        let body = openai_completion_body(10, 3, "gpt-4o-mini");
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["model"], "gpt-4o-mini");
         assert_eq!(value["usage"]["prompt_tokens"], 10);
@@ -405,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_stream_shape_and_counts() {
         let frames = AnthropicFrames::new(&cfg());
-        let chunks = collect_frames(frames.stream_body("claude-3-haiku")).await;
+        let chunks = collect_frames(frames.stream_body("claude-3-haiku", fixed_draw(3))).await;
         // message_start + content_block_start + 3 delta + content_block_stop
         // + message_delta + message_stop
         assert_eq!(chunks.len(), 8);
@@ -422,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_non_streaming_echoes_model_and_usage() {
-        let body = anthropic_message_body(&cfg(), "claude-3-haiku");
+        let body = anthropic_message_body(10, 3, "claude-3-haiku");
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["model"], "claude-3-haiku");
         assert_eq!(value["usage"]["input_tokens"], 10);
@@ -432,27 +476,64 @@ mod tests {
 
     #[tokio::test]
     async fn zero_tokens_still_yields_terminal_frames() {
-        let mut c = cfg();
-        c.tokens = 0;
-        let frames = OpenAiFrames::new(&c);
-        let chunks = collect_frames(frames.stream_body("m")).await;
+        let frames = OpenAiFrames::new();
+        let chunks = collect_frames(frames.stream_body("m", 10, fixed_draw(0))).await;
         // role-delta + usage + [DONE], no content chunks.
         assert_eq!(chunks.len(), 3);
         assert_eq!(&chunks[2][..], b"data: [DONE]\n\n");
     }
 
-    /// The whole point of the shared `tail`: two requests against the same
-    /// `OpenAiFrames` must not affect each other's echoed model.
+    /// The whole point of building the tail per request: two requests
+    /// against the same `OpenAiFrames` must not affect each other's echoed
+    /// model or drawn length.
     #[tokio::test]
     async fn two_requests_get_independent_models() {
-        let frames = OpenAiFrames::new(&cfg());
-        let a = collect_frames(frames.stream_body("model-a")).await;
-        let b = collect_frames(frames.stream_body("model-b")).await;
+        let frames = OpenAiFrames::new();
+        let a = collect_frames(frames.stream_body("model-a", 10, fixed_draw(3))).await;
+        let b = collect_frames(frames.stream_body("model-b", 10, fixed_draw(3))).await;
         assert!(String::from_utf8(a[0].to_vec())
             .unwrap()
             .contains("model-a"));
         assert!(String::from_utf8(b[0].to_vec())
             .unwrap()
             .contains("model-b"));
+    }
+
+    /// A streamed response with a different `k` per request must end with
+    /// the correct terminal frame and a `usage`/`output_tokens` matching the
+    /// number of content chunks actually sent -- for both dialects. This is
+    /// the acceptance check that varying length never desyncs the reported
+    /// count from the real one.
+    #[tokio::test]
+    async fn openai_usage_always_matches_actual_chunk_count() {
+        let frames = OpenAiFrames::new();
+        for k in [0u32, 1, 7, 50] {
+            let chunks = collect_frames(frames.stream_body("m", 10, fixed_draw(k))).await;
+            assert_eq!(chunks.len() as u32, k + 3, "k={k}"); // role + k + usage + [DONE]
+            assert_eq!(&chunks[chunks.len() - 1][..], b"data: [DONE]\n\n", "k={k}");
+            let usage = String::from_utf8(chunks[chunks.len() - 2].to_vec()).unwrap();
+            assert!(
+                usage.contains(&format!("\"completion_tokens\":{k}")),
+                "k={k} usage={usage}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_always_matches_actual_chunk_count() {
+        let frames = AnthropicFrames::new(&cfg());
+        for k in [0u32, 1, 7, 50] {
+            let chunks = collect_frames(frames.stream_body("m", fixed_draw(k))).await;
+            // message_start + content_block_start + k content_block_delta +
+            // content_block_stop + message_delta + message_stop
+            assert_eq!(chunks.len() as u32, k + 5, "k={k}");
+            let last = String::from_utf8(chunks[chunks.len() - 1].to_vec()).unwrap();
+            assert!(last.starts_with("event: message_stop\n"), "k={k}");
+            let message_delta = String::from_utf8(chunks[chunks.len() - 2].to_vec()).unwrap();
+            assert!(
+                message_delta.contains(&format!("\"output_tokens\":{k}")),
+                "k={k} message_delta={message_delta}"
+            );
+        }
     }
 }

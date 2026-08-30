@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 
 use mockupstream::frames::StreamConfig;
 use mockupstream::handler::{self, AppState};
+use mockupstream::profiles::{Dist, Profile, ProfileFile, ProfileSet, DEFAULT_PROFILE};
 use mockupstream::stats;
 
 /// Which downstream HTTP protocol builder to use for every accepted
@@ -63,21 +64,35 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Protocol::Auto)]
     protocol: Protocol,
 
-    /// Delay before the first streamed chunk, in ms.
+    /// Fixed TTFT, in ms, for the `default` profile -- the response shape
+    /// used when a request's `model` names none of the built-in or
+    /// `--profiles`-file profiles (see `mockupstream::profiles`). Every
+    /// *named* profile (`mock-fast-short`/`mock-medium`/`mock-slow-long`)
+    /// draws its own TTFT from its own range regardless of this flag.
     #[arg(long = "ttft-ms", default_value_t = 0)]
     ttft_ms: u64,
 
-    /// Delay between subsequent content chunks, in ms.
+    /// Fixed inter-token delay, in ms, for the `default` profile. See
+    /// `--ttft-ms`.
     #[arg(long = "inter-token-ms", default_value_t = 0)]
     inter_token_ms: u64,
 
-    /// Number of streamed content chunks (and the reported `output_tokens`).
+    /// Fixed streamed content-chunk count (and reported `output_tokens`)
+    /// for the `default` profile. See `--ttft-ms`.
     #[arg(long, default_value_t = 16)]
     tokens: u32,
 
-    /// Reported input token count.
+    /// Reported input token count -- shared by every profile; only output
+    /// length/timing vary per profile (see `internal-docs/scale-test-plan.md`
+    /// §3, which varies output shape, not input).
     #[arg(long = "prompt-tokens", default_value_t = 10)]
     prompt_tokens: u32,
+
+    /// Optional JSON file of named profiles to add to (or override in,
+    /// including `"default"`) the built-in `mock-fast-short`/`mock-medium`/
+    /// `mock-slow-long` set. See `mockupstream::profiles::ProfileFile`.
+    #[arg(long = "profiles")]
+    profiles: Option<std::path::PathBuf>,
 
     /// Print served-request counters to stderr on this interval, in
     /// seconds. 0 (the default) disables the printer.
@@ -108,12 +123,23 @@ async fn main() -> anyhow::Result<()> {
     std::io::stdout().flush()?;
 
     let cfg = StreamConfig {
-        ttft: Duration::from_millis(cli.ttft_ms),
-        inter_token: Duration::from_millis(cli.inter_token_ms),
-        tokens: cli.tokens,
         prompt_tokens: cli.prompt_tokens,
     };
-    let state = Arc::new(AppState::new(cfg));
+    let default_profile = Profile {
+        name: DEFAULT_PROFILE.to_string(),
+        ttft_ms: Dist::fixed(cli.ttft_ms),
+        inter_token_ms: Dist::fixed(cli.inter_token_ms),
+        length: Dist::fixed(cli.tokens as u64),
+    };
+    let mut profiles = ProfileSet::with_builtins(default_profile);
+    if let Some(path) = &cli.profiles {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading --profiles {path:?}: {e}"))?;
+        let file: ProfileFile = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("parsing --profiles {path:?}: {e}"))?;
+        profiles.merge_file(file);
+    }
+    let state = Arc::new(AppState::new(cfg, profiles));
     stats::spawn_printer(
         state.stats.clone(),
         Duration::from_secs(cli.stats_interval_secs),

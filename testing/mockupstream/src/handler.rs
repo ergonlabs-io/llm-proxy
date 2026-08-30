@@ -1,5 +1,6 @@
 //! Routes the four endpoints this mock upstream speaks, reads (and caps)
-//! the request body, and dispatches to the pre-rendered response builders in
+//! the request body, resolves a response [`crate::profiles::Profile`] by
+//! `model`, and dispatches to the pre-rendered response builders in
 //! [`crate::frames`].
 
 use std::sync::Arc;
@@ -8,33 +9,78 @@ use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use serde_json::json;
 
-use crate::frames::{self, AnthropicFrames, OpenAiFrames, ResponseBody, StreamConfig};
+use crate::frames::{self, AnthropicFrames, Draw, OpenAiFrames, ResponseBody, StreamConfig};
+use crate::profiles::{Profile, ProfileSet};
 use crate::request::{self, MAX_BODY_BYTES};
 use crate::stats::Stats;
 
 /// Everything one accepted connection's request handlers share: the
-/// pre-rendered frame sets (one build per process, at startup) and the
-/// request counters. Cheap to clone (an `Arc` bump) per connection/request.
+/// pre-rendered frame sets (one build per process, at startup), the profile
+/// table, and the request counters. Cheap to clone (an `Arc` bump) per
+/// connection/request.
 pub struct AppState {
     openai: OpenAiFrames,
     anthropic: AnthropicFrames,
-    openai_cfg: StreamConfig,
-    anthropic_cfg: StreamConfig,
+    prompt_tokens: u32,
+    profiles: ProfileSet,
     pub stats: Arc<Stats>,
 }
 
 impl AppState {
-    pub fn new(cfg: StreamConfig) -> Self {
+    pub fn new(cfg: StreamConfig, profiles: ProfileSet) -> Self {
         Self {
-            openai: OpenAiFrames::new(&cfg),
+            openai: OpenAiFrames::new(),
             anthropic: AnthropicFrames::new(&cfg),
-            openai_cfg: cfg,
-            anthropic_cfg: cfg,
+            prompt_tokens: cfg.prompt_tokens,
+            profiles,
             stats: Arc::new(Stats::default()),
         }
     }
+}
+
+/// Draw this request's timing/length from its resolved profile, given an
+/// RNG. Split out from [`draw_response_shape`] so a test can hand it a
+/// seeded `SmallRng` and get a reproducible draw -- see this module's tests.
+fn draw_response_shape_with_rng(profile: &Profile, rng: &mut impl Rng) -> Draw {
+    let ttft = profile.sample_ttft(rng);
+    let k = profile.sample_length(rng);
+    let inter_token_delays = (0..k).map(|_| profile.sample_inter_token(rng)).collect();
+    Draw {
+        ttft,
+        inter_token_delays,
+    }
+}
+
+/// Draw this request's timing/length from its resolved profile.
+///
+/// Rust note: `SmallRng` is a fast, non-cryptographic PRNG -- exactly what a
+/// mock's response shaping needs, unlike `StdRng`/`thread_rng`'s stronger
+/// (and slower) guarantees. Seeding a fresh one per request from the OS
+/// (`from_entropy`) keeps it entirely on the stack of this one request's
+/// task: no shared `Mutex`/`RwLock`-guarded generator, so nothing here ever
+/// contends a lock across the `.await`s in `frames::stream_body` -- the
+/// crate doc's "no `Mutex` on the request path" rule, extended to the new
+/// per-request randomness.
+fn draw_response_shape(profile: &Profile) -> Draw {
+    let mut rng = SmallRng::from_entropy();
+    draw_response_shape_with_rng(profile, &mut rng)
+}
+
+/// Non-streaming responses don't need TTFT/inter-token delays (there's
+/// nothing to pace -- the whole body goes out at once), just the drawn
+/// output length. Same split-for-testability shape as
+/// [`draw_response_shape`]/[`draw_response_shape_with_rng`].
+fn draw_length_with_rng(profile: &Profile, rng: &mut impl Rng) -> u32 {
+    profile.sample_length(rng)
+}
+
+fn draw_length(profile: &Profile) -> u32 {
+    let mut rng = SmallRng::from_entropy();
+    draw_length_with_rng(profile, &mut rng)
 }
 
 /// Handle one request. Infallible at the HTTP level -- every outcome this
@@ -84,23 +130,38 @@ async fn handle_dialect(
     // `parse_request_meta`.
     state.stats.record_request(meta.stream);
 
+    // A `model` naming no configured profile is load-test input, not an
+    // error -- `resolve` always returns something (`ProfileSet`'s
+    // `"default"` entry, never removable). See `crate::profiles`.
+    let profile = state.profiles.resolve(&meta.model);
+
     match dialect {
         Dialect::OpenAi => {
             if meta.stream {
-                sse_response(state.openai.stream_body(&meta.model))
+                let draw = draw_response_shape(profile);
+                sse_response(
+                    state
+                        .openai
+                        .stream_body(&meta.model, state.prompt_tokens, draw),
+                )
             } else {
+                let k = draw_length(profile);
                 json_response(frames::openai_completion_body(
-                    &state.openai_cfg,
+                    state.prompt_tokens,
+                    k,
                     &meta.model,
                 ))
             }
         }
         Dialect::Anthropic => {
             if meta.stream {
-                sse_response(state.anthropic.stream_body(&meta.model))
+                let draw = draw_response_shape(profile);
+                sse_response(state.anthropic.stream_body(&meta.model, draw))
             } else {
+                let k = draw_length(profile);
                 json_response(frames::anthropic_message_body(
-                    &state.anthropic_cfg,
+                    state.prompt_tokens,
+                    k,
                     &meta.model,
                 ))
             }
@@ -152,4 +213,64 @@ fn json_error(status: StatusCode, message: &str) -> Response<ResponseBody> {
         .header("content-type", "application/json")
         .body(frames::full_body(Bytes::from(body)))
         .expect("status/headers are always valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiles::Dist;
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
+
+    fn profile(
+        name: &str,
+        ttft: (u64, u64),
+        inter_token: (u64, u64),
+        length: (u64, u64),
+    ) -> Profile {
+        Profile {
+            name: name.to_string(),
+            ttft_ms: Dist {
+                min: ttft.0,
+                max: ttft.1,
+            },
+            inter_token_ms: Dist {
+                min: inter_token.0,
+                max: inter_token.1,
+            },
+            length: Dist {
+                min: length.0,
+                max: length.1,
+            },
+        }
+    }
+
+    /// Acceptance: two requests to the same profile draw different lengths
+    /// and/or timings. Seeded so the test itself is deterministic, per
+    /// `draw_response_shape_with_rng`'s doc -- this is the pure sampler this
+    /// module's production `draw_response_shape` is a thin `from_entropy`
+    /// wrapper around.
+    #[test]
+    fn two_draws_against_the_same_profile_differ() {
+        let p = profile("mock-medium", (200, 400), (15, 30), (300, 600));
+        let mut rng_a = SmallRng::seed_from_u64(1);
+        let mut rng_b = SmallRng::seed_from_u64(2);
+        let a = draw_response_shape_with_rng(&p, &mut rng_a);
+        let b = draw_response_shape_with_rng(&p, &mut rng_b);
+        assert!(
+            a.ttft != b.ttft || a.k() != b.k() || a.inter_token_delays != b.inter_token_delays,
+            "two differently-seeded draws against the same profile produced identical output"
+        );
+    }
+
+    /// Same property for the non-streaming length draw.
+    #[test]
+    fn two_length_draws_against_the_same_profile_can_differ() {
+        let p = profile("mock-medium", (200, 400), (15, 30), (300, 600));
+        let mut rng_a = SmallRng::seed_from_u64(1);
+        let mut rng_b = SmallRng::seed_from_u64(2);
+        let a = draw_length_with_rng(&p, &mut rng_a);
+        let b = draw_length_with_rng(&p, &mut rng_b);
+        assert_ne!(a, b);
+    }
 }

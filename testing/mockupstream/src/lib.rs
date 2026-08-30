@@ -19,11 +19,17 @@
 //!   out of a request body, and nothing else -- the body itself is never
 //!   retained.
 //! - [`frames`]: pre-rendered `Bytes` fragments for both dialects'
-//!   streaming and non-streaming response shapes, built once at startup
-//!   from the CLI's `--ttft-ms`/`--inter-token-ms`/`--tokens`/
-//!   `--prompt-tokens`.
+//!   streaming and non-streaming response shapes -- the content-delta
+//!   fragment rendered once at startup, the length/timing-dependent
+//!   terminal frame rendered fresh per request. See its module doc.
+//! - [`profiles`]: named per-request distributions for TTFT, inter-token
+//!   delay, and streamed length (`mock-fast-short`/`mock-medium`/
+//!   `mock-slow-long` built in, `--profiles <file>` to add/override),
+//!   selected by the request's `model` -- see
+//!   `internal-docs/scale-test-plan.md` §3/§5.
 //! - [`handler`]: routes `POST /v1/chat/completions`, `POST /v1/messages`,
-//!   `GET /health`, and turns anything else into a 404.
+//!   `GET /health`, turns anything else into a 404, and draws each
+//!   request's timing/length from its resolved profile.
 //! - [`stats`]: `AtomicU64` request counters and the optional periodic
 //!   stderr printer (`--stats-interval-secs`).
 //!
@@ -33,5 +39,6 @@
 
 pub mod frames;
 pub mod handler;
+pub mod profiles;
 pub mod request;
 pub mod stats;
