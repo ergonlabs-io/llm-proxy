@@ -496,6 +496,16 @@ const INITIAL_BIND_TIMEOUT: Duration = Duration::from_secs(10);
 /// collector, without holding an unbounded amount of memory.
 const SPAN_SINK_CAPACITY: usize = 4096;
 
+/// WP-50 increment 3b-ii, W4: env var carrying the admin write API's bearer
+/// token, mirroring `keygen`'s own `SECRET_ENV_VAR` (`LLMPROXY_AUTH_SECRET`)
+/// convention -- an operator-supplied credential lives in the environment,
+/// never in the bootstrap config, so a config dump or a checked-in file can
+/// never leak it. `start_admin` reads this exactly once and passes the
+/// result into `proxy_admin::serve` as a plain parameter rather than letting
+/// that crate read the environment itself -- see `serve`'s own doc for why
+/// (`std::env::set_var` is process-global and racy across parallel tests).
+const ADMIN_TOKEN_ENV_VAR: &str = "LLMPROXY_ADMIN_TOKEN";
+
 async fn run_serve(
     concurrency: usize,
     drain_time: Duration,
@@ -652,6 +662,7 @@ async fn run_serve(
         registry.clone(),
         Instant::now(),
         &snapshot_handles,
+        factory_state.clone(),
     )
     .await
     {
@@ -951,20 +962,38 @@ async fn wait_for_initial_binds(
 /// A bind failure is returned as an `Err`, not swallowed: `run_serve` turns
 /// it into a startup failure, holding the admin port to the same standard
 /// `initial_bind` holds every listener port to.
+///
+/// `factory_state` is `run_serve`'s ONE per-serve [`proxy_http::filter::SharedFactoryState`]
+/// -- the admin write API resolves its `ControlPlane` out of it per request
+/// (see `proxy_admin::server`'s module doc for why that resolution can't
+/// happen here or at `serve()` time: this function runs before the worker
+/// pool spawns, so nothing has registered into the slot yet). This function
+/// also reads [`ADMIN_TOKEN_ENV_VAR`] once and passes the result to
+/// `proxy_admin::serve` as a plain parameter, per that function's own doc on
+/// why it never reads the environment itself.
 async fn start_admin(
     admin: Option<SocketAddr>,
     snapshot: Arc<ConfigSnapshot>,
     registry: Arc<proxy_observability::stats::Registry>,
     started_at: Instant,
     snapshot_handles: &SnapshotHandles,
+    factory_state: Arc<proxy_http::filter::SharedFactoryState>,
 ) -> Result<Option<proxy_admin::AdminServer>, String> {
     let Some(addr) = admin else {
         return Ok(None);
     };
     let config = snapshot_handles.register(snapshot);
-    let server = proxy_admin::serve(addr, config, Some(registry), started_at)
-        .await
-        .map_err(|err| err.to_string())?;
+    let admin_token = std::env::var(ADMIN_TOKEN_ENV_VAR).ok();
+    let server = proxy_admin::serve(
+        addr,
+        config,
+        Some(registry),
+        started_at,
+        factory_state,
+        admin_token,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
     Ok(Some(server))
 }
 
@@ -1183,6 +1212,7 @@ mod tests {
             test_registry(),
             Instant::now(),
             &SnapshotHandles::new(),
+            Arc::new(proxy_http::filter::SharedFactoryState::default()),
         )
         .await
         .expect("start_admin(None, ..) must not fail");
@@ -1207,6 +1237,7 @@ mod tests {
             test_registry(),
             Instant::now(),
             &SnapshotHandles::new(),
+            Arc::new(proxy_http::filter::SharedFactoryState::default()),
         )
         .await
         .expect("start_admin should succeed on an available port")
@@ -1236,6 +1267,7 @@ mod tests {
             test_registry(),
             Instant::now(),
             &snapshot_handles,
+            Arc::new(proxy_http::filter::SharedFactoryState::default()),
         )
         .await
         .expect("start_admin should succeed on an available port")

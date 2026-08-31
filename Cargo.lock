@@ -1356,12 +1356,16 @@ dependencies = [
 name = "proxy-admin"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "http-body-util",
  "hyper",
  "hyper-util",
  "proxy-config",
  "proxy-core",
+ "proxy-filters",
+ "proxy-http",
  "proxy-observability",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

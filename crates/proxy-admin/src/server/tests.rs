@@ -6,10 +6,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::client::conn::http1 as client_http1;
-use hyper::{Request, StatusCode};
+use hyper::{HeaderMap, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy_config::ir::{
     ClusterConfig, ClusterKind, CodecType, ConfigSnapshot, DiscoveryType, EndpointIR,
@@ -19,12 +19,30 @@ use proxy_config::ir::{
     SnapshotVersion, UpstreamProtocol, VirtualHostIR,
 };
 use proxy_core::runtime::SnapshotHandles;
+use proxy_filters::auth::{
+    AuthError, AuthOutcome, Authenticator, HmacSecret, KeySet, VirtualKeyAuthenticator,
+};
+use proxy_filters::auth_filter;
+use proxy_filters::control::{ControlPlane, InMemoryControlPlaneStore};
+use proxy_filters::model_authz::ModelAccess;
+use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{
     instruments, prometheus_render, Registry, StatsControl, WorkerId,
 };
 use tokio::net::TcpStream;
 
 use crate::server::{serve, AdminServer};
+
+/// The HMAC secret every write-API test's `ControlPlane` and matching
+/// [`VirtualKeyAuthenticator`] are built with -- arbitrary, but shared
+/// between the two so a plaintext key minted through the admin API actually
+/// verifies when a test re-derives its digest.
+const TEST_HMAC_SECRET: &[u8] = b"admin-write-api-test-secret";
+
+/// The bearer token every write-API test that needs one configures --
+/// distinctive enough that a wrong-token test can pick something else
+/// entirely without risk of an accidental match.
+const ADMIN_TOKEN: &str = "test-admin-token-9f3c";
 
 /// The literal secret this module never expects to see anywhere in a
 /// `/config_dump` response body -- distinctive enough that a partial/prefix
@@ -148,10 +166,29 @@ async fn start(snapshot: Arc<ConfigSnapshot>) -> (AdminServer, SocketAddr) {
 
 /// [`start`], but with an explicit (possibly `Some`) WP-23 stats registry --
 /// what `/stats`'s own tests need to exercise both the wired and unwired
-/// cases.
+/// cases. No `SharedFactoryState` singleton and no admin token -- what every
+/// read-only test needs, and (see test 10 in this file) also what proves
+/// reads are unaffected by the write API's gate.
 async fn start_with_registry(
     snapshot: Arc<ConfigSnapshot>,
     registry: Option<Arc<Registry>>,
+) -> (AdminServer, SocketAddr) {
+    start_full(
+        snapshot,
+        registry,
+        Arc::new(SharedFactoryState::default()),
+        None,
+    )
+    .await
+}
+
+/// The full [`serve`] parameter set -- what the write-API tests need to
+/// supply a real `ControlPlane` (via `factory_state`) and/or a bearer token.
+async fn start_full(
+    snapshot: Arc<ConfigSnapshot>,
+    registry: Option<Arc<Registry>>,
+    factory_state: Arc<SharedFactoryState>,
+    admin_token: Option<String>,
 ) -> (AdminServer, SocketAddr) {
     // Rust note: `SnapshotHandles::register` both builds the handle and
     // enrolls it, the same path production code (`WorkerPool::spawn`, and
@@ -163,11 +200,100 @@ async fn start_with_registry(
         config,
         registry,
         Instant::now(),
+        factory_state,
+        admin_token,
     )
     .await
     .expect("admin server bind");
     let addr = server.local_addr();
     (server, addr)
+}
+
+/// Builds a [`SharedFactoryState`] with a real [`ControlPlane`] already
+/// registered under `auth_filter::TYPE_URL` -- the exact shape a worker's
+/// `AuthFilterFactory::create` produces on the first call for a real
+/// `llmproxy.auth` filter (see that factory's own doc for the
+/// `get_or_try_init` singleton dance this mirrors). Returns the state and
+/// the `ControlPlane`'s own published-snapshot handle, so a test can
+/// `.load()` it directly to check what a mint/revoke/policy write actually
+/// published -- exactly what `crate::control`'s own tests do from inside
+/// that crate.
+fn factory_state_with_control_plane() -> (
+    Arc<SharedFactoryState>,
+    Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+) {
+    let control_plane = ControlPlane::new(
+        Box::new(InMemoryControlPlaneStore::default()),
+        HmacSecret::new(TEST_HMAC_SECRET),
+        KeySet::new(),
+    )
+    .expect("an empty store must not fail ControlPlane::new");
+    let handle = control_plane.handle();
+    let factory_state = Arc::new(SharedFactoryState::default());
+    factory_state
+        .get_or_try_init(auth_filter::TYPE_URL, || {
+            Ok(Arc::new(control_plane) as Arc<dyn std::any::Any + Send + Sync>)
+        })
+        .expect("inserting the test ControlPlane singleton must not fail");
+    (factory_state, handle)
+}
+
+/// A [`VirtualKeyAuthenticator`] over `handle`, built with the same
+/// [`TEST_HMAC_SECRET`] every test's [`ControlPlane`] uses -- what every
+/// mint/revoke test uses to prove a write actually reached the published
+/// snapshot, the same way `crate::control`'s own tests do.
+fn test_authenticator(
+    handle: Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+) -> VirtualKeyAuthenticator {
+    VirtualKeyAuthenticator::new(HmacSecret::new(TEST_HMAC_SECRET), handle)
+}
+
+fn headers_with_bearer(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        hyper::header::AUTHORIZATION,
+        hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+/// A hyper/1 client request carrying a body and an optional bearer token --
+/// the write-API counterpart of [`get`]/[`get_with_content_type`]. Returns
+/// (status, response headers, body).
+async fn request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: &str,
+) -> (StatusCode, HeaderMap, String) {
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = client_http1::handshake(io).await.expect("handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", "application/json");
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let req = builder
+        .body(Full::<Bytes>::from(body.as_bytes().to_vec()))
+        .unwrap();
+    let resp = sender.send_request(req).await.expect("send_request");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body_bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        headers,
+        String::from_utf8(body_bytes.to_vec()).expect("utf8 body"),
+    )
 }
 
 /// A minimal hyper/1 client request over a fresh connection -- returns
@@ -395,8 +521,9 @@ async fn stats_prometheus_body_is_the_summed_value_across_workers() {
     );
 }
 
-/// The mutating endpoints are explicitly out of scope for this increment;
-/// they must not accidentally work.
+/// The mutating endpoints Envoy names (`/quitquitquit`, `/drain_listeners`,
+/// `/logging`) are not part of this API at all -- unlike `/keys`/`/tenants`
+/// below, they must not accidentally work.
 #[tokio::test]
 async fn mutating_endpoints_are_404() {
     let (_server, addr) = start(snapshot_with_secret()).await;
@@ -404,4 +531,485 @@ async fn mutating_endpoints_are_404() {
         let (status, _) = get(addr, path).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "path {path} should 404");
     }
+}
+
+// --- WP-50 increment 3b-ii, W4: the admin write API + bearer gate ---------
+
+/// Rule 17: the fail-CLOSED path gets its own test. `LLMPROXY_ADMIN_TOKEN`
+/// unset (here: `serve`'s `admin_token` is `None`) must refuse the write
+/// with 403 -- and, just as important, must not have minted anything: a
+/// gate that logs a refusal but performs the write anyway is not a gate.
+#[tokio::test]
+async fn post_keys_with_no_admin_token_configured_is_forbidden_and_mints_nothing() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(snapshot_with_secret(), None, factory_state, None).await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"t1","key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body.contains("LLMPROXY_ADMIN_TOKEN"),
+        "403 body should name the env var an operator needs to set: {body}"
+    );
+
+    // Nothing must have been minted. `KeySet` exposes no public way to name
+    // an entry (by design -- see its doc), but its `Debug` impl deliberately
+    // publishes only the COUNT ("never a digest"), which is exactly enough
+    // to prove the store side of this gate stayed closed.
+    let debug = format!("{:?}", handle.load().keys);
+    assert!(
+        debug.contains("len: 0"),
+        "a refused write (no admin token configured) must not mint a key: {debug}"
+    );
+}
+
+/// Token IS configured, but the request carries no `authorization` header at
+/// all -> 401, with the RFC 7235 challenge.
+#[tokio::test]
+async fn write_without_authorization_header_is_401_with_www_authenticate_challenge() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, headers, _body) = request(
+        addr,
+        "POST",
+        "/keys",
+        None,
+        r#"{"tenant":"t1","key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(hyper::header::WWW_AUTHENTICATE),
+        Some(&hyper::header::HeaderValue::from_static("Bearer")),
+        "a 401 must carry the RFC 7235 challenge"
+    );
+}
+
+/// Token IS configured; the request presents a DIFFERENT token -> 401.
+#[tokio::test]
+async fn write_with_wrong_token_is_401() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, _body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some("definitely-not-the-configured-token"),
+        r#"{"tenant":"t1","key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The status alone would still pass if the gate answered 401 AFTER
+    // performing the write. Same reasoning as the fail-closed test above:
+    // assert the store stayed untouched, not just that the caller was told
+    // "no".
+    let debug = format!("{:?}", handle.load().keys);
+    assert!(
+        debug.contains("len: 0"),
+        "a write refused for a wrong bearer token must not mint a key: {debug}"
+    );
+}
+
+/// Token is configured and correct, but nothing has been registered into the
+/// shared factory state yet (the boot-race / no-auth-filter case) -> 503.
+#[tokio::test]
+async fn write_with_correct_token_but_no_control_plane_registered_is_503() {
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        Arc::new(SharedFactoryState::default()),
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, _body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"t1","key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// The mint flow, correctly authorized: 201, a non-empty plaintext `key`
+/// returned exactly once, and the key actually authenticates through the
+/// `ControlPlane`'s published snapshot afterward.
+#[tokio::test]
+async fn post_keys_mints_a_key_that_authenticates_and_returns_plaintext_once() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["key_id"], "key-a");
+    assert_eq!(value["tenant"], "tenant-a");
+    let plaintext = value["key"].as_str().expect("key field is a string");
+    assert!(!plaintext.is_empty(), "the minted key must not be empty");
+
+    let authenticator = test_authenticator(handle);
+    let headers = headers_with_bearer(plaintext);
+    match authenticator.authenticate(&headers) {
+        AuthOutcome::Authenticated(principal) => {
+            assert_eq!(principal.tenant.as_str(), "tenant-a");
+            assert_eq!(principal.key_id.as_str(), "key-a");
+        }
+        other => panic!(
+            "the minted key must authenticate against the published snapshot; got \
+             Rejected={} NoCredential={}",
+            matches!(other, AuthOutcome::Rejected(_)),
+            matches!(other, AuthOutcome::NoCredential)
+        ),
+    }
+}
+
+/// The important one, same shape as `config_dump_redacts_the_api_key` above:
+/// a minted plaintext key must never leak back out through a READ endpoint.
+#[tokio::test]
+async fn config_dump_and_clusters_never_leak_a_minted_plaintext_key() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let plaintext = value["key"].as_str().unwrap().to_string();
+
+    for path in ["/config_dump", "/clusters"] {
+        let (status, body) = get(addr, path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains(&plaintext),
+            "the minted plaintext key leaked into {path}: {body}"
+        );
+    }
+}
+
+/// `DELETE /keys/{id}` -> 204, and the revoked key stops authenticating
+/// through the republished snapshot.
+#[tokio::test]
+async fn delete_keys_revokes_and_snapshot_reflects_it() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let plaintext = value["key"].as_str().unwrap().to_string();
+
+    let authenticator = test_authenticator(handle);
+    let headers = headers_with_bearer(&plaintext);
+    assert!(matches!(
+        authenticator.authenticate(&headers),
+        AuthOutcome::Authenticated(_)
+    ));
+
+    let (status, _headers, _body) =
+        request(addr, "DELETE", "/keys/key-a", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    match authenticator.authenticate(&headers) {
+        AuthOutcome::Rejected(AuthError::RevokedKey) => {}
+        other => panic!(
+            "a revoked key must be rejected after republish; got Authenticated={}",
+            matches!(other, AuthOutcome::Authenticated(_))
+        ),
+    }
+}
+
+/// `POST /tenants` -> 201, `DELETE /tenants/{id}` -> 204. `ControlPlaneSnapshot`
+/// itself carries no tenant list (see `proxy_filters::control`'s own tests
+/// for the same limitation, from inside that crate) -- a policy attached to
+/// the tenant is the one per-tenant fact the published snapshot does expose,
+/// so it stands in here as the observable signal that both writes actually
+/// reached the store and were republished.
+#[tokio::test]
+async fn post_and_delete_tenants_are_reflected_in_the_snapshot() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/tenants",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-x"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["tenant"], "tenant-x");
+
+    let (status, _headers, _body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-x/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":"all"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        handle.load().policies.contains_key("tenant-x"),
+        "the policy PUT right after tenant creation must be visible in the snapshot"
+    );
+
+    let (status, _headers, _body) =
+        request(addr, "DELETE", "/tenants/tenant-x", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        !handle.load().policies.contains_key("tenant-x"),
+        "delete_tenant must remove the tenant's policy from the republished snapshot too"
+    );
+}
+
+/// `PUT /tenants/{id}/policy` with both `"all"` and `{"only": [...]}`, plus
+/// the load-bearing case: an EMPTY `only: []` must stay `Only(vec![])`, not
+/// collapse to `All` -- see `ModelAccess`'s own doc for why that would be a
+/// silent privilege escalation. Mutation pin C targets this assertion.
+#[tokio::test]
+async fn put_policy_all_and_only_are_reflected_and_empty_only_stays_only() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, _body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-all/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":"all"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        handle
+            .load()
+            .policies
+            .get("tenant-all")
+            .unwrap()
+            .model_access,
+        ModelAccess::All
+    );
+
+    let (status, _headers, _body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-only/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":{"only":["gpt-4*"]}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        handle
+            .load()
+            .policies
+            .get("tenant-only")
+            .unwrap()
+            .model_access,
+        ModelAccess::Only(vec![proxy_filters::model_authz::ModelPattern::new(
+            "gpt-4*"
+        )])
+    );
+
+    let (status, _headers, _body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-empty/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":{"only":[]}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        handle
+            .load()
+            .policies
+            .get("tenant-empty")
+            .unwrap()
+            .model_access,
+        ModelAccess::Only(vec![]),
+        "an empty `only: []` must deny every model (Only(vec![])), NOT collapse to All"
+    );
+}
+
+/// READ endpoints stay unaffected by the write API's gate: with NO admin
+/// token configured at all, `/ready` and `/config_dump` behave exactly as
+/// the read-only increment's own tests already prove.
+#[tokio::test]
+async fn reads_work_with_no_admin_token_configured() {
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        Arc::new(SharedFactoryState::default()),
+        None,
+    )
+    .await;
+
+    let (status, body) = get(addr, "/ready").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "LIVE");
+
+    let (status, body) = get(addr, "/config_dump").await;
+    assert_eq!(status, StatusCode::OK);
+    let _: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+}
+
+/// Malformed JSON, an unknown field, and a missing/empty required string all
+/// answer 400, matching ground rule #1 (a silently ignored field is a P0 in
+/// a security-write API too).
+#[tokio::test]
+async fn bad_bodies_are_400() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, _body) =
+        request(addr, "POST", "/keys", Some(ADMIN_TOKEN), "not json at all").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "malformed JSON");
+
+    let (status, _headers, _body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"t1","key_id":"k1","unexpected_field":"x"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown field");
+
+    let (status, _headers, _body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "missing tenant");
+
+    let (status, _headers, _body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"","key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty tenant");
+}
+
+/// A body over the admin write cap (`MAX_ADMIN_BODY_BYTES`, 64 KiB) must 413
+/// rather than being buffered without bound.
+#[tokio::test]
+async fn oversized_body_is_413() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let oversized = "x".repeat(70 * 1024);
+    let (status, _headers, _body) =
+        request(addr, "POST", "/keys", Some(ADMIN_TOKEN), &oversized).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A wrong method on a recognized write path (`/keys` only accepts `POST`)
+/// answers 405, not the generic 404 an unknown path gets.
+#[tokio::test]
+async fn wrong_method_on_write_path_is_405() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _body) = get(addr, "/keys").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
