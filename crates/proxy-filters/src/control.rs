@@ -822,6 +822,79 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Seeds `bootstrap` (`llmproxy.model_authz`'s `typed_config.policies`,
+    /// parsed by `model_authz_filter::parse_config`) into the store, then
+    /// republishes -- store-wins on a tenant collision, the identical rule
+    /// and rationale as [`Self::merge`]'s bootstrap-KEY merge: the store is
+    /// authoritative (an admin `PUT /tenants/{id}/policy` must never be
+    /// silently reverted by a static config value), and a collision is
+    /// logged by TENANT ID ONLY -- never a policy's contents. See WP-50
+    /// increment 3b-iv's design brief, "`typed_config.policies` stays, as
+    /// BOOTSTRAP".
+    ///
+    /// # Idempotence is required, not incidental
+    ///
+    /// `model_authz_filter::create` runs once per worker (ADR-0003) and
+    /// calls this every time with the SAME bootstrap map -- store-wins makes
+    /// every call after the first a genuine no-op: once a tenant's row
+    /// exists in the store (whether THIS method wrote it or an admin did),
+    /// no later call here ever touches it again. See
+    /// `seeding_the_same_bootstrap_map_twice_is_a_no_op` below; the failure
+    /// mode this exists to catch is a re-seed silently reverting an admin
+    /// write that landed between two worker builds.
+    ///
+    /// # Pinned at first build, like `bootstrap_keys` and `store`
+    ///
+    /// Because the `ControlPlane` singleton is per-SERVE and a SIGHUP reload
+    /// reuses it (see `auth_filter::AuthFilterFactory::create`'s doc), a
+    /// tenant this method has already written is fixed at whatever value it
+    /// had on the first build that seeded it -- editing
+    /// `typed_config.policies` for that tenant and reloading does NOT
+    /// re-seed it; store-wins means the OLD stored value keeps winning. A
+    /// genuinely new tenant added to `typed_config.policies` DOES get seeded
+    /// on the next call, since it has no store row yet to collide with.
+    ///
+    /// The operator-facing surprise worth stating outright: seeding WRITES
+    /// into the store, so REMOVING a tenant from `typed_config.policies`
+    /// does not remove its policy -- the row this method wrote outlives the
+    /// config line that produced it. With the default in-memory store that
+    /// is invisible (the store dies with the process); with
+    /// `store: persistent` it is durable, and the only way to change that
+    /// tenant's policy afterwards is an admin write. That is the same
+    /// store-authoritative trade `virtual_keys` already makes, but policies
+    /// are likelier to be edited in place, so it will be met sooner.
+    pub fn seed_bootstrap_policies(&self, bootstrap: &TenantPolicyMap) -> Result<(), StoreError> {
+        let loaded = self.store.load()?;
+        // Rust note: a `HashSet<String>` snapshot of the store's current
+        // tenants, built once up front -- avoids re-`load()`ing the store
+        // (an I/O round trip) once per bootstrap entry, and also lets this
+        // loop track tenants IT just wrote so two identical `key`s within one
+        // `bootstrap` map (impossible today -- `parse_config` dedupes -- but
+        // this function should not depend on that) can't double-log.
+        let mut existing: std::collections::HashSet<String> = loaded
+            .policies
+            .keys()
+            .map(|t| t.as_str().to_string())
+            .collect();
+
+        for (tenant, policy) in bootstrap {
+            if existing.contains(tenant) {
+                tracing::warn!(
+                    tenant = tenant.as_str(),
+                    "control-plane store policy collides with a config bootstrap policy; \
+                     the store record wins"
+                );
+                continue;
+            }
+            self.store
+                .set_policy(&TenantId::new(tenant.clone()), &policy.model_access)?;
+            existing.insert(tenant.clone());
+        }
+
+        self.rebuild();
+        Ok(())
+    }
+
     /// Bootstrap keys layered under the store's, then the store's layered on
     /// top -- on a `key_id` collision the store wins. See the design brief's
     /// "Snapshot rebuild + bootstrap merge" section, which this implements
@@ -1441,6 +1514,129 @@ mod tests {
         // row -- confirm the republish reflects that too.
         let snapshot = cp.handle().load();
         assert!(!snapshot.policies.contains_key("tenant-a"));
+    }
+
+    // --- seed_bootstrap_policies (WP-50 increment 3b-iv) ---------------------
+
+    #[test]
+    fn seed_bootstrap_policies_writes_a_new_tenant_and_republishes() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        let mut bootstrap: TenantPolicyMap = HashMap::new();
+        bootstrap.insert(
+            "tenant-a".to_string(),
+            Arc::new(TenantPolicy {
+                model_access: access.clone(),
+            }),
+        );
+
+        cp.seed_bootstrap_policies(&bootstrap)
+            .expect("seeding into an empty store must succeed");
+
+        let snapshot = cp.handle().load();
+        let policy = snapshot
+            .policies
+            .get("tenant-a")
+            .expect("a bootstrap policy for a tenant absent from the store must be seeded");
+        assert_eq!(policy.model_access, access);
+    }
+
+    #[test]
+    fn seed_bootstrap_policies_does_not_overwrite_an_existing_store_policy() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let store_access = ModelAccess::All;
+        cp.set_policy(&TenantId::new("tenant-a"), &store_access)
+            .expect("set_policy must succeed");
+
+        let bootstrap_access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        let mut bootstrap: TenantPolicyMap = HashMap::new();
+        bootstrap.insert(
+            "tenant-a".to_string(),
+            Arc::new(TenantPolicy {
+                model_access: bootstrap_access,
+            }),
+        );
+
+        cp.seed_bootstrap_policies(&bootstrap)
+            .expect("seeding over an already-populated tenant must still succeed (no-op write)");
+
+        let snapshot = cp.handle().load();
+        assert_eq!(
+            snapshot.policies["tenant-a"].model_access, store_access,
+            "the store's policy must win a tenant collision against the bootstrap map"
+        );
+    }
+
+    // --- THE re-seed property: re-seeding an identical bootstrap map must
+    //     not clobber a store write that landed in between -- see
+    //     `seed_bootstrap_policies`'s doc, "Idempotence is required, not
+    //     incidental". This models `model_authz_filter::create` being called
+    //     once per worker with the SAME parsed `typed_config.policies`.
+
+    #[test]
+    fn seeding_the_same_bootstrap_map_twice_is_a_no_op() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let bootstrap_access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        let mut bootstrap: TenantPolicyMap = HashMap::new();
+        bootstrap.insert(
+            "tenant-a".to_string(),
+            Arc::new(TenantPolicy {
+                model_access: bootstrap_access.clone(),
+            }),
+        );
+
+        // First worker's `create()`: the store has nothing for `tenant-a`
+        // yet, so this WRITES the bootstrap policy.
+        cp.seed_bootstrap_policies(&bootstrap)
+            .expect("first seed must succeed");
+        assert_eq!(
+            cp.handle().load().policies["tenant-a"].model_access,
+            bootstrap_access
+        );
+
+        // An admin `PUT /tenants/tenant-a/policy` lands in between two
+        // worker builds -- exactly `ControlPlane::set_policy`, what that
+        // endpoint calls.
+        let admin_access = ModelAccess::All;
+        cp.set_policy(&TenantId::new("tenant-a"), &admin_access)
+            .expect("admin set_policy must succeed");
+        assert_eq!(
+            cp.handle().load().policies["tenant-a"].model_access,
+            admin_access
+        );
+
+        // A second worker's `create()` seeds the exact same bootstrap map
+        // again -- store-wins must make this a no-op, not a revert.
+        cp.seed_bootstrap_policies(&bootstrap)
+            .expect("re-seeding an identical bootstrap map must succeed");
+        assert_eq!(
+            cp.handle().load().policies["tenant-a"].model_access,
+            admin_access,
+            "re-seeding identical bootstrap policies must not clobber a store policy \
+             that landed in between -- this is the silent-policy-revert \
+             `seed_bootstrap_policies`'s idempotence exists to prevent"
+        );
     }
 
     // --- mutation pins: a write that skips `self.rebuild()` must not be
