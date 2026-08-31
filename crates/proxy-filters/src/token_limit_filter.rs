@@ -278,25 +278,80 @@ impl HttpFilterFactory for TokenLimitFilterFactory {
     fn create(
         &self,
         config: &DynamicMessage,
-        _ctx: &FactoryContext,
+        ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
         let rule = parse_config(config)?;
-        // One store per (filter config, listener) -- exactly the lifetime
-        // the budget needs: it must outlive any single stream (that's the
-        // whole point of a *budget*), but a fresh listener config gets a
-        // fresh one. Every per-stream filter instance below shares this same
-        // `Arc`, which is what makes the limit apply across requests/workers
-        // rather than per-stream (see `InProcessBudgetStore`'s doc for why
-        // that requires `Send + Sync` + `Mutex`, not worker-local state).
-        let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new(rule));
-        // One warner per (filter config, listener), same lifetime and same
-        // reason as `store` above -- see `UsageMissingWarner`'s doc.
-        let usage_missing_warner = Arc::new(UsageMissingWarner::new());
+
+        // One store (and one `UsageMissingWarner`) per (filter config,
+        // listener) -- exactly the lifetime the budget needs: it must
+        // outlive any single stream (that's the whole point of a *budget*),
+        // but a fresh listener config gets a fresh one. The HTTP filter
+        // chain is rebuilt once PER WORKER (ADR-0003; `build_hcm_handler` in
+        // `proxy-core`), and `create` runs once per worker for the same
+        // chain -- so a bare `Arc::new` here (the pre-follow-up shape) built
+        // a FRESH, unshared store on every worker, and a configured
+        // 1000-tokens/minute budget admitted roughly `1000 * worker_count`
+        // per minute: a real quota bypass, not a theoretical one.
+        //
+        // The fix is `SharedFactoryState` (`ctx.shared`, from `proxy-http`):
+        // every worker building THIS SAME CHAIN resolves the SAME slot and
+        // gets back the SAME `Arc<SharedTokenLimitState>`, so the budget is
+        // actually shared process-wide -- see `auth_filter::create`'s
+        // `ControlPlane` resolution for the identical pattern.
+        //
+        // This filter uses the UNDERLYING form (`ctx.shared.get_or_try_init`
+        // with a scope built here) rather than `ctx.get_or_try_init` (which
+        // would use `ctx.scope` alone), because `ctx.scope` names a whole
+        // CHAIN, not a filter instance within it: two `llmproxy.token_limit`
+        // filters with DIFFERENT rules in the SAME chain are expressible
+        // config, and keying on `ctx.scope` alone would let the second one's
+        // `create` silently find the first one's slot already filled and
+        // inherit ITS rule and ITS budget -- the same bug class this whole
+        // change fixes, one level down. So the scope is `ctx.scope` plus a
+        // deterministic rendering of every `LimitRule` field that changes
+        // the budget's MEANING (`on`, `max_tokens`, `window` -- all three; a
+        // rendering that dropped one would let two differently-configured
+        // limiters collide on that field). This gives exactly the property
+        // needed: identical across workers (same chain, same parsed config
+        // -> same string -> one shared store) and distinct for a different
+        // rule (two limiters in one chain don't collide). `{:?}` on
+        // `Duration`/`LimitOn` is stable enough for a same-process string
+        // key (this is not a wire format, unlike `hash_credential`, which
+        // has to survive a different toolchain on the other end).
+        let scope = format!(
+            "{}::token_limit(on={:?},max_tokens={},window={:?})",
+            ctx.scope, rule.on, rule.max_tokens, rule.window
+        );
+
+        let shared = ctx
+            .shared
+            .get_or_try_init(&scope, TYPE_URL, || {
+                let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new(rule));
+                let usage_missing_warner = Arc::new(UsageMissingWarner::new());
+                Ok(Arc::new(SharedTokenLimitState {
+                    store,
+                    usage_missing_warner,
+                }) as Arc<dyn std::any::Any + Send + Sync>)
+            })?
+            .downcast::<SharedTokenLimitState>()
+            .expect("token_limit singleton is always a SharedTokenLimitState");
+
         Ok(Box::new(TokenLimitInstanceFactory {
-            store,
-            usage_missing_warner,
+            store: Arc::clone(&shared.store),
+            usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
         }))
     }
+}
+
+/// The pair of pieces that must be shared across every worker building the
+/// SAME chain with the SAME rule -- see `TokenLimitFilterFactory::create`'s
+/// doc for why both live behind ONE `SharedFactoryState` slot (keyed
+/// together, so a worker that resolves the store always resolves the
+/// matching warner, never a stale or mismatched pairing left over from a
+/// different rule).
+struct SharedTokenLimitState {
+    store: Arc<dyn BudgetStore>,
+    usage_missing_warner: Arc<UsageMissingWarner>,
 }
 
 struct TokenLimitInstanceFactory {
@@ -688,7 +743,7 @@ mod tests {
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, Uri};
     use proxy_config::ir::RouteEntry;
-    use proxy_http::filter::{BufferedBody, HeaderMutationFn, PerRouteConfig};
+    use proxy_http::filter::{BufferedBody, HeaderMutationFn, PerRouteConfig, SharedFactoryState};
     use proxy_http::stream_info::StreamInfo;
 
     use crate::token_limit::LimitOn as TlLimitOn;
@@ -1436,6 +1491,132 @@ mod tests {
         assert!(
             other.is_none(),
             "the same credential on a distinct route must have an independent budget"
+        );
+    }
+
+    // --- cross-worker budget sharing (SharedFactoryState) --------------------
+
+    /// As [`run_request`], but driven through a `Box<dyn HttpFilter>` handed
+    /// back by [`FilterInstanceFactory::create_filter`] instead of a
+    /// hand-built [`TokenLimitFilterInstance`] -- these tests care about the
+    /// WIRING from `TokenLimitFilterFactory::create` down to the shared
+    /// store, not just the instance's own decode/encode behavior, so they
+    /// must go through the real factory path.
+    fn run_request_through(
+        filter: &mut dyn HttpFilter,
+        route: &str,
+        credential: Option<&str>,
+        usage: Option<LlmTokenUsage>,
+    ) -> Option<(StatusCode, HeaderMap)> {
+        let mut cb = TestCallbacks::new(Some(route_named(route)));
+        let mut head = request_headers(credential);
+        filter.decode_headers(&mut cb, &mut head, true);
+
+        if cb.local_reply.is_none() {
+            if let Some(usage) = usage {
+                cb.set_usage(usage);
+            }
+            let mut headers = response_headers();
+            filter.encode_headers(&mut cb, &mut headers, false);
+            let mut data = Bytes::new();
+            filter.encode_data(&mut cb, &mut data, true);
+        }
+
+        cb.local_reply
+    }
+
+    /// **The acceptance test for the WP-50 follow-up fix.** Two `create()`
+    /// calls over ONE `FactoryContext` is exactly what two workers do: the
+    /// HTTP filter chain (and therefore this factory) is rebuilt once per
+    /// worker (ADR-0003), and every worker for one serve is handed the same
+    /// `SharedFactoryState`. Before this fix, each `create()` call built its
+    /// own fresh `InProcessBudgetStore`, so a second worker always started
+    /// with a brand-new, unshared budget -- a configured N-tokens/window
+    /// limit admitted roughly `N * worker_count`. This test drives real
+    /// requests through the real `HttpFilter` callbacks on TWO
+    /// factory-produced filters (not `BudgetStore` directly), because the
+    /// defect is in the wiring between `create` and the store, not in
+    /// `InProcessBudgetStore`'s own accounting.
+    #[test]
+    fn two_workers_building_the_same_chain_share_one_budget() {
+        let ctx = FactoryContext {
+            shared: Arc::new(SharedFactoryState::default()),
+            scope: "listener 'l' filter_chains[0]".to_string(),
+        };
+        let config = rate_limit_settings(10, 1.0); // max_tokens=10, window=10s
+
+        let mut filter_worker_1 = TokenLimitFilterFactory
+            .create(&config, &ctx)
+            .expect("worker 1's create must succeed")
+            .create_filter();
+        let mut filter_worker_2 = TokenLimitFilterFactory
+            .create(&config, &ctx)
+            .expect("worker 2's create must succeed")
+            .create_filter();
+
+        let reply = run_request_through(
+            &mut *filter_worker_1,
+            "r1",
+            Some("Bearer sk-1"),
+            Some(usage(10)),
+        );
+        assert!(
+            reply.is_none(),
+            "worker 1's first request, exactly at the budget, must be admitted"
+        );
+
+        let denied = run_request_through(
+            &mut *filter_worker_2,
+            "r1",
+            Some("Bearer sk-1"),
+            Some(usage(0)),
+        );
+        assert!(
+            denied.is_some(),
+            "worker 2 must see the budget worker 1 already exhausted -- an admission here \
+             means each `create()` call built its own unshared InProcessBudgetStore, which \
+             is the exact quota-multiplied-by-worker-count bug this test exists to catch"
+        );
+    }
+
+    /// Two `llmproxy.token_limit` filters in ONE chain with DIFFERENT rules
+    /// must never share a budget -- keying the shared slot on `ctx.scope`
+    /// alone (rather than `ctx.scope` plus the parsed rule) would let the
+    /// second filter's `create()` silently find the first filter's slot
+    /// already filled and inherit its rule and its budget.
+    #[test]
+    fn two_different_rules_in_one_chain_get_independent_budgets() {
+        let ctx = FactoryContext {
+            shared: Arc::new(SharedFactoryState::default()),
+            scope: "listener 'l' filter_chains[0]".to_string(),
+        };
+        let config_a = rate_limit_settings(10, 1.0); // max_tokens=10, window=10s
+        let config_b = rate_limit_settings(500, 1.0); // a different rule, same chain
+
+        let mut filter_a = TokenLimitFilterFactory
+            .create(&config_a, &ctx)
+            .expect("filter A's create must succeed")
+            .create_filter();
+        let mut filter_b = TokenLimitFilterFactory
+            .create(&config_b, &ctx)
+            .expect("filter B's create must succeed")
+            .create_filter();
+
+        let reply = run_request_through(&mut *filter_a, "r1", Some("Bearer sk-1"), Some(usage(10)));
+        assert!(reply.is_none(), "filter A's first request must be admitted");
+        let denied = run_request_through(&mut *filter_a, "r1", Some("Bearer sk-1"), Some(usage(0)));
+        assert!(
+            denied.is_some(),
+            "filter A's own budget must now be exhausted"
+        );
+
+        let allowed =
+            run_request_through(&mut *filter_b, "r1", Some("Bearer sk-1"), Some(usage(0)));
+        assert!(
+            allowed.is_none(),
+            "filter B, configured with a different rule in the same chain, must have an \
+             independent budget from filter A -- a denial here means both filters shared \
+             one store keyed on chain identity alone, dropping the rule from the scope"
         );
     }
 
