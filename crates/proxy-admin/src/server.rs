@@ -13,7 +13,11 @@
 //! `ControlPlane` (or `None`) at `serve()` time would freeze that boot race
 //! into a permanent 503, or panic the first mint request. Every write
 //! request instead calls [`resolve_control_plane`] fresh -- see that
-//! function's doc for what a miss means.
+//! function's doc for what a miss means, and for the SEPARATE case where more
+//! than one filter chain configures `llmproxy.auth`: this server has no chain
+//! scope of its own (it isn't part of any filter chain), so it cannot pick
+//! one of several `ControlPlane`s without guessing -- that case is a loud,
+//! explicit error, never a silent pick.
 //!
 //! # The admin bearer token: a `serve()` parameter, never read from the
 //! environment here
@@ -329,16 +333,41 @@ async fn handle(
         return unauthorized("missing or invalid bearer token");
     }
 
-    // Gate 3: does the control plane exist yet? See `resolve_control_plane`'s
-    // doc for the two situations this 503 covers and why they don't need to
-    // be told apart.
-    let Some(control_plane) = resolve_control_plane(factory_state) else {
-        return text(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the auth control plane is not initialized yet: either no llmproxy.auth filter is \
-             configured, or the workers have not finished building their filter chains yet -- \
-             retry shortly",
-        );
+    // Gate 3: does the control plane exist, and is it unambiguous which one
+    // this write means? See `resolve_control_plane`'s doc for the two 503
+    // situations that don't need telling apart, and for the third case below
+    // -- more than one `llmproxy.auth`-configured chain -- which does.
+    let control_plane = match resolve_control_plane(factory_state) {
+        Ok(Some(cp)) => cp,
+        Ok(None) => {
+            return text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the auth control plane is not initialized yet: either no llmproxy.auth filter \
+                 is configured, or the workers have not finished building their filter chains \
+                 yet -- retry shortly",
+            );
+        }
+        Err(scopes) => {
+            // Loud, not a guess (CLAUDE.md rule 17's shape applied here too):
+            // picking one of several ControlPlanes at random would risk
+            // writing a key into the wrong tenant's control plane.
+            tracing::error!(
+                endpoint = %path,
+                scopes = ?scopes,
+                "admin write refused: more than one llmproxy.auth-configured filter chain is \
+                 registered, so the admin API cannot tell which ControlPlane this write means"
+            );
+            return text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "the admin write API cannot resolve a single auth control plane: {} filter \
+                     chains each configure llmproxy.auth ({}) -- this admin API supports \
+                     writes only when exactly one chain in this serve configures llmproxy.auth",
+                    scopes.len(),
+                    scopes.join(", "),
+                ),
+            );
+        }
     };
 
     let body = match read_limited_body(req.into_body()).await {
@@ -407,10 +436,14 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
 
 /// Resolves the live [`ControlPlane`] a worker's `AuthFilterFactory`
 /// registered into `factory_state`, keyed on that filter's own
-/// `auth_filter::TYPE_URL` -- see [`SharedFactoryState`]'s doc for the
-/// singleton-slot mechanism this reads.
+/// `auth_filter::TYPE_URL` ACROSS EVERY CHAIN'S SCOPE -- the admin server has
+/// no chain of its own to scope by (it isn't part of any filter chain), so
+/// this reads [`SharedFactoryState::get_across_scopes`] rather than the
+/// scoped `get` a filter factory uses; see that method's doc for the
+/// singleton-slot mechanism and why a `type_url`-only read is unsafe in
+/// general.
 ///
-/// `None` covers two situations this function cannot (and need not)
+/// `Ok(None)` covers two situations this function cannot (and need not)
 /// distinguish, both mapped to the same 503 by the caller:
 /// - **A genuine boot race.** `serve()` is called before the worker pool
 ///   spawns (see the module doc), so a request that lands before any
@@ -424,10 +457,20 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
 ///   ready yet" and "will never exist" are both "the write cannot be served
 ///   right now," and inventing a third status code here would not give the
 ///   caller anything actionable to do differently.
-fn resolve_control_plane(factory_state: &SharedFactoryState) -> Option<Arc<ControlPlane>> {
-    factory_state
-        .get(proxy_filters::auth_filter::TYPE_URL)
-        .and_then(|singleton| singleton.downcast::<ControlPlane>().ok())
+///
+/// `Err(scopes)` is a THIRD, genuinely different situation: more than one
+/// filter chain in this serve configures `llmproxy.auth` (e.g. two listeners,
+/// each with its own keys). The write API is one endpoint (`/keys`), not one
+/// per chain, so there is no scope to route this write to -- and guessing
+/// (e.g. "the first one registered") would silently write a key into the
+/// wrong tenant's control plane, exactly the class of bug this whole task
+/// exists to close. The honest answer, and what the caller does with it: an
+/// explicit error naming every ambiguous scope, never a guess.
+fn resolve_control_plane(
+    factory_state: &SharedFactoryState,
+) -> Result<Option<Arc<ControlPlane>>, Vec<String>> {
+    let singleton = factory_state.get_across_scopes(proxy_filters::auth_filter::TYPE_URL)?;
+    Ok(singleton.and_then(|s| s.downcast::<ControlPlane>().ok()))
 }
 
 /// Reads `body` up to [`MAX_ADMIN_BODY_BYTES`], returning the collected

@@ -66,8 +66,9 @@
 //! map `typed_config.policies` parses to directly. Instead
 //! [`ModelAuthzFilterFactory::create`] resolves the SAME
 //! `crate::control::ControlPlane` singleton `llmproxy.auth`'s factory
-//! registers (`ctx.shared.get(auth_filter::TYPE_URL)`, never
-//! `get_or_try_init` -- this filter has none of the inputs (HMAC secret,
+//! registers (`ctx.get(auth_filter::TYPE_URL)`, which resolves through this
+//! chain's own `FactoryContext::scope` -- see `SharedFactoryState`'s doc for
+//! why that matters -- never `get_or_try_init`: this filter has none of the inputs (HMAC secret,
 //! bootstrap keys, store selection) a fresh `ControlPlane` would need, and
 //! must not invent them), seeds `typed_config.policies` into it as
 //! BOOTSTRAP data (`ControlPlane::seed_bootstrap_policies`), and holds the
@@ -293,13 +294,15 @@ impl HttpFilterFactory for ModelAuthzFilterFactory {
 
         // WP-50 increment 3b-iv: resolve the SAME `ControlPlane` singleton
         // `llmproxy.auth`'s factory registers -- see the module doc's "Reads
-        // the ControlPlaneSnapshot" section for why this is `ctx.shared.get`
-        // (never `get_or_try_init`: this filter has none of a fresh
-        // `ControlPlane`'s required inputs and must not invent them) and why
-        // `None` is always a config error rather than a race, given
-        // `proxy_config`'s lowering-enforced filter order.
+        // the ControlPlaneSnapshot" section for why this is `ctx.get` (never
+        // `get_or_try_init`: this filter has none of a fresh `ControlPlane`'s
+        // required inputs and must not invent them) and why `None` is always
+        // a config error rather than a race, given `proxy_config`'s
+        // lowering-enforced filter order. `ctx.get` resolves through THIS
+        // chain's own `scope` -- since `llmproxy.auth` and `llmproxy.model_authz`
+        // are always in the same chain (the ordering rule above), they share
+        // one `FactoryContext::scope` and so see the same singleton.
         let control_plane = ctx
-            .shared
             .get(auth_filter::TYPE_URL)
             .ok_or_else(|| {
                 invalid(
@@ -950,11 +953,10 @@ mod tests {
             )
             .expect("empty store must not fail boot"),
         );
-        ctx.shared
-            .get_or_try_init(auth_filter::TYPE_URL, || {
-                Ok(Arc::clone(&cp) as Arc<dyn std::any::Any + Send + Sync>)
-            })
-            .expect("registering the control-plane singleton must succeed");
+        ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+            Ok(Arc::clone(&cp) as Arc<dyn std::any::Any + Send + Sync>)
+        })
+        .expect("registering the control-plane singleton must succeed");
 
         // No bootstrap policies configured -- the ONLY policy source in this
         // test is the admin write below.
@@ -1010,11 +1012,10 @@ mod tests {
             )
             .expect("empty store must not fail boot"),
         );
-        ctx.shared
-            .get_or_try_init(auth_filter::TYPE_URL, || {
-                Ok(Arc::clone(&cp) as Arc<dyn std::any::Any + Send + Sync>)
-            })
-            .expect("registering the control-plane singleton must succeed");
+        ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+            Ok(Arc::clone(&cp) as Arc<dyn std::any::Any + Send + Sync>)
+        })
+        .expect("registering the control-plane singleton must succeed");
 
         let config = model_authz(vec![policy_only("tenant-a", &["gpt-4*"])]);
         let instance_factory = ModelAuthzFilterFactory

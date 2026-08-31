@@ -1157,8 +1157,14 @@ fn build_hcm_handler(
     factory_state: &Arc<SharedFactoryState>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
+    // `context` is this chain's identity (the same string this function's own
+    // error messages use) -- it becomes `FactoryContext::scope`, so every
+    // filter factory `create`d below shares one scope for this chain, and a
+    // sibling chain built through a later call gets a different one. See
+    // `SharedFactoryState`'s doc for why this must not collide across chains.
     let factory_ctx = FactoryContext {
         shared: factory_state.clone(),
+        scope: context.to_string(),
     };
     let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
     for f in &hcm.http_filters {
@@ -4073,6 +4079,153 @@ static_resources:
         assert!(
             msg.contains("typed_config.inline_string") || msg.contains("gemini"),
             "error should name the invalid dialect field/value, got: {msg}"
+        );
+    }
+
+    // --- SharedFactoryState scope fix: two listeners must not collide ----------
+
+    /// The `build_hcm_handler`-level half of the regression: two listeners,
+    /// each configuring `llmproxy.auth` with its own `hmac_secret`, built
+    /// through `build_listener_hcm` against the SAME `SharedFactoryState` --
+    /// exactly the shape `initial_bind`/`spawn_bound` produce for a real
+    /// multi-listener config. Each listener's own `context` string
+    /// (`"listener '<name>' filter_chains[0]"`) must become a DIFFERENT
+    /// `FactoryContext::scope`, so each gets its own `ControlPlane` singleton
+    /// rather than colliding on `llmproxy.auth`'s shared `type_url`.
+    ///
+    /// This only proves the two registered under different scopes (via
+    /// `get_across_scopes` reporting the collision as `Err` with both scope
+    /// names) -- `auth_filter`'s own
+    /// `two_scopes_over_one_shared_state_get_independent_control_planes` is
+    /// the test that proves the two `ControlPlane`s actually enforce
+    /// independently (a real request over each filter). Driving that same
+    /// proof through a real socket here would mean standing up two full
+    /// listeners end to end purely to re-demonstrate what `SharedFactoryState`
+    /// itself already guarantees once the scopes differ -- not cheap enough
+    /// to be worth duplicating.
+    #[test]
+    fn two_listeners_each_configuring_auth_get_independent_singleton_scopes() {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: l1
+                http_filters:
+                  - name: llmproxy.auth
+                    typed_config:
+                      "@type": type.llmproxy.dev/llmproxy.filters.v0.Authentication
+                      hmac_secret:
+                        inline_string: listener-l1-secret
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc1
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: up }
+    - name: l2
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: l2
+                http_filters:
+                  - name: llmproxy.auth
+                    typed_config:
+                      "@type": type.llmproxy.dev/llmproxy.filters.v0.Authentication
+                      hmac_secret:
+                        inline_string: listener-l2-secret
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc2
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: up }
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+"#;
+
+        let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+            .expect("bootstrap YAML must parse");
+        let snapshot = build_snapshot(&loaded).expect("bootstrap YAML must lower");
+
+        let l1 = snapshot.listeners.get("l1").expect("listener l1");
+        let l2 = snapshot.listeners.get("l2").expect("listener l2");
+        let cluster_manager = Arc::new(ClusterManager::new(
+            Arc::new(proxy_cluster::resolver::TokioResolver),
+            crate::tls::transport_socket_builder(),
+        ));
+        let stats_control = proxy_observability::stats::StatsControl::new(1);
+        let router_stats = router_stats_for(&stats_control, &snapshot);
+        let token_stats = token_stats_for(&stats_control, &snapshot);
+        let factory_state = Arc::new(SharedFactoryState::default());
+
+        build_listener_hcm(
+            l1,
+            &cluster_manager,
+            &router_stats,
+            &token_stats,
+            None,
+            &factory_state,
+        )
+        .expect("listener l1's filter chain must build");
+        build_listener_hcm(
+            l2,
+            &cluster_manager,
+            &router_stats,
+            &token_stats,
+            None,
+            &factory_state,
+        )
+        .expect("listener l2's filter chain must build");
+
+        let scopes = factory_state
+            .get_across_scopes(proxy_filters::auth_filter::TYPE_URL)
+            .expect_err(
+                "two listeners each configuring llmproxy.auth must register TWO distinct \
+                 scopes -- before the scope fix, l2's build would have silently reused l1's \
+                 slot instead, leaving exactly one",
+            );
+        assert_eq!(
+            scopes.len(),
+            2,
+            "expected exactly two scopes (one per listener), got: {scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|s| s.contains("listener 'l1'"))
+                && scopes.iter().any(|s| s.contains("listener 'l2'")),
+            "each scope must be traceable back to the listener that registered it, got: {scopes:?}"
         );
     }
 

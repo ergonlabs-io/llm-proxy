@@ -335,14 +335,18 @@ impl HttpFilterFactory for AuthFilterFactory {
         let (secret_bytes, bootstrap_keys, store_spec) = parse_config(config)?;
 
         // WP-50 increment 3b-ii, part B: the `ControlPlane` is now the ONE
-        // per-serve instance shared across every worker, resolved through
-        // `FactoryContext::shared` (`SharedFactoryState`) keyed on this
-        // filter's own `TYPE_URL`. The HTTP filter chain is rebuilt per
-        // worker (ADR-0003), so `create` runs once per worker -- without this
+        // per-serve instance shared across every worker BUILDING THIS SAME
+        // CHAIN, resolved through `ctx.get_or_try_init` (`FactoryContext`'s
+        // thin wrapper over `SharedFactoryState`, keyed on `(ctx.scope, this
+        // filter's own TYPE_URL)` -- see `SharedFactoryState`'s doc for why
+        // `scope` is part of the key: two DIFFERENT chains each configuring
+        // `llmproxy.auth` must never share a `ControlPlane`). The HTTP filter
+        // chain is rebuilt per worker (ADR-0003), so `create` runs once per
+        // worker -- without this
         // slot each of those runs would build (and immediately drop) its own
         // `ControlPlane`, and a mint/revoke through one worker would be
         // invisible to every other. The closure below runs only on the FIRST
-        // worker for this `type_url`; every later worker's `create` call
+        // worker for this chain's `(scope, type_url)`; every later worker's `create` call
         // reads the same `Arc<ControlPlane>` back out instead of rebuilding
         // it. WP-50 increment 3b-ii, part W3: the store itself is now
         // SELECTABLE (`typed_config.store`) and is built inside this closure
@@ -368,7 +372,6 @@ impl HttpFilterFactory for AuthFilterFactory {
         // `secret_bytes` is only borrowed there, so it is still available
         // afterward to build the authenticator's own `HmacSecret`.
         let control_plane = ctx
-            .shared
             .get_or_try_init(TYPE_URL, || {
                 let store: Box<dyn ControlPlaneStore> = match store_spec {
                     StoreSpec::InMemory => Box::new(InMemoryControlPlaneStore::default()),
@@ -510,6 +513,7 @@ mod tests {
     use proxy_http::stream_info::StreamInfo;
 
     use crate::control::test_snapshot_handle;
+    use proxy_http::filter::SharedFactoryState;
 
     // --- config-message scaffolding ------------------------------------------
 
@@ -1376,7 +1380,7 @@ mod tests {
     }
 
     // 19: WP-50 increment 3b-ii part B -- the shared-singleton property.
-    // `create` resolves ONE `ControlPlane` through `ctx.shared`, a write
+    // `create` resolves ONE `ControlPlane` through `ctx.get_or_try_init`, a write
     // through it is visible to what the factory wired, and a SECOND `create`
     // over the same `ctx` does not build a second instance.
     #[test]
@@ -1389,7 +1393,6 @@ mod tests {
             .expect("first create must succeed");
 
         let control_plane = ctx
-            .shared
             .get(TYPE_URL)
             .expect("create must register the control plane in the shared slot")
             .downcast::<ControlPlane>()
@@ -1512,7 +1515,6 @@ mod tests {
                 .expect("first create over a persistent store must succeed");
 
             let control_plane = ctx
-                .shared
                 .get(TYPE_URL)
                 .expect("create must register the control plane in the shared slot")
                 .downcast::<ControlPlane>()
@@ -1537,7 +1539,6 @@ mod tests {
             .expect("a second, fresh factory/context over the same path must succeed");
 
         let control_plane2 = ctx2
-            .shared
             .get(TYPE_URL)
             .expect("the second create must also register a control plane")
             .downcast::<ControlPlane>()
@@ -1584,5 +1585,148 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    // --- SharedFactoryState scope fix: two chains must never collide -----------
+
+    // 25: THE regression test. Two chains (two different `FactoryContext::scope`
+    // strings), two different auth configs (different `hmac_secret`, different
+    // `virtual_keys`), over ONE `SharedFactoryState` -- the exact shape
+    // `build_hcm_handler` produces for two listeners (or two filter chains)
+    // that both configure `llmproxy.auth`. Each scope's `ControlPlane` must
+    // reflect ITS OWN config: a key valid in scope A must not authenticate in
+    // scope B, and vice versa.
+    //
+    // Before this fix (`SharedFactoryState` keyed on `type_url` alone), scope
+    // B's `create()` would silently find scope A's slot already filled, skip
+    // running its own `init`, and hand scope B's filter scope A's
+    // `ControlPlane` -- so scope A's key would ALSO authenticate against
+    // scope B (a real cross-tenant key acceptance), and scope B's own key
+    // would be rejected by ITS OWN filter (scope B's `ControlPlane` was never
+    // built at all). Both assertions below catch that: the first would fail
+    // silently-wrong (falsely `Authenticated`), the second would fail with
+    // the wrong REASON (scope B's own valid key rejected).
+    #[test]
+    fn two_scopes_over_one_shared_state_get_independent_control_planes() {
+        let shared = Arc::new(SharedFactoryState::default());
+
+        let secret_a = b"scope-a-secret";
+        let digest_a = digest_hex(secret_a, "llmp_key-a");
+        let config_a = authentication(
+            inline_secret(std::str::from_utf8(secret_a).unwrap()),
+            vec![virtual_key("key-a", "tenant-a", &digest_a, false)],
+        );
+        let ctx_a = FactoryContext {
+            shared: Arc::clone(&shared),
+            scope: "listener 'a' filter_chains[0]".to_string(),
+        };
+        let mut filter_a = AuthFilterFactory
+            .create(&config_a, &ctx_a)
+            .expect("scope A create must succeed")
+            .create_filter();
+
+        let secret_b = b"scope-b-secret";
+        let digest_b = digest_hex(secret_b, "llmp_key-b");
+        let config_b = authentication(
+            inline_secret(std::str::from_utf8(secret_b).unwrap()),
+            vec![virtual_key("key-b", "tenant-b", &digest_b, false)],
+        );
+        let ctx_b = FactoryContext {
+            shared: Arc::clone(&shared),
+            scope: "listener 'b' filter_chains[0]".to_string(),
+        };
+        let mut filter_b = AuthFilterFactory
+            .create(&config_b, &ctx_b)
+            .expect("scope B create must succeed")
+            .create_filter();
+
+        // Scope A's own key authenticates against scope A's own filter.
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_key-a"));
+        filter_a.decode_headers(&mut cb, &mut head, true);
+        assert!(
+            cb.local_reply.is_none(),
+            "scope A's own key must authenticate against scope A's own filter"
+        );
+
+        // Scope A's key must NOT authenticate against scope B's filter -- a
+        // pass here means scope B silently inherited scope A's ControlPlane.
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_key-a"));
+        filter_b.decode_headers(&mut cb, &mut head, true);
+        let reply = cb.local_reply.expect(
+            "scope A's key authenticated against scope B's filter -- scope B silently \
+             reused scope A's ControlPlane/keys instead of building its own",
+        );
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+
+        // The reverse: scope B's own key authenticates against scope B's own
+        // filter, and must NOT authenticate against scope A's.
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_key-b"));
+        filter_b.decode_headers(&mut cb, &mut head, true);
+        assert!(
+            cb.local_reply.is_none(),
+            "scope B's own key must authenticate against scope B's own filter -- if this \
+             fails, scope B's create() never registered its own ControlPlane (it silently \
+             read back scope A's slot instead)"
+        );
+
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_key-b"));
+        filter_a.decode_headers(&mut cb, &mut head, true);
+        let reply = cb.local_reply.expect(
+            "scope B's key authenticated against scope A's filter -- scope A silently \
+             reused scope B's ControlPlane/keys instead of its own",
+        );
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    }
+
+    // 26: the per-worker case (W1/W2, `create_resolves_one_shared_control_plane_through_the_slot`'s
+    // property) must not regress: the SAME scope across two independent
+    // `FactoryContext`s -- exactly what happens when `build_hcm_handler` runs
+    // once per worker over the same `context` string -- still yields ONE
+    // shared `ControlPlane`, not two independent ones.
+    #[test]
+    fn same_scope_twice_still_yields_one_shared_control_plane() {
+        let shared = Arc::new(SharedFactoryState::default());
+        let config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+
+        let ctx1 = FactoryContext {
+            shared: Arc::clone(&shared),
+            scope: "listener 'a' filter_chains[0]".to_string(),
+        };
+        AuthFilterFactory
+            .create(&config, &ctx1)
+            .expect("first create over the shared scope must succeed");
+        let control_plane = ctx1
+            .get(TYPE_URL)
+            .expect("create must register the control plane in the shared slot")
+            .downcast::<ControlPlane>()
+            .expect("the auth control-plane singleton is always a ControlPlane");
+        control_plane
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .expect("mint_key must succeed");
+
+        // A second "worker"'s create -- a fresh FactoryContext, same scope
+        // string, same underlying SharedFactoryState.
+        let ctx2 = FactoryContext {
+            shared: Arc::clone(&shared),
+            scope: "listener 'a' filter_chains[0]".to_string(),
+        };
+        AuthFilterFactory
+            .create(&config, &ctx2)
+            .expect("second create over the same scope must succeed");
+        let control_plane2 = ctx2
+            .get(TYPE_URL)
+            .expect("second create must resolve the SAME singleton, not build a new one")
+            .downcast::<ControlPlane>()
+            .expect("the auth control-plane singleton is always a ControlPlane");
+
+        assert!(
+            Arc::ptr_eq(&control_plane, &control_plane2),
+            "the same scope across two independent FactoryContexts must resolve to the SAME \
+             ControlPlane Arc -- this is the W1/W2 per-worker property and must not regress"
+        );
     }
 }

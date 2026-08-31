@@ -478,27 +478,56 @@ pub trait PerRouteConfig: Send + Sync {
 /// naming a concrete filter type here would invert the crate dependency
 /// (proxy-filters depends on proxy-http, not the reverse). They are
 /// `dyn Any + Send + Sync`, downcast by the crate that owns the concrete type.
+///
+/// The map key is `(scope, type_url)`, not `type_url` alone. `build_hcm_handler`
+/// (`proxy-core`) runs once PER FILTER CHAIN, and every chain in a serve is
+/// handed the same `Arc<SharedFactoryState>` — so `type_url` alone would let
+/// two listeners (or two chains on one listener) that both configure the same
+/// filter collide: the first chain to build wins the slot, and the second
+/// chain's own parsed config is silently discarded in favor of the first's
+/// (found on the auth path — ground rule #1). `scope` is the chain identity
+/// (`FactoryContext::scope`, set from `build_hcm_handler`'s own `context`
+/// parameter); every filter built for one chain shares one scope, so
+/// cross-filter reads within a chain (e.g. `model_authz` reading `auth`'s
+/// `ControlPlane`) still see the same instance.
+///
+/// Rust note: `type_url` stays `&'static str` (every caller passes a literal
+/// constant); only `scope` needs to be an owned `String` — it is built per
+/// chain build (`format!(...)` in `build_hcm_handler`'s caller), so nothing
+/// `'static` is available to borrow.
 #[derive(Default)]
 pub struct SharedFactoryState {
-    singletons: Mutex<HashMap<&'static str, Arc<dyn Any + Send + Sync>>>,
+    singletons: Mutex<HashMap<SingletonKey, Arc<dyn Any + Send + Sync>>>,
 }
 
+/// `SharedFactoryState`'s map key -- pulled out to a named type purely to
+/// satisfy clippy's `type_complexity` lint on the `HashMap` above; it carries
+/// no behavior of its own.
+type SingletonKey = (String, &'static str);
+
 impl SharedFactoryState {
-    /// Return the singleton under `key`, building and inserting it via `init`
-    /// on the first call for that key. Concurrent first-callers (workers build
-    /// their chains on separate runtimes) serialize on the lock; exactly one
-    /// runs `init`, the rest receive its result. `init` MUST NOT call back
-    /// into this method (it runs while the lock is held).
+    /// Return the singleton under `(scope, type_url)`, building and inserting
+    /// it via `init` on the first call for that key. Concurrent first-callers
+    /// (workers build their chains on separate runtimes) serialize on the
+    /// lock; exactly one runs `init`, the rest receive its result. `init`
+    /// MUST NOT call back into this method (it runs while the lock is held).
     pub fn get_or_try_init(
         &self,
-        key: &'static str,
+        scope: &str,
+        type_url: &'static str,
         init: impl FnOnce() -> Result<Arc<dyn Any + Send + Sync>, ConfigError>,
     ) -> Result<Arc<dyn Any + Send + Sync>, ConfigError> {
         let mut guard = self
             .singletons
             .lock()
             .expect("SharedFactoryState mutex poisoned");
-        if let Some(existing) = guard.get(key) {
+        // Rust note: `HashMap::get` needs a borrowed key matching the stored
+        // key's shape — `(&str, &'static str)` doesn't satisfy `Borrow<(String,
+        // &'static str)>`, so the lookup key is built as an owned tuple. Cheap
+        // (one allocation) and only on the cold path relative to holding the
+        // lock at all.
+        let key = (scope.to_string(), type_url);
+        if let Some(existing) = guard.get(&key) {
             return Ok(Arc::clone(existing));
         }
         let built = init()?;
@@ -506,24 +535,95 @@ impl SharedFactoryState {
         Ok(built)
     }
 
-    /// Read a previously-initialized singleton without building one — used by
-    /// the control side (admin server, later increment) to reach an instance a
-    /// worker's factory built. `None` until the first `get_or_try_init`.
-    pub fn get(&self, key: &'static str) -> Option<Arc<dyn Any + Send + Sync>> {
+    /// Read a previously-initialized singleton under `(scope, type_url)`
+    /// without building one — used by a chain's own later filters (e.g.
+    /// `model_authz` reading `auth`'s `ControlPlane`) to reach an instance an
+    /// earlier filter in the SAME chain built. `None` until the first
+    /// `get_or_try_init` for that exact `(scope, type_url)`.
+    pub fn get(&self, scope: &str, type_url: &'static str) -> Option<Arc<dyn Any + Send + Sync>> {
         self.singletons
             .lock()
             .expect("SharedFactoryState mutex poisoned")
-            .get(key)
+            .get(&(scope.to_string(), type_url))
             .map(Arc::clone)
+    }
+
+    /// Read a singleton by `type_url` alone, across every scope — for
+    /// control-plane code (the admin server) that has no chain identity of
+    /// its own to scope by. Distinguishes three cases the admin server needs
+    /// told apart, rather than guessing:
+    /// - `Ok(None)` — no scope has registered `type_url` yet (a boot race, or
+    ///   this filter isn't configured anywhere).
+    /// - `Ok(Some(_))` — exactly one scope has; unambiguous, so this is the
+    ///   one instance the caller means.
+    /// - `Err(scopes)` — MORE THAN ONE scope has registered a singleton under
+    ///   this `type_url` (e.g. two listeners each configuring `llmproxy.auth`
+    ///   with different keys). Returning an arbitrary one here would let an
+    ///   admin write land in the wrong tenant's control plane (ground rule
+    ///   #1); `scopes` names every chain identity that registered one so the
+    ///   caller can say so instead of guessing.
+    pub fn get_across_scopes(
+        &self,
+        type_url: &'static str,
+    ) -> Result<Option<Arc<dyn Any + Send + Sync>>, Vec<String>> {
+        let guard = self
+            .singletons
+            .lock()
+            .expect("SharedFactoryState mutex poisoned");
+        let mut matches = guard
+            .iter()
+            .filter(|((_, t), _)| *t == type_url)
+            .map(|((scope, _), value)| (scope.clone(), Arc::clone(value)));
+        let Some((first_scope, first_value)) = matches.next() else {
+            return Ok(None);
+        };
+        match matches.next() {
+            None => Ok(Some(first_value)),
+            Some((second_scope, _)) => {
+                let mut scopes = vec![first_scope, second_scope];
+                scopes.extend(matches.map(|(scope, _)| scope));
+                scopes.sort();
+                Err(scopes)
+            }
+        }
     }
 }
 
 /// Context handed to factories at config time. Carries the per-serve shared
-/// singleton slot ([`SharedFactoryState`]); a stateless filter ignores it.
+/// singleton slot ([`SharedFactoryState`]) plus this build's chain identity
+/// (`scope`); a stateless filter ignores both.
 /// TODO(WP-11): stats scope, runtime.
 #[derive(Default)]
 pub struct FactoryContext {
     pub shared: Arc<SharedFactoryState>,
+    /// This filter chain's identity, for [`SharedFactoryState`]'s key —
+    /// `build_hcm_handler` (`proxy-core`) sets this from its own `context`
+    /// parameter (the same string its error messages use), once per chain
+    /// build, shared by every filter factory `create`d for that chain. The
+    /// default (`String::new()`, via `#[derive(Default)]`) is the empty scope
+    /// every test `FactoryContext::default()` gets — fine there, since a
+    /// test only ever builds one chain per `FactoryContext`.
+    pub scope: String,
+}
+
+impl FactoryContext {
+    /// Thin wrapper over [`SharedFactoryState::get_or_try_init`] that
+    /// supplies this context's own `scope` — the ergonomic form every filter
+    /// factory's `create` should call instead of reaching through `.shared`
+    /// directly.
+    pub fn get_or_try_init(
+        &self,
+        type_url: &'static str,
+        init: impl FnOnce() -> Result<Arc<dyn Any + Send + Sync>, ConfigError>,
+    ) -> Result<Arc<dyn Any + Send + Sync>, ConfigError> {
+        self.shared.get_or_try_init(&self.scope, type_url, init)
+    }
+
+    /// Thin wrapper over [`SharedFactoryState::get`] that supplies this
+    /// context's own `scope`.
+    pub fn get(&self, type_url: &'static str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.shared.get(&self.scope, type_url)
+    }
 }
 
 /// Created once per (filter config, listener); creates per-stream instances.
@@ -585,35 +685,83 @@ mod tests {
 
     #[test]
     fn get_or_try_init_builds_once_and_returns_same_arc() {
+        // Same scope, same type_url -- one singleton, `init` runs once. This
+        // is the W1/W2 per-worker property: every worker's `create` call for
+        // one chain shares one `FactoryContext::scope`, so this is the shape
+        // that must NOT regress when a second axis (scope) is added to the key.
         let state = SharedFactoryState::default();
         let calls = std::cell::Cell::new(0);
         let first = state
-            .get_or_try_init("k", || {
+            .get_or_try_init("scope-a", "k", || {
                 calls.set(calls.get() + 1);
                 Ok(Arc::new(42u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("first init succeeds");
         let second = state
-            .get_or_try_init("k", || {
+            .get_or_try_init("scope-a", "k", || {
                 calls.set(calls.get() + 1);
                 Ok(Arc::new(99u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("second call succeeds without re-running init");
-        assert_eq!(calls.get(), 1, "init must only run once for the same key");
+        assert_eq!(
+            calls.get(),
+            1,
+            "init must only run once for the same (scope, type_url)"
+        );
         assert!(Arc::ptr_eq(&first, &second));
         let downcast = first.downcast::<u32>().expect("stored value was a u32");
         assert_eq!(*downcast, 42);
     }
 
     #[test]
-    fn different_keys_build_independently() {
+    fn different_type_urls_build_independently() {
         let state = SharedFactoryState::default();
         let a = state
-            .get_or_try_init("a", || Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>))
+            .get_or_try_init("scope", "a", || {
+                Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>)
+            })
             .expect("init a succeeds");
         let b = state
-            .get_or_try_init("b", || Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>))
+            .get_or_try_init("scope", "b", || {
+                Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>)
+            })
             .expect("init b succeeds");
+        assert_eq!(*a.downcast::<u32>().unwrap(), 1);
+        assert_eq!(*b.downcast::<u32>().unwrap(), 2);
+    }
+
+    /// Two different scopes, same type_url -- two DIFFERENT singletons, and
+    /// `init` runs twice. This is the bug this task fixes: before the
+    /// `(scope, type_url)` key, this test's second `get_or_try_init` would
+    /// have returned the FIRST scope's value without running its own `init`
+    /// at all -- exactly the silent-discard shape found on the auth path
+    /// (two listeners each configuring `llmproxy.auth` colliding on one
+    /// `type_url`-only slot).
+    #[test]
+    fn different_scopes_build_independently_even_with_the_same_type_url() {
+        let state = SharedFactoryState::default();
+        let calls = std::cell::Cell::new(0);
+        let a = state
+            .get_or_try_init("scope-a", "k", || {
+                calls.set(calls.get() + 1);
+                Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>)
+            })
+            .expect("init for scope-a succeeds");
+        let b = state
+            .get_or_try_init("scope-b", "k", || {
+                calls.set(calls.get() + 1);
+                Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>)
+            })
+            .expect("init for scope-b succeeds");
+        assert_eq!(
+            calls.get(),
+            2,
+            "each scope must run its own init exactly once, even though both use type_url \"k\""
+        );
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "scope-a and scope-b must resolve to two DIFFERENT singleton instances"
+        );
         assert_eq!(*a.downcast::<u32>().unwrap(), 1);
         assert_eq!(*b.downcast::<u32>().unwrap(), 2);
     }
@@ -621,11 +769,49 @@ mod tests {
     #[test]
     fn get_is_none_before_init_and_some_after() {
         let state = SharedFactoryState::default();
-        assert!(state.get("k").is_none());
+        assert!(state.get("scope", "k").is_none());
         state
-            .get_or_try_init("k", || Ok(Arc::new(7u32) as Arc<dyn Any + Send + Sync>))
+            .get_or_try_init("scope", "k", || {
+                Ok(Arc::new(7u32) as Arc<dyn Any + Send + Sync>)
+            })
             .expect("init succeeds");
-        let found = state.get("k").expect("singleton present after init");
+        let found = state
+            .get("scope", "k")
+            .expect("singleton present after init");
         assert_eq!(*found.downcast::<u32>().unwrap(), 7);
+    }
+
+    #[test]
+    fn get_across_scopes_distinguishes_absent_unique_and_ambiguous() {
+        let state = SharedFactoryState::default();
+        assert!(state
+            .get_across_scopes("k")
+            .expect("no scope registered yet")
+            .is_none());
+
+        state
+            .get_or_try_init("scope-a", "k", || {
+                Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>)
+            })
+            .expect("init for scope-a succeeds");
+        let unique = state
+            .get_across_scopes("k")
+            .expect("exactly one scope registered is unambiguous")
+            .expect("must be Some once one scope has registered");
+        assert_eq!(*unique.downcast::<u32>().unwrap(), 1);
+
+        state
+            .get_or_try_init("scope-b", "k", || {
+                Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>)
+            })
+            .expect("init for scope-b succeeds");
+        let scopes = state
+            .get_across_scopes("k")
+            .expect_err("two scopes registered under the same type_url must be ambiguous");
+        assert_eq!(
+            scopes,
+            vec!["scope-a".to_string(), "scope-b".to_string()],
+            "the ambiguity error must name every scope that registered a singleton"
+        );
     }
 }

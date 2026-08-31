@@ -231,12 +231,18 @@ fn factory_state_with_control_plane() -> (
     let handle = control_plane.handle();
     let factory_state = Arc::new(SharedFactoryState::default());
     factory_state
-        .get_or_try_init(auth_filter::TYPE_URL, || {
+        .get_or_try_init(TEST_CHAIN_SCOPE, auth_filter::TYPE_URL, || {
             Ok(Arc::new(control_plane) as Arc<dyn std::any::Any + Send + Sync>)
         })
         .expect("inserting the test ControlPlane singleton must not fail");
     (factory_state, handle)
 }
+
+/// The single chain scope every `factory_state_with_control_plane` test
+/// registers into -- arbitrary, standing in for `build_hcm_handler`'s own
+/// `context` string; only the ambiguity test below registers a SECOND,
+/// different scope.
+const TEST_CHAIN_SCOPE: &str = "listener 'test' filter_chains[0]";
 
 /// A [`VirtualKeyAuthenticator`] over `handle`, built with the same
 /// [`TEST_HMAC_SECRET`] every test's [`ControlPlane`] uses -- what every
@@ -652,6 +658,72 @@ async fn write_with_correct_token_but_no_control_plane_registered_is_503() {
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Token is configured and correct, and a `ControlPlane` IS registered --
+/// under TWO different chain scopes, standing in for two listeners that each
+/// configure `llmproxy.auth`. The admin API has no chain of its own to
+/// disambiguate by, so this must be a loud, explicit error naming the
+/// ambiguity, never a silent pick of one of the two -- see
+/// `resolve_control_plane`'s doc for why guessing here is exactly the class
+/// of bug this task exists to close.
+#[tokio::test]
+async fn write_with_two_registered_control_planes_is_an_explicit_error_not_a_guess() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    let cp_a = ControlPlane::new(
+        Box::new(InMemoryControlPlaneStore::default()),
+        HmacSecret::new(b"scope-a-secret"),
+        KeySet::new(),
+    )
+    .expect("an empty store must not fail ControlPlane::new");
+    let cp_b = ControlPlane::new(
+        Box::new(InMemoryControlPlaneStore::default()),
+        HmacSecret::new(b"scope-b-secret"),
+        KeySet::new(),
+    )
+    .expect("an empty store must not fail ControlPlane::new");
+    factory_state
+        .get_or_try_init(
+            "listener 'a' filter_chains[0]",
+            auth_filter::TYPE_URL,
+            || Ok(Arc::new(cp_a) as Arc<dyn std::any::Any + Send + Sync>),
+        )
+        .expect("registering scope a's ControlPlane must not fail");
+    factory_state
+        .get_or_try_init(
+            "listener 'b' filter_chains[0]",
+            auth_filter::TYPE_URL,
+            || Ok(Arc::new(cp_b) as Arc<dyn std::any::Any + Send + Sync>),
+        )
+        .expect("registering scope b's ControlPlane must not fail");
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"t1","key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "two llmproxy.auth-configured chains must be an explicit error, not the 503 the \
+         genuinely-not-ready case gets and not a 2xx that silently wrote into one of them"
+    );
+    assert!(
+        body.contains("listener 'a' filter_chains[0]")
+            && body.contains("listener 'b' filter_chains[0]"),
+        "the error must name every ambiguous scope, not just say \"ambiguous\": {body}"
+    );
 }
 
 /// The mint flow, correctly authorized: 201, a non-empty plaintext `key`
