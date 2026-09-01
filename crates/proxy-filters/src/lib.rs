@@ -43,7 +43,12 @@
 //!     and the published `ControlPlaneSnapshot` `VirtualKeyAuthenticator` now
 //!     reads instead of a static `KeySet` -- see
 //!     `internal-docs/wp-50-3b-store-design-brief.md`. `redb` and the admin
-//!     write API are 3b-ii, not built here.
+//!     write API are 3b-ii, not built here. Increment 3c-i ([`spend`]) adds
+//!     the spend-budget filter's price table: a pure `(cluster, model)` ->
+//!     per-bucket-price lookup and the integer-micro-dollar cost function
+//!     over one request's `usage::TokenUsage` -- see
+//!     `internal-docs/wp-50-3c-spend-budgets.md`. No accumulation, no
+//!     enforcement, and no `HttpFilter` yet; those are 3c-ii/iii.
 
 pub mod auth;
 pub mod auth_filter;
@@ -52,6 +57,7 @@ pub mod body_rewrite_filter;
 pub mod control;
 pub mod model_authz;
 pub mod model_authz_filter;
+pub mod spend;
 pub mod token_limit;
 pub mod token_limit_filter;
 pub mod usage;

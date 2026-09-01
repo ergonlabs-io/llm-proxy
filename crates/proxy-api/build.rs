@@ -44,6 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "llmproxy/filters/v0/auth.proto",
         // WP-50 increment 3a: per-tenant model allow-lists.
         "llmproxy/filters/v0/model_authz.proto",
+        // WP-50 increment 3c-i: the spend-budget filter's (cluster, model)
+        // price table.
+        "llmproxy/filters/v0/spend.proto",
         // WP-51 increment 3: OTLP export. The collector gRPC services; protoc
         // pulls the transitive trace/metrics/common/resource messages. We
         // hand-roll the exporter over these (build_client) and the in-test
