@@ -323,9 +323,18 @@ impl HttpFilterFactory for TokenLimitFilterFactory {
             ctx.scope, rule.on, rule.max_tokens, rule.window
         );
 
+        // WP-50 3c-ii-a: `ctx.stat_prefix` is passed through unchanged here so
+        // the call compiles against the new two-identity signature; nothing
+        // in `proxy-admin` addresses a `token_limit` singleton by name today,
+        // so the by-name index this populates is inert for this filter. If
+        // that changes, note that two `llmproxy.token_limit` filters in one
+        // chain (distinguished above by `scope`, not `ctx.stat_prefix`) would
+        // collide on the SAME `(stat_prefix, TYPE_URL)` name-index slot --
+        // the narrow uniqueness check in `proxy-config`'s lowering only
+        // covers `llmproxy.auth`, deliberately (see that check's doc).
         let shared = ctx
             .shared
-            .get_or_try_init(&scope, TYPE_URL, || {
+            .get_or_try_init(&scope, &ctx.stat_prefix, TYPE_URL, || {
                 let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new(rule));
                 let usage_missing_warner = Arc::new(UsageMissingWarner::new());
                 Ok(Arc::new(SharedTokenLimitState {
@@ -1542,6 +1551,7 @@ mod tests {
         let ctx = FactoryContext {
             shared: Arc::new(SharedFactoryState::default()),
             scope: "listener 'l' filter_chains[0]".to_string(),
+            stat_prefix: "l".to_string(),
         };
         let config = rate_limit_settings(10, 1.0); // max_tokens=10, window=10s
 
@@ -1589,6 +1599,7 @@ mod tests {
         let ctx = FactoryContext {
             shared: Arc::new(SharedFactoryState::default()),
             scope: "listener 'l' filter_chains[0]".to_string(),
+            stat_prefix: "l".to_string(),
         };
         let config_a = rate_limit_settings(10, 1.0); // max_tokens=10, window=10s
         let config_b = rate_limit_settings(500, 1.0); // a different rule, same chain

@@ -68,6 +68,11 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants",
     "/tenants/{id}",
     "/tenants/{id}/policy",
+    "/chains/{stat_prefix}/keys",
+    "/chains/{stat_prefix}/keys/{id}",
+    "/chains/{stat_prefix}/tenants",
+    "/chains/{stat_prefix}/tenants/{id}",
+    "/chains/{stat_prefix}/tenants/{id}/policy",
 ];
 
 /// Hard cap on a write request's body. An admin write endpoint has no
@@ -334,39 +339,69 @@ async fn handle(
     }
 
     // Gate 3: does the control plane exist, and is it unambiguous which one
-    // this write means? See `resolve_control_plane`'s doc for the two 503
-    // situations that don't need telling apart, and for the third case below
-    // -- more than one `llmproxy.auth`-configured chain -- which does.
-    let control_plane = match resolve_control_plane(factory_state) {
-        Ok(Some(cp)) => cp,
-        Ok(None) => {
-            return text(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the auth control plane is not initialized yet: either no llmproxy.auth filter \
-                 is configured, or the workers have not finished building their filter chains \
-                 yet -- retry shortly",
-            );
+    // this write means?
+    //
+    // WP-50 3c-ii-a: a SCOPED route (`route.stat_prefix()` is `Some`) names
+    // exactly which chain it means, so it resolves through
+    // `SharedFactoryState::get_by_name` -- no ambiguity is possible there
+    // (Lane H's lowering check rejects a duplicate `stat_prefix` among
+    // `llmproxy.auth`-configuring chains before this server ever runs), and
+    // an unknown name is a 404, not a 503: it names an operator error
+    // (typo'd or never-configured `stat_prefix`), not a boot race.
+    //
+    // An UNSCOPED route falls back to `resolve_control_plane`
+    // (`get_across_scopes`) exactly as it did before this increment -- kept
+    // as a convenience for the single-chain case; see that function's doc
+    // for the two 503 situations it does not need to tell apart, and for the
+    // third case below (more than one `llmproxy.auth`-configured chain) that
+    // it does.
+    let control_plane = if let Some(stat_prefix) = route.stat_prefix() {
+        match resolve_control_plane_by_name(factory_state, stat_prefix) {
+            Some(cp) => cp,
+            None => {
+                return text(
+                    StatusCode::NOT_FOUND,
+                    &format!(
+                        "no chain named '{stat_prefix}' registers an llmproxy.auth control \
+                         plane -- check the HCM's stat_prefix in the config, or that its \
+                         worker has finished building its filter chain"
+                    ),
+                );
+            }
         }
-        Err(scopes) => {
-            // Loud, not a guess (CLAUDE.md rule 17's shape applied here too):
-            // picking one of several ControlPlanes at random would risk
-            // writing a key into the wrong tenant's control plane.
-            tracing::error!(
-                endpoint = %path,
-                scopes = ?scopes,
-                "admin write refused: more than one llmproxy.auth-configured filter chain is \
-                 registered, so the admin API cannot tell which ControlPlane this write means"
-            );
-            return text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!(
-                    "the admin write API cannot resolve a single auth control plane: {} filter \
-                     chains each configure llmproxy.auth ({}) -- this admin API supports \
-                     writes only when exactly one chain in this serve configures llmproxy.auth",
-                    scopes.len(),
-                    scopes.join(", "),
-                ),
-            );
+    } else {
+        match resolve_control_plane(factory_state) {
+            Ok(Some(cp)) => cp,
+            Ok(None) => {
+                return text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the auth control plane is not initialized yet: either no llmproxy.auth \
+                     filter is configured, or the workers have not finished building their \
+                     filter chains yet -- retry shortly",
+                );
+            }
+            Err(scopes) => {
+                // Loud, not a guess (CLAUDE.md rule 17's shape applied here
+                // too): picking one of several ControlPlanes at random would
+                // risk writing a key into the wrong tenant's control plane.
+                tracing::error!(
+                    endpoint = %path,
+                    scopes = ?scopes,
+                    "admin write refused: more than one llmproxy.auth-configured filter chain \
+                     is registered, so the unscoped admin API cannot tell which ControlPlane \
+                     this write means -- use /chains/{{stat_prefix}}/... instead"
+                );
+                return text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!(
+                        "the unscoped admin write API cannot resolve a single auth control \
+                         plane: {} filter chains each configure llmproxy.auth ({}) -- use \
+                         /chains/{{stat_prefix}}/... to address one of them explicitly",
+                        scopes.len(),
+                        scopes.join(", "),
+                    ),
+                );
+            }
         }
     };
 
@@ -376,33 +411,74 @@ async fn handle(
     };
 
     match route {
-        WriteRoute::Keys => handle_mint_key(&control_plane, &body),
-        WriteRoute::KeyById(id) => handle_revoke_key(&control_plane, id),
-        WriteRoute::Tenants => handle_create_tenant(&control_plane, &body),
-        WriteRoute::TenantById(id) => handle_delete_tenant(&control_plane, id),
-        WriteRoute::TenantPolicy(id) => handle_set_policy(&control_plane, id, &body),
+        WriteRoute::Keys | WriteRoute::ScopedKeys(_) => handle_mint_key(&control_plane, &body),
+        WriteRoute::KeyById(id) | WriteRoute::ScopedKeyById(_, id) => {
+            handle_revoke_key(&control_plane, id)
+        }
+        WriteRoute::Tenants | WriteRoute::ScopedTenants(_) => {
+            handle_create_tenant(&control_plane, &body)
+        }
+        WriteRoute::TenantById(id) | WriteRoute::ScopedTenantById(_, id) => {
+            handle_delete_tenant(&control_plane, id)
+        }
+        WriteRoute::TenantPolicy(id) | WriteRoute::ScopedTenantPolicy(_, id) => {
+            handle_set_policy(&control_plane, id, &body)
+        }
     }
 }
 
 /// One of the write-capable paths this server recognizes, with the path
-/// parameter (if any) borrowed straight out of the request's path segments.
-/// Kept separate from method matching ([`WriteRoute::expected_method`]) so
-/// "known path, wrong method" can answer 405 rather than falling through to
-/// the generic 404 an unrecognized path gets.
+/// parameter(s) (if any) borrowed straight out of the request's path
+/// segments. Kept separate from method matching
+/// ([`WriteRoute::expected_method`]) so "known path, wrong method" can
+/// answer 405 rather than falling through to the generic 404 an unrecognized
+/// path gets.
+///
+/// WP-50 3c-ii-a added the `Scoped*` variants (`/chains/{stat_prefix}/...`)
+/// alongside the original unscoped ones rather than replacing them --
+/// [`Self::stat_prefix`] is the single place that tells the two families
+/// apart for [`handle`]'s control-plane resolution gate.
 enum WriteRoute<'a> {
     Keys,
     KeyById(&'a str),
     Tenants,
     TenantById(&'a str),
     TenantPolicy(&'a str),
+    ScopedKeys(&'a str),
+    ScopedKeyById(&'a str, &'a str),
+    ScopedTenants(&'a str),
+    ScopedTenantById(&'a str, &'a str),
+    ScopedTenantPolicy(&'a str, &'a str),
 }
 
-impl WriteRoute<'_> {
+impl<'a> WriteRoute<'a> {
     fn expected_method(&self) -> Method {
         match self {
             WriteRoute::Keys | WriteRoute::Tenants => Method::POST,
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
             WriteRoute::TenantPolicy(_) => Method::PUT,
+            WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
+            WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
+            WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
+        }
+    }
+
+    /// `Some(stat_prefix)` for a `/chains/{stat_prefix}/...` route, `None`
+    /// for an unscoped one -- `handle`'s single branch point between
+    /// `get_by_name` (scoped, always-correct) and `get_across_scopes`
+    /// (unscoped, the W4 convenience alias).
+    fn stat_prefix(&self) -> Option<&'a str> {
+        match self {
+            WriteRoute::Keys
+            | WriteRoute::KeyById(_)
+            | WriteRoute::Tenants
+            | WriteRoute::TenantById(_)
+            | WriteRoute::TenantPolicy(_) => None,
+            WriteRoute::ScopedKeys(s)
+            | WriteRoute::ScopedTenants(s)
+            | WriteRoute::ScopedKeyById(s, _)
+            | WriteRoute::ScopedTenantById(s, _)
+            | WriteRoute::ScopedTenantPolicy(s, _) => Some(s),
         }
     }
 }
@@ -430,6 +506,17 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
+        // WP-50 3c-ii-a: the scoped forms, addressed by the chain's
+        // operator-chosen `stat_prefix` -- see `WriteRoute`'s doc.
+        ["chains", stat_prefix, "keys"] => Some(WriteRoute::ScopedKeys(stat_prefix)),
+        ["chains", stat_prefix, "keys", id] => Some(WriteRoute::ScopedKeyById(stat_prefix, id)),
+        ["chains", stat_prefix, "tenants"] => Some(WriteRoute::ScopedTenants(stat_prefix)),
+        ["chains", stat_prefix, "tenants", id] => {
+            Some(WriteRoute::ScopedTenantById(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "policy"] => {
+            Some(WriteRoute::ScopedTenantPolicy(stat_prefix, id))
+        }
         _ => None,
     }
 }
@@ -471,6 +558,26 @@ fn resolve_control_plane(
 ) -> Result<Option<Arc<ControlPlane>>, Vec<String>> {
     let singleton = factory_state.get_across_scopes(proxy_filters::auth_filter::TYPE_URL)?;
     Ok(singleton.and_then(|s| s.downcast::<ControlPlane>().ok()))
+}
+
+/// Resolves the [`ControlPlane`] registered under the chain named
+/// `stat_prefix` -- the scoped (`/chains/{stat_prefix}/...`) counterpart of
+/// [`resolve_control_plane`], added in WP-50 3c-ii-a. `None` means no chain
+/// by that name has registered an `llmproxy.auth` control plane, which
+/// [`handle`] reports as 404: unlike the unscoped path, there is no
+/// ambiguity to report here (`get_by_name` cannot find two chains at once,
+/// since `proxy-config`'s Lane H lowering rejects a duplicate `stat_prefix`
+/// among `llmproxy.auth`-configuring chains before this server ever starts),
+/// so a caller-facing 404 naming the unknown `stat_prefix` is honest: either
+/// it was typo'd, or that chain's worker has not finished building its
+/// filter chain yet.
+fn resolve_control_plane_by_name(
+    factory_state: &SharedFactoryState,
+    stat_prefix: &str,
+) -> Option<Arc<ControlPlane>> {
+    factory_state
+        .get_by_name(stat_prefix, proxy_filters::auth_filter::TYPE_URL)
+        .and_then(|s| s.downcast::<ControlPlane>().ok())
 }
 
 /// Reads `body` up to [`MAX_ADMIN_BODY_BYTES`], returning the collected

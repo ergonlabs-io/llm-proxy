@@ -17,6 +17,21 @@
 //! `handle` for the full gate and its per-endpoint doc comments for request/
 //! response shapes.
 //!
+//! WP-50 3c-ii-a added a **scoped** form of every write endpoint,
+//! `/chains/{stat_prefix}/keys`, `/chains/{stat_prefix}/keys/{id}`,
+//! `/chains/{stat_prefix}/tenants`, `/chains/{stat_prefix}/tenants/{id}`,
+//! `/chains/{stat_prefix}/tenants/{id}/policy` -- addressed by the target
+//! HTTP connection manager's own operator-chosen `stat_prefix`, ALWAYS
+//! correct regardless of how many chains in this serve configure
+//! `llmproxy.auth`. The original unscoped endpoints (`/keys`, ...) stay: a
+//! convenience alias that succeeds only when exactly one chain in this serve
+//! configures `llmproxy.auth`, and explicitly refuses (rather than guessing)
+//! when more than one does -- see `server::resolve_control_plane`'s doc for
+//! why guessing would be a real cross-tenant write hazard, and
+//! `internal-docs/wp-50-3c-spend-budgets.md`'s "addressing follows Envoy"
+//! for why `stat_prefix`, not the internal positional chain identity, is the
+//! externally-addressable name.
+//!
 //! Everything else 404s, naming the endpoints that exist. `/quitquitquit`,
 //! `/drain_listeners`, and `/logging` (Envoy's own admin mutating
 //! endpoints) are not part of this API and stay 404.

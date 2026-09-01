@@ -1619,6 +1619,7 @@ mod tests {
         let ctx_a = FactoryContext {
             shared: Arc::clone(&shared),
             scope: "listener 'a' filter_chains[0]".to_string(),
+            stat_prefix: "a".to_string(),
         };
         let mut filter_a = AuthFilterFactory
             .create(&config_a, &ctx_a)
@@ -1634,6 +1635,7 @@ mod tests {
         let ctx_b = FactoryContext {
             shared: Arc::clone(&shared),
             scope: "listener 'b' filter_chains[0]".to_string(),
+            stat_prefix: "b".to_string(),
         };
         let mut filter_b = AuthFilterFactory
             .create(&config_b, &ctx_b)
@@ -1695,6 +1697,7 @@ mod tests {
         let ctx1 = FactoryContext {
             shared: Arc::clone(&shared),
             scope: "listener 'a' filter_chains[0]".to_string(),
+            stat_prefix: "a".to_string(),
         };
         AuthFilterFactory
             .create(&config, &ctx1)
@@ -1713,6 +1716,7 @@ mod tests {
         let ctx2 = FactoryContext {
             shared: Arc::clone(&shared),
             scope: "listener 'a' filter_chains[0]".to_string(),
+            stat_prefix: "a".to_string(),
         };
         AuthFilterFactory
             .create(&config, &ctx2)

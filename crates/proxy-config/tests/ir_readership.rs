@@ -132,24 +132,22 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   rather than reading `.cumulative` directly.",
     },
     AllowlistEntry {
-        struct_name: "HttpConnectionManagerConfig",
-        field_name: "stat_prefix",
-        kind: EntryKind::KnownInert,
-        reason: "Accepted-but-inert today; WP-23 (stats registry) closes it. \
-                  Named in IMPLEMENTATION_PLAN.md's WP-39 note alongside \
-                  `access_logs` as one of two known survivors — `access_logs` \
-                  has since landed (WP-24 chunk 3, see \
-                  crates/proxy-core/src/listener.rs's `new_with_access_logs` \
-                  call), leaving this one outstanding.",
-    },
-    AllowlistEntry {
         struct_name: "TcpProxyConfig",
         field_name: "stat_prefix",
-        kind: EntryKind::KnownInert,
+        kind: EntryKind::KnownInertNameCollision,
         reason: "Same stats gap as HttpConnectionManagerConfig.stat_prefix \
-                  above (WP-23), on the TCP proxy's copy of the field; not \
-                  separately called out in the plan's WP-39 note, but the \
-                  same owning WP applies.",
+                  (WP-23 outstanding for the TCP proxy's own copy of the \
+                  field) — still genuinely inert on THIS struct. Reclassified \
+                  from KnownInert in WP-50 3c-ii-a: `HttpConnectionManagerConfig`'s \
+                  own `stat_prefix` (a DIFFERENT field on a different struct) \
+                  now has a real runtime reader (`build_hcm_handler`, \
+                  `proxy-core`), and `proxy_http::filter::FactoryContext` \
+                  gained an unrelated `stat_prefix: String` field of its own \
+                  (read as `ctx.stat_prefix`/`self.stat_prefix` across \
+                  proxy-http/proxy-filters/proxy-core) -- the text-based scan \
+                  can't tell any of these three same-named fields apart, so \
+                  it now finds a `.stat_prefix` read regardless of whether \
+                  TcpProxyConfig's own field is ever touched.",
     },
     AllowlistEntry {
         struct_name: "RetryPolicyIR",

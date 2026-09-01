@@ -209,40 +209,63 @@ async fn start_full(
     (server, addr)
 }
 
-/// Builds a [`SharedFactoryState`] with a real [`ControlPlane`] already
-/// registered under `auth_filter::TYPE_URL` -- the exact shape a worker's
-/// `AuthFilterFactory::create` produces on the first call for a real
-/// `llmproxy.auth` filter (see that factory's own doc for the
-/// `get_or_try_init` singleton dance this mirrors). Returns the state and
-/// the `ControlPlane`'s own published-snapshot handle, so a test can
-/// `.load()` it directly to check what a mint/revoke/policy write actually
-/// published -- exactly what `crate::control`'s own tests do from inside
-/// that crate.
-fn factory_state_with_control_plane() -> (
-    Arc<SharedFactoryState>,
-    Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
-) {
+/// Registers a real [`ControlPlane`] into `factory_state` under
+/// `(scope, auth_filter::TYPE_URL)` AND, since WP-50 3c-ii-a, the matching
+/// `(stat_prefix, auth_filter::TYPE_URL)` name-index slot -- the exact shape
+/// a worker's `AuthFilterFactory::create` produces for a real `llmproxy.auth`
+/// filter (see that factory's own doc for the `get_or_try_init` singleton
+/// dance this mirrors). Returns the `ControlPlane`'s own published-snapshot
+/// handle, so a test can `.load()` it directly to check what a
+/// mint/revoke/policy write actually published -- exactly what
+/// `crate::control`'s own tests do from inside that crate.
+fn register_control_plane(
+    factory_state: &Arc<SharedFactoryState>,
+    scope: &str,
+    stat_prefix: &str,
+    hmac_secret: &[u8],
+) -> Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>> {
     let control_plane = ControlPlane::new(
         Box::new(InMemoryControlPlaneStore::default()),
-        HmacSecret::new(TEST_HMAC_SECRET),
+        HmacSecret::new(hmac_secret),
         KeySet::new(),
     )
     .expect("an empty store must not fail ControlPlane::new");
     let handle = control_plane.handle();
-    let factory_state = Arc::new(SharedFactoryState::default());
     factory_state
-        .get_or_try_init(TEST_CHAIN_SCOPE, auth_filter::TYPE_URL, || {
+        .get_or_try_init(scope, stat_prefix, auth_filter::TYPE_URL, || {
             Ok(Arc::new(control_plane) as Arc<dyn std::any::Any + Send + Sync>)
         })
         .expect("inserting the test ControlPlane singleton must not fail");
+    handle
+}
+
+/// Builds a [`SharedFactoryState`] with a single real [`ControlPlane`]
+/// registered under [`TEST_CHAIN_SCOPE`]/[`TEST_CHAIN_STAT_PREFIX`] -- what
+/// every single-chain write test uses (the unscoped alias resolves it
+/// unambiguously; the scoped form resolves it by name).
+fn factory_state_with_control_plane() -> (
+    Arc<SharedFactoryState>,
+    Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+) {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    let handle = register_control_plane(
+        &factory_state,
+        TEST_CHAIN_SCOPE,
+        TEST_CHAIN_STAT_PREFIX,
+        TEST_HMAC_SECRET,
+    );
     (factory_state, handle)
 }
 
 /// The single chain scope every `factory_state_with_control_plane` test
 /// registers into -- arbitrary, standing in for `build_hcm_handler`'s own
-/// `context` string; only the ambiguity test below registers a SECOND,
-/// different scope.
+/// `context` string; only the ambiguity/scoped-addressing tests below
+/// register a SECOND, different scope.
 const TEST_CHAIN_SCOPE: &str = "listener 'test' filter_chains[0]";
+
+/// The `stat_prefix` matching [`TEST_CHAIN_SCOPE`]'s registration -- WP-50
+/// 3c-ii-a's external name for the same chain.
+const TEST_CHAIN_STAT_PREFIX: &str = "test-chain";
 
 /// A [`VirtualKeyAuthenticator`] over `handle`, built with the same
 /// [`TEST_HMAC_SECRET`] every test's [`ControlPlane`] uses -- what every
@@ -670,32 +693,18 @@ async fn write_with_correct_token_but_no_control_plane_registered_is_503() {
 #[tokio::test]
 async fn write_with_two_registered_control_planes_is_an_explicit_error_not_a_guess() {
     let factory_state = Arc::new(SharedFactoryState::default());
-    let cp_a = ControlPlane::new(
-        Box::new(InMemoryControlPlaneStore::default()),
-        HmacSecret::new(b"scope-a-secret"),
-        KeySet::new(),
-    )
-    .expect("an empty store must not fail ControlPlane::new");
-    let cp_b = ControlPlane::new(
-        Box::new(InMemoryControlPlaneStore::default()),
-        HmacSecret::new(b"scope-b-secret"),
-        KeySet::new(),
-    )
-    .expect("an empty store must not fail ControlPlane::new");
-    factory_state
-        .get_or_try_init(
-            "listener 'a' filter_chains[0]",
-            auth_filter::TYPE_URL,
-            || Ok(Arc::new(cp_a) as Arc<dyn std::any::Any + Send + Sync>),
-        )
-        .expect("registering scope a's ControlPlane must not fail");
-    factory_state
-        .get_or_try_init(
-            "listener 'b' filter_chains[0]",
-            auth_filter::TYPE_URL,
-            || Ok(Arc::new(cp_b) as Arc<dyn std::any::Any + Send + Sync>),
-        )
-        .expect("registering scope b's ControlPlane must not fail");
+    register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        b"scope-a-secret",
+    );
+    register_control_plane(
+        &factory_state,
+        "listener 'b' filter_chains[0]",
+        "chain-b",
+        b"scope-b-secret",
+    );
 
     let (_server, addr) = start_full(
         snapshot_with_secret(),
@@ -723,6 +732,114 @@ async fn write_with_two_registered_control_planes_is_an_explicit_error_not_a_gue
         body.contains("listener 'a' filter_chains[0]")
             && body.contains("listener 'b' filter_chains[0]"),
         "the error must name every ambiguous scope, not just say \"ambiguous\": {body}"
+    );
+}
+
+/// **WP-50 3c-ii-a's centrepiece.** Two chains, distinct `stat_prefix`es,
+/// each with its OWN `ControlPlane` -- exactly the shape `resolve_control_plane`
+/// (the unscoped path) refuses to guess between. Minting through
+/// `/chains/chain-a/keys` must land in chain a's `ControlPlane` and be
+/// invisible to chain b's: this is the property `get_by_name` exists to
+/// give the admin server, as opposed to `get_across_scopes`, which cannot
+/// tell the two apart at all.
+#[tokio::test]
+async fn scoped_write_lands_in_the_named_chains_control_plane_and_not_the_others() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    let handle_a = register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        TEST_HMAC_SECRET,
+    );
+    let handle_b = register_control_plane(
+        &factory_state,
+        "listener 'b' filter_chains[0]",
+        "chain-b",
+        TEST_HMAC_SECRET,
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/chains/chain-a/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "scoped mint into chain-a: {body}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let plaintext = value["key"].as_str().expect("key field is a string");
+
+    let auth_a = test_authenticator(handle_a);
+    match auth_a.authenticate(&headers_with_bearer(plaintext)) {
+        AuthOutcome::Authenticated(principal) => {
+            assert_eq!(principal.tenant.as_str(), "tenant-a");
+        }
+        other => panic!(
+            "the key minted through /chains/chain-a/keys must authenticate against chain-a's \
+             own ControlPlane; got Rejected={} NoCredential={}",
+            matches!(other, AuthOutcome::Rejected(_)),
+            matches!(other, AuthOutcome::NoCredential)
+        ),
+    }
+
+    let auth_b = test_authenticator(handle_b);
+    assert!(
+        !matches!(
+            auth_b.authenticate(&headers_with_bearer(plaintext)),
+            AuthOutcome::Authenticated(_)
+        ),
+        "a key minted into chain-a's ControlPlane must NOT authenticate against chain-b's -- \
+         a pass here means the scoped write landed in the wrong chain"
+    );
+}
+
+/// An unknown `stat_prefix` is a 404 naming the segment that matched no
+/// registered chain -- never a 503 (this is not a boot race: some chain IS
+/// registered, just not the one named) and never a silent fall-through to
+/// the unscoped resolution.
+#[tokio::test]
+async fn scoped_write_with_unknown_stat_prefix_is_404() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        TEST_HMAC_SECRET,
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/chains/no-such-chain/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"t1","key_id":"k1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("no-such-chain"),
+        "the 404 must name the unresolved stat_prefix: {body}"
     );
 }
 

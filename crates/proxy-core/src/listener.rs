@@ -1165,6 +1165,11 @@ fn build_hcm_handler(
     let factory_ctx = FactoryContext {
         shared: factory_state.clone(),
         scope: context.to_string(),
+        // WP-50 3c-ii-a: the HCM's own operator-supplied `stat_prefix` (this
+        // function already holds `hcm`) becomes the chain's external name --
+        // see `FactoryContext`'s doc for why this is a second field, not a
+        // rename of `scope`.
+        stat_prefix: hcm.stat_prefix.clone(),
     };
     let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
     for f in &hcm.http_filters {

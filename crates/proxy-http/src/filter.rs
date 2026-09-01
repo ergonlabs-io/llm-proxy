@@ -495,14 +495,22 @@ pub trait PerRouteConfig: Send + Sync {
 /// constant); only `scope` needs to be an owned `String` — it is built per
 /// chain build (`format!(...)` in `build_hcm_handler`'s caller), so nothing
 /// `'static` is available to borrow.
+///
+/// WP-50 3c-ii-a: a second map, `by_name`, indexes the SAME `Arc`s by
+/// `(stat_prefix, type_url)` — see [`FactoryContext`]'s doc for why `scope`
+/// and `stat_prefix` are two different identities, not one renamed. Both
+/// maps are populated together in `get_or_try_init`; nothing is ever in one
+/// and not the other.
 #[derive(Default)]
 pub struct SharedFactoryState {
     singletons: Mutex<HashMap<SingletonKey, Arc<dyn Any + Send + Sync>>>,
+    by_name: Mutex<HashMap<SingletonKey, Arc<dyn Any + Send + Sync>>>,
 }
 
 /// `SharedFactoryState`'s map key -- pulled out to a named type purely to
 /// satisfy clippy's `type_complexity` lint on the `HashMap` above; it carries
-/// no behavior of its own.
+/// no behavior of its own. Used for both the `scope`-keyed and
+/// `stat_prefix`-keyed maps -- both keys are `(String, &'static str)` shaped.
 type SingletonKey = (String, &'static str);
 
 impl SharedFactoryState {
@@ -511,9 +519,18 @@ impl SharedFactoryState {
     /// (workers build their chains on separate runtimes) serialize on the
     /// lock; exactly one runs `init`, the rest receive its result. `init`
     /// MUST NOT call back into this method (it runs while the lock is held).
+    ///
+    /// `stat_prefix` is the chain's external name (see [`FactoryContext`]'s
+    /// doc): on the first build for this `scope`, the same `Arc` is also
+    /// recorded under `(stat_prefix, type_url)` so [`Self::get_by_name`] can
+    /// find it later. A `scope` that already has a singleton for this
+    /// `type_url` returns the existing `Arc` without touching `by_name` again
+    /// -- the name index is populated once, at the same moment the scope
+    /// index is.
     pub fn get_or_try_init(
         &self,
         scope: &str,
+        stat_prefix: &str,
         type_url: &'static str,
         init: impl FnOnce() -> Result<Arc<dyn Any + Send + Sync>, ConfigError>,
     ) -> Result<Arc<dyn Any + Send + Sync>, ConfigError> {
@@ -532,6 +549,14 @@ impl SharedFactoryState {
         }
         let built = init()?;
         guard.insert(key, Arc::clone(&built));
+        // Populate the name index under the same lock ordering discipline
+        // (singletons first, then by_name) every call site uses -- there is
+        // only this one call site, so no ordering hazard exists yet, but the
+        // comment is here for whoever adds a second.
+        self.by_name
+            .lock()
+            .expect("SharedFactoryState mutex poisoned")
+            .insert((stat_prefix.to_string(), type_url), Arc::clone(&built));
         Ok(built)
     }
 
@@ -545,6 +570,28 @@ impl SharedFactoryState {
             .lock()
             .expect("SharedFactoryState mutex poisoned")
             .get(&(scope.to_string(), type_url))
+            .map(Arc::clone)
+    }
+
+    /// Read a previously-initialized singleton under `(stat_prefix, type_url)`
+    /// -- the admin server's scoped lookup (`/chains/{stat_prefix}/...`).
+    /// Unlike `scope`, `stat_prefix` is an operator-chosen name (`ir.rs:283`),
+    /// so this is safe to expose in a URL or use as a persisted-row key; see
+    /// [`FactoryContext`]'s doc for the split. `None` if no chain named
+    /// `stat_prefix` has registered a singleton for `type_url` -- ambiguity
+    /// cannot happen here the way it can for `get_across_scopes`, because
+    /// `proxy-config`'s lowering (Lane H) rejects a duplicate `stat_prefix`
+    /// among chains that register an admin-addressable singleton, so at most
+    /// one chain can ever occupy this key.
+    pub fn get_by_name(
+        &self,
+        stat_prefix: &str,
+        type_url: &'static str,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.by_name
+            .lock()
+            .expect("SharedFactoryState mutex poisoned")
+            .get(&(stat_prefix.to_string(), type_url))
             .map(Arc::clone)
     }
 
@@ -590,8 +637,29 @@ impl SharedFactoryState {
 }
 
 /// Context handed to factories at config time. Carries the per-serve shared
-/// singleton slot ([`SharedFactoryState`]) plus this build's chain identity
-/// (`scope`); a stateless filter ignores both.
+/// singleton slot ([`SharedFactoryState`]) plus this build's TWO chain
+/// identities; a stateless filter ignores all three.
+///
+/// WP-50 3c-ii-a split these into two fields with two different jobs, per
+/// `internal-docs/wp-50-3c-spend-budgets.md`'s "addressing follows Envoy":
+/// - **`scope`** KEYS singletons. It is positional, internal, and always
+///   unique per chain build, even for two chains that would otherwise be
+///   indistinguishable (same listener config repeated, same `stat_prefix`).
+///   Nothing durable or user-facing may be keyed by it — reordering filter
+///   chains changes it silently.
+/// - **`stat_prefix`** NAMES a chain externally. It is the HCM's
+///   operator-supplied `stat_prefix` (`ir.rs:283`), already required and
+///   already rendered in `/config_dump`. It is what admin URLs
+///   (`/chains/{stat_prefix}/...`) and persisted rows (WP-50 3c-ii-b) key by,
+///   because it is stable under reordering and human-chosen -- but it is
+///   only enforced unique among chains that register an admin-addressable
+///   singleton (`proxy-config`'s Lane H check), so a filter that never calls
+///   `get_by_name` must never assume it is unique.
+///
+/// A reader adding a new call site: singleton lifetime and cross-filter reads
+/// within one chain use `scope` (via `get`/`get_or_try_init`); anything
+/// exposed outside the process (an admin endpoint, a spend row) uses
+/// `stat_prefix` (via `get_by_name`).
 /// TODO(WP-11): stats scope, runtime.
 #[derive(Default)]
 pub struct FactoryContext {
@@ -604,19 +672,27 @@ pub struct FactoryContext {
     /// every test `FactoryContext::default()` gets — fine there, since a
     /// test only ever builds one chain per `FactoryContext`.
     pub scope: String,
+    /// This filter chain's OPERATOR-CHOSEN external name -- the HCM's
+    /// `stat_prefix` (`ir.rs:283`), set by `build_hcm_handler` from the same
+    /// `HttpConnectionManagerConfig` it already has in hand. See this type's
+    /// own doc for why this is a second field, not a rename of `scope`. The
+    /// default (`String::new()`) matches `scope`'s: fine for a test that
+    /// never calls `get_by_name`.
+    pub stat_prefix: String,
 }
 
 impl FactoryContext {
     /// Thin wrapper over [`SharedFactoryState::get_or_try_init`] that
-    /// supplies this context's own `scope` — the ergonomic form every filter
-    /// factory's `create` should call instead of reaching through `.shared`
-    /// directly.
+    /// supplies this context's own `scope` and `stat_prefix` — the ergonomic
+    /// form every filter factory's `create` should call instead of reaching
+    /// through `.shared` directly.
     pub fn get_or_try_init(
         &self,
         type_url: &'static str,
         init: impl FnOnce() -> Result<Arc<dyn Any + Send + Sync>, ConfigError>,
     ) -> Result<Arc<dyn Any + Send + Sync>, ConfigError> {
-        self.shared.get_or_try_init(&self.scope, type_url, init)
+        self.shared
+            .get_or_try_init(&self.scope, &self.stat_prefix, type_url, init)
     }
 
     /// Thin wrapper over [`SharedFactoryState::get`] that supplies this
@@ -692,13 +768,13 @@ mod tests {
         let state = SharedFactoryState::default();
         let calls = std::cell::Cell::new(0);
         let first = state
-            .get_or_try_init("scope-a", "k", || {
+            .get_or_try_init("scope-a", "name-a", "k", || {
                 calls.set(calls.get() + 1);
                 Ok(Arc::new(42u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("first init succeeds");
         let second = state
-            .get_or_try_init("scope-a", "k", || {
+            .get_or_try_init("scope-a", "name-a", "k", || {
                 calls.set(calls.get() + 1);
                 Ok(Arc::new(99u32) as Arc<dyn Any + Send + Sync>)
             })
@@ -717,12 +793,12 @@ mod tests {
     fn different_type_urls_build_independently() {
         let state = SharedFactoryState::default();
         let a = state
-            .get_or_try_init("scope", "a", || {
+            .get_or_try_init("scope", "name", "a", || {
                 Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("init a succeeds");
         let b = state
-            .get_or_try_init("scope", "b", || {
+            .get_or_try_init("scope", "name", "b", || {
                 Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("init b succeeds");
@@ -742,13 +818,13 @@ mod tests {
         let state = SharedFactoryState::default();
         let calls = std::cell::Cell::new(0);
         let a = state
-            .get_or_try_init("scope-a", "k", || {
+            .get_or_try_init("scope-a", "name-a", "k", || {
                 calls.set(calls.get() + 1);
                 Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("init for scope-a succeeds");
         let b = state
-            .get_or_try_init("scope-b", "k", || {
+            .get_or_try_init("scope-b", "name-b", "k", || {
                 calls.set(calls.get() + 1);
                 Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>)
             })
@@ -771,7 +847,7 @@ mod tests {
         let state = SharedFactoryState::default();
         assert!(state.get("scope", "k").is_none());
         state
-            .get_or_try_init("scope", "k", || {
+            .get_or_try_init("scope", "name", "k", || {
                 Ok(Arc::new(7u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("init succeeds");
@@ -790,7 +866,7 @@ mod tests {
             .is_none());
 
         state
-            .get_or_try_init("scope-a", "k", || {
+            .get_or_try_init("scope-a", "name-a", "k", || {
                 Ok(Arc::new(1u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("init for scope-a succeeds");
@@ -801,7 +877,7 @@ mod tests {
         assert_eq!(*unique.downcast::<u32>().unwrap(), 1);
 
         state
-            .get_or_try_init("scope-b", "k", || {
+            .get_or_try_init("scope-b", "name-b", "k", || {
                 Ok(Arc::new(2u32) as Arc<dyn Any + Send + Sync>)
             })
             .expect("init for scope-b succeeds");
@@ -812,6 +888,38 @@ mod tests {
             scopes,
             vec!["scope-a".to_string(), "scope-b".to_string()],
             "the ambiguity error must name every scope that registered a singleton"
+        );
+    }
+
+    /// WP-50 3c-ii-a: `get_by_name` resolves the same `Arc` `get` returns for
+    /// the matching scope, and a DIFFERENT `stat_prefix` finds nothing --
+    /// this is the property the admin server's scoped endpoints
+    /// (`/chains/{stat_prefix}/...`) depend on to land a write in the right
+    /// chain's control plane and not merely "some" chain's.
+    #[test]
+    fn get_by_name_resolves_the_same_arc_as_scoped_get_and_nothing_for_a_different_name() {
+        let state = SharedFactoryState::default();
+        let built = state
+            .get_or_try_init("listener 'l1' filter_chains[0]", "chain-a", "k", || {
+                Ok(Arc::new(7u32) as Arc<dyn Any + Send + Sync>)
+            })
+            .expect("init succeeds");
+
+        let by_name = state
+            .get_by_name("chain-a", "k")
+            .expect("stat_prefix \"chain-a\" registered a singleton for \"k\"");
+        assert!(
+            Arc::ptr_eq(&built, &by_name),
+            "get_by_name must resolve the SAME Arc get_or_try_init returned"
+        );
+
+        assert!(
+            state.get_by_name("chain-b", "k").is_none(),
+            "a different stat_prefix must not resolve chain-a's singleton"
+        );
+        assert!(
+            state.get_by_name("chain-a", "other-type-url").is_none(),
+            "a different type_url under the same stat_prefix must not resolve"
         );
     }
 }

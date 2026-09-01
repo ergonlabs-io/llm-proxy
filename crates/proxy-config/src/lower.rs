@@ -71,9 +71,17 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         return Ok(snapshot);
     };
 
+    // WP-50 3c-ii-a: `seen_stat_prefixes` accumulates across EVERY listener in
+    // this bootstrap, not just within one -- two listeners each configuring
+    // `llmproxy.auth` with the same `stat_prefix` is exactly the ambiguity
+    // this check exists to reject. See `check_admin_addressable_stat_prefixes`'s
+    // doc for why only `llmproxy.auth`-configuring chains are covered.
+    let mut seen_stat_prefixes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (i, l) in sr.listeners.iter().enumerate() {
         let path = format!("static_resources.listeners[{i}]");
         let ir = convert_listener(l, &path)?;
+        check_admin_addressable_stat_prefixes(&ir, &path, &mut seen_stat_prefixes)?;
         if snapshot
             .listeners
             .insert(ir.name.clone(), Arc::new(ir))
@@ -1533,6 +1541,76 @@ fn check_lane_h_filter_order(
         }
     }
 
+    Ok(())
+}
+
+/// WP-50 3c-ii-a: rejects a duplicate HCM `stat_prefix` among chains that
+/// configure `llmproxy.auth`, across this ENTIRE listener (`seen` is shared
+/// by every listener the caller processes, not reset per-listener -- two
+/// different listeners each configuring `llmproxy.auth` under the same
+/// `stat_prefix` collide exactly the same as two chains on one listener).
+///
+/// Deliberately narrow, per
+/// `internal-docs/wp-50-3c-spend-budgets.md`'s "addressing follows Envoy":
+/// Envoy tolerates a duplicate `stat_prefix` everywhere (it merges stats),
+/// and a duplicate among chains that register NO admin-addressable
+/// singleton must stay legal -- e.g. two `llmproxy.token_limit`-only chains
+/// sharing a name is fine, because nothing ever looks one up by that name.
+/// `llmproxy.auth` is the only filter an admin endpoint addresses by name
+/// today (`SharedFactoryState::get_by_name`, `proxy-admin`'s
+/// `/chains/{stat_prefix}/...`); a chain that never registers one has no
+/// addressing collision to have. Walks both `filter_chains` and
+/// `default_filter_chain` -- either can carry an HCM.
+fn check_admin_addressable_stat_prefixes(
+    listener: &ListenerConfig,
+    path: &str,
+    seen: &mut std::collections::HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (i, fc) in listener.filter_chains.iter().enumerate() {
+        check_filter_chain_stat_prefix(fc, &format!("{path}.filter_chains[{i}]"), seen)?;
+    }
+    if let Some(fc) = &listener.default_filter_chain {
+        check_filter_chain_stat_prefix(fc, &format!("{path}.default_filter_chain"), seen)?;
+    }
+    Ok(())
+}
+
+/// One filter chain's half of [`check_admin_addressable_stat_prefixes`]:
+/// finds this chain's HCM (if it has one -- a `TcpProxy`-terminated chain
+/// does not), and if it configures `llmproxy.auth`, records or rejects its
+/// `stat_prefix` against every chain already seen.
+fn check_filter_chain_stat_prefix(
+    fc: &FilterChainSpec,
+    path: &str,
+    seen: &mut std::collections::HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (k, filter) in fc.filters.iter().enumerate() {
+        let NetworkFilterSpec::HttpConnectionManager(hcm) = filter else {
+            continue;
+        };
+        let configures_auth = hcm
+            .http_filters
+            .iter()
+            .any(|f| f.type_url == AUTH_FILTER_TYPE);
+        if !configures_auth {
+            continue;
+        }
+        let stat_prefix_path = format!("{path}.filters[{k}].typed_config.stat_prefix");
+        if let Some(first_path) = seen.get(&hcm.stat_prefix) {
+            return Err(invalid(
+                stat_prefix_path,
+                format!(
+                    "duplicate stat_prefix `{}` (already used at `{first_path}`): both chains \
+                     configure llmproxy.auth, so admin addressing \
+                     (`/chains/{{stat_prefix}}/...`) and persisted spend rows could not tell \
+                     them apart -- a duplicate stat_prefix among chains that DON'T configure \
+                     llmproxy.auth stays legal, exactly as in Envoy",
+                    hcm.stat_prefix
+                ),
+            ));
+        }
+        seen.insert(hcm.stat_prefix.clone(), stat_prefix_path);
+    }
     Ok(())
 }
 
