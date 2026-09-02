@@ -13,18 +13,79 @@ syntax = "proto3";
 
 package llmproxy.filters.v0;
 
-// The configured price table for the spend-budget filter (`llmproxy.spend`).
+// The configured price table for the spend-budget filter (`llmproxy.spend_limit`).
 //
-// This message alone answers "what did this request cost" -- it does not
-// accumulate spend, enforce a ceiling, or read `StreamInfo`. Those are later
-// increments (3c-ii, 3c-iii); this is only the price data they will read.
+// This message answers "what did this request cost" (`pricing`) and "what
+// reporting period does an unbudgeted tenant's spend accrue into"
+// (`default_period`). It deliberately does NOT carry the ceiling itself --
+// see this message's "Where the ceiling lives" note below -- and by 3c-ii it
+// also does not accumulate spend or enforce anything; 3c-iii-b is the filter
+// that reads this config, resolves the shared `SpendAccumulator` singleton,
+// and does both.
 message SpendLimit {
   // The configured per-cluster price lists. An entry for a cluster that is
   // never actually dialled by a request is simply never charged -- see
   // `ClusterPricing.cluster`'s doc for why cluster names are not
   // cross-checked against the snapshot at load.
   repeated ClusterPricing pricing = 1;
+
+  // The reporting period a tenant's spend accrues into when that tenant has
+  // NO configured `TenantBudget` -- see `proxy_filters::spend::TenantBudget`
+  // for why a budget's OWN period always wins when one exists: this field is
+  // a fallback for spend HISTORY to have somewhere to accrue, never a value
+  // that overrides a tenant's actual budget period. `PERIOD_UNSPECIFIED`
+  // (proto3's implicit zero value for an unset enum) means `MONTHLY`, not an
+  // error -- an operator who never thinks about this field gets the coarser,
+  // less surprising default rather than a load-time failure over a knob most
+  // deployments will never touch.
+  Period default_period = 2;
+
+  // How often the in-memory spend accumulator flushes to the
+  // `ControlPlaneStore`, in seconds. `0` (proto3's implicit default for an
+  // unset `uint32`) means "use the built-in default of 5 seconds" -- this is
+  // a durability knob, not a correctness one (see "Enforcement reads live
+  // memory" below), so treating unset as "pick a sane default" is safe in a
+  // way an unset ceiling or an unset price would not be.
+  uint32 flush_interval_seconds = 3;
 }
+
+// A calendar-aligned accounting window. See
+// `proxy_filters::spend::Period` -- this enum is this proto's mirror of that
+// Rust type, converted once at config load, never carried through to the
+// data plane as a raw integer.
+enum Period {
+  // proto3's implicit zero value. Never a real choice at the data-plane
+  // level; wherever this enum is read, `PERIOD_UNSPECIFIED` is translated to
+  // a concrete default appropriate to that field (see `default_period`
+  // above) rather than left as a third, ambiguous "period".
+  PERIOD_UNSPECIFIED = 0;
+  DAILY = 1;
+  MONTHLY = 2;
+}
+
+// Where the ceiling itself lives, and why not here
+//
+// A tenant's spend CEILING (`TenantBudget` -- `max_micros` + its own
+// `period`) is deliberately NOT a field on `SpendLimit`, unlike the price
+// table above. It lives in the control plane
+// (`proxy_filters::control::ControlPlane`, beside `ModelAccess`) and is set
+// through the admin API (`PUT /chains/{stat_prefix}/tenants/{id}/budget`),
+// the same seam WP-50 3b already uses for per-tenant model allow-lists.
+//
+// Two reasons, not one:
+//
+// - **A ceiling is per-TENANT, not per-deployment.** `SpendLimit` is one
+//   filter's static `typed_config`, shared by every tenant that chain
+//   serves; a ceiling that varies by tenant cannot be expressed as a single
+//   scalar on it without inventing a second, redundant tenant list this
+//   message would then have to keep in sync with the control plane's own.
+// - **A ceiling changes far more often than prices do, in production, by an
+//   operator responding to a specific tenant's usage** -- exactly the "take
+//   effect on the next request with no reload" property WP-50 3b built the
+//   admin write API and `ControlPlaneSnapshot` republish path for. Bootstrap
+//   config is the wrong tool for a value that is expected to change while
+//   the process is running; prices, by contrast, are close to static
+//   deployment facts, which is why they DO belong in `typed_config`.
 
 // One cluster's price list.
 //

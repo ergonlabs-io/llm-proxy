@@ -101,7 +101,7 @@ use std::time::Duration;
 // WP-50 increment 3c-ii-b: UTC calendar-aligned period keys. `chrono` is
 // already a workspace dependency (`proxy-cluster`, `proxy-observability`
 // use it); this crate had no prior need for wall-clock rendering.
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::auth::TenantId;
 use crate::control::{ControlPlaneStore, StoreError};
@@ -401,6 +401,31 @@ fn round_once(numerator: u128) -> u64 {
 // `rollover_splits_into_two_period_rows_not_one_when_the_flush_ticks_late`;
 // its mutation pin computes the key from the flush's own "now" instead.
 //
+// # `record` takes its `Period` explicitly -- a per-call parameter, not a
+// per-accumulator constant (WP-50 3c-iii-b fixup)
+//
+// This was a live defect between two merged increments, not a design
+// preference: [`TenantBudget`] (3c-iii-a) carries a budget's period PER
+// TENANT, but this accumulator originally fixed ONE `Period` for its entire
+// lifetime and `record` used that fixed value unconditionally. A daily-budget
+// tenant and a monthly-budget tenant sharing one accumulator (the ordinary
+// case -- one accumulator per chain, many tenants) could therefore never both
+// be metered correctly: whichever period the accumulator was constructed
+// with was the only one any tenant's spend was ever bucketed under, silently
+// wrong for every tenant configured with the other period.
+//
+// So `record` takes `period: Period` as an explicit argument -- the caller
+// (the 3c-iii-b enforcement filter) resolves the CALLING tenant's own
+// `TenantBudget::period` (or, for a tenant with no budget at all, falls back
+// to [`Self::default_period`] purely so spend history still accrues
+// somewhere reportable) and passes it in per call. The constructor's
+// erstwhile `period` field is renamed [`Inner::default_period`] to make that
+// fallback-only role explicit at the type level rather than leaving a field
+// named `period` that no longer means "the accumulator's period". Pinned by
+// `two_tenants_with_different_periods_each_accrue_into_their_own_period_key`;
+// its mutation pin has `record` ignore the passed period and use
+// `default_period` instead.
+//
 // # Enforcement reads live memory; the flusher is durability, not security
 //
 // [`SpendAccumulator::current_total`] reads the in-memory bucket directly
@@ -455,6 +480,49 @@ impl Period {
             Period::Daily => PeriodKey(now.format("%Y-%m-%d").to_string()),
             Period::Monthly => PeriodKey(now.format("%Y-%m").to_string()),
         }
+    }
+
+    /// The UTC instant this period's CURRENT window ends (exclusive) -- the
+    /// next daily or monthly calendar boundary strictly after `now`. WP-50
+    /// increment 3c-iii-b's enforcement filter uses this (never the
+    /// accumulator itself, which has no notion of a ceiling) to compute
+    /// `x-ratelimit-reset`/`retry-after` on a 429: "how many seconds until
+    /// this tenant's ceiling resets", the same calendar alignment
+    /// [`Self::key_for`] already uses so the two can never disagree about
+    /// where a boundary falls.
+    pub fn next_boundary(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let next_date = match self {
+            Period::Daily => now.date_naive() + chrono::Duration::days(1),
+            Period::Monthly => {
+                let (year, month) = (now.year(), now.month());
+                let (next_year, next_month) = if month == 12 {
+                    (year + 1, 1)
+                } else {
+                    (year, month + 1)
+                };
+                NaiveDate::from_ymd_opt(next_year, next_month, 1)
+                    .expect("the first day of a valid year/month is always a valid date")
+            }
+        };
+        next_date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always a valid time")
+            .and_utc()
+    }
+
+    /// Seconds from `now` until [`Self::next_boundary`], for the enforcement
+    /// filter's `x-ratelimit-reset`/`retry-after` headers.
+    ///
+    /// Rust note: `.max(0)` before the `as u64` -- `next_boundary` is always
+    /// strictly later than `now` by construction (it is always at least the
+    /// start of tomorrow, or of next month), so the subtraction is never
+    /// negative in practice, but guarding the cast explicitly costs nothing
+    /// and turns a "should never happen" into a documented saturate rather
+    /// than a silent two's-complement wraparound if some future edit ever
+    /// violates that invariant.
+    pub fn seconds_until_reset(&self, now: DateTime<Utc>) -> u64 {
+        let boundary = self.next_boundary(now);
+        (boundary - now).num_seconds().max(0) as u64
     }
 }
 
@@ -570,7 +638,11 @@ struct Bucket {
 struct Inner {
     stat_prefix: String,
     store: Arc<dyn ControlPlaneStore>,
-    period: Period,
+    /// The period used ONLY for a tenant with no configured [`TenantBudget`]
+    /// -- see this section's "`record` takes its `Period` explicitly" note.
+    /// Never consulted for a tenant `record` is called with an explicit
+    /// period for.
+    default_period: Period,
     buckets: Mutex<HashMap<(TenantId, PeriodKey), Bucket>>,
 }
 
@@ -687,12 +759,19 @@ impl SpendAccumulator {
     /// (see [`Self::start_flusher`]) so a test can exercise `record`/
     /// `current_total`/`flush_now` with no background thread involved at
     /// all.
-    pub fn new(stat_prefix: String, store: Arc<dyn ControlPlaneStore>, period: Period) -> Self {
+    ///
+    /// `default_period` is used ONLY for a tenant [`Self::record`] is never
+    /// given an explicit period for -- see [`Inner::default_period`]'s doc.
+    pub fn new(
+        stat_prefix: String,
+        store: Arc<dyn ControlPlaneStore>,
+        default_period: Period,
+    ) -> Self {
         SpendAccumulator {
             inner: Arc::new(Inner {
                 stat_prefix,
                 store,
-                period,
+                default_period,
                 buckets: Mutex::new(HashMap::new()),
             }),
             flusher: Mutex::new(None),
@@ -700,22 +779,38 @@ impl SpendAccumulator {
     }
 
     /// Records one request's charge against `tenant`'s bucket for the
-    /// period `now` falls in. [`Charge::Priced`] adds to the tenant's
-    /// total; [`Charge::Unpriced`] only increments the unpriced-request
-    /// count and (if both are known) remembers the `(cluster, model)`
-    /// pair, capped at [`MAX_UNPRICED_PAIRS`] -- see [`Bucket`]'s doc.
+    /// period `now` falls in, under `period` -- see this section's "`record`
+    /// takes its `Period` explicitly" note for why the caller supplies this
+    /// per call rather than the accumulator fixing one for its whole
+    /// lifetime: a tenant with a configured [`TenantBudget`] passes that
+    /// budget's OWN period, so a daily-budget tenant and a monthly-budget
+    /// tenant sharing this accumulator each accrue into their own period key,
+    /// correctly, from the same call. A tenant with no budget at all has
+    /// nothing to derive a period from; the caller passes
+    /// [`Self::default_period`] for that case purely so its spend history
+    /// still accrues somewhere reportable.
+    ///
+    /// [`Charge::Priced`] adds to the tenant's total; [`Charge::Unpriced`]
+    /// only increments the unpriced-request count and (if both are known)
+    /// remembers the `(cluster, model)` pair, capped at
+    /// [`MAX_UNPRICED_PAIRS`] -- see [`Bucket`]'s doc.
     pub fn record(
         &self,
         tenant: &TenantId,
         now: DateTime<Utc>,
+        period: Period,
         charge: Charge,
         cluster: Option<&str>,
         model: Option<&str>,
     ) {
         // The period key is computed from THIS record's own timestamp, not
         // from whatever "now" the flusher last observed -- see this
-        // section's "Rollover happens on RECORD" note.
-        let period_key = self.inner.period.key_for(now);
+        // section's "Rollover happens on RECORD" note. It is computed from
+        // the CALLER-SUPPLIED period, not `self.inner.default_period` -- see
+        // this section's "`record` takes its `Period` explicitly" note; using
+        // the accumulator's default here regardless of what was passed is
+        // exactly the bug this fixup closes.
+        let period_key = period.key_for(now);
         let mut buckets = self
             .inner
             .buckets
@@ -743,6 +838,14 @@ impl SpendAccumulator {
                 }
             }
         }
+    }
+
+    /// The period a tenant with NO configured [`TenantBudget`] is metered
+    /// under -- see [`Inner::default_period`]'s doc. The 3c-iii-b enforcement
+    /// filter reads this to build the `period` argument [`Self::record`]
+    /// needs when the request's tenant has no budget at all.
+    pub fn default_period(&self) -> Period {
+        self.inner.default_period
     }
 
     /// The live in-memory total for `(tenant, period)` -- what a future
@@ -1287,6 +1390,31 @@ mod tests {
         assert_eq!(after, PeriodKey::for_test("2028-03-01"));
     }
 
+    #[test]
+    fn daily_next_boundary_is_the_start_of_the_following_utc_day() {
+        assert_eq!(
+            Period::Daily.next_boundary(dt(2026, 8, 31, 13, 0, 0)),
+            dt(2026, 9, 1, 0, 0, 0)
+        );
+        assert_eq!(
+            Period::Daily.seconds_until_reset(dt(2026, 8, 31, 23, 59, 0)),
+            60
+        );
+    }
+
+    #[test]
+    fn monthly_next_boundary_is_the_first_of_the_following_utc_month() {
+        assert_eq!(
+            Period::Monthly.next_boundary(dt(2026, 8, 15, 13, 0, 0)),
+            dt(2026, 9, 1, 0, 0, 0)
+        );
+        // December must roll the YEAR over too, not just the month.
+        assert_eq!(
+            Period::Monthly.next_boundary(dt(2026, 12, 15, 13, 0, 0)),
+            dt(2027, 1, 1, 0, 0, 0)
+        );
+    }
+
     // --- Rollover on record, not on the flush tick -----------------------
 
     #[test]
@@ -1300,6 +1428,7 @@ mod tests {
         accumulator.record(
             &tenant,
             before_boundary,
+            Period::Daily,
             Charge::Priced(MicroUsd::from_micros(1_000_000)),
             Some("cluster-a"),
             Some("model-a"),
@@ -1307,6 +1436,7 @@ mod tests {
         accumulator.record(
             &tenant,
             after_boundary,
+            Period::Daily,
             Charge::Priced(MicroUsd::from_micros(2_000_000)),
             Some("cluster-a"),
             Some("model-a"),
@@ -1334,6 +1464,85 @@ mod tests {
         );
     }
 
+    // --- record takes its period explicitly (WP-50 3c-iii-b fixup) -------
+
+    /// The defect this fixup closes, as an executable assertion: ONE
+    /// accumulator, TWO tenants, each with its OWN period -- a daily-budget
+    /// tenant and a monthly-budget tenant, the exact combination that cannot
+    /// coexist correctly if `record` uses a single accumulator-wide period
+    /// instead of the caller-supplied one. Each tenant's charge must land in
+    /// its OWN period's row, not both landing in whatever period the
+    /// accumulator happened to be constructed with.
+    #[test]
+    fn two_tenants_with_different_periods_each_accrue_into_their_own_period_key() {
+        // Constructed with a `default_period` that matches NEITHER tenant's
+        // actual period below -- if `record` ever fell back to it instead of
+        // the passed-in period, both charges would land in the wrong row (or
+        // the same row), and this test would still have to fail to catch it.
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let accumulator = SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+            Period::Monthly,
+        );
+
+        let daily_tenant = TenantId::new("tenant-daily");
+        let monthly_tenant = TenantId::new("tenant-monthly");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+
+        accumulator.record(
+            &daily_tenant,
+            now,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(3_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+        accumulator.record(
+            &monthly_tenant,
+            now,
+            Period::Monthly,
+            Charge::Priced(MicroUsd::from_micros(4_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+
+        assert_eq!(
+            accumulator.current_total(&daily_tenant, &Period::Daily.key_for(now)),
+            3_000_000,
+            "the daily-budget tenant's charge must land in ITS OWN daily period key"
+        );
+        assert_eq!(
+            accumulator.current_total(&monthly_tenant, &Period::Monthly.key_for(now)),
+            4_000_000,
+            "the monthly-budget tenant's charge must land in ITS OWN monthly period key"
+        );
+        assert_eq!(
+            accumulator.current_total(&daily_tenant, &Period::Monthly.key_for(now)),
+            0,
+            "the daily tenant's charge must NOT have leaked into a monthly-keyed row"
+        );
+        assert_eq!(
+            accumulator.current_total(&monthly_tenant, &Period::Daily.key_for(now)),
+            0,
+            "the monthly tenant's charge must NOT have leaked into a daily-keyed row"
+        );
+
+        accumulator.flush_now().unwrap();
+        assert_eq!(
+            store
+                .load_spend("test-chain", &daily_tenant, &Period::Daily.key_for(now))
+                .unwrap(),
+            3_000_000
+        );
+        assert_eq!(
+            store
+                .load_spend("test-chain", &monthly_tenant, &Period::Monthly.key_for(now))
+                .unwrap(),
+            4_000_000
+        );
+    }
+
     // --- Absolute-write idempotence --------------------------------------
 
     #[test]
@@ -1345,6 +1554,7 @@ mod tests {
         accumulator.record(
             &tenant,
             now,
+            Period::Daily,
             Charge::Priced(MicroUsd::from_micros(5_000_000)),
             Some("cluster-a"),
             Some("model-a"),
@@ -1379,6 +1589,7 @@ mod tests {
             accumulator_a.record(
                 &tenant,
                 now,
+                Period::Daily,
                 Charge::Priced(MicroUsd::from_micros(7_000_000)),
                 Some("cluster-a"),
                 Some("model-a"),
@@ -1469,6 +1680,7 @@ mod tests {
         accumulator.record(
             &tenant,
             now,
+            Period::Daily,
             Charge::Priced(MicroUsd::from_micros(4_000_000)),
             Some("cluster-a"),
             Some("model-a"),
@@ -1494,6 +1706,7 @@ mod tests {
         accumulator.record(
             &tenant,
             now,
+            Period::Daily,
             Charge::Unpriced,
             Some("cluster-a"),
             Some("model-a"),
@@ -1528,6 +1741,7 @@ mod tests {
             accumulator.record(
                 &tenant,
                 now,
+                Period::Daily,
                 Charge::Unpriced,
                 Some("cluster-a"),
                 Some(&format!("model-{i}")),
@@ -1573,6 +1787,7 @@ mod tests {
         accumulator.record(
             &tenant,
             now,
+            Period::Daily,
             Charge::Priced(MicroUsd::from_micros(3_000_000)),
             Some("cluster-a"),
             Some("model-a"),
@@ -1616,6 +1831,7 @@ mod tests {
             accumulator.record(
                 &tenant,
                 now,
+                Period::Daily,
                 Charge::Priced(MicroUsd::from_micros(9_000_000)),
                 Some("cluster-a"),
                 Some("model-a"),

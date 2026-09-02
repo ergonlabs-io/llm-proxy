@@ -20,8 +20,8 @@ use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, S
 // leave `lower.rs` free to drift from both.
 use proxy_config::lower::{
     AUTH_FILTER_TYPE as AUTH, BODY_REWRITE_FILTER_TYPE as BODY_REWRITE,
-    MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT,
-    USAGE_FILTER_TYPE as USAGE,
+    MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT,
+    TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT, USAGE_FILTER_TYPE as USAGE,
 };
 
 /// `lower.rs` cannot import the filters' constants — `proxy-filters` depends
@@ -72,6 +72,13 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
          proxy-config/src/lower.rs or BOTH new WP-50 increment 3a ordering rules silently \
          stop firing"
     );
+    assert_eq!(
+        SPEND_LIMIT,
+        proxy_filters::spend_limit_filter::TYPE_URL,
+        "the spend_limit filter's type URL changed; update `SPEND_LIMIT_FILTER_TYPE` in \
+         proxy-config/src/lower.rs or BOTH new WP-50 increment 3c-iii-b ordering rules \
+         silently stop firing"
+    );
 }
 
 /// One `http_filters` entry. The configs are the minimum each message needs to
@@ -85,6 +92,7 @@ fn filter_entry(name: &str, type_url: &str) -> String {
         USAGE => "\n                      inline_string: \"\"",
         BODY_REWRITE => "\n                      default_value: true\n                      runtime_key: openai",
         MODEL_AUTHZ => "\n                      policies: []",
+        SPEND_LIMIT => "\n                      pricing: []",
         other => panic!("unexpected type url {other}"),
     };
     format!(
@@ -293,6 +301,79 @@ fn model_authz_before_body_rewrite_is_rejected_because_the_authz_filter_would_se
     );
 }
 
+// --- rule 5: auth before spend_limit (decode-side, WP-50 inc 3c-iii-b) -----
+
+#[test]
+fn auth_before_spend_limit_is_accepted() {
+    chain(&[
+        ("llmproxy.auth", AUTH),
+        ("llmproxy.spend_limit", SPEND_LIMIT),
+    ])
+    .expect("auth ahead of spend_limit is the correct order");
+}
+
+/// Reversed, the spend filter's `decode_headers` runs before the auth filter
+/// has written `StreamInfo::auth.tenant`, reads `None`, and treats every
+/// request as unlimited -- a ceiling that silently never fires.
+#[test]
+fn spend_limit_before_auth_is_rejected_because_the_spend_filter_would_see_no_tenant() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.spend_limit", SPEND_LIMIT),
+        ("llmproxy.auth", AUTH),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
+    assert!(
+        reason.contains("llmproxy.auth") && reason.contains("BEFORE"),
+        "the reason must name the filter and the required direction: {reason}"
+    );
+    assert!(
+        reason.contains("unlimited"),
+        "the reason must say what actually goes wrong: {reason}"
+    );
+}
+
+// --- rule 6: spend_limit before usage (encode-side, so REVERSED) -----------
+
+#[test]
+fn spend_limit_before_usage_is_accepted() {
+    chain(&[
+        ("llmproxy.spend_limit", SPEND_LIMIT),
+        ("llmproxy.usage", USAGE),
+    ])
+    .expect("the spend filter ahead of the usage filter is the correct order");
+}
+
+/// The direction here is the OPPOSITE of what "must run first" suggests,
+/// because the spend filter's `record` is encode-side and encode runs in
+/// reverse config order. Reversed, every request is priced as free and a
+/// configured ceiling can never be reached.
+#[test]
+fn usage_before_spend_limit_is_rejected_because_the_spend_filter_would_price_every_request_as_free()
+{
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.usage", USAGE),
+        ("llmproxy.spend_limit", SPEND_LIMIT),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
+    assert!(
+        reason.contains("priced as free"),
+        "the reason must state the silent consequence: {reason}"
+    );
+    assert!(
+        reason.contains("REVERSE"),
+        "the reason must explain WHY the required order looks backwards, or the \
+         operator will read the error as a typo in our validator: {reason}"
+    );
+}
+
 // --- a rule applies only when both of its filters are present --------------
 
 #[test]
@@ -303,6 +384,7 @@ fn each_lane_h_filter_alone_is_a_valid_chain() {
         ("llmproxy.usage", USAGE),
         ("llmproxy.body_rewrite", BODY_REWRITE),
         ("llmproxy.model_authz", MODEL_AUTHZ),
+        ("llmproxy.spend_limit", SPEND_LIMIT),
     ] {
         chain(&[(name, url)])
             .unwrap_or_else(|e| panic!("`{name}` alone must be a valid chain, got {e:?}"));

@@ -58,6 +58,7 @@ pub mod control;
 pub mod model_authz;
 pub mod model_authz_filter;
 pub mod spend;
+pub mod spend_limit_filter;
 pub mod token_limit;
 pub mod token_limit_filter;
 pub mod usage;

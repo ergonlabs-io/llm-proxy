@@ -1424,6 +1424,7 @@ pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.Data
 pub const BODY_REWRITE_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
+pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
 
 /// Rejects Lane-H filter chains whose order silently disables a filter.
 ///
@@ -1471,9 +1472,33 @@ pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0
 /// kind of surprise ground rule #1 exists to catch at load time instead of
 /// in production.
 ///
+/// # WP-50 increment 3c-iii-b: `llmproxy.spend_limit` gets the SAME two-rule
+/// shape as `llmproxy.token_limit`, for the identical reason
+///
+/// `llmproxy.spend_limit` is decode-check + encode-record, exactly like
+/// `llmproxy.token_limit` (see that filter's module doc's "Retrospective
+/// enforcement" section) — so it needs the same two orderings, in the same
+/// two directions:
+///
+/// - `llmproxy.auth` BEFORE `llmproxy.spend_limit` (decode-side): the spend
+///   filter's decode check buckets on `StreamInfo::auth.tenant`, which the
+///   auth filter writes; decode callbacks run in config order. Reversed, the
+///   spend filter sees no tenant on every request and treats every one as
+///   unlimited (see `proxy_filters::spend_limit_filter`'s "no tenant ->
+///   admit" section) — a ceiling that silently never fires, the money
+///   analogue of the token-limiter's spoofable-credential downgrade.
+/// - `llmproxy.spend_limit` BEFORE `llmproxy.usage` (encode-side): the spend
+///   filter's `record` runs on the ENCODE path, which is REVERSE config
+///   order, so "the usage filter has already run" means "the usage filter is
+///   LATER in config order" — exactly `token_limit`'s own usage-ordering rule
+///   restated for money. Reversed, `StreamInfo::llm.usage` reads `None`
+///   forever and every request is priced as if it cost nothing, so a
+///   configured ceiling can never be reached no matter how much a tenant
+///   actually spends.
+///
 /// Both rules are stated at their own call sites too
-/// (`token_limit_filter`'s and `model_authz_filter`'s module docs); this
-/// function is the enforcement.
+/// (`token_limit_filter`'s, `model_authz_filter`'s, and
+/// `spend_limit_filter`'s module docs); this function is the enforcement.
 fn check_lane_h_filter_order(
     http_filters: &[HttpFilterSpec],
     path: &str,
@@ -1522,6 +1547,26 @@ fn check_lane_h_filter_order(
              StreamInfo::requested_model, and decode callbacks run in config order; with \
              this order reversed the authz filter would see no model and refuse every \
              request",
+        ),
+        (
+            AUTH_FILTER_TYPE,
+            "llmproxy.auth",
+            SPEND_LIMIT_FILTER_TYPE,
+            "llmproxy.spend_limit",
+            "the spend limiter buckets on the tenant the auth filter resolves, and decode \
+             callbacks run in config order; with this order reversed the spend filter would \
+             see no tenant on every request and treat every one as unlimited, so a \
+             configured ceiling would silently never fire",
+        ),
+        (
+            SPEND_LIMIT_FILTER_TYPE,
+            "llmproxy.spend_limit",
+            USAGE_FILTER_TYPE,
+            "llmproxy.usage",
+            "the spend limiter records cost on the ENCODE path, which runs in REVERSE \
+             config order, so the usage filter must come LATER in config order for its \
+             report to exist by then; with this order reversed every request would be \
+             priced as free and a configured ceiling could never be reached",
         ),
     ];
 

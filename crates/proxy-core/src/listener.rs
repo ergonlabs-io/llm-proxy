@@ -113,6 +113,19 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::model_authz_filter::ModelAuthzFilterFactory,
         ));
+        // WP-50 increment 3c-iii-b (Lane H): per-tenant spend-budget
+        // enforcement. Decode-check + encode-record, exactly like
+        // `llmproxy.token_limit` above -- must be configured AFTER
+        // `llmproxy.auth` (needs the tenant) and BEFORE `llmproxy.usage`
+        // (needs the usage filter's encode-side write) in any listener's
+        // `http_filters` list. `proxy_config::lower::check_lane_h_filter_order`
+        // enforces both at config load. Also registered unconditionally,
+        // same reasoning as the filters above: registering it does NOT
+        // enable spend enforcement anywhere; only a listener that configures
+        // the filter enforces a ceiling.
+        registry.register(Arc::new(
+            proxy_filters::spend_limit_filter::SpendLimitFilterFactory,
+        ));
         Arc::new(registry)
     })
 }

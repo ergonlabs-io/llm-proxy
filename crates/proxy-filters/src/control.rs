@@ -967,7 +967,11 @@ impl std::fmt::Debug for MintedKey {
 /// the published snapshot. See the module doc for the full seam and the
 /// boot/refresh fail-closed split.
 pub struct ControlPlane {
-    store: Box<dyn ControlPlaneStore>,
+    /// Rust note: `Arc`, not `Box`, purely so [`ControlPlane::store`] can
+    /// hand a SHARED handle to it out. [`ControlPlane::new`] still takes a
+    /// `Box` (every call site already passes one, and `Arc::from(Box<dyn T>)`
+    /// converts for free), so widening this cost no caller a change.
+    store: Arc<dyn ControlPlaneStore>,
     secret: HmacSecret,
     bootstrap_keys: KeySet,
     published: Arc<ArcSwap<ControlPlaneSnapshot>>,
@@ -987,6 +991,7 @@ impl ControlPlane {
         secret: HmacSecret,
         bootstrap_keys: KeySet,
     ) -> Result<Self, StoreError> {
+        let store: Arc<dyn ControlPlaneStore> = Arc::from(store);
         let loaded = store.load()?;
         let snapshot = Self::merge(&bootstrap_keys, loaded);
         // Rust note: `ArcSwap::new` takes the initial `Arc<T>` directly --
@@ -1037,6 +1042,21 @@ impl ControlPlane {
     /// itself.
     pub fn handle(&self) -> Arc<ArcSwap<ControlPlaneSnapshot>> {
         Arc::clone(&self.published)
+    }
+
+    /// A shared handle to the SAME store this control plane reads and writes.
+    ///
+    /// Exists for `spend_limit_filter`'s [`crate::spend::SpendAccumulator`],
+    /// which must persist spend into the very store the operator configured
+    /// (`typed_config.store` on `llmproxy.auth` -- in-memory or a redb file),
+    /// not a private one of its own. Handing back a fresh
+    /// `InMemoryControlPlaneStore` instead would leave 3c-ii-b's whole
+    /// persistence path -- `set_spend`/`load_spend` on redb, absolute writes,
+    /// restart-resume -- wired to nothing, and a monthly ceiling would reset
+    /// to zero on every process restart: a budget an operator could escape by
+    /// bouncing the proxy. See `spend_limit_filter`'s module doc.
+    pub fn store(&self) -> Arc<dyn ControlPlaneStore> {
+        Arc::clone(&self.store)
     }
 
     /// The HMAC secret this control plane was built with. Unused by 3b-i's
