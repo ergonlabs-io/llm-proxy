@@ -36,6 +36,10 @@ serde_json = { workspace = true }
 # WP-34: warns loudly (rather than failing closed) when a budget applies to a
 # request but usage could not be read -- see `token_limit_filter`'s module doc.
 tracing = { workspace = true }
+# WP-50 increment 3c-ii-b: UTC calendar-aligned spend periods
+# (`spend::Period::key_for`) -- `proxy-cluster`/`proxy-observability` already
+# depend on this for the same reason (wall-clock rendering).
+chrono = { workspace = true }
 
 [dev-dependencies]
 proxy-api = { workspace = true }

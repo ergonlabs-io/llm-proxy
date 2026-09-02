@@ -54,6 +54,11 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::auth::{HmacSecret, KeyId, KeyRecord, KeySet, TenantId, TenantPolicy};
 use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
+// WP-50 increment 3c-ii-b: spend rows are keyed by a `PeriodKey`, which
+// `spend.rs` owns (it also owns the calendar-alignment logic that produces
+// one) -- `control.rs` only stores and retrieves values already computed
+// there. See `spend.rs`'s module doc for why the boundary is drawn there.
+use crate::spend::PeriodKey;
 
 /// One key row exactly as a [`ControlPlaneStore`] persists it -- the
 /// admin-write shape, not the digest-keyed [`KeySet`] the data plane reads.
@@ -147,6 +152,46 @@ pub trait ControlPlaneStore: Send + Sync {
     /// [`ControlPlane::rebuild`] for why the row is not deleted.
     fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError>;
     fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError>;
+
+    // WP-50 increment 3c-ii-b: spend rows, keyed `(stat_prefix, tenant,
+    // period)`. `stat_prefix` is a plain `&str` (not this crate's
+    // `TenantId`/`KeyId` newtypes) because it names a FILTER CHAIN, per the
+    // "external name" split in `internal-docs/wp-50-3c-spend-budgets.md`'s
+    // "RESOLVED -- addressing follows Envoy" section -- the same
+    // operator-chosen `stat_prefix` A1 already uses to address a chain from
+    // the admin server.
+    /// Sets the ABSOLUTE spend total for `(stat_prefix, tenant, period)`,
+    /// overwriting whatever was stored. Deliberately NOT additive.
+    ///
+    /// An absolute write is idempotent: a caller that retries after an
+    /// AMBIGUOUS failure (a timeout or a dropped connection, where the
+    /// first attempt's outcome is unknown) simply re-sends the same total
+    /// it already computed, and the retry is a no-op rather than a second
+    /// charge. An additive write is not idempotent -- a retried delta
+    /// double-counts -- and for a spend CEILING a double-count denies a
+    /// tenant service they already paid for, which is the wrong direction
+    /// to fail in for a control whose entire job is "did they pay enough".
+    /// [`crate::spend::SpendAccumulator`] is the only production caller,
+    /// and it always sends the FULL current total for the bucket it is
+    /// flushing, never a delta -- see that module's doc.
+    fn set_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        total_micros: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Reads the spend total for `(stat_prefix, tenant, period)`. A row
+    /// that has never been written -- a period nothing has charged yet, or
+    /// a fresh store -- reads as `0`, not an error, the same "absence is
+    /// the zero value" convention the rest of this store already uses.
+    fn load_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+    ) -> Result<u64, StoreError>;
 }
 
 /// The two things the data plane reads per request, built wholesale by
@@ -175,6 +220,12 @@ struct InMemoryState {
     tenants: Vec<TenantId>,
     keys: HashMap<KeyId, StoredKey>,
     policies: HashMap<TenantId, ModelAccess>,
+    // WP-50 increment 3c-ii-b: keyed on the full `(stat_prefix, tenant,
+    // period)` triple as one tuple key -- there is no `load()`-style
+    // wholesale read for spend (each row is read/written independently by
+    // its own key), so this needs no separate reverse index the way
+    // `keys_by_tenant` does for `keys`.
+    spend: HashMap<(String, TenantId, PeriodKey), u64>,
 }
 
 impl InMemoryControlPlaneStore {
@@ -184,6 +235,7 @@ impl InMemoryControlPlaneStore {
                 tenants: Vec::new(),
                 keys: HashMap::new(),
                 policies: HashMap::new(),
+                spend: HashMap::new(),
             }),
         }
     }
@@ -265,6 +317,41 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         state.policies.insert(tenant.clone(), access.clone());
         Ok(())
     }
+
+    fn set_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        total_micros: u64,
+    ) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        state.spend.insert(
+            (stat_prefix.to_string(), tenant.clone(), period.clone()),
+            total_micros,
+        );
+        Ok(())
+    }
+
+    fn load_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+    ) -> Result<u64, StoreError> {
+        let state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        Ok(state
+            .spend
+            .get(&(stat_prefix.to_string(), tenant.clone(), period.clone()))
+            .copied()
+            .unwrap_or(0))
+    }
 }
 
 // --- redb tables -----------------------------------------------------------
@@ -280,6 +367,16 @@ const TENANTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant
 const KEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keys");
 const KEYS_BY_TENANT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keys_by_tenant");
 const POLICIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("policies");
+// WP-50 increment 3c-ii-b: a spend row's key is the 3-part
+// `(stat_prefix, tenant, period)` tuple, not a single `&str` like every
+// table above -- `redb::Key` has a native impl for tuples of `Key` types
+// (see `tuple_types.rs` upstream), so this uses that directly rather than
+// hand-rolling a delimiter-joined single string the way `keys_by_tenant`'s
+// VALUE does for `Vec<String>`. The value is a plain `u64`, not JSON bytes
+// like the other tables: `u64` already has a native fixed-width `redb::Value`
+// impl, so encoding a bare integer through `serde_json` would only add an
+// allocation and a round trip for no benefit.
+const SPEND_TABLE: TableDefinition<(&str, &str, &str), u64> = TableDefinition::new("spend");
 
 /// One `keys` row, exactly as `redb` stores it -- everything a [`StoredKey`]
 /// carries except `key_id`, which is already the table's key and would just
@@ -449,6 +546,7 @@ impl RedbControlPlaneStore {
         txn.open_table(KEYS_TABLE).map_err(store_err)?;
         txn.open_table(KEYS_BY_TENANT_TABLE).map_err(store_err)?;
         txn.open_table(POLICIES_TABLE).map_err(store_err)?;
+        txn.open_table(SPEND_TABLE).map_err(store_err)?;
         txn.commit().map_err(store_err)?;
         Ok(())
     }
@@ -657,6 +755,43 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         }
         txn.commit().map_err(store_err)?;
         Ok(())
+    }
+
+    fn set_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        total_micros: u64,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(SPEND_TABLE).map_err(store_err)?;
+            table
+                .insert(
+                    (stat_prefix, tenant.as_str(), period.as_str()),
+                    total_micros,
+                )
+                .map_err(store_err)?;
+        }
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn load_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+    ) -> Result<u64, StoreError> {
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(SPEND_TABLE).map_err(store_err)?;
+        let total = table
+            .get((stat_prefix, tenant.as_str(), period.as_str()))
+            .map_err(store_err)?
+            .map(|guard| guard.value())
+            .unwrap_or(0);
+        Ok(total)
     }
 }
 
@@ -1035,6 +1170,23 @@ mod tests {
         fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
             self.0.set_policy(tenant, access)
         }
+        fn set_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            total_micros: u64,
+        ) -> Result<(), StoreError> {
+            self.0.set_spend(stat_prefix, tenant, period, total_micros)
+        }
+        fn load_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+        ) -> Result<u64, StoreError> {
+            self.0.load_spend(stat_prefix, tenant, period)
+        }
     }
 
     /// A store whose `load` can be toggled to fail on command, via a shared
@@ -1067,6 +1219,24 @@ mod tests {
         fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
             self.inner.set_policy(tenant, access)
         }
+        fn set_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            total_micros: u64,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .set_spend(stat_prefix, tenant, period, total_micros)
+        }
+        fn load_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+        ) -> Result<u64, StoreError> {
+            self.inner.load_spend(stat_prefix, tenant, period)
+        }
     }
 
     /// `load` always fails; every write no-ops successfully (this double
@@ -1094,6 +1264,23 @@ mod tests {
         }
         fn set_policy(&self, _tenant: &TenantId, _access: &ModelAccess) -> Result<(), StoreError> {
             Ok(())
+        }
+        fn set_spend(
+            &self,
+            _stat_prefix: &str,
+            _tenant: &TenantId,
+            _period: &PeriodKey,
+            _total_micros: u64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn load_spend(
+            &self,
+            _stat_prefix: &str,
+            _tenant: &TenantId,
+            _period: &PeriodKey,
+        ) -> Result<u64, StoreError> {
+            Ok(0)
         }
     }
 
@@ -1979,11 +2166,70 @@ mod tests {
                     &ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
                 )
                 .unwrap();
+            // WP-50 increment 3c-ii-b: spend rows, keyed `(stat_prefix,
+            // tenant, period)`, are not part of `StoredControlPlane` (there
+            // is no wholesale `load()` for them -- see the trait doc), so
+            // they are checked directly against BOTH stores below rather
+            // than through `assert_stored_control_planes_match`.
+            store
+                .set_spend(
+                    "chain-a",
+                    &TenantId::new("tenant-a"),
+                    &PeriodKey::for_test("2026-08"),
+                    12_500_000,
+                )
+                .unwrap();
         }
 
         assert_stored_control_planes_match(
             &redb_store.load().unwrap(),
             &inmemory_store.load().unwrap(),
+        );
+
+        assert_eq!(
+            redb_store
+                .load_spend(
+                    "chain-a",
+                    &TenantId::new("tenant-a"),
+                    &PeriodKey::for_test("2026-08"),
+                )
+                .unwrap(),
+            inmemory_store
+                .load_spend(
+                    "chain-a",
+                    &TenantId::new("tenant-a"),
+                    &PeriodKey::for_test("2026-08"),
+                )
+                .unwrap(),
+            "redb and InMemory must agree on a spend row written identically to both"
+        );
+        assert_eq!(
+            redb_store
+                .load_spend(
+                    "chain-a",
+                    &TenantId::new("tenant-a"),
+                    &PeriodKey::for_test("2026-09"),
+                )
+                .unwrap(),
+            0,
+            "a period never written must read as 0, not an error"
+        );
+        assert_eq!(
+            redb_store
+                .load_spend(
+                    "chain-a",
+                    &TenantId::new("tenant-a"),
+                    &PeriodKey::for_test("2026-09"),
+                )
+                .unwrap(),
+            inmemory_store
+                .load_spend(
+                    "chain-a",
+                    &TenantId::new("tenant-a"),
+                    &PeriodKey::for_test("2026-09"),
+                )
+                .unwrap(),
+            "both stores must agree that an unwritten period reads as 0"
         );
     }
 

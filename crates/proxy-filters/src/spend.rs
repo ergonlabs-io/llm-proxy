@@ -93,8 +93,18 @@
 //! list — an unreproducible wrong answer in the one subsystem that must never
 //! produce one. So [`PriceTable`] is keyed on exact model strings, full stop.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
+// WP-50 increment 3c-ii-b: UTC calendar-aligned period keys. `chrono` is
+// already a workspace dependency (`proxy-cluster`, `proxy-observability`
+// use it); this crate had no prior need for wall-clock rendering.
+use chrono::{DateTime, Utc};
+
+use crate::auth::TenantId;
+use crate::control::{ControlPlaneStore, StoreError};
 use crate::usage::TokenUsage;
 
 /// An amount of money in integer micro-dollars (1e-6 USD). See the module
@@ -362,6 +372,487 @@ fn round_once(numerator: u128) -> u64 {
     // standard integer trick, valid here because the operand is non-negative.
     let rounded = (numerator + 500_000) / 1_000_000;
     rounded.min(u128::from(u64::MAX)) as u64
+}
+
+// ============================================================================
+// WP-50 increment 3c-ii-b -- periods, the accumulator, and the flusher.
+// Normative: `internal-docs/wp-50-3c-spend-budgets.md`'s "3c-ii-b" section.
+// ============================================================================
+//
+// [`PriceTable`] above answers "what did this request cost"; everything
+// below answers "how much has this tenant spent this period, and when does
+// the durable store find out".
+//
+// # Rollover happens on RECORD, never on the flush tick -- a correctness
+// property, not an optimization
+//
+// [`SpendAccumulator::record`] computes its OWN period key from the
+// timestamp it is called with, every time -- it never asks "what period is
+// it right now" once and stamps a batch of pending work with that single
+// answer. So two periods can coexist as two separate map entries for as
+// long as requests straddle a boundary, and the periodic flush (which only
+// ever iterates whatever keys already exist) can never observe them as
+// anything but two rows. If rollover instead happened on the flush TICK --
+// computing "now"'s period once per tick and charging every pending record
+// to it -- a flusher that wakes late (a paused process, a slow disk, a GC
+// pause) could fold a request that happened in period A into the row it
+// writes for period B, silently moving spend across a billing boundary
+// nobody can see happened. Pinned by
+// `rollover_splits_into_two_period_rows_not_one_when_the_flush_ticks_late`;
+// its mutation pin computes the key from the flush's own "now" instead.
+//
+// # Enforcement reads live memory; the flusher is durability, not security
+//
+// [`SpendAccumulator::current_total`] reads the in-memory bucket directly
+// and never consults, or waits on, anything the flusher has or has not
+// written. A slow or entirely dead flusher thread therefore cannot loosen a
+// ceiling a future enforcement filter (3c-iii) checks against
+// `current_total` -- it can only make the STORED total (what a restart
+// resumes from) staler than it could be. Pinned by
+// `a_dead_flusher_does_not_change_current_total`.
+//
+// # The flush driver is a plain `std::thread`, not tokio
+//
+// See the design brief's "3c-ii architecture -- who drives the flush"
+// section for the three rejected alternatives (a tokio task from the
+// filter factory, an inline flush on the request path, `run_serve` polling
+// for the singleton). The short version: the data-plane runtime is
+// `!Send`/worker-local (ADR-0003), a redb write on the request path
+// violates 3b's rule outright, and `run_serve` cannot name a singleton
+// nothing has published yet. [`SpendAccumulator`] is already
+// `Send + Sync` -- a `SharedFactoryState` singleton reached from every
+// worker -- so an independent OS thread needs no runtime and entangles
+// with neither.
+
+/// How many distinct unpriced `(cluster, model)` pairs one bucket
+/// remembers before it stops inserting and only counts. `model` is read out
+/// of the request body (see [`crate::usage`]), so a caller that varies it
+/// on every request can grow this set without bound if nothing caps it --
+/// a remote memory-growth vector, not a theoretical one. Pinned by
+/// `unpriced_pairs_cap_at_32_pairs_and_set_the_truncated_flag`; its
+/// mutation pin removes the cap.
+const MAX_UNPRICED_PAIRS: usize = 32;
+
+/// A calendar-aligned accounting window a spend total resets on. Always
+/// UTC, never the local clock -- see the section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Period {
+    Daily,
+    Monthly,
+}
+
+impl Period {
+    /// The period `now` falls in, rendered as its [`PeriodKey`]. Called
+    /// from [`SpendAccumulator::record`] with the RECORD's own timestamp --
+    /// never with the flush tick's "now" -- see this section's "Rollover
+    /// happens on RECORD" note for why that split matters.
+    pub fn key_for(&self, now: DateTime<Utc>) -> PeriodKey {
+        // `%Y-%m-%d`/`%Y-%m` are `chrono`'s strftime-style specifiers, both
+        // zero-padded; `now` being a `DateTime<Utc>` (never naive or
+        // local) is what makes the rendering UTC-safe by construction
+        // rather than by convention.
+        match self {
+            Period::Daily => PeriodKey(now.format("%Y-%m-%d").to_string()),
+            Period::Monthly => PeriodKey(now.format("%Y-%m").to_string()),
+        }
+    }
+}
+
+/// A rendered [`Period`] -- `"2026-08-31"` for [`Period::Daily`],
+/// `"2026-08"` for [`Period::Monthly`]. A newtype around `String`, same
+/// reasoning as [`MicroUsd`]'s doc above: a raw period string and a raw
+/// tenant id are both "just a `String`" at the type level, and this keeps a
+/// call site from passing one where the other belongs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PeriodKey(String);
+
+impl PeriodKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only: builds a `PeriodKey` directly from an already-rendered
+    /// string, bypassing [`Period::key_for`]'s calendar logic. Exists for
+    /// `control.rs`'s store parity test, which needs to write/read a spend
+    /// row under an arbitrary period key without also exercising calendar
+    /// alignment -- a separate concern that test does not want conflated
+    /// with store parity.
+    #[cfg(test)]
+    pub(crate) fn for_test(key: &str) -> Self {
+        PeriodKey(key.to_string())
+    }
+}
+
+/// One `(tenant, period)`'s live, in-memory spend state. Same shape as
+/// `crate::token_limit::InProcessBudgetStore`'s window map -- a plain
+/// struct behind the accumulator's one `Mutex`, with no store I/O involved
+/// in building or reading it.
+#[derive(Debug, Clone, Default)]
+struct Bucket {
+    /// The tenant's absolute spend for this period, in micro-dollars.
+    total_micros: u64,
+    /// Requests this period whose `(cluster, model)` had no configured
+    /// price -- see [`Charge::Unpriced`]'s doc. Charged nothing, but kept
+    /// discoverable per the design brief's "the gap must stay discoverable"
+    /// requirement.
+    unpriced_requests: u64,
+    /// Distinct `(cluster, model)` pairs seen among this bucket's unpriced
+    /// requests, capped at [`MAX_UNPRICED_PAIRS`].
+    unpriced_pairs: BTreeSet<(String, String)>,
+    /// Set once [`MAX_UNPRICED_PAIRS`] distinct pairs have been recorded --
+    /// tells a later reader "there were more pairs than this set shows"
+    /// without growing the set itself.
+    unpriced_pairs_truncated: bool,
+}
+
+/// The state a [`SpendAccumulator`] and its flusher thread both need
+/// access to. Split out from `SpendAccumulator` itself so the thread can
+/// hold its own `Arc` clone of ONLY this, not of `SpendAccumulator` --
+///
+/// Rust note: if the thread instead held an `Arc<SpendAccumulator>`,
+/// `SpendAccumulator`'s `Drop` (which shuts the thread down) could never
+/// run: `Drop::drop` only fires once every clone of an `Arc` is gone, and
+/// the thread's own clone would forever be one of them -- a deadlock in
+/// waiting, not a panic, which is what makes it worth calling out. `Inner`
+/// carries no handle back to `SpendAccumulator` or its flusher state, so
+/// the thread's clone of `Inner` never keeps `SpendAccumulator` itself
+/// alive, and dropping the last external `Arc<SpendAccumulator>` runs
+/// `Drop` immediately regardless of whether the thread is still running.
+struct Inner {
+    stat_prefix: String,
+    store: Arc<dyn ControlPlaneStore>,
+    period: Period,
+    buckets: Mutex<HashMap<(TenantId, PeriodKey), Bucket>>,
+}
+
+impl Inner {
+    /// Returns the bucket for `(tenant, period_key)`, inserting a freshly
+    /// LOADED one on first touch if this process has not seen that period
+    /// before. Both [`SpendAccumulator::record`] (which then mutates it)
+    /// and [`SpendAccumulator::current_total`] (which only reads it) go
+    /// through this, so a `current_total` read before any `record` call in
+    /// a fresh period still resumes from the store rather than reporting
+    /// zero for spend that already happened -- the "restart resume"
+    /// property the design brief requires.
+    ///
+    /// A load failure here must NOT lose the request it is servicing: this
+    /// logs loudly and starts the bucket at zero rather than propagating an
+    /// error, per CLAUDE.md rule 17 ("a security control that fails open
+    /// must be loud") -- the same "metering must not refuse traffic"
+    /// precedent `token_limit`'s missing-usage path already sets.
+    fn get_or_load_bucket<'a>(
+        &self,
+        buckets: &'a mut HashMap<(TenantId, PeriodKey), Bucket>,
+        tenant: &TenantId,
+        period_key: &PeriodKey,
+    ) -> &'a mut Bucket {
+        buckets
+            .entry((tenant.clone(), period_key.clone()))
+            .or_insert_with(|| {
+                let total_micros =
+                    match self.store.load_spend(&self.stat_prefix, tenant, period_key) {
+                        Ok(total) => total,
+                        Err(err) => {
+                            tracing::warn!(
+                                stat_prefix = %self.stat_prefix,
+                                tenant = tenant.as_str(),
+                                period = period_key.as_str(),
+                                error = %err,
+                                "spend accumulator: failed to load the stored total for a new \
+                                 period; resuming from zero in this process rather than \
+                                 refusing the request"
+                            );
+                            0
+                        }
+                    };
+                Bucket {
+                    total_micros,
+                    ..Bucket::default()
+                }
+            })
+    }
+
+    /// Writes every in-memory bucket's ABSOLUTE total to the store. See
+    /// [`ControlPlaneStore::set_spend`]'s doc for why absolute, not a
+    /// delta. Best-effort across buckets: one tenant's write failing does
+    /// not stop the rest from flushing, but the first failure is still
+    /// returned so a caller (the flusher thread's warning, or a test) can
+    /// tell the flush was not fully durable.
+    fn flush_now(&self) -> Result<(), StoreError> {
+        let buckets = self
+            .buckets
+            .lock()
+            .expect("spend accumulator mutex poisoned");
+        let mut first_err = None;
+        for ((tenant, period_key), bucket) in buckets.iter() {
+            if let Err(err) =
+                self.store
+                    .set_spend(&self.stat_prefix, tenant, period_key, bucket.total_micros)
+            {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The flusher thread's stop condition, plus the [`Condvar`] that lets it
+/// wake IMMEDIATELY on shutdown rather than sleeping out up to one full
+/// interval.
+///
+/// Rust note: a `Condvar`, not a short poll loop -- a poll trades wakeup
+/// latency for CPU burned on every tick even when nothing changed, and this
+/// has exactly one waiter and one notifier, precisely the case a `Condvar`
+/// is for. The boolean it guards is the actual shutdown flag; the `Condvar`
+/// itself carries no state; it only wakes a thread already waiting on the
+/// paired `Mutex`.
+struct ShutdownSignal {
+    stop: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// A started flusher thread's handle -- kept so [`SpendAccumulator`] can
+/// signal and join it, from either [`SpendAccumulator::start_flusher`]
+/// (replacing a previous thread) or `Drop` (shutting down for good).
+struct Flusher {
+    shutdown: Arc<ShutdownSignal>,
+    join: JoinHandle<()>,
+}
+
+/// Per-`(tenant, period)` spend, accumulated in memory with no store I/O on
+/// the record path, periodically flushed by a background OS thread. See
+/// the section above for the rollover and enforcement properties, and the
+/// design brief's "3c-ii architecture" section for why a plain thread.
+pub struct SpendAccumulator {
+    inner: Arc<Inner>,
+    flusher: Mutex<Option<Flusher>>,
+}
+
+impl SpendAccumulator {
+    /// Construction and starting the flusher thread are SEPARATE calls
+    /// (see [`Self::start_flusher`]) so a test can exercise `record`/
+    /// `current_total`/`flush_now` with no background thread involved at
+    /// all.
+    pub fn new(stat_prefix: String, store: Arc<dyn ControlPlaneStore>, period: Period) -> Self {
+        SpendAccumulator {
+            inner: Arc::new(Inner {
+                stat_prefix,
+                store,
+                period,
+                buckets: Mutex::new(HashMap::new()),
+            }),
+            flusher: Mutex::new(None),
+        }
+    }
+
+    /// Records one request's charge against `tenant`'s bucket for the
+    /// period `now` falls in. [`Charge::Priced`] adds to the tenant's
+    /// total; [`Charge::Unpriced`] only increments the unpriced-request
+    /// count and (if both are known) remembers the `(cluster, model)`
+    /// pair, capped at [`MAX_UNPRICED_PAIRS`] -- see [`Bucket`]'s doc.
+    pub fn record(
+        &self,
+        tenant: &TenantId,
+        now: DateTime<Utc>,
+        charge: Charge,
+        cluster: Option<&str>,
+        model: Option<&str>,
+    ) {
+        // The period key is computed from THIS record's own timestamp, not
+        // from whatever "now" the flusher last observed -- see this
+        // section's "Rollover happens on RECORD" note.
+        let period_key = self.inner.period.key_for(now);
+        let mut buckets = self
+            .inner
+            .buckets
+            .lock()
+            .expect("spend accumulator mutex poisoned");
+        let bucket = self
+            .inner
+            .get_or_load_bucket(&mut buckets, tenant, &period_key);
+
+        match charge {
+            Charge::Priced(amount) => {
+                bucket.total_micros = bucket.total_micros.saturating_add(amount.as_micros());
+            }
+            Charge::Unpriced => {
+                bucket.unpriced_requests += 1;
+                if let (Some(cluster), Some(model)) = (cluster, model) {
+                    let pair = (cluster.to_string(), model.to_string());
+                    if !bucket.unpriced_pairs.contains(&pair) {
+                        if bucket.unpriced_pairs.len() < MAX_UNPRICED_PAIRS {
+                            bucket.unpriced_pairs.insert(pair);
+                        } else {
+                            bucket.unpriced_pairs_truncated = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The live in-memory total for `(tenant, period)` -- what a future
+    /// enforcement filter (3c-iii) checks a ceiling against. See this
+    /// section's "Enforcement reads live memory" note: this never consults
+    /// the flusher or its state, so the flusher's liveness cannot affect
+    /// what it returns.
+    pub fn current_total(&self, tenant: &TenantId, period: &PeriodKey) -> u64 {
+        let mut buckets = self
+            .inner
+            .buckets
+            .lock()
+            .expect("spend accumulator mutex poisoned");
+        self.inner
+            .get_or_load_bucket(&mut buckets, tenant, period)
+            .total_micros
+    }
+
+    /// Writes every bucket's current absolute total to the store. Callable
+    /// directly with no thread involved at all -- tests use this to assert
+    /// against the store; the flusher thread also calls it on every tick,
+    /// and `Drop` calls it once more on shutdown.
+    pub fn flush_now(&self) -> Result<(), StoreError> {
+        self.inner.flush_now()
+    }
+
+    /// Starts the background flush thread, ticking every `interval`. See
+    /// this section's "The flush driver is a plain `std::thread`" note for
+    /// why not a tokio task.
+    ///
+    /// Rust note: `self: &Arc<Self>`, not `&self` -- this documents at the
+    /// call site that `start_flusher` is meant to be called on an
+    /// already-shared, already-`Arc`-wrapped accumulator (the shape a
+    /// `SharedFactoryState` singleton holds it in), even though the thread
+    /// closure below only clones [`Self::inner`], never `Self` -- see
+    /// [`Inner`]'s doc for why.
+    ///
+    /// Calling this twice cleanly shuts down and joins the previous thread
+    /// first (the same path `Drop` uses) rather than leaking a second one;
+    /// production code starts it exactly once (the singleton guarantees
+    /// that), but a silent thread leak on a hypothetical second call would
+    /// be a strictly worse bug than the small cost of guarding against it.
+    pub fn start_flusher(self: &Arc<Self>, interval: Duration) {
+        self.stop_flusher_if_running();
+
+        let shutdown = Arc::new(ShutdownSignal {
+            stop: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let inner = Arc::clone(&self.inner);
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join = std::thread::Builder::new()
+            .name("spend-flusher".to_string())
+            .spawn(move || run_flusher(inner, thread_shutdown, interval))
+            .expect("spawning the spend flusher thread must not fail");
+
+        *self
+            .flusher
+            .lock()
+            .expect("spend accumulator mutex poisoned") = Some(Flusher { shutdown, join });
+    }
+
+    /// Signals and joins a currently-running flusher thread, if any --
+    /// shared by [`Self::start_flusher`] (replacing a previous thread) and
+    /// `Drop` (shutting down for good). Does NOT flush; the caller flushes
+    /// afterward, so there is exactly one writer at the moment of shutdown
+    /// rather than the outgoing thread and the caller racing each other.
+    fn stop_flusher_if_running(&self) {
+        let flusher = self
+            .flusher
+            .lock()
+            .expect("spend accumulator mutex poisoned")
+            .take();
+        if let Some(flusher) = flusher {
+            *flusher
+                .shutdown
+                .stop
+                .lock()
+                .expect("spend flusher shutdown mutex poisoned") = true;
+            flusher.shutdown.cv.notify_all();
+            // Rust note: `.join()` blocks THIS thread until the flusher
+            // thread returns from `run_flusher`. Ignoring the `Result` (a
+            // `join` only errors if the thread panicked) matches how a
+            // background worker's panic is handled elsewhere in this
+            // codebase: it should surface via the usual panic machinery
+            // (a failed test, a process abort), not be silently swallowed
+            // here.
+            let _ = flusher.join.join();
+        }
+    }
+}
+
+/// The flusher thread's body: waits up to `interval` (woken immediately by
+/// [`SpendAccumulator::stop_flusher_if_running`]'s `notify_all` on
+/// shutdown), flushes on every timeout, and returns -- WITHOUT flushing --
+/// as soon as shutdown is signalled. [`SpendAccumulator`]'s `Drop`
+/// performs the final flush itself, once this thread has fully stopped, so
+/// shutdown has exactly one writer rather than this thread's last flush
+/// racing `Drop`'s.
+fn run_flusher(inner: Arc<Inner>, shutdown: Arc<ShutdownSignal>, interval: Duration) {
+    let mut guard = shutdown
+        .stop
+        .lock()
+        .expect("spend flusher shutdown mutex poisoned");
+    loop {
+        if *guard {
+            return;
+        }
+        let (new_guard, wait_result) = shutdown
+            .cv
+            .wait_timeout(guard, interval)
+            .expect("spend flusher shutdown condvar poisoned");
+        guard = new_guard;
+        if *guard {
+            return;
+        }
+        if wait_result.timed_out() {
+            // Release the shutdown lock before store I/O -- a concurrent
+            // shutdown request must never wait on this tick's flush to
+            // finish before it can even set the flag.
+            drop(guard);
+            if let Err(err) = inner.flush_now() {
+                tracing::warn!(
+                    stat_prefix = %inner.stat_prefix,
+                    error = %err,
+                    "spend flusher: periodic flush failed; will retry next interval"
+                );
+            }
+            guard = shutdown
+                .stop
+                .lock()
+                .expect("spend flusher shutdown mutex poisoned");
+        }
+        // A spurious wakeup with neither shutdown signalled nor a timeout:
+        // loop and wait again.
+    }
+}
+
+impl Drop for SpendAccumulator {
+    /// Shuts the flusher thread down (if one was started) and flushes once
+    /// more, unconditionally. Without this final flush, every clean
+    /// process exit would discard up to one flush interval of spend --
+    /// turning the documented crash-refund (see the design brief's
+    /// "Enforcement reads live memory" section) into an
+    /// ORDINARY-OPERATION refund, which is a much larger and much more
+    /// frequent hole than a crash. Pinned by
+    /// `drop_flushes_what_was_recorded_since_the_last_tick`; its mutation
+    /// pin skips this final flush.
+    fn drop(&mut self) {
+        self.stop_flusher_if_running();
+        if let Err(err) = self.inner.flush_now() {
+            tracing::warn!(
+                stat_prefix = %self.inner.stat_prefix,
+                error = %err,
+                "spend accumulator: final flush on shutdown failed; up to one interval \
+                 of spend may be lost on the next restart"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -675,6 +1166,415 @@ mod tests {
             "four 0.6-micro-dollar buckets are 2.4 in total and must round ONCE to 2 -- \
              a result of 4 means each bucket was rounded up separately, which doubles \
              the charge on small requests"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 3c-ii-b: periods, the accumulator, and the flusher.
+    // ------------------------------------------------------------------
+
+    use crate::control::InMemoryControlPlaneStore;
+
+    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    /// A fresh [`SpendAccumulator`] and a handle to the [`InMemoryControlPlaneStore`]
+    /// backing it, so a test can inspect what was actually flushed.
+    fn test_accumulator(period: Period) -> (SpendAccumulator, Arc<InMemoryControlPlaneStore>) {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let accumulator = SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+            period,
+        );
+        (accumulator, store)
+    }
+
+    // --- Period keys ----------------------------------------------------
+
+    #[test]
+    fn daily_period_renders_as_the_utc_calendar_date() {
+        assert_eq!(
+            Period::Daily.key_for(dt(2026, 8, 31, 12, 0, 0)),
+            PeriodKey::for_test("2026-08-31")
+        );
+    }
+
+    #[test]
+    fn monthly_period_renders_as_the_utc_calendar_month() {
+        assert_eq!(
+            Period::Monthly.key_for(dt(2026, 8, 31, 12, 0, 0)),
+            PeriodKey::for_test("2026-08")
+        );
+    }
+
+    #[test]
+    fn daily_period_differs_either_side_of_a_utc_day_boundary() {
+        let before = Period::Daily.key_for(dt(2026, 8, 31, 23, 59, 59));
+        let after = Period::Daily.key_for(dt(2026, 9, 1, 0, 0, 0));
+        assert_ne!(before, after);
+        assert_eq!(before, PeriodKey::for_test("2026-08-31"));
+        assert_eq!(after, PeriodKey::for_test("2026-09-01"));
+    }
+
+    #[test]
+    fn monthly_period_differs_either_side_of_a_utc_month_boundary() {
+        let before = Period::Monthly.key_for(dt(2026, 8, 31, 23, 59, 59));
+        let after = Period::Monthly.key_for(dt(2026, 9, 1, 0, 0, 0));
+        assert_ne!(before, after);
+        assert_eq!(before, PeriodKey::for_test("2026-08"));
+        assert_eq!(after, PeriodKey::for_test("2026-09"));
+    }
+
+    #[test]
+    fn daily_period_differs_either_side_of_a_leap_year_february_boundary() {
+        // 2028 is a leap year: February has 29 days, not 28.
+        let before = Period::Daily.key_for(dt(2028, 2, 29, 23, 59, 59));
+        let after = Period::Daily.key_for(dt(2028, 3, 1, 0, 0, 0));
+        assert_ne!(before, after);
+        assert_eq!(before, PeriodKey::for_test("2028-02-29"));
+        assert_eq!(after, PeriodKey::for_test("2028-03-01"));
+    }
+
+    // --- Rollover on record, not on the flush tick -----------------------
+
+    #[test]
+    fn rollover_splits_into_two_period_rows_not_one_when_the_flush_ticks_late() {
+        let (accumulator, store) = test_accumulator(Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+
+        let before_boundary = dt(2026, 8, 31, 23, 59, 59);
+        let after_boundary = dt(2026, 9, 1, 0, 0, 1);
+
+        accumulator.record(
+            &tenant,
+            before_boundary,
+            Charge::Priced(MicroUsd::from_micros(1_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+        accumulator.record(
+            &tenant,
+            after_boundary,
+            Charge::Priced(MicroUsd::from_micros(2_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+
+        // ONE flush, well after both records -- simulating a flusher that
+        // woke up late, past the boundary. If rollover happened on the
+        // flush tick's own "now" instead of on each record's own
+        // timestamp, this single flush could fold both records into ONE
+        // row instead of two.
+        accumulator.flush_now().unwrap();
+
+        let day_31 = store
+            .load_spend("test-chain", &tenant, &PeriodKey::for_test("2026-08-31"))
+            .unwrap();
+        let day_01 = store
+            .load_spend("test-chain", &tenant, &PeriodKey::for_test("2026-09-01"))
+            .unwrap();
+
+        assert_eq!(
+            (day_31, day_01),
+            (1_000_000, 2_000_000),
+            "a record's period must be fixed at RECORD time, not recomputed on the flush \
+             tick -- a late-waking flusher must never merge two periods' spend into one row"
+        );
+    }
+
+    // --- Absolute-write idempotence --------------------------------------
+
+    #[test]
+    fn flush_now_twice_with_no_new_record_leaves_the_stored_total_unchanged() {
+        let (accumulator, store) = test_accumulator(Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+
+        accumulator.record(
+            &tenant,
+            now,
+            Charge::Priced(MicroUsd::from_micros(5_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+        accumulator.flush_now().unwrap();
+        accumulator.flush_now().unwrap();
+
+        let total = store
+            .load_spend("test-chain", &tenant, &PeriodKey::for_test("2026-08-31"))
+            .unwrap();
+        assert_eq!(
+            total, 5_000_000,
+            "an absolute write flushed twice with no intervening record must leave the \
+             stored total unchanged -- an additive write would double it"
+        );
+    }
+
+    // --- Restart resume ----------------------------------------------------
+
+    #[test]
+    fn a_new_accumulator_over_the_same_store_resumes_the_stored_total() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+
+        {
+            let accumulator_a = SpendAccumulator::new(
+                "test-chain".to_string(),
+                Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+                Period::Daily,
+            );
+            accumulator_a.record(
+                &tenant,
+                now,
+                Charge::Priced(MicroUsd::from_micros(7_000_000)),
+                Some("cluster-a"),
+                Some("model-a"),
+            );
+            accumulator_a.flush_now().unwrap();
+        }
+
+        let accumulator_b = SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+            Period::Daily,
+        );
+        let period_key = Period::Daily.key_for(now);
+        assert_eq!(
+            accumulator_b.current_total(&tenant, &period_key),
+            7_000_000,
+            "a fresh accumulator over the same store must resume the flushed total, \
+             not reset to zero -- a restart must not forget spend that already happened"
+        );
+    }
+
+    /// A `load_spend` failure on first touch of a period must not lose the
+    /// request: the bucket resumes from zero (logged loudly) rather than
+    /// the accumulator refusing to record at all. Per CLAUDE.md rule 17.
+    #[test]
+    fn a_load_spend_failure_on_first_touch_resumes_from_zero_instead_of_losing_the_request() {
+        struct AlwaysFailsLoadSpend(InMemoryControlPlaneStore);
+
+        impl ControlPlaneStore for AlwaysFailsLoadSpend {
+            fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
+                self.0.load()
+            }
+            fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+                self.0.create_tenant(tenant)
+            }
+            fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+                self.0.delete_tenant(tenant)
+            }
+            fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), StoreError> {
+                self.0.put_key(rec)
+            }
+            fn revoke_key(&self, key_id: &crate::auth::KeyId) -> Result<(), StoreError> {
+                self.0.revoke_key(key_id)
+            }
+            fn set_policy(
+                &self,
+                tenant: &TenantId,
+                access: &crate::model_authz::ModelAccess,
+            ) -> Result<(), StoreError> {
+                self.0.set_policy(tenant, access)
+            }
+            fn set_spend(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                total_micros: u64,
+            ) -> Result<(), StoreError> {
+                self.0.set_spend(stat_prefix, tenant, period, total_micros)
+            }
+            fn load_spend(
+                &self,
+                _stat_prefix: &str,
+                _tenant: &TenantId,
+                _period: &PeriodKey,
+            ) -> Result<u64, StoreError> {
+                Err(StoreError::Unavailable(
+                    "test double: load_spend always fails".to_string(),
+                ))
+            }
+        }
+
+        let store: Arc<dyn ControlPlaneStore> =
+            Arc::new(AlwaysFailsLoadSpend(InMemoryControlPlaneStore::default()));
+        let accumulator = SpendAccumulator::new("test-chain".to_string(), store, Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+
+        // Must not panic and must still record -- the load failure is
+        // logged, not propagated as a lost request.
+        accumulator.record(
+            &tenant,
+            now,
+            Charge::Priced(MicroUsd::from_micros(4_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+
+        assert_eq!(
+            accumulator.current_total(&tenant, &Period::Daily.key_for(now)),
+            4_000_000,
+            "a failed resume-load must start the bucket at zero and still record the \
+             CURRENT request, not drop it"
+        );
+    }
+
+    // --- Unpriced requests -------------------------------------------------
+
+    #[test]
+    fn unpriced_charge_increments_count_and_pair_but_not_total() {
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        accumulator.record(
+            &tenant,
+            now,
+            Charge::Unpriced,
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+
+        assert_eq!(
+            accumulator.current_total(&tenant, &period_key),
+            0,
+            "an unpriced charge must not add anything to the spend total"
+        );
+
+        let buckets = accumulator.inner.buckets.lock().unwrap();
+        let bucket = buckets.get(&(tenant.clone(), period_key.clone())).unwrap();
+        assert_eq!(bucket.unpriced_requests, 1);
+        assert!(
+            bucket
+                .unpriced_pairs
+                .contains(&("cluster-a".to_string(), "model-a".to_string())),
+            "the (cluster, model) pair of an unpriced request must be recorded"
+        );
+        assert!(!bucket.unpriced_pairs_truncated);
+    }
+
+    #[test]
+    fn unpriced_pairs_cap_at_32_pairs_and_set_the_truncated_flag() {
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        for i in 0..40 {
+            accumulator.record(
+                &tenant,
+                now,
+                Charge::Unpriced,
+                Some("cluster-a"),
+                Some(&format!("model-{i}")),
+            );
+        }
+
+        let buckets = accumulator.inner.buckets.lock().unwrap();
+        let bucket = buckets.get(&(tenant.clone(), period_key.clone())).unwrap();
+        assert_eq!(bucket.unpriced_requests, 40);
+        assert_eq!(
+            bucket.unpriced_pairs.len(),
+            32,
+            "the distinct-pair set must stop growing once MAX_UNPRICED_PAIRS is reached"
+        );
+        assert!(
+            bucket.unpriced_pairs_truncated,
+            "once the cap is hit, the truncated flag must be set so a reader knows there \
+             were more distinct pairs than the set shows"
+        );
+    }
+
+    // --- Flusher liveness is a durability concern, not a security one ------
+
+    #[test]
+    fn current_total_reflects_a_record_even_when_the_flusher_has_not_ticked() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let accumulator = Arc::new(SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+            Period::Daily,
+        ));
+        // A very long interval: for the life of this test, the flusher
+        // thread is running but will never tick -- functionally
+        // indistinguishable, from `current_total`'s point of view, from a
+        // thread that panicked and died outright. Enforcement (a future
+        // 3c-iii filter) reads `current_total`, never the flusher's state,
+        // so neither case can loosen what it sees.
+        accumulator.start_flusher(Duration::from_secs(3600));
+
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+        accumulator.record(
+            &tenant,
+            now,
+            Charge::Priced(MicroUsd::from_micros(3_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+
+        assert_eq!(
+            accumulator.current_total(&tenant, &period_key),
+            3_000_000,
+            "current_total must reflect the live in-memory record regardless of whether \
+             the flusher has ticked yet -- a dead or slow flusher must not change what \
+             enforcement sees"
+        );
+        assert_eq!(
+            store
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            0,
+            "the store must NOT have this total yet -- proves current_total reads live \
+             memory rather than secretly reading the last flushed value"
+        );
+    }
+
+    // --- Drop flushes --------------------------------------------------------
+
+    #[test]
+    fn drop_flushes_what_was_recorded_since_the_last_tick() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+
+        {
+            let accumulator = Arc::new(SpendAccumulator::new(
+                "test-chain".to_string(),
+                Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+                Period::Daily,
+            ));
+            // A long interval so the flusher thread is started but has no
+            // realistic chance to tick before the accumulator drops -- if
+            // `Drop` itself did not flush, this record would be lost.
+            accumulator.start_flusher(Duration::from_secs(3600));
+            accumulator.record(
+                &tenant,
+                now,
+                Charge::Priced(MicroUsd::from_micros(9_000_000)),
+                Some("cluster-a"),
+                Some("model-a"),
+            );
+        } // The last `Arc<SpendAccumulator>` clone drops here.
+
+        let period_key = Period::Daily.key_for(now);
+        assert_eq!(
+            store
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            9_000_000,
+            "Drop must flush what was recorded since the flusher's last tick -- \
+             otherwise a clean shutdown loses up to one interval of spend, turning the \
+             documented crash-refund into an ordinary-operation refund"
         );
     }
 }
