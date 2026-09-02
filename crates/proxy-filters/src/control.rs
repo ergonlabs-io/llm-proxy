@@ -192,6 +192,33 @@ pub trait ControlPlaneStore: Send + Sync {
     /// [`crate::spend::SpendAccumulator`] is the only production caller,
     /// and it always sends the FULL current total for the bucket it is
     /// flushing, never a delta -- see that module's doc.
+    ///
+    /// # SINGLE-WRITER ONLY. Read this before implementing a remote store.
+    ///
+    /// "Absolute" is correct for ONE writer and actively wrong for two. Two
+    /// processes flushing the same `(stat_prefix, tenant, period)` are
+    /// last-writer-wins: process A flushes 300, process B flushes 200, the
+    /// row is 200, and A's 300 is silently GONE. Sharing a store between
+    /// replicas would therefore LOSE spend rather than double-count it --
+    /// quieter, and worse, than the per-process ceiling it looks like it
+    /// would fix.
+    ///
+    /// Today that is unreachable rather than guarded: [`RedbControlPlaneStore`]
+    /// takes an exclusive file lock, so a second process fails loudly at
+    /// open. The trap opens the moment someone implements a REMOTE
+    /// `ControlPlaneStore` (Redis, Postgres) behind this trait -- which is
+    /// exactly what the trait was shaped to allow (see the 3b brief's
+    /// distributed-readiness section). Such an implementation MUST NOT reuse
+    /// these absolute-write semantics for spend: it needs an additive or
+    /// compare-and-swap primitive plus a way for enforcement to see other
+    /// writers' totals, because
+    /// [`crate::spend::SpendAccumulator::current_total`] reads THIS process's
+    /// memory and nothing else.
+    ///
+    /// The ceiling is consequently enforced PER PROCESS: N replicas enforce
+    /// N independent budgets. That is the same shape as the per-worker budget
+    /// bug fixed in `0dc91d1`, one level up, and it is documented rather than
+    /// solved -- see `internal-docs/wp-50-3c-spend-budgets.md`.
     fn set_spend(
         &self,
         stat_prefix: &str,
