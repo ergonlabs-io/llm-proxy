@@ -524,6 +524,46 @@ impl Period {
         let boundary = self.next_boundary(now);
         (boundary - now).num_seconds().max(0) as u64
     }
+
+    /// The UTC instant this period's CURRENT window STARTED -- the mirror of
+    /// [`Self::next_boundary`] (which names when it ENDS). Private: WP-50
+    /// 3c-iv's only consumer of a period's start is [`Self::window_rfc3339_now`]
+    /// below, which renders it as a string rather than handing back a raw
+    /// `DateTime`.
+    fn current_boundary(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let start_date = match self {
+            Period::Daily => now.date_naive(),
+            Period::Monthly => NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                .expect("the first day of a valid year/month is always a valid date"),
+        };
+        start_date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always a valid time")
+            .and_utc()
+    }
+
+    /// [`Self::key_for`] evaluated against the real wall clock
+    /// (`Utc::now()`) -- WP-50 increment 3c-iv's admin spend read
+    /// (`proxy-admin`) needs "what period is it right now" and has no
+    /// `chrono` dependency of its own to build a `DateTime<Utc>` with; this
+    /// answers that without requiring one.
+    pub fn key_for_now(&self) -> PeriodKey {
+        self.key_for(Utc::now())
+    }
+
+    /// This period's `[start, end)` window around `Utc::now()` --
+    /// [`Self::current_boundary`] and [`Self::next_boundary`] as a pair.
+    ///
+    /// Returns `DateTime<Utc>`, deliberately NOT formatted strings. How a
+    /// timestamp is RENDERED is a presentation decision belonging to
+    /// whatever is doing the presenting (today, `proxy-admin`'s spend read,
+    /// which renders RFC 3339); this module is the integer-money domain and
+    /// has no business owning a wire format. Contrast [`MicroUsd`], which
+    /// likewise stores an integer and leaves decimal rendering to the caller.
+    pub fn window_now(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        let now = Utc::now();
+        (self.current_boundary(now), self.next_boundary(now))
+    }
 }
 
 /// A rendered [`Period`] -- `"2026-08-31"` for [`Period::Daily`],
@@ -644,6 +684,16 @@ struct Inner {
     /// period for.
     default_period: Period,
     buckets: Mutex<HashMap<(TenantId, PeriodKey), Bucket>>,
+    /// WP-50 increment 3c-iv: when [`Inner::flush_now`] last wrote every
+    /// bucket to the store WITHOUT ERROR -- `None` until the first such
+    /// flush. A FAILED flush (see [`Inner::flush_now`]'s `first_err`) must
+    /// NEVER advance this: it would otherwise claim durability the store
+    /// does not actually have, which is exactly the kind of unreproducible
+    /// wrong answer the module doc's "Money is integer" section warns
+    /// against for a different reason. The admin spend read
+    /// ([`SpendAccumulator::report`]) surfaces this so an operator can see
+    /// the crash-refund window directly rather than assuming it.
+    last_flush_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl Inner {
@@ -699,6 +749,13 @@ impl Inner {
     /// not stop the rest from flushing, but the first failure is still
     /// returned so a caller (the flusher thread's warning, or a test) can
     /// tell the flush was not fully durable.
+    ///
+    /// [`Self::last_flush_at`] is advanced to `Utc::now()` ONLY when every
+    /// bucket wrote successfully -- see that field's doc for why a partial
+    /// or total failure must leave it exactly where it was: a report that
+    /// claimed a flush just succeeded when it did not would be a durability
+    /// lie, not a rounding one, but the same shape of "unreproducible wrong
+    /// answer" the module doc elsewhere warns against.
     fn flush_now(&self) -> Result<(), StoreError> {
         let buckets = self
             .buckets
@@ -717,7 +774,13 @@ impl Inner {
         }
         match first_err {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => {
+                *self
+                    .last_flush_at
+                    .lock()
+                    .expect("spend accumulator mutex poisoned") = Some(Utc::now());
+                Ok(())
+            }
         }
     }
 }
@@ -743,6 +806,29 @@ struct ShutdownSignal {
 struct Flusher {
     shutdown: Arc<ShutdownSignal>,
     join: JoinHandle<()>,
+}
+
+/// [`SpendAccumulator::report`]'s return value -- everything WP-50 increment
+/// 3c-iv's admin spend read renders for one `(tenant, period)`. See that
+/// method's doc for the "never-spent tenant reports zeros" guarantee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendReport {
+    /// The tenant's live spend total for this period, in micro-dollars.
+    pub total_micros: u64,
+    /// Requests this period whose `(cluster, model)` had no configured
+    /// price -- see [`Charge::Unpriced`]'s doc.
+    pub unpriced_requests: u64,
+    /// Distinct unpriced `(cluster, model)` pairs, sorted (a `BTreeSet`'s
+    /// iteration order is already sorted -- see [`Bucket::unpriced_pairs`]),
+    /// capped at [`MAX_UNPRICED_PAIRS`].
+    pub unpriced_pairs: Vec<(String, String)>,
+    /// Set once more than [`MAX_UNPRICED_PAIRS`] distinct pairs were seen --
+    /// tells a reader there were more than [`Self::unpriced_pairs`] shows.
+    pub unpriced_pairs_truncated: bool,
+    /// When this accumulator last flushed EVERY bucket to the store
+    /// successfully -- `None` if it never has. See
+    /// [`SpendAccumulator::last_flush_at`]'s doc.
+    pub last_flush_at: Option<DateTime<Utc>>,
 }
 
 /// Per-`(tenant, period)` spend, accumulated in memory with no store I/O on
@@ -773,6 +859,7 @@ impl SpendAccumulator {
                 store,
                 default_period,
                 buckets: Mutex::new(HashMap::new()),
+                last_flush_at: Mutex::new(None),
             }),
             flusher: Mutex::new(None),
         }
@@ -840,6 +927,24 @@ impl SpendAccumulator {
         }
     }
 
+    /// [`Self::record`] against the real wall clock (`Utc::now()`) -- the
+    /// `record`-side counterpart of [`Period::key_for_now`]'s cross-crate
+    /// convenience: a caller with no `chrono` dependency of its own (WP-50
+    /// 3c-iv's `proxy-admin` server tests, standing in for what the
+    /// `llmproxy.spend_limit` filter's own `record_if_present` does with a
+    /// real `Utc::now()`) can record a charge without constructing a
+    /// `DateTime<Utc>` itself.
+    pub fn record_now(
+        &self,
+        tenant: &TenantId,
+        period: Period,
+        charge: Charge,
+        cluster: Option<&str>,
+        model: Option<&str>,
+    ) {
+        self.record(tenant, Utc::now(), period, charge, cluster, model);
+    }
+
     /// The period a tenant with NO configured [`TenantBudget`] is metered
     /// under -- see [`Inner::default_period`]'s doc. The 3c-iii-b enforcement
     /// filter reads this to build the `period` argument [`Self::record`]
@@ -870,6 +975,59 @@ impl SpendAccumulator {
     /// and `Drop` calls it once more on shutdown.
     pub fn flush_now(&self) -> Result<(), StoreError> {
         self.inner.flush_now()
+    }
+
+    /// The UTC instant [`Self::flush_now`] last completed with EVERY bucket
+    /// written successfully -- `None` if no flush has ever fully succeeded.
+    /// See [`Inner::last_flush_at`]'s doc for why a failed (even partially
+    /// failed) flush must never advance this.
+    pub fn last_flush_at(&self) -> Option<DateTime<Utc>> {
+        *self
+            .inner
+            .last_flush_at
+            .lock()
+            .expect("spend accumulator mutex poisoned")
+    }
+
+    /// WP-50 increment 3c-iv -- the admin spend read's data source. Returns
+    /// `(tenant, period)`'s live spend, unpriced-request discoverability
+    /// counters, and the accumulator's last successful flush time, all in
+    /// one snapshot so a caller (`proxy-admin`'s spend endpoint) does not
+    /// need to lock the buckets map itself or reason about torn reads across
+    /// several separate calls.
+    ///
+    /// A `(tenant, period)` this process has never touched reports ZEROS,
+    /// not an error -- it goes through the same [`Inner::get_or_load_bucket`]
+    /// [`Self::current_total`] does, which resumes from the store (itself
+    /// `0` for a row nothing has ever written, per
+    /// [`ControlPlaneStore::load_spend`]'s doc) rather than treating "never
+    /// spent" as a failure. An operator asking about a tenant that has not
+    /// made a request yet gets a valid, boring answer.
+    pub fn report(&self, tenant: &TenantId, period: &PeriodKey) -> SpendReport {
+        let mut buckets = self
+            .inner
+            .buckets
+            .lock()
+            .expect("spend accumulator mutex poisoned");
+        let bucket = self.inner.get_or_load_bucket(&mut buckets, tenant, period);
+        // Rust note: `unpriced_pairs` is a `BTreeSet`, so iterating it is
+        // ALREADY in sorted order -- no separate `.sort()` needed to satisfy
+        // the design brief's "sorted for stable output" requirement.
+        let unpriced_pairs: Vec<(String, String)> = bucket.unpriced_pairs.iter().cloned().collect();
+        let report = SpendReport {
+            total_micros: bucket.total_micros,
+            unpriced_requests: bucket.unpriced_requests,
+            unpriced_pairs,
+            unpriced_pairs_truncated: bucket.unpriced_pairs_truncated,
+            // `last_flush_at` locks a DIFFERENT mutex than `buckets` above,
+            // so reading it while still holding `buckets`'s guard is not a
+            // self-deadlock -- called here (rather than after `buckets`
+            // drops) only so every field of `report` is assembled in one
+            // place.
+            last_flush_at: self.last_flush_at(),
+        };
+        drop(buckets);
+        report
     }
 
     /// Starts the background flush thread, ticking every `interval`. See
@@ -1847,6 +2005,198 @@ mod tests {
             "Drop must flush what was recorded since the flusher's last tick -- \
              otherwise a clean shutdown loses up to one interval of spend, turning the \
              documented crash-refund into an ordinary-operation refund"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 3c-iv: `SpendAccumulator::report` and `last_flush_at`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn last_flush_at_is_none_before_any_flush() {
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        assert_eq!(accumulator.last_flush_at(), None);
+    }
+
+    #[test]
+    fn last_flush_at_advances_on_a_successful_flush() {
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        accumulator.flush_now().expect("flush must succeed");
+        assert!(
+            accumulator.last_flush_at().is_some(),
+            "a successful flush (even of zero buckets) must set last_flush_at"
+        );
+    }
+
+    /// A store double whose `set_spend` always fails -- the mirror image of
+    /// `AlwaysFailsLoadSpend` above, used to prove a FAILED flush must not
+    /// advance `last_flush_at`. Pinned by `a_failed_flush_does_not_advance_last_flush_at`;
+    /// its mutation pin has `Inner::flush_now` set `last_flush_at`
+    /// unconditionally instead of only in the `None` (no error) arm.
+    struct AlwaysFailsSetSpend(InMemoryControlPlaneStore);
+
+    impl ControlPlaneStore for AlwaysFailsSetSpend {
+        fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
+            self.0.load()
+        }
+        fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+            self.0.create_tenant(tenant)
+        }
+        fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+            self.0.delete_tenant(tenant)
+        }
+        fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), StoreError> {
+            self.0.put_key(rec)
+        }
+        fn revoke_key(&self, key_id: &crate::auth::KeyId) -> Result<(), StoreError> {
+            self.0.revoke_key(key_id)
+        }
+        fn set_policy(
+            &self,
+            tenant: &TenantId,
+            access: &crate::model_authz::ModelAccess,
+        ) -> Result<(), StoreError> {
+            self.0.set_policy(tenant, access)
+        }
+        fn set_budget(
+            &self,
+            tenant: &TenantId,
+            budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
+            self.0.set_budget(tenant, budget)
+        }
+        fn set_spend(
+            &self,
+            _stat_prefix: &str,
+            _tenant: &TenantId,
+            _period: &PeriodKey,
+            _total_micros: u64,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable(
+                "test double: set_spend always fails".to_string(),
+            ))
+        }
+        fn load_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+        ) -> Result<u64, StoreError> {
+            self.0.load_spend(stat_prefix, tenant, period)
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_does_not_advance_last_flush_at() {
+        let store: Arc<dyn ControlPlaneStore> =
+            Arc::new(AlwaysFailsSetSpend(InMemoryControlPlaneStore::default()));
+        let accumulator = SpendAccumulator::new("test-chain".to_string(), store, Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+
+        // A bucket to flush, so `flush_now` actually attempts a write (and
+        // fails) rather than trivially succeeding over zero buckets.
+        accumulator.record(
+            &tenant,
+            now,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(1_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+
+        assert!(accumulator.flush_now().is_err(), "the flush must fail");
+        assert_eq!(
+            accumulator.last_flush_at(),
+            None,
+            "a FAILED flush must not advance last_flush_at -- doing so would claim \
+             durability the store does not actually have"
+        );
+    }
+
+    #[test]
+    fn report_on_a_never_touched_tenant_period_is_all_zeros_not_an_error() {
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        let tenant = TenantId::new("tenant-never-spent");
+        let period_key = PeriodKey::for_test("2026-08-31");
+
+        let report = accumulator.report(&tenant, &period_key);
+
+        assert_eq!(report.total_micros, 0);
+        assert_eq!(report.unpriced_requests, 0);
+        assert!(report.unpriced_pairs.is_empty());
+        assert!(!report.unpriced_pairs_truncated);
+        assert_eq!(report.last_flush_at, None);
+    }
+
+    #[test]
+    fn report_reflects_live_spend_and_unpriced_discoverability() {
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        accumulator.record(
+            &tenant,
+            now,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(6_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+        accumulator.record(
+            &tenant,
+            now,
+            Period::Daily,
+            Charge::Unpriced,
+            Some("cluster-b"),
+            Some("unpriced-model"),
+        );
+        accumulator.flush_now().expect("flush must succeed");
+
+        let report = accumulator.report(&tenant, &period_key);
+
+        assert_eq!(report.total_micros, 6_000_000);
+        assert_eq!(report.unpriced_requests, 1);
+        assert_eq!(
+            report.unpriced_pairs,
+            vec![("cluster-b".to_string(), "unpriced-model".to_string())]
+        );
+        assert!(!report.unpriced_pairs_truncated);
+        assert!(
+            report.last_flush_at.is_some(),
+            "report must surface the accumulator's last successful flush time"
+        );
+    }
+
+    #[test]
+    fn report_sorts_unpriced_pairs_for_stable_output() {
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 8, 31, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        // Recorded in reverse-sorted order -- the report must still come
+        // back sorted.
+        for (cluster, model) in [("cluster-z", "model-z"), ("cluster-a", "model-a")] {
+            accumulator.record(
+                &tenant,
+                now,
+                Period::Daily,
+                Charge::Unpriced,
+                Some(cluster),
+                Some(model),
+            );
+        }
+
+        let report = accumulator.report(&tenant, &period_key);
+        assert_eq!(
+            report.unpriced_pairs,
+            vec![
+                ("cluster-a".to_string(), "model-a".to_string()),
+                ("cluster-z".to_string(), "model-z".to_string()),
+            ],
+            "unpriced_pairs must be sorted regardless of record order"
         );
     }
 }

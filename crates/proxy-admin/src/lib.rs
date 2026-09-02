@@ -7,6 +7,15 @@
 //! empty `200` -- an operator who trusts an empty `/stats` believes there is
 //! no traffic.
 //!
+//! **The one exception: `GET /tenants/{id}/spend` (WP-50 increment 3c-iv) is
+//! a READ that is nonetheless gated exactly like a write.** Every other read
+//! above is deliberately non-sensitive -- config shape, cluster names,
+//! aggregate stats -- but per-tenant spend is financial data: how much a
+//! specific tenant has billed, against what ceiling, this period. Nothing
+//! about it should be answerable to an unauthenticated caller just because
+//! the HTTP verb is `GET`. See `server.rs`'s `handle` and `WriteRoute`'s doc
+//! for how a GET route shares the write API's gate/resolution machinery.
+//!
 //! Write endpoints, gated by the `LLMPROXY_ADMIN_TOKEN` bearer token (see
 //! `server::serve`'s doc for why that env var is read in `crates/proxy`, not
 //! here): `POST /keys` (mint), `DELETE /keys/{id}` (revoke),
@@ -14,7 +23,9 @@
 //! `PUT /tenants/{id}/policy` (set model-access policy),
 //! `PUT /tenants/{id}/budget` (set or clear a tenant's spend ceiling -- WP-50
 //! increment 3c-iii-a; storage and admin CRUD only, the enforcing filter is a
-//! later increment). Unset (or empty/whitespace) token means every write is
+//! later increment), and the read described above,
+//! `GET /tenants/{id}/spend` (WP-50 increment 3c-iv). Unset (or
+//! empty/whitespace) token means every one of these -- write OR read -- is
 //! refused with 403 -- **unset never means open** (CLAUDE.md rule 17). See
 //! `server.rs`'s `handle` for the full gate and its per-endpoint doc
 //! comments for request/response shapes.
@@ -29,11 +40,13 @@
 //! budget (unlimited) and an explicitly configured zero ceiling are kept
 //! distinct rather than collapsed.
 //!
-//! WP-50 3c-ii-a added a **scoped** form of every write endpoint,
+//! WP-50 3c-ii-a added a **scoped** form of every write endpoint (and, since
+//! 3c-iv, the gated spend read too),
 //! `/chains/{stat_prefix}/keys`, `/chains/{stat_prefix}/keys/{id}`,
 //! `/chains/{stat_prefix}/tenants`, `/chains/{stat_prefix}/tenants/{id}`,
 //! `/chains/{stat_prefix}/tenants/{id}/policy`,
-//! `/chains/{stat_prefix}/tenants/{id}/budget` -- addressed by the target
+//! `/chains/{stat_prefix}/tenants/{id}/budget`,
+//! `/chains/{stat_prefix}/tenants/{id}/spend` -- addressed by the target
 //! HTTP connection manager's own operator-chosen `stat_prefix`, ALWAYS
 //! correct regardless of how many chains in this serve configure
 //! `llmproxy.auth`. The original unscoped endpoints (`/keys`, ...) stay: a

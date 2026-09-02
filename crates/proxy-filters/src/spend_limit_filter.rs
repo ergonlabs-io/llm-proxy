@@ -361,9 +361,40 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
 
 /// The pieces every worker building the SAME chain must share -- see
 /// `create`'s doc for why both live behind ONE `SharedFactoryState` slot.
-struct SharedSpendLimitState {
+///
+/// `pub` (crossing the crate boundary) because WP-50 increment 3c-iv's admin
+/// spend read (`proxy-admin`) downcasts to this exact type: what is
+/// registered under [`TYPE_URL`] in [`proxy_http::filter::SharedFactoryState`]
+/// is THIS wrapper, never a bare `Arc<SpendAccumulator>` -- an admin-side
+/// downcast straight to `SpendAccumulator` would silently fail every time.
+/// `usage_missing_warner` stays private; only [`Self::accumulator`] is ever
+/// read from outside this module.
+pub struct SharedSpendLimitState {
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+}
+
+impl SharedSpendLimitState {
+    /// The shared spend accumulator this chain's `llmproxy.spend_limit`
+    /// filter accrues into -- what the admin spend read reports from.
+    pub fn accumulator(&self) -> &Arc<SpendAccumulator> {
+        &self.accumulator
+    }
+
+    /// Test-support constructor, `pub` so `proxy-admin`'s server tests (a
+    /// different crate) can register a singleton of the EXACT type
+    /// production registers under [`TYPE_URL`] without driving the whole
+    /// `SpendLimitFilterFactory::create`/HCM-build machinery just to get one
+    /// -- see this type's own doc for why registering a bare
+    /// `Arc<SpendAccumulator>` instead would make the admin server's
+    /// downcast silently miss.
+    #[doc(hidden)]
+    pub fn for_test(accumulator: Arc<SpendAccumulator>) -> Self {
+        SharedSpendLimitState {
+            accumulator,
+            usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+        }
+    }
 }
 
 struct SpendLimitInstanceFactory {

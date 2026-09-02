@@ -20,12 +20,12 @@ use proxy_config::ir::{
 };
 use proxy_core::runtime::SnapshotHandles;
 use proxy_filters::auth::{
-    AuthError, AuthOutcome, Authenticator, HmacSecret, KeySet, VirtualKeyAuthenticator,
+    AuthError, AuthOutcome, Authenticator, HmacSecret, KeySet, TenantId, VirtualKeyAuthenticator,
 };
 use proxy_filters::auth_filter;
 use proxy_filters::control::{ControlPlane, InMemoryControlPlaneStore};
 use proxy_filters::model_authz::ModelAccess;
-use proxy_filters::spend::{MicroUsd, Period};
+use proxy_filters::spend::{Charge, MicroUsd, Period};
 use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{
     instruments, prometheus_render, Registry, StatsControl, WorkerId,
@@ -256,6 +256,72 @@ fn factory_state_with_control_plane() -> (
         TEST_HMAC_SECRET,
     );
     (factory_state, handle)
+}
+
+/// Registers a real [`SpendAccumulator`] into `factory_state` under
+/// `(scope, spend_limit_filter::TYPE_URL)` and its `stat_prefix` name index
+/// -- WP-50 3c-iv's stand-in for what `SpendLimitFilterFactory::create`
+/// registers in production. Wraps the accumulator in
+/// [`SharedSpendLimitState::for_test`], the SAME wrapper type production
+/// registers (see that constructor's own doc for why a bare
+/// `Arc<SpendAccumulator>` here would make the admin server's downcast
+/// silently miss), rather than driving the whole
+/// `SpendLimitFilterFactory::create`/HCM-build machinery just to get one.
+///
+/// Uses its own fresh, private [`InMemoryControlPlaneStore`] -- independent
+/// of whatever store the `ControlPlane` registered at the same scope uses.
+/// That is a deliberate simplification for these admin-wiring tests (which
+/// exercise gating/resolution/response shape, not `spend_limit_filter`'s own
+/// "flushes into the operator's store" property, already covered by that
+/// module's own tests): [`SpendAccumulator::report`]/`record` never touch
+/// the `ControlPlane`'s store at all, so nothing here depends on the two
+/// being the same store.
+fn register_spend_accumulator(
+    factory_state: &Arc<SharedFactoryState>,
+    scope: &str,
+    stat_prefix: &str,
+    default_period: Period,
+) -> Arc<proxy_filters::spend::SpendAccumulator> {
+    let accumulator = Arc::new(proxy_filters::spend::SpendAccumulator::new(
+        stat_prefix.to_string(),
+        Arc::new(InMemoryControlPlaneStore::default()),
+        default_period,
+    ));
+    factory_state
+        .get_or_try_init(
+            scope,
+            stat_prefix,
+            proxy_filters::spend_limit_filter::TYPE_URL,
+            || {
+                Ok(Arc::new(
+                    proxy_filters::spend_limit_filter::SharedSpendLimitState::for_test(Arc::clone(
+                        &accumulator,
+                    )),
+                ) as Arc<dyn std::any::Any + Send + Sync>)
+            },
+        )
+        .expect("inserting the test spend accumulator singleton must not fail");
+    accumulator
+}
+
+/// [`factory_state_with_control_plane`], plus a real [`SpendAccumulator`]
+/// registered at the SAME [`TEST_CHAIN_SCOPE`]/[`TEST_CHAIN_STAT_PREFIX`] --
+/// what every single-chain spend-read test uses.
+fn factory_state_with_control_plane_and_spend(
+    default_period: Period,
+) -> (
+    Arc<SharedFactoryState>,
+    Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+    Arc<proxy_filters::spend::SpendAccumulator>,
+) {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let accumulator = register_spend_accumulator(
+        &factory_state,
+        TEST_CHAIN_SCOPE,
+        TEST_CHAIN_STAT_PREFIX,
+        default_period,
+    );
+    (factory_state, handle, accumulator)
 }
 
 /// The single chain scope every `factory_state_with_control_plane` test
@@ -1310,6 +1376,398 @@ async fn scoped_put_budget_with_unknown_stat_prefix_is_404() {
         "/chains/no-such-chain/tenants/tenant-a/budget",
         Some(ADMIN_TOKEN),
         r#"{"budget":{"max_usd":"1.00","period":"daily"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("no-such-chain"),
+        "the 404 must name the unresolved stat_prefix: {body}"
+    );
+}
+
+// --- GET /tenants/{id}/spend (WP-50 increment 3c-iv) ------------------------
+//
+// A READ, gated exactly like a write -- see `lib.rs`'s module doc for why.
+// These tests exercise the SAME three gates the write-API tests above do,
+// restated for this endpoint, plus its own two-singleton resolution and
+// response shape.
+
+/// Unit test for the rendering helper itself: `spend_usd` must render EXACTLY
+/// from the integer, including a value whose fractional part has leading
+/// zeros a naive divide-and-cast would drop.
+#[test]
+fn render_micro_usd_renders_exactly_from_the_integer() {
+    use crate::server::render_micro_usd;
+    assert_eq!(render_micro_usd(0), "0.000000");
+    assert_eq!(
+        render_micro_usd(1_234),
+        "0.001234",
+        "leading zeros after the decimal point must survive"
+    );
+    assert_eq!(render_micro_usd(1_000_000), "1.000000");
+    assert_eq!(render_micro_usd(500_000_000), "500.000000");
+    assert_eq!(render_micro_usd(1_000_001), "1.000001");
+}
+
+/// No admin token configured -> 403, exactly like every write endpoint --
+/// this is a GET, but it renders per-tenant financial data, so it is gated
+/// like a write (see `lib.rs`'s module doc). Pinned by mutation Pin A (skip
+/// the bearer gate for the spend read).
+#[tokio::test]
+async fn spend_read_with_no_admin_token_configured_is_forbidden() {
+    let (factory_state, _handle, _accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    let (_server, addr) = start_full(snapshot_with_secret(), None, factory_state, None).await;
+
+    let (status, body) = get(addr, "/tenants/tenant-a/spend").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the spend read must be refused exactly like a write when no token is configured: \
+         {body}"
+    );
+}
+
+/// A wrong bearer token -> 401, matching every write endpoint's gate.
+#[tokio::test]
+async fn spend_read_with_wrong_token_is_401() {
+    let (factory_state, _handle, _accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some("definitely-not-the-configured-token"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+/// A `ControlPlane` IS registered, but no `llmproxy.spend_limit` accumulator
+/// is -- 503, naming the missing filter, matching the shape of the existing
+/// missing-`ControlPlane` 503 elsewhere in this file (never a fourth status
+/// code for "half configured").
+#[tokio::test]
+async fn spend_read_with_no_accumulator_registered_is_503() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.contains("llmproxy.spend_limit"),
+        "the 503 must name what's missing: {body}"
+    );
+}
+
+/// A tenant that has never spent reports zeros, not an error -- an operator
+/// asking about a tenant that hasn't made a request yet gets a valid, boring
+/// answer.
+#[tokio::test]
+async fn spend_read_on_a_tenant_that_never_spent_is_zeros_not_an_error() {
+    let (factory_state, _handle, _accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-never-spent/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["spend_micro_usd"], 0);
+    assert_eq!(value["spend_usd"], "0.000000");
+    assert_eq!(value["unpriced_requests"], 0);
+    assert_eq!(value["budget_micro_usd"], serde_json::Value::Null);
+    assert_eq!(value["remaining_micro_usd"], serde_json::Value::Null);
+}
+
+/// A tenant with no configured budget is unlimited: `budget_micro_usd` and
+/// `remaining_micro_usd` render `null`, never a fabricated ceiling, even
+/// though the tenant HAS spent something.
+#[tokio::test]
+async fn spend_read_on_an_unlimited_tenant_has_null_budget_fields() {
+    let (factory_state, _handle, accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    accumulator.record_now(
+        &TenantId::new("tenant-a"),
+        Period::Monthly,
+        Charge::Priced(MicroUsd::from_micros(4_200)),
+        Some("cluster-a"),
+        Some("m"),
+    );
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["spend_micro_usd"], 4_200);
+    assert_eq!(value["budget_micro_usd"], serde_json::Value::Null);
+    assert_eq!(value["remaining_micro_usd"], serde_json::Value::Null);
+}
+
+/// A budgeted tenant reports the correct `remaining_micro_usd`, and it
+/// SATURATES at zero rather than wrapping once spend exceeds the budget --
+/// the check/record split (`spend_limit_filter`'s own module doc) means the
+/// request that crosses a ceiling is always admitted, so live spend CAN
+/// legitimately exceed the configured budget. Pinned by mutation Pin B
+/// (`remaining` computed by wrapping subtraction instead of saturating).
+#[tokio::test]
+async fn spend_read_on_a_budgeted_tenant_reports_remaining_and_saturates_at_zero() {
+    let (factory_state, _handle, accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"10.00","period":"monthly"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Under budget: $4 of $10.
+    accumulator.record_now(
+        &TenantId::new("tenant-a"),
+        Period::Monthly,
+        Charge::Priced(MicroUsd::from_micros(4_000_000)),
+        Some("cluster-a"),
+        Some("m"),
+    );
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["budget_micro_usd"], 10_000_000);
+    assert_eq!(value["remaining_micro_usd"], 6_000_000);
+
+    // Push spend PAST the budget -- remaining must saturate at 0, never wrap
+    // around to a huge positive number.
+    accumulator.record_now(
+        &TenantId::new("tenant-a"),
+        Period::Monthly,
+        Charge::Priced(MicroUsd::from_micros(20_000_000)),
+        Some("cluster-a"),
+        Some("m"),
+    );
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["spend_micro_usd"], 24_000_000);
+    assert_eq!(
+        value["remaining_micro_usd"], 0,
+        "remaining must saturate at zero, not wrap, once spend exceeds the budget: {value}"
+    );
+}
+
+/// Unpriced requests are reported: the count AND the distinct `(cluster,
+/// model)` pairs -- the design brief's discoverability requirement (an
+/// unconfigured price costs zero, but the gap must stay visible).
+#[tokio::test]
+async fn spend_read_reports_unpriced_requests_and_pairs() {
+    let (factory_state, _handle, accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    accumulator.record_now(
+        &TenantId::new("tenant-a"),
+        Period::Monthly,
+        Charge::Unpriced,
+        Some("cluster-a"),
+        Some("some-model"),
+    );
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["unpriced_requests"], 1);
+    assert_eq!(
+        value["unpriced_pairs"],
+        serde_json::json!([["cluster-a", "some-model"]])
+    );
+    assert_eq!(value["unpriced_pairs_truncated"], false);
+}
+
+/// The scoped form returns the NAMED chain's spend and not another chain's --
+/// mirrors `scoped_put_budget_lands_in_the_named_chains_control_plane_and_not_the_others`,
+/// restated for the spend read.
+#[tokio::test]
+async fn scoped_spend_read_returns_the_named_chains_spend_and_not_the_others() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        TEST_HMAC_SECRET,
+    );
+    register_control_plane(
+        &factory_state,
+        "listener 'b' filter_chains[0]",
+        "chain-b",
+        TEST_HMAC_SECRET,
+    );
+    let accumulator_a = register_spend_accumulator(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        Period::Monthly,
+    );
+    let accumulator_b = register_spend_accumulator(
+        &factory_state,
+        "listener 'b' filter_chains[0]",
+        "chain-b",
+        Period::Monthly,
+    );
+    accumulator_a.record_now(
+        &TenantId::new("tenant-a"),
+        Period::Monthly,
+        Charge::Priced(MicroUsd::from_micros(1_000_000)),
+        Some("cluster-a"),
+        Some("m"),
+    );
+    accumulator_b.record_now(
+        &TenantId::new("tenant-a"),
+        Period::Monthly,
+        Charge::Priced(MicroUsd::from_micros(9_000_000)),
+        Some("cluster-a"),
+        Some("m"),
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/chains/chain-a/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(
+        value["spend_micro_usd"], 1_000_000,
+        "the scoped read must return chain-a's own spend, not chain-b's: {value}"
+    );
+}
+
+/// An unknown `stat_prefix` is a 404, matching every other scoped endpoint --
+/// the `ControlPlane` gate (shared with every write route) refuses before
+/// this endpoint's own accumulator resolution is ever reached.
+#[tokio::test]
+async fn scoped_spend_read_with_unknown_stat_prefix_is_404() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        TEST_HMAC_SECRET,
+    );
+    register_spend_accumulator(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        Period::Monthly,
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/chains/no-such-chain/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);

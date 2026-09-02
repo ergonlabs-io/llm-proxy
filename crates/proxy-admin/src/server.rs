@@ -46,7 +46,8 @@ use proxy_core::WorkerConfigHandle;
 use proxy_filters::auth::{KeyId, TenantId};
 use proxy_filters::control::{ControlPlane, StoreError};
 use proxy_filters::model_authz::{ModelAccess, ModelPattern};
-use proxy_filters::spend::{parse_micro_usd, Period, TenantBudget};
+use proxy_filters::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
+use proxy_filters::spend_limit_filter::SharedSpendLimitState;
 use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
@@ -70,12 +71,16 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}",
     "/tenants/{id}/policy",
     "/tenants/{id}/budget",
+    // WP-50 increment 3c-iv: a READ, but gated like a write -- see
+    // `handle`'s route table and `lib.rs`'s module doc for why.
+    "/tenants/{id}/spend",
     "/chains/{stat_prefix}/keys",
     "/chains/{stat_prefix}/keys/{id}",
     "/chains/{stat_prefix}/tenants",
     "/chains/{stat_prefix}/tenants/{id}",
     "/chains/{stat_prefix}/tenants/{id}/policy",
     "/chains/{stat_prefix}/tenants/{id}/budget",
+    "/chains/{stat_prefix}/tenants/{id}/spend",
 ];
 
 /// Hard cap on a write request's body. An admin write endpoint has no
@@ -288,7 +293,14 @@ async fn handle(
         _ => {}
     }
 
-    // ---- Write endpoints (WP-50 3b-ii W4): gated, resolved per request. ----
+    // ---- Write endpoints (WP-50 3b-ii W4), PLUS one gated read (WP-50
+    // 3c-iv's `.../spend`): all resolved per request through the SAME three
+    // gates. `.../spend` is a GET, not a write, but it renders per-tenant
+    // spend -- financial data, unlike every endpoint matched by literal path
+    // above (`/config_dump`, `/clusters`, `/stats`, ...), which is why it is
+    // routed here instead of there. See `lib.rs`'s module doc for the
+    // one-line rule and `WriteRoute`'s doc for how a GET fits a type named
+    // for writes. ----
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // Rust note: leading `/` stripped, then split on `/` WITHOUT filtering
@@ -358,7 +370,8 @@ async fn handle(
     // for the two 503 situations it does not need to tell apart, and for the
     // third case below (more than one `llmproxy.auth`-configured chain) that
     // it does.
-    let control_plane = if let Some(stat_prefix) = route.stat_prefix() {
+    let stat_prefix_opt = route.stat_prefix();
+    let control_plane = if let Some(stat_prefix) = stat_prefix_opt {
         match resolve_control_plane_by_name(factory_state, stat_prefix) {
             Some(cp) => cp,
             None => {
@@ -430,6 +443,9 @@ async fn handle(
         WriteRoute::TenantBudget(id) | WriteRoute::ScopedTenantBudget(_, id) => {
             handle_set_budget(&control_plane, id, &body)
         }
+        WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
+            handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
+        }
     }
 }
 
@@ -444,6 +460,12 @@ async fn handle(
 /// alongside the original unscoped ones rather than replacing them --
 /// [`Self::stat_prefix`] is the single place that tells the two families
 /// apart for [`handle`]'s control-plane resolution gate.
+///
+/// WP-50 3c-iv added `TenantSpend`/`ScopedTenantSpend` -- a GET, despite the
+/// type's name. It shares this type (rather than getting a parallel
+/// `ReadRoute` enum) precisely because it needs the exact same gate and the
+/// exact same scoped/unscoped `ControlPlane` resolution every other variant
+/// here already has; see [`handle`]'s doc for why it is gated at all.
 enum WriteRoute<'a> {
     Keys,
     KeyById(&'a str),
@@ -452,12 +474,15 @@ enum WriteRoute<'a> {
     TenantPolicy(&'a str),
     // WP-50 increment 3c-iii-a.
     TenantBudget(&'a str),
+    // WP-50 increment 3c-iv.
+    TenantSpend(&'a str),
     ScopedKeys(&'a str),
     ScopedKeyById(&'a str, &'a str),
     ScopedTenants(&'a str),
     ScopedTenantById(&'a str, &'a str),
     ScopedTenantPolicy(&'a str, &'a str),
     ScopedTenantBudget(&'a str, &'a str),
+    ScopedTenantSpend(&'a str, &'a str),
 }
 
 impl<'a> WriteRoute<'a> {
@@ -467,6 +492,7 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
             WriteRoute::TenantPolicy(_) => Method::PUT,
             WriteRoute::TenantBudget(_) => Method::PUT,
+            WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
             WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
             WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
@@ -485,13 +511,15 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::Tenants
             | WriteRoute::TenantById(_)
             | WriteRoute::TenantPolicy(_)
-            | WriteRoute::TenantBudget(_) => None,
+            | WriteRoute::TenantBudget(_)
+            | WriteRoute::TenantSpend(_) => None,
             WriteRoute::ScopedKeys(s)
             | WriteRoute::ScopedTenants(s)
             | WriteRoute::ScopedKeyById(s, _)
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
-            | WriteRoute::ScopedTenantBudget(s, _) => Some(s),
+            | WriteRoute::ScopedTenantBudget(s, _)
+            | WriteRoute::ScopedTenantSpend(s, _) => Some(s),
         }
     }
 }
@@ -521,6 +549,8 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
         // WP-50 3c-iii-a.
         ["tenants", id, "budget"] => Some(WriteRoute::TenantBudget(id)),
+        // WP-50 3c-iv: a GET, gated like a write -- see `WriteRoute`'s doc.
+        ["tenants", id, "spend"] => Some(WriteRoute::TenantSpend(id)),
         // WP-50 3c-ii-a: the scoped forms, addressed by the chain's
         // operator-chosen `stat_prefix` -- see `WriteRoute`'s doc.
         ["chains", stat_prefix, "keys"] => Some(WriteRoute::ScopedKeys(stat_prefix)),
@@ -535,6 +565,10 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         // WP-50 3c-iii-a.
         ["chains", stat_prefix, "tenants", id, "budget"] => {
             Some(WriteRoute::ScopedTenantBudget(stat_prefix, id))
+        }
+        // WP-50 3c-iv.
+        ["chains", stat_prefix, "tenants", id, "spend"] => {
+            Some(WriteRoute::ScopedTenantSpend(stat_prefix, id))
         }
         _ => None,
     }
@@ -597,6 +631,54 @@ fn resolve_control_plane_by_name(
     factory_state
         .get_by_name(stat_prefix, proxy_filters::auth_filter::TYPE_URL)
         .and_then(|s| s.downcast::<ControlPlane>().ok())
+}
+
+/// Resolves the [`SpendAccumulator`] singleton `llmproxy.spend_limit`
+/// registers, ACROSS EVERY CHAIN'S SCOPE -- the WP-50 3c-iv counterpart of
+/// [`resolve_control_plane`], for the unscoped `GET /tenants/{id}/spend`
+/// alias.
+///
+/// **What is registered under [`proxy_filters::spend_limit_filter::TYPE_URL`]
+/// is [`SharedSpendLimitState`], a WRAPPER -- never a bare
+/// `Arc<SpendAccumulator>`.** `SpendLimitFilterFactory::create` bundles the
+/// accumulator together with its usage-missing warner behind one singleton
+/// slot (see that type's own doc for why); downcasting straight to
+/// `SpendAccumulator` here would silently fail on every real chain, which is
+/// exactly the trap this function's doc exists to name before a future
+/// caller re-adds it.
+///
+/// `Ok(None)`/`Err(scopes)` mirror [`resolve_control_plane`]'s exact
+/// semantics, restated for this singleton: `Ok(None)` covers both a boot
+/// race and "no chain configures `llmproxy.spend_limit` at all" (both a 503
+/// to the caller -- "not configured" and "not ready yet" are equally
+/// unactionable to distinguish); `Err(scopes)` is more than one chain
+/// registering the singleton, which cannot actually happen for an unscoped
+/// caller that already resolved a SINGLE, unambiguous `ControlPlane` above
+/// (`llmproxy.spend_limit` requires `llmproxy.auth` earlier in the SAME
+/// chain, so two spend-configured chains would already have failed the
+/// control-plane gate) -- kept here defensively, mirroring
+/// `resolve_control_plane`'s shape, rather than assumed.
+fn resolve_spend_state(
+    factory_state: &SharedFactoryState,
+) -> Result<Option<Arc<SpendAccumulator>>, Vec<String>> {
+    let singleton = factory_state.get_across_scopes(proxy_filters::spend_limit_filter::TYPE_URL)?;
+    Ok(singleton
+        .and_then(|s| s.downcast::<SharedSpendLimitState>().ok())
+        .map(|shared| Arc::clone(shared.accumulator())))
+}
+
+/// The scoped (`/chains/{stat_prefix}/...`) counterpart of
+/// [`resolve_spend_state`] -- see that function's doc for the wrapper-type
+/// downcast this also performs, and [`resolve_control_plane_by_name`]'s doc
+/// for why a `stat_prefix` lookup carries no ambiguity to report.
+fn resolve_spend_state_by_name(
+    factory_state: &SharedFactoryState,
+    stat_prefix: &str,
+) -> Option<Arc<SpendAccumulator>> {
+    factory_state
+        .get_by_name(stat_prefix, proxy_filters::spend_limit_filter::TYPE_URL)
+        .and_then(|s| s.downcast::<SharedSpendLimitState>().ok())
+        .map(|shared| Arc::clone(shared.accumulator()))
 }
 
 /// Reads `body` up to [`MAX_ADMIN_BODY_BYTES`], returning the collected
@@ -1006,6 +1088,155 @@ fn handle_set_budget(
         }
         Err(err) => store_error_response("/tenants/{id}/budget", err),
     }
+}
+
+/// Resolves the spend accumulator (scoped or unscoped, matching
+/// `stat_prefix`'s presence exactly the way [`handle`]'s own `ControlPlane`
+/// gate already did just above this call) and dispatches to
+/// [`handle_get_spend`]. Split out of [`handle`]'s final `match` so that
+/// match's other arms stay one-liners; this one needs its own resolution
+/// step because a tenant's spend read needs a SECOND singleton beyond the
+/// `ControlPlane` every other write/read here already resolved.
+fn handle_get_spend_route(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+    control_plane: &ControlPlane,
+    tenant: &str,
+    path: &str,
+) -> Response<Full<Bytes>> {
+    let accumulator = match stat_prefix {
+        Some(stat_prefix) => resolve_spend_state_by_name(factory_state, stat_prefix),
+        None => match resolve_spend_state(factory_state) {
+            Ok(accumulator) => accumulator,
+            Err(scopes) => {
+                // See `resolve_spend_state`'s doc: defensive, mirrors
+                // `resolve_control_plane`'s ambiguity handling, but cannot
+                // actually be reached given the control-plane gate that
+                // already ran above this call.
+                tracing::error!(
+                    endpoint = %path,
+                    scopes = ?scopes,
+                    "admin spend read refused: more than one llmproxy.spend_limit-configured \
+                     filter chain is registered, so the unscoped admin API cannot tell which \
+                     accumulator this read means -- use /chains/{{stat_prefix}}/... instead"
+                );
+                return text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!(
+                        "the unscoped admin spend read cannot resolve a single spend \
+                         accumulator: {} filter chains each configure llmproxy.spend_limit \
+                         ({}) -- use /chains/{{stat_prefix}}/... to address one of them \
+                         explicitly",
+                        scopes.len(),
+                        scopes.join(", "),
+                    ),
+                );
+            }
+        },
+    };
+    handle_get_spend(control_plane, accumulator, tenant)
+}
+
+/// `GET /tenants/{id}/spend` (and its scoped form) -- WP-50 increment 3c-iv.
+///
+/// Reads TWO singletons, both of which can legitimately be missing on a
+/// live, otherwise-healthy chain:
+/// - the tenant's [`TenantBudget`] (period + ceiling), read off the
+///   ALREADY-RESOLVED `control_plane`'s published snapshot -- a tenant with
+///   no configured budget is not an error (see `TenantBudget`'s own doc);
+///   `budget_micro_usd`/`remaining_micro_usd` render `null` for one;
+/// - the spend accumulator itself, resolved by the caller
+///   ([`handle_get_spend_route`]) and handed in as `None` when
+///   `llmproxy.spend_limit` is not configured on this chain at all -- THAT
+///   is the one genuinely missing-singleton case this function answers with
+///   a 503, matching the shape of the missing-`ControlPlane` 503 elsewhere
+///   in this file (never a fourth status code for "half configured").
+///
+/// **Which period?** The tenant's own `TenantBudget::period` if one is
+/// configured, else [`SpendAccumulator::default_period`] -- exactly
+/// `spend_limit_filter`'s own `decode_headers` resolution, restated here so
+/// the read reports the SAME period the enforcement filter would check.
+///
+/// `spend_usd` is rendered from the integer `total_micros` by
+/// [`render_micro_usd`] -- never through an `f64`; see `proxy_filters::spend`'s
+/// module doc for why introducing one anywhere in the money path is a bug.
+fn handle_get_spend(
+    control_plane: &ControlPlane,
+    accumulator: Option<Arc<SpendAccumulator>>,
+    tenant: &str,
+) -> Response<Full<Bytes>> {
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    let Some(accumulator) = accumulator else {
+        return text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "llmproxy.spend_limit is not configured on this chain, so there is no spend \
+             accumulator to report from",
+        );
+    };
+
+    let tenant_id = TenantId::new(tenant);
+    // Rust note: `TenantPolicyMap` is keyed on the tenant's plain `&str`
+    // name, not `TenantId` -- same lookup `spend_limit_filter`'s own
+    // `decode_headers` performs against this exact snapshot.
+    let budget = control_plane
+        .handle()
+        .load()
+        .policies
+        .get(tenant)
+        .and_then(|policy| policy.budget);
+
+    let period = budget
+        .map(|b| b.period)
+        .unwrap_or_else(|| accumulator.default_period());
+    let period_key = period.key_for_now();
+    // Rust note: `Period::window_now` hands back `DateTime<Utc>`; rendering
+    // them as RFC 3339 is this layer's job, not the money module's.
+    let (period_start, period_end) = period.window_now();
+    let (period_started_at, period_ends_at) = (period_start.to_rfc3339(), period_end.to_rfc3339());
+    let report = accumulator.report(&tenant_id, &period_key);
+
+    let (budget_micros, remaining_micros) = match budget {
+        Some(b) => {
+            let limit = b.max_micros.as_micros();
+            // Saturating, never wrapping: `total_micros` can exceed `limit`
+            // (the check/record split means the request that crosses a
+            // ceiling is always admitted -- see `spend_limit_filter`'s own
+            // module doc), and an operator reading a wrapped-around
+            // `remaining` as a huge positive number instead of `0` would be
+            // told the opposite of the truth.
+            (Some(limit), Some(limit.saturating_sub(report.total_micros)))
+        }
+        None => (None, None),
+    };
+
+    json(
+        StatusCode::OK,
+        &serde_json::json!({
+            "tenant": tenant,
+            "period": period_key.as_str(),
+            "period_started_at": period_started_at,
+            "period_ends_at": period_ends_at,
+            "spend_micro_usd": report.total_micros,
+            "spend_usd": render_micro_usd(report.total_micros),
+            "budget_micro_usd": budget_micros,
+            "remaining_micro_usd": remaining_micros,
+            "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
+            "unpriced_requests": report.unpriced_requests,
+            "unpriced_pairs": report.unpriced_pairs,
+            "unpriced_pairs_truncated": report.unpriced_pairs_truncated,
+        }),
+    )
+}
+
+/// Renders integer micro-dollars as a decimal-string dollar amount, e.g.
+/// `1_234` -> `"0.001234"`, `500_000_000` -> `"500.000000"`. Never goes
+/// through `f64` -- `proxy_filters::spend`'s entire module is integer-only by
+/// design (see its module doc's "Money is integer, never `f64`" section),
+/// and this admin read must not be the first place that property breaks.
+fn render_micro_usd(micros: u64) -> String {
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
 }
 
 fn text(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
