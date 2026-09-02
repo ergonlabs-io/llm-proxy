@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-08-23 · 1222 tests passed, 23 skipped as of 2026-08-23 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 2 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-02 · 1565 tests passed, 16 skipped as of 2026-09-02 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -189,8 +189,13 @@
     <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
   </div>
   <p class="now">
-    <b>Now — v0.2.0 "production-ready serving": stop claiming "performant" without evidence, and
-    be safe to run unattended.</b>
+    <b>Now — v0.3.0 "dynamic configuration": be deployable the way Envoy is deployed.</b> Current
+    by declaration since v0.2.0 shipped 2026-08-29 — <b>no gate-relevant work has actually landed
+    on it</b> (WP-20/21/22/28 unchanged, see the v0.3.0 gate span below). What landed instead,
+    2026-08-29 through 2026-09-02, is WP-50 increment 3 (operator control plane: tenants, spend
+    budgets), P0 product-defining work that gates neither v0.2.0 nor v0.3.0 — see the dated block
+    at the end of this paragraph.
+    <b>v0.2.0 "production-ready serving" shipped 2026-08-29</b> and is tagged.
     <b>v0.1.0 "LLM gateway" shipped 2026-08-08</b> and is tagged. <b>v0.0.1 shipped 2026-08-01</b>:
     the live smoke test ran against the real OpenAI and Anthropic endpoints and passed all four
     cases (both providers, streaming and not) on the first attempt.
@@ -213,77 +218,28 @@
     departure, not a gap that was missed. WP-35's scope closed narrower than its title:
     same-dialect fallback only — cross-dialect (openai → anthropic) is a deliberate hard error,
     split into new WP-52 (v1.0.0) rather than left as a silent gap.</span>
-    <span class="gate"><b>v0.2.0's SHIP GATE —</b> a published capacity report (p99, tokens/sec
-    ceiling, RSS under sustained long-lived streams) from a run that is not harness-bound, plus
-    <code>/config_dump</code> and <code>/stats</code> on the admin endpoint, plus a config swap
-    under live traffic with zero dropped streams. <b>Two of the three clauses CLOSED 2026-08-09;
-    the capacity report is now the only one open. Its previously-named blocker (a 202-stream h2
-    ceiling) is fixed as of 2026-08-22 — no report has been published regardless.</b>
-    <code>/config_dump</code> and <code>/stats</code> — closed: <code>/config_dump</code>'s
-    redaction is structural (WP-50 increment 1), and <code>/stats</code> now reports <b>real
-    traffic</b>, not merely a correctly-rendered empty registry — WP-23 increments 4/5/6a landed
-    the Prometheus renderer, a registry that survives a config swap, and cluster stat call sites,
-    proven end to end by <code>crates/proxy/tests/stats_e2e.rs</code> and mutation-verified.
-    Increment 6b (listener stats, LLM-token stats) remains open but doesn't reopen this clause,
-    which was written against cluster traffic. Config swap under live traffic — closed: SIGHUP
-    now triggers a real reload (a bad config keeps the old snapshot and logs, never taking the
-    proxy down), and <code>testing/diffrig/tests/swap_under_load.rs</code> proves zero dropped
-    streams under 6 concurrent SSE/non-streaming requests during the swap, asserting the SSE
-    terminal frame rather than a request count (this proxy never injects into a truncated
-    stream, so a count-based check would miss a silent truncation). <b>A defect then surfaced
-    IN the already-closed <code>/config_dump</code> clause and is worth naming plainly:</b>
-    found 2026-08-09 by writing user documentation against the code, not by a test — the admin
-    server's own config handle was never enrolled where a SIGHUP reload actually publishes, so
-    <code>/config_dump</code>/<code>/clusters</code> kept serving the BOOT snapshot forever,
-    including after a real reload. Fixed structurally (a registry that enrolls a handle the same
-    step it hands one out) and verified end to end: real binary, real SIGHUP, HTTP response bytes
-    asserted to change; a follow-up made the original mistake not just discouraged but
-    uncompilable. <b>The capacity report is the one open clause, and its blocker is now
-    cleared — but the report itself still does not exist.</b> Found 2026-08-09 while building
-    the swap test: <code>loadgen::driver::execute</code> could not detect SSE stream
-    truncation — it classified a streaming request as successful once the body ended without a
-    transport error, never checking for the terminal frame, so a run in which the proxy
-    truncated every stream would have reported a 0% error rate. <b>Fixed and merged the same
-    day, on <code>main</code>, inside this board's 1146</b> — and a second, larger defect found
-    alongside it: every failed request's time-to-failure was feeding the latency percentiles, so
-    a proxy collapsing under load would have measured as getting <i>faster</i>. Both
-    mutation-verified; percentiles now cover successful requests only. What remains is
-    unglamorous: <b>no sweep has actually been run</b> against the fixed instrument, so zero
-    p99/tokens-per-sec/RSS numbers are published. The Linux <code>/proc</code> sampler is
-    unverified but is <b>no longer a blocker</b> (owner decision 2026-08-09) — the gate asks for
-    a run that isn't harness-bound, not specifically Linux, and the macOS sampler path is the
-    verified one; what IS still open on that clause is WP-15 h1 connection reuse (h2 got a
-    per-worker multiplexed cache today; h1 still burns two ephemeral ports per request and caps
-    the rig near ~8k streams). <b>Since then (2026-08-20/21): the sweep's prerequisites, which
-    had not existed, now do.</b> There was no standalone LLM upstream anywhere in the tree — only
-    in-process test fixtures a diffrig test spawns and drops — so <code>testing/mockupstream</code>
-    (a real long-lived binary) and <code>scripts/capacity-sweep.sh</code> (<code>make sweep</code>,
-    <code>make sweep-compare</code>) were built to drive it. Separately, the configuration format
-    itself could not produce an HTTP/2 upstream at all — <code>lower.rs</code> never emitted
-    <code>typed_extension_protocol_options</code>, so every provider cluster the format we tell
-    users to write actually built was HTTP/1.1, connect-per-request; now opt-in per provider via
-    <code>protocol: http2</code>, default unchanged. <b>The first sweep run was entirely a harness
-    artifact</b> — a zero-latency mock drove ~5,800 connects/sec at concurrency one against a box
-    sustaining ~546/sec, exhausting ephemeral ports before the proxy was ever tested; fixed by
-    making the mock LLM-shaped and deriving the SLO from generation time. <b>The FIRST real ceiling
-    found is 202 concurrent streams</b> — hyper's h2 server defaults
-    <code>max_concurrent_streams</code> to 200, confirmed in the dependency source in use, and the
-    proxy multiplexes onto one upstream connection without opening a second. This was a known
-    implementation gap, not a capacity number, and did not close this clause. <b>FIXED
-    2026-08-22 (WP-15 slice C, <code>6965fd6</code>):</b> the h2 cache now keeps a bounded set of
-    connections per key and dials another once one saturates. Measured 202 → 808 concurrent
-    streams (4x) on the identical harness, still not resource-bound (20-22% CPU, 82.7MB RSS,
-    0.00 error rate). <b>Two more loadgen measurement-honesty bugs, found 2026-08-21 by running
-    real sweeps</b> (<code>c029d44</code>): an all-failure level rendered its percentiles as
-    <code>Duration::MAX</code>'s float conversion (a huge number a reader could misread as "very
-    slow" instead of "no data"), and the harness guard budgeted only concurrent streams while a
-    fast upstream is actually churn-rate bound (measured 5,800 connects/sec at concurrency 1
-    against a ~546/sec ceiling — the guard stayed silent through a 10.6x overload). Both fixed
-    and mutation-verified. <b>As of this refresh, nothing is known to block running the sweep
-    except that no one has</b> — every previously-cited blocker on this clause is now fixed, and
-    zero p99/tokens-per-sec/RSS numbers are published regardless. An h1-vs-h2 comparison sweep
-    was reported "in flight" as of an earlier refresh; its numbers were never recorded here and
-    should not be assumed to still be running.</span>
+    <span class="gate"><b>v0.2.0's SHIP GATE — CLOSED, shipped 2026-08-29 (tag <code>v0.2.0</code>).</b>
+    A published capacity report (p99, tokens/sec ceiling, RSS under sustained long-lived streams)
+    from a run that is not harness-bound, plus <code>/config_dump</code> and <code>/stats</code>
+    on the admin endpoint, plus a config swap under live traffic with zero dropped streams. All
+    three met: <code>/config_dump</code>/<code>/stats</code> closed 2026-08-09
+    (<code>/stats</code> reports real traffic, not an empty registry —
+    <code>crates/proxy/tests/stats_e2e.rs</code>); the swap clause closed the same day
+    (<code>testing/diffrig/tests/swap_under_load.rs</code>, terminal-frame assertion, not a
+    request count); the capacity report published <code>054b809</code> after two loadgen
+    measurement-honesty bugs (a truncated-SSE false positive, failed requests skewing p99
+    <i>down</i>) and the real 202-concurrent-stream h2 ceiling (hyper's default) were fixed —
+    WP-15 slice C took it to 808. Last in-scope item WP-51 (OpenTelemetry) closed
+    <code>0d7bd1b</code>; HTTP upgrades/WebSocket tunneling (WP-10 S10) landed the same window as
+    a bonus, not gate-required. Full history of this gate's long path to closing is in
+    <code>internal-docs/MILESTONES.md</code>, not repeated here now that it's shipped.</span>
+    <span class="gate"><b>v0.3.0's SHIP GATE — RED, and nothing has moved it yet.</b> The proxy
+    takes its entire configuration from an ADS control plane, ACKs and NACKs correctly per S8,
+    and survives a control-plane reconnect with make-before-break cluster warming. WP-20 (ADS
+    client) is ready and unblocked; WP-21/WP-22 are blocked on it; WP-28 (the control-plane test
+    harness) has only its own scaffolding started. Zero of the four in-scope WPs are done. The
+    work that landed since v0.2.0 shipped was WP-50 increment 3, described below — real, but it
+    does not touch this gate.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -396,8 +352,33 @@
     fixed 2026-08-23; <code>DC</code>'s own unit test had fabricated its trigger condition
     instead of driving it, which is exactly why the gap survived). <b>WP-10's row</b> is
     corrected above (downstream h2 has been done since 2026-08-02; this board mislabelled it as
-    outstanding until 2026-08-23). None of the above moves a ship gate — the v0.2.0 capacity
-    report is still the only open clause on this milestone, see above.</span>
+    outstanding until 2026-08-23). None of the above moved v0.2.0's gate; it shipped 2026-08-29
+    with every clause closed, see the gate span above.
+    <b>2026-09-02 — WP-50 increment 3 (tenants, budgets, spend) shipped complete, and it is the
+    only thing on this refresh that moved: no v0.3.0 gate work landed.</b> 3a (per-tenant model
+    allow-lists, config-only, <code>39ea4d5</code>), 3b (a selectable embedded-<code>redb</code>
+    control-plane store, an admin write API gated on <code>LLMPROXY_ADMIN_TOKEN</code>, and
+    chains addressed by <code>stat_prefix</code> instead of position), and 3c (a
+    <code>(cluster, model)</code> price table, per-tenant spend budgets with a period, and a new
+    <code>llmproxy.spend_limit</code> filter returning 429 + <code>x-ratelimit-*</code> in
+    micro-dollars) are all done — WP-50's card carries the full breakdown and every open item.
+    <b>Two security-relevant defects were found and fixed along the way, in code that was
+    already shipped and already green:</b> a <code>SharedFactoryState</code> singleton keyed on
+    <code>type_url</code> alone let a second <code>llmproxy.auth</code>-configured listener
+    silently authenticate against the first's keys (<code>df0ae8c</code>), and the token limiter
+    built one budget store <b>per worker</b>, so a configured N tokens/minute admitted roughly
+    N × core count (<code>0dc91d1</code>) — a live quota bypass, not a hypothetical one. <b>Left
+    open, stated plainly rather than folded into "done":</b> spend budgets are enforced per
+    process, not per fleet (the same shape as the worker bug above, one level up, unfixed for
+    spend); the admin write API's unscoped endpoints support exactly one
+    <code>llmproxy.auth</code> chain; and the admin API has never been run against the real
+    binary — no test sets <code>LLMPROXY_ADMIN_TOKEN</code>, and four of the five defects found
+    this window were wiring bugs unit tests structurally could not see. <b>An overlap with
+    WP-42 was found and deliberately left unresolved</b>: 3c's spend enforcement now meets
+    WP-42's stated acceptance criteria without going through WP-53's versioned-pricing
+    prerequisite — see WP-42's and WP-53's cards. <b>Test count re-measured directly this
+    refresh: 1565 passed, 16 skipped</b> (<code>make tq-count</code>), up from 1435 at the start
+    of this range — not carried forward from a commit message.</span>
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>

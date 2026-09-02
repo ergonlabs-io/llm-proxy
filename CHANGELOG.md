@@ -11,7 +11,80 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Nothing yet. Work toward **v0.3.0** — see `internal-docs/MILESTONES.md`.
+Work toward **v0.3.0** (ADS/xDS) has not started; everything below is WP-50 increment 3
+(operator control plane: tenants, budgets, spend), which shipped between the v0.2.0 tag and
+this point and gates neither release — see `internal-docs/MILESTONES.md`'s v0.2.0 section for
+why it's recorded there.
+
+### Added
+
+- **Admin write API, gated by `LLMPROXY_ADMIN_TOKEN`.** `POST /keys` (mints a virtual key,
+  returns the plaintext exactly once), `DELETE /keys/{id}`, tenant CRUD, and
+  `PUT /tenants/{id}/policy` (per-tenant model allow-lists). Fails closed with `403` when the
+  token env var is unset, `401` with a challenge on a wrong token, `503` during the brief
+  startup race before a control plane is registered. Request bodies are capped at 64 KiB.
+- **Per-tenant spend budgets.** `PUT /tenants/{id}/budget` sets a ceiling (an absent budget is
+  unlimited; a configured zero denies everything) with a daily or monthly period. A new
+  `llmproxy.spend_limit` filter enforces it against a live in-memory counter, returning `429`
+  with `x-ratelimit-*` headers (values in **micro-dollars**, not request counts) on
+  exhaustion; the budget restores on period rollover.
+- **Per-request pricing.** A `(cluster, model)` price table, in integer micro-dollars, priced
+  independently per token bucket (input/output/cached/cache-creation) and resolved against
+  the cluster a request actually dialled — never the route — so a failover is billed at the
+  fallback's price, not the primary's.
+- **`GET /tenants/{id}/spend`**, gated behind the admin token despite being a `GET` (it's
+  financial data): live spend, budget and remaining, last-flush time, and the count plus
+  distinct `(cluster, model)` pairs of unpriced requests, so an operator can see a pricing gap
+  instead of assuming a model is billed when it silently isn't.
+- **A selectable, persistent control-plane store.** The auth filter's config gains
+  `oneof store { in_memory | persistent { path } }`; unset defaults to `in_memory`, so every
+  config written before this change is unaffected. The persistent option is an embedded
+  `redb` database — keys, tenants, policies, and budgets survive a restart.
+- **Chains addressed by name, not position.** Admin endpoints are now scoped as
+  `/chains/{stat_prefix}/...`, matching the operator-chosen name already required on the HTTP
+  connection manager, so reordering filter chains in config can't silently reassign a
+  tenant's billing history to the wrong chain. The pre-existing unscoped endpoints keep
+  working as a single-chain convenience alias.
+
+### Changed
+
+- **Per-tenant model allow-lists are now enforced live, not just stored.** `llmproxy.model_authz`
+  reads the published control-plane snapshot instead of its own static config, so an admin
+  `PUT /tenants/{id}/policy` changes what the next request from that tenant is allowed to do,
+  with no restart or reload. As part of this, a tenant with no policy in the snapshot is now
+  **permitted** every model, reversing the previous default of denying an unrecognized tenant
+  — authorization defaults open once a caller is authenticated, consistent with how an
+  unconfigured tenant is treated everywhere else in the control plane.
+
+### Fixed
+
+- **Security: a configured token-per-minute rate limit admitted roughly (limit × core count)
+  tokens per minute, not the configured limit.** The limiter built a separate budget store
+  per worker process instead of sharing one; an operator relying on, say, a 1000
+  tokens/minute ceiling was silently getting up to 8000/minute on an 8-core box. Fixed by
+  sharing one budget per filter chain and rule; existing configs need no changes.
+- **Security: two listeners each configuring `llmproxy.auth` could authenticate against the
+  wrong one's keys.** The shared factory state that holds parsed auth config (HMAC secret,
+  virtual keys, store) was keyed on the filter's type alone, so a second chain's config was
+  parsed, validated, and then silently discarded in favor of the first chain's — a request
+  presenting the *second* chain's key would authenticate against the *first* chain's tenant
+  set. Now keyed per filter chain as well as filter type. Only affects configs with more than
+  one `llmproxy.auth`-configured chain.
+
+### Known limitations
+
+- **Spend budgets are enforced per process, not per fleet.** N replicas behind a load
+  balancer enforce N independent ceilings — the same shape as the rate-limit bug above, one
+  level up, and not yet fixed for spend. Closing it needs an additive/CAS write on a
+  distributed `ControlPlaneStore`, which does not exist yet.
+- **The admin write API's unscoped endpoints (`/keys`, `/tenants`, ...) support exactly one
+  `llmproxy.auth`-configured chain**; with several, they refuse explicitly rather than
+  guess. The scoped `/chains/{stat_prefix}/...` form has no such limit.
+- **The admin API has never been exercised against the real binary** — only unit tests, none
+  of which set `LLMPROXY_ADMIN_TOKEN`. This is a real coverage gap: most of the defects above
+  were wiring bugs that unit tests structurally could not see.
+- OIDC/JWT as a second authentication method is not built; the `Authenticator` trait was
+  designed for it but nothing implements it yet.
 
 ## [0.2.0] — 2026-08-29
 
