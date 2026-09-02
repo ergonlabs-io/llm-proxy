@@ -46,6 +46,7 @@ use proxy_core::WorkerConfigHandle;
 use proxy_filters::auth::{KeyId, TenantId};
 use proxy_filters::control::{ControlPlane, StoreError};
 use proxy_filters::model_authz::{ModelAccess, ModelPattern};
+use proxy_filters::spend::{parse_micro_usd, Period, TenantBudget};
 use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
@@ -68,11 +69,13 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants",
     "/tenants/{id}",
     "/tenants/{id}/policy",
+    "/tenants/{id}/budget",
     "/chains/{stat_prefix}/keys",
     "/chains/{stat_prefix}/keys/{id}",
     "/chains/{stat_prefix}/tenants",
     "/chains/{stat_prefix}/tenants/{id}",
     "/chains/{stat_prefix}/tenants/{id}/policy",
+    "/chains/{stat_prefix}/tenants/{id}/budget",
 ];
 
 /// Hard cap on a write request's body. An admin write endpoint has no
@@ -424,6 +427,9 @@ async fn handle(
         WriteRoute::TenantPolicy(id) | WriteRoute::ScopedTenantPolicy(_, id) => {
             handle_set_policy(&control_plane, id, &body)
         }
+        WriteRoute::TenantBudget(id) | WriteRoute::ScopedTenantBudget(_, id) => {
+            handle_set_budget(&control_plane, id, &body)
+        }
     }
 }
 
@@ -444,11 +450,14 @@ enum WriteRoute<'a> {
     Tenants,
     TenantById(&'a str),
     TenantPolicy(&'a str),
+    // WP-50 increment 3c-iii-a.
+    TenantBudget(&'a str),
     ScopedKeys(&'a str),
     ScopedKeyById(&'a str, &'a str),
     ScopedTenants(&'a str),
     ScopedTenantById(&'a str, &'a str),
     ScopedTenantPolicy(&'a str, &'a str),
+    ScopedTenantBudget(&'a str, &'a str),
 }
 
 impl<'a> WriteRoute<'a> {
@@ -457,9 +466,11 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::Keys | WriteRoute::Tenants => Method::POST,
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
             WriteRoute::TenantPolicy(_) => Method::PUT,
+            WriteRoute::TenantBudget(_) => Method::PUT,
             WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
             WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
+            WriteRoute::ScopedTenantBudget(..) => Method::PUT,
         }
     }
 
@@ -473,12 +484,14 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::KeyById(_)
             | WriteRoute::Tenants
             | WriteRoute::TenantById(_)
-            | WriteRoute::TenantPolicy(_) => None,
+            | WriteRoute::TenantPolicy(_)
+            | WriteRoute::TenantBudget(_) => None,
             WriteRoute::ScopedKeys(s)
             | WriteRoute::ScopedTenants(s)
             | WriteRoute::ScopedKeyById(s, _)
             | WriteRoute::ScopedTenantById(s, _)
-            | WriteRoute::ScopedTenantPolicy(s, _) => Some(s),
+            | WriteRoute::ScopedTenantPolicy(s, _)
+            | WriteRoute::ScopedTenantBudget(s, _) => Some(s),
         }
     }
 }
@@ -506,6 +519,8 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
+        // WP-50 3c-iii-a.
+        ["tenants", id, "budget"] => Some(WriteRoute::TenantBudget(id)),
         // WP-50 3c-ii-a: the scoped forms, addressed by the chain's
         // operator-chosen `stat_prefix` -- see `WriteRoute`'s doc.
         ["chains", stat_prefix, "keys"] => Some(WriteRoute::ScopedKeys(stat_prefix)),
@@ -516,6 +531,10 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         }
         ["chains", stat_prefix, "tenants", id, "policy"] => {
             Some(WriteRoute::ScopedTenantPolicy(stat_prefix, id))
+        }
+        // WP-50 3c-iii-a.
+        ["chains", stat_prefix, "tenants", id, "budget"] => {
+            Some(WriteRoute::ScopedTenantBudget(stat_prefix, id))
         }
         _ => None,
     }
@@ -755,6 +774,55 @@ struct SetPolicyRequest {
     access: AccessSpec,
 }
 
+/// `PUT /tenants/{id}/budget`'s body (WP-50 increment 3c-iii-a).
+///
+/// # Shape: one optional field expresses both "set" and "clear" unambiguously
+///
+/// `{"budget": {"max_usd": "500.00", "period": "monthly"}}` sets a ceiling;
+/// `{"budget": null}` clears it (reverts to unlimited) -- see
+/// [`proxy_filters::spend::TenantBudget`]'s doc for why "unlimited" and "a
+/// configured zero" must stay distinguishable. A flat two-shape body (a bare
+/// `{"max_usd": ..., "period": ...}` for set,
+/// vs. some other top-level shape for clear) would need its OWN sentinel to
+/// tell "set" from "clear" apart, which is exactly the ambiguity this single
+/// `Option` field avoids: `serde`'s ordinary `null`-means-`None` handles both
+/// cases with no additional convention to invent or document.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetBudgetRequest {
+    budget: Option<BudgetSpec>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetSpec {
+    /// A decimal-string ceiling, e.g. `"500.00"` -- parsed by
+    /// [`parse_micro_usd`], the SAME parser a configured price uses (see
+    /// that function's doc), so an operator cannot express a budget more
+    /// precisely than a price.
+    max_usd: String,
+    period: PeriodSpec,
+}
+
+/// External representation of [`Period`] over the wire -- `"daily"` or
+/// `"monthly"`, matching the proto/config convention this admin API already
+/// uses elsewhere (lowercase, snake_case wire names for a Rust enum).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PeriodSpec {
+    Daily,
+    Monthly,
+}
+
+impl From<PeriodSpec> for Period {
+    fn from(spec: PeriodSpec) -> Self {
+        match spec {
+            PeriodSpec::Daily => Period::Daily,
+            PeriodSpec::Monthly => Period::Monthly,
+        }
+    }
+}
+
 /// External representation of [`ModelAccess`] over the wire: `"all"` (a bare
 /// string) or `{"only": [...]}` -- the default externally-tagged shape
 /// `#[derive(Deserialize)]` produces for an enum, which is exactly the two
@@ -892,6 +960,51 @@ fn handle_set_policy(
             no_content()
         }
         Err(err) => store_error_response("/tenants/{id}/policy", err),
+    }
+}
+
+/// `PUT /tenants/{id}/budget` (WP-50 increment 3c-iii-a). `{"budget": null}`
+/// clears the tenant's ceiling (reverts to unlimited); `{"budget": {...}}`
+/// sets it, parsing `max_usd` with [`parse_micro_usd`] -- the SAME parser a
+/// configured price uses -- so a malformed decimal string is a 400 naming
+/// the problem, not a silently-truncated ceiling.
+fn handle_set_budget(
+    control_plane: &ControlPlane,
+    tenant: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    let request: SetBudgetRequest = match parse_json_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+
+    let budget = match request.budget {
+        None => None,
+        Some(spec) => match parse_micro_usd(&spec.max_usd) {
+            Ok(max_micros) => Some(TenantBudget {
+                max_micros,
+                period: spec.period.into(),
+            }),
+            Err(err) => {
+                return bad_request(&format!("invalid `max_usd`: {err}"));
+            }
+        },
+    };
+
+    match control_plane.set_budget(&TenantId::new(tenant), budget.as_ref()) {
+        Ok(()) => {
+            tracing::info!(
+                endpoint = "/tenants/{id}/budget",
+                tenant,
+                cleared = budget.is_none(),
+                "admin: set a tenant's spend budget"
+            );
+            no_content()
+        }
+        Err(err) => store_error_response("/tenants/{id}/budget", err),
     }
 }
 

@@ -11,16 +11,29 @@
 //! `server::serve`'s doc for why that env var is read in `crates/proxy`, not
 //! here): `POST /keys` (mint), `DELETE /keys/{id}` (revoke),
 //! `POST /tenants` (create), `DELETE /tenants/{id}` (delete),
-//! `PUT /tenants/{id}/policy` (set model-access policy). Unset (or
-//! empty/whitespace) token means every write is refused with 403 --
-//! **unset never means open** (CLAUDE.md rule 17). See `server.rs`'s
-//! `handle` for the full gate and its per-endpoint doc comments for request/
-//! response shapes.
+//! `PUT /tenants/{id}/policy` (set model-access policy),
+//! `PUT /tenants/{id}/budget` (set or clear a tenant's spend ceiling -- WP-50
+//! increment 3c-iii-a; storage and admin CRUD only, the enforcing filter is a
+//! later increment). Unset (or empty/whitespace) token means every write is
+//! refused with 403 -- **unset never means open** (CLAUDE.md rule 17). See
+//! `server.rs`'s `handle` for the full gate and its per-endpoint doc
+//! comments for request/response shapes.
+//!
+//! `PUT .../budget`'s body is `{"budget": {"max_usd": "500.00", "period":
+//! "monthly"}}` to set a ceiling, or `{"budget": null}` to clear it (revert
+//! to unlimited) -- one optional field expresses both set and clear
+//! unambiguously, with no separate sentinel to invent. `max_usd` is parsed
+//! by `proxy_filters::spend::parse_micro_usd`, the SAME parser a configured
+//! price uses, so a budget can never be expressed more precisely than a
+//! price. See `proxy_filters::spend::TenantBudget`'s doc for why an absent
+//! budget (unlimited) and an explicitly configured zero ceiling are kept
+//! distinct rather than collapsed.
 //!
 //! WP-50 3c-ii-a added a **scoped** form of every write endpoint,
 //! `/chains/{stat_prefix}/keys`, `/chains/{stat_prefix}/keys/{id}`,
 //! `/chains/{stat_prefix}/tenants`, `/chains/{stat_prefix}/tenants/{id}`,
-//! `/chains/{stat_prefix}/tenants/{id}/policy` -- addressed by the target
+//! `/chains/{stat_prefix}/tenants/{id}/policy`,
+//! `/chains/{stat_prefix}/tenants/{id}/budget` -- addressed by the target
 //! HTTP connection manager's own operator-chosen `stat_prefix`, ALWAYS
 //! correct regardless of how many chains in this serve configure
 //! `llmproxy.auth`. The original unscoped endpoints (`/keys`, ...) stay: a

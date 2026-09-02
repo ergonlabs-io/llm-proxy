@@ -268,7 +268,13 @@ pub fn parse_config(config: &DynamicMessage) -> Result<TenantPolicyMap, ConfigEr
         let model_access = parse_model_access(msg, i)?;
 
         seen.insert(tenant.clone(), i);
-        map.insert(tenant, Arc::new(TenantPolicy { model_access }));
+        map.insert(
+            tenant,
+            Arc::new(TenantPolicy {
+                model_access,
+                budget: None,
+            }),
+        );
     }
 
     Ok(map)
@@ -792,7 +798,13 @@ mod tests {
         entries
             .into_iter()
             .map(|(tenant, model_access)| {
-                (tenant.to_string(), Arc::new(TenantPolicy { model_access }))
+                (
+                    tenant.to_string(),
+                    Arc::new(TenantPolicy {
+                        model_access,
+                        budget: None,
+                    }),
+                )
             })
             .collect()
     }

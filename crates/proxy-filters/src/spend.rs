@@ -483,6 +483,55 @@ impl PeriodKey {
     }
 }
 
+// ============================================================================
+// WP-50 increment 3c-iii-a -- per-tenant budgets: storage and admin CRUD
+// only. This increment carries a configured ceiling through
+// `crate::control::ControlPlane`/`ControlPlaneStore` and out over the admin
+// API; CHECKING a request against it is 3c-iii-b's filter, out of scope here.
+// ============================================================================
+
+/// A tenant's spend ceiling: at most `max_micros` per `period`. Carried on
+/// [`crate::auth::TenantPolicy::budget`]; see that field's doc for the
+/// `None`-vs-`Some(0)` distinction restated from the `TenantPolicy` side.
+///
+/// # `None` (on `TenantPolicy::budget`) means unlimited -- the deliberate default
+///
+/// Mirrors [`crate::model_authz::ModelAccess::default`]'s reasoning exactly,
+/// restated for money: a budget is an opt-in ceiling, not a default-deny. If
+/// an absent budget meant "spend nothing", turning WP-50 3c-iii-b's
+/// enforcement filter on would deny every tenant's very first request the
+/// moment an operator adds it to a chain -- that is an outage, not a safety
+/// property. Restriction is opt-in: an operator sets a ceiling when they want
+/// one.
+///
+/// # Unlike `ModelAccess`, `None` here is genuinely a different fact from a configured zero
+///
+/// `ModelAccess` has no missing-vs-configured distinction to make *inside*
+/// the enum -- `All` and `Only(vec![])` are both fully-specified values, and
+/// the only "is this tenant restricted at all" question lives one level up,
+/// at `TenantPolicy::model_access` vs. `TenantPolicy::default()`.
+/// `TenantBudget` has that identical two-level shape, restated for money:
+/// `None` (no ceiling configured -- unlimited) vs. `Some(TenantBudget {
+/// max_micros: MicroUsd::from_micros(0), .. })` (a ceiling IS configured, and
+/// it happens to be zero -- deny every priced request for the rest of this
+/// period). Both are legitimate, deliberate policies, exactly like
+/// `ModelAccess::Only(vec![])` denying every model for a tenant -- see that
+/// type's doc. Collapsing the two would make "an operator meant to lock a
+/// tenant out entirely" indistinguishable from "no one has ever configured a
+/// budget for this tenant", which is the same shape of silent privilege
+/// escalation `ModelAccess`'s own doc warns about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantBudget {
+    /// The ceiling, in integer micro-dollars -- see the module doc's "Money
+    /// is integer, never `f64`" section. Config supplies this as a decimal
+    /// string parsed once by [`parse_micro_usd`], the SAME parser a price
+    /// uses, so an operator cannot express a budget more precisely than a
+    /// price.
+    pub max_micros: MicroUsd,
+    /// The calendar-aligned window this ceiling resets on.
+    pub period: Period,
+}
+
 /// One `(tenant, period)`'s live, in-memory spend state. Same shape as
 /// `crate::token_limit::InProcessBudgetStore`'s window map -- a plain
 /// struct behind the accumulator's one `Mutex`, with no store I/O involved
@@ -1380,6 +1429,13 @@ mod tests {
                 access: &crate::model_authz::ModelAccess,
             ) -> Result<(), StoreError> {
                 self.0.set_policy(tenant, access)
+            }
+            fn set_budget(
+                &self,
+                tenant: &TenantId,
+                budget: Option<&TenantBudget>,
+            ) -> Result<(), StoreError> {
+                self.0.set_budget(tenant, budget)
             }
             fn set_spend(
                 &self,

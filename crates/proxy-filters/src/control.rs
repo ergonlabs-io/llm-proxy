@@ -58,7 +58,7 @@ use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
 // `spend.rs` owns (it also owns the calendar-alignment logic that produces
 // one) -- `control.rs` only stores and retrieves values already computed
 // there. See `spend.rs`'s module doc for why the boundary is drawn there.
-use crate::spend::PeriodKey;
+use crate::spend::{PeriodKey, TenantBudget};
 
 /// One key row exactly as a [`ControlPlaneStore`] persists it -- the
 /// admin-write shape, not the digest-keyed [`KeySet`] the data plane reads.
@@ -95,6 +95,12 @@ pub struct StoredControlPlane {
     pub tenants: Vec<TenantId>,
     pub keys: Vec<StoredKey>,
     pub policies: HashMap<TenantId, ModelAccess>,
+    // WP-50 increment 3c-iii-a: a tenant's budget, keyed independently of
+    // `policies` above -- a tenant can have a stored `ModelAccess`, a stored
+    // `TenantBudget`, both, or neither, and [`ControlPlane::merge`] combines
+    // them by tenant rather than assuming one row implies the other. See
+    // that function's doc for why this is deliberate, not an oversight.
+    pub budgets: HashMap<TenantId, TenantBudget>,
 }
 
 /// Why a [`ControlPlaneStore`] call failed.
@@ -152,6 +158,18 @@ pub trait ControlPlaneStore: Send + Sync {
     /// [`ControlPlane::rebuild`] for why the row is not deleted.
     fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError>;
     fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError>;
+
+    /// Sets or clears `tenant`'s spend budget (WP-50 increment 3c-iii-a).
+    /// `Some(budget)` replaces whatever was stored; `None` clears it,
+    /// reverting the tenant to unlimited -- see [`TenantBudget`]'s doc for
+    /// why an absent budget must never be confused with a configured
+    /// `max_micros` of `0`. Stored independently of [`Self::set_policy`]'s
+    /// `ModelAccess` row: setting one must never touch the other.
+    fn set_budget(
+        &self,
+        tenant: &TenantId,
+        budget: Option<&TenantBudget>,
+    ) -> Result<(), StoreError>;
 
     // WP-50 increment 3c-ii-b: spend rows, keyed `(stat_prefix, tenant,
     // period)`. `stat_prefix` is a plain `&str` (not this crate's
@@ -220,6 +238,9 @@ struct InMemoryState {
     tenants: Vec<TenantId>,
     keys: HashMap<KeyId, StoredKey>,
     policies: HashMap<TenantId, ModelAccess>,
+    // WP-50 increment 3c-iii-a: independent of `policies` above -- see
+    // `StoredControlPlane::budgets`'s doc.
+    budgets: HashMap<TenantId, TenantBudget>,
     // WP-50 increment 3c-ii-b: keyed on the full `(stat_prefix, tenant,
     // period)` triple as one tuple key -- there is no `load()`-style
     // wholesale read for spend (each row is read/written independently by
@@ -235,6 +256,7 @@ impl InMemoryControlPlaneStore {
                 tenants: Vec::new(),
                 keys: HashMap::new(),
                 policies: HashMap::new(),
+                budgets: HashMap::new(),
                 spend: HashMap::new(),
             }),
         }
@@ -262,6 +284,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             tenants: state.tenants.clone(),
             keys: state.keys.values().cloned().collect(),
             policies: state.policies.clone(),
+            budgets: state.budgets.clone(),
         })
     }
 
@@ -283,6 +306,10 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .expect("control-plane store mutex poisoned");
         state.tenants.retain(|t| t != tenant);
         state.policies.remove(tenant);
+        // Parity with `policies` above: a deleted tenant's budget row goes
+        // with it, the same "a deleted tenant carries no leftover
+        // configuration" rule `set_policy`'s removal already follows.
+        state.budgets.remove(tenant);
         Ok(())
     }
 
@@ -315,6 +342,26 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .lock()
             .expect("control-plane store mutex poisoned");
         state.policies.insert(tenant.clone(), access.clone());
+        Ok(())
+    }
+
+    fn set_budget(
+        &self,
+        tenant: &TenantId,
+        budget: Option<&TenantBudget>,
+    ) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        match budget {
+            Some(budget) => {
+                state.budgets.insert(tenant.clone(), *budget);
+            }
+            None => {
+                state.budgets.remove(tenant);
+            }
+        }
         Ok(())
     }
 
@@ -367,6 +414,11 @@ const TENANTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant
 const KEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keys");
 const KEYS_BY_TENANT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keys_by_tenant");
 const POLICIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("policies");
+// WP-50 increment 3c-iii-a: a tenant's budget, JSON-encoded like every other
+// table here -- see `EncodedTenantBudget`'s doc. Independent of
+// `POLICIES_TABLE`: a tenant may have a row in one, the other, both, or
+// neither.
+const BUDGETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("budgets");
 // WP-50 increment 3c-ii-b: a spend row's key is the 3-part
 // `(stat_prefix, tenant, period)` tuple, not a single `&str` like every
 // table above -- `redb::Key` has a native impl for tuples of `Key` types
@@ -438,6 +490,61 @@ impl From<EncodedModelAccess> for ModelAccess {
             EncodedModelAccess::Only(patterns) => {
                 ModelAccess::Only(patterns.into_iter().map(ModelPattern::new).collect())
             }
+        }
+    }
+}
+
+/// [`crate::spend::Period`] as `serde_json` sees it. A local mirror, not a
+/// `serde` derive on `Period` itself -- same reasoning as
+/// [`EncodedModelAccess`]'s doc: `Period` lives in `spend.rs`, which this
+/// increment's scope does not otherwise need to touch for a serde impl.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum EncodedPeriod {
+    Daily,
+    Monthly,
+}
+
+impl From<crate::spend::Period> for EncodedPeriod {
+    fn from(period: crate::spend::Period) -> Self {
+        match period {
+            crate::spend::Period::Daily => EncodedPeriod::Daily,
+            crate::spend::Period::Monthly => EncodedPeriod::Monthly,
+        }
+    }
+}
+
+impl From<EncodedPeriod> for crate::spend::Period {
+    fn from(encoded: EncodedPeriod) -> Self {
+        match encoded {
+            EncodedPeriod::Daily => crate::spend::Period::Daily,
+            EncodedPeriod::Monthly => crate::spend::Period::Monthly,
+        }
+    }
+}
+
+/// [`TenantBudget`] as `serde_json` sees it -- same "local mirror, not a
+/// derive on the real type" reasoning as [`EncodedModelAccess`] and
+/// [`EncodedPeriod`] above.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EncodedTenantBudget {
+    max_micros: u64,
+    period: EncodedPeriod,
+}
+
+impl From<&TenantBudget> for EncodedTenantBudget {
+    fn from(budget: &TenantBudget) -> Self {
+        EncodedTenantBudget {
+            max_micros: budget.max_micros.as_micros(),
+            period: budget.period.into(),
+        }
+    }
+}
+
+impl From<EncodedTenantBudget> for TenantBudget {
+    fn from(encoded: EncodedTenantBudget) -> Self {
+        TenantBudget {
+            max_micros: crate::spend::MicroUsd::from_micros(encoded.max_micros),
+            period: encoded.period.into(),
         }
     }
 }
@@ -546,6 +653,7 @@ impl RedbControlPlaneStore {
         txn.open_table(KEYS_TABLE).map_err(store_err)?;
         txn.open_table(KEYS_BY_TENANT_TABLE).map_err(store_err)?;
         txn.open_table(POLICIES_TABLE).map_err(store_err)?;
+        txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
         txn.commit().map_err(store_err)?;
         Ok(())
@@ -649,10 +757,19 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             policies.insert(TenantId::new(key.value()), encoded.into());
         }
 
+        let budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
+        let mut budgets = HashMap::new();
+        for entry in budgets_table.iter().map_err(store_err)? {
+            let (key, value) = entry.map_err(store_err)?;
+            let encoded: EncodedTenantBudget = decode_json(value.value())?;
+            budgets.insert(TenantId::new(key.value()), encoded.into());
+        }
+
         Ok(StoredControlPlane {
             tenants,
             keys,
             policies,
+            budgets,
         })
     }
 
@@ -681,6 +798,13 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         {
             let mut policies_table = txn.open_table(POLICIES_TABLE).map_err(store_err)?;
             policies_table.remove(tenant.as_str()).map_err(store_err)?;
+        }
+        {
+            // Parity with `policies_table` above and with
+            // `InMemoryControlPlaneStore::delete_tenant` -- see that impl's
+            // comment.
+            let mut budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
+            budgets_table.remove(tenant.as_str()).map_err(store_err)?;
         }
         // Matches `InMemoryControlPlaneStore::delete_tenant` exactly: `keys`
         // and `keys_by_tenant` are left untouched. A tenant's keys outliving
@@ -752,6 +876,30 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             table
                 .insert(tenant.as_str(), encode_json(&encoded).as_slice())
                 .map_err(store_err)?;
+        }
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn set_budget(
+        &self,
+        tenant: &TenantId,
+        budget: Option<&TenantBudget>,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
+            match budget {
+                Some(budget) => {
+                    let encoded: EncodedTenantBudget = budget.into();
+                    table
+                        .insert(tenant.as_str(), encode_json(&encoded).as_slice())
+                        .map_err(store_err)?;
+                }
+                None => {
+                    table.remove(tenant.as_str()).map_err(store_err)?;
+                }
+            }
         }
         txn.commit().map_err(store_err)?;
         Ok(())
@@ -957,6 +1105,23 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Sets or clears `tenant`'s spend budget, then republishes (WP-50
+    /// increment 3c-iii-a) -- store-then-`rebuild()`, exactly like
+    /// [`Self::set_policy`], so a budget change reaches every worker's
+    /// `VirtualKeyAuthenticator` (and, later, 3c-iii-b's enforcement filter)
+    /// on the next request rather than the next unrelated rebuild.
+    /// `Some(budget)` sets it; `None` clears it, reverting the tenant to
+    /// unlimited -- see [`crate::spend::TenantBudget`]'s doc.
+    pub fn set_budget(
+        &self,
+        tenant: &TenantId,
+        budget: Option<&TenantBudget>,
+    ) -> Result<(), StoreError> {
+        self.store.set_budget(tenant, budget)?;
+        self.rebuild();
+        Ok(())
+    }
+
     /// Seeds `bootstrap` (`llmproxy.model_authz`'s `typed_config.policies`,
     /// parsed by `model_authz_filter::parse_config`) into the store, then
     /// republishes -- store-wins on a tenant collision, the identical rule
@@ -1093,12 +1258,41 @@ impl ControlPlane {
         // (`ModelAccess::All`) wherever a policy lookup misses, exactly as it
         // does today via `model_authz_filter`'s own `typed_config`, which
         // this snapshot does not yet replace.
+        //
+        // WP-50 increment 3c-iii-a: `loaded.budgets` is a SEPARATE store
+        // table from `loaded.policies` (see `StoredControlPlane::budgets`'s
+        // doc) -- a tenant can have a `ModelAccess` row, a `TenantBudget`
+        // row, both, or neither, entirely independently, because
+        // `set_policy`/`set_budget` are two independent writes with two
+        // independent store methods. This loop therefore drains
+        // `loaded.budgets` by tenant as it walks `loaded.policies` (the
+        // common case: both rows exist), then a second pass below picks up
+        // any tenant that has a budget but was never given a policy row --
+        // neither field may silently vanish because the OTHER one happened
+        // to be present or absent. `seed_bootstrap_policies` only ever calls
+        // `store.set_policy` (never `set_budget`), so a bootstrap policy
+        // seed can never observe, let alone clobber, a budget an admin set:
+        // the two writes are to different tables, and this merge always
+        // looks a tenant's budget up independently of where its policy row
+        // came from.
+        let mut budgets = loaded.budgets;
         let mut policies: TenantPolicyMap = HashMap::new();
         for (tenant, access) in loaded.policies {
+            let budget = budgets.remove(&tenant);
             policies.insert(
                 tenant.as_str().to_string(),
                 Arc::new(TenantPolicy {
                     model_access: access,
+                    budget,
+                }),
+            );
+        }
+        for (tenant, budget) in budgets {
+            policies.insert(
+                tenant.as_str().to_string(),
+                Arc::new(TenantPolicy {
+                    model_access: ModelAccess::default(),
+                    budget: Some(budget),
                 }),
             );
         }
@@ -1130,6 +1324,7 @@ mod tests {
     use http::{HeaderMap, HeaderValue};
 
     use crate::auth::{AuthError, AuthOutcome, Authenticator, VirtualKeyAuthenticator};
+    use crate::spend::{MicroUsd, Period};
 
     fn headers_with_authorization(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1169,6 +1364,13 @@ mod tests {
         }
         fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
             self.0.set_policy(tenant, access)
+        }
+        fn set_budget(
+            &self,
+            tenant: &TenantId,
+            budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
+            self.0.set_budget(tenant, budget)
         }
         fn set_spend(
             &self,
@@ -1219,6 +1421,13 @@ mod tests {
         fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
             self.inner.set_policy(tenant, access)
         }
+        fn set_budget(
+            &self,
+            tenant: &TenantId,
+            budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_budget(tenant, budget)
+        }
         fn set_spend(
             &self,
             stat_prefix: &str,
@@ -1263,6 +1472,13 @@ mod tests {
             Ok(())
         }
         fn set_policy(&self, _tenant: &TenantId, _access: &ModelAccess) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn set_budget(
+            &self,
+            _tenant: &TenantId,
+            _budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
             Ok(())
         }
         fn set_spend(
@@ -1721,6 +1937,7 @@ mod tests {
             "tenant-a".to_string(),
             Arc::new(TenantPolicy {
                 model_access: access.clone(),
+                budget: None,
             }),
         );
 
@@ -1755,6 +1972,7 @@ mod tests {
             "tenant-a".to_string(),
             Arc::new(TenantPolicy {
                 model_access: bootstrap_access,
+                budget: None,
             }),
         );
 
@@ -1790,6 +2008,7 @@ mod tests {
             "tenant-a".to_string(),
             Arc::new(TenantPolicy {
                 model_access: bootstrap_access.clone(),
+                budget: None,
             }),
         );
 
@@ -1824,6 +2043,233 @@ mod tests {
              that landed in between -- this is the silent-policy-revert \
              `seed_bootstrap_policies`'s idempotence exists to prevent"
         );
+    }
+
+    // --- ControlPlane::set_budget / TenantBudget storage (WP-50 increment 3c-iii-a) ---
+
+    /// `None` round-trips as unlimited (no `TenantPolicy` at all -- the
+    /// tenant falls back to `TenantPolicy::default()`, `budget: None`), and
+    /// `Some(TenantBudget { max_micros: 0, .. })` round-trips as a REAL zero
+    /// ceiling, never confused with the absent case. Mutation pin A targets
+    /// this test: making `None` deserialize/behave as `Some(0)` must turn it
+    /// red.
+    #[test]
+    fn none_budget_round_trips_as_unlimited_and_some_zero_as_a_real_ceiling() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        // A tenant nobody has ever set a budget for: `budget` is `None`.
+        cp.create_tenant(&TenantId::new("tenant-unset"))
+            .expect("create_tenant must succeed");
+        let snapshot = cp.handle().load();
+        assert!(
+            snapshot
+                .policies
+                .get("tenant-unset")
+                .map(|p| p.budget)
+                .unwrap_or(None)
+                .is_none(),
+            "a tenant with no budget ever set must read back as `None` (unlimited), \
+             not as a zero ceiling"
+        );
+
+        // A tenant with a stored POLICY but no stored budget -- exercises
+        // `merge()`'s "policy row present, budget row absent" path
+        // specifically (distinct from `tenant-unset` above, which has
+        // neither row at all, and hits a different branch of `merge`).
+        cp.set_policy(
+            &TenantId::new("tenant-policy-only"),
+            &ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+        )
+        .expect("set_policy must succeed");
+        let snapshot = cp.handle().load();
+        assert!(
+            snapshot
+                .policies
+                .get("tenant-policy-only")
+                .expect("the policy row must be present")
+                .budget
+                .is_none(),
+            "a tenant with a stored policy but no stored budget must read back `budget: None`, \
+             not a zero ceiling"
+        );
+
+        // A tenant with an explicit zero-micro-dollar ceiling: `Some`, and
+        // its `max_micros` really is 0.
+        let zero_budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(0),
+            period: Period::Daily,
+        };
+        cp.set_budget(&TenantId::new("tenant-zero"), Some(&zero_budget))
+            .expect("set_budget must succeed");
+        let snapshot = cp.handle().load();
+        let budget = snapshot
+            .policies
+            .get("tenant-zero")
+            .and_then(|p| p.budget)
+            .expect(
+                "a tenant with an explicitly configured zero-micro-dollar budget must read \
+                 back Some(..), never None",
+            );
+        assert_eq!(
+            budget.max_micros,
+            MicroUsd::from_micros(0),
+            "the configured ceiling must round-trip as exactly zero, not some other value"
+        );
+        assert_ne!(
+            snapshot.policies.get("tenant-unset").and_then(|p| p.budget),
+            snapshot.policies.get("tenant-zero").and_then(|p| p.budget),
+            "an unset budget (None) must never compare equal to an explicit zero ceiling \
+             (Some(0)) -- collapsing the two is exactly the bug this test pins"
+        );
+    }
+
+    /// `ControlPlane::set_budget` republishes: the new budget must be visible
+    /// through `handle().load()` immediately, with no separate `rebuild()`
+    /// call from the test. Mutation pin B (skip `rebuild()` inside
+    /// `set_budget`) must turn this red.
+    #[test]
+    fn set_budget_republishes_immediately() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(500_000_000),
+            period: Period::Monthly,
+        };
+        cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
+            .expect("set_budget must succeed");
+
+        let snapshot = cp.handle().load();
+        assert_eq!(
+            snapshot.policies.get("tenant-a").and_then(|p| p.budget),
+            Some(budget),
+            "a budget set through ControlPlane::set_budget must be visible through the \
+             published handle right away -- a set_budget that skipped rebuild() would leave \
+             this None"
+        );
+    }
+
+    /// Clearing a budget (`set_budget(.., None)`) removes it from the
+    /// published snapshot and republishes.
+    #[test]
+    fn clearing_a_budget_removes_it_and_republishes() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(1_000_000),
+            period: Period::Daily,
+        };
+        cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
+            .expect("set_budget must succeed");
+        assert!(cp
+            .handle()
+            .load()
+            .policies
+            .get("tenant-a")
+            .and_then(|p| p.budget)
+            .is_some());
+
+        cp.set_budget(&TenantId::new("tenant-a"), None)
+            .expect("clearing a budget must succeed");
+        let snapshot = cp.handle().load();
+        assert!(
+            snapshot
+                .policies
+                .get("tenant-a")
+                .and_then(|p| p.budget)
+                .is_none(),
+            "set_budget(.., None) must clear the budget in the republished snapshot"
+        );
+    }
+
+    /// Setting a budget must not clobber an already-set `model_access` for
+    /// the SAME tenant. Mutation pin C (make `set_budget`'s merge overwrite
+    /// the whole `TenantPolicy` rather than just its `budget` field) must
+    /// turn this red.
+    #[test]
+    fn setting_a_budget_does_not_clobber_model_access() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        cp.set_policy(&TenantId::new("tenant-a"), &access)
+            .expect("set_policy must succeed");
+
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(2_000_000),
+            period: Period::Daily,
+        };
+        cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
+            .expect("set_budget must succeed");
+
+        let snapshot = cp.handle().load();
+        let policy = snapshot
+            .policies
+            .get("tenant-a")
+            .expect("tenant must exist");
+        assert_eq!(
+            policy.model_access, access,
+            "setting a budget must not clobber the tenant's already-configured model_access"
+        );
+        assert_eq!(policy.budget, Some(budget));
+    }
+
+    /// The other direction: setting a policy must not clobber an
+    /// already-set budget for the same tenant.
+    #[test]
+    fn setting_a_policy_does_not_clobber_a_budget() {
+        let secret_bytes = b"operator-secret";
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(3_000_000),
+            period: Period::Monthly,
+        };
+        cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
+            .expect("set_budget must succeed");
+
+        let access = ModelAccess::Only(vec![ModelPattern::new("claude-*")]);
+        cp.set_policy(&TenantId::new("tenant-a"), &access)
+            .expect("set_policy must succeed");
+
+        let snapshot = cp.handle().load();
+        let policy = snapshot
+            .policies
+            .get("tenant-a")
+            .expect("tenant must exist");
+        assert_eq!(
+            policy.budget,
+            Some(budget),
+            "setting a policy must not clobber the tenant's already-configured budget"
+        );
+        assert_eq!(policy.model_access, access);
     }
 
     // --- mutation pins: a write that skips `self.rebuild()` must not be
@@ -1946,6 +2392,15 @@ mod tests {
         a_policies.sort_by_key(|(t, _)| *t);
         b_policies.sort_by_key(|(t, _)| *t);
         assert_eq!(a_policies, b_policies, "policies must match");
+
+        // WP-50 increment 3c-iii-a.
+        let mut a_budgets: Vec<(&str, &TenantBudget)> =
+            a.budgets.iter().map(|(t, b)| (t.as_str(), b)).collect();
+        let mut b_budgets: Vec<(&str, &TenantBudget)> =
+            b.budgets.iter().map(|(t, b)| (t.as_str(), b)).collect();
+        a_budgets.sort_by_key(|(t, _)| *t);
+        b_budgets.sort_by_key(|(t, _)| *t);
+        assert_eq!(a_budgets, b_budgets, "budgets must match");
     }
 
     // --- redb: put_key then load() round-trips digest/tenant/revoked
@@ -2045,6 +2500,60 @@ mod tests {
         store.delete_tenant(&TenantId::new("tenant-a")).unwrap();
         let loaded = store.load().unwrap();
         assert!(loaded.tenants.is_empty());
+    }
+
+    // --- redb: set_budget then load() returns it; None clears it; parity
+    //     with InMemory; persistence across reopen (WP-50 increment 3c-iii-a)
+
+    #[test]
+    fn redb_set_budget_then_load_returns_it_and_none_clears_it() {
+        let store = RedbControlPlaneStore::in_memory();
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(9_000_000),
+            period: Period::Daily,
+        };
+        store
+            .set_budget(&TenantId::new("tenant-a"), Some(&budget))
+            .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.budgets.get(&TenantId::new("tenant-a")),
+            Some(&budget)
+        );
+
+        store.set_budget(&TenantId::new("tenant-a"), None).unwrap();
+        let loaded = store.load().unwrap();
+        assert!(
+            !loaded.budgets.contains_key(&TenantId::new("tenant-a")),
+            "set_budget(.., None) must clear the row, not merely blank its value"
+        );
+    }
+
+    #[test]
+    fn redb_persists_a_budget_across_reopen() {
+        let path = temp_db_path("budget-persists-across-reopen");
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(42_000_000),
+            period: Period::Monthly,
+        };
+
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            store
+                .set_budget(&TenantId::new("tenant-a"), Some(&budget))
+                .unwrap();
+        }
+
+        let reopened = RedbControlPlaneStore::open(&path).unwrap();
+        let loaded = reopened.load().unwrap();
+        assert_eq!(
+            loaded.budgets.get(&TenantId::new("tenant-a")),
+            Some(&budget),
+            "a reopened store must still see the budget"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     // --- redb: the whole point -- a key survives dropping and reopening the
@@ -2164,6 +2673,18 @@ mod tests {
                 .set_policy(
                     &TenantId::new("tenant-a"),
                     &ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+                )
+                .unwrap();
+            // WP-50 increment 3c-iii-a: a budget IS part of `StoredControlPlane`
+            // (unlike spend rows below), so it is compared through
+            // `assert_stored_control_planes_match` like `keys`/`policies`.
+            store
+                .set_budget(
+                    &TenantId::new("tenant-a"),
+                    Some(&TenantBudget {
+                        max_micros: MicroUsd::from_micros(500_000_000),
+                        period: Period::Monthly,
+                    }),
                 )
                 .unwrap();
             // WP-50 increment 3c-ii-b: spend rows, keyed `(stat_prefix,

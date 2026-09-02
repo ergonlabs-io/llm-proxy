@@ -220,17 +220,38 @@ pub struct TenantPolicy {
     /// whose emptiness would have to be interpreted as either "everything" or
     /// "nothing".
     pub model_access: crate::model_authz::ModelAccess,
+    /// This tenant's spend ceiling, if any (WP-50 increment 3c-iii-a). See
+    /// [`crate::spend::TenantBudget`]'s doc for the full reasoning; in short:
+    ///
+    /// **`None` means unlimited, and that is the deliberate default** -- the
+    /// exact same reasoning as [`crate::model_authz::ModelAccess::default`]:
+    /// a budget is an opt-in ceiling, not a default-deny, so an operator
+    /// enabling the (separate, 3c-iii-b) enforcement filter must not have it
+    /// silently deny every tenant's very first request. Restriction is
+    /// opt-in: an operator sets a ceiling when they want one.
+    ///
+    /// **Unlike `model_access` above, though, `None` here is genuinely a
+    /// different fact from a configured ceiling of zero.** `Some(TenantBudget
+    /// { max_micros: MicroUsd::from_micros(0), .. })` is a real, legitimate,
+    /// deliberate policy -- deny every priced request this period -- exactly
+    /// like `ModelAccess::Only(vec![])` denying every model. This increment
+    /// (storage and admin CRUD only) is careful to keep the two
+    /// distinguishable end to end; see [`crate::control::ControlPlane::set_budget`]
+    /// and its store methods.
+    pub budget: Option<crate::spend::TenantBudget>,
 }
 
 impl fmt::Debug for TenantPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Rust note: unlike every other hand-written `Debug` in this module,
-        // `model_access` IS included -- it is configuration (a list of model
-        // name patterns), not a secret, and an operator debugging "why was
-        // this tenant refused" needs to see it. Contrast `KeyRecord`/`KeySet`,
-        // which redact exactly because their fields ARE key-material-adjacent.
+        // `model_access`/`budget` ARE included -- both are configuration (a
+        // list of model name patterns, a spend ceiling), not secrets, and an
+        // operator debugging "why was this tenant refused" needs to see them.
+        // Contrast `KeyRecord`/`KeySet`, which redact exactly because their
+        // fields ARE key-material-adjacent.
         f.debug_struct("TenantPolicy")
             .field("model_access", &self.model_access)
+            .field("budget", &self.budget)
             .finish()
     }
 }

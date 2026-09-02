@@ -25,6 +25,7 @@ use proxy_filters::auth::{
 use proxy_filters::auth_filter;
 use proxy_filters::control::{ControlPlane, InMemoryControlPlaneStore};
 use proxy_filters::model_authz::ModelAccess;
+use proxy_filters::spend::{MicroUsd, Period};
 use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{
     instruments, prometheus_render, Registry, StatsControl, WorkerId,
@@ -1093,6 +1094,228 @@ async fn put_policy_all_and_only_are_reflected_and_empty_only_stays_only() {
             .model_access,
         ModelAccess::Only(vec![]),
         "an empty `only: []` must deny every model (Only(vec![])), NOT collapse to All"
+    );
+}
+
+// --- PUT /tenants/{id}/budget (WP-50 increment 3c-iii-a) --------------------
+
+/// Sets a budget, reads it back through the published snapshot, then clears
+/// it (`{"budget": null}`) and confirms it is gone -- the round trip for
+/// both directions of the endpoint's one request shape.
+#[tokio::test]
+async fn put_budget_sets_reads_back_and_clears() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"500.00","period":"monthly"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "set: {body}");
+
+    let budget = handle
+        .load()
+        .policies
+        .get("tenant-a")
+        .and_then(|p| p.budget)
+        .expect("the budget PUT must be visible in the republished snapshot");
+    assert_eq!(budget.max_micros, MicroUsd::from_micros(500_000_000));
+    assert_eq!(budget.period, Period::Monthly);
+
+    let (status, _headers, body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":null}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "clear: {body}");
+    assert!(
+        handle
+            .load()
+            .policies
+            .get("tenant-a")
+            .and_then(|p| p.budget)
+            .is_none(),
+        "{{\"budget\": null}} must clear the tenant's budget"
+    );
+}
+
+/// Setting a budget must not clobber an already-set model-access policy for
+/// the same tenant, and vice versa -- both directions, exercised through the
+/// real HTTP endpoints rather than `ControlPlane` directly.
+#[tokio::test]
+async fn put_budget_and_put_policy_do_not_clobber_each_other() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, _body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":{"only":["gpt-4*"]}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _headers, _body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"10.00","period":"daily"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let policy = handle
+        .load()
+        .policies
+        .get("tenant-a")
+        .expect("tenant must exist")
+        .clone();
+    assert_eq!(
+        policy.model_access,
+        ModelAccess::Only(vec![proxy_filters::model_authz::ModelPattern::new(
+            "gpt-4*"
+        )]),
+        "PUT .../budget must not clobber the tenant's already-set policy"
+    );
+    assert!(policy.budget.is_some());
+}
+
+/// A malformed `max_usd` (not a valid decimal `parse_micro_usd` accepts) is a
+/// 400 naming the problem, never a silently-truncated or silently-zeroed
+/// budget.
+#[tokio::test]
+async fn put_budget_with_a_malformed_max_usd_is_400() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"not-a-number","period":"daily"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// The scoped form lands in the named chain's `ControlPlane` and not
+/// another's -- same shape as `scoped_write_lands_in_the_named_chains_control_plane_and_not_the_others`,
+/// restated for the budget endpoint.
+#[tokio::test]
+async fn scoped_put_budget_lands_in_the_named_chains_control_plane_and_not_the_others() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    let handle_a = register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        TEST_HMAC_SECRET,
+    );
+    let handle_b = register_control_plane(
+        &factory_state,
+        "listener 'b' filter_chains[0]",
+        "chain-b",
+        TEST_HMAC_SECRET,
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "PUT",
+        "/chains/chain-a/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"1.00","period":"daily"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert!(
+        handle_a
+            .load()
+            .policies
+            .get("tenant-a")
+            .and_then(|p| p.budget)
+            .is_some(),
+        "the scoped budget write must land in chain-a's own ControlPlane"
+    );
+    assert!(
+        handle_b
+            .load()
+            .policies
+            .get("tenant-a")
+            .and_then(|p| p.budget)
+            .is_none(),
+        "a budget set through /chains/chain-a/... must NOT appear in chain-b's ControlPlane"
+    );
+}
+
+/// An unknown `stat_prefix` is a 404 naming the segment, matching every
+/// other scoped write endpoint.
+#[tokio::test]
+async fn scoped_put_budget_with_unknown_stat_prefix_is_404() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        TEST_HMAC_SECRET,
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "PUT",
+        "/chains/no-such-chain/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"1.00","period":"daily"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("no-such-chain"),
+        "the 404 must name the unresolved stat_prefix: {body}"
     );
 }
 
