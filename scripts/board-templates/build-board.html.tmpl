@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-04 · 1565 tests passed, 16 skipped as of 2026-09-02 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-04 · 1579 tests passed, 16 skipped as of 2026-09-04 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -198,15 +198,15 @@
     Before that, 2026-08-29 through 2026-09-02, WP-50 increment 3 landed (operator control
     plane: tenants, spend budgets), P0 product-defining work gating neither v0.2.0 nor v0.3.0 —
     see the dated block at the end of this paragraph.
-    <span class="gate"><b>⛔ P0 OPEN, found 2026-09-04 —</b> <code>llmproxy.model_authz</code>
-    denies <b>every</b> request in a real filter chain: it reads
-    <code>StreamInfo::requested_model</code> in <code>decode_headers</code>, but
-    <code>body_rewrite</code> writes it in <code>decode_data</code>, and the filter manager runs
-    all header callbacks before any data callbacks. A header/data phase mismatch that config
-    ordering cannot fix, so WP-50 3a/3b-iv is non-functional in production until it lands. Found
-    by the first end-to-end drill ever to run the admin API against the real binary — 18 unit
-    tests passed because they write the field directly. Rule 16, again: a suite that never
-    switches a feature on cannot regress it.</span>
+    <span class="gate"><b>✓ P0 FOUND AND FIXED 2026-09-04 —</b>
+    <code>llmproxy.model_authz</code> denied <b>every</b> request in any chain that enabled it,
+    a 100% outage that made WP-50 3a/3b-iv non-functional in production (fails closed, so not a
+    bypass). It read <code>StreamInfo::requested_model</code> in <code>decode_headers</code>,
+    but <code>body_rewrite</code> writes it in <code>decode_data</code> and the filter manager
+    runs all header callbacks before any data — a header/data <b>phase</b> mismatch that config
+    ordering could never have fixed. Found by the first drill ever to run the admin API against
+    the real binary; 18 unit tests had passed because they called <code>decode_headers</code>
+    directly. Rule 16, again: a suite that never switches a feature on cannot regress it.</span>
     <b>v0.2.0 "production-ready serving" shipped 2026-08-29</b> and is tagged.
     <b>v0.1.0 "LLM gateway" shipped 2026-08-08</b> and is tagged. <b>v0.0.1 shipped 2026-08-01</b>:
     the live smoke test ran against the real OpenAI and Anthropic endpoints and passed all four
