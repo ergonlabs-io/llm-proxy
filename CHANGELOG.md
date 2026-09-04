@@ -11,10 +11,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Work toward **v0.3.0** (ADS/xDS) has not started; everything below is WP-50 increment 3
-(operator control plane: tenants, budgets, spend), which shipped between the v0.2.0 tag and
-this point and gates neither release — see `internal-docs/MILESTONES.md`'s v0.2.0 section for
-why it's recorded there.
+Work toward **v0.3.0** (ADS/xDS) has started: the test harness gained the ability to drop and
+resume an xDS stream, without which a control-plane reconnect could not be tested at all. No
+user-visible xDS behavior exists yet — the proxy still takes its configuration from a file.
+Everything else below is WP-50 increment 3 (operator control plane: tenants, budgets, spend),
+which shipped between the v0.2.0 tag and this point and gates neither release — see
+`internal-docs/MILESTONES.md`'s v0.2.0 section for why it's recorded there.
 
 ### Added
 
@@ -36,6 +38,13 @@ why it's recorded there.
   financial data): live spend, budget and remaining, last-flush time, and the count plus
   distinct `(cluster, model)` pairs of unpriced requests, so an operator can see a pricing gap
   instead of assuming a model is billed when it silently isn't.
+- **An end-to-end test drill for the admin write API against the real binary.** Spawns the
+  shipped executable with `LLMPROXY_ADMIN_TOKEN` set and a mock upstream, then drives the admin
+  surface over a real socket: the `403`/`401`/success gate, a minted key authenticating real
+  traffic through the data plane, a revocation taking effect on the very next request, a policy
+  write changing enforcement with no reload, a budget write producing `429` with `x-ratelimit-*`,
+  and scoped versus unscoped chain addressing. This closes the coverage gap recorded below and
+  found the `model_authz` defect above on its first run.
 - **A selectable, persistent control-plane store.** The auth filter's config gains
   `oneof store { in_memory | persistent { path } }`; unset defaults to `in_memory`, so every
   config written before this change is unaffected. The persistent option is an embedded
@@ -58,6 +67,16 @@ why it's recorded there.
 
 ### Fixed
 
+- **`llmproxy.model_authz` refused every request in any filter chain that enabled it.** Per-tenant
+  model allow-lists were therefore non-functional: a chain configuring the filter returned `403`
+  for 100% of traffic, whatever the policy said. The filter read the requested model during the
+  header phase, but that value is published during the body phase, and the proxy runs every
+  filter's header callbacks before it delivers any body data — so the value was always absent and
+  the filter took its "no model to authorize" denial path. Filter ordering could not affect this
+  and no configuration worked around it. The tenant check still happens on headers; the model
+  check now happens once the body (or the trailers) has been seen. Requests with no body and
+  requests carrying trailers are both still checked, so the fix does not turn a refusal into a
+  gap. The filter fails **closed**, so this was an outage rather than an authorization bypass.
 - **Security: a configured token-per-minute rate limit admitted roughly (limit × core count)
   tokens per minute, not the configured limit.** The limiter built a separate budget store
   per worker process instead of sharing one; an operator relying on, say, a 1000
@@ -80,9 +99,6 @@ why it's recorded there.
 - **The admin write API's unscoped endpoints (`/keys`, `/tenants`, ...) support exactly one
   `llmproxy.auth`-configured chain**; with several, they refuse explicitly rather than
   guess. The scoped `/chains/{stat_prefix}/...` form has no such limit.
-- **The admin API has never been exercised against the real binary** — only unit tests, none
-  of which set `LLMPROXY_ADMIN_TOKEN`. This is a real coverage gap: most of the defects above
-  were wiring bugs that unit tests structurally could not see.
 - OIDC/JWT as a second authentication method is not built; the `Authenticator` trait was
   designed for it but nothing implements it yet.
 
