@@ -21,6 +21,11 @@ pub enum RequestKind {
 /// One recorded `DiscoveryRequest`, trimmed to the fields tests care about.
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
+    /// Which `StreamAggregatedResources` stream this request arrived on.
+    /// Monotonic across the server's lifetime, first stream is `1` (see
+    /// `RequestLog::next_stream_id`), so a reconnect (drop stream N, open
+    /// stream N+1) is visible in the log without inspecting timing.
+    pub stream_id: u64,
     pub type_url: String,
     pub version_info: String,
     pub response_nonce: String,
@@ -30,8 +35,9 @@ pub struct RecordedRequest {
 }
 
 impl RecordedRequest {
-    fn from_proto(req: &DiscoveryRequest) -> Self {
+    fn from_proto(stream_id: u64, req: &DiscoveryRequest) -> Self {
         Self {
+            stream_id,
             type_url: req.type_url.clone(),
             version_info: req.version_info.clone(),
             response_nonce: req.response_nonce.clone(),
@@ -47,6 +53,14 @@ impl RecordedRequest {
     /// could in principle NACK immediately after connecting to reject a
     /// cached response, though that never happens for `ScriptedAds`' own
     /// self-tests).
+    ///
+    /// This still reads correctly across a reconnect: per S8 a reconnecting
+    /// client re-sends its subscriptions with the last-ACKed `version_info`
+    /// but an empty `response_nonce` (there is no prior nonce on the new
+    /// stream to echo), so it classifies as `Initial` again even though
+    /// `version_info` is non-empty. Distinguishing "first request on a
+    /// fresh stream" from "first request ever" is what `stream_id` is for,
+    /// not `kind()` — a test asserting reconnect-resync should check both.
     pub fn kind(&self) -> RequestKind {
         if self.error_detail.is_some() {
             RequestKind::Nack
@@ -58,7 +72,28 @@ impl RecordedRequest {
     }
 }
 
-/// Thread-safe, cloneable handle onto a stream's recorded requests.
+/// The mutable state behind a [`RequestLog`]: the requests seen so far, plus
+/// the counter that hands out `stream_id`s. Both live behind the same lock
+/// because a stream's very first request needs the id assigned before it
+/// can be pushed.
+#[derive(Debug)]
+struct Inner {
+    requests: Vec<RecordedRequest>,
+    next_stream_id: u64,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        // First stream is 1, not 0, purely so log/test output reads as
+        // "stream 1" rather than "stream 0" — no other significance.
+        Self {
+            requests: Vec::new(),
+            next_stream_id: 1,
+        }
+    }
+}
+
+/// Thread-safe, cloneable handle onto every stream's recorded requests.
 ///
 /// Rust note: `Arc<Mutex<..>>` is the standard "shared, mutable, from
 /// multiple tasks" shape — the gRPC handler task appends to it while test
@@ -67,7 +102,7 @@ impl RecordedRequest {
 /// an `.await`.
 #[derive(Debug, Clone, Default)]
 pub struct RequestLog {
-    inner: Arc<Mutex<Vec<RecordedRequest>>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl RequestLog {
@@ -75,11 +110,21 @@ impl RequestLog {
         Self::default()
     }
 
-    pub(crate) fn record(&self, req: &DiscoveryRequest) {
+    /// Hands out the next `stream_id`, for `ScriptedAds` to assign once per
+    /// accepted stream (never per request).
+    pub(crate) fn next_stream_id(&self) -> u64 {
+        let mut inner = self.inner.lock().expect("request log mutex poisoned");
+        let id = inner.next_stream_id;
+        inner.next_stream_id += 1;
+        id
+    }
+
+    pub(crate) fn record(&self, stream_id: u64, req: &DiscoveryRequest) {
         self.inner
             .lock()
             .expect("request log mutex poisoned")
-            .push(RecordedRequest::from_proto(req));
+            .requests
+            .push(RecordedRequest::from_proto(stream_id, req));
     }
 
     /// A snapshot of everything recorded so far, in arrival order.
@@ -87,6 +132,7 @@ impl RequestLog {
         self.inner
             .lock()
             .expect("request log mutex poisoned")
+            .requests
             .clone()
     }
 }

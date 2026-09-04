@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures::{Stream, StreamExt};
@@ -32,18 +33,29 @@ use crate::script::Step;
 /// erases the concrete type behind a trait object.
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
-/// The puppet ADS server. Cheap to clone (only an `Arc`-backed log and a
-/// script `Vec` are cloned into each stream's driver task).
+/// The puppet ADS server. Cheap to clone: the script itself, the cursor
+/// into it, and the log are each `Arc`-backed and shared (not copied) into
+/// every stream's driver task.
 #[derive(Clone)]
 pub struct ScriptedAds {
-    script: Vec<Step>,
+    script: Arc<Vec<Step>>,
+    /// Index of the next unconsumed step. Deliberately **shared across
+    /// streams, not cloned fresh into each one** — a `Step::DropStream`
+    /// ends stream N and the next stream must resume at the step after it,
+    /// not replay from 0, or a reconnect scenario would just re-serve the
+    /// client responses it already ACKed. See `next_step`.
+    ///
+    /// Rust note: `Arc<Mutex<usize>>`, same shape and lock-scope rule
+    /// (never held across an `.await`) as `RequestLog`'s own note.
+    cursor: Arc<Mutex<usize>>,
     log: RequestLog,
 }
 
 impl ScriptedAds {
     pub fn new(script: Vec<Step>) -> Self {
         Self {
-            script,
+            script: Arc::new(script),
+            cursor: Arc::new(Mutex::new(0)),
             log: RequestLog::new(),
         }
     }
@@ -51,6 +63,19 @@ impl ScriptedAds {
     /// The log every stream this server accepts appends its requests to.
     pub fn log(&self) -> RequestLog {
         self.log.clone()
+    }
+
+    /// Pops the next step off the shared cursor, advancing it. Returns
+    /// `None` once the script is exhausted. Because the cursor (not the
+    /// script) is what's shared, a step consumed by one stream's driver
+    /// task is never handed to a later stream's.
+    fn next_step(&self) -> Option<Step> {
+        let mut pos = self.cursor.lock().expect("script cursor mutex poisoned");
+        let step = self.script.get(*pos).cloned();
+        if step.is_some() {
+            *pos += 1;
+        }
+        step
     }
 }
 
@@ -68,7 +93,10 @@ impl AggregatedDiscoveryService for ScriptedAds {
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
         let mut incoming = request.into_inner();
         let log = self.log.clone();
-        let script = self.script.clone();
+        let ads = self.clone();
+        // Assigned once per accepted stream (not per request) so a
+        // reconnect is visible in the log as a new stream_id.
+        let stream_id = log.next_stream_id();
         let (tx, rx) = mpsc::channel::<Result<DiscoveryResponse, Status>>(16);
 
         // Rust note: the driver runs in its own task so this method can
@@ -76,38 +104,58 @@ impl AggregatedDiscoveryService for ScriptedAds {
         // response stream; tonic polls that stream to pull responses out as
         // the driver task pushes them in.
         tokio::spawn(async move {
-            'steps: for step in script {
-                let Step::Send {
-                    type_url,
-                    version_info,
-                    nonce,
-                    resources,
-                } = step;
+            'steps: loop {
+                let Some(step) = ads.next_step() else {
+                    break 'steps;
+                };
 
-                // Wait for the client's next request for this step's
-                // type_url, recording every request (including ones for
-                // other in-flight types) as it arrives.
-                loop {
-                    match incoming.next().await {
-                        Some(Ok(req)) => {
-                            log.record(&req);
-                            if req.type_url == type_url {
-                                break;
+                match step {
+                    Step::DropStream => {
+                        // End this stream from the server side right now,
+                        // without waiting for anything more from the
+                        // client: dropping `tx` (and `incoming`, when this
+                        // task returns) closes the response stream, which
+                        // is exactly what a control plane going away looks
+                        // like on the wire. The cursor already moved past
+                        // this step, so the next stream resumes after it.
+                        return;
+                    }
+                    Step::Wait { duration } => {
+                        tokio::time::sleep(duration).await;
+                    }
+                    Step::Send {
+                        type_url,
+                        version_info,
+                        nonce,
+                        resources,
+                    } => {
+                        // Wait for the client's next request for this
+                        // step's type_url, recording every request
+                        // (including ones for other in-flight types) as it
+                        // arrives.
+                        loop {
+                            match incoming.next().await {
+                                Some(Ok(req)) => {
+                                    log.record(stream_id, &req);
+                                    if req.type_url == type_url {
+                                        break;
+                                    }
+                                }
+                                _ => break 'steps,
                             }
                         }
-                        _ => break 'steps,
-                    }
-                }
 
-                let response = DiscoveryResponse {
-                    version_info,
-                    resources,
-                    type_url,
-                    nonce,
-                    ..Default::default()
-                };
-                if tx.send(Ok(response)).await.is_err() {
-                    break;
+                        let response = DiscoveryResponse {
+                            version_info,
+                            resources,
+                            type_url,
+                            nonce,
+                            ..Default::default()
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -116,7 +164,7 @@ impl AggregatedDiscoveryService for ScriptedAds {
             // stream, so trailing ACK/NACKs of the last scripted response
             // are captured too.
             while let Some(Ok(req)) = incoming.next().await {
-                log.record(&req);
+                log.record(stream_id, &req);
             }
         });
 
