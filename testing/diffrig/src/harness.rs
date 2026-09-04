@@ -128,7 +128,7 @@ impl ProxyProcess {
     /// and deadlock the child if nobody drains it; a plain file has no such
     /// limit) so a startup failure can be diagnosed.
     pub fn spawn(bin: &Path, config_path: &Path, log_path: &Path) -> Self {
-        Self::spawn_with_flag(bin, "--config", config_path, log_path)
+        Self::spawn_with_flag(bin, "--config", config_path, log_path, &[])
     }
 
     /// Spawn `llm-proxy -c config_path` (Envoy mode), otherwise identical to
@@ -142,22 +142,47 @@ impl ProxyProcess {
     /// [`Self::spawn`] once a dialect `auth:` block lands; it exercises the
     /// same lowering path real users hit and needs no hand-written YAML.
     pub fn spawn_envoy(bin: &Path, config_path: &Path, log_path: &Path) -> Self {
-        Self::spawn_with_flag(bin, "-c", config_path, log_path)
+        Self::spawn_with_flag(bin, "-c", config_path, log_path, &[])
     }
 
-    // Rust note: shared body for `spawn`/`spawn_envoy` -- only the flag name
-    // differs, so it's a parameter rather than two near-identical `Command`
-    // builders.
-    fn spawn_with_flag(bin: &Path, flag: &str, config_path: &Path, log_path: &Path) -> Self {
+    /// Same as [`Self::spawn_envoy`], plus `envs` set in the CHILD's
+    /// environment only (via `Command::env`, never `std::env::set_var` --
+    /// that call is process-global and would race every other test binary
+    /// running concurrently in this workspace). Added for the WP-50 admin
+    /// write API drill (`admin_e2e.rs`), which must set
+    /// `LLMPROXY_ADMIN_TOKEN` for the spawned proxy without touching this
+    /// test process's own environment.
+    pub fn spawn_envoy_with_env(
+        bin: &Path,
+        config_path: &Path,
+        log_path: &Path,
+        envs: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn_with_flag(bin, "-c", config_path, log_path, envs)
+    }
+
+    // Rust note: shared body for `spawn`/`spawn_envoy`/`spawn_envoy_with_env`
+    // -- only the flag name and the extra env vars differ, so both are
+    // parameters rather than three near-identical `Command` builders.
+    fn spawn_with_flag(
+        bin: &Path,
+        flag: &str,
+        config_path: &Path,
+        log_path: &Path,
+        envs: &[(&str, &str)],
+    ) -> Self {
         let log_file = std::fs::File::create(log_path).expect("create proxy log file");
         let log_file_err = log_file.try_clone().expect("clone log file handle");
-        let child = Command::new(bin)
+        let mut command = Command::new(bin);
+        command
             .arg(flag)
             .arg(config_path)
             .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err))
-            .spawn()
-            .expect("spawn llm-proxy");
+            .stderr(Stdio::from(log_file_err));
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("spawn llm-proxy");
         Self {
             child,
             log_path: log_path.to_path_buf(),

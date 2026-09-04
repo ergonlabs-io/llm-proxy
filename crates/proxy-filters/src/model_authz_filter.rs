@@ -8,15 +8,36 @@
 //! This filter needs two facts that only exist once two OTHER decode-path
 //! filters have already run: `StreamInfo::auth.tenant` (written by
 //! `llmproxy.auth`) and `StreamInfo::requested_model` (written by
-//! `llmproxy.body_rewrite`). Decoder callbacks run in **config order**
-//! (S2.1), so both of those filters must be configured BEFORE
-//! `llmproxy.model_authz` in a listener's `http_filters` list.
+//! `llmproxy.body_rewrite`). Both of those filters must be configured
+//! BEFORE `llmproxy.model_authz` in a listener's `http_filters` list;
 //! `proxy_config::lower::check_lane_h_filter_order` rejects the wrong order
 //! at config load, with an error explaining why -- see that function's doc.
-//! Get it backwards and this filter reads `None` for whichever fact came
-//! from the reordered filter and refuses EVERY request (see the next
-//! section), which is at least loud, unlike the two existing Lane-H ordering
-//! traps this one joins (`token_limit_filter`'s module doc).
+//!
+//! **Config order is necessary but NOT sufficient, and assuming otherwise
+//! was a P0 (found 2026-09-04, fixed the same day).** The two facts arrive
+//! in DIFFERENT phases, not merely at different chain positions:
+//!
+//! - `auth` writes `auth.tenant` from its `decode_headers`;
+//! - `body_rewrite` writes `requested_model` from its `decode_data`.
+//!
+//! `filter_manager::drive_decode` runs EVERY filter's `decode_headers`
+//! first, and only then delivers data in a trailing loop over
+//! `[0, header_reach)`. So a header-phase read of `requested_model` sees
+//! `None` no matter how the chain is ordered -- and this filter, which did
+//! exactly that, denied 100% of traffic in any chain that enabled it. Its
+//! own unit tests all passed, because they wrote the field directly and
+//! called `decode_headers` themselves, never going through `drive_decode`.
+//!
+//! The split below follows the phases rather than fighting them: the tenant
+//! check stays in `decode_headers` (where the fact genuinely is available),
+//! and the model check runs from `decode_data`/`decode_trailers`, where
+//! config order DOES hold because that trailing loop is itself in config
+//! order. See [`ModelAuthzFilterInstance::authorize_model`].
+//!
+//! Get the config order backwards and this filter reads `None` for the
+//! tenant and refuses EVERY request (see the next section), which is at
+//! least loud, unlike the two existing Lane-H ordering traps this one joins
+//! (`token_limit_filter`'s module doc).
 //!
 //! # Fail closed on missing inputs; OPEN on an unconfigured tenant
 //!
@@ -98,10 +119,11 @@ use arc_swap::ArcSwap;
 use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
+use bytes::Bytes;
 use proxy_config::ConfigError;
 use proxy_http::filter::{
-    DecoderCallbacks, FactoryContext, FilterHeadersStatus, FilterInstanceFactory, HttpFilter,
-    HttpFilterFactory, RequestHeaders,
+    DecoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus, FilterInstanceFactory,
+    FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders, RequestTrailers,
 };
 
 use crate::auth::TenantPolicy;
@@ -358,6 +380,7 @@ struct ModelAuthzInstanceFactory {
 impl FilterInstanceFactory for ModelAuthzInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(ModelAuthzFilterInstance {
+            decided: false,
             snapshot: Arc::clone(&self.snapshot),
         })
     }
@@ -368,6 +391,11 @@ impl FilterInstanceFactory for ModelAuthzInstanceFactory {
 /// encode-side half, like `auth_filter`).
 struct ModelAuthzFilterInstance {
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
+    /// Whether the model check has already run for this stream. The check
+    /// has three possible trigger points (end-of-body, trailers, or a
+    /// bodyless request) and must run exactly once -- see
+    /// [`Self::authorize_model`].
+    decided: bool,
 }
 
 impl ModelAuthzFilterInstance {
@@ -379,35 +407,57 @@ impl ModelAuthzFilterInstance {
     fn deny(&self, cb: &mut dyn DecoderCallbacks) {
         cb.send_local_reply(StatusCode::FORBIDDEN, "forbidden", None, DENY_DETAILS);
     }
-}
 
-impl HttpFilter for ModelAuthzFilterInstance {
-    fn decode_headers(
-        &mut self,
-        cb: &mut dyn DecoderCallbacks,
-        _headers: &mut RequestHeaders,
-        _end_stream: bool,
-    ) -> FilterHeadersStatus {
-        // Rust note: `stream_info()` hands back a `RefMut` guard that must
-        // not be held across another call on `cb` (see its doc) -- cloning
-        // both `Option<String>`s out and letting the guard drop at the end
-        // of this block keeps that rule visibly satisfied, same pattern as
-        // `token_limit_filter::decode_headers`.
+    /// Cases 2 and 3 of the module doc: the checks that need
+    /// `StreamInfo::requested_model`, and therefore cannot run before
+    /// `llmproxy.body_rewrite`'s `decode_data` has published it.
+    ///
+    /// **Why this is not in `decode_headers`, which is where it lived until
+    /// 2026-09-04 and where it denied every request in a real chain.**
+    /// `body_rewrite` writes `requested_model` from its `decode_data`, and
+    /// `filter_manager::drive_decode` runs EVERY filter's `decode_headers`
+    /// first and only then delivers data in a trailing loop over
+    /// `[0, header_reach)`. So a header-phase read of that field is
+    /// guaranteed to see `None` no matter how the chain is ordered -- a
+    /// header/data PHASE mismatch, not a config-order bug. `decode_data`
+    /// is delivered in config order within that trailing loop, so reading
+    /// the field here does what the original code intended to do.
+    ///
+    /// Idempotent via `self.decided`: the trigger points below overlap (a
+    /// chunked body ends with `end_stream`, a trailered request never sets
+    /// `end_stream` on data at all), and a second call must not send a
+    /// second local reply.
+    fn authorize_model(&mut self, cb: &mut dyn DecoderCallbacks) {
+        if self.decided {
+            return;
+        }
+        self.decided = true;
+
+        // Rust note: same `RefMut`-guard discipline as `decode_headers` --
+        // clone out and let the guard drop before any other call on `cb`.
         let (tenant, model) = {
             let info = cb.stream_info();
             (info.auth.tenant.clone(), info.requested_model.clone())
         };
 
-        // Case 1: no authenticated tenant -- see the module doc.
+        // Case 1 is re-checked rather than assumed: `decode_headers` already
+        // refused a stream with no tenant (and a local reply stops the
+        // chain, so this normally cannot be reached), but this function
+        // must not silently authorize against a `None` tenant if that ever
+        // stops holding.
         let Some(tenant) = tenant else {
             self.deny(cb);
-            return FilterHeadersStatus::Continue;
+            return;
         };
 
-        // Case 2: no requested model -- see the module doc.
+        // Case 2: no requested model -- see the module doc. This is also
+        // the path a bodyless request takes: `decode_data` is still
+        // delivered (with an empty `body` and `end_stream`), nothing ever
+        // published a model, and the request is refused rather than
+        // slipping through unchecked.
         let Some(model) = model else {
             self.deny(cb);
-            return FilterHeadersStatus::Continue;
+            return;
         };
 
         // Rust note: `ArcSwap::load` hands back a lock-free guard over
@@ -435,6 +485,50 @@ impl HttpFilter for ModelAuthzFilterInstance {
         if !permitted {
             self.deny(cb);
         }
+    }
+}
+
+impl HttpFilter for ModelAuthzFilterInstance {
+    /// Case 1 only: refuse a stream with no authenticated tenant. That fact
+    /// IS available here -- `llmproxy.auth` writes `StreamInfo::auth.tenant`
+    /// from its own `decode_headers`, and config order (enforced by
+    /// `proxy_config::lower::check_lane_h_filter_order`) puts it earlier in
+    /// the same header phase.
+    ///
+    /// The model check deliberately does NOT run here; see
+    /// [`ModelAuthzFilterInstance::authorize_model`] for why a header-phase
+    /// read of `StreamInfo::requested_model` can only ever see `None`.
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        // Rust note: `stream_info()` hands back a `RefMut` guard that must
+        // not be held across another call on `cb` (see its doc) -- cloning
+        // out and letting the guard drop at the end of this block keeps that
+        // rule visibly satisfied, same pattern as
+        // `token_limit_filter::decode_headers`.
+        // `decode_headers` is the start of a stream, so this is where the
+        // once-per-stream decision latch resets. In production a filter
+        // instance already serves exactly one stream (`create` runs per
+        // stream), which would make this redundant -- it is here so the
+        // latch cannot silently suppress the check if an instance is ever
+        // reused, which is precisely what a unit test does when it drives
+        // two requests through one instance.
+        self.decided = false;
+
+        let tenant = { cb.stream_info().auth.tenant.clone() };
+
+        // Case 1: no authenticated tenant -- see the module doc.
+        if tenant.is_none() {
+            // Nothing further can authorize this stream, so record the
+            // decision here too: `decode_data` must not send a second local
+            // reply behind this one.
+            self.decided = true;
+            self.deny(cb);
+        }
+
         // Rust note: the returned status is irrelevant on the deny path --
         // `drive_decode` checks `ctx.local_reply.is_some()` right after this
         // callback returns and stops the chain unconditionally when set,
@@ -443,6 +537,41 @@ impl HttpFilter for ModelAuthzFilterInstance {
         // `filter_manager.rs`). `Continue` is returned either way only
         // because the trait requires *a* value.
         FilterHeadersStatus::Continue
+    }
+
+    /// The model check's ordinary trigger point. `end_stream` here means the
+    /// full body has been delivered, so `llmproxy.body_rewrite` -- earlier in
+    /// this same trailing loop, by config order -- has already published
+    /// `StreamInfo::requested_model`.
+    ///
+    /// A bodyless request still reaches this callback (`filter_manager`
+    /// delivers `decode_data` unconditionally to every filter in
+    /// `[0, header_reach)`, with an empty buffer), which is what keeps it
+    /// from becoming an authorization bypass.
+    fn decode_data(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _data: &mut Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        if end_stream {
+            self.authorize_model(cb);
+        }
+        FilterDataStatus::Continue
+    }
+
+    /// The trailered-request trigger point. `filter_manager` computes
+    /// `end_stream = trailers.is_none()` for `decode_data`, so a request
+    /// carrying trailers never sees `end_stream` on data at all -- without
+    /// this callback such a request would skip the check entirely, which is
+    /// a bypass rather than merely a missed denial.
+    fn decode_trailers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _trailers: &mut RequestTrailers,
+    ) -> FilterTrailersStatus {
+        self.authorize_model(cb);
+        FilterTrailersStatus::Continue
     }
 }
 
@@ -791,7 +920,10 @@ mod tests {
             keys: KeySet::new(),
             policies,
         })));
-        ModelAuthzFilterInstance { snapshot }
+        ModelAuthzFilterInstance {
+            snapshot,
+            decided: false,
+        }
     }
 
     fn policies_map(entries: Vec<(&str, ModelAccess)>) -> TenantPolicyMap {
@@ -824,7 +956,8 @@ mod tests {
         cb.set_tenant("tenant-a");
         cb.set_requested_model("gpt-4o");
         let mut head = request_headers();
-        let status = filter.decode_headers(&mut cb, &mut head, true);
+        let status = filter.decode_headers(&mut cb, &mut head, false);
+        decode_request_after_headers(&mut filter, &mut cb);
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert!(cb.local_reply.is_none(), "gpt-4o must be permitted");
 
@@ -833,8 +966,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-a");
         cb.set_requested_model("claude-3");
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut filter, &mut cb);
         let reply = cb.local_reply.expect("claude-3 must be denied");
         assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
         assert_eq!(reply.details, "model_not_permitted");
@@ -849,8 +981,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-a");
         cb.set_requested_model("some-completely-unlisted-model");
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut filter, &mut cb);
         assert!(cb.local_reply.is_none());
     }
 
@@ -863,8 +994,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         // No `set_tenant` call -- StreamInfo::auth.tenant stays None.
         cb.set_requested_model("gpt-4o");
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut filter, &mut cb);
         let reply = cb
             .local_reply
             .expect("an unauthenticated stream must be refused, not implicitly allowed");
@@ -874,6 +1004,40 @@ mod tests {
 
     // --- acceptance: no requested model -> 403 -------------------------------
 
+    /// Companion to [`decode_request`] for the one test that asserts on
+    /// `decode_headers`' returned status: it has already run the header
+    /// phase itself, so this delivers only the trailing data phase.
+    fn decode_request_after_headers(filter: &mut dyn HttpFilter, cb: &mut TestCallbacks) {
+        if cb.local_reply.is_some() {
+            return;
+        }
+        let mut body = Bytes::new();
+        filter.decode_data(cb, &mut body, true);
+    }
+
+    /// Drive the filter the way `filter_manager::drive_decode` actually
+    /// does: the ENTIRE header phase first, then the trailing data phase.
+    ///
+    /// Tests that exercise the model check must go through this rather than
+    /// calling `decode_headers` directly. Calling it directly is exactly
+    /// what hid the 2026-09-04 P0: 18 unit tests passed while the filter
+    /// denied every request in a real chain, because they wrote
+    /// `StreamInfo::requested_model` themselves and then invoked the one
+    /// callback that, in production, always runs before anything sets it.
+    ///
+    /// `end_stream: false` on headers mirrors a request that has a body;
+    /// the `local_reply` check between the phases is S2.5 (a local reply
+    /// stops the chain, so no data is delivered afterwards).
+    fn decode_request(filter: &mut dyn HttpFilter, cb: &mut TestCallbacks) {
+        let mut head = request_headers();
+        filter.decode_headers(cb, &mut head, false);
+        if cb.local_reply.is_some() {
+            return;
+        }
+        let mut body = Bytes::new();
+        filter.decode_data(cb, &mut body, true);
+    }
+
     #[test]
     fn no_requested_model_is_refused() {
         let policies = policies_map(vec![("tenant-a", ModelAccess::All)]);
@@ -881,8 +1045,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-a");
         // No `set_requested_model` call -- StreamInfo::requested_model stays None.
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut filter, &mut cb);
         let reply = cb
             .local_reply
             .expect("a request with no extractable model must be refused");
@@ -900,8 +1063,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-unknown-to-this-snapshot");
         cb.set_requested_model("gpt-4o");
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut filter, &mut cb);
         assert!(
             cb.local_reply.is_none(),
             "a tenant absent from the published snapshot must be ALLOWED -- authorization \
@@ -983,8 +1145,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-a");
         cb.set_requested_model("claude-3");
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut *filter, &mut cb);
         assert!(
             cb.local_reply.is_none(),
             "tenant-a has no policy yet, so it must be allowed"
@@ -1002,13 +1163,161 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-a");
         cb.set_requested_model("claude-3");
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut *filter, &mut cb);
         let reply = cb.local_reply.expect(
             "an admin PUT /tenants/{id}/policy must change enforcement on the very next \
              request, with no reload -- this is the increment's reason to exist",
         );
         assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+    }
+
+    // --- 2026-09-04 P0 regression: the header/data PHASE mismatch ---------
+    //
+    // Found by `testing/diffrig/tests/admin_e2e.rs`, the first drill to run
+    // the admin API against the real binary. The model check used to live in
+    // `decode_headers`, reading a field only `body_rewrite::decode_data`
+    // ever writes -- and `filter_manager::drive_decode` runs every
+    // `decode_headers` before any `decode_data`. So it read `None` on every
+    // request and denied all traffic. 18 unit tests missed it because they
+    // called `decode_headers` directly after setting the field themselves.
+
+    /// The exact production sequence, with the model published only at the
+    /// data phase, as `body_rewrite` really does it. Mutation pin: move the
+    /// `authorize_model` call back into `decode_headers` and this reds.
+    #[test]
+    fn a_permitted_model_published_at_the_data_phase_is_allowed() {
+        let policies = policies_map(vec![(
+            "tenant-a",
+            ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+        )]);
+        let mut filter = filter_with(policies);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+
+        // Header phase: nothing has published a model yet -- this is the
+        // state the old code always saw, and wrongly denied on.
+        let mut head = request_headers();
+        filter.decode_headers(&mut cb, &mut head, false);
+        assert!(
+            cb.local_reply.is_none(),
+            "the header phase must NOT decide: body_rewrite has not run yet, so a denial \
+             here refuses every request in a real chain (the 2026-09-04 P0)"
+        );
+
+        // Data phase: `body_rewrite` (earlier in the chain, same trailing
+        // loop) publishes the model, then this filter checks it.
+        cb.set_requested_model("gpt-4o");
+        let mut body = Bytes::new();
+        filter.decode_data(&mut cb, &mut body, true);
+        assert!(
+            cb.local_reply.is_none(),
+            "gpt-4o matches the tenant's gpt-4* allow-list and must be permitted"
+        );
+    }
+
+    /// The denial still happens -- just one phase later. Guards against
+    /// "fixing" the P0 by making the filter permissive.
+    #[test]
+    fn a_denied_model_published_at_the_data_phase_is_still_refused() {
+        let policies = policies_map(vec![(
+            "tenant-a",
+            ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+        )]);
+        let mut filter = filter_with(policies);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        cb.set_requested_model("claude-3");
+        decode_request(&mut filter, &mut cb);
+        let reply = cb
+            .local_reply
+            .expect("claude-3 is outside the gpt-4* allow-list and must be refused");
+        assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+    }
+
+    /// A bodyless request must not slip past the check. `filter_manager`
+    /// delivers `decode_data` to every filter in `[0, header_reach)` even
+    /// with an empty buffer, so the check still fires and refuses (case 2,
+    /// no extractable model). Without that, moving the check off the header
+    /// phase would have converted a fail-closed outage into a real bypass.
+    #[test]
+    fn a_bodyless_request_is_refused_rather_than_slipping_through() {
+        let policies = policies_map(vec![(
+            "tenant-a",
+            ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+        )]);
+        let mut filter = filter_with(policies);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        // No `set_requested_model` -- nothing published one.
+        decode_request(&mut filter, &mut cb);
+        let reply = cb
+            .local_reply
+            .expect("a bodyless request has no model to authorize and must be refused");
+        assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+    }
+
+    /// A trailered request never sees `end_stream` on `decode_data`
+    /// (`filter_manager` computes it as `trailers.is_none()`), so the check
+    /// has to fire from `decode_trailers` instead. Without that override
+    /// this request would reach the upstream unauthorized.
+    #[test]
+    fn a_trailered_request_is_still_checked_via_decode_trailers() {
+        let policies = policies_map(vec![(
+            "tenant-a",
+            ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+        )]);
+        let mut filter = filter_with(policies);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        cb.set_requested_model("claude-3");
+
+        let mut head = request_headers();
+        filter.decode_headers(&mut cb, &mut head, false);
+        // Trailers present, so the data callback is delivered with
+        // `end_stream == false` and must NOT decide.
+        let mut body = Bytes::new();
+        filter.decode_data(&mut cb, &mut body, false);
+        assert!(
+            cb.local_reply.is_none(),
+            "the data phase must not decide while trailers are still coming"
+        );
+
+        let mut trailers = RequestTrailers(HeaderMap::new());
+        filter.decode_trailers(&mut cb, &mut trailers);
+        let reply = cb
+            .local_reply
+            .expect("a trailered request must still be authorized, via decode_trailers");
+        assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+    }
+
+    /// The check must send at most ONE local reply even though it has three
+    /// possible trigger points.
+    #[test]
+    fn the_check_decides_exactly_once_per_stream() {
+        let policies = policies_map(vec![(
+            "tenant-a",
+            ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+        )]);
+        let mut filter = filter_with(policies);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        cb.set_requested_model("claude-3");
+
+        let mut head = request_headers();
+        filter.decode_headers(&mut cb, &mut head, false);
+        let mut body = Bytes::new();
+        filter.decode_data(&mut cb, &mut body, true);
+        assert!(cb.local_reply.is_some(), "the data phase decides");
+        cb.local_reply = None;
+
+        // A second trigger (trailers after an end_stream data call is not a
+        // real sequence, but the latch must hold regardless).
+        let mut trailers = RequestTrailers(HeaderMap::new());
+        filter.decode_trailers(&mut cb, &mut trailers);
+        assert!(
+            cb.local_reply.is_none(),
+            "the decision latch must prevent a second local reply for one stream"
+        );
     }
 
     // --- bootstrap seeding: typed_config.policies still authorizes ---------
@@ -1038,8 +1347,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-a");
         cb.set_requested_model("claude-3");
-        let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode_request(&mut *filter, &mut cb);
         let reply = cb
             .local_reply
             .expect("typed_config.policies seeded into the store must still deny claude-3");
