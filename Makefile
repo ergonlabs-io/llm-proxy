@@ -181,6 +181,52 @@ run: ## Run the proxy with CONFIG (default: examples/tcp-proxy.yaml)
 validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.yaml
 	cargo run -p proxy -- -c $(CONFIG) --mode validate
 
+# ------------------------------------------------- xDS conformance (docker) --
+
+# Owner decision 2026-09-04: the go-control-plane cross-implementation check is
+# an OPT-IN target, NOT part of `make ci`. `make ci` stays hermetic and needs no
+# docker.
+#
+# THE RISK THIS CARRIES, stated because it has already cost this project once:
+# an opt-in target is exactly the shape of `local_openai_smoke.rs`, which rule 16
+# in CLAUDE.md records as having quietly stopped running for a whole work package
+# while the suite stayed green -- an entire observability surface went untested
+# behind an `#[ignore]`. A target nobody runs is worse than no target, because it
+# reads as coverage.
+#
+# So this has a stated cadence, not just an existence:
+#   - run it before closing WP-20, and
+#   - run it before the v0.3.0 ship gate is declared closed.
+# `internal-docs/MILESTONES.md`'s v0.3.0 gate names it as the verification, which
+# is what keeps the cadence enforceable rather than aspirational.
+
+DOCKER := $(shell command -v docker 2>/dev/null)
+
+.PHONY: xds-conformance
+xds-conformance: ## Run the xDS client against a real go-control-plane server (needs docker)
+ifeq ($(DOCKER),)
+	@echo ""
+	@echo "=============================================================================="
+	@echo " SKIPPING make xds-conformance: no docker found on PATH."
+	@echo ""
+	@echo " This target checks our ADS client against go-control-plane, the reference"
+	@echo " implementation -- the one check that catches us agreeing with ourselves"
+	@echo " about the protocol and both being wrong. testing/controlplane's own puppet"
+	@echo " server cannot do that: we wrote both sides of it."
+	@echo "=============================================================================="
+	@echo ""
+	@exit 1
+else
+	@echo "NOT IMPLEMENTED YET -- WP-20 increment 5 owes the fixture."
+	@echo ""
+	@echo "The harness (testing/controlplane) and the client exist; what is missing is"
+	@echo "the go-control-plane container and the scenario script driven against it."
+	@echo "This target exists now so the decision is discoverable from the build system"
+	@echo "rather than only from a design brief, and so it fails LOUDLY rather than"
+	@echo "silently passing and reading as coverage."
+	@exit 1
+endif
+
 # --------------------------------------------------------------- QA (Go) --
 
 # Evaluated at parse time (not recipe time), so `ifeq` below can branch on it
