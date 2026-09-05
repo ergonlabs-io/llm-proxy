@@ -12,8 +12,10 @@
 
 pub mod backoff;
 pub mod client;
+pub mod store;
 pub mod subscription;
 
 pub use backoff::BackoffPolicy;
 pub use client::{AdsClient, AdsError, Reconnect, Sleep, Validator};
+pub use store::{ApplyError, ApplyOutcome, SetSemantics, SotwSet};
 pub use subscription::{Request, Subscription, SubscriptionState, Verdict};
