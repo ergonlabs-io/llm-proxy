@@ -11,9 +11,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Work toward **v0.3.0** (ADS/xDS) has started: the test harness gained the ability to drop and
-resume an xDS stream, without which a control-plane reconnect could not be tested at all. No
-user-visible xDS behavior exists yet — the proxy still takes its configuration from a file.
+Work toward **v0.3.0** (ADS/xDS) has started. The test harness gained the ability to drop and
+resume an xDS stream, without which a control-plane reconnect could not be tested at all; and
+the configuration loader now accepts a `dynamic_resources` block naming an ADS control plane,
+validating it fully and rejecting every option that is not implemented with the exact path of
+the offending field. **No xDS behavior exists yet** — nothing connects to a control plane, and
+the proxy still takes its configuration from a file. Only the ADS forms of `lds_config` and
+`cds_config` are accepted; EDS, delta xDS, REST, filesystem sources and the `google_grpc`
+client are each refused by name.
 Everything else below is WP-50 increment 3 (operator control plane: tenants, budgets, spend),
 which shipped between the v0.2.0 tag and this point and gates neither release — see
 `internal-docs/MILESTONES.md`'s v0.2.0 section for why it's recorded there.

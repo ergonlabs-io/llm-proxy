@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-04 · 1579 tests passed, 16 skipped as of 2026-09-04 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-04 · 1597 tests passed, 16 skipped as of 2026-09-04 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -191,9 +191,10 @@
   <p class="now">
     <b>Now — v0.3.0 "dynamic configuration": be deployable the way Envoy is deployed.</b> Current
     by declaration since v0.2.0 shipped 2026-08-29. <b>WP-20 started 2026-09-04</b> against a
-    design brief that cuts it into six increments; increment 0 (the WP-28 chunk that makes
-    reconnect-resync expressible at all) has landed and increment 1 (bootstrap
-    <code>dynamic_resources</code> → IR) is in flight. Note <b>WP-20 alone does not close this
+    design brief that cuts it into six increments; increments 0 (the WP-28 chunk that makes
+    reconnect-resync expressible at all) and 1 (bootstrap <code>dynamic_resources</code> → IR,
+    with every unimplemented member refused by dotted path) have both landed; increment 2 is the
+    subscription state machine. Note <b>WP-20 alone does not close this
     gate</b> — EDS defers to WP-21, which owns the missing IR <code>Eds</code> variant.
     Before that, 2026-08-29 through 2026-09-02, WP-50 increment 3 landed (operator control
     plane: tenants, spend budgets), P0 product-defining work gating neither v0.2.0 nor v0.3.0 —
