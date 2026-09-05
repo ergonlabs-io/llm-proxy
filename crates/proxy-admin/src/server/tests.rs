@@ -152,6 +152,9 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         secrets: HashMap::new(),
         admin: Some("127.0.0.1:9901".parse().unwrap()),
         tracing: None,
+        // WP-20 increment 1: this fixture is a static-config snapshot, which
+        // is what `None` means -- no control plane is involved.
+        ads: None,
         version: SnapshotVersion(1),
     })
 }

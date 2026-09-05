@@ -67,7 +67,23 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     // reads `node.metadata` rather than a `static_resources`-adjacent field.
     snapshot.tracing = convert_tracing_metadata(b.node.as_ref(), "node")?;
 
+    // WP-20 increment 1. Lowered before `static_resources` so the ADS
+    // cluster-existence check below can run against the finished cluster map.
+    let ads_pending = convert_dynamic_resources(b, "dynamic_resources")?;
+
     let Some(sr) = &b.static_resources else {
+        // An ADS config naming a cluster is only legal with static resources
+        // to declare that cluster in -- catch it here rather than letting the
+        // early return skip the existence check.
+        if let Some(ads) = &ads_pending {
+            return Err(invalid(
+                "dynamic_resources.ads_config.grpc_services[0].envoy_grpc.cluster_name",
+                format!(
+                    "ADS cluster `{}` must be statically defined, but this bootstrap has no static_resources",
+                    ads.cluster.as_str()
+                ),
+            ));
+        }
         return Ok(snapshot);
     };
 
@@ -112,6 +128,22 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     // cannot fold into the loop above, because a member may be declared
     // after the aggregate that names it.
     validate_cluster_graph(sr, &snapshot)?;
+
+    // WP-20: the proto is explicit -- "The cluster with name `cluster_name`
+    // must be statically defined". Checked here, once the cluster map is
+    // complete, for the same reason `validate_cluster_graph` is.
+    if let Some(ads) = &ads_pending {
+        if !snapshot.clusters.contains_key(&ads.cluster) {
+            return Err(invalid(
+                "dynamic_resources.ads_config.grpc_services[0].envoy_grpc.cluster_name",
+                format!(
+                    "ADS cluster `{}` is not defined in static_resources.clusters",
+                    ads.cluster.as_str()
+                ),
+            ));
+        }
+    }
+    snapshot.ads = ads_pending;
     Ok(snapshot)
 }
 
@@ -122,7 +154,17 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
 /// checked parents; a listed type rejects every set field not named.
 fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
     Some(match message {
-        "envoy.config.bootstrap.v3.Bootstrap" => &["node", "admin", "static_resources"],
+        "envoy.config.bootstrap.v3.Bootstrap" => {
+            &["node", "admin", "static_resources", "dynamic_resources"]
+        }
+        "envoy.config.bootstrap.v3.Bootstrap.DynamicResources" => {
+            &["lds_config", "cds_config", "ads_config"]
+        }
+        "envoy.config.core.v3.ApiConfigSource" => {
+            &["api_type", "transport_api_version", "grpc_services"]
+        }
+        "envoy.config.core.v3.GrpcService" => &["envoy_grpc"],
+        "envoy.config.core.v3.GrpcService.EnvoyGrpc" => &["cluster_name"],
         "envoy.config.bootstrap.v3.Admin" => &["address"],
         "envoy.config.bootstrap.v3.Bootstrap.StaticResources" => &["listeners", "clusters"],
         "envoy.config.listener.v3.Listener" => &[
@@ -2142,6 +2184,248 @@ fn convert_upstream_certificate(
         _ => Err(invalid(
             path,
             "at most one client certificate is supported (one per key type is a downstream-only concept)",
+        )),
+    }
+}
+
+// --------------------------------------------------------- dynamic (xDS) --
+
+/// Lower bootstrap `dynamic_resources` into [`AdsConfig`] (WP-20 increment 1).
+///
+/// **This widens a deliberate refusal, it does not fix a silent drop.** Before
+/// this increment `Bootstrap`'s allowed-field list named only
+/// `node`/`admin`/`static_resources`, so a config carrying `dynamic_resources`
+/// failed strict-mode validation by name -- ground rule #1 working correctly.
+///
+/// v1 accepts a narrow surface and refuses everything else with its full
+/// dotted path: `api_type: GRPC`, `transport_api_version: V3`, and exactly one
+/// `grpc_services` entry using `envoy_grpc`. Per-type non-ADS sources are a
+/// different transport we do not implement, and `eds_config` needs an IR
+/// discovery variant that WP-21 owns.
+fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConfig>, ConfigError> {
+    let Some(dr) = &b.dynamic_resources else {
+        return Ok(None);
+    };
+
+    // `xdstp://` resource locators are upstream-hidden and unimplemented.
+    if !dr.lds_resources_locator.is_empty() {
+        return Err(unsupported(
+            format!("{path}.lds_resources_locator"),
+            "xdstp:// resource locators are not implemented",
+        ));
+    }
+    if !dr.cds_resources_locator.is_empty() {
+        return Err(unsupported(
+            format!("{path}.cds_resources_locator"),
+            "xdstp:// resource locators are not implemented",
+        ));
+    }
+
+    let Some(api) = &dr.ads_config else {
+        // A per-type ConfigSource without an ads_config is a separate
+        // transport (its own gRPC stream, or REST polling), not ADS.
+        if dr.lds_config.is_some() || dr.cds_config.is_some() {
+            return Err(unsupported(
+                format!("{path}.ads_config"),
+                "lds_config/cds_config are only implemented when delivered over ADS, so \
+                 dynamic_resources.ads_config must be set",
+            ));
+        }
+        return Ok(None);
+    };
+    let api_path = format!("{path}.ads_config");
+
+    // Per-type sources must be ADS-backed: the proto says "only ConfigSources
+    // that have the ads field set will be streamed on the ADS channel", so a
+    // source without it would silently never be subscribed.
+    let lds = check_ads_source(dr.lds_config.as_ref(), &format!("{path}.lds_config"))?;
+    let cds = check_ads_source(dr.cds_config.as_ref(), &format!("{path}.cds_config"))?;
+
+    // EDS is WP-21's: the IR has no `Eds` discovery variant to lower into, and
+    // inventing one here would put the warming semantics in the wrong package.
+    if !lds && !cds {
+        return Err(invalid(
+            &api_path,
+            "dynamic_resources.ads_config is set but neither lds_config nor cds_config \
+             subscribes over ADS, so nothing would be requested",
+        ));
+    }
+
+    convert_api_config_source(api, &api_path, lds, cds, b)
+}
+
+/// A per-type `ConfigSource` is honoured only in its ADS form. Returns whether
+/// this type is subscribed at all (`None` => not subscribed).
+fn check_ads_source(
+    source: Option<&core_v3::ConfigSource>,
+    path: &str,
+) -> Result<bool, ConfigError> {
+    use core_v3::config_source::ConfigSourceSpecifier;
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    if !source.resource_api_version().eq(&core_v3::ApiVersion::V3) {
+        return Err(unsupported(
+            format!("{path}.resource_api_version"),
+            "only the V3 xDS resource API version is implemented",
+        ));
+    }
+    match &source.config_source_specifier {
+        Some(ConfigSourceSpecifier::Ads(_)) => Ok(true),
+        Some(ConfigSourceSpecifier::ApiConfigSource(_)) => Err(unsupported(
+            format!("{path}.api_config_source"),
+            "a per-type api_config_source is a separate xDS transport; only ADS-delivered \
+             resources are implemented (set the `ads` field instead)",
+        )),
+        Some(ConfigSourceSpecifier::Path(_)) | Some(ConfigSourceSpecifier::PathConfigSource(_)) => {
+            Err(unsupported(
+                format!("{path}.path_config_source"),
+                "filesystem xDS is not implemented yet (WP-22)",
+            ))
+        }
+        Some(ConfigSourceSpecifier::Self_(_)) => Err(unsupported(
+            format!("{path}.self"),
+            "`self` config sources are not implemented",
+        )),
+        None => Err(invalid(
+            path,
+            "a config source must set one of its specifier members",
+        )),
+    }
+}
+
+/// The `ApiConfigSource` half: transport, versions, and the target cluster.
+fn convert_api_config_source(
+    api: &core_v3::ApiConfigSource,
+    path: &str,
+    lds: bool,
+    cds: bool,
+    b: &Bootstrap,
+) -> Result<Option<AdsConfig>, ConfigError> {
+    use core_v3::api_config_source::ApiType;
+
+    // Rust note: prost renders a proto enum field as `i32` plus a generated
+    // accessor that maps an unknown value to the default; matching on the
+    // accessor keeps every named variant explicit (no `_ =>` fallthrough), so
+    // adding a variant upstream is a compile error rather than a silent
+    // acceptance -- ground rule #1 applied to enums.
+    match api.api_type() {
+        ApiType::Grpc => {}
+        ApiType::DeltaGrpc | ApiType::AggregatedDeltaGrpc => {
+            return Err(unsupported(
+                format!("{path}.api_type"),
+                "delta xDS is not implemented yet (WP-22); use GRPC",
+            ));
+        }
+        ApiType::Rest | ApiType::DeprecatedAndUnavailableDoNotUse => {
+            return Err(unsupported(
+                format!("{path}.api_type"),
+                "REST xDS is not implemented and is not planned; use GRPC",
+            ));
+        }
+        ApiType::AggregatedGrpc => {
+            return Err(unsupported(
+                format!("{path}.api_type"),
+                "AGGREGATED_GRPC is set implicitly by dynamic_resources.ads_config; use GRPC",
+            ));
+        }
+    }
+
+    if !api.transport_api_version().eq(&core_v3::ApiVersion::V3) {
+        return Err(unsupported(
+            format!("{path}.transport_api_version"),
+            "only the V3 xDS transport API version is implemented",
+        ));
+    }
+
+    // REST-only field; silently ignoring it would pick a different server.
+    if !api.cluster_names.is_empty() {
+        return Err(unsupported(
+            format!("{path}.cluster_names"),
+            "cluster_names is REST-only; name the ADS cluster via grpc_services[0].envoy_grpc",
+        ));
+    }
+    if api.refresh_delay.is_some() {
+        return Err(unsupported(
+            format!("{path}.refresh_delay"),
+            "refresh_delay is REST-only and is not honoured for gRPC ADS",
+        ));
+    }
+    if api.request_timeout.is_some() {
+        return Err(unsupported(
+            format!("{path}.request_timeout"),
+            "request_timeout is REST-only and is not honoured for gRPC ADS",
+        ));
+    }
+    if api.rate_limit_settings.is_some() {
+        return Err(unsupported(
+            format!("{path}.rate_limit_settings"),
+            "discovery-request rate limiting is not implemented",
+        ));
+    }
+    if !api.config_validators.is_empty() {
+        return Err(unsupported(
+            format!("{path}.config_validators"),
+            "config validator extensions are not implemented",
+        ));
+    }
+    if api.set_node_on_first_message_only {
+        return Err(unsupported(
+            format!("{path}.set_node_on_first_message_only"),
+            "the Node is sent on every discovery request; omitting it after the first is not \
+             implemented",
+        ));
+    }
+
+    if api.grpc_services.len() != 1 {
+        return Err(unsupported(
+            format!("{path}.grpc_services"),
+            format!(
+                "exactly one ADS gRPC service is implemented, found {}",
+                api.grpc_services.len()
+            ),
+        ));
+    }
+    let svc_path = format!("{path}.grpc_services[0]");
+    let cluster = convert_ads_grpc_service(&api.grpc_services[0], &svc_path)?;
+
+    Ok(Some(AdsConfig {
+        cluster,
+        lds,
+        cds,
+        initial_fetch_timeout: None,
+        node: NodeIdentity {
+            id: b.node.as_ref().map(|n| n.id.clone()).unwrap_or_default(),
+            cluster: b
+                .node
+                .as_ref()
+                .map(|n| n.cluster.clone())
+                .unwrap_or_default(),
+        },
+    }))
+}
+
+/// Only the `envoy_grpc` target is implemented -- `google_grpc` is a whole
+/// second gRPC stack with its own TLS and channel configuration.
+fn convert_ads_grpc_service(svc: &core_v3::GrpcService, path: &str) -> Result<String, ConfigError> {
+    use core_v3::grpc_service::TargetSpecifier;
+    match &svc.target_specifier {
+        Some(TargetSpecifier::EnvoyGrpc(e)) => {
+            if e.cluster_name.is_empty() {
+                return Err(invalid(
+                    format!("{path}.envoy_grpc.cluster_name"),
+                    "the ADS cluster name must not be empty",
+                ));
+            }
+            Ok(e.cluster_name.clone())
+        }
+        Some(TargetSpecifier::GoogleGrpc(_)) => Err(unsupported(
+            format!("{path}.google_grpc"),
+            "the google_grpc client is not implemented; use envoy_grpc",
+        )),
+        None => Err(invalid(
+            path,
+            "a gRPC service must set one of its target members",
         )),
     }
 }

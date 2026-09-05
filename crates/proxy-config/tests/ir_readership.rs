@@ -90,6 +90,59 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
+    // --- WP-20 increment 1: the ADS config surface, lowered but not yet
+    //     consumed. The client that will read all of these is `proxy-xds`,
+    //     which is (as of 2026-09-04) eleven lines of doc comment. Increment 3
+    //     builds the transport and increment 4 applies resources; DELETE these
+    //     five entries then -- the staleness check below is what forces it.
+    AllowlistEntry {
+        struct_name: "ConfigSnapshot",
+        field_name: "ads",
+        kind: EntryKind::KnownInert,
+        reason: "WP-20 increment 1 lowers bootstrap dynamic_resources into the \
+                  IR so the config surface can be validated and refused \
+                  precisely (ground rule #1) before any client exists. Nothing \
+                  dials a control plane yet: proxy-xds is a doc comment. \
+                  Increment 3 (the gRPC transport) is the first reader; \
+                  increment 4 publishes resources through \
+                  ConfigPublisher::publish. Delete this entry then.",
+    },
+    AllowlistEntry {
+        struct_name: "AdsConfig",
+        field_name: "lds",
+        kind: EntryKind::KnownInert,
+        reason: "WP-20: which resource types are subscribed over ADS. Read by \
+                  the subscription state machine (increment 2/3), which does \
+                  not exist yet. See ConfigSnapshot.ads's entry.",
+    },
+    AllowlistEntry {
+        struct_name: "AdsConfig",
+        field_name: "cds",
+        kind: EntryKind::KnownInert,
+        reason: "WP-20: as AdsConfig.lds -- the CDS half of the same \
+                  subscription set. See ConfigSnapshot.ads's entry.",
+    },
+    AllowlistEntry {
+        struct_name: "AdsConfig",
+        field_name: "initial_fetch_timeout",
+        kind: EntryKind::KnownInert,
+        reason: "WP-20 carries this so the config surface is complete, but its \
+                  consumer is WP-21's warming logic (a listener with an RDS \
+                  dependency waits for its route config, bounded by this), not \
+                  WP-20's client. It therefore outlives the other four entries \
+                  here -- expect to delete it with WP-21, not with WP-20.",
+    },
+    AllowlistEntry {
+        struct_name: "AdsConfig",
+        field_name: "node",
+        kind: EntryKind::KnownInert,
+        reason: "WP-20: the xDS Node identity (S8) echoed on every \
+                  DiscoveryRequest. Read when increment 3 builds the first \
+                  request. Note bootstrap `node` was already partly lowered \
+                  before this increment, but only for node.metadata's tracing \
+                  key -- the protocol identity (id, cluster) was not in the IR \
+                  at all. See ConfigSnapshot.ads's entry.",
+    },
     AllowlistEntry {
         struct_name: "ClusterConfig",
         field_name: "usage_dialect",

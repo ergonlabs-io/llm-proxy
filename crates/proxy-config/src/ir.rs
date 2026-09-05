@@ -59,7 +59,54 @@ pub struct ConfigSnapshot {
     /// [`TracingConfig`]'s doc for the config shape and the sampling
     /// contract.
     pub tracing: Option<TracingConfig>,
+    /// ADS transport configuration (WP-20), from bootstrap `dynamic_resources`.
+    /// `None` -- the default, and every release through v0.2.0 -- means fully
+    /// static configuration and no control-plane connection is ever attempted.
+    ///
+    /// This sits at the snapshot root rather than in a per-resource map (like
+    /// [`Self::listeners`]) because it is bootstrap-level: it describes where
+    /// resources come FROM, not a resource.
+    pub ads: Option<AdsConfig>,
     pub version: SnapshotVersion,
+}
+
+// -------------------------------------------------------------------- ads --
+
+/// How to reach the ADS control plane, lowered from bootstrap
+/// `dynamic_resources` (WP-20). Config surface only: nothing in this snapshot
+/// dials anything, and the client that will is `proxy-xds`.
+///
+/// v1 is deliberately narrow -- `api_type: GRPC`, `transport_api_version: V3`,
+/// and exactly one `envoy_grpc` service naming a statically-defined cluster.
+/// Every other member of `ApiConfigSource` is refused at load with its full
+/// dotted path rather than silently ignored (ground rule #1); see
+/// `lower::convert_dynamic_resources`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdsConfig {
+    /// The statically-defined cluster carrying the ADS stream. The proto is
+    /// explicit that this cluster "must be statically defined", so lowering
+    /// validates it exists in this same bootstrap.
+    pub cluster: ClusterName,
+    /// Whether listeners arrive over the ADS channel (bootstrap `lds_config`
+    /// with its `ads` field set).
+    pub lds: bool,
+    /// Whether clusters arrive over the ADS channel (bootstrap `cds_config`
+    /// with its `ads` field set).
+    pub cds: bool,
+    /// S8 / WP-21's `initial_fetch_timeout`. Carried now so the config surface
+    /// is complete; WP-21 is what consumes it for warming.
+    pub initial_fetch_timeout: Option<Duration>,
+    /// The xDS `Node` identity echoed on every `DiscoveryRequest` (S8).
+    pub node: NodeIdentity,
+}
+
+/// The bootstrap `node` fields the xDS protocol itself needs. Distinct from
+/// `node.metadata`, which this crate already reads for an unrelated purpose
+/// (see `lower::convert_tracing_metadata`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeIdentity {
+    pub id: String,
+    pub cluster: String,
 }
 
 // ---------------------------------------------------------------- tracing --
