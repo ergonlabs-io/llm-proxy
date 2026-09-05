@@ -9,3 +9,7 @@
 //!
 //! Scale rule (PLAN.md Part 8.5): on any xDS failure keep serving last-good
 //! config with backoff — never NACK-storm, never shed state.
+
+pub mod subscription;
+
+pub use subscription::{Request, Subscription, SubscriptionState, Verdict};
