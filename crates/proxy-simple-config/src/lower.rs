@@ -214,10 +214,17 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     }
     // `models:` entries (WP-49) each get an implicit route on their own
     // name, evaluated after the explicit `routes:` list (first match wins,
-    // same S1 rule) and before the 404 backstop.
-    for (name, model) in &config.models {
+    // same S1 rule) and before the 404 backstop. WP-49 increment 2:
+    // `model_catalog_order` puts them in exact > longest-prefix > `*`
+    // precedence order rather than the catalogue's alphabetical key order.
+    for (name, model) in model_catalog_order(config) {
         routes.push(lower_model(config, name, model, &mut warnings)?);
     }
+    // A bare `*` catalogue entry (increment 2's empty-prefix tier) is just
+    // as much a catch-all as a `routes:` rule with `model: "*"` -- it also
+    // needs to suppress the synthetic 404 below, or that 404 becomes a dead,
+    // never-reached route sitting after it (harmless, but confusing output).
+    has_catch_all |= config.models.contains_key("*");
     if !has_catch_all {
         routes.push(json!({
             "match": { "prefix": "/" },
@@ -1007,6 +1014,108 @@ fn provider_headers_to_add(
 }
 
 // -------------------------------------------------------------------- models --
+
+/// A `models:` catalogue key's shape (WP-49 increment 2). The only two legal
+/// shapes both fall out of where a trailing `*` sits, so classifying and
+/// validating are the same pass -- see [`classify_model_key`].
+///
+/// The bare catch-all `*` is deliberately NOT a third variant: it is exactly
+/// `Prefix("")`, an empty prefix. That is what turns "longest prefix, then
+/// catch-all" (two rules to remember) into one: sort prefixes by descending
+/// length, and the empty one sorts last for free. See `model_catalog_order`.
+///
+/// **Shared semantics, not shared code.** `proxy_filters::model_authz::ModelPattern`
+/// (WP-50 3a, per-tenant model allow-lists) matches trailing-`*` globs with
+/// the identical rule -- exact, or `prefix*` via `str::starts_with`. This
+/// crate cannot depend on `proxy-filters` in production code (it is a
+/// dev-dependency only, kept out of the dialect's dependency tree -- see
+/// `Cargo.toml`), so the matching rule is re-implemented here rather than
+/// imported. **The two must keep agreeing on what a pattern means** -- see
+/// this increment's report for why a shared crate wasn't built for this yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelKeyShape {
+    /// No `*` at all -- matches this exact model name, and only this one.
+    Exact,
+    /// Zero or more literal characters (`prefix`) followed by exactly one
+    /// trailing `*` -- matches any model name starting with `prefix`,
+    /// `prefix` itself included. An empty `prefix` is the bare `*`.
+    Prefix(String),
+}
+
+/// Classifies (and validates the shape of) one `models:` catalogue key.
+/// Legal shapes: no `*` (exact), or a single trailing `*` (`prefix*`,
+/// including the bare `*`). Anything else -- `*` in the middle, more than
+/// one `*`, a leading `*` that isn't the whole pattern -- is a load error
+/// naming the unsupported form, same as a mid-string glob in `routes[].model`
+/// would be accepted (via `safe_regex`) but this narrower catalogue syntax
+/// is not: see the module doc on why `models:` keys are deliberately a
+/// smaller grammar.
+pub(crate) fn classify_model_key(name: &str) -> Result<ModelKeyShape, String> {
+    match name.find('*') {
+        None => Ok(ModelKeyShape::Exact),
+        // The FIRST `*` sits at the last byte -- the only way that can be
+        // true is if it is also the ONLY `*` (a second one earlier would be
+        // found first). So this one check rules out both "more than one
+        // `*`" and "a `*` that isn't trailing" at once.
+        Some(pos) if pos == name.len() - 1 => Ok(ModelKeyShape::Prefix(name[..pos].to_string())),
+        Some(_) => Err(format!(
+            "`{name}` is not a supported model pattern -- `*` may appear at most once, and \
+             only as a trailing wildcard (`prefix*`) or alone (`*`); a mid-string `*` (e.g. \
+             `*-4o`, `gpt-*-mini`) is not supported here"
+        )),
+    }
+}
+
+/// `models:` entries in WP-49 increment 2's precedence order: exact match
+/// wins, then the longest matching prefix, then the (empty-prefix) catch-all
+/// -- see [`ModelKeyShape`]'s doc for why that is one sort rule, not two.
+///
+/// **Why a sort, not a lookup trie, even though the plan's own suggestion is
+/// a trie:** the thing that actually resolves one request to one catalogue
+/// entry is the Envoy route table this function feeds -- `lower_model`
+/// builds an ordinary Envoy route per entry, and Envoy's HTTP connection
+/// manager evaluates routes in list order, first match wins, exactly as it
+/// already does for the hand-written `routes:` list above. That evaluator
+/// is List-shaped, not something this crate can swap for a trie underneath
+/// it -- so however this function computes the order, the per-REQUEST cost
+/// is Envoy's, unaffected by anything here. What this function owns is
+/// purely a load-time question -- "what order do N config entries go into
+/// that list" -- and a stable sort answers it in O(n log n) over the
+/// catalogue once, at config-load, never per request. A trie would earn its
+/// keep if this crate ever resolves a model name to a route ITSELF (a
+/// custom filter, bypassing Envoy's route table) rather than emitting one;
+/// nothing today does that, so building one now would be a structure with
+/// no caller.
+///
+/// Ties: two DIFFERENT prefixes of equal length can never both match the
+/// same request (their Nth character would have to be two different values
+/// at once), so the alphabetical tie-break below never actually decides a
+/// real match -- it only makes the emitted bootstrap byte-for-byte
+/// deterministic. A tie on the SAME prefix text is a duplicate key, already
+/// rejected at parse time by `model::deserialize_model_catalog` before this
+/// function ever sees it.
+///
+/// `validate_semantics` has already classified (and would have rejected) an
+/// illegal key shape before lowering runs, so `classify_model_key` failing
+/// here would mean a config reached lowering that parse-time validation was
+/// supposed to stop -- an internal bug, not a user-facing error, hence
+/// `.expect` rather than another `Result`.
+pub(crate) fn model_catalog_order(config: &SimpleConfig) -> Vec<(&String, &ModelDef)> {
+    let mut exact = Vec::new();
+    let mut prefixed: Vec<(usize, &String, &ModelDef)> = Vec::new();
+    for (name, model) in &config.models {
+        match classify_model_key(name).expect("validated: models.<name> has a legal shape") {
+            ModelKeyShape::Exact => exact.push((name, model)),
+            ModelKeyShape::Prefix(prefix) => prefixed.push((prefix.len(), name, model)),
+        }
+    }
+    // Longest prefix first; alphabetical by name is the deterministic
+    // tie-break the doc comment above explains is never load-bearing for
+    // correctness, only for a stable bootstrap.
+    prefixed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    exact.extend(prefixed.into_iter().map(|(_, name, model)| (name, model)));
+    exact
+}
 
 /// `models.<name>` -> one route (WP-49). `providers[0]` is the only entry
 /// this increment ever uses to serve traffic -- it produces the route,

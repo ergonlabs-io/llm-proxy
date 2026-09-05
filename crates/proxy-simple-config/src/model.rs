@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 /// Top-level keys reserved for future schema versions; rejected in v0 so they
 /// can be added compatibly later.
@@ -36,15 +37,66 @@ pub struct SimpleConfig {
     pub providers: BTreeMap<String, Provider>,
     /// Logical models (WP-49): a client-facing name mapped to an ordered
     /// list of backends able to serve it. Each entry gets an implicit route
-    /// matching its name exactly, in addition to whatever `routes` express.
-    /// `BTreeMap` for the same determinism reason as `providers`.
-    #[serde(default)]
+    /// matching its name (exactly, or by wildcard precedence -- WP-49
+    /// increment 2, see `lower::model_catalog_order`), in addition to
+    /// whatever `routes` express. `BTreeMap` for the same determinism reason
+    /// as `providers`; `deserialize_with` on top of that catches a literal
+    /// duplicate key, which a plain `BTreeMap` deserialize would otherwise
+    /// silently collapse to "last one wins" (see `deserialize_model_catalog`).
+    #[serde(default, deserialize_with = "deserialize_model_catalog")]
     pub models: BTreeMap<String, ModelDef>,
     pub routes: Vec<RouteRule>,
     #[serde(default)]
     pub limits: Vec<Limit>,
     #[serde(default)]
     pub observability: Option<Observability>,
+}
+
+/// Deserializes `models:` into a `BTreeMap`, erroring on a literal duplicate
+/// key instead of silently keeping only the last one (WP-49 increment 2:
+/// "a genuine tie ... is a config-load error naming both offenders, never a
+/// silent pick" -- ground rule #1 applies to ambiguity, not just unknown
+/// fields). `serde`'s own blanket `BTreeMap` deserialize can't tell us this:
+/// it inserts key by key, so a repeated key just overwrites the earlier
+/// entry before we ever see it. Rust note: this is a hand-written
+/// `Deserialize`-shaped visitor (via `deserialize_with`, so it plugs into
+/// `#[derive(Deserialize)]` for the one field that needs different behavior)
+/// -- `visit_map` gets one `(key, value)` pair at a time off the underlying
+/// YAML mapping, same protocol serde's own container `Deserialize` impls use.
+fn deserialize_model_catalog<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, ModelDef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ModelCatalogVisitor;
+
+    impl<'de> Visitor<'de> for ModelCatalogVisitor {
+        type Value = BTreeMap<String, ModelDef>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of model name -> model definition")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, ModelDef>()? {
+                if out.insert(key.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate `models` entry `{key}` -- each catalogue key must be \
+                         unique, and precedence between two identical patterns is never \
+                         resolved silently"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(ModelCatalogVisitor)
 }
 
 /// `listen`: shorthand `host:port` string, or an object to enable TLS.

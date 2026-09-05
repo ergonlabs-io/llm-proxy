@@ -7,7 +7,7 @@
 
 use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
-use crate::lower::{dialect_from_models, resolved_dialect};
+use crate::lower::{classify_model_key, dialect_from_models, resolved_dialect};
 use crate::model::{
     is_valid_provider_name, Listen, ModelProviderRef, ProviderModelRef, SimpleConfig, RESERVED_KEYS,
 };
@@ -195,6 +195,15 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
 
     for (name, model) in &config.models {
         let path = format!("models.{name}");
+        // WP-49 increment 2: a catalogue key's `*` placement must be exact,
+        // a single trailing wildcard, or the bare `*` -- anything else (a
+        // mid-string glob, more than one `*`) is a load error naming this
+        // path, never silently treated as a literal or as `routes[].model`'s
+        // wider `safe_regex` grammar.
+        classify_model_key(name).map_err(|reason| ConfigError::InvalidValue {
+            field_path: path.clone(),
+            reason,
+        })?;
         if model.providers.is_empty() {
             return Err(ConfigError::InvalidValue {
                 field_path: format!("{path}.providers"),

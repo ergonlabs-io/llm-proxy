@@ -39,17 +39,22 @@
       }
     },
     "models": {
-      "description": "Logical model catalogue (WP-49): a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name exactly, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. WP-49 increment 1 is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a load-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) lands with WP-35.",
+      "description": "Logical model catalogue (WP-49): a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. WP-49 increment 1 is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a load-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) lands with WP-35.",
       "default": {},
       "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/ModelDef" },
+      "patternProperties": {
+        "^([^*]+\\*?|\\*)$": { "$ref": "#/$defs/ModelDef" }
+      },
+      "additionalProperties": false,
       "examples": [{
         "claude-sonnet-4-5": {
           "providers": [
             "anthropic/claude-sonnet-4-5-20250929",
             { "provider": "vertex-us", "model": "claude-sonnet-4-5@20250929", "dialect": "anthropic" }
           ]
-        }
+        },
+        "claude-*": { "providers": ["anthropic/claude-3-5-haiku-latest"] },
+        "*": { "providers": ["openai/gpt-4o-mini"] }
       }]
     },
     "routes": {

@@ -2116,6 +2116,289 @@ observability:
     assert_eq!(got, "anthropic");
 }
 
+// ---------------------------------------------- WP-49 increment 2: wildcards --
+//
+// `models:` catalogue keys now take `*`, matched exact > longest prefix >
+// bare `*` catch-all -- see `lower::model_catalog_order`'s doc for why that
+// is one sort rule rather than two, and `lower::classify_model_key` for the
+// legal shapes.
+
+/// The full precedence ladder in one config: an exact key, two prefixes of
+/// different lengths, and a bare `*` catch-all. Each of four distinct model
+/// names exercises exactly one tier, and the tier that wins is read off the
+/// target CLUSTER, not just the header matcher -- proving the route that
+/// wins is also the route that was meant to.
+#[test]
+fn model_catalog_precedence_ladder() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+  p-gpt4: { base_url: "https://p-gpt4.example.com" }
+  p-gpt: { base_url: "https://p-gpt.example.com" }
+  p-catchall: { base_url: "https://p-catchall.example.com" }
+routes:
+  - { model: "unrelated", provider: openai }
+models:
+  gpt-4o:
+    providers: [openai]
+  "gpt-4*":
+    providers: [p-gpt4]
+  "gpt-*":
+    providers: [p-gpt]
+  "*":
+    providers: [p-catchall]
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes must be an array");
+
+    // routes[0] is the explicit `routes:` rule; routes[1..] are the four
+    // `models:` entries, in precedence order: exact, then longest prefix
+    // first, then the (empty-prefix) catch-all last.
+    assert_eq!(routes.len(), 5, "routes: {routes:#?}");
+    let m = |i: usize| &routes[i];
+    assert_eq!(
+        m(1)["match"]["headers"][0]["string_match"]["exact"],
+        "gpt-4o"
+    );
+    assert_eq!(m(1)["route"]["cluster"], "provider:openai");
+    assert_eq!(
+        m(2)["match"]["headers"][0]["string_match"]["prefix"],
+        "gpt-4"
+    );
+    assert_eq!(m(2)["route"]["cluster"], "provider:p-gpt4");
+    assert_eq!(
+        m(3)["match"]["headers"][0]["string_match"]["prefix"],
+        "gpt-"
+    );
+    assert_eq!(m(3)["route"]["cluster"], "provider:p-gpt");
+    assert!(
+        m(4)["match"]["headers"].is_null(),
+        "the bare `*` catch-all carries no header matcher: {:?}",
+        m(4)
+    );
+    assert_eq!(m(4)["route"]["cluster"], "provider:p-catchall");
+}
+
+/// Two competing prefixes, isolated from the rest of the ladder: the
+/// LONGER one wins regardless of catalogue (BTreeMap/YAML) order -- this is
+/// the acceptance clause the plan states explicitly ("with both `claude-*`
+/// and `claude-sonnet-*` defined, `claude-sonnet-4-5` resolves to the
+/// latter").
+#[test]
+fn longest_matching_prefix_wins_between_two_prefixes() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  broad: { base_url: "https://broad.example.com" }
+  narrow: { base_url: "https://narrow.example.com" }
+routes:
+  - { model: "unrelated", provider: broad }
+models:
+  "claude-*":
+    providers: [broad]
+  "claude-sonnet-*":
+    providers: [narrow]
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes must be an array");
+    // routes[0] explicit, [1] `claude-sonnet-*`, [2] `claude-*`, [3] the
+    // synthetic 404 (neither prefix is a catch-all, so it's still appended
+    // -- unchanged pre-existing behavior, not this test's concern).
+    assert_eq!(routes.len(), 4, "routes: {routes:#?}");
+    // The longer prefix (`claude-sonnet-`) must be listed FIRST -- Envoy
+    // matches first-match-wins, so list order IS precedence order here.
+    assert_eq!(
+        routes[1]["match"]["headers"][0]["string_match"]["prefix"],
+        "claude-sonnet-"
+    );
+    assert_eq!(routes[1]["route"]["cluster"], "provider:narrow");
+    assert_eq!(
+        routes[2]["match"]["headers"][0]["string_match"]["prefix"],
+        "claude-"
+    );
+    assert_eq!(routes[2]["route"]["cluster"], "provider:broad");
+}
+
+/// A bare `*` catalogue entry serves everything nothing more specific
+/// claimed -- proven here against a name that matches neither the exact key
+/// nor the one prefix.
+#[test]
+fn catalog_catch_all_serves_what_nothing_else_matches() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  specific: { base_url: "https://specific.example.com" }
+  fallback: { base_url: "https://fallback.example.com" }
+routes:
+  - { model: "unrelated", provider: specific }
+models:
+  gpt-4o:
+    providers: [specific]
+  "*":
+    providers: [fallback]
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes must be an array");
+    // exact `gpt-4o` first, bare `*` last, no synthetic 404 (the catch-all
+    // already covers every remaining request).
+    assert_eq!(routes.len(), 3, "routes: {routes:#?}");
+    assert_eq!(routes[2]["route"]["cluster"], "provider:fallback");
+    assert!(routes[2]["match"]["headers"].is_null());
+    assert!(
+        !routes.iter().any(|r| r["direct_response"]["status"] == 404),
+        "a catch-all model entry must not leave a dead 404 backstop behind it: {routes:#?}"
+    );
+}
+
+/// Today's behavior, unchanged by this increment: with no `*` anywhere (not
+/// in `routes:`, not in `models:`), a name matching nothing still falls
+/// through to the synthetic 404 backstop `missing_catch_all_gets_404_backstop`
+/// already covers for `routes:` alone -- this pins the same guarantee when
+/// the only routing surface configured is `models:`.
+#[test]
+fn models_only_with_no_catch_all_still_gets_404_backstop() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "unrelated", provider: openai }
+models:
+  gpt-4o:
+    providers: [openai]
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes must be an array");
+    let last = routes.last().expect("at least one route");
+    assert_eq!(last["direct_response"]["status"], 404);
+}
+
+/// Every shape the plan explicitly names as illegal: a leading `*` that
+/// isn't the whole pattern, a mid-string `*`, and a repeated `*`. Each must
+/// fail at PARSE time (`validate_semantics`), at the SAME dotted path
+/// (`models.<name>`) a shape error on any other `models:` field would use --
+/// never silently treated as a literal, and never accepted as
+/// `routes[].model`'s wider `safe_regex` grammar would accept it.
+#[test]
+fn illegal_model_catalog_key_shapes_fail_at_parse_time() {
+    for bad in ["*-4o", "gpt-*-mini", "**", "a*b*"] {
+        let err = parse(&format!(
+            r#"
+version: 0
+providers:
+  openai: {{ api_key: ${{OPENAI_API_KEY}} }}
+routes:
+  - {{ model: "unrelated", provider: openai }}
+models:
+  "{bad}":
+    providers: [openai]
+"#
+        ))
+        .expect_err(&format!("`{bad}` must be rejected"));
+        let ConfigError::InvalidValue { field_path, reason } = &err else {
+            panic!("`{bad}`: expected InvalidValue, got: {err}");
+        };
+        assert_eq!(field_path, &format!("models.{bad}"), "`{bad}`");
+        assert!(
+            reason.contains('*'),
+            "`{bad}`: reason should explain the `*` rule, got {reason}"
+        );
+    }
+}
+
+/// The same catalogue key written twice is a load error naming the
+/// duplicate, never a silent "last one wins" -- which is what a plain
+/// `BTreeMap` deserialize would otherwise do (see
+/// `model::deserialize_model_catalog`'s doc).
+#[test]
+fn duplicate_model_catalog_key_is_rejected() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  a: { base_url: "https://a.example.com" }
+  b: { base_url: "https://b.example.com" }
+routes:
+  - { model: "unrelated", provider: a }
+models:
+  "gpt-4*":
+    providers: [a]
+  "gpt-4*":
+    providers: [b]
+"#,
+    )
+    .expect_err("a literal duplicate `models:` key must be rejected");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "models");
+    assert!(
+        reason.contains("gpt-4*") && reason.to_lowercase().contains("duplicate"),
+        "should name the duplicated key: {reason}"
+    );
+}
+
+/// Back-compat, restated for increment 2: a catalogue of ONLY exact names
+/// (no `*` anywhere) lowers in the exact same order as before this
+/// increment -- alphabetical, i.e. whatever `BTreeMap`'s key order already
+/// was. `model_catalog_order` must be a no-op reshuffle for this case.
+#[test]
+fn exact_only_catalog_lowers_in_the_same_order_as_before() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "unrelated", provider: openai }
+models:
+  zeta:
+    providers: [openai]
+  alpha:
+    providers: [openai]
+  mid:
+    providers: [openai]
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    let routes = hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes must be an array");
+    let names: Vec<&str> = routes[1..4]
+        .iter()
+        .map(|r| {
+            r["match"]["headers"][0]["string_match"]["exact"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    // Alphabetical -- `BTreeMap`'s natural order, unaffected by the YAML
+    // declaration order above (zeta, alpha, mid).
+    assert_eq!(names, ["alpha", "mid", "zeta"]);
+}
+
 /// **The join between the two crates, which nothing else tests.**
 ///
 /// `proxy-simple-config` writes provider credentials into
