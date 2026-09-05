@@ -1534,6 +1534,14 @@ dependencies = [
 [[package]]
 name = "proxy-xds"
 version = "0.2.0"
+dependencies = [
+ "controlplane",
+ "futures",
+ "proxy-api",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+]
 
 [[package]]
 name = "quote"

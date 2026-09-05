@@ -4,11 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# No dependencies: this crate is a placeholder for Lane E (WP-20/21/22) and
-# contains no code yet -- src/lib.rs is doc comments only. It previously
-# declared proxy-api and proxy-config, which nothing referenced, so the
-# workspace carried two edges that existed only in anticipation. Re-add them
-# when there is code that uses them (WP-40).
+# WP-20 increment 3a adds the first real code (the ADS gRPC request/response
+# pump), so this crate now has real edges. `proxy-config` is deliberately
+# still NOT one of them: validation is injected as a callback rather than
+# implemented here (see client.rs), which is what keeps this crate free of
+# ground-rule #2's proto boundary until increment 4 wires real validation.
+[dependencies]
+proxy-api = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The WP-28 puppet ADS server this increment's tests run the pump against
+# over a real loopback socket. Not a workspace.dependencies entry: nothing
+# else depends on it yet (see testing/controlplane's own Cargo.toml).
+controlplane = { path = "../../testing/controlplane" }
 
 [lints]
 workspace = true
