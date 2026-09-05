@@ -1,4 +1,5 @@
-//! WP-20 increment 3a acceptance: the ADS gRPC request/response pump, run
+//! WP-20 increment 3a/3b acceptance: the ADS gRPC request/response pump and
+//! the reconnect loop above it, run
 //! against `testing/controlplane`'s `ScriptedAds` over a real loopback
 //! socket -- the same model `testing/controlplane/tests/ads_selftest.rs`
 //! uses to drive the generated client stub directly.
@@ -8,12 +9,13 @@
 //! (`Harness::spawn` binds `127.0.0.1:0`; rule 15).
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use controlplane::{Harness, RequestKind, RequestLog, Step};
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
-use proxy_xds::{AdsClient, Subscription, SubscriptionState, Verdict};
+use proxy_xds::{AdsClient, BackoffPolicy, Reconnect, Subscription, SubscriptionState, Verdict};
 
 const CDS: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 const RDS: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
@@ -67,7 +69,7 @@ async fn accept_produces_an_ack_with_the_accepted_version_and_nonce() {
         .expect("client connects");
 
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
-    let run = tokio::spawn(async move { ads.run_once(&mut client, always_accept()).await });
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
 
     wait_for_log_len(&harness.log, 2).await;
 
@@ -133,7 +135,8 @@ async fn reject_produces_a_nack_with_the_previous_version_and_new_nonce() {
             Verdict::Accept
         }
     });
-    let run = tokio::spawn(async move { ads.run_once(&mut client, validate).await });
+    let mut validate = validate;
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut validate).await });
 
     // [0] initial, [1] ACK of v1, [2] NACK of v2.
     wait_for_log_len(&harness.log, 3).await;
@@ -187,7 +190,7 @@ async fn empty_name_subscription_is_never_requested() {
         SubscriptionState::new(CDS, Subscription::Wildcard),
         SubscriptionState::new(RDS, Subscription::Names(BTreeSet::new())),
     ]);
-    let run = tokio::spawn(async move { ads.run_once(&mut client, always_accept()).await });
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
 
     // [0] CDS initial, [1] CDS ACK -- and nothing else, ever, for RDS.
     wait_for_log_len(&harness.log, 2).await;
@@ -199,5 +202,293 @@ async fn empty_name_subscription_is_never_requested() {
     );
 
     run.abort();
+    harness.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// WP-20 increment 3b: reconnect, resync, and backoff.
+// ---------------------------------------------------------------------------
+
+/// A `Reconnect` whose sleep records what it was asked to wait for and then
+/// returns immediately, and whose jitter draw is the constant `1.0` (the top
+/// of the range) so every recorded delay is the policy's exact cap for that
+/// attempt.
+///
+/// Returning immediately is what keeps these tests at milliseconds: the
+/// assertion is "the loop asked for 500ms", which is the real claim -- that
+/// it actually slept is `tokio::time::sleep`'s problem, not WP-20's.
+fn recording_reconnect(policy: BackoffPolicy) -> (Reconnect, Arc<Mutex<Vec<Duration>>>) {
+    let recorded: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
+    let reconnect = Reconnect {
+        policy,
+        rng: Box::new(|| 1.0),
+        sleep: Box::new(move |delay| {
+            sink.lock().expect("delay sink mutex poisoned").push(delay);
+            Box::pin(std::future::ready(()))
+        }),
+    };
+    (reconnect, recorded)
+}
+
+/// Polls `delays` until it holds at least `want` entries, or panics after
+/// `WAIT_TIMEOUT`.
+async fn wait_for_delays(delays: &Arc<Mutex<Vec<Duration>>>, want: usize) -> Vec<Duration> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        let seen = delays.lock().expect("delay sink mutex poisoned").clone();
+        if seen.len() >= want {
+            return seen;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {WAIT_TIMEOUT:?} waiting for {want} backoff delays, saw {seen:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// WP-20's `reconnect-resync` acceptance scenario, and S8's reconnect rule:
+///
+/// > Reconnect: new stream, re-send all subscriptions with acked versions
+/// > (versions persist across streams for same server).
+///
+/// The script serves v1, drops the stream, then serves v2. The claim is
+/// about the FIRST request of the second stream: it must carry `v1` (the
+/// version survived) and an EMPTY nonce (the nonce did not). Sending `n1`
+/// there would echo a nonce the new stream never issued; sending an empty
+/// version would ask the control plane to re-send config we already have.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_resends_the_acked_version_with_no_nonce() {
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+        Step::DropStream,
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v2".to_string(),
+            nonce: "n2".to_string(),
+            resources: vec![],
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
+    let (reconnect, _delays) = recording_reconnect(BackoffPolicy::default());
+    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+
+    // Three requests, not four: `ScriptedAds` reaches its `DropStream` step
+    // the instant it has pushed v1 and returns without reading again, so the
+    // client's ACK of v1 lands on a stream nobody is recording. That costs
+    // nothing here -- the claim under test is what the SECOND stream opens
+    // with, and stream 2 carrying `v1` is itself proof the client accepted
+    // v1 and kept it across the reconnect.
+    wait_for_log_len(&harness.log, 3).await;
+    let log = harness.log.snapshot();
+
+    assert_eq!(log[0].stream_id, 1);
+    assert_eq!(
+        log[0].version_info, "",
+        "the first request ever carries no version"
+    );
+
+    assert_eq!(
+        log[1].stream_id, 2,
+        "the client must open a NEW stream after the drop: {log:?}"
+    );
+    assert_eq!(
+        log[1].version_info, "v1",
+        "the acked version must persist across the reconnect"
+    );
+    assert_eq!(
+        log[1].response_nonce, "",
+        "the nonce belongs to the dropped stream and must NOT be echoed on the new one"
+    );
+    assert_eq!(
+        log[1].kind(),
+        RequestKind::Initial,
+        "a resync request carries no nonce, so it reads as Initial"
+    );
+
+    assert_eq!(log[2].stream_id, 2);
+    assert_eq!(log[2].kind(), RequestKind::Ack);
+    assert_eq!(log[2].version_info, "v2");
+    assert_eq!(log[2].response_nonce, "n2");
+
+    run.abort();
+    harness.shutdown().await;
+}
+
+/// The first reconnect must wait, and it must wait the policy's floor rather
+/// than nothing. A zero first delay is what turns a control plane restart
+/// into a reconnect storm (PLAN.md Part 8.5: "never NACK-storm").
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_reconnect_waits_the_base_interval() {
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+        Step::DropStream,
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v2".to_string(),
+            nonce: "n2".to_string(),
+            resources: vec![],
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
+    let (reconnect, delays) = recording_reconnect(BackoffPolicy::default());
+    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+
+    let seen = wait_for_delays(&delays, 1).await;
+    assert_eq!(
+        seen[0],
+        Duration::from_millis(500),
+        "with a max jitter draw the first reconnect must wait the full base interval"
+    );
+
+    run.abort();
+    harness.shutdown().await;
+}
+
+/// Consecutive streams that never deliver a response must back off further
+/// each time -- and a stream that DOES deliver one resets the curve to its
+/// floor. Envoy resets its xDS backoff on message receipt for exactly this
+/// reason: a control plane that accepts and instantly drops would otherwise
+/// be hammered at the floor forever.
+///
+/// Script: three bare drops (no response at all), then a response, then a
+/// drop. With a constant max draw the delays must read
+/// `[500ms, 1s, 2s, 500ms]` -- the doubling, then the reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn backoff_grows_across_dead_streams_and_resets_after_a_response() {
+    let harness = Harness::spawn(vec![
+        Step::DropStream,
+        Step::DropStream,
+        Step::DropStream,
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+        Step::DropStream,
+    ])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
+    let (reconnect, delays) = recording_reconnect(BackoffPolicy::default());
+    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+
+    let seen = wait_for_delays(&delays, 4).await;
+    assert_eq!(
+        &seen[..4],
+        &[
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+        ],
+        "expected the curve to double across dead streams then reset after the v1 response"
+    );
+
+    run.abort();
+    harness.shutdown().await;
+}
+
+/// `run` must call [`SubscriptionState::reset_stream`] before each new
+/// stream, and this test observes the state directly rather than the wire.
+///
+/// It has to, and the reason is worth recording: `initial_request()` hardcodes
+/// `response_nonce: None`, so a `run` that forgot the reset would still put a
+/// correct (nonce-free) resync request on the wire. The reset is therefore
+/// **state hygiene, not the wire guarantee** -- `last_nonce()` is public, and
+/// increment 4 reads it. A mutation removing the reset survives every
+/// wire-level assertion in this file and fails only here.
+///
+/// Rust note: `tokio::time::timeout` around `run` (whose return type is `!`)
+/// is what makes the client inspectable -- the timeout drops the future, which
+/// ends the `&mut ads` borrow, and the states are readable afterwards. That is
+/// why this test does not `tokio::spawn` the way its neighbours do.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_clears_the_nonce_but_keeps_the_version_across_a_reconnect() {
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+        // Give the client time to read v1 and record its nonce before the
+        // stream goes away, so the assertion below is about the reset and
+        // not about a response the client never saw.
+        Step::Wait {
+            duration: Duration::from_millis(150),
+        },
+        Step::DropStream,
+        // Stream 2 sends nothing: whatever `last_nonce` reads afterwards was
+        // put there by stream 1, or cleared by the reset.
+        Step::Wait {
+            duration: Duration::from_secs(30),
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
+    let (reconnect, delays) = recording_reconnect(BackoffPolicy::default());
+
+    let _ = tokio::time::timeout(
+        Duration::from_millis(800),
+        ads.run(&mut client, always_accept(), reconnect),
+    )
+    .await;
+
+    assert!(
+        !delays.lock().expect("delay sink mutex poisoned").is_empty(),
+        "the stream must have been dropped and reconnected at least once"
+    );
+
+    let state = &ads.states()[0];
+    assert_eq!(
+        state.acked_version(),
+        Some("v1"),
+        "the acked version belongs to the server and survives the reconnect"
+    );
+    assert_eq!(
+        state.last_nonce(),
+        None,
+        "the nonce belongs to the dropped stream and must be cleared by reset_stream"
+    );
+
     harness.shutdown().await;
 }

@@ -15,6 +15,9 @@ tonic = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
+# increment 3b: the reconnect loop's real RNG and its `warn!` when a stream ends.
+rand = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The WP-28 puppet ADS server this increment's tests run the pump against

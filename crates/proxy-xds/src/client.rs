@@ -1,4 +1,5 @@
-//! WP-20 increment 3a: the ADS gRPC request/response pump.
+//! WP-20 increments 3a and 3b: the ADS gRPC request/response pump, and the
+//! reconnect loop that keeps re-establishing it.
 //!
 //! This module owns exactly one thing: driving a single
 //! `StreamAggregatedResources` bidi stream so that
@@ -15,14 +16,18 @@
 //! - **Applying resources is increment 4's job too.** The response's
 //!   `resources` field is never read here -- only `type_url`, `version_info`
 //!   and `nonce`, which is all [`SubscriptionState::on_response`] needs.
-//! - **Reconnect and backoff are increment 3b.** [`AdsClient::run_once`]
-//!   drives ONE stream and returns when the server ends it (or the stream
-//!   errors); it does not retry, and it does not call
-//!   [`SubscriptionState::reset_stream`] -- that is the caller's job on the
-//!   next call, once increment 3b exists to make one.
+//!
+//! Increment 3b added the layer above the pump: [`AdsClient::run`] reconnects
+//! forever with a jittered backoff, calling
+//! [`SubscriptionState::reset_stream`] before each new stream so S8's
+//! "versions persist across streams, nonces do not" holds on the wire.
+//! [`AdsClient::run_once`] still drives exactly ONE stream and still resets
+//! nothing -- everything about reconnecting lives in `run`.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use proxy_api::envoy::service::discovery::v3::{DiscoveryRequest, DiscoveryResponse};
@@ -30,6 +35,7 @@ use proxy_api::google::rpc::Status as RpcStatus;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
+use crate::backoff::{self, BackoffPolicy};
 use crate::subscription::{Request, SubscriptionState, Verdict};
 
 /// Decides the verdict for one `DiscoveryResponse`.
@@ -42,9 +48,10 @@ use crate::subscription::{Request, SubscriptionState, Verdict};
 /// because it runs inside a `tokio::spawn`-able future.
 pub type Validator = Box<dyn FnMut(&DiscoveryResponse) -> Verdict + Send>;
 
-/// Errors from pumping one ADS stream. None of these are retried here --
-/// reconnecting on any of them is increment 3b's job. This type only reports
-/// what went wrong on the stream that just ended.
+/// Errors from pumping ONE ADS stream. [`AdsClient::run_once`] never retries;
+/// [`AdsClient::run`] treats every one of these as "that stream ended", logs
+/// it, and reconnects after a backoff (PLAN.md Part 8.5: keep serving
+/// last-good config, never shed state).
 #[derive(Debug, thiserror::Error)]
 pub enum AdsError {
     /// The stream itself failed (transport error, or the server closed it
@@ -104,21 +111,116 @@ fn to_proto(req: &Request) -> DiscoveryRequest {
     }
 }
 
+/// How [`AdsClient::run`] waits between streams. Both the randomness and the
+/// sleeping are injected rather than reached for, which is the whole reason
+/// the reconnect tests below take milliseconds instead of minutes: a test
+/// supplies a constant draw and a sleep that records its argument and returns
+/// immediately, then asserts the exact `Duration` the loop asked for.
+pub struct Reconnect {
+    pub policy: BackoffPolicy,
+    /// Draws the jitter, in `[0.0, 1.0]`. Same shape as
+    /// `proxy_http::retry::backoff_delay`'s.
+    pub rng: Box<dyn FnMut() -> f64 + Send>,
+    /// Waits for the delay the policy computed.
+    pub sleep: Sleep,
+}
+
+/// The sleeping half of [`Reconnect`].
+///
+/// Rust note: an `FnMut` returning a boxed future, rather than an `async fn`
+/// in a trait -- the closure has to be stored in a struct and called from a
+/// loop that already holds `&mut self`, and `Pin<Box<dyn Future>>` is the
+/// ordinary way to name "some future I will not spell out". `'static` on the
+/// future (not borrowing the closure) keeps the call site free to hold other
+/// `&mut` borrows across the await.
+pub type Sleep = Box<dyn FnMut(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+impl Reconnect {
+    /// The production wiring: Envoy's xDS mux curve, a real RNG, real sleeps.
+    pub fn real() -> Self {
+        Self {
+            policy: BackoffPolicy::default(),
+            rng: Box::new(rand::random::<f64>),
+            sleep: Box::new(|delay| Box::pin(tokio::time::sleep(delay))),
+        }
+    }
+}
+
 /// One ADS client: the per-type subscription state this proxy holds, driven
-/// over a single gRPC stream at a time by [`AdsClient::run_once`].
+/// over a single gRPC stream at a time by [`AdsClient::run_once`], and
+/// re-established across streams by [`AdsClient::run`].
 pub struct AdsClient {
     states: Vec<SubscriptionState>,
+    /// Consecutive stream failures since the last stream that received a
+    /// response, i.e. the attempt number [`backoff::delay`] is asked about.
+    ///
+    /// Reset the instant a response arrives, NOT when a stream opens: a
+    /// control plane that accepts the connection and then immediately drops
+    /// it would otherwise pin the backoff at its floor forever and become a
+    /// reconnect storm. This is Envoy's own placement (`GrpcStream`resets its
+    /// backoff strategy in `onReceiveMessage`).
+    attempt: u32,
 }
 
 impl AdsClient {
     pub fn new(states: Vec<SubscriptionState>) -> Self {
-        Self { states }
+        Self { states, attempt: 0 }
     }
 
     /// The current per-type state. Mostly for tests -- production callers
-    /// drive everything through [`AdsClient::run_once`].
+    /// drive everything through [`AdsClient::run`].
     pub fn states(&self) -> &[SubscriptionState] {
         &self.states
+    }
+
+    /// Consecutive failed streams since one last received a response. Zero
+    /// while the control plane is healthy.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Reconnects forever: reset per-stream state, pump one stream, log why
+    /// it ended, wait a jittered backoff, repeat. Never returns -- there is
+    /// no stream-ending condition WP-20 treats as fatal, because giving up on
+    /// xDS means never picking up config again while the process keeps
+    /// serving the last-good one.
+    ///
+    /// The `client`'s `Channel` is reused across streams on purpose: tonic
+    /// re-establishes the underlying connection per RPC, so a control plane
+    /// that goes away and comes back needs no new `Channel` here -- the next
+    /// `stream_aggregated_resources` call dials it again.
+    ///
+    /// Rust note: the `-> !` ("never") return type is how Rust spells "this
+    /// diverges". Callers `tokio::spawn` it and drop the handle, or select
+    /// against it; there is no `Ok` case to handle.
+    pub async fn run(
+        &mut self,
+        client: &mut AggregatedDiscoveryServiceClient<Channel>,
+        mut validate: Validator,
+        mut reconnect: Reconnect,
+    ) -> ! {
+        loop {
+            // S8 rule 4, and the reason this is at the TOP of the loop rather
+            // than after a failure: the nonce belongs to the stream that
+            // issued it, so it must be gone BEFORE `run_once` builds the new
+            // stream's initial requests. The acked version deliberately
+            // survives -- "versions persist across streams for same server".
+            for state in &mut self.states {
+                state.reset_stream();
+            }
+
+            match self.run_once(client, &mut validate).await {
+                Ok(()) => tracing::warn!("ADS stream closed by the control plane; reconnecting"),
+                Err(err) => tracing::warn!(%err, "ADS stream ended; reconnecting"),
+            }
+
+            let delay = backoff::delay(&reconnect.policy, self.attempt, &mut reconnect.rng);
+            // Saturating so a control plane that is down for a very long time
+            // wraps to nothing -- `backoff::delay` already clamps the cap.
+            self.attempt = self.attempt.saturating_add(1);
+            tracing::debug!(?delay, attempt = self.attempt, "ADS reconnect backoff");
+            (reconnect.sleep)(delay).await;
+        }
     }
 
     /// Opens `StreamAggregatedResources` on `client`, sends the initial
@@ -128,13 +230,12 @@ impl AdsClient {
     /// to the matching `SubscriptionState` and sends back the `Request` it
     /// returns. Returns `Ok(())` once the server ends the stream cleanly.
     ///
-    /// Reconnecting is NOT this function's job -- a caller that wants to
-    /// reconnect calls this again with a freshly connected `client` (that is
-    /// increment 3b).
+    /// Reconnecting is NOT this function's job, and neither is resetting
+    /// per-stream state: [`AdsClient::run`] owns both.
     pub async fn run_once(
         &mut self,
         client: &mut AggregatedDiscoveryServiceClient<Channel>,
-        mut validate: Validator,
+        validate: &mut Validator,
     ) -> Result<(), AdsError> {
         // Rust note: bounded so a client that never reads applies
         // backpressure rather than growing memory unboundedly -- 16 matches
@@ -162,6 +263,12 @@ impl AdsClient {
             let Some(resp) = inbound.message().await? else {
                 return Ok(());
             };
+
+            // The control plane is talking to us, so this stream counts as
+            // established: the next failure starts its backoff from the floor
+            // again. See the field's own note for why arrival, not connect,
+            // is the right moment.
+            self.attempt = 0;
 
             let state = self
                 .states

@@ -1674,9 +1674,11 @@ dependencies = [
  "controlplane",
  "futures",
  "proxy-api",
+ "rand",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
