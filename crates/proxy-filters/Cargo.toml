@@ -40,9 +40,35 @@ tracing = { workspace = true }
 # (`spend::Period::key_for`) -- `proxy-cluster`/`proxy-observability` already
 # depend on this for the same reason (wall-clock rendering).
 chrono = { workspace = true }
+# WP-50 increment 2c-i: JWT verification against a statically configured
+# JWKS. Pinned to the 9.x line (not the current 11.x) specifically because
+# 9.x's default (and only, pre-backend-split) crypto backend is `ring` 0.17 --
+# the exact version this workspace already pins for rustls -- so this adds no
+# second crypto stack. `jsonwebtoken` 10/11 dropped `ring` entirely in favor of
+# `aws_lc_rs` (a C/asm subtree) or a `rust_crypto` feature (a different
+# pure-Rust stack: `rsa`/`sha2`/`hmac`/`ed25519-dalek`/`p256`/`p384`), either of
+# which would be exactly the "second crypto stack" this task was told to flag
+# rather than add unilaterally. Default features (`use_pem`) are turned off:
+# this authenticator only ever builds keys from JWKS `n`/`e` components
+# (`DecodingKey::from_rsa_raw_components`), never from a PEM file, so
+# `pem`/`simple_asn1` would be dead weight.
+jsonwebtoken = { version = "9", default-features = false }
 
 [dev-dependencies]
 proxy-api = { workspace = true }
+# WP-50 increment 2c-i tests: generates a fresh RSA keypair per test run to
+# sign hand-built JWTs -- see the design brief's "never commit a private key,
+# even a test one" and `proxy-core/tests/tls.rs`'s `RSA_TEST_KEY_PEM`, which
+# had to embed one because `ring`/`rcgen` can SIGN with RSA but cannot
+# GENERATE an RSA keypair (RSA key generation is out of `ring`'s scope). `rsa`
+# (pure Rust, RustCrypto) is used ONLY for key generation and exporting
+# PKCS#1 DER / raw (n, e) components in test code; every signature these tests
+# produce, and every signature the production `JwtAuthenticator` verifies,
+# still goes through `ring` via `jsonwebtoken`.
+# `pem` is needed to PARSE the committed PKCS#8 test key (see jwt_auth.rs's
+# TEST_KEY_PEM); key GENERATION is no longer used, because 2048-bit RSA keygen
+# per nextest process took the workspace suite from ~23s to 60.7s.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 
 [features]
 # Each non-core filter lands behind a feature flag (default-on set decided in WP-31).

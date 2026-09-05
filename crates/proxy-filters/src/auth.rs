@@ -119,7 +119,12 @@ use crate::control::ControlPlaneSnapshot;
 /// header. Anything else (no header, a different scheme, a bare token) is
 /// simply not a credential this authenticator understands -- see
 /// [`AuthOutcome::NoCredential`].
-const BEARER_PREFIX: &str = "Bearer ";
+///
+/// `pub(crate)`, not private: [`crate::jwt_auth::JwtAuthenticator`] (WP-50
+/// increment 2c-i) parses the same `Bearer ` scheme over the same header --
+/// sharing the constant means the two authenticators cannot silently drift
+/// on it.
+pub(crate) const BEARER_PREFIX: &str = "Bearer ";
 
 /// Printable prefix every virtual key carries -- see the design brief's "Key
 /// format" section: greppable in incident response, revocable by prefix
@@ -128,7 +133,12 @@ const BEARER_PREFIX: &str = "Bearer ";
 /// later authenticator (e.g. a JWT) rather than being a malformed virtual
 /// key -- this is the OIDC seam, and it is why that case is
 /// `NoCredential`, not `Rejected`.
-const KEY_PREFIX: &str = "llmp_";
+///
+/// `pub(crate)`, not private: [`crate::jwt_auth::JwtAuthenticator`] checks
+/// the SAME prefix (in the opposite direction -- a value that starts with it
+/// is NOT a JWT, see that module's doc) so the two authenticators' notions of
+/// "whose kind is this" cannot silently drift apart.
+pub(crate) const KEY_PREFIX: &str = "llmp_";
 
 /// Identifies the tenant (account/team) a request was authenticated as.
 ///
@@ -291,6 +301,50 @@ pub enum AuthError {
     /// The presented value's digest matched a configured [`KeyRecord`], but
     /// that record is marked `revoked`.
     RevokedKey,
+
+    // -- WP-50 increment 2c-i: `crate::jwt_auth::JwtAuthenticator`'s
+    // rejection reasons. Added here (not on a separate error type) for the
+    // same reason `UnknownKey`/`RevokedKey` already share this enum: both
+    // authenticators feed the same `AuthOutcome::Rejected`, and the design
+    // brief's "nothing above [`Authenticator`] changes" promise covers this
+    // enum too -- it is part of the seam, not part of one implementation.
+    /// The bearer value was not a well-formed JWT: not three
+    /// `.`-separated segments, invalid base64, or a segment that did not
+    /// decode to JSON (including a header naming an algorithm this crate
+    /// does not model at all, e.g. `alg: none` -- see the module's `alg`
+    /// allow-list doc).
+    JwtMalformed,
+    /// The token's `kid` header named no configured JWKS key -- including a
+    /// token with no `kid` at all, which is indistinguishable from "names an
+    /// absent key" once there is more than one configured key to choose
+    /// among.
+    JwtUnknownKid,
+    /// Signature verification failed: a bad signature, OR the token's `alg`
+    /// header is not in this authenticator's allow-list (this is what stops
+    /// the classic RS256/HS256 key-confusion attack -- see the module doc).
+    /// Both collapse to one reason so neither a caller nor the access log can
+    /// distinguish "wrong algorithm" from "wrong signature" -- the same
+    /// non-disclosure the virtual-key authenticator applies to
+    /// `UnknownKey`/`RevokedKey` on the wire (see `auth_filter`'s module
+    /// doc), applied here at the reason-enum level since this authenticator
+    /// has no filter wiring yet to enforce it downstream.
+    JwtInvalidSignature,
+    /// The token's `exp` claim is in the past (beyond the configured
+    /// leeway).
+    JwtExpired,
+    /// The token's `nbf` claim is in the future (beyond the configured
+    /// leeway).
+    JwtNotYetValid,
+    /// An `issuer` was configured and the token's `iss` claim did not match
+    /// it (including a token with no `iss` claim at all).
+    JwtIssuerMismatch,
+    /// An `audience` was configured and the token's `aud` claim did not
+    /// contain it (including a token with no `aud` claim at all).
+    JwtAudienceMismatch,
+    /// The token verified, but the configured tenant claim was absent or was
+    /// not a non-empty string. Never defaulted -- see the design brief's
+    /// "missing tenant claim is Rejected, never a default tenant".
+    JwtMissingTenantClaim,
 }
 
 /// The result of asking one [`Authenticator`] to resolve a request.

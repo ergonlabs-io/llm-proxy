@@ -48,13 +48,19 @@
 //!     per-bucket-price lookup and the integer-micro-dollar cost function
 //!     over one request's `usage::TokenUsage` -- see
 //!     `internal-docs/wp-50-3c-spend-budgets.md`. No accumulation, no
-//!     enforcement, and no `HttpFilter` yet; those are 3c-ii/iii.
+//!     enforcement, and no `HttpFilter` yet; those are 3c-ii/iii. Increment
+//!     2c-i ([`jwt_auth`]) adds a second `Authenticator`: RS256-only JWT
+//!     verification against a STATICALLY configured JWKS (no network fetch,
+//!     no refresh timer -- that is a later increment). Not yet wired into
+//!     `auth_filter`'s `AuthenticatorChain` or parsed from `typed_config`,
+//!     mirroring how 2a-i landed before 2a-ii's filter wiring.
 
 pub mod auth;
 pub mod auth_filter;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
 pub mod control;
+pub mod jwt_auth;
 pub mod model_authz;
 pub mod model_authz_filter;
 pub mod spend;

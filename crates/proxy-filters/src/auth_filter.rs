@@ -492,6 +492,45 @@ impl HttpFilter for AuthFilterInstance {
                 self.deny(cb, "auth_revoked_key");
                 FilterHeadersStatus::Continue
             }
+            // WP-50 increment 2c-i: `crate::jwt_auth::JwtAuthenticator`'s
+            // rejection reasons. No `JwtAuthenticator` is pushed onto this
+            // filter's chain yet (that wiring is 2c-ii), so these arms are
+            // unreachable today -- they exist only because `AuthError` is
+            // matched exhaustively here, and each still gets its own
+            // `details` string now so the wiring step does not also have to
+            // touch this match.
+            AuthOutcome::Rejected(AuthError::JwtMalformed) => {
+                self.deny(cb, "auth_jwt_malformed");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtUnknownKid) => {
+                self.deny(cb, "auth_jwt_unknown_kid");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtInvalidSignature) => {
+                self.deny(cb, "auth_jwt_invalid_signature");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtExpired) => {
+                self.deny(cb, "auth_jwt_expired");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtNotYetValid) => {
+                self.deny(cb, "auth_jwt_not_yet_valid");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtIssuerMismatch) => {
+                self.deny(cb, "auth_jwt_issuer_mismatch");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtAudienceMismatch) => {
+                self.deny(cb, "auth_jwt_audience_mismatch");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtMissingTenantClaim) => {
+                self.deny(cb, "auth_jwt_missing_tenant_claim");
+                FilterHeadersStatus::Continue
+            }
             AuthOutcome::NoCredential => {
                 self.deny(cb, "auth_no_credential");
                 FilterHeadersStatus::Continue
