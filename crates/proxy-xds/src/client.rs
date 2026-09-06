@@ -318,13 +318,10 @@ impl AdsClient {
         handler: &mut H,
     ) -> Result<(), AdsError> {
         // Rust note: bounded so a client that never reads applies
-        // backpressure rather than growing memory unboundedly -- 16 matches
-        // `testing/controlplane`'s own choice of bound for the same reason.
-        let (tx, rx) = mpsc::channel::<DiscoveryRequest>(16);
-        let response = client
-            .stream_aggregated_resources(OutboundStream(rx))
-            .await?;
-        let mut inbound = response.into_inner();
+        // backpressure rather than growing memory unboundedly. The bound must
+        // also be big enough to hold every initial request, because they are
+        // queued BEFORE anything drains the channel -- see below.
+        let (tx, rx) = mpsc::channel::<DiscoveryRequest>(self.states.len().max(16));
 
         // S8 / Envoy's own `GrpcMuxImpl`: the node identity goes on the FIRST
         // request of a stream and is omitted from every request after it, so
@@ -334,6 +331,26 @@ impl AdsClient {
         // what makes a control plane that lost its state able to identify us.
         let mut node_pending = self.node.clone();
 
+        // **These are queued BEFORE the stream is opened, and that ordering is
+        // load-bearing rather than stylistic.** `stream_aggregated_resources`
+        // does not resolve until the server sends response HEADERS, and
+        // grpc-go -- so every go-control-plane-based management server, which
+        // is most of them -- does not send headers until its handler's first
+        // outgoing message, which it does not produce until it has received a
+        // request. Awaiting the stream first and sending after therefore
+        // deadlocks both sides: we wait for headers, the server waits for a
+        // request, forever.
+        //
+        // Found 2026-09-06 by `make xds-conformance`, the first run of this
+        // client against the reference implementation. Our own puppet server
+        // in `testing/controlplane` cannot catch it, because tonic sends
+        // headers eagerly from `Response::new(stream)` -- exactly the
+        // "us agreeing with ourselves about the protocol and both being
+        // wrong" failure that target's own message says it exists to find.
+        //
+        // Queuing into a buffered channel does not block (the bound above is
+        // sized for it), so the requests are simply sitting in the outbound
+        // stream ready for tonic to send the moment the connection is live.
         for state in &self.states {
             if state.has_nothing_to_request() {
                 // S8 / this crate's own doc: an empty name subscription
@@ -347,6 +364,11 @@ impl AdsClient {
                 .map_err(|_| AdsError::OutboundClosed)?;
             node_pending = None;
         }
+
+        let response = client
+            .stream_aggregated_resources(OutboundStream(rx))
+            .await?;
+        let mut inbound = response.into_inner();
 
         loop {
             let Some(resp) = inbound.message().await? else {

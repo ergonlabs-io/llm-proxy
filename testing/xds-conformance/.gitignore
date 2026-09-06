@@ -1,0 +1,5 @@
+# This crate is its OWN Cargo workspace (see Cargo.toml's [workspace] table),
+# so it gets its own /target rather than sharing the root workspace's -- the
+# root .gitignore's `/target` entry is anchored to the repo root and does not
+# reach here.
+/target

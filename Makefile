@@ -217,14 +217,13 @@ ifeq ($(DOCKER),)
 	@echo ""
 	@exit 1
 else
-	@echo "NOT IMPLEMENTED YET -- WP-20 increment 5 owes the fixture."
-	@echo ""
-	@echo "The harness (testing/controlplane) and the client exist; what is missing is"
-	@echo "the go-control-plane container and the scenario script driven against it."
-	@echo "This target exists now so the decision is discoverable from the build system"
-	@echo "rather than only from a design brief, and so it fails LOUDLY rather than"
-	@echo "silently passing and reading as coverage."
-	@exit 1
+	# WP-20 increment 5: testing/xds-conformance/ builds go-control-plane's own
+	# cache/server packages into a real ADS server (Dockerfile pins the exact
+	# go-control-plane version -- see its README.md), then runs our real
+	# proxy-xds AdsClient against it over a real loopback socket, on an
+	# ephemeral host port. See testing/xds-conformance/README.md for what
+	# this does and does not check, and its own cadence note.
+	cd testing/xds-conformance && cargo test --test go_control_plane -- --ignored --test-threads=1
 endif
 
 # --------------------------------------------------------------- QA (Go) --

@@ -1,0 +1,32 @@
+# Deliberately its OWN workspace (the empty [workspace] table below), not a
+# member of the root Cargo.toml's workspace. WP-20 increment 5's whole point
+# is an opt-in, docker-gated check (`make xds-conformance`) that `make ci`
+# must never reach -- see README.md. Keeping this crate physically outside
+# the root workspace's `members` list means `cargo build --workspace` /
+# `make ci` at the repo root cannot see it at all, rather than relying on
+# every future contributor to remember not to wire it in.
+[workspace]
+
+[package]
+name = "xds-conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This crate has no `src/` at all -- it is nothing but the integration test
+# in `tests/`, so every dependency below is a dev-dependency in the ordinary
+# Cargo sense (used only by tests, never by a library this package doesn't
+# have). `scripts/check-deps.py` (part of `make ci`'s `deps-check`) checks
+# `[dependencies]` only against `src/`+`build.rs`, so declaring these there
+# instead would report all six as unused -- keep them here.
+[dev-dependencies]
+# Path deps into the real crates -- this is a TEST of the real client, never
+# a reimplementation of its protocol logic (ground rule: protos/xDS logic
+# stay inside proxy-config/proxy-xds; this crate only calls their public API).
+proxy-xds = { path = "../../crates/proxy-xds" }
+proxy-api = { path = "../../crates/proxy-api" }
+proxy-config = { path = "../../crates/proxy-config" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
+
+[lints.rust]
+unsafe_code = "deny"
