@@ -38,9 +38,16 @@
 //!    `tracing::warn!` names the resource and says the static definition
 //!    keeps serving -- `internal-docs/envoy-divergences.md` already records
 //!    this as a deliberate divergence from Envoy's own silence here.
-//! 6. **RDS and EDS are out of scope for this increment**, refused by name
-//!    rather than silently ignored (ground rule #1's shape): RDS is WP-20
-//!    increment 5's own follow-on, EDS is WP-21's.
+//! 6. **RDS and EDS are refused by name**, not silently ignored (ground
+//!    rule #1's shape). **Both belong to WP-21, not to WP-20** -- corrected
+//!    2026-09-06, because an earlier note here claimed RDS for WP-20's own
+//!    increment 5 and that was wrong. The IR has no way to express either
+//!    dependency: a `HttpConnectionManagerConfig` carries its route table
+//!    inline as an `Arc<RouteTable>` with no by-name variant, and there is no
+//!    `Eds` discovery type. `proxy-config`'s own lowering has said so all
+//!    along -- an HCM using `rds` is refused with "RDS is not implemented yet
+//!    (WP-21)". Applying either here would mean inventing an IR shape whose
+//!    warming rules WP-21 owns.
 //!
 //! # Ordering is `SotwSet::apply`'s job, not this module's
 //!
@@ -202,8 +209,9 @@ impl ResourceApplier {
             CDS_TYPE_URL => self.on_cds_response(resp).await,
             LDS_TYPE_URL => self.on_lds_response(resp).await,
             RDS_TYPE_URL => Verdict::Reject(format!(
-                "RDS (`{RDS_TYPE_URL}`) is not applied by this increment -- route tables are \
-                 WP-20 increment 5's own follow-on"
+                "RDS (`{RDS_TYPE_URL}`) is not applied: a listener references its route table \
+                 inline, and the by-name variant plus the warming rules that go with it are \
+                 WP-21's"
             )),
             EDS_TYPE_URL => Verdict::Reject(format!(
                 "EDS (`{EDS_TYPE_URL}`) is not applied by this increment -- endpoint discovery \
