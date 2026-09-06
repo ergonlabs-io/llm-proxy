@@ -1673,7 +1673,10 @@ version = "0.2.0"
 dependencies = [
  "controlplane",
  "futures",
+ "prost",
+ "prost-types",
  "proxy-api",
+ "proxy-config",
  "rand",
  "thiserror 2.0.18",
  "tokio",

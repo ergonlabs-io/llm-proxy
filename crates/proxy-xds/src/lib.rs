@@ -10,11 +10,13 @@
 //! Scale rule (PLAN.md Part 8.5): on any xDS failure keep serving last-good
 //! config with backoff — never NACK-storm, never shed state.
 
+pub mod apply;
 pub mod backoff;
 pub mod client;
 pub mod store;
 pub mod subscription;
 
+pub use apply::{Publish, ResourceApplier};
 pub use backoff::BackoffPolicy;
 pub use client::{AdsClient, AdsError, Reconnect, Sleep, Validator};
 pub use store::{ApplyError, ApplyOutcome, SetSemantics, SotwSet};
