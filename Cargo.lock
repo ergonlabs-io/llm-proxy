@@ -1478,6 +1478,7 @@ dependencies = [
  "proxy-http",
  "proxy-observability",
  "proxy-simple-config",
+ "proxy-xds",
  "ring",
  "serde_json",
  "tokio",

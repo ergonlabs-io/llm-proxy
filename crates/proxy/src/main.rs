@@ -9,6 +9,7 @@
 //! network filter chain (`tcp_proxy` etc.) is still a stub -- see
 //! `proxy_core::listener`'s `TODO(WP-09)`.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,7 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use proxy_config::ir::SnapshotVersion;
+use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
+use proxy_config::ir::{NodeIdentity, SnapshotVersion};
 use proxy_config::{
     build_snapshot, load_bootstrap_file, ConfigSnapshot, LoadedBootstrap, StrictMode,
 };
@@ -25,7 +27,9 @@ use proxy_core::drain::{
 };
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
-use tokio::sync::mpsc;
+use proxy_xds::{AdsClient, Publish, Reconnect, ResourceApplier, Subscription, SubscriptionState};
+use tokio::sync::{mpsc, oneshot};
+use tonic::transport::Channel;
 
 mod keygen;
 
@@ -712,6 +716,18 @@ async fn run_serve(
     };
     let mut current_version = snapshot.version;
 
+    // WP-20 increment 4d-iii: build the ADS client, if bootstrap
+    // `dynamic_resources` asks for one, from this same boot snapshot --
+    // before `snapshot` moves into `WorkerPool::spawn` just below. `None`
+    // means nothing was started; see `start_ads`'s own doc for the three
+    // (non-fatal) ways that happens. The receiver is read from inside the
+    // `select!` in this function's own signal loop, further down.
+    let mut ads_apply_rx = start_ads(
+        &snapshot,
+        service_node.as_deref(),
+        service_cluster.as_deref(),
+    );
+
     let publisher = WorkerPool::spawn(
         WorkerPoolConfig {
             concurrency,
@@ -758,28 +774,85 @@ async fn run_serve(
     }
 
     // Runs until a shutdown signal arrives; a SIGHUP along the way triggers a
-    // config reload and loops back to waiting, exactly like Envoy's own
+    // config reload, and an ADS-applied snapshot (WP-20 increment 4d-iii)
+    // does likewise, and both loop back to waiting, exactly like Envoy's own
     // hot-reload trigger. See `reload`'s doc for what "reload" does and does
     // not apply, and requirement 1's test (`sighup_with_a_broken_config_...`
     // in `tests/reload.rs`) for why a failed reload must never reach the
     // `break` below.
+    //
+    // Rust note: `tokio::select!` picks whichever branch is ready first, so
+    // this is what turns two independent producers of "apply a new snapshot"
+    // (SIGHUP and ADS) into one control loop that never applies both at once.
     loop {
-        match control_signals.recv().await {
-            ControlSignal::Shutdown => break,
-            ControlSignal::Reload => {
-                if let Some(new_version) = reload(
-                    &config_source,
-                    current_version,
-                    &publisher,
-                    &cluster_manager_for_reload,
-                    &stats_control,
-                    &stat_handle_tables_for_reload,
-                )
-                .await
-                {
-                    current_version = new_version;
+        tokio::select! {
+            signal = control_signals.recv() => match signal {
+                ControlSignal::Shutdown => break,
+                ControlSignal::Reload => {
+                    if let Some(new_version) = reload(
+                        &config_source,
+                        current_version,
+                        &publisher,
+                        &cluster_manager_for_reload,
+                        &stats_control,
+                        &stat_handle_tables_for_reload,
+                    )
+                    .await
+                    {
+                        current_version = new_version;
+                    }
                 }
-            }
+            },
+            ads_msg = recv_ads_apply(&mut ads_apply_rx) => match ads_msg {
+                Some((mut ads_snapshot, reply)) => {
+                    // Rust note: authoritative version stamping happens HERE,
+                    // not inside `ResourceApplier` -- see the comment on
+                    // `apply_snapshot`'s own doc and on `current_version`
+                    // above. Two producers stamp a version: `reload` (SIGHUP)
+                    // does the same overwrite right before its own
+                    // `apply_snapshot` call; `ResourceApplier::assemble_snapshot`'s
+                    // internal version is advisory only and is discarded here.
+                    ads_snapshot.version = SnapshotVersion(current_version.0 + 1);
+                    let (version, rejected) = apply_snapshot(
+                        ads_snapshot,
+                        &publisher,
+                        &cluster_manager_for_reload,
+                        &stats_control,
+                        &stat_handle_tables_for_reload,
+                    )
+                    .await;
+                    current_version = version;
+                    for (name, err) in &rejected {
+                        tracing::error!(
+                            cluster = %name,
+                            error = %err,
+                            "ADS: cluster rejected while applying a discovery response; it is \
+                             not part of the live cluster set (a request routed to it will fail \
+                             until the control plane sends a working definition)"
+                        );
+                    }
+                    // A dropped receiver (the ADS task's `Publish` future was
+                    // cancelled, e.g. mid-shutdown) must not panic this loop
+                    // -- `send` returning `Err` just means nobody is waiting
+                    // for the reply any more.
+                    let _ = reply.send(());
+                }
+                None => {
+                    // Reachable ONLY when the ADS task dropped its sender,
+                    // which should never happen: `AdsClient::run` is `-> !`,
+                    // so the task ends only if it panics. (The "no ADS client
+                    // was started" case does NOT arrive here -- there
+                    // `ads_apply_rx` is already `None` and `recv_ads_apply`
+                    // pends forever, so this arm is simply never ready.)
+                    // Setting it to `None` stops selecting on a channel that
+                    // would otherwise resolve to `None` again immediately,
+                    // turning this loop into a spin.
+                    tracing::error!(
+                        "the ADS client task ended, which it should not be able to do;                          continuing to serve the last-good config with no control-plane                          connection"
+                    );
+                    ads_apply_rx = None;
+                }
+            },
         }
     }
 
@@ -969,6 +1042,218 @@ async fn reload(
         "SIGHUP: config reload succeeded"
     );
     Some(version)
+}
+
+// --------------------------------------------------------------------- ads --
+//
+// WP-20 increment 4d-iii: the ADS client is the *second* producer of
+// `Arc<ConfigSnapshot>` `apply_snapshot`'s doc comment predicted -- everything
+// below is what actually constructs it from bootstrap `dynamic_resources` and
+// wires its output back into `run_serve`'s own control loop, instead of
+// reaching around `apply_snapshot`/`ConfigPublisher` to publish on its own.
+
+/// Full `type_url` a CDS `DiscoveryRequest` subscribes to. Duplicated from
+/// `proxy_xds::apply`'s own (private) constant of the same value rather than
+/// making that one `pub` -- see this task's own brief for why.
+const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
+/// Full `type_url` an LDS `DiscoveryRequest` subscribes to.
+const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
+
+/// What `ResourceApplier`'s `Publish` callback sends to `run_serve`'s control
+/// loop for one accepted `DiscoveryResponse`: an owned snapshot to apply, and
+/// the oneshot half the loop replies on once it actually has (see
+/// `start_ads`'s doc for why the callback awaits the reply before resolving).
+type AdsApplyMsg = (ConfigSnapshot, oneshot::Sender<()>);
+
+/// `--service-node`/`--service-cluster` override the corresponding field of
+/// bootstrap `node` when present -- Envoy gives its own flags of the same
+/// name the identical relationship to its bootstrap `node`. A pure function,
+/// deliberately, so this rule is unit-testable without an `AdsClient`, a
+/// channel, or a control plane (see the `effective_node_*` tests below).
+///
+/// An explicitly-empty override (`--service-node ''`, i.e. `Some("")`) still
+/// overrides the bootstrap value with an empty string. The signal this reads
+/// is `Some` vs `None` -- whether the flag was passed at all, which is
+/// exactly what `clap` surfaces on `Args::service_node`/`service_cluster` --
+/// not whether the value it carries happens to be non-empty. Treating an
+/// empty override as "ignore it" would mean an operator who deliberately
+/// wants an empty node id (unusual, but not this function's business to
+/// forbid) silently keeps the bootstrap's instead, with no way to tell it
+/// happened short of reading the ADS wire traffic.
+fn effective_node(
+    bootstrap: &NodeIdentity,
+    service_node: Option<&str>,
+    service_cluster: Option<&str>,
+) -> NodeIdentity {
+    NodeIdentity {
+        id: service_node
+            .map(str::to_string)
+            .unwrap_or_else(|| bootstrap.id.clone()),
+        cluster: service_cluster
+            .map(str::to_string)
+            .unwrap_or_else(|| bootstrap.cluster.clone()),
+    }
+}
+
+/// Builds and spawns the ADS client task when `snapshot.ads` asks for one.
+///
+/// Returns `None` -- and starts nothing -- in three cases, none of them
+/// fatal to `run_serve` (PLAN.md 8.5: keep serving last-good/static config):
+/// - `snapshot.ads` is `None`: no `dynamic_resources` in bootstrap, today's
+///   behavior for every release through v0.2.0, untouched by this increment.
+/// - neither `lds` nor `cds` is enabled: nothing to subscribe to, logged at
+///   `info!`.
+/// - the named ADS cluster has no endpoints: a config error, logged at
+///   `error!` with the cluster name -- config lowering already guarantees the
+///   cluster itself exists in `static_resources` (`AdsConfig`'s own doc), so
+///   this is the one thing left for this function to check.
+///
+/// The `Channel` is built with `connect_lazy`, not an eager `connect().await`:
+/// a control plane that is not up yet at boot must not stop the proxy from
+/// serving. [`AdsClient::run`] reconnects forever with a jittered backoff (see
+/// its own doc comment), and a lazy channel is what lets the FIRST attempt
+/// fail into that loop instead of into a startup error here.
+fn start_ads(
+    snapshot: &Arc<ConfigSnapshot>,
+    service_node: Option<&str>,
+    service_cluster: Option<&str>,
+) -> Option<mpsc::Receiver<AdsApplyMsg>> {
+    let ads = snapshot.ads.as_ref()?;
+
+    if !ads.lds && !ads.cds {
+        tracing::info!(
+            cluster = %ads.cluster,
+            "ADS configured but neither `lds` nor `cds` is enabled; nothing to subscribe to, \
+             not starting an ADS client"
+        );
+        return None;
+    }
+
+    // Rust note: `?` above already returned on `ads.is_none()`; from here on
+    // `ads.cluster` is a name config lowering has already checked exists in
+    // `static_resources`, so a missing entry here would be that guarantee
+    // breaking, not an operator mistake -- treated the same as "no
+    // endpoints" below rather than a panic, per ground rule #1's spirit
+    // (loud, not silent -- but never fatal to the process here, see PLAN.md
+    // 8.5).
+    let endpoint = match snapshot
+        .clusters
+        .get(&ads.cluster)
+        .and_then(|c| c.endpoints.first())
+    {
+        Some(endpoint) => endpoint,
+        None => {
+            tracing::error!(
+                cluster = %ads.cluster,
+                "ADS cluster has no endpoints (or does not exist); not starting an ADS client"
+            );
+            return None;
+        }
+    };
+    let uri = format!("http://{}:{}", endpoint.host, endpoint.port);
+
+    let channel = match Channel::from_shared(uri.clone()) {
+        Ok(endpoint) => endpoint.connect_lazy(),
+        Err(err) => {
+            tracing::error!(
+                cluster = %ads.cluster,
+                uri,
+                error = %err,
+                "ADS cluster address is not a valid URI; not starting an ADS client"
+            );
+            return None;
+        }
+    };
+    let mut grpc_client = AggregatedDiscoveryServiceClient::new(channel);
+
+    let mut states = Vec::new();
+    if ads.cds {
+        states.push(SubscriptionState::new(CDS_TYPE_URL, Subscription::Wildcard));
+    }
+    if ads.lds {
+        states.push(SubscriptionState::new(LDS_TYPE_URL, Subscription::Wildcard));
+    }
+
+    let node = effective_node(&ads.node, service_node, service_cluster);
+
+    // Bounded at 1: `ResourceApplier` (via `AdsClient::run_once`) applies one
+    // `DiscoveryResponse` at a time and its `Publish` future awaits the
+    // oneshot reply below before resolving, so at most one message is ever in
+    // flight on this channel.
+    let (apply_tx, apply_rx) = mpsc::channel::<AdsApplyMsg>(1);
+    let publish: Publish = Box::new(move |snapshot: Arc<ConfigSnapshot>| {
+        let apply_tx = apply_tx.clone();
+        Box::pin(async move {
+            // Rust note: `ConfigSnapshot` has no `Clone` impl (deliberately --
+            // see `crates/proxy-config/tests/ir_readership.rs`'s module doc),
+            // so this is the one place this increment needs to turn the
+            // `Arc<ConfigSnapshot>` `ResourceApplier` hands back into an
+            // owned one to send down the channel. `with_dynamic_resources`
+            // (its own public constructor) is reused for exactly that,
+            // rather than a struct literal here naming every field -- see
+            // that method's own doc for why a struct literal in a runtime
+            // crate is the shape `ir_readership.rs` exists to catch. Passing
+            // empty dynamic maps means every listener/cluster is carried
+            // over unchanged; the version passed through is a placeholder --
+            // `run_serve`'s control loop is the authoritative stamper (see
+            // its own comment on `current_version`) and overwrites it before
+            // this ever reaches `apply_snapshot`.
+            let owned =
+                snapshot.with_dynamic_resources(HashMap::new(), HashMap::new(), snapshot.version);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if apply_tx.send((owned, reply_tx)).await.is_err() {
+                // The control loop only ever drops its receiver by falling
+                // out of `run_serve`'s select loop at shutdown -- if this
+                // fires, the process is already on its way down and there is
+                // nothing left to apply.
+                return;
+            }
+            // Apply-then-ACK (S8): this future does not resolve until the
+            // control loop has actually applied the snapshot --
+            // `AdsClient::run_once` does not send this response's ACK until
+            // THIS future resolves.
+            //
+            // **NO TEST IN THIS CRATE CATCHES THE LOSS OF THIS `.await`,
+            // measured 2026-09-06**: deleting it leaves all 45 green. The
+            // seam itself is pinned one layer down, by
+            // `proxy-xds`'s `the_ack_does_not_reach_the_wire_until_the_            // handler_future_resolves` -- but nothing yet proves that THIS
+            // closure uses the seam correctly, because that needs a real
+            // control plane and a booted binary. It is owed by WP-20
+            // increment 5's WP-28 scenario suite, alongside the untested
+            // step-4/step-5 ordering `apply_snapshot`'s doc records.
+            let _ = reply_rx.await;
+        })
+    });
+
+    let applier = ResourceApplier::new(Arc::clone(snapshot), publish);
+    let mut client = AdsClient::new(states).with_node(node);
+    let reconnect = Reconnect::real();
+
+    // Rust note: spawned and the `JoinHandle` dropped -- `AdsClient::run`
+    // never returns (`-> !`), so there is nothing to join, only to abandon at
+    // shutdown. This lands on the control runtime `run_serve` is already
+    // `block_on`'d on (see the OTLP exporter's own `tokio::spawn` above for
+    // the same reasoning): a plain `tokio::spawn`, not `spawn_local`, since
+    // neither the client nor the applier holds any `!Send` worker-local state
+    // (ADR-0003 governs workers, not this control-runtime-only task).
+    tokio::spawn(async move {
+        client.run(&mut grpc_client, applier, reconnect).await;
+    });
+
+    Some(apply_rx)
+}
+
+/// Polls `rx` if `Some`, otherwise never resolves. This is what lets
+/// `run_serve`'s `tokio::select!` include the ADS-apply channel as one of its
+/// arms even when no ADS client was ever started (`rx` is `None`) without
+/// that arm spinning in a tight loop on an instantly-ready `None` -- an `mpsc`
+/// receiver whose sender was simply never created still resolves `recv()` to
+/// `None` immediately, same as one whose sender was dropped.
+async fn recv_ads_apply(rx: &mut Option<mpsc::Receiver<AdsApplyMsg>>) -> Option<AdsApplyMsg> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Waits for `expected` workers to each report `Ok(())` over `bind_rx`, or
@@ -1556,5 +1841,65 @@ routes:
             "a dialect file loaded through the Bootstrap front-end must not succeed"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- effective_node: --service-node/--service-cluster overrides -------
+    //
+    // WP-20 increment 4d-iii closes the ⚠️ outstanding item on the plan's
+    // WP-20 checklist: these two flags used to reach only the startup log
+    // line. Covered here as unit tests against the pure function rather than
+    // a spawned-process test, same reasoning as `ConfigSource`'s tests above.
+
+    fn node(id: &str, cluster: &str) -> NodeIdentity {
+        NodeIdentity {
+            id: id.to_string(),
+            cluster: cluster.to_string(),
+        }
+    }
+
+    #[test]
+    fn effective_node_with_neither_override_keeps_bootstrap() {
+        let bootstrap = node("bootstrap-id", "bootstrap-cluster");
+        assert_eq!(effective_node(&bootstrap, None, None), bootstrap);
+    }
+
+    #[test]
+    fn effective_node_service_node_alone_overrides_only_id() {
+        let bootstrap = node("bootstrap-id", "bootstrap-cluster");
+        assert_eq!(
+            effective_node(&bootstrap, Some("cli-id"), None),
+            node("cli-id", "bootstrap-cluster")
+        );
+    }
+
+    #[test]
+    fn effective_node_service_cluster_alone_overrides_only_cluster() {
+        let bootstrap = node("bootstrap-id", "bootstrap-cluster");
+        assert_eq!(
+            effective_node(&bootstrap, None, Some("cli-cluster")),
+            node("bootstrap-id", "cli-cluster")
+        );
+    }
+
+    #[test]
+    fn effective_node_both_overrides_replace_both_fields() {
+        let bootstrap = node("bootstrap-id", "bootstrap-cluster");
+        assert_eq!(
+            effective_node(&bootstrap, Some("cli-id"), Some("cli-cluster")),
+            node("cli-id", "cli-cluster")
+        );
+    }
+
+    #[test]
+    fn effective_node_explicitly_empty_override_still_overrides() {
+        // `Some("")` -- the flag was passed with an empty value -- must
+        // still replace the bootstrap value: presence of the flag is the
+        // signal, not whether its content is non-empty (see
+        // `effective_node`'s own doc comment for why).
+        let bootstrap = node("bootstrap-id", "bootstrap-cluster");
+        assert_eq!(
+            effective_node(&bootstrap, Some(""), None),
+            node("", "bootstrap-cluster")
+        );
     }
 }
