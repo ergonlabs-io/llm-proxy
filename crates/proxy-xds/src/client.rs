@@ -7,15 +7,19 @@
 //! returned [`crate::subscription::Request`] reaches the wire. Everything
 //! else is deliberately out of this increment's scope:
 //!
-//! - **Validation is injected, not implemented.** [`Validator`] is a plain
-//!   callback the caller supplies. Real validation (WP-03/04 field-path
-//!   errors against the IR) is increment 4's job; pulling `proxy-config` in
-//!   here would make every transport test a config test, and this crate's
-//!   whole point (per its own `Cargo.toml` comment) is staying free of that
-//!   edge until then.
-//! - **Applying resources is increment 4's job too.** The response's
-//!   `resources` field is never read here -- only `type_url`, `version_info`
-//!   and `nonce`, which is all [`SubscriptionState::on_response`] needs.
+//! - **Deciding a response's verdict, and applying it, is injected -- not
+//!   implemented here.** [`ResponseHandler`] is the seam a caller supplies;
+//!   [`FnHandler`] adapts a plain synchronous [`Validator`] closure to it for
+//!   callers (mostly this crate's own tests) with nothing to await. Real
+//!   validation and applying (WP-03/04 field-path errors against the IR, and
+//!   `apply.rs`'s `ResourceApplier`) is increment 4's job; pulling
+//!   `proxy-config` in HERE would make every transport test a config test,
+//!   and this crate's whole point (per its own `Cargo.toml` comment) is
+//!   staying free of that edge until then.
+//! - **The response's `resources` field is never read by this module** --
+//!   only `type_url`, `version_info` and `nonce`, which is all
+//!   [`SubscriptionState::on_response`] needs. Whatever `handler.handle`
+//!   returns is the only thing that ever looks at `resources`.
 //!
 //! Increment 3b added the layer above the pump: [`AdsClient::run`] reconnects
 //! forever with a jittered backoff, calling
@@ -23,6 +27,13 @@
 //! "versions persist across streams, nonces do not" holds on the wire.
 //! [`AdsClient::run_once`] still drives exactly ONE stream and still resets
 //! nothing -- everything about reconnecting lives in `run`.
+//!
+//! Increment 4d-i made the handler seam async: [`ResponseHandler::handle`]
+//! returns a future, so applying a response -- which does real I/O, e.g.
+//! `crates/proxy/src/main.rs::reload`'s
+//! `ClusterManager::update_from_snapshot` resolving DNS per cluster -- can
+//! finish before the ACK for that response goes out. Apply-then-ACK, never
+//! ACK-then-apply, per S8.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -49,6 +60,42 @@ use crate::subscription::{Request, SubscriptionState, Verdict};
 /// to accumulate state across calls (e.g. increment 4's IR builder); `Send`
 /// because it runs inside a `tokio::spawn`-able future.
 pub type Validator = Box<dyn FnMut(&DiscoveryResponse) -> Verdict + Send>;
+
+/// Decides the verdict for one `DiscoveryResponse`, and applies it.
+///
+/// Rust note: written as return-position `impl Trait` in a trait (RPITIT,
+/// stable since 1.75) rather than a bare `async fn` in the trait. A bare
+/// `async fn handle(...)` here would still compile, but the trait could not
+/// name a bound on the future it desugars to -- only a concrete `impl` could
+/// choose to make its future `Send`, and the trait itself would have no way
+/// to require it. `AdsClient::run` gets `tokio::spawn`ed by its callers,
+/// which needs the whole future it returns -- and therefore every future it
+/// awaits, including whatever `handle` returns -- to be `Send`. Spelling the
+/// return type out lets `+ Send` sit on the trait method itself, so a
+/// non-`Send` implementation fails to compile right here instead of at some
+/// `tokio::spawn` call site several files away.
+pub trait ResponseHandler: Send {
+    fn handle(
+        &mut self,
+        resp: &DiscoveryResponse,
+    ) -> impl std::future::Future<Output = Verdict> + Send;
+}
+
+/// Adapts a plain [`Validator`] closure to [`ResponseHandler`], so a caller
+/// with nothing to await -- mostly this crate's own tests -- can still write
+/// its intent as a one-line synchronous closure instead of a hand-written
+/// handler type.
+///
+/// Rust note: `std::future::ready` is the whole body of the trait impl below
+/// -- it wraps an already-computed value in a `Future` that resolves the
+/// first time it is polled, which is exactly "no awaiting happened here".
+pub struct FnHandler(pub Validator);
+
+impl ResponseHandler for FnHandler {
+    fn handle(&mut self, resp: &DiscoveryResponse) -> impl Future<Output = Verdict> + Send {
+        std::future::ready((self.0)(resp))
+    }
+}
 
 /// Errors from pumping ONE ADS stream. [`AdsClient::run_once`] never retries;
 /// [`AdsClient::run`] treats every one of these as "that stream ended", logs
@@ -226,10 +273,10 @@ impl AdsClient {
     /// Rust note: the `-> !` ("never") return type is how Rust spells "this
     /// diverges". Callers `tokio::spawn` it and drop the handle, or select
     /// against it; there is no `Ok` case to handle.
-    pub async fn run(
+    pub async fn run<H: ResponseHandler>(
         &mut self,
         client: &mut AggregatedDiscoveryServiceClient<Channel>,
-        mut validate: Validator,
+        mut handler: H,
         mut reconnect: Reconnect,
     ) -> ! {
         loop {
@@ -242,7 +289,7 @@ impl AdsClient {
                 state.reset_stream();
             }
 
-            match self.run_once(client, &mut validate).await {
+            match self.run_once(client, &mut handler).await {
                 Ok(()) => tracing::warn!("ADS stream closed by the control plane; reconnecting"),
                 Err(err) => tracing::warn!(%err, "ADS stream ended; reconnecting"),
             }
@@ -265,10 +312,10 @@ impl AdsClient {
     ///
     /// Reconnecting is NOT this function's job, and neither is resetting
     /// per-stream state: [`AdsClient::run`] owns both.
-    pub async fn run_once(
+    pub async fn run_once<H: ResponseHandler>(
         &mut self,
         client: &mut AggregatedDiscoveryServiceClient<Channel>,
-        validate: &mut Validator,
+        handler: &mut H,
     ) -> Result<(), AdsError> {
         // Rust note: bounded so a client that never reads applies
         // backpressure rather than growing memory unboundedly -- 16 matches
@@ -318,7 +365,7 @@ impl AdsClient {
                 .find(|s| s.type_url() == resp.type_url.as_str())
                 .ok_or_else(|| AdsError::UnknownTypeUrl(resp.type_url.clone()))?;
 
-            let verdict = validate(&resp);
+            let verdict = handler.handle(&resp).await;
             let next = state.on_response(&resp.version_info, &resp.nonce, verdict);
             tx.send(to_proto(&next, node_pending.as_ref()))
                 .await

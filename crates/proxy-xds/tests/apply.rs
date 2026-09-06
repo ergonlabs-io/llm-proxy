@@ -20,7 +20,7 @@ use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::ConfigSnapshot;
 use proxy_config::lower_dynamic_cluster;
-use proxy_xds::{Publish, ResourceApplier, Verdict};
+use proxy_xds::{Publish, ResourceApplier, ResponseHandler, Verdict};
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
 const CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
@@ -157,19 +157,26 @@ fn base_with_static_cluster(name: &str, port: u32) -> Arc<ConfigSnapshot> {
 fn recording_publisher() -> (Publish, Arc<Mutex<Vec<Arc<ConfigSnapshot>>>>) {
     let published: Arc<Mutex<Vec<Arc<ConfigSnapshot>>>> = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&published);
-    let publish: Publish = Box::new(move |snapshot| recorded.lock().unwrap().push(snapshot));
+    // Rust note: `Publish` now returns a boxed future (see its own doc in
+    // `apply.rs`), so even a publisher with nothing to await must wrap its
+    // work in one -- `std::future::ready` is the synchronous case's whole
+    // body, same idiom as `client::FnHandler` uses for `Validator`.
+    let publish: Publish = Box::new(move |snapshot| {
+        recorded.lock().unwrap().push(snapshot);
+        Box::pin(std::future::ready(()))
+    });
     (publish, published)
 }
 
 // ------------------------------------------------------------- acceptance --
 
-#[test]
-fn a_cds_response_with_one_valid_cluster_publishes_a_snapshot_with_the_version_bumped() {
+#[tokio::test]
+async fn a_cds_response_with_one_valid_cluster_publishes_a_snapshot_with_the_version_bumped() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
     let resp = cds_response("v1", &[minimal_cluster("payments-primary", 8080)]);
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
 
     assert_eq!(verdict, Verdict::Accept);
     assert_eq!(published.lock().unwrap().len(), 1);
@@ -177,13 +184,13 @@ fn a_cds_response_with_one_valid_cluster_publishes_a_snapshot_with_the_version_b
     assert_eq!(applier.current().version.0, 1);
 }
 
-#[test]
-fn a_lds_response_with_one_valid_listener_publishes_a_snapshot_with_the_version_bumped() {
+#[tokio::test]
+async fn a_lds_response_with_one_valid_listener_publishes_a_snapshot_with_the_version_bumped() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
     let resp = lds_response("v1", &[minimal_listener("ingress", "some-cluster", 10000)]);
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
 
     assert_eq!(verdict, Verdict::Accept);
     assert_eq!(published.lock().unwrap().len(), 1);
@@ -191,13 +198,15 @@ fn a_lds_response_with_one_valid_listener_publishes_a_snapshot_with_the_version_
     assert_eq!(applier.current().version.0, 1);
 }
 
-#[test]
-fn a_second_cds_response_dropping_a_cluster_removes_it_full_state() {
+#[tokio::test]
+async fn a_second_cds_response_dropping_a_cluster_removes_it_full_state() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
-    applier.on_response(&cds_response("v1", &[minimal_cluster("a", 8080)]));
-    let verdict = applier.on_response(&cds_response("v2", &[]));
+    applier
+        .on_response(&cds_response("v1", &[minimal_cluster("a", 8080)]))
+        .await;
+    let verdict = applier.on_response(&cds_response("v2", &[])).await;
 
     assert_eq!(verdict, Verdict::Accept);
     assert!(!applier.current().clusters.contains_key("a"));
@@ -211,8 +220,8 @@ fn a_second_cds_response_dropping_a_cluster_removes_it_full_state() {
 /// lower (a field outside `allowed_fields`'s allowlist), so the whole
 /// response must be discarded: no `SotwSet::apply`, no snapshot, no publish
 /// call, `current()` unchanged.
-#[test]
-fn a_cds_response_where_one_of_two_clusters_fails_to_lower_rejects_and_publishes_nothing() {
+#[tokio::test]
+async fn a_cds_response_where_one_of_two_clusters_fails_to_lower_rejects_and_publishes_nothing() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
@@ -221,7 +230,7 @@ fn a_cds_response_where_one_of_two_clusters_fails_to_lower_rejects_and_publishes
     let good = minimal_cluster("good", 8081);
     let resp = cds_response("v1", &[good, bad]);
 
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
     assert!(
         matches!(verdict, Verdict::Reject(_)),
         "expected Reject, got {verdict:?}"
@@ -236,8 +245,8 @@ fn a_cds_response_where_one_of_two_clusters_fails_to_lower_rejects_and_publishes
 }
 
 /// Same claim as above, for listeners.
-#[test]
-fn an_lds_response_where_one_of_two_listeners_fails_to_lower_rejects_and_publishes_nothing() {
+#[tokio::test]
+async fn an_lds_response_where_one_of_two_listeners_fails_to_lower_rejects_and_publishes_nothing() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
@@ -246,7 +255,7 @@ fn an_lds_response_where_one_of_two_listeners_fails_to_lower_rejects_and_publish
     let good = minimal_listener("good", "some-cluster", 10001);
     let resp = lds_response("v1", &[good, bad]);
 
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
     assert!(
         matches!(verdict, Verdict::Reject(_)),
         "expected Reject, got {verdict:?}"
@@ -256,8 +265,8 @@ fn an_lds_response_where_one_of_two_listeners_fails_to_lower_rejects_and_publish
     assert_eq!(applier.current().version.0, 0);
 }
 
-#[test]
-fn a_cds_response_naming_the_same_cluster_twice_is_rejected() {
+#[tokio::test]
+async fn a_cds_response_naming_the_same_cluster_twice_is_rejected() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
@@ -265,7 +274,7 @@ fn a_cds_response_naming_the_same_cluster_twice_is_rejected() {
         "v1",
         &[minimal_cluster("dup", 8080), minimal_cluster("dup", 8081)],
     );
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
 
     assert!(matches!(verdict, Verdict::Reject(_)));
     assert!(published.lock().unwrap().is_empty());
@@ -274,17 +283,17 @@ fn a_cds_response_naming_the_same_cluster_twice_is_rejected() {
 
 // ----------------------------------------------------------- no-op resend --
 
-#[test]
-fn resending_an_identical_cluster_set_publishes_nothing_and_does_not_bump_the_version() {
+#[tokio::test]
+async fn resending_an_identical_cluster_set_publishes_nothing_and_does_not_bump_the_version() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
     let resp = cds_response("v1", &[minimal_cluster("a", 8080)]);
-    applier.on_response(&resp);
+    applier.on_response(&resp).await;
     assert_eq!(published.lock().unwrap().len(), 1);
     assert_eq!(applier.current().version.0, 1);
 
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
     assert_eq!(verdict, Verdict::Accept);
     assert_eq!(
         published.lock().unwrap().len(),
@@ -308,16 +317,20 @@ fn resending_an_identical_cluster_set_publishes_nothing_and_does_not_bump_the_ve
 /// a new endpoint would be **silently ignored**. That is ground rule 1's
 /// failure mode arriving over the wire instead of from a file, and every
 /// other test in this file passes while it happens.
-#[test]
-fn a_cluster_whose_bytes_changed_under_the_same_name_is_republished() {
+#[tokio::test]
+async fn a_cluster_whose_bytes_changed_under_the_same_name_is_republished() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
-    applier.on_response(&cds_response("v1", &[minimal_cluster("a", 8080)]));
+    applier
+        .on_response(&cds_response("v1", &[minimal_cluster("a", 8080)]))
+        .await;
     assert_eq!(published.lock().unwrap().len(), 1);
     assert_eq!(applier.current().version.0, 1);
 
-    let verdict = applier.on_response(&cds_response("v2", &[minimal_cluster("a", 9090)]));
+    let verdict = applier
+        .on_response(&cds_response("v2", &[minimal_cluster("a", 9090)]))
+        .await;
     assert_eq!(verdict, Verdict::Accept);
     assert_eq!(
         published.lock().unwrap().len(),
@@ -347,8 +360,9 @@ fn a_cluster_whose_bytes_changed_under_the_same_name_is_republished() {
 
 // ----------------------------------------------------- static name immunity --
 
-#[test]
-fn a_dynamic_name_colliding_with_a_static_one_is_refused_and_the_static_definition_survives() {
+#[tokio::test]
+async fn a_dynamic_name_colliding_with_a_static_one_is_refused_and_the_static_definition_survives()
+{
     let base = base_with_static_cluster("shared", 9000);
     let static_arc = Arc::clone(base.clusters.get("shared").unwrap());
     let (publish, published) = recording_publisher();
@@ -365,7 +379,7 @@ fn a_dynamic_name_colliding_with_a_static_one_is_refused_and_the_static_definiti
             minimal_cluster("new-cluster", 9001),
         ],
     );
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
     assert_eq!(verdict, Verdict::Accept);
 
     let snapshot = applier.current();
@@ -379,8 +393,8 @@ fn a_dynamic_name_colliding_with_a_static_one_is_refused_and_the_static_definiti
 
 // ------------------------------------------------------------- type routing --
 
-#[test]
-fn an_rds_response_is_rejected_naming_the_work_package_that_owns_it() {
+#[tokio::test]
+async fn an_rds_response_is_rejected_naming_the_work_package_that_owns_it() {
     let (publish, _published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
@@ -388,7 +402,7 @@ fn an_rds_response_is_rejected_naming_the_work_package_that_owns_it() {
         type_url: "type.googleapis.com/envoy.config.route.v3.RouteConfiguration".to_string(),
         ..Default::default()
     };
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
     let Verdict::Reject(message) = verdict else {
         panic!("expected Reject");
     };
@@ -398,8 +412,8 @@ fn an_rds_response_is_rejected_naming_the_work_package_that_owns_it() {
     );
 }
 
-#[test]
-fn a_completely_unknown_type_url_is_rejected_not_silently_ignored() {
+#[tokio::test]
+async fn a_completely_unknown_type_url_is_rejected_not_silently_ignored() {
     let (publish, _published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
@@ -407,7 +421,7 @@ fn a_completely_unknown_type_url_is_rejected_not_silently_ignored() {
         type_url: "type.googleapis.com/definitely.not.a.real.Type".to_string(),
         ..Default::default()
     };
-    let verdict = applier.on_response(&resp);
+    let verdict = applier.on_response(&resp).await;
     let Verdict::Reject(message) = verdict else {
         panic!("expected Reject");
     };
@@ -416,18 +430,22 @@ fn a_completely_unknown_type_url_is_rejected_not_silently_ignored() {
 
 // -------------------------------------------------------- independent sets --
 
-#[test]
-fn a_cds_full_state_response_does_not_remove_a_previously_published_listener() {
+#[tokio::test]
+async fn a_cds_full_state_response_does_not_remove_a_previously_published_listener() {
     let (publish, published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
-    applier.on_response(&lds_response(
-        "v1",
-        &[minimal_listener("ingress", "some-cluster", 10000)],
-    ));
+    applier
+        .on_response(&lds_response(
+            "v1",
+            &[minimal_listener("ingress", "some-cluster", 10000)],
+        ))
+        .await;
     assert!(applier.current().listeners.contains_key("ingress"));
 
-    let verdict = applier.on_response(&cds_response("v1", &[minimal_cluster("a", 8080)]));
+    let verdict = applier
+        .on_response(&cds_response("v1", &[minimal_cluster("a", 8080)]))
+        .await;
     assert_eq!(verdict, Verdict::Accept);
     assert!(
         applier.current().listeners.contains_key("ingress"),
@@ -437,20 +455,24 @@ fn a_cds_full_state_response_does_not_remove_a_previously_published_listener() {
     assert_eq!(published.lock().unwrap().len(), 2);
 }
 
-// ----------------------------------------------------------- into_validator --
+// ------------------------------------------------------------ ResponseHandler --
 
-#[test]
-fn into_validator_produces_a_validator_returning_the_same_verdict_as_on_response() {
+/// WP-20 increment 4d-i: `ResourceApplier` no longer needs an `into_validator`
+/// adapter to reach the ADS client -- it IS a [`ResponseHandler`] directly.
+/// This is the replacement for the old `into_validator` test: the same claim
+/// ("the seam gives back exactly what `on_response` would"), now through
+/// `ResponseHandler::handle` instead of a consumed `Validator` closure.
+#[tokio::test]
+async fn resource_applier_is_a_response_handler_returning_the_same_verdict_as_on_response() {
     let resp = cds_response("v1", &[minimal_cluster("a", 8080)]);
 
     let (publish_a, _recorded_a) = recording_publisher();
     let mut applier_direct = ResourceApplier::new(empty_base(), publish_a);
-    let direct = applier_direct.on_response(&resp);
+    let direct = applier_direct.on_response(&resp).await;
 
     let (publish_b, _recorded_b) = recording_publisher();
-    let applier_for_validator = ResourceApplier::new(empty_base(), publish_b);
-    let mut validator = applier_for_validator.into_validator();
-    let via_validator = validator(&resp);
+    let mut applier_via_handler = ResourceApplier::new(empty_base(), publish_b);
+    let via_handler = applier_via_handler.handle(&resp).await;
 
-    assert_eq!(direct, via_validator);
+    assert_eq!(direct, via_handler);
 }

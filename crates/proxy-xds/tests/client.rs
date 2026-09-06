@@ -16,7 +16,10 @@ use controlplane::{Harness, RequestKind, RequestLog, Step};
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::NodeIdentity;
-use proxy_xds::{AdsClient, BackoffPolicy, Reconnect, Subscription, SubscriptionState, Verdict};
+use proxy_xds::{
+    AdsClient, BackoffPolicy, FnHandler, Reconnect, ResponseHandler, Subscription,
+    SubscriptionState, Verdict,
+};
 
 const CDS: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 const RDS: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
@@ -70,7 +73,10 @@ async fn accept_produces_an_ack_with_the_accepted_version_and_nonce() {
         .expect("client connects");
 
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
-    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
+    let run = tokio::spawn(async move {
+        ads.run_once(&mut client, &mut FnHandler(always_accept()))
+            .await
+    });
 
     wait_for_log_len(&harness.log, 2).await;
 
@@ -136,8 +142,8 @@ async fn reject_produces_a_nack_with_the_previous_version_and_new_nonce() {
             Verdict::Accept
         }
     });
-    let mut validate = validate;
-    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut validate).await });
+    let mut handler = FnHandler(validate);
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut handler).await });
 
     // [0] initial, [1] ACK of v1, [2] NACK of v2.
     wait_for_log_len(&harness.log, 3).await;
@@ -191,7 +197,10 @@ async fn empty_name_subscription_is_never_requested() {
         SubscriptionState::new(CDS, Subscription::Wildcard),
         SubscriptionState::new(RDS, Subscription::Names(BTreeSet::new())),
     ]);
-    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
+    let run = tokio::spawn(async move {
+        ads.run_once(&mut client, &mut FnHandler(always_accept()))
+            .await
+    });
 
     // [0] CDS initial, [1] CDS ACK -- and nothing else, ever, for RDS.
     wait_for_log_len(&harness.log, 2).await;
@@ -286,7 +295,10 @@ async fn reconnect_resends_the_acked_version_with_no_nonce() {
 
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
     let (reconnect, _delays) = recording_reconnect(BackoffPolicy::default());
-    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+    let run = tokio::spawn(async move {
+        ads.run(&mut client, FnHandler(always_accept()), reconnect)
+            .await
+    });
 
     // Three requests, not four: `ScriptedAds` reaches its `DropStream` step
     // the instant it has pushed v1 and returns without reading again, so the
@@ -359,7 +371,10 @@ async fn the_first_reconnect_waits_the_base_interval() {
 
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
     let (reconnect, delays) = recording_reconnect(BackoffPolicy::default());
-    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+    let run = tokio::spawn(async move {
+        ads.run(&mut client, FnHandler(always_accept()), reconnect)
+            .await
+    });
 
     let seen = wait_for_delays(&delays, 1).await;
     assert_eq!(
@@ -404,7 +419,10 @@ async fn backoff_grows_across_dead_streams_and_resets_after_a_response() {
 
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
     let (reconnect, delays) = recording_reconnect(BackoffPolicy::default());
-    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+    let run = tokio::spawn(async move {
+        ads.run(&mut client, FnHandler(always_accept()), reconnect)
+            .await
+    });
 
     let seen = wait_for_delays(&delays, 4).await;
     assert_eq!(
@@ -470,7 +488,7 @@ async fn run_clears_the_nonce_but_keeps_the_version_across_a_reconnect() {
 
     let _ = tokio::time::timeout(
         Duration::from_millis(800),
-        ads.run(&mut client, always_accept(), reconnect),
+        ads.run(&mut client, FnHandler(always_accept()), reconnect),
     )
     .await;
 
@@ -528,7 +546,10 @@ async fn the_first_request_of_a_stream_carries_the_node_and_later_ones_do_not() 
 
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)])
         .with_node(test_node());
-    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
+    let run = tokio::spawn(async move {
+        ads.run_once(&mut client, &mut FnHandler(always_accept()))
+            .await
+    });
 
     wait_for_log_len(&harness.log, 2).await;
     let log = harness.log.snapshot();
@@ -581,7 +602,10 @@ async fn a_reconnect_sends_the_node_again_on_the_new_stream() {
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)])
         .with_node(test_node());
     let (reconnect, _delays) = recording_reconnect(BackoffPolicy::default());
-    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+    let run = tokio::spawn(async move {
+        ads.run(&mut client, FnHandler(always_accept()), reconnect)
+            .await
+    });
 
     // [0] stream 1 initial, [1] stream 2 resync, [2] stream 2 ACK of v2 -- the
     // stream-1 ACK is not recorded, see the resync test above for why.
@@ -627,13 +651,108 @@ async fn a_client_with_no_node_configured_sends_none() {
         .expect("client connects");
 
     let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
-    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
+    let run = tokio::spawn(async move {
+        ads.run_once(&mut client, &mut FnHandler(always_accept()))
+            .await
+    });
 
     wait_for_log_len(&harness.log, 2).await;
     let log = harness.log.snapshot();
     assert!(
         log.iter().all(|r| r.node.is_none()),
         "no node configured means no node on any request: {log:?}"
+    );
+
+    run.abort();
+    harness.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// WP-20 increment 4d-i: the handler seam is async -- applying a response can
+// await before its ACK goes out.
+// ---------------------------------------------------------------------------
+
+/// A [`ResponseHandler`] whose future does not resolve until a `oneshot`
+/// fires, so a test can hold `run_once` right at the point where it has a
+/// verdict but has not yet sent the request that carries it.
+///
+/// Rust note: `gate` is an `Option` so `handle` can `.take()` its receiver out
+/// from behind `&mut self` -- a `oneshot::Receiver` is consumed by awaiting
+/// it, so it cannot be stored back, and this handler is only ever asked to
+/// handle one response in this test.
+struct DelayedHandler {
+    gate: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl ResponseHandler for DelayedHandler {
+    fn handle(
+        &mut self,
+        _resp: &DiscoveryResponse,
+    ) -> impl std::future::Future<Output = Verdict> + Send {
+        let gate = self
+            .gate
+            .take()
+            .expect("DelayedHandler is only asked to handle one response in this test");
+        async move {
+            let _ = gate.await;
+            Verdict::Accept
+        }
+    }
+}
+
+/// The acceptance claim for this increment: with a handler whose future is
+/// still pending, the ACK for the response it is handling must not have
+/// reached the control plane yet. Once the gate is released, the ACK follows.
+///
+/// Both waits are bounded (rule 14): the first is expected to time out, and
+/// asserting that via `Result::expect_err` on a short `tokio::time::timeout`
+/// is what turns "the ACK went out early" into a named failure rather than a
+/// pass that just got lucky on timing, and what keeps this test itself from
+/// hanging if `run_once` never sends the ACK at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ack_does_not_reach_the_wire_until_the_handler_future_resolves() {
+    let harness = Harness::spawn(vec![Step::Send {
+        type_url: CDS.to_string(),
+        version_info: "v1".to_string(),
+        nonce: "n1".to_string(),
+        resources: vec![],
+    }])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let mut handler = DelayedHandler { gate: Some(gate) };
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut handler).await });
+
+    // Only the initial request can have gone out yet -- the handler is
+    // awaiting the gate, so `run_once` must not have reached the ACK send.
+    tokio::time::timeout(
+        Duration::from_millis(300),
+        wait_for_log_len(&harness.log, 2),
+    )
+    .await
+    .expect_err("the ACK must not reach the wire while the handler's future is still pending");
+
+    release.send(()).expect("DelayedHandler is still awaiting");
+
+    // Releasing the gate lets the handler's future resolve, and the ACK
+    // follows it onto the wire.
+    tokio::time::timeout(WAIT_TIMEOUT, wait_for_log_len(&harness.log, 2))
+        .await
+        .expect("the ACK must reach the wire once the handler future resolves");
+
+    let log = harness.log.snapshot();
+    assert_eq!(
+        log[1].kind(),
+        RequestKind::Ack,
+        "expected an ACK once the handler resolved, got {:?}",
+        log[1]
     );
 
     run.abort();

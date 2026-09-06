@@ -50,6 +50,8 @@
 //! only ever touches one of them per call, driven by the response's own
 //! `type_url`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use prost::Message;
@@ -59,7 +61,7 @@ use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::{ClusterConfig, ConfigSnapshot, ListenerConfig, SnapshotVersion};
 use proxy_config::{lower_dynamic_cluster, lower_dynamic_listener};
 
-use crate::client::Validator;
+use crate::client::ResponseHandler;
 use crate::store::{ApplyError, ApplyOutcome, SetSemantics, SotwSet};
 use crate::subscription::Verdict;
 
@@ -77,12 +79,21 @@ const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.Cluster
 /// Where a newly assembled snapshot goes once every resource in a response
 /// has lowered cleanly.
 ///
-/// Rust note: a plain boxed `FnMut`, the same shape as [`Validator`] in
-/// `client.rs` and [`crate::client::Sleep`] -- an injected callback rather
-/// than a dependency on `proxy-core`'s `ConfigPublisher`, so this crate never
-/// pulls in the worker runtime. Wiring the real `ConfigPublisher` in is
-/// `crates/proxy/src/main.rs`'s job, not this module's.
-pub type Publish = Box<dyn FnMut(Arc<ConfigSnapshot>) + Send>;
+/// Rust note: same shape as [`crate::client::Sleep`] -- a boxed `FnMut`
+/// returning a boxed future rather than an `async fn` in a struct field,
+/// because the closure has to live in a struct field and be called from
+/// behind `&mut self`, and `Pin<Box<dyn Future>>` is the ordinary way to name
+/// "some future I will not spell out" there. It is a future (not a plain
+/// synchronous callback, as increment 4b-ii first had it) because the real
+/// `ConfigPublisher::publish` it wraps runs LAST in
+/// `crates/proxy/src/main.rs::reload`, after
+/// `ClusterManager::update_from_snapshot`'s own await -- this seam has to be
+/// able to await too, or that ordering could never reach it. This is an
+/// injected callback, not a dependency on `proxy-core`'s `ConfigPublisher`
+/// directly, so this crate never pulls in the worker runtime; wiring the real
+/// one in is `crates/proxy/src/main.rs`'s job, not this module's.
+pub type Publish =
+    Box<dyn FnMut(Arc<ConfigSnapshot>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 /// One dynamically-held resource: the raw bytes it arrived as, plus the IR
 /// [`lower_dynamic_cluster`] / [`lower_dynamic_listener`] produced from them.
@@ -181,10 +192,15 @@ impl ResourceApplier {
     /// `type_url` -- including RDS and EDS, both real xDS types just not
     /// this increment's job -- is refused by name rather than silently
     /// ignored (ground rule #1).
-    pub fn on_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
+    ///
+    /// `async` since increment 4d-i: publishing (below, via [`Publish`]) can
+    /// now await, and this is the method that awaits it, so
+    /// [`AdsClient::run_once`](crate::client::AdsClient::run_once) can finish
+    /// applying a response before it sends that response's ACK.
+    pub async fn on_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
         match resp.type_url.as_str() {
-            CDS_TYPE_URL => self.on_cds_response(resp),
-            LDS_TYPE_URL => self.on_lds_response(resp),
+            CDS_TYPE_URL => self.on_cds_response(resp).await,
+            LDS_TYPE_URL => self.on_lds_response(resp).await,
             RDS_TYPE_URL => Verdict::Reject(format!(
                 "RDS (`{RDS_TYPE_URL}`) is not applied by this increment -- route tables are \
                  WP-20 increment 5's own follow-on"
@@ -197,19 +213,7 @@ impl ResourceApplier {
         }
     }
 
-    /// Consume into the [`Validator`] the ADS client wants.
-    ///
-    /// Rust note: the closure captures `self` by move (`mut self` in the
-    /// signature, not `&mut self`), so calling `into_validator` gives up
-    /// ownership of the `ResourceApplier` entirely -- there is no path back
-    /// to it except through the `Validator` this returns. That mirrors how
-    /// `client.rs`'s own `Validator` is consumed: `AdsClient::run_once` takes
-    /// `&mut Validator` and never hands the caller a way to peek behind it.
-    pub fn into_validator(mut self) -> Validator {
-        Box::new(move |resp: &DiscoveryResponse| self.on_response(resp))
-    }
-
-    fn on_cds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
+    async fn on_cds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
         let mut pairs = Vec::with_capacity(resp.resources.len());
         for (index, any) in resp.resources.iter().enumerate() {
             let path = cds_path(any, index);
@@ -236,10 +240,10 @@ impl ResourceApplier {
                 ));
             }
         };
-        self.finish(outcome, "cluster")
+        self.finish(outcome, "cluster").await
     }
 
-    fn on_lds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
+    async fn on_lds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
         let mut pairs = Vec::with_capacity(resp.resources.len());
         for (index, any) in resp.resources.iter().enumerate() {
             let path = lds_path(any, index);
@@ -264,14 +268,14 @@ impl ResourceApplier {
                 ));
             }
         };
-        self.finish(outcome, "listener")
+        self.finish(outcome, "listener").await
     }
 
     /// Common tail of both `on_*_response` methods: warn on anything shadowed
     /// (rule 5), publish a fresh snapshot iff something actually changed
     /// (rule 4), and accept either way -- a `SotwSet::apply` that ran at all
     /// already means every resource in the response lowered cleanly.
-    fn finish(&mut self, outcome: ApplyOutcome, kind: &str) -> Verdict {
+    async fn finish(&mut self, outcome: ApplyOutcome, kind: &str) -> Verdict {
         for name in &outcome.shadowed_by_static {
             tracing::warn!(
                 resource = %name,
@@ -285,7 +289,7 @@ impl ResourceApplier {
             !outcome.added.is_empty() || !outcome.updated.is_empty() || !outcome.removed.is_empty();
         if changed {
             let snapshot = self.assemble_snapshot();
-            (self.publish)(Arc::clone(&snapshot));
+            (self.publish)(Arc::clone(&snapshot)).await;
             self.current = snapshot;
         }
         Verdict::Accept
@@ -333,5 +337,16 @@ impl ResourceApplier {
             clusters,
             SnapshotVersion(self.current.version.0 + 1),
         ))
+    }
+}
+
+/// `ResourceApplier` IS the real [`ResponseHandler`] -- there is no adapter
+/// step (increment 4b-ii's `into_validator` filled that role for the old
+/// synchronous [`crate::client::Validator`] seam and is gone; a caller now
+/// passes a `ResourceApplier` to [`crate::client::AdsClient::run`] /
+/// `run_once` directly).
+impl ResponseHandler for ResourceApplier {
+    fn handle(&mut self, resp: &DiscoveryResponse) -> impl Future<Output = Verdict> + Send {
+        self.on_response(resp)
     }
 }
