@@ -822,6 +822,90 @@ struct StatHandleTables {
     token_usage: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
 }
 
+/// Applies an already-built [`ConfigSnapshot`] to every piece of running
+/// state, in the one order that is safe. This is the shared tail end WP-20's
+/// design brief requires: `reload` below (the SIGHUP producer) is the first
+/// caller, and the ADS client -- the *second* producer of `Arc<ConfigSnapshot>`,
+/// landing next -- calls this SAME function rather than reaching around it to
+/// publish on its own (`internal-docs/wp-20-design-brief.md`, "The apply path
+/// is solved, and xDS must not invent a second one").
+///
+/// Order of operations, and why -- unchanged from what used to be inline in
+/// `reload`, just no longer duplicated for a second caller:
+/// 1. [`proxy_http::stat_handles::StatHandles::resolve_missing`] over the
+///    cluster keys, so a cluster this table has never seen has a handle
+///    resolved *before* traffic can possibly reach it.
+/// 2. [`proxy_http::stat_handles::DownstreamStatHandles::resolve_missing`]
+///    over the listener keys, so a listener this snapshot introduces has a
+///    `downstream_cx_total` handle resolved before its accept loop can
+///    possibly see a connection.
+/// 3. [`proxy_http::stat_handles::TokenUsageStatHandles::resolve_missing`]
+///    over the cluster keys, so a cluster this snapshot introduces has its
+///    four `llm.client.token.usage` handles resolved before it can dial its
+///    first request.
+/// 4. [`proxy_cluster::manager::ClusterManager::update_from_snapshot`] --
+///    exactly the call `run_serve` makes at boot -- so the shared cluster
+///    manager every worker's router reads through picks up added, removed, or
+///    changed clusters. A rejected cluster (unimplemented `lb_policy`, a bad
+///    `transport_socket`, ...) is left out of the live cluster set; the
+///    name+error pairs are *returned* rather than logged here, since the two
+///    callers want different things done with them (`reload` logs a
+///    SIGHUP-specific message below; the ADS caller will want to NACK the
+///    discovery response, not just log).
+/// 5. [`proxy_core::runtime::ConfigPublisher::publish`], LAST: this is what
+///    makes the snapshot visible to workers (via each worker's `config_ping`
+///    -> `reconcile`, already covered by `proxy-core`'s own tests), so it must
+///    not run until step 4 has already taught the cluster manager about every
+///    cluster the new snapshot's routes can reach -- otherwise a worker could
+///    start routing to a cluster the manager doesn't know about yet.
+///
+/// **NO TEST CATCHES A REORDERING OF STEPS 4 AND 5, and that was measured,
+/// not assumed** (2026-09-06): moving `publish` above `update_from_snapshot`
+/// leaves all 40 of this crate's tests green. So if you are editing the six
+/// lines below, the order is on you -- the suite will not stop you.
+///
+/// It is left untested deliberately rather than by oversight. The damage
+/// window is the microseconds between `publish` storing the snapshot and
+/// `update_from_snapshot` storing the cluster map (which it does synchronously,
+/// before its per-cluster `refresh_cluster().await` loop), so a test that polls
+/// for it would pass or fail on scheduler luck -- and CLAUDE.md rule 14's
+/// lesson is that an instrument which lies is worse than no instrument. The
+/// honest coverage for this is an end-to-end one: traffic in flight against a
+/// snapshot that introduces a new cluster. That belongs with the WP-28
+/// scenario suite (WP-20 increment 5), not here.
+async fn apply_snapshot(
+    snapshot: ConfigSnapshot,
+    publisher: &proxy_core::runtime::ConfigPublisher,
+    cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
+    stats_control: &proxy_observability::stats::StatsControl,
+    tables: &StatHandleTables,
+) -> (
+    SnapshotVersion,
+    Vec<(
+        proxy_config::ir::ClusterName,
+        proxy_cluster::manager::ClusterBuildError,
+    )>,
+) {
+    tables
+        .router
+        .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
+    tables
+        .downstream
+        .resolve_missing(stats_control, snapshot.listeners.keys().map(String::as_str));
+    tables
+        .token_usage
+        .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
+
+    let rejected = cluster_manager
+        .update_from_snapshot(&snapshot.clusters)
+        .await;
+
+    let version = snapshot.version;
+    publisher.publish(Arc::new(snapshot));
+
+    (version, rejected)
+}
+
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
@@ -854,30 +938,20 @@ async fn reload(
     // (it has no notion of "this is a reload") -- requirement 3 is that the
     // version strictly advances across reloads, so this overwrites it with
     // the next number in the sequence this process has been handing out
-    // since boot (`current_version`, threaded in by the caller).
+    // since boot (`current_version`, threaded in by the caller). This stays
+    // here, not in `apply_snapshot`, because the ADS producer landing next
+    // stamps its own versions differently (from the discovery response, not
+    // from a local counter) -- versioning is producer-specific, applying is not.
     snapshot.version = SnapshotVersion(current_version.0 + 1);
 
-    tables
-        .router
-        .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
-    // WP-23 increment 6b: same reasoning as the line above, for the
-    // listener-keyed table -- a listener a reload introduces must have a
-    // `downstream_cx_total` handle resolved before its accept loop can
-    // possibly see a connection.
-    tables
-        .downstream
-        .resolve_missing(stats_control, snapshot.listeners.keys().map(String::as_str));
-    // WP-23 increment 6b: same reasoning again, for the provider(=cluster)-
-    // keyed token-usage table -- a cluster a reload introduces must have its
-    // four `llm.client.token.usage` handles resolved before it can dial
-    // its first request.
-    tables
-        .token_usage
-        .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
+    // Captured before `snapshot` moves into `apply_snapshot` below, purely so
+    // the success log line further down can still report them.
+    let listeners = snapshot.listeners.len();
+    let clusters = snapshot.clusters.len();
 
-    let rejected = cluster_manager
-        .update_from_snapshot(&snapshot.clusters)
-        .await;
+    let (version, rejected) =
+        apply_snapshot(snapshot, publisher, cluster_manager, stats_control, tables).await;
+
     for (name, err) in &rejected {
         tracing::error!(
             cluster = %name,
@@ -886,11 +960,6 @@ async fn reload(
              (a request routed to it will fail until this is fixed and reloaded again)"
         );
     }
-
-    let listeners = snapshot.listeners.len();
-    let clusters = snapshot.clusters.len();
-    let version = snapshot.version;
-    publisher.publish(Arc::new(snapshot));
 
     tracing::info!(
         version = version.0,

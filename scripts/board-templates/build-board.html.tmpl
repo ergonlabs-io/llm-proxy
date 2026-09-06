@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-05 · 1653 tests passed, 16 skipped as of 2026-09-05 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-06 · 1693 tests passed, 16 skipped as of 2026-09-05 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -195,11 +195,19 @@
     reconnect-resync expressible at all), 1 (bootstrap <code>dynamic_resources</code> → IR, every
     unimplemented member refused by dotted path), 2 (the S8 subscription state machine — pure
     logic, so ACK/NACK conformance is pinned without a socket), 3a (the tonic pump — the
-    first code that actually connects) and 3b (reconnect forever with an injectable jittered
-    backoff, 500ms–30s, plus the S8 resync rule on every new stream) have all landed
-    2026-09-04/05. <b>The client still applies nothing it receives</b> — no LDS/CDS response has
-    ever reached the IR — so increment 4 (resource application) is next, then 5 (the
-    go-control-plane fixture). Note <b>WP-20 alone does not close this
+    first code that actually connects), 3b (reconnect forever with an injectable jittered
+    backoff, 500ms–30s, plus the S8 resync rule on every new stream) and now <b>4</b> (4a the SotW
+    resource-set semantics as pure logic, 4b-i strict per-resource lowering through
+    <code>check_supported_surface</code>, 4b-ii <code>ResourceApplier</code> decode/validate/
+    apply/publish, 4c a real <code>node</code> on the wire — it had been going out unset on every
+    request) have all landed 2026-09-04/05. <b>The client now applies what it receives</b> —
+    accepted LDS/CDS resources reach the IR — but RDS and EDS are both still refused by name, not
+    silently dropped: RDS is increment 5's own follow-on, EDS is WP-21's. What's left: increment 5
+    (the 5 WP-28 acceptance scenarios plus the go-control-plane fixture behind
+    <code>make xds-conformance</code>) and, separately, the <code>main.rs</code> wiring that builds
+    an <code>AdsClient</code> from <code>AdsConfig</code> and hands it the real
+    <code>ConfigPublisher</code> — nothing in the shipped binary does that yet, so the subsystem
+    stays unreachable from the product either way. Note <b>WP-20 alone does not close this
     gate</b> — EDS defers to WP-21, which owns the missing IR <code>Eds</code> variant.
     Before that, 2026-08-29 through 2026-09-02, WP-50 increment 3 landed (operator control
     plane: tenants, spend budgets), P0 product-defining work gating neither v0.2.0 nor v0.3.0 —
@@ -254,12 +262,17 @@
     <span class="gate"><b>v0.3.0's SHIP GATE — RED.</b> The proxy
     takes its entire configuration from an ADS control plane, ACKs and NACKs correctly per S8,
     and survives a control-plane reconnect with make-before-break cluster warming. WP-20 (ADS
-    client) has five of its six increments landed — it opens a real gRPC stream, ACKs/NACKs, and
-    now reconnects and resyncs forever with a jittered backoff — but <b>applies none of what it
-    receives</b>, so the gate is unmoved: nothing reaches the IR yet. WP-21/WP-22 remain blocked
-    on it; WP-28 (the control-plane test harness) has landed the DropStream/Wait chunk WP-20's own
-    reconnect-resync scenario needed and is otherwise still scaffolding. Zero of the four in-scope
-    WPs are done.</span>
+    client) has landed five of its six increments (0 through 4) — it opens a real gRPC stream,
+    ACKs/NACKs, reconnects and resyncs forever with a jittered backoff, and as of increment 4
+    <b>applies accepted LDS/CDS resources into the IR</b> (RDS and EDS still refused by name, not
+    silently dropped). That moves the gate's substance but not its color: increment 5 (the 5
+    WP-28 acceptance scenarios plus the go-control-plane fixture behind
+    <code>make xds-conformance</code>) hasn't started, and — independent of increment count —
+    <b>nothing in the shipped binary constructs an <code>AdsClient</code> yet</b>, so the whole
+    subsystem is unreachable from the product regardless of what it can do in isolation.
+    WP-21/WP-22 remain blocked on it; WP-28 (the control-plane test harness) has landed the
+    DropStream/Wait chunk WP-20's own reconnect-resync scenario needed and is otherwise still
+    scaffolding. Zero of the four in-scope WPs are done.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
