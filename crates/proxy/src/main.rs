@@ -895,6 +895,51 @@ struct StatHandleTables {
     token_usage: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
 }
 
+/// Proof that a snapshot's clusters are already installed in the shared
+/// [`proxy_cluster::manager::ClusterManager`].
+///
+/// Rust note: a zero-sized "receipt" (or witness) type. It carries no data --
+/// its whole job is that [`install_clusters`] is the only thing that can
+/// produce one and [`publish_to_workers`] demands one by value, so the
+/// dangerous order (publish first, install second) is not expressible. This
+/// is the cheapest way to turn "a comment says do these in order" into "the
+/// compiler says so", and it exists because two separate attempts to catch
+/// the wrong order with a test both failed -- see [`apply_snapshot`]'s doc.
+#[must_use = "publishing without installing clusters first is the bug this type exists to prevent"]
+struct ClustersInstalled;
+
+/// Step 4: teach the shared cluster manager about this snapshot's clusters,
+/// returning the receipt [`publish_to_workers`] needs plus any clusters it
+/// rejected.
+async fn install_clusters(
+    cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
+    clusters: &std::collections::HashMap<
+        proxy_config::ir::ClusterName,
+        Arc<proxy_config::ir::ClusterConfig>,
+    >,
+) -> (
+    ClustersInstalled,
+    Vec<(
+        proxy_config::ir::ClusterName,
+        proxy_cluster::manager::ClusterBuildError,
+    )>,
+) {
+    let rejected = cluster_manager.update_from_snapshot(clusters).await;
+    (ClustersInstalled, rejected)
+}
+
+/// Step 5: make the snapshot visible to workers. Takes the
+/// [`ClustersInstalled`] receipt by value so this cannot run before step 4.
+fn publish_to_workers(
+    publisher: &proxy_core::runtime::ConfigPublisher,
+    snapshot: ConfigSnapshot,
+    _installed: ClustersInstalled,
+) -> SnapshotVersion {
+    let version = snapshot.version;
+    publisher.publish(Arc::new(snapshot));
+    version
+}
+
 /// Applies an already-built [`ConfigSnapshot`] to every piece of running
 /// state, in the one order that is safe. This is the shared tail end WP-20's
 /// design brief requires: `reload` below (the SIGHUP producer) is the first
@@ -932,20 +977,25 @@ struct StatHandleTables {
 ///    cluster the new snapshot's routes can reach -- otherwise a worker could
 ///    start routing to a cluster the manager doesn't know about yet.
 ///
-/// **NO TEST CATCHES A REORDERING OF STEPS 4 AND 5, and that was measured,
-/// not assumed** (2026-09-06): moving `publish` above `update_from_snapshot`
-/// leaves all 40 of this crate's tests green. So if you are editing the six
-/// lines below, the order is on you -- the suite will not stop you.
+/// **The ordering of steps 4 and 5 is enforced by the TYPE SYSTEM, not by a
+/// test, and that is a deliberate choice made after two measured failures.**
 ///
-/// It is left untested deliberately rather than by oversight. The damage
-/// window is the microseconds between `publish` storing the snapshot and
-/// `update_from_snapshot` storing the cluster map (which it does synchronously,
-/// before its per-cluster `refresh_cluster().await` loop), so a test that polls
-/// for it would pass or fail on scheduler luck -- and CLAUDE.md rule 14's
-/// lesson is that an instrument which lies is worse than no instrument. The
-/// honest coverage for this is an end-to-end one: traffic in flight against a
-/// snapshot that introduces a new cluster. That belongs with the WP-28
-/// scenario suite (WP-20 increment 5), not here.
+/// First (2026-09-06) a plain mutation showed no unit test caught a
+/// reordering. Then an end-to-end test was written for exactly this -- boot
+/// the binary, have a control plane introduce a cluster, drive real traffic --
+/// and a mutation showed *it did not catch the reordering either*
+/// (`tests/ads_e2e.rs`, see its module doc). The reason is structural: the
+/// damage window is the microseconds between `publish` storing the snapshot
+/// and `update_from_snapshot` storing the cluster map, which it does
+/// synchronously before its per-cluster `refresh_cluster().await` loop. No
+/// black-box observer can reliably land inside it, and CLAUDE.md rule 14's
+/// lesson is that an instrument which lies is worse than none.
+///
+/// So the order is a compile-time property instead: [`install_clusters`]
+/// returns a [`ClustersInstalled`] receipt that [`publish_to_workers`]
+/// requires by value. Swapping the two statements below does not typecheck --
+/// the receipt would be used before it exists. That is a stronger guarantee
+/// than the test that could not be written, and it costs one zero-sized type.
 async fn apply_snapshot(
     snapshot: ConfigSnapshot,
     publisher: &proxy_core::runtime::ConfigPublisher,
@@ -969,12 +1019,10 @@ async fn apply_snapshot(
         .token_usage
         .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
 
-    let rejected = cluster_manager
-        .update_from_snapshot(&snapshot.clusters)
-        .await;
-
-    let version = snapshot.version;
-    publisher.publish(Arc::new(snapshot));
+    let (installed, rejected) = install_clusters(cluster_manager, &snapshot.clusters).await;
+    // `installed` is consumed here, and it cannot exist before the line above
+    // -- that is what makes the order a compile error rather than a comment.
+    let version = publish_to_workers(publisher, snapshot, installed);
 
     (version, rejected)
 }
@@ -1213,14 +1261,25 @@ fn start_ads(
             // `AdsClient::run_once` does not send this response's ACK until
             // THIS future resolves.
             //
-            // **NO TEST IN THIS CRATE CATCHES THE LOSS OF THIS `.await`,
-            // measured 2026-09-06**: deleting it leaves all 45 green. The
-            // seam itself is pinned one layer down, by
-            // `proxy-xds`'s `the_ack_does_not_reach_the_wire_until_the_            // handler_future_resolves` -- but nothing yet proves that THIS
-            // closure uses the seam correctly, because that needs a real
-            // control plane and a booted binary. It is owed by WP-20
-            // increment 5's WP-28 scenario suite, alongside the untested
-            // step-4/step-5 ordering `apply_snapshot`'s doc records.
+            // **NOTHING CATCHES THE LOSS OF THIS `.await`, and an
+            // end-to-end attempt to fix that FAILED -- measured twice.**
+            // Deleting it leaves this crate's unit tests green (2026-09-06),
+            // and it also leaves all three of `tests/ads_e2e.rs`'s
+            // real-binary-against-a-real-control-plane tests green. The
+            // reason is in that file's module doc: observing the ACK costs a
+            // network round trip, orders of magnitude longer than the window
+            // this bug opens, so the racing apply always wins.
+            //
+            // The seam itself IS pinned, one layer down, by `proxy-xds`'s
+            // `the_ack_does_not_reach_the_wire_until_the_handler_future_resolves`
+            // -- what is unpinned is that THIS closure uses it. The sibling
+            // step-4/step-5 ordering was in the same position and got solved
+            // structurally instead (see `apply_snapshot`'s `ClustersInstalled`
+            // receipt); the same trick does not reach across this channel,
+            // because the reply arrives at runtime rather than as a value the
+            // compiler can require. Left open deliberately, and the harm is
+            // bounded: a control plane believes config is live fractionally
+            // early, which is an S8 conformance point, not a serving defect.
             let _ = reply_rx.await;
         })
     });

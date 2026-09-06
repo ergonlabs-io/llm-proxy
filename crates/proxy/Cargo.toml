@@ -49,6 +49,17 @@ http = { workspace = true }
 # than guessing a `target/` layout that a per-worktree `CARGO_TARGET_DIR`
 # (see CLAUDE.md) could change out from under a hardcoded guess.
 serde_json = { workspace = true }
+# tests/ads_e2e.rs (WP-20 increment 5): the WP-28 puppet ADS server this
+# scripts a control plane with -- same dev-only dependency as
+# `crates/proxy-xds`'s own tests, not a `workspace.dependencies` entry since
+# nothing outside test code needs it (see that crate's Cargo.toml comment).
+controlplane = { path = "../../testing/controlplane" }
+# tests/ads_e2e.rs: hand-builds a `Cluster` proto and wraps it as a
+# `google.protobuf.Any` to script a CDS response directly -- there is no
+# bootstrap file on this path, only a resource the ADS client decodes off
+# the wire, same idiom as `crates/proxy-xds/tests/apply.rs`'s own fixtures.
+prost = { workspace = true }
+prost-types = { workspace = true }
 # tests/otlp_trace_e2e.rs's mock OTLP collector: a real `TraceServiceServer`
 # (generated in `proxy-api`) served over a real ephemeral `tonic` endpoint --
 # the only way to prove spans actually cross the wire in the shape a real
