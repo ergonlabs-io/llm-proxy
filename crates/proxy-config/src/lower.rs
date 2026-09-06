@@ -147,6 +147,92 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     Ok(snapshot)
 }
 
+// --------------------------------------------------- single xDS resource lowering --
+
+/// Full proto type name a dynamic `Cluster` resource must carry.
+const DYNAMIC_CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
+/// Full proto type name a dynamic `Listener` resource must carry.
+const DYNAMIC_LISTENER_TYPE: &str = "envoy.config.listener.v3.Listener";
+
+/// Lower one xDS-delivered resource `Any` into its typed proto `T`, running
+/// the SAME strict-mode surface check `build_snapshot` runs over a whole
+/// file-loaded bootstrap (ground rule #1) -- just scoped to this one
+/// resource instead of the whole tree. `path` is the caller's dotted-path
+/// root (e.g. `cds.clusters[payments-primary]`); every error below, and every
+/// error the surface walk finds deeper inside this resource, is reported
+/// rooted at it. `expected_type` is the full proto type name this resource
+/// must carry (e.g. `envoy.config.cluster.v3.Cluster`).
+///
+/// Rust note: `T: prost::Message + Default` is the same bound
+/// [`decode_any`] uses -- any generated prost message type can be decoded
+/// this way, so this one function serves both [`lower_dynamic_cluster`] and
+/// [`lower_dynamic_listener`] without repeating the type-URL/pool/surface-walk
+/// plumbing in each.
+fn lower_dynamic_any<T: prost::Message + Default>(
+    any: &prost_types::Any,
+    path: &str,
+    expected_type: &str,
+) -> Result<T, ConfigError> {
+    // The pool lookup runs first, keyed by whatever type name actually
+    // arrived: a type absent from the pool entirely (garbage, or a real Envoy
+    // type we simply haven't vendored) is `UnknownTypeUrl`, distinct from a
+    // real, resolvable type that just isn't the one this call expects.
+    let actual_type = type_name(any);
+    let inner_desc = proxy_api::descriptor_pool()
+        .get_message_by_name(actual_type)
+        .ok_or_else(|| ConfigError::UnknownTypeUrl {
+            field_path: path.to_string(),
+            type_url: any.type_url.clone(),
+        })?;
+    if actual_type != expected_type {
+        return Err(invalid(
+            path,
+            format!("expected `{expected_type}`, found `{actual_type}`"),
+        ));
+    }
+
+    let dyn_msg = DynamicMessage::decode(inner_desc, any.value.as_slice())
+        .map_err(|e| ConfigError::Parse(format!("cannot decode `{}`: {e}", any.type_url)))?;
+    // Rust note: `check_supported_surface` mutates this buffer as it recurses
+    // (push a field name, recurse, truncate back) -- seeding it with `path`
+    // instead of starting from `String::new()` is what makes a nested
+    // unsupported-field error read `<path>.<field>...` rather than restarting
+    // from the resource root's own name.
+    let mut walk_path = path.to_string();
+    check_supported_surface(&dyn_msg, &mut walk_path)?;
+
+    decode_any::<T>(any, path)
+}
+
+/// Lower one xDS-delivered `Cluster` resource into IR.
+///
+/// `path` is the caller-supplied dotted-path root for every error raised
+/// beneath it -- the ADS client passes something like
+/// `cds.clusters[payments-primary]`, mirroring how [`build_snapshot`] passes
+/// `static_resources.clusters[{i}]` for a file-loaded one. This runs the same
+/// strict-mode surface check `build_snapshot` applies to file config (ground
+/// rule #1) over this one resource before converting anything, so an
+/// xDS-delivered `Cluster` cannot carry a field the file loader would reject
+/// and slip through just because it arrived over the wire instead.
+pub fn lower_dynamic_cluster(
+    any: &prost_types::Any,
+    path: &str,
+) -> Result<ClusterConfig, ConfigError> {
+    let c: cluster_v3::Cluster = lower_dynamic_any(any, path, DYNAMIC_CLUSTER_TYPE)?;
+    convert_cluster(&c, path)
+}
+
+/// Lower one xDS-delivered `Listener` resource into IR. See
+/// [`lower_dynamic_cluster`] for what `path` roots and why the surface check
+/// runs here too -- xDS is not a hole around strict mode.
+pub fn lower_dynamic_listener(
+    any: &prost_types::Any,
+    path: &str,
+) -> Result<ListenerConfig, ConfigError> {
+    let l: listener_v3::Listener = lower_dynamic_any(any, path, DYNAMIC_LISTENER_TYPE)?;
+    convert_listener(&l, path)
+}
+
 // ------------------------------------------------------------ surface check --
 
 /// Fields we currently map to IR, per message type. A message type absent from
