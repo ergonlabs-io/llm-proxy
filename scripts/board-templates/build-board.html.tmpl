@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-06 · 1693 tests passed, 16 skipped as of 2026-09-05 (cargo nextest, workspace; doctests run separately via <code>make tq-doc</code>: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-06 · 1723 tests passed, 16 skipped as of 2026-09-06 (cargo nextest, workspace; doctests carried forward, not re-run this refresh: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -190,28 +190,35 @@
   </div>
   <p class="now">
     <b>Now — v0.3.0 "dynamic configuration": be deployable the way Envoy is deployed.</b> Current
-    by declaration since v0.2.0 shipped 2026-08-29. <b>WP-20 started 2026-09-04</b> against a
-    design brief that cuts it into six increments; increments 0 (the WP-28 chunk that makes
-    reconnect-resync expressible at all), 1 (bootstrap <code>dynamic_resources</code> → IR, every
-    unimplemented member refused by dotted path), 2 (the S8 subscription state machine — pure
-    logic, so ACK/NACK conformance is pinned without a socket), 3a (the tonic pump — the
-    first code that actually connects), 3b (reconnect forever with an injectable jittered
-    backoff, 500ms–30s, plus the S8 resync rule on every new stream) and now <b>4</b> (4a the SotW
-    resource-set semantics as pure logic, 4b-i strict per-resource lowering through
-    <code>check_supported_surface</code>, 4b-ii <code>ResourceApplier</code> decode/validate/
-    apply/publish, 4c a real <code>node</code> on the wire — it had been going out unset on every
-    request) have all landed 2026-09-04/05. <b>The client now applies what it receives</b> —
-    accepted LDS/CDS resources reach the IR — but RDS and EDS are both still refused by name, not
-    silently dropped: RDS is increment 5's own follow-on, EDS is WP-21's. What's left: increment 5
-    (the 5 WP-28 acceptance scenarios plus the go-control-plane fixture behind
-    <code>make xds-conformance</code>) and, separately, the <code>main.rs</code> wiring that builds
-    an <code>AdsClient</code> from <code>AdsConfig</code> and hands it the real
-    <code>ConfigPublisher</code> — nothing in the shipped binary does that yet, so the subsystem
-    stays unreachable from the product either way. Note <b>WP-20 alone does not close this
-    gate</b> — EDS defers to WP-21, which owns the missing IR <code>Eds</code> variant.
-    Before that, 2026-08-29 through 2026-09-02, WP-50 increment 3 landed (operator control
-    plane: tenants, spend budgets), P0 product-defining work gating neither v0.2.0 nor v0.3.0 —
-    see the dated block at the end of this paragraph.
+    by declaration since v0.2.0 shipped 2026-08-29. <b>WP-20 is DONE, 2026-09-05/06 — all six
+    increments (0 through 5).</b> Increment 5 landed all five WP-28 acceptance scenarios {ACK,
+    NACK-recover, reconnect-resync, spurious-nonce, out-of-order-response} over a real socket, plus
+    <code>make xds-conformance</code>, which <b>found a real deadlock on its first run</b>
+    against a pinned go-control-plane: our client queued its initial request only after awaiting
+    stream headers, and grpc-go withholds those until it has a request to answer — our own puppet
+    harness structurally cannot catch this, since tonic sends headers eagerly. The client is also
+    now reachable from the shipped binary (increment 4d-iii) — until that landed, every piece of
+    WP-20 was built, tested, and unreachable. RDS and EDS are both refused by name, not silently
+    dropped, and both are now WP-21's — a doc correction moved RDS off WP-20 mid-flight, since the
+    IR has no by-name route-table variant for an HCM to warm against. One ordering gap stays open,
+    deliberately and in writing: ACK-before-apply in <code>main.rs</code>, which two independent
+    test attempts could not observe from outside (the ACK's own network round trip dwarfs the
+    race window) — publish-ordering is closed instead by the type system.
+    <b>WP-21 (warming, ordering, make-before-break) started 2026-09-06</b>, and this is the WP
+    that actually closes the gate: increment 1 landed the EDS cluster IR surface (config surface
+    only — nothing subscribes to EDS or applies an endpoint update yet), and found one real defect
+    on the way (a statically-declared EDS cluster's membership would have been wiped by the next
+    DNS-cadence refresh tick, now fixed). <b>Do not read WP-20's completion as the gate moving —
+    it has not.</b> EDS subscription/application, listener warming, and the make-before-break
+    churn test are all still ahead of WP-21.
+    <b>WP-54 (tenant self-service usage API) is DONE, 2026-09-06, both increments</b> — not
+    gate-moving, it never was part of the ADS gate. <b>WP-55 (usage history) was decided the same
+    day: export-only, stay stateless</b>, and resized L → S once its own stale starting claim
+    (the token-usage metric "never recorded") was checked against the code and found wrong;
+    it is ready to start, not gate-moving either. Before all of this, 2026-08-29 through
+    2026-09-02, WP-50 increment 3 landed (operator control plane: tenants, spend budgets), P0
+    product-defining work gating neither v0.2.0 nor v0.3.0 — see the dated block at the end of
+    this paragraph.
     <span class="gate"><b>✓ P0 FOUND AND FIXED 2026-09-04 —</b>
     <code>llmproxy.model_authz</code> denied <b>every</b> request in any chain that enabled it,
     a 100% outage that made WP-50 3a/3b-iv non-functional in production (fails closed, so not a
@@ -259,20 +266,23 @@
     <code>0d7bd1b</code>; HTTP upgrades/WebSocket tunneling (WP-10 S10) landed the same window as
     a bonus, not gate-required. Full history of this gate's long path to closing is in
     <code>internal-docs/MILESTONES.md</code>, not repeated here now that it's shipped.</span>
-    <span class="gate"><b>v0.3.0's SHIP GATE — RED.</b> The proxy
+    <span class="gate"><b>v0.3.0's SHIP GATE — still RED.</b> The proxy
     takes its entire configuration from an ADS control plane, ACKs and NACKs correctly per S8,
-    and survives a control-plane reconnect with make-before-break cluster warming. WP-20 (ADS
-    client) has landed five of its six increments (0 through 4) — it opens a real gRPC stream,
-    ACKs/NACKs, reconnects and resyncs forever with a jittered backoff, and as of increment 4
-    <b>applies accepted LDS/CDS resources into the IR</b> (RDS and EDS still refused by name, not
-    silently dropped). That moves the gate's substance but not its color: increment 5 (the 5
-    WP-28 acceptance scenarios plus the go-control-plane fixture behind
-    <code>make xds-conformance</code>) hasn't started, and — independent of increment count —
-    <b>nothing in the shipped binary constructs an <code>AdsClient</code> yet</b>, so the whole
-    subsystem is unreachable from the product regardless of what it can do in isolation.
-    WP-21/WP-22 remain blocked on it; WP-28 (the control-plane test harness) has landed the
+    and survives a control-plane reconnect with make-before-break cluster warming. <b>WP-20 (ADS
+    client) is DONE, 2026-09-05/06 — all six increments.</b> It opens a real gRPC stream,
+    ACKs/NACKs, reconnects and resyncs forever with a jittered backoff, applies accepted LDS/CDS
+    resources into the IR, all five WP-28 acceptance scenarios pass over a real socket, and
+    <code>make xds-conformance</code> found and fixed a real deadlock against a pinned
+    go-control-plane on its first run — evidence for why that opt-in target exists, since our own
+    puppet harness structurally cannot reproduce it. <b>Read that as the ADS client working, not
+    as the gate moving</b>: RDS and EDS are both still refused by name, not silently dropped, and
+    both are now WP-21's. <b>WP-21 started 2026-09-06</b> — increment 1 landed the EDS cluster IR
+    surface, config surface only, nothing subscribes to EDS or applies an endpoint update yet.
+    Make-before-break cluster warming, listener warming on RDS dependency, and the churn
+    acceptance test are all still ahead of WP-21, and that is what this gate is actually waiting
+    on now. WP-22 remains blocked on WP-21; WP-28 (the control-plane test harness) has landed the
     DropStream/Wait chunk WP-20's own reconnect-resync scenario needed and is otherwise still
-    scaffolding. Zero of the four in-scope WPs are done.</span>
+    scaffolding. One of the four in-scope WPs (WP-20) is done.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -433,7 +443,7 @@
     { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
   ];
 
-  const CURRENT_MS = "v0.2.0";
+  const CURRENT_MS = "v0.3.0";
 
   // status: done | ready | started | blocked ; ms = the release the WP closes in
   const wps = /*__DATA__*/;
