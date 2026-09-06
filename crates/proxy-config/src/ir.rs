@@ -70,6 +70,75 @@ pub struct ConfigSnapshot {
     pub version: SnapshotVersion,
 }
 
+impl ConfigSnapshot {
+    /// Build the snapshot that succeeds this one when xDS delivers a new set
+    /// of dynamic resources (WP-20 increment 4b-ii): everything that is not a
+    /// listener or a cluster is carried forward from `self` unchanged, and the
+    /// two resource maps become `self`'s static entries plus the dynamic ones.
+    ///
+    /// **This lives here, rather than in `proxy-xds` where its only caller
+    /// is, for one specific reason** -- and it is the reason
+    /// `crates/proxy-config/tests/ir_readership.rs` exists. That test proves
+    /// every IR field has a real runtime reader, by scanning the runtime
+    /// crates for the field's name; its module doc names the failure mode it
+    /// was written to prevent, "a `/config_dump` that grows to render the
+    /// whole IR would defeat it one field at a time, quietly, with no test
+    /// ever failing". A snapshot-assembly function written as a struct literal
+    /// in a runtime crate is exactly that shape: it names every field of
+    /// `ConfigSnapshot`, so every one of them reads as consumed forever after,
+    /// whether or not anything actually acts on it. Keeping the assembly in
+    /// `proxy-config` keeps the instrument sharp.
+    ///
+    /// `version` is the caller's, not derived here: it counts snapshots
+    /// actually published, and a response that changes nothing publishes
+    /// nothing (see `proxy_xds::apply`), so this type cannot know it.
+    ///
+    /// # Panics (debug builds)
+    ///
+    /// Static resources are immune to xDS -- Envoy's own rule, and
+    /// `proxy_xds::store` enforces it by refusing a dynamic name that
+    /// collides with a static one. A collision reaching here means that
+    /// refusal broke, so it is a `debug_assert!` rather than a silent
+    /// overwrite of the static definition.
+    pub fn with_dynamic_resources(
+        &self,
+        dynamic_listeners: HashMap<ListenerName, Arc<ListenerConfig>>,
+        dynamic_clusters: HashMap<ClusterName, Arc<ClusterConfig>>,
+        version: SnapshotVersion,
+    ) -> ConfigSnapshot {
+        let mut listeners = self.listeners.clone();
+        for (name, cfg) in dynamic_listeners {
+            debug_assert!(
+                !self.listeners.contains_key(&name),
+                "dynamic listener `{name}` collides with a static one; static names are immune \
+                 to xDS and should have been refused before reaching here"
+            );
+            listeners.insert(name, cfg);
+        }
+
+        let mut clusters = self.clusters.clone();
+        for (name, cfg) in dynamic_clusters {
+            debug_assert!(
+                !self.clusters.contains_key(&name),
+                "dynamic cluster `{name}` collides with a static one; static names are immune \
+                 to xDS and should have been refused before reaching here"
+            );
+            clusters.insert(name, cfg);
+        }
+
+        ConfigSnapshot {
+            listeners,
+            clusters,
+            routes: self.routes.clone(),
+            secrets: self.secrets.clone(),
+            admin: self.admin,
+            tracing: self.tracing.clone(),
+            ads: self.ads.clone(),
+            version,
+        }
+    }
+}
+
 // -------------------------------------------------------------------- ads --
 
 /// How to reach the ADS control plane, lowered from bootstrap

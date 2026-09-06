@@ -50,7 +50,6 @@
 //! only ever touches one of them per call, driven by the response's own
 //! `type_url`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use prost::Message;
@@ -292,59 +291,47 @@ impl ResourceApplier {
         Verdict::Accept
     }
 
-    /// Build a fresh snapshot: `base`'s non-resource fields unchanged,
-    /// listeners/clusters as `base`'s static entries plus whatever each
-    /// `SotwSet` currently holds dynamically, version bumped by one from
-    /// `current` (the last one actually published).
+    /// Build a fresh snapshot: the dynamic sets' current entries merged over
+    /// `base`, version bumped by one from `current` (the last one actually
+    /// published, so a no-op response leaves no gap in the sequence).
+    ///
+    /// The merge itself is [`ConfigSnapshot::with_dynamic_resources`], in
+    /// `proxy-config`, and deliberately not a struct literal here: a struct
+    /// literal in a runtime crate names every field of `ConfigSnapshot`, which
+    /// would make all of them read as consumed by
+    /// `crates/proxy-config/tests/ir_readership.rs`'s scan whether or not
+    /// anything acts on them. That test's own module doc names this as the
+    /// failure mode it exists to prevent. See the method's doc.
     fn assemble_snapshot(&self) -> Arc<ConfigSnapshot> {
-        let mut listeners: HashMap<String, Arc<ListenerConfig>> = HashMap::new();
-        for (name, cfg) in &self.base.listeners {
-            listeners.insert(name.clone(), Arc::clone(cfg));
-        }
-        for name in self.listeners.names() {
-            let entry = self
-                .listeners
-                .get(name)
-                .expect("a name SotwSet::names() just returned must be present in the same set");
-            // Static names are supposed to be immune (`store.rs` rule 3): a
-            // colliding name is reported `shadowed_by_static` and never
-            // reaches the dynamic map at all. Assert the invariant rather
-            // than assume it -- a bug here would silently let a dynamic
-            // listener overwrite a static one instead of refusing it.
-            debug_assert!(
-                !self.base.listeners.contains_key(name),
-                "dynamic listener `{name}` collides with a static one; static names should have \
-                 made this shadowed_by_static, never applied"
-            );
-            listeners.insert(name.to_string(), Arc::clone(&entry.ir));
-        }
+        let listeners = self
+            .listeners
+            .names()
+            .into_iter()
+            .map(|name| {
+                let entry = self
+                    .listeners
+                    .get(name)
+                    .expect("a name SotwSet::names() just returned must be present in the set");
+                (name.to_string(), Arc::clone(&entry.ir))
+            })
+            .collect();
+        let clusters = self
+            .clusters
+            .names()
+            .into_iter()
+            .map(|name| {
+                let entry = self
+                    .clusters
+                    .get(name)
+                    .expect("a name SotwSet::names() just returned must be present in the set");
+                (name.to_string(), Arc::clone(&entry.ir))
+            })
+            .collect();
 
-        let mut clusters: HashMap<String, Arc<ClusterConfig>> = HashMap::new();
-        for (name, cfg) in &self.base.clusters {
-            clusters.insert(name.clone(), Arc::clone(cfg));
-        }
-        for name in self.clusters.names() {
-            let entry = self
-                .clusters
-                .get(name)
-                .expect("a name SotwSet::names() just returned must be present in the same set");
-            debug_assert!(
-                !self.base.clusters.contains_key(name),
-                "dynamic cluster `{name}` collides with a static one; static names should have \
-                 made this shadowed_by_static, never applied"
-            );
-            clusters.insert(name.to_string(), Arc::clone(&entry.ir));
-        }
-
-        Arc::new(ConfigSnapshot {
+        Arc::new(self.base.with_dynamic_resources(
             listeners,
             clusters,
-            routes: self.base.routes.clone(),
-            secrets: self.base.secrets.clone(),
-            admin: self.base.admin,
-            tracing: self.base.tracing.clone(),
-            ads: self.base.ads.clone(),
-            version: SnapshotVersion(self.current.version.0 + 1),
-        })
+            SnapshotVersion(self.current.version.0 + 1),
+        ))
     }
 }

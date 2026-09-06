@@ -111,16 +111,22 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "AdsConfig",
         field_name: "lds",
         kind: EntryKind::KnownInert,
-        reason: "WP-20: which resource types are subscribed over ADS. Read by \
-                  the subscription state machine (increment 2/3), which does \
-                  not exist yet. See ConfigSnapshot.ads's entry.",
+        reason: "WP-20: which resource types are subscribed over ADS. The \
+                  original reason said the subscription state machine \
+                  (increment 2/3) would read this. It does not: increments \
+                  2-4 build their SubscriptionStates from arguments the \
+                  caller passes, so the first real reader is the wiring in \
+                  crates/proxy/src/main.rs that constructs an AdsClient FROM \
+                  this config. Delete this entry with that, not with \
+                  increment 3.",
     },
     AllowlistEntry {
         struct_name: "AdsConfig",
         field_name: "cds",
         kind: EntryKind::KnownInert,
         reason: "WP-20: as AdsConfig.lds -- the CDS half of the same \
-                  subscription set. See ConfigSnapshot.ads's entry.",
+                  subscription set, and the same correction applies. See \
+                  AdsConfig.lds's entry.",
     },
     AllowlistEntry {
         struct_name: "AdsConfig",
@@ -136,12 +142,22 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "AdsConfig",
         field_name: "node",
         kind: EntryKind::KnownInert,
-        reason: "WP-20: the xDS Node identity (S8) echoed on every \
-                  DiscoveryRequest. Read when increment 3 builds the first \
-                  request. Note bootstrap `node` was already partly lowered \
-                  before this increment, but only for node.metadata's tracing \
-                  key -- the protocol identity (id, cluster) was not in the IR \
-                  at all. See ConfigSnapshot.ads's entry.",
+        reason: "WP-20: the xDS Node identity (S8) a DiscoveryRequest \
+                  carries. THE ORIGINAL REASON HERE WAS WRONG, AND THE WAY IT \
+                  WAS WRONG IS WORTH KEEPING: it said increment 3 would read \
+                  this when it built the first request. Increment 3a built the \
+                  request and did NOT -- client.rs's `to_proto` fills \
+                  type_url, version_info, response_nonce, resource_names and \
+                  error_detail, then `..Default::default()`, so `node` goes \
+                  out empty on every request. That is a real gap against a \
+                  control plane that keys on node.id, not merely an unread \
+                  field, and THIS FILE CANNOT CATCH IT: an unset field is \
+                  inert either way, so the allowlist stays green while the \
+                  wire is wrong. Found 2026-09-05 by auditing this entry after \
+                  increment 4 tripped its neighbour. Note bootstrap `node` was \
+                  already partly lowered before increment 1, but only for \
+                  node.metadata's tracing key -- the protocol identity (id, \
+                  cluster) was not in the IR at all.",
     },
     AllowlistEntry {
         struct_name: "ClusterConfig",
