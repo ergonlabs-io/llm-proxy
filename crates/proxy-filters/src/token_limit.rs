@@ -112,43 +112,168 @@ use std::time::{Duration, Instant};
 
 use crate::usage::TokenUsage;
 
-/// The identity a budget is tracked against.
+/// The identity a budget is tracked against: which route, and who the budget
+/// belongs to (see [`LimitSubject`]).
 ///
-/// Rendered ahead of time (by the filter, in a later increment) from
-/// configured descriptors — e.g. an api-key header value, a route name, a
-/// model name — into one opaque string. Keeping this a plain wrapper rather
-/// than exposing the descriptor list here means [`InProcessBudgetStore`]
-/// never needs to know what a descriptor *is*; it only ever compares keys.
+/// Previously this was a flattened, opaque `String` built by
+/// `from_descriptors(&[("route", ..), ("tenant", ..)])` -- enough for
+/// [`InProcessBudgetStore`]'s `Mutex<HashMap<LimitKey, Window>>` to compare
+/// keys, but with no way back out to "which route" or "which tenant" short of
+/// parsing a separator format that existed only by accident. WP-54's
+/// per-tenant usage query needs exactly that (enumerating a tenant's keys
+/// across routes), so this is now a struct with named fields -- see
+/// `IMPLEMENTATION_PLAN.md`'s WP-54 entry ("Decision needed before
+/// implementing") for the fuller reasoning. The struct also does something
+/// the flattened string could not: it makes "a credential was hashed before
+/// it became part of a key" a property [`LimitSubject::Credential`] enforces
+/// by only ever holding a [`CredentialDigest`], not a comment resting on every
+/// call site remembering to hash first.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LimitKey(String);
+pub struct LimitKey {
+    route: String,
+    subject: LimitSubject,
+}
+
+/// Who a [`LimitKey`]'s budget belongs to. The two variants are two disjoint
+/// key spaces -- previously that separation was enforced only by the
+/// descriptor NAME differing (`tenant=` vs `cred=`) inside one flattened
+/// string; as an enum it is enforced by the type. See
+/// `token_limit_filter`'s module doc ("The two key spaces never overlap")
+/// for why that separation is a security property, not a preference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LimitSubject {
+    /// An identity the proxy itself assigned (WP-50 virtual keys).
+    Tenant(String),
+    /// No auth filter authenticated the stream, so the bucket is keyed on a
+    /// digest of the credential the caller presented. See
+    /// [`CredentialDigest`] -- a digest is the only thing this variant can
+    /// hold; there is no way to construct it from a raw, unhashed value.
+    Credential(CredentialDigest),
+}
 
 impl LimitKey {
-    /// Build a key from an ordered list of `(descriptor_name, value)` pairs.
-    ///
-    /// The exact separator is an internal implementation detail (two
-    /// different descriptor lists are never compared against each other,
-    /// only two renderings of the *same* configured list), so any injective
-    /// encoding is fine; this one is easy to eyeball in logs/tests.
-    pub fn from_descriptors(parts: &[(&str, &str)]) -> Self {
-        let mut rendered = String::new();
-        for (name, value) in parts {
-            if !rendered.is_empty() {
-                rendered.push('|');
-            }
-            rendered.push_str(name);
-            rendered.push('=');
-            rendered.push_str(value);
+    /// Build a key for an identity the proxy itself assigned -- see
+    /// [`LimitSubject::Tenant`].
+    pub fn for_tenant(route: &str, tenant: &str) -> Self {
+        LimitKey {
+            route: route.to_string(),
+            subject: LimitSubject::Tenant(tenant.to_string()),
         }
-        LimitKey(rendered)
+    }
+
+    /// Build a key for the fallback path: no authenticated tenant, so the
+    /// bucket is keyed on a digest of the credential the caller presented.
+    /// Takes the RAW credential and hashes it internally -- unlike the old
+    /// `from_descriptors(&[("cred", hash_credential(..))])` shape, the call
+    /// site cannot forget to hash before constructing the key. See
+    /// [`CredentialDigest::hash`].
+    pub fn for_credential(route: &str, raw_credential: &str) -> Self {
+        LimitKey {
+            route: route.to_string(),
+            subject: LimitSubject::Credential(CredentialDigest::hash(raw_credential)),
+        }
+    }
+
+    /// The route name this key was bucketed under.
+    pub fn route(&self) -> &str {
+        &self.route
+    }
+
+    /// Who this key's budget belongs to.
+    pub fn subject(&self) -> &LimitSubject {
+        &self.subject
+    }
+
+    /// Whether this key is a [`LimitSubject::Tenant`] matching `tenant`
+    /// exactly -- the shape a later increment's per-tenant usage query needs
+    /// (enumerating every key belonging to one tenant, across routes)
+    /// without building that query here.
+    pub fn is_for_tenant(&self, tenant: &str) -> bool {
+        matches!(&self.subject, LimitSubject::Tenant(t) if t == tenant)
     }
 }
 
 impl std::fmt::Display for LimitKey {
-    /// Renders the same descriptor string [`Self::from_descriptors`] built
-    /// (`route=r1|tenant=t1`, say) -- see that method's doc for why this is
-    /// safe to put in a log line: any credential feeding a `cred=` descriptor
-    /// was already hashed by `token_limit_filter::hash_credential` before it
-    /// ever reached here, so this is never cleartext.
+    /// Renders `route=<route>|tenant=<id>` or `route=<route>|cred=<hex
+    /// digest>` -- unchanged from the pre-struct flattened-string rendering,
+    /// because log lines and at least one test assert on this exact shape.
+    /// Safe to log in both cases: a tenant id is an identifier the operator
+    /// chose, not a secret, and [`LimitSubject::Credential`] can only ever
+    /// hold an already-hashed [`CredentialDigest`] -- see that type's doc.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "route={}|", self.route)?;
+        match &self.subject {
+            LimitSubject::Tenant(tenant) => write!(f, "tenant={tenant}"),
+            LimitSubject::Credential(digest) => write!(f, "cred={digest}"),
+        }
+    }
+}
+
+/// A hashed credential. Constructible ONLY by hashing -- there is no
+/// `From<String>`, no public tuple constructor, and no `new` that accepts an
+/// unhashed value, so a raw credential cannot become a
+/// [`LimitSubject::Credential`] without going through [`Self::hash`] first.
+/// That is the type-level version of what used to be a comment on
+/// `token_limit_filter::hash_credential` (moved here as [`Self::hash`], see
+/// its doc for the FNV-1a reasoning, carried forward unchanged).
+///
+/// `Debug` is derived rather than hand-rolled: it prints the hex digest, not
+/// anything a raw credential could be recovered from, since a `CredentialDigest`
+/// never holds anything but a digest to begin with.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CredentialDigest(String);
+
+impl CredentialDigest {
+    /// A stable, non-cryptographic hash of a raw credential value, rendered
+    /// as hex.
+    ///
+    /// This is not a security control against an attacker who already has the
+    /// credential value — that isn't the threat model, and the value becomes
+    /// neither more nor less usable for auth by being hashed. It exists so the
+    /// credential never appears in cleartext anywhere a [`LimitKey`] could end
+    /// up: a debug log, a metrics label, a future `%DYNAMIC_METADATA%`-style
+    /// access-log field.
+    ///
+    /// # Why FNV-1a rather than `std`'s `DefaultHasher`
+    ///
+    /// `DefaultHasher` would be the obvious zero-dependency choice, and it is
+    /// what this function used first. It is wrong here for one reason: `std`
+    /// explicitly does **not** guarantee its algorithm is stable across Rust
+    /// releases. That is harmless while every key is computed and compared
+    /// inside one process — but this store sits behind [`BudgetStore`],
+    /// whose entire purpose is to let a distributed (Redis/RLS) backend land
+    /// later. The moment a budget is shared, two proxies built against
+    /// different toolchains would hash the same credential to different keys
+    /// and each be handed a full budget — a quota silently multiplied by the
+    /// fleet size, which is the exact failure the shared store was chosen to
+    /// avoid in the first place.
+    ///
+    /// FNV-1a 64 is a frozen, published specification: same input, same
+    /// output, forever, on any machine and any compiler. It costs about eight
+    /// lines and no new crate — relevant because this workspace's dependency
+    /// tree is already slated for review. Collision resistance is irrelevant
+    /// here; stability is the requirement, and it is the one `DefaultHasher`
+    /// does not offer.
+    pub fn hash(raw: &str) -> Self {
+        // FNV-1a, 64-bit. Rust note: `wrapping_mul` is the defined behavior of
+        // the algorithm (it is specified modulo 2^64), not a guard against a
+        // bug -- a plain `*` would panic on overflow in debug builds on the
+        // first byte.
+        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in raw.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        CredentialDigest(format!("{hash:016x}"))
+    }
+}
+
+impl std::fmt::Display for CredentialDigest {
+    /// Renders the hex digest -- safe to log; see [`Self::hash`]'s doc for
+    /// why this is FNV-1a rather than a reversible encoding.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -432,7 +557,7 @@ mod tests {
     #[test]
     fn exact_429_onset_and_remaining_track_scripted_usage() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Total, 25, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         // Request 1: check (25 remaining), record 10 -> used 10.
@@ -491,7 +616,7 @@ mod tests {
     #[test]
     fn record_never_errors_or_signals_truncation_even_when_already_over_budget() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         // Exhaust the budget.
@@ -531,7 +656,7 @@ mod tests {
     fn window_rollover_restores_budget() {
         let window = Duration::from_secs(60);
         let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, window));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let t0 = Instant::now();
 
         store.record(&key, &usage(6, 4), 1.0, t0);
@@ -576,7 +701,7 @@ mod tests {
     #[test]
     fn check_is_pure_repeated_calls_agree() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         store.record(&key, &usage(3, 2), 1.0, now);
@@ -604,7 +729,7 @@ mod tests {
 
         let unweighted = InProcessBudgetStore::new(rule(LimitOn::Total, 10, window));
         let weighted = InProcessBudgetStore::new(rule(LimitOn::Total, 10, window));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
 
         let mut unweighted_denies_at = None;
         let mut weighted_denies_at = None;
@@ -637,7 +762,7 @@ mod tests {
     #[test]
     fn input_limit_ignores_output_tokens() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Input, 10, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         // All output, no input: must never deny an Input-only rule.
@@ -661,7 +786,7 @@ mod tests {
     #[test]
     fn output_limit_ignores_input_tokens() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Output, 10, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         store.record(&key, &usage(1_000_000, 0), 1.0, now);
@@ -687,7 +812,7 @@ mod tests {
     #[test]
     fn total_limit_includes_cached_and_cache_creation_buckets() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         let usage_with_cache = TokenUsage {
@@ -714,7 +839,7 @@ mod tests {
         // exercises *this module's* saturating accumulation in isolation
         // without also depending on `TokenUsage::total`'s own arithmetic.
         let store = InProcessBudgetStore::new(rule(LimitOn::Input, 10, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         // A single pathological usage value at the u64 max.
@@ -731,7 +856,7 @@ mod tests {
     #[test]
     fn huge_weight_does_not_panic_or_wrap() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
-        let key = LimitKey::from_descriptors(&[("api_key", "sk-1")]);
+        let key = LimitKey::for_credential("r", "sk-1");
         let now = Instant::now();
 
         for weight in [f64::MAX, f64::INFINITY, 1e300] {
@@ -749,8 +874,8 @@ mod tests {
     #[test]
     fn distinct_keys_have_independent_budgets() {
         let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, Duration::from_secs(60)));
-        let key_a = LimitKey::from_descriptors(&[("api_key", "sk-a")]);
-        let key_b = LimitKey::from_descriptors(&[("api_key", "sk-b")]);
+        let key_a = LimitKey::for_credential("r", "sk-a");
+        let key_b = LimitKey::for_credential("r", "sk-b");
         let now = Instant::now();
 
         store.record(&key_a, &usage(10, 0), 1.0, now);

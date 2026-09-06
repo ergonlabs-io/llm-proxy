@@ -151,10 +151,13 @@
 //! caller, so it must never land somewhere it could reach a log — this repo
 //! already takes credential care seriously elsewhere (the access-log
 //! request-header snapshot is taken before route-injected auth is applied, in
-//! `filter_manager::drive_decode`). [`hash_credential`] hashes it before it
-//! ever touches a [`LimitKey`]; see that function's doc for why a plain
-//! (non-cryptographic) hash is sufficient here. A tenant id needs no such
-//! treatment — it is an identifier the operator chose, not a secret.
+//! `filter_manager::drive_decode`). [`LimitKey::for_credential`] hashes it,
+//! via [`CredentialDigest::hash`], before it ever touches a [`LimitKey`] --
+//! see that function's doc for why a plain (non-cryptographic) hash is
+//! sufficient here, and see [`CredentialDigest`]'s own doc for why that
+//! hashing is now enforced by the type, not by every call site remembering
+//! to do it. A tenant id needs no such treatment — it is an identifier the
+//! operator chose, not a secret.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -379,49 +382,6 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
     }
 }
 
-/// A stable, non-cryptographic hash of the `authorization` header's value,
-/// rendered as hex.
-///
-/// This is not a security control against an attacker who already has the
-/// header value — that isn't the threat model, and the value becomes neither
-/// more nor less usable for auth by being hashed. It exists so the credential
-/// never appears in cleartext anywhere a [`LimitKey`] could end up: a debug
-/// log, a metrics label, a future `%DYNAMIC_METADATA%`-style access-log field.
-///
-/// # Why FNV-1a rather than `std`'s `DefaultHasher`
-///
-/// `DefaultHasher` would be the obvious zero-dependency choice, and it is what
-/// this function used first. It is wrong here for one reason: `std` explicitly
-/// does **not** guarantee its algorithm is stable across Rust releases. That is
-/// harmless while every key is computed and compared inside one process — but
-/// this store sits behind [`BudgetStore`](crate::token_limit::BudgetStore),
-/// whose entire purpose is to let a distributed (Redis/RLS) backend land later.
-/// The moment a budget is shared, two proxies built against different
-/// toolchains would hash the same credential to different keys and each be
-/// handed a full budget — a quota silently multiplied by the fleet size, which
-/// is the exact failure the shared store was chosen to avoid in the first
-/// place.
-///
-/// FNV-1a 64 is a frozen, published specification: same input, same output,
-/// forever, on any machine and any compiler. It costs about eight lines and no
-/// new crate — relevant because this workspace's dependency tree is already
-/// slated for review. Collision resistance is irrelevant here; stability is the
-/// requirement, and it is the one `DefaultHasher` does not offer.
-fn hash_credential(value: &str) -> String {
-    // FNV-1a, 64-bit. Rust note: `wrapping_mul` is the defined behavior of the
-    // algorithm (it is specified modulo 2^64), not a guard against a bug --
-    // a plain `*` would panic on overflow in debug builds on the first byte.
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{hash:016x}")
-}
-
 /// Warns, at most once per [`LimitKey`] per [`Self::REPEAT_INTERVAL`], when a
 /// budget applied to a request but its usage could not be read — see the
 /// module doc's "Loud on unreadable usage" section for what this is
@@ -617,23 +577,19 @@ impl HttpFilter for TokenLimitFilterInstance {
             // An identity the proxy assigned. The client's `authorization`
             // header is deliberately not consulted at all on this path -- it
             // has no influence on which bucket the request lands in.
-            Some(tenant) => {
-                LimitKey::from_descriptors(&[("route", route_name.as_str()), ("tenant", &tenant)])
-            }
+            Some(tenant) => LimitKey::for_tenant(route_name.as_str(), &tenant),
             // No auth filter authenticated this stream. See the module doc's
             // bucket-key section: the descriptor NAME differs from the
             // authenticated case, so these two key spaces can never collide.
+            // `for_credential` hashes the raw value internally -- see its doc
+            // -- so there is no separate hashing step to forget here.
             None => {
                 let credential = headers
                     .headers
                     .get(AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default();
-                let credential_hash = hash_credential(credential);
-                LimitKey::from_descriptors(&[
-                    ("route", route_name.as_str()),
-                    ("cred", credential_hash.as_str()),
-                ])
+                LimitKey::for_credential(route_name.as_str(), credential)
             }
         };
 
@@ -755,7 +711,7 @@ mod tests {
     use proxy_http::filter::{BufferedBody, HeaderMutationFn, PerRouteConfig, SharedFactoryState};
     use proxy_http::stream_info::StreamInfo;
 
-    use crate::token_limit::LimitOn as TlLimitOn;
+    use crate::token_limit::{CredentialDigest, LimitOn as TlLimitOn};
 
     // --- config parsing -------------------------------------------------------
 
@@ -1238,10 +1194,7 @@ mod tests {
         // Nothing was recorded: the budget must still show fully available.
         assert_eq!(
             store.check(
-                &LimitKey::from_descriptors(&[
-                    ("route", "r1"),
-                    ("cred", &hash_credential("Bearer sk-1")),
-                ]),
+                &LimitKey::for_credential("r1", "Bearer sk-1"),
                 Instant::now()
             ),
             Ok(LimitDecision::Allow {
@@ -1732,7 +1685,7 @@ mod tests {
         // adversarial value available, and the collision a value-only
         // distinction would allow.
         let credential = "Bearer sk-collide";
-        let colliding_name = hash_credential(credential);
+        let colliding_name = CredentialDigest::hash(credential).to_string();
         run_request_as_tenant(&store, "r1", &colliding_name, None, Some(usage(10)));
         let denied = run_request_as_tenant(&store, "r1", &colliding_name, None, Some(usage(0)));
         assert!(denied.is_some(), "that tenant's budget must be exhausted");
@@ -1767,10 +1720,7 @@ mod tests {
         // `reset_after`/`retry_after` count down from the window start, so
         // only the variant and its two stable fields are asserted.
         match store.check(
-            &LimitKey::from_descriptors(&[
-                ("route", "r1"),
-                ("cred", &hash_credential("Bearer sk-a")),
-            ]),
+            &LimitKey::for_credential("r1", "Bearer sk-a"),
             Instant::now(),
         ) {
             Ok(LimitDecision::Deny {
@@ -1787,7 +1737,7 @@ mod tests {
 
     // --- credential care ------------------------------------------------------
 
-    /// Pins `hash_credential` to the published FNV-1a 64 test vectors.
+    /// Pins `CredentialDigest::hash` to the published FNV-1a 64 test vectors.
     ///
     /// This test is the stability guarantee, not the doc comment above it. The
     /// whole reason this function is not `std`'s `DefaultHasher` is that a
@@ -1806,7 +1756,7 @@ mod tests {
             ("foobar", "85944171f73967e8"),
         ] {
             assert_eq!(
-                hash_credential(input),
+                CredentialDigest::hash(input).to_string(),
                 want,
                 "FNV-1a 64 of {input:?} is a frozen published value; if this \
                  changed, the hash is no longer portable across processes and \
@@ -1818,10 +1768,7 @@ mod tests {
     #[test]
     fn the_credential_never_appears_in_cleartext_in_the_limit_key() {
         let credential = "Bearer sk-super-secret-value";
-        let key = LimitKey::from_descriptors(&[
-            ("route", "r1"),
-            ("cred", hash_credential(credential).as_str()),
-        ]);
+        let key = LimitKey::for_credential("r1", credential);
         assert!(
             !format!("{key:?}").contains(credential),
             "the raw credential must never appear in a LimitKey's Debug output"
