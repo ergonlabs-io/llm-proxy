@@ -29,9 +29,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use proxy_api::envoy::config::core::v3::Node as NodeProto;
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use proxy_api::envoy::service::discovery::v3::{DiscoveryRequest, DiscoveryResponse};
 use proxy_api::google::rpc::Status as RpcStatus;
+use proxy_config::ir::NodeIdentity;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
@@ -93,8 +95,17 @@ impl futures::Stream for OutboundStream {
 /// `DiscoveryRequest`. `Option::unwrap_or_default` turns "no version/nonce
 /// yet" into the proto's own empty-string convention -- S8's first request
 /// of a stream carries `""`, not an absent field.
-fn to_proto(req: &Request) -> DiscoveryRequest {
+///
+/// `node` is `Some` only for the FIRST request sent on a stream; see
+/// [`AdsClient::run_once`] for the rule and why it is per stream rather than
+/// per request or per type.
+fn to_proto(req: &Request, node: Option<&NodeIdentity>) -> DiscoveryRequest {
     DiscoveryRequest {
+        node: node.map(|n| NodeProto {
+            id: n.id.clone(),
+            cluster: n.cluster.clone(),
+            ..Default::default()
+        }),
         type_url: req.type_url.clone(),
         version_info: req.version_info.clone().unwrap_or_default(),
         response_nonce: req.response_nonce.clone().unwrap_or_default(),
@@ -160,11 +171,33 @@ pub struct AdsClient {
     /// reconnect storm. This is Envoy's own placement (`GrpcStream`resets its
     /// backoff strategy in `onReceiveMessage`).
     attempt: u32,
+    /// The xDS `Node` identity (S8) this client announces itself with, from
+    /// bootstrap `dynamic_resources`. `None` means no node reaches the wire at
+    /// all -- legal, but a control plane that routes by `node.id` (as
+    /// go-control-plane's snapshot cache does) will not find a snapshot for
+    /// this client.
+    node: Option<NodeIdentity>,
 }
 
 impl AdsClient {
     pub fn new(states: Vec<SubscriptionState>) -> Self {
-        Self { states, attempt: 0 }
+        Self {
+            states,
+            attempt: 0,
+            node: None,
+        }
+    }
+
+    /// Announce this `Node` identity to the control plane.
+    ///
+    /// Rust note: a consuming builder method (`mut self` in, `Self` out) so a
+    /// client can be written as
+    /// `AdsClient::new(states).with_node(node)` -- the ordinary Rust shape for
+    /// an optional construction-time knob, and it keeps `new` from growing a
+    /// parameter every caller would have to pass `None` for.
+    pub fn with_node(mut self, node: NodeIdentity) -> Self {
+        self.node = Some(node);
+        self
     }
 
     /// The current per-type state. Mostly for tests -- production callers
@@ -246,6 +279,14 @@ impl AdsClient {
             .await?;
         let mut inbound = response.into_inner();
 
+        // S8 / Envoy's own `GrpcMuxImpl`: the node identity goes on the FIRST
+        // request of a stream and is omitted from every request after it, so
+        // this is per STREAM, not per request and not per resource type --
+        // whichever type happens to be requested first carries it. A
+        // reconnect opens a new stream and therefore sends it again, which is
+        // what makes a control plane that lost its state able to identify us.
+        let mut node_pending = self.node.clone();
+
         for state in &self.states {
             if state.has_nothing_to_request() {
                 // S8 / this crate's own doc: an empty name subscription
@@ -254,9 +295,10 @@ impl AdsClient {
                 // rather than send a request nobody meant.
                 continue;
             }
-            tx.send(to_proto(&state.initial_request()))
+            tx.send(to_proto(&state.initial_request(), node_pending.as_ref()))
                 .await
                 .map_err(|_| AdsError::OutboundClosed)?;
+            node_pending = None;
         }
 
         loop {
@@ -278,9 +320,13 @@ impl AdsClient {
 
             let verdict = validate(&resp);
             let next = state.on_response(&resp.version_info, &resp.nonce, verdict);
-            tx.send(to_proto(&next))
+            tx.send(to_proto(&next, node_pending.as_ref()))
                 .await
                 .map_err(|_| AdsError::OutboundClosed)?;
+            // Covers the case where every subscription had nothing to request
+            // at stream open, so the first request on the wire is this ACK
+            // rather than an initial request.
+            node_pending = None;
         }
     }
 }

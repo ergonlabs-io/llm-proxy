@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use controlplane::{Harness, RequestKind, RequestLog, Step};
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
+use proxy_config::ir::NodeIdentity;
 use proxy_xds::{AdsClient, BackoffPolicy, Reconnect, Subscription, SubscriptionState, Verdict};
 
 const CDS: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
@@ -490,5 +491,151 @@ async fn run_clears_the_nonce_but_keeps_the_version_across_a_reconnect() {
         "the nonce belongs to the dropped stream and must be cleared by reset_stream"
     );
 
+    harness.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// WP-20 increment 4c: the Node identity on the wire.
+// ---------------------------------------------------------------------------
+
+fn test_node() -> NodeIdentity {
+    NodeIdentity {
+        id: "proxy-1".to_string(),
+        cluster: "edge".to_string(),
+    }
+}
+
+/// The xDS protocol, and Envoy's own `GrpcMuxImpl`: a client sends its node
+/// identity on the FIRST request of a stream and omits it from every request
+/// after. Increment 3a built the request and never set the field at all --
+/// `to_proto` filled five fields and then `..Default::default()` -- so every
+/// request went out anonymous, which a control plane keying on `node.id`
+/// (go-control-plane's snapshot cache does) has no way to serve.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_request_of_a_stream_carries_the_node_and_later_ones_do_not() {
+    let harness = Harness::spawn(vec![Step::Send {
+        type_url: CDS.to_string(),
+        version_info: "v1".to_string(),
+        nonce: "n1".to_string(),
+        resources: vec![],
+    }])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)])
+        .with_node(test_node());
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
+
+    wait_for_log_len(&harness.log, 2).await;
+    let log = harness.log.snapshot();
+
+    assert_eq!(
+        log[0]
+            .node
+            .as_ref()
+            .map(|(id, c)| (id.as_str(), c.as_str())),
+        Some(("proxy-1", "edge")),
+        "the first request of a stream must carry the node identity"
+    );
+    assert_eq!(
+        log[1].node, None,
+        "requests after the first on the same stream must omit the node"
+    );
+
+    run.abort();
+    harness.shutdown().await;
+}
+
+/// A reconnect opens a new stream, so the node must be sent again -- that is
+/// the whole point of the rule being per stream rather than per client. A
+/// control plane that lost its state on the restart that dropped us has no
+/// other way to learn who we are.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconnect_sends_the_node_again_on_the_new_stream() {
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+        Step::DropStream,
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v2".to_string(),
+            nonce: "n2".to_string(),
+            resources: vec![],
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)])
+        .with_node(test_node());
+    let (reconnect, _delays) = recording_reconnect(BackoffPolicy::default());
+    let run = tokio::spawn(async move { ads.run(&mut client, always_accept(), reconnect).await });
+
+    // [0] stream 1 initial, [1] stream 2 resync, [2] stream 2 ACK of v2 -- the
+    // stream-1 ACK is not recorded, see the resync test above for why.
+    wait_for_log_len(&harness.log, 3).await;
+    let log = harness.log.snapshot();
+
+    assert_eq!(log[0].stream_id, 1);
+    assert!(log[0].node.is_some(), "stream 1's first request carries it");
+
+    assert_eq!(log[1].stream_id, 2);
+    assert_eq!(
+        log[1]
+            .node
+            .as_ref()
+            .map(|(id, c)| (id.as_str(), c.as_str())),
+        Some(("proxy-1", "edge")),
+        "the new stream's first request must carry the node again"
+    );
+    assert_eq!(
+        log[2].node, None,
+        "and only its first request, not the ACK after it"
+    );
+
+    run.abort();
+    harness.shutdown().await;
+}
+
+/// A client with no node configured sends none -- legal on the wire, and the
+/// behavior every test written before increment 4c depended on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_with_no_node_configured_sends_none() {
+    let harness = Harness::spawn(vec![Step::Send {
+        type_url: CDS.to_string(),
+        version_info: "v1".to_string(),
+        nonce: "n1".to_string(),
+        resources: vec![],
+    }])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut always_accept()).await });
+
+    wait_for_log_len(&harness.log, 2).await;
+    let log = harness.log.snapshot();
+    assert!(
+        log.iter().all(|r| r.node.is_none()),
+        "no node configured means no node on any request: {log:?}"
+    );
+
+    run.abort();
     harness.shutdown().await;
 }

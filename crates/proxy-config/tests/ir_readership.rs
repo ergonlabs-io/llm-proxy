@@ -91,10 +91,14 @@ struct AllowlistEntry {
 
 const ALLOWLIST: &[AllowlistEntry] = &[
     // --- WP-20 increment 1: the ADS config surface, lowered but not yet
-    //     consumed. The client that will read all of these is `proxy-xds`,
-    //     which is (as of 2026-09-04) eleven lines of doc comment. Increment 3
-    //     builds the transport and increment 4 applies resources; DELETE these
-    //     five entries then -- the staleness check below is what forces it.
+    //     consumed. One of the original five has left: `AdsConfig.node`
+    //     reached the wire with increment 4c -- the increment that noticed
+    //     this entry's own reason had been wrong since 3a. That is worth
+    //     remembering, because this file could not have caught it: an unset
+    //     field is inert either way, so the list stayed green while every
+    //     DiscoveryRequest went out anonymous. The four below are genuinely
+    //     still inert; each says what will read it, corrected 2026-09-05 to
+    //     name the increment that actually will.
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "ads",
@@ -137,27 +141,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   dependency waits for its route config, bounded by this), not \
                   WP-20's client. It therefore outlives the other four entries \
                   here -- expect to delete it with WP-21, not with WP-20.",
-    },
-    AllowlistEntry {
-        struct_name: "AdsConfig",
-        field_name: "node",
-        kind: EntryKind::KnownInert,
-        reason: "WP-20: the xDS Node identity (S8) a DiscoveryRequest \
-                  carries. THE ORIGINAL REASON HERE WAS WRONG, AND THE WAY IT \
-                  WAS WRONG IS WORTH KEEPING: it said increment 3 would read \
-                  this when it built the first request. Increment 3a built the \
-                  request and did NOT -- client.rs's `to_proto` fills \
-                  type_url, version_info, response_nonce, resource_names and \
-                  error_detail, then `..Default::default()`, so `node` goes \
-                  out empty on every request. That is a real gap against a \
-                  control plane that keys on node.id, not merely an unread \
-                  field, and THIS FILE CANNOT CATCH IT: an unset field is \
-                  inert either way, so the allowlist stays green while the \
-                  wire is wrong. Found 2026-09-05 by auditing this entry after \
-                  increment 4 tripped its neighbour. Note bootstrap `node` was \
-                  already partly lowered before increment 1, but only for \
-                  node.metadata's tracing key -- the protocol identity (id, \
-                  cluster) was not in the IR at all.",
     },
     AllowlistEntry {
         struct_name: "ClusterConfig",

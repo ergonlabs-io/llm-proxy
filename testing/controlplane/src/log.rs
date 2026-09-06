@@ -32,6 +32,15 @@ pub struct RecordedRequest {
     /// `Some` iff the request's `error_detail` was set, i.e. a NACK.
     pub error_detail: Option<String>,
     pub resource_names: Vec<String>,
+    /// `(node.id, node.cluster)` iff the request carried a `node`.
+    ///
+    /// Per the xDS protocol (and Envoy's own `GrpcMuxImpl`) a client sends
+    /// its node identity on the FIRST request of a stream and omits it from
+    /// every request after, so this is `Some` on at most one recorded request
+    /// per `stream_id` -- and a reconnect must produce another one. Recorded
+    /// as the two fields tests assert on rather than the whole `Node` message,
+    /// matching how the rest of this struct is trimmed.
+    pub node: Option<(String, String)>,
 }
 
 impl RecordedRequest {
@@ -46,6 +55,7 @@ impl RecordedRequest {
                 .as_ref()
                 .map(|status| status.message.clone()),
             resource_names: req.resource_names.clone(),
+            node: req.node.as_ref().map(|n| (n.id.clone(), n.cluster.clone())),
         }
     }
 
