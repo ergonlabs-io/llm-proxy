@@ -353,6 +353,31 @@ impl std::fmt::Display for BudgetUnavailable {
 
 impl std::error::Error for BudgetUnavailable {}
 
+/// One [`LimitKey`]'s current-window standing, shaped for WP-54's `GET
+/// /v1/usage` — see [`BudgetStore::usage_for_tenant`].
+///
+/// This is a read-only *rendering* of the same numbers [`LimitDecision::Allow`]
+/// already carries; it deliberately does NOT hold a [`LimitKey`] or anything
+/// built from one — `token_limit_filter`'s usage endpoint renders this
+/// straight into a JSON response body, and the module doc's rule ("never
+/// echo a `LimitKey`... into the response body") is easiest to keep if the
+/// type handed to that response can't violate it in the first place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TenantUsage {
+    /// The route this budget is bucketed under — see [`LimitKey::route`].
+    /// Safe to expose: a route name is operator-chosen config, not a secret.
+    pub route: String,
+    /// Weighted tokens consumed in the current window.
+    pub used: f64,
+    /// The configured cap for this window.
+    pub limit: f64,
+    /// `limit - used`, floored at zero — never negative, matching
+    /// [`LimitDecision`]'s own `remaining` fields.
+    pub remaining: f64,
+    /// How long until the current window rolls over.
+    pub reset_after: Duration,
+}
+
 /// Seam for a token-budget backend. See the module docs (in particular
 /// "Making this distributed") for why the trait is shaped this way ahead of
 /// a second implementation.
@@ -394,6 +419,32 @@ pub trait BudgetStore: Send + Sync {
     /// backpressure rather than propagate that failure here — treat this as
     /// best-effort, not a commit.
     fn record(&self, key: &LimitKey, usage: &TokenUsage, weight: f64, now: Instant);
+
+    /// Every current-window budget belonging to `tenant`, across all routes
+    /// — the query WP-54's `GET /v1/usage` needs and neither `check` nor
+    /// `record` can answer alone (both take a single, already-known
+    /// [`LimitKey`]; this instead enumerates every key for one tenant).
+    ///
+    /// **This does NOT fail open.** Every other method on this trait fails
+    /// open on `Err` (see [`BudgetUnavailable`]) because the alternative —
+    /// refusing real LLM traffic over a metering hiccup — is worse. That
+    /// reasoning inverts here: this is a read-only reporting endpoint with no
+    /// traffic riding on it, so there is nothing an `Err` here could be
+    /// worse than, and a usage number that is silently wrong (rather than
+    /// visibly absent) is the actual hazard for a caller deciding whether to
+    /// keep spending against a budget it can no longer see. Callers (see
+    /// `token_limit_filter`'s usage-endpoint handler) turn `Err` into a 503,
+    /// not a 200 with stale or empty numbers.
+    ///
+    /// Ordering is intentionally unspecified by this signature — see
+    /// [`InProcessBudgetStore`]'s implementation for why the concrete
+    /// ordering it commits to (by route name) is a property of that
+    /// implementation, not a guarantee every `BudgetStore` must provide.
+    fn usage_for_tenant(
+        &self,
+        tenant: &str,
+        now: Instant,
+    ) -> Result<Vec<TenantUsage>, BudgetUnavailable>;
 }
 
 /// One key's current fixed window: when it started, and how many (weighted)
@@ -525,6 +576,47 @@ impl BudgetStore for InProcessBudgetStore {
         } else {
             window.used = window.used.saturating_add(weighted_tokens);
         }
+    }
+
+    /// Sorted by [`LimitKey::route`] — see the trait method's doc for why
+    /// ordering is this implementation's commitment, not the trait's. A
+    /// `Vec` this is built from has no inherent order (it's collected out of
+    /// a `HashMap`), so an unsorted result would make `GET /v1/usage`'s
+    /// response body nondeterministic across otherwise-identical requests,
+    /// which is both hard to test and a bad experience for anything that
+    /// diffs the response.
+    fn usage_for_tenant(
+        &self,
+        tenant: &str,
+        now: Instant,
+    ) -> Result<Vec<TenantUsage>, BudgetUnavailable> {
+        let windows = self.windows.lock().unwrap();
+        let limit = self.rule.max_tokens;
+        let mut usages: Vec<TenantUsage> = windows
+            .iter()
+            .filter(|(key, _)| key.is_for_tenant(tenant))
+            .map(|(key, window)| {
+                let elapsed = now.saturating_duration_since(window.started_at);
+                let (used, reset_after) = if elapsed >= self.rule.window {
+                    (0, self.rule.window)
+                } else {
+                    (window.used, self.rule.window - elapsed)
+                };
+                TenantUsage {
+                    route: key.route().to_string(),
+                    used: used as f64,
+                    limit: limit as f64,
+                    remaining: limit.saturating_sub(used) as f64,
+                    reset_after,
+                }
+            })
+            .collect();
+        // Rust note: `sort_by` (not `sort_by_key`) because `TenantUsage`
+        // doesn't implement `Ord`/borrow a comparable key by reference
+        // without cloning; comparing `&str` slices directly avoids an
+        // allocation per comparison.
+        usages.sort_by(|a, b| a.route.cmp(&b.route));
+        Ok(usages)
     }
 }
 
@@ -892,5 +984,89 @@ mod tests {
             },
             "key_b's budget must be untouched by key_a's usage"
         );
+    }
+
+    // ---- usage_for_tenant (WP-54 increment 2) ------------------------------
+
+    /// A tenant with budgets on more than one route gets all of them back,
+    /// sorted by route -- the multi-route case increment 1's `LimitKey`
+    /// struct exists specifically to make answerable.
+    #[test]
+    fn usage_for_tenant_reports_every_route_the_tenant_has_a_budget_on() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 100, Duration::from_secs(60)));
+        let now = Instant::now();
+
+        store.record(
+            &LimitKey::for_tenant("zebra", "acme"),
+            &usage(30, 0),
+            1.0,
+            now,
+        );
+        store.record(
+            &LimitKey::for_tenant("alpha", "acme"),
+            &usage(10, 0),
+            1.0,
+            now,
+        );
+
+        let report = store.usage_for_tenant("acme", now).unwrap();
+        assert_eq!(
+            report,
+            vec![
+                TenantUsage {
+                    route: "alpha".to_string(),
+                    used: 10.0,
+                    limit: 100.0,
+                    remaining: 90.0,
+                    reset_after: Duration::from_secs(60),
+                },
+                TenantUsage {
+                    route: "zebra".to_string(),
+                    used: 30.0,
+                    limit: 100.0,
+                    remaining: 70.0,
+                    reset_after: Duration::from_secs(60),
+                },
+            ],
+            "must report both routes, sorted by route name (alpha before zebra, not \
+             insertion order)"
+        );
+    }
+
+    /// A tenant with no recorded usage anywhere gets an empty list back, not
+    /// an error -- a true (if unremarkable) answer, per the module doc.
+    #[test]
+    fn usage_for_tenant_with_no_budgets_returns_an_empty_list() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 100, Duration::from_secs(60)));
+        let now = Instant::now();
+
+        store.record(
+            &LimitKey::for_tenant("r1", "someone-else"),
+            &usage(5, 0),
+            1.0,
+            now,
+        );
+
+        assert_eq!(store.usage_for_tenant("acme", now).unwrap(), vec![]);
+    }
+
+    /// A credential-keyed bucket (no authenticated tenant) must never be
+    /// mistaken for a tenant's -- the same disjoint-key-space property
+    /// [`LimitSubject`]'s doc already requires of `check`/`record`.
+    #[test]
+    fn usage_for_tenant_never_returns_a_credential_keyed_bucket() {
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 100, Duration::from_secs(60)));
+        let now = Instant::now();
+
+        // A credential bucket whose route/value happen to look exactly like
+        // the tenant being queried.
+        store.record(
+            &LimitKey::for_credential("r1", "acme"),
+            &usage(5, 0),
+            1.0,
+            now,
+        );
+
+        assert_eq!(store.usage_for_tenant("acme", now).unwrap(), vec![]);
     }
 }

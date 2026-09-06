@@ -158,6 +158,32 @@
 //! hashing is now enforced by the type, not by every call site remembering
 //! to do it. A tenant id needs no such treatment — it is an identifier the
 //! operator chose, not a secret.
+//!
+//! # `GET /v1/usage` — WP-54 increment 2, a read-only tenant self-service endpoint
+//!
+//! This filter also intercepts `GET /v1/usage` in `decode_headers`, before
+//! any budget check, and answers it directly rather than proxying it
+//! upstream — see [`TokenLimitFilterInstance::handle_usage_request`] for the
+//! implementation and its status-code policy. No new storage: it queries
+//! [`BudgetStore::usage_for_tenant`], which every [`BudgetStore`]
+//! implementation must now provide alongside `check`/`record`.
+//!
+//! **The security property is the design, not a detail: the key
+//! authenticates AND scopes.** The tenant comes ONLY from
+//! `StreamInfo::auth.tenant` — there is no code path here that accepts a
+//! caller-supplied tenant from a query parameter, a header, or the path. An
+//! unauthenticated request (`auth.tenant` is `None`) is refused with `401`,
+//! never falls back to the credential-keyed bucket, and never returns an
+//! empty-but-successful body — either would let an unauthenticated caller
+//! probe. This is also why the endpoint structurally cannot appear on a
+//! listener with no `auth` block configured: with no auth filter in the
+//! chain, `auth.tenant` is never written, so `401` is the only reachable
+//! outcome.
+//!
+//! Nothing an authenticated tenant's own request returns is a
+//! [`LimitKey`], a [`LimitSubject::Credential`], or a [`CredentialDigest`] --
+//! [`crate::token_limit::TenantUsage`] carries only a route name and plain
+//! numbers, by construction.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -178,7 +204,7 @@ use proxy_observability::ResponseFlag;
 
 use crate::token_limit::{
     BudgetStore, BudgetUnavailable, InProcessBudgetStore, LimitDecision, LimitKey, LimitOn,
-    LimitRule,
+    LimitRule, TenantUsage,
 };
 use crate::usage::TokenUsage;
 
@@ -553,6 +579,123 @@ impl TokenLimitFilterInstance {
         // to check on the return value.
         self.store.record(key, &usage, 1.0, Instant::now());
     }
+
+    /// **WP-54 increment 2.** Terminates a `GET /v1/usage` request with the
+    /// authenticated caller's own current-window budgets, never proxying it
+    /// upstream. See the module doc's usage-endpoint section for the
+    /// security property this holds: the tenant comes ONLY from
+    /// `StreamInfo::auth.tenant`, which an upstream `llmproxy.auth` filter
+    /// wrote after authenticating -- there is no code path here that reads a
+    /// tenant from a query parameter, a header, or the path.
+    ///
+    /// # Status codes
+    ///
+    /// - `401` if there is no authenticated tenant. This is what makes the
+    ///   plan's gating acceptance ("the endpoint never appears on a listener
+    ///   with no `auth` block") true by construction rather than by a
+    ///   separate check: with no auth filter in the chain (or one that ran
+    ///   and did not authenticate), `auth.tenant` is `None`, and this is the
+    ///   ONLY branch reachable. It must never fall back to a credential-keyed
+    ///   lookup -- that would let an unauthenticated caller probe by
+    ///   presenting an arbitrary `authorization` header.
+    /// - `503` on [`BudgetUnavailable`] -- see
+    ///   [`BudgetStore::usage_for_tenant`]'s doc for why this endpoint does
+    ///   NOT fail open like the rest of this filter.
+    /// - `200` otherwise, with a JSON body -- including a tenant with no
+    ///   configured budgets at all, which gets `200` and an empty `routes`
+    ///   array (a true answer), never an error.
+    fn handle_usage_request(&self, cb: &mut dyn DecoderCallbacks) {
+        // Rust note: same "clone out of the RefMut guard, let it drop"
+        // pattern as `decode_headers`'s own tenant read above -- `stream_info()`
+        // must not be held across the `send_local_reply` call below.
+        let tenant: Option<String> = cb.stream_info().auth.tenant.clone();
+
+        let Some(tenant) = tenant else {
+            cb.send_local_reply(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                None,
+                "usage_endpoint_no_authenticated_tenant",
+            );
+            return;
+        };
+
+        match self.store.usage_for_tenant(&tenant, Instant::now()) {
+            Ok(routes) => {
+                let body = render_usage_response(&tenant, &routes);
+                cb.send_local_reply(
+                    StatusCode::OK,
+                    &body,
+                    Some(Box::new(|response_headers: &mut http::HeaderMap| {
+                        response_headers.insert(
+                            http::header::CONTENT_TYPE,
+                            http::HeaderValue::from_static("application/json"),
+                        );
+                    })),
+                    "usage_endpoint",
+                );
+            }
+            Err(BudgetUnavailable) => {
+                // Deliberately NOT the fail-open behavior the rest of this
+                // filter uses -- see `usage_for_tenant`'s doc for why a
+                // read-only reporting endpoint inverts that policy.
+                cb.send_local_reply(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "usage temporarily unavailable",
+                    None,
+                    "usage_endpoint_store_unavailable",
+                );
+            }
+        }
+    }
+}
+
+/// The exact path `GET /v1/usage` is matched against -- see
+/// [`TokenLimitFilterInstance::handle_usage_request`]'s call site in
+/// `decode_headers`. Compared against [`http::Uri::path`], which excludes
+/// the query string, so this can never be influenced by one.
+const USAGE_PATH: &str = "/v1/usage";
+
+/// Render [`TokenLimitFilterInstance::handle_usage_request`]'s response body.
+///
+/// Built with `serde_json` (already a `proxy-filters` dependency -- see
+/// `Cargo.toml`'s WP-50 3b comment; it rides in for `ControlPlaneStore`'s
+/// row encoding) rather than hand-rendered, specifically so `tenant` and
+/// every `route` name are escaped correctly by a library that has already
+/// solved that problem -- see
+/// `tests::a_route_name_containing_a_quote_and_backslash_is_escaped_correctly`
+/// for the case that would catch a hand-rolled escaper getting this wrong.
+///
+/// **Never pass a [`LimitKey`] or anything built from one to this
+/// function.** It only ever receives `tenant` (a `&str` the caller already
+/// authenticated) and [`TenantUsage`] (which, by its own doc, holds no
+/// credential-shaped data) -- see the module doc's "never echo" rule.
+fn render_usage_response(tenant: &str, routes: &[TenantUsage]) -> String {
+    // Rust note: `serde_json::json!` builds a `serde_json::Value` tree
+    // in-place (like a struct literal, but for untyped JSON) -- there is no
+    // `#[derive(Serialize)]` response type here because this shape exists
+    // only at this one call site and doesn't need one.
+    let routes: Vec<serde_json::Value> = routes
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "route": r.route,
+                "used": r.used,
+                "limit": r.limit,
+                "remaining": r.remaining,
+                "reset_after_seconds": r.reset_after.as_secs(),
+            })
+        })
+        .collect();
+    // This limiter only ever implements a fixed window (see `token_limit`'s
+    // module doc) -- `window` is a constant describing that, not a per-route
+    // value, so it renders once at the top level rather than per route.
+    serde_json::json!({
+        "tenant": tenant,
+        "window": "fixed",
+        "routes": routes,
+    })
+    .to_string()
 }
 
 impl HttpFilter for TokenLimitFilterInstance {
@@ -562,6 +705,19 @@ impl HttpFilter for TokenLimitFilterInstance {
         headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
+        // WP-54 increment 2: `GET /v1/usage` is intercepted here, before any
+        // budget check or bucket-key derivation, and never proxied upstream
+        // -- see the module doc's usage-endpoint section. `Uri::path()`
+        // deliberately excludes the query string, so `?tenant=B` (or
+        // anything else appended after `?`) changes nothing about whether
+        // this branch fires, and [`Self::handle_usage_request`] never reads
+        // the query string at all -- there is no code path from a query
+        // parameter, a header, or a path segment to a tenant identity here.
+        if headers.method == http::Method::GET && headers.uri.path() == USAGE_PATH {
+            self.handle_usage_request(cb);
+            return FilterHeadersStatus::Continue;
+        }
+
         let route_name = cb
             .route()
             .and_then(|route| route.name.clone())
@@ -853,7 +1009,7 @@ mod tests {
     struct TestCallbacks {
         route: Option<Arc<RouteEntry>>,
         stream_info: RefCell<StreamInfo>,
-        local_reply: Option<(StatusCode, HeaderMap)>,
+        local_reply: Option<(StatusCode, HeaderMap, String)>,
     }
 
     impl TestCallbacks {
@@ -880,7 +1036,7 @@ mod tests {
         fn send_local_reply(
             &mut self,
             code: StatusCode,
-            _body: &str,
+            body: &str,
             modify_headers: Option<HeaderMutationFn>,
             _details: &str,
         ) {
@@ -888,7 +1044,7 @@ mod tests {
             if let Some(f) = modify_headers {
                 f(&mut headers);
             }
-            self.local_reply = Some((code, headers));
+            self.local_reply = Some((code, headers, body.to_string()));
         }
         fn continue_decoding(&mut self) {
             unimplemented!("token_limit_filter never stops iteration")
@@ -1000,7 +1156,7 @@ mod tests {
         route: &str,
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
-    ) -> Option<(StatusCode, HeaderMap)> {
+    ) -> Option<(StatusCode, HeaderMap, String)> {
         run_request_inner(store, route, None, credential, usage)
     }
 
@@ -1014,7 +1170,7 @@ mod tests {
         tenant: &str,
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
-    ) -> Option<(StatusCode, HeaderMap)> {
+    ) -> Option<(StatusCode, HeaderMap, String)> {
         run_request_inner(store, route, Some(tenant), credential, usage)
     }
 
@@ -1024,7 +1180,7 @@ mod tests {
         tenant: Option<&str>,
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
-    ) -> Option<(StatusCode, HeaderMap)> {
+    ) -> Option<(StatusCode, HeaderMap, String)> {
         let mut filter = filter_with(Arc::clone(store));
         let mut cb = TestCallbacks::new(Some(route_named(route)));
         if let Some(tenant) = tenant {
@@ -1078,8 +1234,9 @@ mod tests {
 
         // Exhaust the budget.
         run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(10)));
-        let (status, headers) = run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(0)))
-            .expect("second request must be denied");
+        let (status, headers, _body) =
+            run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(0)))
+                .expect("second request must be denied");
 
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         for name in [
@@ -1290,7 +1447,7 @@ mod tests {
         route: &str,
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
-    ) -> Option<(StatusCode, HeaderMap)> {
+    ) -> Option<(StatusCode, HeaderMap, String)> {
         let mut filter = TokenLimitFilterInstance {
             store: Arc::clone(store),
             usage_missing_warner: Arc::clone(warner),
@@ -1469,7 +1626,7 @@ mod tests {
         route: &str,
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
-    ) -> Option<(StatusCode, HeaderMap)> {
+    ) -> Option<(StatusCode, HeaderMap, String)> {
         let mut cb = TestCallbacks::new(Some(route_named(route)));
         let mut head = request_headers(credential);
         filter.decode_headers(&mut cb, &mut head, true);
@@ -1816,6 +1973,15 @@ mod tests {
         fn record(&self, _key: &LimitKey, _usage: &TokenUsage, _weight: f64, _now: Instant) {
             panic!("record must not be called by this test -- it never gets past decode_headers if fail-open is broken in the deny direction, and this test only exercises decode_headers")
         }
+        fn usage_for_tenant(
+            &self,
+            _tenant: &str,
+            _now: Instant,
+        ) -> Result<Vec<TenantUsage>, BudgetUnavailable> {
+            // Doubles as the WP-54 increment 2 "store unavailable" stub --
+            // see `usage_endpoint_returns_503_when_the_budget_store_is_unavailable`.
+            Err(BudgetUnavailable)
+        }
     }
 
     #[test]
@@ -1831,6 +1997,338 @@ mod tests {
         assert!(
             cb.local_reply.is_none(),
             "a budget-store error must admit the request (fail open), not deny it"
+        );
+    }
+
+    // --- WP-54 increment 2: GET /v1/usage ------------------------------------
+
+    /// Drives ONLY `decode_headers` (the usage endpoint never reaches
+    /// `encode_*` -- it terminates the request before any budget check),
+    /// against a request whose `uri` and headers a test can shape freely.
+    /// `tenant` stands in for whatever an upstream `llmproxy.auth` filter
+    /// would have written; `None` mirrors no auth filter having run.
+    fn run_usage_request(
+        store: &Arc<dyn BudgetStore>,
+        tenant: Option<&str>,
+        uri: &str,
+        extra_header: Option<(&str, &str)>,
+    ) -> Option<(StatusCode, HeaderMap, String)> {
+        let mut filter = filter_with(Arc::clone(store));
+        // `route: None` -- the usage endpoint never calls `cb.route()`, so a
+        // route double would be dead weight here.
+        let mut cb = TestCallbacks::new(None);
+        if let Some(tenant) = tenant {
+            cb.set_authenticated_tenant(tenant);
+        }
+        let mut headers = HeaderMap::new();
+        if let Some((name, value)) = extra_header {
+            headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let mut head = RequestHeaders {
+            method: Method::GET,
+            uri: uri.parse().expect("valid test URI"),
+            headers,
+        };
+        filter.decode_headers(&mut cb, &mut head, true);
+        cb.local_reply
+    }
+
+    /// Records `used` (weighted) tokens for `(route, tenant)` directly on the
+    /// store -- the fastest way to give a test a specific "current window"
+    /// number to assert on, without driving a whole request/response cycle
+    /// through the filter for each one.
+    fn seed_tenant_usage(store: &Arc<dyn BudgetStore>, route: &str, tenant: &str, used: u64) {
+        store.record(
+            &LimitKey::for_tenant(route, tenant),
+            &TokenUsage {
+                input_tokens: used,
+                ..Default::default()
+            },
+            1.0,
+            Instant::now(),
+        );
+    }
+
+    /// **Acceptance case 1**: an authenticated tenant with budgets on more
+    /// than one route gets its own numbers back for every one of them, in
+    /// deterministic (route-sorted) order — the multi-route case is the
+    /// whole reason `LimitKey` became a struct (increment 1); a
+    /// single-route test would not prove this.
+    #[test]
+    fn an_authenticated_tenant_reads_its_own_usage_across_multiple_routes() {
+        let store = store_with(10_000, Duration::from_secs(60));
+        seed_tenant_usage(&store, "chat", "acme", 1_200);
+        seed_tenant_usage(&store, "images", "acme", 500);
+
+        let (status, headers, body) = run_usage_request(&store, Some("acme"), "/v1/usage", None)
+            .expect("an authenticated tenant must get a reply, not a proxied request");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("body must be valid JSON");
+        // Rust note: `reset_after_seconds` counts down from the moment
+        // `seed_tenant_usage` recorded, so a real (if tiny) amount of wall
+        // time has elapsed by the time this assertion runs -- asserting its
+        // exact value would be a flaky test asserting something about the
+        // clock, not this endpoint. Every OTHER field has no such
+        // dependency, so this blanks `reset_after_seconds` out of both
+        // routes before the exact-equality check below, and checks its
+        // bound (`<= 60`, the configured window) separately.
+        for route in parsed["routes"].as_array_mut().unwrap() {
+            let reset = route["reset_after_seconds"].as_u64().unwrap();
+            assert!(
+                reset <= 60,
+                "reset_after_seconds must never exceed the configured 60s window, got {reset}"
+            );
+            route["reset_after_seconds"] = serde_json::Value::Null;
+        }
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "tenant": "acme",
+                "window": "fixed",
+                "routes": [
+                    {
+                        "route": "chat",
+                        "used": 1200.0,
+                        "limit": 10000.0,
+                        "remaining": 8800.0,
+                        "reset_after_seconds": null,
+                    },
+                    {
+                        "route": "images",
+                        "used": 500.0,
+                        "limit": 10000.0,
+                        "remaining": 9500.0,
+                        "reset_after_seconds": null,
+                    },
+                ],
+            }),
+            "must report both routes with their own numbers, sorted by route name \
+             (`chat` before `images`, not insertion order) -- got body: {body}"
+        );
+    }
+
+    /// **Acceptance case 2, the cross-tenant negative -- the acceptance
+    /// criterion itself.** Tenant A is authenticated; tenant B has its own,
+    /// very different, usage recorded. No combination of a query parameter,
+    /// a header, or a path segment naming tenant B may yield any of B's
+    /// numbers -- the tenant comes ONLY from `StreamInfo::auth.tenant`. This
+    /// test actually tries all three smuggling vectors rather than asserting
+    /// the property in the abstract.
+    #[test]
+    fn no_query_parameter_header_or_path_segment_can_read_a_different_tenants_usage() {
+        let store = store_with(10_000, Duration::from_secs(60));
+        seed_tenant_usage(&store, "chat", "tenant-a", 42);
+        seed_tenant_usage(&store, "chat", "tenant-b", 999_999);
+
+        // Vector 1: a query parameter naming tenant B. `Uri::path()` excludes
+        // the query string, so this must still be intercepted as the usage
+        // endpoint and must still answer for tenant A (the authenticated
+        // identity), never tenant B.
+        let (status, _headers, body) =
+            run_usage_request(&store, Some("tenant-a"), "/v1/usage?tenant=tenant-b", None)
+                .expect("a query string must not stop this from being the usage endpoint");
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("\"tenant\":\"tenant-a\""),
+            "must answer for the AUTHENTICATED tenant regardless of the query string, got: {body}"
+        );
+        assert!(
+            !body.contains("tenant-b") && !body.contains("999999"),
+            "a `?tenant=` query parameter must never select a different tenant's usage, got: {body}"
+        );
+
+        // Vector 2: a header naming tenant B. The handler never reads any
+        // header at all, so this must behave identically to no header.
+        let (status, _headers, body) = run_usage_request(
+            &store,
+            Some("tenant-a"),
+            "/v1/usage",
+            Some(("x-tenant", "tenant-b")),
+        )
+        .expect("a header must not stop this from being the usage endpoint");
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("\"tenant\":\"tenant-a\""),
+            "must answer for the AUTHENTICATED tenant regardless of any header, got: {body}"
+        );
+        assert!(
+            !body.contains("tenant-b") && !body.contains("999999"),
+            "a header must never select a different tenant's usage, got: {body}"
+        );
+
+        // Vector 3: a path segment naming tenant B. This does NOT equal the
+        // exact usage path, so it must not be intercepted as the usage
+        // endpoint AT ALL -- it falls through to the ordinary budget-checked
+        // request path (which, for a route named "" with no configured
+        // budget on it, is simply admitted), never returning anyone's usage.
+        let reply = run_usage_request(&store, Some("tenant-a"), "/v1/usage/tenant-b", None);
+        if let Some((_status, _headers, body)) = reply {
+            assert!(
+                !body.contains("tenant-b") && !body.contains("999999"),
+                "a path segment must never select a different tenant's usage, got: {body}"
+            );
+        }
+    }
+
+    /// **Acceptance case 3**: no authenticated tenant means no code path can
+    /// have produced one, so this must refuse with `401` and leak nothing --
+    /// not an empty-but-successful body, which would let an unauthenticated
+    /// caller probe the endpoint's mere existence for free.
+    #[test]
+    fn a_request_with_no_authenticated_tenant_is_refused_with_401_and_no_body_leakage() {
+        let store = store_with(10_000, Duration::from_secs(60));
+        seed_tenant_usage(&store, "chat", "someone", 1_000);
+
+        let (status, _headers, body) = run_usage_request(&store, None, "/v1/usage", None)
+            .expect("an unauthenticated request must still get a reply -- a refusal, not a proxy");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            !body.contains("someone") && !body.contains("1000") && !body.contains("route"),
+            "a 401 must carry no usage data at all, got: {body}"
+        );
+    }
+
+    /// This is also the acceptance test for the plan's gating requirement
+    /// ("the endpoint never appears on a listener that has no `auth` block
+    /// configured"): with no auth filter in the chain, `StreamInfo::auth.tenant`
+    /// is structurally `None` (nothing ever writes it), so this filter's ONLY
+    /// reachable branch is the 401 above -- there is no separate check to
+    /// forget, because there is no other code path that could produce `200`.
+    #[test]
+    fn with_no_auth_filter_in_the_chain_the_usage_endpoint_never_returns_200() {
+        let store = store_with(10_000, Duration::from_secs(60));
+        seed_tenant_usage(&store, "chat", "someone", 1_000);
+
+        // No `set_authenticated_tenant` call at all -- exactly what a chain
+        // with no `llmproxy.auth` filter leaves `StreamInfo::auth.tenant` as.
+        let (status, ..) =
+            run_usage_request(&store, None, "/v1/usage", None).expect("must still get a reply");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "with no auth filter configured, this must never be 200"
+        );
+    }
+
+    /// **Acceptance case 4**: the store side, not the request path, is what
+    /// must NOT fail open here -- see `BudgetStore::usage_for_tenant`'s doc
+    /// for why this endpoint inverts the rest of this filter's fail-open
+    /// policy.
+    #[test]
+    fn usage_endpoint_returns_503_when_the_budget_store_is_unavailable() {
+        let store: Arc<dyn BudgetStore> = Arc::new(AlwaysErrorsStore);
+
+        let (status, _headers, body) = run_usage_request(&store, Some("acme"), "/v1/usage", None)
+            .expect("a store error must still produce a reply, not a silent proxy-through");
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !body.contains("routes"),
+            "a 503 must not carry a (necessarily wrong) usage body, got: {body}"
+        );
+    }
+
+    /// **Acceptance case 5**: a tenant that is authenticated but has no
+    /// configured budget anywhere gets a true, empty answer -- `200`, not an
+    /// error, and not a nonexistent-tenant error either (there is no such
+    /// concept here; the store simply has nothing for this key).
+    #[test]
+    fn a_tenant_with_no_budgets_gets_200_and_an_empty_routes_array() {
+        let store = store_with(10_000, Duration::from_secs(60));
+        // Some OTHER tenant has usage; the queried tenant has none at all.
+        seed_tenant_usage(&store, "chat", "someone-else", 500);
+
+        let (status, _headers, body) =
+            run_usage_request(&store, Some("brand-new-tenant"), "/v1/usage", None)
+                .expect("must get a reply");
+
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("body must be valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({"tenant": "brand-new-tenant", "window": "fixed", "routes": []}),
+            "a tenant with no budgets must get an empty `routes` array, not an error"
+        );
+    }
+
+    /// **Acceptance case 6**: drives a request through the credential-keyed
+    /// fallback path first (so a `CredentialDigest` genuinely exists in the
+    /// store), then asserts the usage endpoint's response -- for a
+    /// completely different, authenticated tenant -- contains neither the
+    /// digest nor anything that looks like a rendered `LimitKey`. See the
+    /// module doc's "never echo" rule: it is safe to log a `LimitKey` only
+    /// because of a property of the logging site, and this is a new site
+    /// with no such guarantee, so it must never receive one at all.
+    #[test]
+    fn the_response_body_never_contains_a_credential_digest_or_a_rendered_limit_key() {
+        let store = store_with(10_000, Duration::from_secs(60));
+
+        // Populate a real credential-keyed bucket via the normal, unauthenticated
+        // fallback path (see `with_no_authenticated_tenant_the_filter_falls_back_to_the_hashed_credential`).
+        let credential = "Bearer sk-super-secret-value";
+        run_request(&store, "chat", Some(credential), Some(usage(10)));
+        let digest = CredentialDigest::hash(credential).to_string();
+
+        seed_tenant_usage(&store, "chat", "acme", 1_200);
+        let (status, _headers, body) =
+            run_usage_request(&store, Some("acme"), "/v1/usage", None).expect("must get a reply");
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(
+            !body.contains(&digest),
+            "the response must never contain a CredentialDigest, got: {body}"
+        );
+        assert!(
+            !body.contains(credential) && !body.contains("sk-super-secret-value"),
+            "the response must never contain the raw credential either, got: {body}"
+        );
+        assert!(
+            !body.contains("cred=") && !body.contains("route=chat|"),
+            "the response must never contain a rendered `LimitKey` (its `Display` format), \
+             got: {body}"
+        );
+    }
+
+    /// **Acceptance case 7**: a request that is not `GET /v1/usage` must be
+    /// completely unaffected by this change -- proxied through the ordinary
+    /// budget-checked path exactly as every other test in this file already
+    /// exercises. Pins the two ways a request could *almost* match (right
+    /// path, wrong method; wrong path) so a future edit can't accidentally
+    /// widen the match.
+    #[test]
+    fn requests_other_than_get_v1_usage_are_unaffected_by_the_usage_endpoint() {
+        let store = store_with(10, Duration::from_secs(60));
+
+        // Wrong method, exact path: a POST to `/v1/usage` must be treated
+        // as an ordinary request (budget-checked, not intercepted).
+        let mut filter = filter_with(Arc::clone(&store));
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_authenticated_tenant("acme");
+        let mut head = RequestHeaders {
+            method: Method::POST,
+            uri: "/v1/usage".parse().unwrap(),
+            headers: HeaderMap::new(),
+        };
+        filter.decode_headers(&mut cb, &mut head, true);
+        assert!(
+            cb.local_reply.is_none(),
+            "POST /v1/usage must be admitted like any other ordinary request, not intercepted"
+        );
+
+        // Right method, wrong path: unaffected, exactly as before this change.
+        let reply = run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(10)));
+        assert!(
+            reply.is_none(),
+            "an ordinary chat-completions request must be admitted exactly as before"
         );
     }
 }
