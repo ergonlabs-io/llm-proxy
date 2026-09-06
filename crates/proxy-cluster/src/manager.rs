@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use proxy_config::ir::{ClusterConfig, ClusterKind, ClusterName, EndpointIR, LbPolicy};
+use proxy_config::ir::{
+    ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, LbPolicy,
+};
 use tokio::task::JoinHandle;
 
 use crate::discovery;
@@ -566,6 +568,19 @@ impl ClusterManager {
             {
                 return Ok(HostSetDiff::default())
             }
+            // WP-21 increment 1: an EDS cluster declared in STATIC config is
+            // `ClusterSource::Config`, not `ClusterSource::Eds` (that variant
+            // is for clusters `add_eds_cluster` registered), so it reaches
+            // here -- and it must short-circuit for the same reason the two
+            // arms above do, plus a sharper one. Production re-runs this on
+            // the DNS refresh timer; `discovery::resolve` returns an EMPTY
+            // host set for `DiscoveryType::Eds`, so falling through would
+            // diff the EDS-delivered membership against nothing and wipe it
+            // on the next tick. Found while adding the IR variant, not by a
+            // test -- there is no EDS delivery path to regress yet.
+            ClusterSource::Config(config) if config.discovery == DiscoveryType::Eds => {
+                return Ok(HostSetDiff::default())
+            }
             ClusterSource::Config(config) => config,
         };
         let new_set = discovery::resolve(config, self.resolver.as_ref()).await?;
@@ -802,6 +817,8 @@ mod tests {
         endpoints: Vec<EndpointIR>,
     ) -> Arc<ClusterConfig> {
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: name.to_string(),
             discovery,
             lb_policy: LbPolicy::RoundRobin,
@@ -835,6 +852,8 @@ mod tests {
             ..proxy_config::ir::OutlierDetectionIR::ENVOY_DEFAULT
         };
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: name.to_string(),
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,
@@ -858,6 +877,8 @@ mod tests {
     /// *something* syntactically valid to satisfy `ClusterConfig`'s shape.
     fn aggregate_config(name: &str, members: &[&str]) -> Arc<ClusterConfig> {
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: name.to_string(),
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,
@@ -899,6 +920,8 @@ mod tests {
         health_check: proxy_config::ir::HealthCheckIR,
     ) -> Arc<ClusterConfig> {
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: name.to_string(),
             discovery,
             lb_policy: LbPolicy::RoundRobin,
@@ -960,6 +983,8 @@ mod tests {
             ..proxy_config::ir::OutlierDetectionIR::ENVOY_DEFAULT
         };
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: name.to_string(),
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,

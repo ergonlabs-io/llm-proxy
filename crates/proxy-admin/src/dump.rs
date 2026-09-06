@@ -428,6 +428,9 @@ fn discovery_type_str(d: DiscoveryType) -> &'static str {
         DiscoveryType::Static => "STATIC",
         DiscoveryType::StrictDns => "STRICT_DNS",
         DiscoveryType::LogicalDns => "LOGICAL_DNS",
+        // Matches the proto enum name, as every arm here does -- a
+        // `/config_dump` reader is comparing against Envoy's own output.
+        DiscoveryType::Eds => "EDS",
     }
 }
 

@@ -597,6 +597,8 @@ async fn strict_mode_cluster_manager_rejects_a_tls_cluster_without_a_transport_s
     ));
 
     let cluster = ClusterConfig {
+        // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+        eds: None,
         name: "secure".to_string(),
         discovery: proxy_config::ir::DiscoveryType::Static,
         lb_policy: proxy_config::ir::LbPolicy::RoundRobin,

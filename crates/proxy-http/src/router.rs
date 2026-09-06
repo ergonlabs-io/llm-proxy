@@ -2327,6 +2327,8 @@ mod tests {
         snapshot.insert(
             "up".to_string(),
             Arc::new(ClusterConfig {
+                // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+                eds: None,
                 name: "up".to_string(),
                 discovery: DiscoveryType::Static,
                 lb_policy: LbPolicy::RoundRobin,
@@ -2397,6 +2399,8 @@ mod tests {
         snapshot.insert(
             "up".to_string(),
             Arc::new(ClusterConfig {
+                // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+                eds: None,
                 name: "up".to_string(),
                 discovery: DiscoveryType::Static,
                 lb_policy: LbPolicy::RoundRobin,

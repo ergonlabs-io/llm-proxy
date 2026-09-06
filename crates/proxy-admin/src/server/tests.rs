@@ -124,6 +124,8 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
     };
 
     let cluster = ClusterConfig {
+        // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+        eds: None,
         name: "upstream".to_string(),
         discovery: DiscoveryType::Static,
         lb_policy: LbPolicy::RoundRobin,

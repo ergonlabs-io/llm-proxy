@@ -157,6 +157,34 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   copy from reaching the wrong provider on failover.",
     },
     AllowlistEntry {
+        struct_name: "ClusterConfig",
+        field_name: "eds",
+        kind: EntryKind::KnownInert,
+        reason: "WP-21 increment 1 lowers Cluster.eds_cluster_config into the \
+                  IR so an EDS cluster's config surface can be validated and \
+                  refused precisely (ground rule #1) before any subscription \
+                  exists -- the same shape as ConfigSnapshot.ads (WP-20 \
+                  increment 1) above. Nothing subscribes to EDS or applies an \
+                  endpoint update yet: EDS clusters are still registered \
+                  directly against ClusterManager via add_eds_cluster/ \
+                  accept_eds_update (proxy-cluster/src/manager.rs), bypassing \
+                  ClusterConfig entirely. The first reader is whichever later \
+                  WP-21 increment wires ClusterManager::update_from_snapshot \
+                  to read this field and drive that same add/accept path from \
+                  the config snapshot instead of a direct call. Delete this \
+                  entry then.",
+    },
+    AllowlistEntry {
+        struct_name: "EdsClusterConfig",
+        field_name: "service_name",
+        kind: EntryKind::KnownInert,
+        reason: "Same inert reason as ClusterConfig.eds immediately above -- \
+                  this is the one field that struct carries. It is the \
+                  resource name a real subscription would request; nothing \
+                  subscribes yet, so nothing reads it. Delete alongside \
+                  ClusterConfig.eds's entry.",
+    },
+    AllowlistEntry {
         struct_name: "VirtualHostIR",
         field_name: "domains",
         kind: EntryKind::ConsumedInternally,

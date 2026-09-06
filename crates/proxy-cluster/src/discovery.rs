@@ -41,6 +41,20 @@ pub async fn resolve(config: &ClusterConfig, resolver: &dyn HostResolver) -> io:
         DiscoveryType::Static => static_hosts(&config.endpoints)?,
         DiscoveryType::StrictDns => strict_dns_hosts(&config.endpoints, resolver).await?,
         DiscoveryType::LogicalDns => logical_dns_hosts(&config.endpoints, resolver).await?,
+        // An EDS cluster owns no endpoints to resolve -- its membership
+        // arrives through
+        // [`crate::manager::ClusterManager::accept_eds_update`]. Empty, not
+        // an error: a cluster whose EDS response has not landed yet is the
+        // ordinary startup state, and WP-21's warming is what stops traffic
+        // reaching it meanwhile.
+        //
+        // **Callers must not reach here for an EDS cluster in the steady
+        // state**, and `ClusterManager::refresh_cluster` has an explicit arm
+        // to make sure they do not: resolving to empty on a DNS-cadence
+        // refresh would WIPE the host set EDS had already delivered. This arm
+        // is the defensive floor for a caller that gets that wrong, not the
+        // intended path.
+        DiscoveryType::Eds => Vec::new(),
     };
     Ok(HostSet::from_hosts(hosts))
 }
@@ -126,6 +140,8 @@ mod tests {
 
     fn cluster(discovery: DiscoveryType, endpoints: Vec<EndpointIR>) -> ClusterConfig {
         ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: "test".to_string(),
             discovery,
             lb_policy: LbPolicy::RoundRobin,

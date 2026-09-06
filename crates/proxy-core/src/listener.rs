@@ -1828,6 +1828,8 @@ mod tests {
     /// A STATIC cluster with a single priority-0 endpoint at `addr`.
     fn static_cluster(name: &str, addr: SocketAddr) -> ClusterConfig {
         ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: name.to_string(),
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,

@@ -107,6 +107,8 @@ mod tests {
 
     fn cluster(name: &str) -> ClusterConfig {
         ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: name.to_string(),
             discovery: proxy_config::ir::DiscoveryType::Static,
             lb_policy: proxy_config::ir::LbPolicy::RoundRobin,

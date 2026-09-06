@@ -108,6 +108,8 @@ async fn build_router_with_stats(
     snapshot.insert(
         "up".to_string(),
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: "up".to_string(),
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,
@@ -216,6 +218,8 @@ async fn build_router_with_access_logs(
     snapshot.insert(
         "up".to_string(),
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: "up".to_string(),
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,
@@ -541,6 +545,8 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
             snapshot.insert(
                 "up".to_string(),
                 Arc::new(ClusterConfig {
+                    // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+                    eds: None,
                     name: "up".to_string(),
                     discovery: DiscoveryType::Static,
                     lb_policy: LbPolicy::RoundRobin,
@@ -980,6 +986,8 @@ async fn build_router_with_attempt_count_flags(
     snapshot.insert(
         "up".to_string(),
         Arc::new(ClusterConfig {
+            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+            eds: None,
             name: "up".to_string(),
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,

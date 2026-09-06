@@ -300,6 +300,8 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "metadata",
             "health_checks",
             "outlier_detection",
+            // WP-21 increment 1: EDS clusters -- see `convert_eds_cluster_config`.
+            "eds_cluster_config",
         ],
         // WP-35 increment 2b-i: the only custom cluster type implemented is
         // `envoy.clusters.aggregate` (see `convert_cluster`'s
@@ -315,6 +317,17 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // mode, arriving with no code change of ours to blame it on.
         "envoy.config.cluster.v3.Cluster.CustomClusterType" => &["name", "typed_config"],
         "envoy.extensions.clusters.aggregate.v3.ClusterConfig" => &["clusters"],
+        // WP-21 increment 1: `service_name` maps to IR (with its
+        // default-to-cluster-name behavior); `eds_config` is walked below via
+        // `check_ads_source`'s ADS-only reasoning (see
+        // `convert_eds_cluster_config`). `envoy.config.core.v3.ConfigSource`
+        // itself is deliberately absent from this table -- same as
+        // `dynamic_resources`'s `ads_config`/`lds_config`/`cds_config`
+        // above it, its per-specifier rejection happens in typed code, not
+        // the surface walk, so the surface walk lets every one of its fields
+        // through and `check_ads_source` is what actually rejects the
+        // unimplemented ones by name.
+        "envoy.config.cluster.v3.Cluster.EdsClusterConfig" => &["eds_config", "service_name"],
         // WP-50 / WP-47 increment 1: the first proto this project defines
         // itself rather than borrowing from Envoy. Listed for the same
         // forward-compat reason as the two entries above -- every field is
@@ -2713,12 +2726,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
             Ok(ProtoDiscovery::Static) => (DiscoveryType::Static, ClusterKind::Endpoints),
             Ok(ProtoDiscovery::StrictDns) => (DiscoveryType::StrictDns, ClusterKind::Endpoints),
             Ok(ProtoDiscovery::LogicalDns) => (DiscoveryType::LogicalDns, ClusterKind::Endpoints),
-            Ok(ProtoDiscovery::Eds) => {
-                return Err(unsupported(
-                    format!("{path}.type"),
-                    "EDS clusters are not implemented yet (WP-21)",
-                ))
-            }
+            Ok(ProtoDiscovery::Eds) => (DiscoveryType::Eds, ClusterKind::Endpoints),
             _ => {
                 return Err(unsupported(
                     format!("{path}.type"),
@@ -2778,6 +2786,13 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         }
     };
     let is_aggregate = matches!(kind, ClusterKind::Aggregate { .. });
+
+    // WP-21 increment 1: `eds_cluster_config`'s shape and defaulting, only
+    // consulted for the `Eds` arm just above -- see `convert_eds_cluster_config`.
+    let eds = match discovery {
+        DiscoveryType::Eds => Some(convert_eds_cluster_config(c, path)?),
+        _ => None,
+    };
 
     let lb_policy = match ProtoLb::try_from(c.lb_policy) {
         Ok(ProtoLb::RoundRobin) => LbPolicy::RoundRobin,
@@ -2876,6 +2891,28 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         }
     }
 
+    // An EDS cluster's endpoints come from the EDS stream, not from its own
+    // `load_assignment` -- unlike the aggregate case above, an *empty*
+    // `load_assignment` (no locality carries any `lb_endpoints`) is harmless
+    // and left alone, since it lowers to the same empty `endpoints` an EDS
+    // cluster needs anyway. A non-empty one is rejected: its hosts would be
+    // silently ignored in favour of the EDS-delivered set, ground rule #1's
+    // exact shape.
+    if discovery == DiscoveryType::Eds {
+        let has_any_endpoint = c.load_assignment.as_ref().is_some_and(|la| {
+            la.endpoints
+                .iter()
+                .any(|locality| !locality.lb_endpoints.is_empty())
+        });
+        if has_any_endpoint {
+            return Err(invalid(
+                format!("{path}.load_assignment"),
+                "an EDS cluster's endpoints come from the EDS stream, not load_assignment -- \
+                 they would be silently ignored in favour of the EDS-delivered set",
+            ));
+        }
+    }
+
     let mut endpoints = Vec::new();
     if let Some(la) = &c.load_assignment {
         for (i, locality) in la.endpoints.iter().enumerate() {
@@ -2953,7 +2990,51 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         usage_dialect,
         health_check,
         outlier_detection,
+        eds,
     })
+}
+
+/// `Cluster.eds_cluster_config` -> IR, called only for the `Eds` arm of
+/// `convert_cluster`'s discovery match. Envoy requires this block to be set
+/// on an EDS cluster, requires its `eds_config` to be set, and this project
+/// has exactly one transport that can deliver it: WP-20's ADS client -- a
+/// `path_config_source`, `api_config_source`, or `self` source is a
+/// different delivery mechanism we do not implement.
+fn convert_eds_cluster_config(
+    c: &cluster_v3::Cluster,
+    path: &str,
+) -> Result<EdsClusterConfig, ConfigError> {
+    let cfg_path = format!("{path}.eds_cluster_config");
+    let eds_cfg = c
+        .eds_cluster_config
+        .as_ref()
+        .ok_or_else(|| invalid(&cfg_path, "eds_cluster_config is required when type is EDS"))?;
+
+    let eds_config_path = format!("{cfg_path}.eds_config");
+    // `check_ads_source` (defined above, for `dynamic_resources`'s per-type
+    // ConfigSources) says exactly what we mean here too: only the ADS form
+    // of a ConfigSource is implemented. It returns `Ok(false)` for an unset
+    // source, which for a *required* field is itself the error -- the `!` arm
+    // below is what turns that into one, since `check_ads_source` alone has
+    // no way to know whether its caller's field was optional.
+    let over_ads = check_ads_source(eds_cfg.eds_config.as_ref(), &eds_config_path)?;
+    if !over_ads {
+        return Err(invalid(
+            &eds_config_path,
+            "eds_cluster_config.eds_config is required for an EDS cluster",
+        ));
+    }
+
+    // Rust note: `String::is_empty` rather than checking for a sentinel --
+    // proto3 has no concept of an unset scalar field, so "unset" and "empty
+    // string" are the same wire value; Envoy's own default-to-cluster-name
+    // behavior for `service_name` is defined the same way.
+    let service_name = if eds_cfg.service_name.is_empty() {
+        c.name.clone()
+    } else {
+        eds_cfg.service_name.clone()
+    };
+    Ok(EdsClusterConfig { service_name })
 }
 
 /// WP-35 increment 2b-ii: a cross-cluster post-pass over the assembled

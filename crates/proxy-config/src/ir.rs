@@ -667,6 +667,30 @@ pub struct ClusterConfig {
     /// [`crate::ir::OutlierDetectionIR`]-backed detector from this field yet
     /// (see `crates/proxy-config/tests/ir_readership.rs`'s allowlist entry).
     pub outlier_detection: Option<OutlierDetectionIR>,
+    /// `Cluster.eds_cluster_config`, present exactly when `discovery` is
+    /// [`DiscoveryType::Eds`] (`lower.rs::convert_cluster` sets the two
+    /// together, never one without the other). `None` for every other
+    /// discovery type, including `Aggregate` -- an aggregate has no
+    /// discovery mechanism of its own (see `kind`'s doc).
+    ///
+    /// WP-21 increment 1 only lowers and validates this shape; nothing
+    /// subscribes to EDS or applies an endpoint update yet, so `endpoints`
+    /// stays empty on an EDS cluster the same way it does on an aggregate --
+    /// see `crates/proxy-config/tests/ir_readership.rs`'s allowlist entry for
+    /// which increment reads it.
+    pub eds: Option<EdsClusterConfig>,
+}
+
+/// IR for `envoy.config.cluster.v3.Cluster.EdsClusterConfig` (supported
+/// surface) -- WP-21 increment 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdsClusterConfig {
+    /// The resource name to subscribe to. Envoy defaults this to the
+    /// cluster's own name when `service_name` is unset -- `lower.rs`
+    /// resolves that default at lowering time, so this is always the
+    /// resource name to request, never the proto's raw (possibly empty)
+    /// field.
+    pub service_name: String,
 }
 
 // ---------------------------------------------------------- health checks --
@@ -954,6 +978,13 @@ pub enum DiscoveryType {
     StrictDns,
     /// DNS-resolve, use one address at a time (WP-16).
     LogicalDns,
+    /// Endpoints arrive over EDS rather than from the cluster's own
+    /// `endpoints` list -- `ClusterConfig::endpoints` is always empty for a
+    /// cluster with this discovery type (`lower.rs::convert_cluster` rejects
+    /// a non-empty `load_assignment` alongside `type: EDS`). WP-21 owns the
+    /// subscription that will actually deliver a host set for these: this
+    /// increment (1) only makes the config surface loadable, not live.
+    Eds,
 }
 
 /// Where a cluster's hosts come from -- see [`ClusterConfig::kind`]'s doc for

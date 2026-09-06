@@ -120,6 +120,8 @@ fn mutation(key: &str, value: &str, action: HeaderAppendAction) -> HeaderMutatio
 /// mechanism this test relies on to tell `"a"`'s and `"b"`'s attempts apart.
 fn member_cluster(name: &str, addr: SocketAddr, mutations: Vec<HeaderMutation>) -> ClusterConfig {
     ClusterConfig {
+        // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+        eds: None,
         name: name.to_string(),
         discovery: DiscoveryType::Static,
         lb_policy: LbPolicy::RoundRobin,
@@ -148,6 +150,8 @@ fn member_cluster(name: &str, addr: SocketAddr, mutations: Vec<HeaderMutation>) 
 /// need *something* syntactically valid to satisfy `ClusterConfig`'s shape.
 fn aggregate_cluster() -> ClusterConfig {
     ClusterConfig {
+        // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
+        eds: None,
         name: "providers".to_string(),
         discovery: DiscoveryType::Static,
         lb_policy: LbPolicy::RoundRobin,
