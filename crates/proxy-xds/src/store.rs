@@ -140,6 +140,24 @@ impl<T> SotwSet<T> {
     pub fn is_empty(&self) -> bool {
         self.dynamic.is_empty()
     }
+
+    /// Discard the named dynamic entries as though `apply` had never stored
+    /// them. A name not currently held is a silent no-op.
+    ///
+    /// WP-21 increment 2b-ii (`apply.rs`'s EDS path) is the reason this
+    /// exists: `apply` records a resource in the store BEFORE its caller gets
+    /// a chance to hand it to a downstream sink, so a sink that then fails
+    /// leaves the store believing the resource is installed. Left alone, an
+    /// identical retransmission of that resource would compare equal
+    /// (rule 4's `unchanged`) and never reach the sink again -- a resource
+    /// stuck permanently uninstalled while the store reports it fine.
+    /// Forgetting it here makes the next delivery of the same bytes read as
+    /// `added` again, so the sink is retried instead of skipped.
+    pub fn forget(&mut self, names: &BTreeSet<String>) {
+        for name in names {
+            self.dynamic.remove(name);
+        }
+    }
 }
 
 impl<T: PartialEq> SotwSet<T> {
@@ -415,6 +433,31 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(s.names(), vec!["a", "b"]);
         assert!(!s.is_empty());
+    }
+
+    // --- WP-21 increment 2b-ii: `forget` -----------------------------------
+
+    #[test]
+    fn forgetting_a_name_makes_a_later_identical_apply_report_it_added_again() {
+        let mut s = SotwSet::new(SetSemantics::PerName, no_statics());
+        s.apply(res(&[("a", 1)])).unwrap();
+        assert_eq!(*s.get("a").unwrap(), 1);
+
+        s.forget(&set(&["a"]));
+        assert!(s.get("a").is_none());
+
+        // Same bytes as before `forget` -- without it this would come back
+        // `unchanged` (rule 4) and never look like a fresh apply again.
+        let outcome = s.apply(res(&[("a", 1)])).unwrap();
+        assert_eq!(outcome.added, vec!["a".to_string()]);
+        assert!(outcome.unchanged.is_empty());
+    }
+
+    #[test]
+    fn forgetting_an_unheld_name_is_a_silent_no_op() {
+        let mut s: SotwSet<i32> = SotwSet::new(SetSemantics::PerName, no_statics());
+        s.forget(&set(&["nope"]));
+        assert!(s.is_empty());
     }
 
     #[test]

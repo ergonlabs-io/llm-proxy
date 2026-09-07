@@ -18,15 +18,17 @@ use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
 use proxy_api::envoy::config::listener::v3 as listener_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
-use proxy_config::ir::ConfigSnapshot;
+use proxy_config::ir::{ConfigSnapshot, EndpointIR};
 use proxy_config::lower_dynamic_cluster;
-use proxy_xds::{Publish, ResourceApplier, ResponseHandler, Verdict};
+use proxy_xds::{Publish, PublishEndpoints, ResourceApplier, ResponseHandler, Verdict};
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
 const CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
 const LISTENER_TYPE: &str = "envoy.config.listener.v3.Listener";
+const ENDPOINT_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
 const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
+const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 
 /// Wrap an encoded proto message as a `google.protobuf.Any`, the same shape
 /// an ADS `DiscoveryResponse.resources` entry carries on the wire.
@@ -133,6 +135,84 @@ fn lds_response(version: &str, listeners: &[listener_v3::Listener]) -> Discovery
     }
 }
 
+/// A minimal `ClusterLoadAssignment` naming `cluster_name`, with one endpoint
+/// per `(ip, port)` pair -- just enough for `lower_dynamic_endpoints` to
+/// accept it.
+fn minimal_assignment(
+    cluster_name: &str,
+    hosts: &[(&str, u32)],
+) -> endpoint_v3::ClusterLoadAssignment {
+    endpoint_v3::ClusterLoadAssignment {
+        cluster_name: cluster_name.to_string(),
+        endpoints: vec![endpoint_v3::LocalityLbEndpoints {
+            lb_endpoints: hosts
+                .iter()
+                .map(|(ip, port)| endpoint_v3::LbEndpoint {
+                    host_identifier: Some(endpoint_v3::lb_endpoint::HostIdentifier::Endpoint(
+                        endpoint_v3::Endpoint {
+                            address: Some(core_v3::Address {
+                                address: Some(core_v3::address::Address::SocketAddress(
+                                    core_v3::SocketAddress {
+                                        address: ip.to_string(),
+                                        port_specifier: Some(
+                                            core_v3::socket_address::PortSpecifier::PortValue(
+                                                *port,
+                                            ),
+                                        ),
+                                        ..Default::default()
+                                    },
+                                )),
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn eds_response(
+    version: &str,
+    assignments: &[endpoint_v3::ClusterLoadAssignment],
+) -> DiscoveryResponse {
+    DiscoveryResponse {
+        version_info: version.to_string(),
+        type_url: EDS_TYPE_URL.to_string(),
+        nonce: format!("n-{version}"),
+        resources: assignments
+            .iter()
+            .map(|a| any_of(a, ENDPOINT_TYPE))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// An EDS cluster proto: `type: EDS`, `eds_cluster_config` over ADS. Same
+/// idiom as `minimal_cluster`, just the other `DiscoveryType`.
+fn eds_cluster(name: &str, service_name: &str) -> cluster_v3::Cluster {
+    cluster_v3::Cluster {
+        name: name.to_string(),
+        cluster_discovery_type: Some(cluster_v3::cluster::ClusterDiscoveryType::Type(
+            cluster_v3::cluster::DiscoveryType::Eds as i32,
+        )),
+        eds_cluster_config: Some(cluster_v3::cluster::EdsClusterConfig {
+            eds_config: Some(core_v3::ConfigSource {
+                config_source_specifier: Some(core_v3::config_source::ConfigSourceSpecifier::Ads(
+                    core_v3::AggregatedConfigSource {},
+                )),
+                resource_api_version: core_v3::ApiVersion::V3 as i32,
+                ..Default::default()
+            }),
+            service_name: service_name.to_string(),
+        }),
+        ..Default::default()
+    }
+}
+
 /// An empty base snapshot: no static listeners or clusters, so every dynamic
 /// name is free to use.
 fn empty_base() -> Arc<ConfigSnapshot> {
@@ -149,6 +229,44 @@ fn base_with_static_cluster(name: &str, port: u32) -> Arc<ConfigSnapshot> {
     let mut snapshot = ConfigSnapshot::default();
     snapshot.clusters.insert(name.to_string(), Arc::new(ir));
     Arc::new(snapshot)
+}
+
+/// A base snapshot carrying one static EDS cluster named `name`, subscribing
+/// to EDS resource `service_name`.
+fn base_with_static_eds_cluster(name: &str, service_name: &str) -> Arc<ConfigSnapshot> {
+    let any = any_of(&eds_cluster(name, service_name), CLUSTER_TYPE);
+    let ir = lower_dynamic_cluster(&any, "static_resources.clusters[0]")
+        .expect("fixture EDS cluster must lower");
+    let mut snapshot = ConfigSnapshot::default();
+    snapshot.clusters.insert(name.to_string(), Arc::new(ir));
+    Arc::new(snapshot)
+}
+
+/// What [`recording_endpoint_sink`] hands back: every successful sink call,
+/// in order, as `(cluster_name, endpoints)`.
+type RecordedEndpointCalls = Arc<Mutex<Vec<(String, Vec<EndpointIR>)>>>;
+
+/// A recording [`PublishEndpoints`]: every successful call appends
+/// `(cluster_name, endpoints)` to a shared `Vec`. `fail_names` lists cluster
+/// names whose FIRST call must return `Err` -- used to drive the
+/// sink-failure-then-retry scenario -- and is consumed (removed) on that
+/// first failing call, so a second call for the same name succeeds and is
+/// recorded normally.
+fn recording_endpoint_sink(fail_names: &[&str]) -> (PublishEndpoints, RecordedEndpointCalls) {
+    let recorded: RecordedEndpointCalls = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::clone(&recorded);
+    let mut still_failing: std::collections::HashSet<String> =
+        fail_names.iter().map(|s| s.to_string()).collect();
+    let sink: PublishEndpoints = Box::new(move |name, endpoints| {
+        if still_failing.remove(&name) {
+            return Box::pin(std::future::ready(Err(format!(
+                "sink deliberately failed for `{name}`"
+            ))));
+        }
+        calls.lock().unwrap().push((name, endpoints));
+        Box::pin(std::future::ready(Ok(())))
+    });
+    (sink, recorded)
 }
 
 /// A recording [`Publish`]: every call appends the published snapshot to a
@@ -475,4 +593,154 @@ async fn resource_applier_is_a_response_handler_returning_the_same_verdict_as_on
     let via_handler = applier_via_handler.handle(&resp).await;
 
     assert_eq!(direct, via_handler);
+}
+
+// ---------------------------------------------------------------- EDS (2b-ii) --
+
+/// A valid EDS response reaches the sink with the right
+/// `(cluster_name, endpoints)`.
+#[tokio::test]
+async fn a_valid_eds_response_reaches_the_sink_with_the_right_name_and_endpoints() {
+    let (publish, _published) = recording_publisher();
+    let (sink, recorded) = recording_endpoint_sink(&[]);
+    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+
+    let resp = eds_response(
+        "v1",
+        &[minimal_assignment("my-cluster", &[("10.0.0.1", 9090)])],
+    );
+    let verdict = applier.on_response(&resp).await;
+
+    assert_eq!(verdict, Verdict::Accept);
+    let calls = recorded.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "my-cluster");
+    assert_eq!(calls[0].1.len(), 1);
+    assert_eq!(calls[0].1[0].host, "10.0.0.1");
+    assert_eq!(calls[0].1[0].port, 9090);
+}
+
+/// A second, identical EDS response must not reach the sink again -- the
+/// same `unchanged` suppression `Entry`'s `PartialEq` gives CDS/LDS.
+#[tokio::test]
+async fn a_second_identical_eds_response_does_not_reach_the_sink_again() {
+    let (publish, _published) = recording_publisher();
+    let (sink, recorded) = recording_endpoint_sink(&[]);
+    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+
+    let resp = eds_response(
+        "v1",
+        &[minimal_assignment("my-cluster", &[("10.0.0.1", 9090)])],
+    );
+    applier.on_response(&resp).await;
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+
+    let verdict = applier.on_response(&resp).await;
+    assert_eq!(verdict, Verdict::Accept);
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        1,
+        "an unchanged EDS resource must not reach the sink a second time"
+    );
+}
+
+/// An EDS response with a resource that fails to lower is rejected without
+/// any sink call -- the all-or-nothing rule, same as CDS/LDS.
+#[tokio::test]
+async fn an_eds_response_with_a_resource_that_fails_to_lower_is_rejected_without_a_sink_call() {
+    let (publish, _published) = recording_publisher();
+    let (sink, recorded) = recording_endpoint_sink(&[]);
+    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+
+    let good = minimal_assignment("good", &[("10.0.0.1", 9090)]);
+    let mut bad = minimal_assignment("bad", &[("10.0.0.2", 9091)]);
+    // Outside `lower_dynamic_endpoints`'s allowlist for `LbEndpoint`.
+    bad.endpoints[0].lb_endpoints[0].health_status = 1;
+    let resp = eds_response("v1", &[good, bad]);
+
+    let verdict = applier.on_response(&resp).await;
+    assert!(
+        matches!(verdict, Verdict::Reject(_)),
+        "expected Reject, got {verdict:?}"
+    );
+    assert!(
+        recorded.lock().unwrap().is_empty(),
+        "the sink must never be called when any resource in the response fails to lower"
+    );
+}
+
+/// The store-consistency fix from `apply.rs`'s own doc on `on_eds_response`:
+/// a sink that fails once and then succeeds, given the same resource bytes
+/// twice, must reach the sink the SECOND time too. Without the fix
+/// (`SotwSet::forget` on a failed name), `apply` already recorded the first
+/// attempt, the second identical response would compare `unchanged`, and the
+/// sink would never be called again -- a resource stuck permanently
+/// uninstalled while the store reports it fine. This is the deliverable this
+/// increment's brief names explicitly.
+#[tokio::test]
+async fn a_sink_that_fails_once_is_retried_on_the_next_identical_response() {
+    let (publish, _published) = recording_publisher();
+    let (sink, recorded) = recording_endpoint_sink(&["my-cluster"]);
+    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+
+    let resp = eds_response(
+        "v1",
+        &[minimal_assignment("my-cluster", &[("10.0.0.1", 9090)])],
+    );
+
+    let first = applier.on_response(&resp).await;
+    assert!(
+        matches!(first, Verdict::Reject(_)),
+        "expected the first attempt to reject (sink fails), got {first:?}"
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+
+    // Same bytes again. If the store were left believing the first attempt
+    // applied, this would come back `unchanged` and the sink would never be
+    // asked again.
+    let second = applier.on_response(&resp).await;
+    assert_eq!(
+        second,
+        Verdict::Accept,
+        "the retry must reach the sink, which now succeeds"
+    );
+    let calls = recorded.lock().unwrap();
+    assert_eq!(calls.len(), 1, "the sink must be called on the retry");
+    assert_eq!(calls[0].0, "my-cluster");
+}
+
+/// An EDS response arriving before `with_endpoint_sink` is ever called is
+/// refused by name, not silently ignored, and names that this applier has no
+/// sink wired rather than blaming an unimplemented increment.
+#[tokio::test]
+async fn an_eds_response_with_no_sink_wired_is_rejected_naming_the_reason() {
+    let (publish, _published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let resp = eds_response(
+        "v1",
+        &[minimal_assignment("my-cluster", &[("10.0.0.1", 9090)])],
+    );
+    let verdict = applier.on_response(&resp).await;
+    let Verdict::Reject(message) = verdict else {
+        panic!("expected Reject, got {verdict:?}");
+    };
+    assert!(
+        message.contains("no endpoint sink"),
+        "message should say why, got: {message}"
+    );
+}
+
+/// `eds_resource_names` picks up a static EDS cluster's `service_name`.
+#[tokio::test]
+async fn eds_resource_names_picks_up_a_static_eds_clusters_service_name() {
+    let base = base_with_static_eds_cluster("payments", "payments-eds");
+    let (publish, _published) = recording_publisher();
+    let applier = ResourceApplier::new(base, publish);
+
+    let names = applier.eds_resource_names();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["payments-eds".to_string()])
+    );
 }

@@ -35,6 +35,7 @@
 //! finish before the ACK for that response goes out. Apply-then-ACK, never
 //! ACK-then-apply, per S8.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -79,6 +80,21 @@ pub trait ResponseHandler: Send {
         &mut self,
         resp: &DiscoveryResponse,
     ) -> impl std::future::Future<Output = Verdict> + Send;
+
+    /// The resource names this handler currently wants subscribed for
+    /// `type_url`, if it derives one at all. `None` means "this handler has
+    /// no opinion for this type" -- WP-21 increment 2b-ii's addition, for
+    /// EDS: `ResourceApplier` computes its EDS name set from whatever
+    /// clusters it currently holds (see its own `eds_resource_names`), and
+    /// `run_once` below is what turns a change in that set into a follow-up
+    /// `DiscoveryRequest` on the wire.
+    ///
+    /// Rust note: a defaulted trait method, so `FnHandler` and every existing
+    /// test `ResponseHandler` impl keep compiling unchanged -- only
+    /// `ResourceApplier` overrides it.
+    fn desired_names(&self, _type_url: &str) -> Option<BTreeSet<String>> {
+        None
+    }
 }
 
 /// Adapts a plain [`Validator`] closure to [`ResponseHandler`], so a caller
@@ -396,6 +412,27 @@ impl AdsClient {
             // at stream open, so the first request on the wire is this ACK
             // rather than an initial request.
             node_pending = None;
+
+            // WP-21 increment 2b-ii: this response may have changed what a
+            // name-based subscription (EDS today) wants. The ACK/NACK above
+            // MUST go out first -- it answers the response that just
+            // arrived, on THIS response's nonce, and must not be reordered
+            // behind a request that has nothing to do with it. Only after
+            // that does the pump ask every state what it wants now; a CDS
+            // response naming a new EDS cluster is what makes
+            // `ResourceApplier::desired_names` return a wider EDS set here,
+            // which is the mechanism by which accepting a cluster subscribes
+            // to its endpoints.
+            for state in &mut self.states {
+                let Some(names) = handler.desired_names(state.type_url()) else {
+                    continue;
+                };
+                if state.set_names(names) {
+                    tx.send(to_proto(&state.initial_request(), node_pending.as_ref()))
+                        .await
+                        .map_err(|_| AdsError::OutboundClosed)?;
+                }
+            }
         }
     }
 }
