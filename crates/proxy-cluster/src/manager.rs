@@ -3,12 +3,16 @@
 //! router (WP-13) only ever talks to it through [`ClusterManager::cluster`]'s
 //! `Arc<dyn ClusterEntry>` handle, never touching discovery internals.
 //!
-//! Warming ("is this cluster ready to serve") is a stub here --
+//! Warming ("is this cluster ready to serve") tracking lives here --
 //! [`ClusterManager::is_initialized`] flips once a cluster's first
 //! resolution lands, or, for a cluster that never resolves in time,
 //! [`ClusterManager::force_initialize`] mimics Envoy's
-//! `initial_fetch_timeout` "proceed empty" behavior. Real warming order is
-//! WP-21.
+//! `initial_fetch_timeout` "proceed empty" behavior.
+//! [`ClusterManager::warming_clusters`] (WP-21 increment 3) is what a
+//! readiness probe reads; this crate has no opinion on what a caller does
+//! with a non-empty result -- see `proxy-admin`'s `ReadinessProbe` and
+//! `proxy/src/main.rs` for the production wiring, and note this only gates
+//! `/ready`, not request routing (that's WP-58).
 
 use std::collections::HashMap;
 use std::io;
@@ -689,6 +693,20 @@ impl ClusterManager {
             managed.initialized.store(true, Ordering::Release);
         }
     }
+
+    /// The names of every currently-registered cluster still waiting on its
+    /// first resolution/EDS update -- built on [`Self::is_initialized`], not
+    /// a second copy of its logic. WP-21 increment 3: this is what gives
+    /// `is_initialized` a production caller -- `/ready` gates on whether this
+    /// is empty (see `proxy-admin`'s `ReadinessProbe` and `proxy/src/main.rs`).
+    pub fn warming_clusters(&self) -> Vec<ClusterName> {
+        self.clusters
+            .load()
+            .keys()
+            .filter(|name| !self.is_initialized(name))
+            .cloned()
+            .collect()
+    }
 }
 
 /// The router-facing view of one cluster (implements [`ClusterEntry`]).
@@ -1193,6 +1211,26 @@ mod tests {
         assert!(!manager.is_initialized("never-fed"));
         manager.force_initialize("never-fed");
         assert!(manager.is_initialized("never-fed"));
+    }
+
+    #[tokio::test]
+    async fn warming_clusters_reports_unresolved_and_omits_resolved() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "static-svc".to_string(),
+            cluster_config(
+                "static-svc",
+                DiscoveryType::Static,
+                vec![endpoint("10.0.0.1", 80)],
+            ),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        manager.add_eds_cluster("never-fed".to_string());
+
+        let warming = manager.warming_clusters();
+        assert_eq!(warming, vec!["never-fed".to_string()]);
     }
 
     #[tokio::test]

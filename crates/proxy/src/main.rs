@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -657,6 +658,23 @@ async fn run_serve(
     // -- see that type's doc in `proxy-core`'s `runtime.rs`.
     let snapshot_handles = Arc::new(SnapshotHandles::new());
 
+    // WP-21 increment 3: `/ready`'s readiness probe, built here (not inside
+    // `start_admin`) because it needs `cluster_manager`, which `start_admin`
+    // deliberately has no dependency on -- `proxy-admin` only ever sees the
+    // `proxy_admin::ReadinessProbe` seam, never `proxy-cluster` itself (see
+    // that type's doc). `timeout` follows `AdsConfig::initial_fetch_timeout`
+    // when the bootstrap set one, else the same default Envoy itself uses;
+    // `Instant::now()` here doubles as the warming deadline's start AND is
+    // close enough to true process start for that purpose -- `run_serve` has
+    // done no blocking I/O of note before this line.
+    let readiness_timeout = snapshot
+        .ads
+        .as_ref()
+        .and_then(|ads| ads.initial_fetch_timeout)
+        .unwrap_or(proxy_cluster::discovery::DEFAULT_INITIAL_FETCH_TIMEOUT);
+    let readiness =
+        build_readiness_probe(cluster_manager.clone(), readiness_timeout, Instant::now());
+
     // WP-50 increment 1: the read-only admin surface. Opt-in -- only binds
     // when the config names an `admin` address -- and, like a listener's
     // `initial_bind`, a bind failure here is a startup error, not a silent
@@ -670,6 +688,7 @@ async fn run_serve(
         Instant::now(),
         &snapshot_handles,
         factory_state.clone(),
+        Some(readiness),
     )
     .await
     {
@@ -1402,6 +1421,65 @@ async fn wait_for_initial_binds(
     Ok(())
 }
 
+/// WP-21 increment 3: builds the `/ready` readiness probe `run_serve` wires
+/// into [`start_admin`], which passes it straight through to
+/// `proxy_admin::serve`. Reads [`proxy_cluster::manager::ClusterManager::warming_clusters`]
+/// fresh on every call -- no caching, since the whole point is that warming
+/// state can change between polls -- and reports [`proxy_admin::Readiness::Initializing`]
+/// for as long as it is non-empty AND `deadline_started_at.elapsed()` is
+/// under `timeout`; past the deadline it reports [`proxy_admin::Readiness::Live`]
+/// instead.
+///
+/// **This only changes what `/ready` says -- it never calls
+/// `ClusterManager::force_initialize` and never touches `is_initialized`.**
+/// A cluster that never resolved stays un-initialized forever; the deadline
+/// only stops that fact from gating readiness. WP-58 is what makes a request
+/// to a still-warming cluster behave differently from one to a cluster whose
+/// hosts are all ejected, and it needs `is_initialized` to keep telling those
+/// two states apart -- see this crate's [`run_serve`] doc for where `timeout`
+/// itself is resolved (`AdsConfig::initial_fetch_timeout`, falling back to
+/// [`proxy_cluster::discovery::DEFAULT_INITIAL_FETCH_TIMEOUT`]).
+///
+/// Logs once, at `warn!`, the first probe call that observes the deadline
+/// has passed with clusters still warming, naming them -- never on every
+/// call. `/ready` is polled by orchestrators on a tight loop; logging on
+/// every poll would become the incident (CLAUDE.md rule 17's "keep the
+/// suppression off the healthy hot path" reasoning, applied to a warning
+/// rather than a security control).
+///
+/// Rust note: `warned` is a plain `AtomicBool`, not `Arc<AtomicBool>` --
+/// it is captured BY the closure (moved in), not shared with anything
+/// outside it, so a bare value works: every call to the returned `Fn`
+/// receives `&self` over the closure's own captures, which is enough shared
+/// access for `AtomicBool`'s interior mutability. No `Arc` needed for
+/// something with exactly one owner.
+fn build_readiness_probe(
+    cluster_manager: Arc<proxy_cluster::manager::ClusterManager>,
+    timeout: Duration,
+    deadline_started_at: Instant,
+) -> proxy_admin::ReadinessProbe {
+    let warned = AtomicBool::new(false);
+    Arc::new(move || {
+        let warming = cluster_manager.warming_clusters();
+        if warming.is_empty() {
+            return proxy_admin::Readiness::Live;
+        }
+        if deadline_started_at.elapsed() < timeout {
+            return proxy_admin::Readiness::Initializing { warming };
+        }
+        if !warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                clusters = ?warming,
+                timeout_s = timeout.as_secs(),
+                "cluster warming deadline (initial_fetch_timeout) expired with clusters still \
+                 unresolved; /ready now reports LIVE for them, but ClusterManager::is_initialized \
+                 stays false -- see WP-58"
+            );
+        }
+        proxy_admin::Readiness::Live
+    })
+}
+
 /// Starts the read-only admin server (`proxy-admin`, WP-50 increment 1) when
 /// `admin` names a bind address; binds nothing and returns `Ok(None)`
 /// otherwise -- the admin surface is opt-in, never automatic.
@@ -1447,6 +1525,7 @@ async fn start_admin(
     started_at: Instant,
     snapshot_handles: &SnapshotHandles,
     factory_state: Arc<proxy_http::filter::SharedFactoryState>,
+    readiness: Option<proxy_admin::ReadinessProbe>,
 ) -> Result<Option<proxy_admin::AdminServer>, String> {
     let Some(addr) = admin else {
         return Ok(None);
@@ -1460,6 +1539,7 @@ async fn start_admin(
         started_at,
         factory_state,
         admin_token,
+        readiness,
     )
     .await
     .map_err(|err| err.to_string())?;
@@ -1682,6 +1762,7 @@ mod tests {
             Instant::now(),
             &SnapshotHandles::new(),
             Arc::new(proxy_http::filter::SharedFactoryState::default()),
+            None,
         )
         .await
         .expect("start_admin(None, ..) must not fail");
@@ -1707,6 +1788,7 @@ mod tests {
             Instant::now(),
             &SnapshotHandles::new(),
             Arc::new(proxy_http::filter::SharedFactoryState::default()),
+            None,
         )
         .await
         .expect("start_admin should succeed on an available port")
@@ -1737,6 +1819,7 @@ mod tests {
             Instant::now(),
             &snapshot_handles,
             Arc::new(proxy_http::filter::SharedFactoryState::default()),
+            None,
         )
         .await
         .expect("start_admin should succeed on an available port")
@@ -1770,6 +1853,62 @@ mod tests {
             response.contains("\"version\":7"),
             "expected /config_dump to reflect the snapshot published through the shared \
              registry, got:\n{response}"
+        );
+    }
+
+    /// A `ClusterManager` carrying one cluster that has never resolved --
+    /// what every [`build_readiness_probe`] test below drives against,
+    /// avoiding any real DNS/EDS traffic.
+    fn manager_with_one_never_fed_cluster() -> Arc<proxy_cluster::manager::ClusterManager> {
+        let manager = proxy_cluster::manager::ClusterManager::with_default_transport(Arc::new(
+            proxy_cluster::resolver::TokioResolver,
+        ));
+        manager.add_eds_cluster("never-fed".to_string());
+        Arc::new(manager)
+    }
+
+    // ---- WP-21 increment 3: the readiness probe's deadline -----------------
+    //
+    // Both tests drive `build_readiness_probe` directly (per the task's own
+    // acceptance note) rather than sleeping past a real timeout -- the
+    // deadline is just `Instant` subtraction, so backdating
+    // `deadline_started_at` proves the "past the deadline" branch
+    // deterministically and instantly.
+
+    #[tokio::test]
+    async fn readiness_probe_reports_initializing_before_the_deadline() {
+        let manager = manager_with_one_never_fed_cluster();
+        let probe = build_readiness_probe(manager.clone(), Duration::from_secs(60), Instant::now());
+        match probe() {
+            proxy_admin::Readiness::Initializing { warming } => {
+                assert_eq!(warming, vec!["never-fed".to_string()]);
+            }
+            other => panic!("expected Initializing before the deadline, got {other:?}"),
+        }
+        assert!(!manager.is_initialized("never-fed"));
+    }
+
+    /// The important assertion, per the task: past the deadline `/ready`
+    /// reports `Live` for a cluster that never resolved, but
+    /// `ClusterManager::is_initialized` stays `false` for it -- the deadline
+    /// gates readiness, it does not call `force_initialize`. This is what
+    /// stops someone "simplifying" `build_readiness_probe` into a
+    /// `force_initialize` call later: that change would still make this
+    /// test pass on `Readiness::Live` but fail on `is_initialized`.
+    #[tokio::test]
+    async fn readiness_probe_reports_live_past_the_deadline_but_leaves_is_initialized_false() {
+        let manager = manager_with_one_never_fed_cluster();
+        // Backdated, not slept-past: the deadline already elapsed before the
+        // first call.
+        let deadline_started_at = Instant::now() - Duration::from_secs(60);
+        let probe =
+            build_readiness_probe(manager.clone(), Duration::from_secs(1), deadline_started_at);
+
+        assert_eq!(probe(), proxy_admin::Readiness::Live);
+        assert!(
+            !manager.is_initialized("never-fed"),
+            "the warming deadline must gate /ready only -- it must never mark a cluster \
+             initialized (that stays WP-58's job, at request time)"
         );
     }
 

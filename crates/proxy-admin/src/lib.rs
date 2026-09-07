@@ -5,7 +5,11 @@
 //! `/server_info`, `/stats`, `/stats/prometheus`. `/stats`(`/prometheus`) is
 //! a deliberate 404 when no WP-23 stats registry is wired rather than a fake
 //! empty `200` -- an operator who trusts an empty `/stats` believes there is
-//! no traffic.
+//! no traffic. `/ready` (WP-21 increment 3) is `200 "LIVE"` unless a
+//! [`server::ReadinessProbe`] was wired AND reports still-warming clusters,
+//! in which case it is `503 "INITIALIZING"` -- see that type's doc for the
+//! injected-closure seam and `crates/proxy/src/main.rs` for the production
+//! probe and its warming deadline.
 //!
 //! **The one exception: `GET /tenants/{id}/spend` (WP-50 increment 3c-iv) is
 //! a READ that is nonetheless gated exactly like a write.** Every other read
@@ -111,4 +115,4 @@
 pub mod dump;
 pub mod server;
 
-pub use server::{serve, AdminError, AdminServer};
+pub use server::{serve, AdminError, AdminServer, Readiness, ReadinessProbe};
