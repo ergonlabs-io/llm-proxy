@@ -158,10 +158,12 @@ with ourselves about the protocol and both being wrong. testing/controlplane's
 own puppet server cannot do that: we wrote both sides of it."* This fixture
 found that.
 
-**Fixing `client.rs` is out of scope for this task** (`crates/` is owned by
-other lanes this batch). This README records the finding so it is not lost
-between now and whoever picks up `AdsClient::run_once`'s send ordering; once
-fixed, both tests in this file are expected to go green with no other changes.
+**Fixed in the same commit that landed this fixture** (`e32bc9d`).
+`run_once` now queues every initial request into the outbound channel before
+it opens the stream, so they are waiting for tonic to send the moment the
+connection is live, and neither side is left waiting on the other. The
+comment in `client.rs` at that send site records why the ordering is
+load-bearing rather than stylistic.
 
 Confirmed clean teardown on both the failing run above and a docker-unavailable
 run: `docker ps -a` shows no leftover containers (each test's `Container` is an

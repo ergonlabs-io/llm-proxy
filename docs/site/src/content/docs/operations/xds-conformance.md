@@ -70,31 +70,32 @@ landed).
   drives `proxy_xds::AdsClient` directly so a failure here localizes to the
   wire protocol itself, not to the binary's own plumbing around it.
 
-## Current status: does not pass, and the reason is a real bug, not the fixture
+## What its first run found
 
-As of the fixture's first real run against go-control-plane (2026-09-06),
-**both scenarios time out.** The client opens the stream — go-control-plane's
-own log shows it — then never sends its first request, and so never gets a
+On the fixture's first real run against go-control-plane (2026-09-06),
+**both scenarios timed out.** The client opened the stream — go-control-plane's
+own log showed it — then never sent its first request, and so never got a
 response.
 
-The confirmed root cause is an ordering problem in
-`AdsClient::run_once` (`crates/proxy-xds/src/client.rs`): it awaits the
-stream handle from `stream_aggregated_resources` before sending the first
-request. `tonic`'s generated client does not return that handle until it
-has received the server's response headers, and go-control-plane (built on
-`grpc-go`) does not send response headers until it has read a first message
-from the client — so each side is waiting on the other, and it deadlocks
-every time.
+The cause was an ordering problem in `AdsClient::run_once`
+(`crates/proxy-xds/src/client.rs`): it awaited the stream handle from
+`stream_aggregated_resources` before sending the first request. `tonic`'s
+generated client does not return that handle until it has received the
+server's response headers, and go-control-plane (built on `grpc-go`) does
+not send response headers until it has read a first message from the
+client. Each side waited on the other.
 
 Our own scripted test server (`testing/controlplane`) never surfaced this,
 because it sends response headers as soon as its handler starts, before
 reading anything from the client — a different, more permissive behavior
 than a real `grpc-go` server. This is exactly the failure mode this target
 exists to catch: two implementations we control agreeing with each other
-and both being wrong. See `testing/xds-conformance/README.md` for the full
-account, including the confirmed manual reproduction. Fixing
-`AdsClient::run_once`'s send ordering is tracked separately and is not done
-as of this writing.
+and both being wrong.
+
+`run_once` now queues every initial request into the outbound channel
+**before** it opens the stream, so the requests are waiting for `tonic` to
+send the moment the connection is live. See
+`testing/xds-conformance/README.md` for the full account.
 
 ## Running it
 
