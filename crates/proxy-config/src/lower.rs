@@ -153,6 +153,9 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
 const DYNAMIC_CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
 /// Full proto type name a dynamic `Listener` resource must carry.
 const DYNAMIC_LISTENER_TYPE: &str = "envoy.config.listener.v3.Listener";
+/// Full proto type name a dynamic `ClusterLoadAssignment` (EDS) resource must
+/// carry.
+const DYNAMIC_ENDPOINTS_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
 
 /// Lower one xDS-delivered resource `Any` into its typed proto `T`, running
 /// the SAME strict-mode surface check `build_snapshot` runs over a whole
@@ -231,6 +234,54 @@ pub fn lower_dynamic_listener(
 ) -> Result<ListenerConfig, ConfigError> {
     let l: listener_v3::Listener = lower_dynamic_any(any, path, DYNAMIC_LISTENER_TYPE)?;
     convert_listener(&l, path)
+}
+
+/// Lower one xDS-delivered `ClusterLoadAssignment` (an EDS resource) into its
+/// endpoints. See [`lower_dynamic_cluster`] for what `path` roots and why the
+/// surface check runs here too -- an EDS response is not exempt from ground
+/// rule #1 just because it never touches a bootstrap file.
+///
+/// Returns the assignment's `cluster_name` alongside the endpoints. That
+/// field is the EDS **resource name** -- it is what an `EdsClusterConfig`
+/// subscribes to via `service_name` (WP-21 increment 1), not necessarily the
+/// `Cluster.name` the endpoints end up attached to (Envoy allows the two to
+/// differ so several `Cluster`s can share one EDS resource). The caller
+/// (WP-21 increment 2b) is what matches this name back to a pending
+/// subscription; nothing here assumes a 1:1 mapping.
+pub fn lower_dynamic_endpoints(
+    any: &prost_types::Any,
+    path: &str,
+) -> Result<(String, Vec<EndpointIR>), ConfigError> {
+    let la: endpoint_v3::ClusterLoadAssignment =
+        lower_dynamic_any(any, path, DYNAMIC_ENDPOINTS_TYPE)?;
+
+    let mut endpoints = Vec::new();
+    for (i, locality) in la.endpoints.iter().enumerate() {
+        let priority = locality.priority;
+        for (j, lbe) in locality.lb_endpoints.iter().enumerate() {
+            let e_path = format!("{path}.endpoints[{i}].lb_endpoints[{j}]");
+            // `convert_endpoint` takes a `DiscoveryType` because a STATIC
+            // cluster's own `load_assignment` (converted in `convert_cluster`,
+            // above) requires literal IPs -- Envoy has already resolved
+            // nothing for it, so a hostname there would silently never
+            // connect. An EDS-delivered endpoint is a different situation:
+            // it came from a management server that may have done its own
+            // resolution (a literal IP, the common case) or may be handing
+            // the data plane a hostname on purpose (Envoy's EDS wire format
+            // does not forbid it). `DiscoveryType::Eds` is passed rather than
+            // `Static` so a hostname here is ACCEPTED, not refused --
+            // `convert_endpoint` only rejects non-IP hosts when `discovery ==
+            // DiscoveryType::Static`, and every other variant (this one
+            // included) already falls through unchecked.
+            endpoints.push(convert_endpoint(
+                lbe,
+                priority,
+                DiscoveryType::Eds,
+                &e_path,
+            )?);
+        }
+    }
+    Ok((la.cluster_name, endpoints))
 }
 
 // ------------------------------------------------------------ surface check --

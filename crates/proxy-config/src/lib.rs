@@ -20,7 +20,9 @@ pub use error::{
 };
 pub use ir::ConfigSnapshot;
 pub use loader::{load_bootstrap_file, parse_bootstrap, ConfigFormat, LoadedBootstrap};
-pub use lower::{build_snapshot, lower_dynamic_cluster, lower_dynamic_listener};
+pub use lower::{
+    build_snapshot, lower_dynamic_cluster, lower_dynamic_endpoints, lower_dynamic_listener,
+};
 pub use validate::validate_message;
 
 /// How to treat config fields we do not (yet) implement.
