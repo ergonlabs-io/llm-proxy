@@ -79,13 +79,13 @@ export default defineConfig({
 						{ label: 'Managing secrets', slug: 'authentication/managing-secrets' },
 					],
 				},
-				// {
-				// 	label: 'Limits and budgets',
-				// 	items: [
-				// 		{ label: 'Token rate limiting', slug: 'limits-and-budgets/token-rate-limiting' },
-				// 		{ label: 'Tenants', slug: 'limits-and-budgets/tenants' },
-				// 	],
-				// },
+				{
+					label: 'Limits and budgets',
+					items: [
+						{ label: 'Token rate limiting', slug: 'limits-and-budgets/token-rate-limiting' },
+						// { label: 'Tenants', slug: 'limits-and-budgets/tenants' },
+					],
+				},
 				{
 					label: 'Observability',
 					items: [
@@ -100,6 +100,7 @@ export default defineConfig({
 						// { label: 'Running in production', slug: 'operations/running-in-production' },
 						{ label: 'Config reload', slug: 'operations/config-reload' },
 						{ label: 'Draining and shutdown', slug: 'operations/draining-and-shutdown' },
+						{ label: 'xDS conformance', slug: 'operations/xds-conformance' },
 						// { label: 'TLS', slug: 'operations/tls' },
 					],
 				},

@@ -28,7 +28,9 @@ the access log.
 **Enforces token budgets.** A tenant over its limit gets a 429 with
 `x-ratelimit-*` headers before the request reaches a provider. A request already
 in flight is never cut short. Limits are keyed to the authenticated tenant, so
-changing a header does not buy a fresh quota.
+changing a header does not buy a fresh quota. A tenant can read its own
+current-window standing at `GET /v1/usage`, scoped to the key it presented —
+never to a tenant it names itself.
 
 **Authenticates callers.** Virtual keys verified with HMAC-SHA256 in constant
 time. Authentication fails closed: with an `auth` block configured, a request
