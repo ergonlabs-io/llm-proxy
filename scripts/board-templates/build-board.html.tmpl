@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 55 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-06 · 1723 tests passed, 16 skipped as of 2026-09-06 (cargo nextest, workspace; doctests carried forward, not re-run this refresh: 5 passed, 1 ignored) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 59 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-07 · 1756 tests passed, 16 skipped as of 2026-09-07 (cargo nextest, workspace, via a full <code>make ci</code> — fmt, clippy and doctests included, all green) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -204,18 +204,36 @@
     deliberately and in writing: ACK-before-apply in <code>main.rs</code>, which two independent
     test attempts could not observe from outside (the ACK's own network round trip dwarfs the
     race window) — publish-ordering is closed instead by the type system.
-    <b>WP-21 (warming, ordering, make-before-break) started 2026-09-06</b>, and this is the WP
-    that actually closes the gate: increment 1 landed the EDS cluster IR surface (config surface
-    only — nothing subscribes to EDS or applies an endpoint update yet), and found one real defect
-    on the way (a statically-declared EDS cluster's membership would have been wiped by the next
-    DNS-cadence refresh tick, now fixed). <b>Do not read WP-20's completion as the gate moving —
-    it has not.</b> EDS subscription/application, listener warming, and the make-before-break
-    churn test are all still ahead of WP-21.
+    <b>WP-21 (warming, ordering, make-before-break) started 2026-09-06, and increment 2 landed
+    EDS ingest end to end on 2026-09-07.</b> An ADS-delivered <code>ClusterLoadAssignment</code>
+    now lowers through the same converter the static path uses, resolves to the cluster(s)
+    subscribing to it, and reaches <code>ClusterManager::accept_eds_update</code> — proven by an
+    <code>ads_e2e</code> scenario that routes a real request through the result. Two bugs were
+    caught in review rather than by a test, and both are the same shape: a constraint written
+    down in one increment that the next increment did not honour. Increment 2a accepted a
+    hostname in an EDS endpoint (nothing resolves one — refused at lowering now), and 2b-ii
+    called the sink with the EDS <i>resource</i> name where <code>accept_eds_update</code> is
+    keyed by <code>Cluster.name</code>, which Envoy lets differ. <b>Do not read this as the gate
+    moving.</b> Cluster warming, listener warming on an RDS dependency (RDS is still refused by
+    name), the init manager, <code>/ready</code> gating and the make-before-break churn test are
+    all still ahead of WP-21 — and <code>is_initialized</code> STILL has no production caller, so
+    warming is inert for every discovery type, not only EDS.
     <b>WP-54 (tenant self-service usage API) is DONE, 2026-09-06, both increments</b> — not
-    gate-moving, it never was part of the ADS gate. <b>WP-55 (usage history) was decided the same
-    day: export-only, stay stateless</b>, and resized L → S once its own stale starting claim
-    (the token-usage metric "never recorded") was checked against the code and found wrong;
-    it is ready to start, not gate-moving either. Before all of this, 2026-08-29 through
+    gate-moving, it never was part of the ADS gate. <b>WP-55 (usage history) was decided
+    2026-09-06 — export-only, stay stateless — and DONE 2026-09-07</b>: a <code>tenant</code>
+    dimension on the token-usage instrument, capped at 4000 series so an unbounded tenant space
+    folds into one overflow series rather than growing the registry, dropping the dimension and
+    never the measurement. It was resized L → S once its own stale starting claim (the
+    token-usage metric "never recorded") was checked against the code and found wrong.
+    <b>Four new work packages, scoped 2026-09-07, three of them driven by an external consumer:</b>
+    a sibling project (<code>remote-llm</code>) is building a sidecar that registers GPU inference
+    nodes, and asked for per-endpoint metadata (WP-56), a <code>/clusters</code> view that shows
+    live host sets rather than configured ones (WP-57), and a failure that distinguishes "never
+    fed" from "all hosts ejected" (WP-58). Its review also prompted <b>WP-59, the one to read</b>:
+    <code>update_from_snapshot</code> rebuilds every config-sourced cluster wholesale, so any
+    change clears health-check state and outlier ejections proxy-wide — harmless under a human
+    SIGHUP, a standing mechanism for silently clearing ejection state once cluster config arrives
+    on a 10-second heartbeat. Before all of this, 2026-08-29 through
     2026-09-02, WP-50 increment 3 landed (operator control plane: tenants, spend budgets), P0
     product-defining work gating neither v0.2.0 nor v0.3.0 — see the dated block at the end of
     this paragraph.
