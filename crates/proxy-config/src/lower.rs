@@ -260,19 +260,15 @@ pub fn lower_dynamic_endpoints(
         let priority = locality.priority;
         for (j, lbe) in locality.lb_endpoints.iter().enumerate() {
             let e_path = format!("{path}.endpoints[{i}].lb_endpoints[{j}]");
-            // `convert_endpoint` takes a `DiscoveryType` because a STATIC
-            // cluster's own `load_assignment` (converted in `convert_cluster`,
-            // above) requires literal IPs -- Envoy has already resolved
-            // nothing for it, so a hostname there would silently never
-            // connect. An EDS-delivered endpoint is a different situation:
-            // it came from a management server that may have done its own
-            // resolution (a literal IP, the common case) or may be handing
-            // the data plane a hostname on purpose (Envoy's EDS wire format
-            // does not forbid it). `DiscoveryType::Eds` is passed rather than
-            // `Static` so a hostname here is ACCEPTED, not refused --
-            // `convert_endpoint` only rejects non-IP hosts when `discovery ==
-            // DiscoveryType::Static`, and every other variant (this one
-            // included) already falls through unchecked.
+            // `convert_endpoint` takes a `DiscoveryType` to decide whether
+            // a literal IP is required. It is for `Eds`, and the reason is
+            // downstream of here: these endpoints are installed by
+            // `ClusterManager::accept_eds_update` through
+            // `discovery::static_hosts`, which does no name resolution.
+            // Envoy's EDS wire format permits a hostname -- we cannot use
+            // one -- so refusing it here keeps the failure a config-time
+            // error carrying a dotted path rather than an `io::Error` on
+            // every push. See `convert_endpoint` for the wording.
             endpoints.push(convert_endpoint(
                 lbe,
                 priority,
@@ -3967,10 +3963,33 @@ fn convert_endpoint(
         .as_ref()
         .ok_or_else(|| invalid(format!("{path}.endpoint"), "address is required"))?;
     let (host, port) = socket_host_port(addr, &format!("{path}.endpoint.address"))?;
-    if discovery == DiscoveryType::Static && host.parse::<IpAddr>().is_err() {
+    // STATIC and EDS both require a literal IP, for two different reasons
+    // that land in the same place.
+    //
+    // STATIC: nothing ever resolves a STATIC cluster's own endpoints, so a
+    // hostname here would silently never connect.
+    //
+    // EDS: an EDS-delivered endpoint is consumed by
+    // `ClusterManager::accept_eds_update`, which builds hosts through
+    // `discovery::static_hosts` -- and that does no name resolution either.
+    // Accepting a name here would not make it work; it would only move the
+    // failure from a config-time error carrying a dotted path to a per-update
+    // runtime `io::Error` on every EDS push, which is ground rule #1's exact
+    // shape. Envoy's EDS wire format does permit a hostname, so this is a
+    // limitation of what we can currently do with one, and the message says
+    // so rather than claiming the wire format forbids it.
+    if matches!(discovery, DiscoveryType::Static | DiscoveryType::Eds)
+        && host.parse::<IpAddr>().is_err()
+    {
+        let why = if discovery == DiscoveryType::Static {
+            "STATIC clusters require IPs (use STRICT_DNS or LOGICAL_DNS for hostnames)"
+        } else {
+            "EDS-delivered endpoints require IPs -- the endpoints an EDS response carries are \
+             installed without name resolution, so a hostname here would never connect"
+        };
         return Err(invalid(
             format!("{path}.endpoint.address.socket_address.address"),
-            format!("`{host}` is not an IP address; STATIC clusters require IPs (use STRICT_DNS or LOGICAL_DNS for hostnames)"),
+            format!("`{host}` is not an IP address; {why}"),
         ));
     }
     Ok(EndpointIR {

@@ -234,24 +234,34 @@ fn an_assignment_with_no_localities_lowers_to_an_empty_endpoint_list_rather_than
 
 // --------------------------------------------------------- hostnames vs IPs --
 
-/// Decided (see `lower_dynamic_endpoints`'s doc in `lower.rs`): an
-/// EDS-delivered endpoint is NOT held to the STATIC-cluster "must be a
-/// literal IP" rule, because the management server -- not this data plane --
-/// is the one that decided how to address the host, and Envoy's own EDS wire
-/// format does not forbid a hostname there. A hostname must lower cleanly,
-/// not be refused the way `convert_endpoint` refuses one under
-/// `DiscoveryType::Static`.
+/// An EDS-delivered endpoint must carry a literal IP, the same as a STATIC
+/// cluster's own endpoints, but for a different reason: `accept_eds_update`
+/// installs these through `discovery::static_hosts`, which does no name
+/// resolution. Envoy's EDS wire format does permit a hostname -- we cannot
+/// currently use one, and refusing at lowering keeps that a config-time error
+/// with a dotted path instead of a per-push runtime `io::Error`.
 #[test]
-fn an_eds_endpoint_with_a_hostname_instead_of_a_literal_ip_lowers_without_error() {
+fn an_eds_endpoint_with_a_hostname_instead_of_a_literal_ip_is_refused() {
     let la = assignment(
         "payments-primary",
         vec![vec![lb_endpoint("payments.internal.example.com", 8080)]],
     );
     let any = any_of(&la, ENDPOINTS_TYPE);
 
-    let (_, endpoints) = lower_dynamic_endpoints(&any, "eds.assignments[payments-primary]")
-        .expect("a hostname must be accepted for an EDS-delivered endpoint");
+    let err = lower_dynamic_endpoints(&any, "eds.assignments[payments-primary]")
+        .expect_err("a hostname cannot be installed without resolution, so it must be refused");
 
-    assert_eq!(endpoints.len(), 1);
-    assert_eq!(endpoints[0].host, "payments.internal.example.com");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(
+        field_path,
+        "eds.assignments[payments-primary].endpoints[0].lb_endpoints[0]\
+         .endpoint.address.socket_address.address"
+    );
+    assert!(
+        reason.contains("without name resolution"),
+        "the message must say why a hostname cannot be used, not just that it was refused: \
+         {reason}"
+    );
 }
