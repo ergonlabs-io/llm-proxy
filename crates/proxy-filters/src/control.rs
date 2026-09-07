@@ -47,9 +47,12 @@
 //! [`VirtualKeyAuthenticator`]: crate::auth::VirtualKeyAuthenticator
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use rand::Rng;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::auth::{HmacSecret, KeyId, KeyRecord, KeySet, TenantId, TenantPolicy};
@@ -146,6 +149,48 @@ impl std::error::Error for StoreError {}
 pub trait ControlPlaneStore: Send + Sync {
     /// The snapshot-build read: everything a rebuild needs, in one call.
     fn load(&self) -> Result<StoredControlPlane, StoreError>;
+
+    /// A monotonic counter bumped by every TIER-2 write -- tenants, keys,
+    /// policies, budgets -- and NEVER by a spend write (WP-61, ADR-0006 §3).
+    /// [`ControlPlane`]'s poller reads only this value on every tick and does
+    /// the full [`Self::load`] + republish ONLY when it has moved, which is
+    /// what lets N replicas notice a revocation without every replica
+    /// re-reading the whole store every tick.
+    ///
+    /// # Why spend must never bump this
+    ///
+    /// Spend rows are written every flush interval by the data plane --
+    /// [`crate::spend::SpendAccumulator`]'s flusher thread, on a cadence
+    /// measured in seconds, from every replica, continuously. Bumping this
+    /// counter on a spend write would make every poller see the stamp move
+    /// every flush interval and trigger a full policy rebuild on every
+    /// replica every flush interval, for a write this counter has nothing to
+    /// say about (tier 2 identity/policy, not tier 3 accrued counters -- see
+    /// ADR-0006 §1's tier table). [`Self::set_spend`] does not call this.
+    ///
+    /// # A never-written store reads `0`
+    ///
+    /// Same "absence is the zero value" convention this store already uses
+    /// elsewhere (see [`Self::load_spend`]'s doc) -- a fresh store or a store
+    /// double that never bumps reads back `0`, not an error.
+    ///
+    /// # Bump unconditionally -- do not try to detect a no-op write
+    ///
+    /// Every write listed above bumps the counter even if, say, `set_policy`
+    /// was called with the exact `ModelAccess` already stored. Detecting "did
+    /// this write actually change anything" would need a read-before-write
+    /// comparison this trait's write methods do not otherwise need, purely to
+    /// save one poller's one redundant rebuild -- and a bug in that
+    /// comparison fails in the dangerous direction: a spurious bump costs one
+    /// wasted rebuild, but a MISSED bump is a revocation that never
+    /// propagates, silently, forever (the poller only rebuilds when the stamp
+    /// moves -- see [`ControlPlane::poll_once`]). Unconditional-bump is the
+    /// only implementation that cannot have that bug.
+    ///
+    /// `revoke_key` on an unknown `key_id` returns [`StoreError::NotFound`]
+    /// and must NOT bump -- nothing was written, so there is nothing for a
+    /// poller to notice.
+    fn policy_generation(&self) -> Result<u64, StoreError>;
 
     // Writes. The data plane never calls any of these -- only a future admin
     // API (3b-ii) does, off the request path.
@@ -274,6 +319,10 @@ struct InMemoryState {
     // its own key), so this needs no separate reverse index the way
     // `keys_by_tenant` does for `keys`.
     spend: HashMap<(String, TenantId, PeriodKey), u64>,
+    // WP-61: bumped by every tier-2 write below, under this SAME mutex
+    // acquisition -- see `ControlPlaneStore::policy_generation`'s doc for why
+    // a spend write (`set_spend` above) must never touch this field.
+    generation: u64,
 }
 
 impl InMemoryControlPlaneStore {
@@ -285,6 +334,7 @@ impl InMemoryControlPlaneStore {
                 policies: HashMap::new(),
                 budgets: HashMap::new(),
                 spend: HashMap::new(),
+                generation: 0,
             }),
         }
     }
@@ -315,6 +365,14 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         })
     }
 
+    fn policy_generation(&self) -> Result<u64, StoreError> {
+        let state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        Ok(state.generation)
+    }
+
     fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
         let mut state = self
             .state
@@ -323,6 +381,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         if !state.tenants.contains(tenant) {
             state.tenants.push(tenant.clone());
         }
+        state.generation += 1;
         Ok(())
     }
 
@@ -337,6 +396,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         // with it, the same "a deleted tenant carries no leftover
         // configuration" rule `set_policy`'s removal already follows.
         state.budgets.remove(tenant);
+        state.generation += 1;
         Ok(())
     }
 
@@ -346,6 +406,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .lock()
             .expect("control-plane store mutex poisoned");
         state.keys.insert(rec.key_id.clone(), rec.clone());
+        state.generation += 1;
         Ok(())
     }
 
@@ -357,8 +418,11 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         match state.keys.get_mut(key_id) {
             Some(rec) => {
                 rec.revoked = true;
+                state.generation += 1;
                 Ok(())
             }
+            // Nothing was written -- must NOT bump. See
+            // `ControlPlaneStore::policy_generation`'s doc.
             None => Err(StoreError::NotFound),
         }
     }
@@ -369,6 +433,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .lock()
             .expect("control-plane store mutex poisoned");
         state.policies.insert(tenant.clone(), access.clone());
+        state.generation += 1;
         Ok(())
     }
 
@@ -389,6 +454,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
                 state.budgets.remove(tenant);
             }
         }
+        state.generation += 1;
         Ok(())
     }
 
@@ -456,6 +522,12 @@ const BUDGETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("budget
 // impl, so encoding a bare integer through `serde_json` would only add an
 // allocation and a round trip for no benefit.
 const SPEND_TABLE: TableDefinition<(&str, &str, &str), u64> = TableDefinition::new("spend");
+// WP-61: a single row, keyed `"policy"`, holding the tier-2 generation
+// counter -- see `ControlPlaneStore::policy_generation`'s doc. A dedicated
+// table (rather than a row inside, say, `TENANTS_TABLE`) so bumping it is one
+// `insert` regardless of which of the six tier-2 tables the accompanying
+// write actually touched.
+const GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("generation");
 
 /// One `keys` row, exactly as `redb` stores it -- everything a [`StoredKey`]
 /// carries except `key_id`, which is already the table's key and would just
@@ -664,7 +736,9 @@ impl RedbControlPlaneStore {
         Ok(store)
     }
 
-    /// Creates all four tables if they do not already exist.
+    /// Creates all tables if they do not already exist -- six as of WP-61
+    /// (the doc used to say "all four"; `SPEND_TABLE` and `GENERATION_TABLE`
+    /// are the two that arrived since).
     ///
     /// Rust note: this runs a WRITE transaction even though it inserts no
     /// rows -- `WriteTransaction::open_table` is the only `redb` API that
@@ -682,7 +756,24 @@ impl RedbControlPlaneStore {
         txn.open_table(POLICIES_TABLE).map_err(store_err)?;
         txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
+        txn.open_table(GENERATION_TABLE).map_err(store_err)?;
         txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Reads the current generation (or `0` if the row has never been
+    /// written -- same "absence is the zero value" convention as everywhere
+    /// else in this store) and writes back `+1`, inside `txn` -- the SAME
+    /// write transaction as the tier-2 row the caller is about to commit, so
+    /// the bump and the write it accompanies commit atomically or not at all.
+    /// A reader must never observe the new stamp without the write it stands
+    /// for. See [`ControlPlaneStore::policy_generation`]'s doc.
+    fn bump_generation(txn: &redb::WriteTransaction) -> Result<(), StoreError> {
+        let mut table = txn.open_table(GENERATION_TABLE).map_err(store_err)?;
+        let current = table.get("policy").map_err(store_err)?.map(|g| g.value());
+        table
+            .insert("policy", current.unwrap_or(0) + 1)
+            .map_err(store_err)?;
         Ok(())
     }
 
@@ -753,6 +844,16 @@ impl RedbControlPlaneStore {
 }
 
 impl ControlPlaneStore for RedbControlPlaneStore {
+    fn policy_generation(&self) -> Result<u64, StoreError> {
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(GENERATION_TABLE).map_err(store_err)?;
+        Ok(table
+            .get("policy")
+            .map_err(store_err)?
+            .map(|g| g.value())
+            .unwrap_or(0))
+    }
+
     fn load(&self) -> Result<StoredControlPlane, StoreError> {
         let txn = self.db.begin_read().map_err(store_err)?;
 
@@ -812,6 +913,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 .insert(tenant.as_str(), [].as_slice())
                 .map_err(store_err)?;
         }
+        Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
     }
@@ -837,6 +939,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         // and `keys_by_tenant` are left untouched. A tenant's keys outliving
         // the tenant row is the existing, deliberate InMemory behavior this
         // store must not silently diverge from -- see the parity test below.
+        Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
     }
@@ -870,6 +973,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         }
         Self::add_key_to_tenant_index(&txn, rec.tenant.as_str(), rec.key_id.as_str())?;
 
+        Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
     }
@@ -883,7 +987,10 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 // Matches `InMemoryControlPlaneStore::revoke_key`: revoking
                 // an unknown key_id is `StoreError::NotFound`, and nothing
                 // is written -- dropping `txn` here without calling
-                // `commit()` rolls the whole (empty) transaction back.
+                // `commit()` rolls the whole (empty) transaction back, and
+                // returning before `bump_generation` means the stamp is not
+                // touched either. See `ControlPlaneStore::policy_generation`'s
+                // doc.
                 None => return Err(StoreError::NotFound),
             };
             row.revoked = true;
@@ -891,6 +998,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 .insert(key_id.as_str(), encode_json(&row).as_slice())
                 .map_err(store_err)?;
         }
+        Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
     }
@@ -904,6 +1012,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 .insert(tenant.as_str(), encode_json(&encoded).as_slice())
                 .map_err(store_err)?;
         }
+        Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
     }
@@ -928,6 +1037,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 }
             }
         }
+        Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
     }
@@ -990,6 +1100,36 @@ impl std::fmt::Debug for MintedKey {
     }
 }
 
+/// The policy poller thread's stop condition, plus the [`Condvar`] that wakes
+/// it immediately on shutdown rather than sleeping out up to one full
+/// interval.
+///
+/// Rust note: this is a deliberate TWIN of `spend.rs`'s private
+/// `ShutdownSignal` -- same shape (one waiter, one notifier, a `Mutex<bool>`
+/// plus a bare `Condvar`), same reason (a poll trades wakeup latency for CPU
+/// burned every tick even when nothing changed, and this has exactly one
+/// waiter and one notifier) -- not a shared type the two modules both import.
+/// Each stays private to its own module: `spend.rs`'s flusher and this
+/// module's poller are two independent background threads with independent
+/// lifetimes ([`SpendAccumulator`](crate::spend::SpendAccumulator) and
+/// [`ControlPlane`] are not the same object and do not share a shutdown
+/// signal), and duplicating ~6 lines of struct definition is cheaper than the
+/// coupling a shared type would introduce between two modules that otherwise
+/// have no reason to know about each other.
+struct PollShutdown {
+    stop: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// A started policy-poller thread's handle -- kept so [`ControlPlane`] can
+/// signal and join it, from either [`ControlPlane::start_policy_poller`]
+/// (replacing a previous thread) or `Drop` (shutting down for good). Mirrors
+/// `spend.rs`'s private `Flusher`.
+struct PolicyPoller {
+    shutdown: Arc<PollShutdown>,
+    join: JoinHandle<()>,
+}
+
 /// Owns the store, the operator's HMAC secret, the config bootstrap keys, and
 /// the published snapshot. See the module doc for the full seam and the
 /// boot/refresh fail-closed split.
@@ -1002,6 +1142,16 @@ pub struct ControlPlane {
     secret: HmacSecret,
     bootstrap_keys: KeySet,
     published: Arc<ArcSwap<ControlPlaneSnapshot>>,
+    /// WP-61: the `policy_generation` stamp the currently-published snapshot
+    /// reflects. `None` means "unknown" -- a stamp read that failed at boot,
+    /// or a store whose `policy_generation` errored -- which forces the next
+    /// poll to rebuild rather than risk comparing against a stale or
+    /// meaningless number. See [`Self::poll_once`].
+    last_generation: Mutex<Option<u64>>,
+    /// WP-61: when a poll (or a `rebuild()`) last SUCCEEDED. See
+    /// [`Self::snapshot_age`].
+    last_reconciled_at: Mutex<Instant>,
+    poller: Mutex<Option<PolicyPoller>>,
 }
 
 impl ControlPlane {
@@ -1019,6 +1169,28 @@ impl ControlPlane {
         bootstrap_keys: KeySet,
     ) -> Result<Self, StoreError> {
         let store: Arc<dyn ControlPlaneStore> = Arc::from(store);
+        // WP-61: read the generation stamp BEFORE `load()`, not after.
+        //
+        // Rust note: this ordering is load-bearing, not incidental. If a
+        // concurrent admin write lands between the two reads, reading the
+        // stamp SECOND would observe the new (post-write) generation
+        // alongside data that predates it, and `last_generation` would then
+        // already match a later `policy_generation()` that reflects a write
+        // this snapshot never saw -- the next `poll_once` would see "no
+        // change" and skip the rebuild that write was supposed to trigger,
+        // permanently (until the NEXT write bumps the stamp again). Reading
+        // the stamp FIRST means the worst case is the opposite and harmless:
+        // `load()` picks up that same write anyway, and the stamp we recorded
+        // is merely a little older than what we loaded, so the next poll
+        // just does one redundant rebuild.
+        //
+        // A stamp-read failure here is deliberately `.ok()`, not `?`: this is
+        // still the "boot" side of the boot/refresh split (see the module
+        // doc), and only `load()` failing is a hard error. Losing the
+        // opening stamp only means the first poll tick always rebuilds
+        // (`last_generation` starts `None`), which is one redundant rebuild,
+        // not a missed revocation.
+        let generation = store.policy_generation().ok();
         let loaded = store.load()?;
         let snapshot = Self::merge(&bootstrap_keys, loaded);
         // Rust note: `ArcSwap::new` takes the initial `Arc<T>` directly --
@@ -1032,11 +1204,23 @@ impl ControlPlane {
             secret,
             bootstrap_keys,
             published,
+            last_generation: Mutex::new(generation),
+            last_reconciled_at: Mutex::new(Instant::now()),
+            poller: Mutex::new(None),
         })
     }
 
     /// Re-reads the store and republishes -- OR, on a read failure, leaves
     /// the previously published snapshot exactly as it was.
+    ///
+    /// This is the ADMIN-WRITE path's refresh (`mint_key`, `revoke_key`, and
+    /// friends call it right after their own write -- see their "writes THEN
+    /// republishes" docs) and is UNCONDITIONAL: it always re-reads and
+    /// republishes, unlike [`Self::poll_once`], which only does that work
+    /// when the generation stamp has actually moved. That is deliberate --
+    /// the caller here just performed a write and already knows the store
+    /// changed, so checking the stamp first would only add a redundant read
+    /// before the read it was always going to do anyway.
     ///
     /// Rust note: the `Err` arm deliberately does not touch `self.published`
     /// at all. `ArcSwap` keeps serving whatever `Arc` is currently stored
@@ -1048,11 +1232,27 @@ impl ControlPlane {
     /// every key that used to authenticate would start 401-ing the instant a
     /// store read hiccuped, silently, with no distinguishing signal from "the
     /// key was actually revoked". See the module doc and CLAUDE.md rule 17.
+    ///
+    /// WP-61: on success, also records the generation stamp the fresh
+    /// snapshot reflects and marks `last_reconciled_at` as now -- both read
+    /// BEFORE `load()`, for the same reason [`Self::new`]'s doc explains.
+    /// `Err` leaves both untouched, exactly like `published`: a failed
+    /// refresh is not a reconciliation and must not reset the staleness
+    /// clock [`Self::snapshot_age`] reports.
     pub fn rebuild(&self) {
+        let generation = self.store.policy_generation().ok();
         match self.store.load() {
             Ok(loaded) => {
                 let snapshot = Self::merge(&self.bootstrap_keys, loaded);
                 self.published.store(Arc::new(snapshot));
+                *self
+                    .last_generation
+                    .lock()
+                    .expect("control plane mutex poisoned") = generation;
+                *self
+                    .last_reconciled_at
+                    .lock()
+                    .expect("control plane mutex poisoned") = Instant::now();
             }
             Err(err) => {
                 tracing::warn!(
@@ -1060,6 +1260,142 @@ impl ControlPlane {
                     "control-plane store refresh failed; keeping the last published snapshot"
                 );
             }
+        }
+    }
+
+    /// WP-61's replica-to-replica propagation step: reads ONLY the
+    /// generation stamp, and does the full `load()` + republish (identical to
+    /// [`Self::rebuild`]) ONLY if it moved since the last successful poll or
+    /// rebuild. Returns `Ok(true)` if a rebuild happened, `Ok(false)` if the
+    /// stamp was unchanged.
+    ///
+    /// An unchanged stamp still means this replica IS reconciled as of now --
+    /// it just confirmed the store agrees with what it already has -- so
+    /// `last_reconciled_at` advances either way on success. See
+    /// [`Self::snapshot_age`].
+    ///
+    /// On a stamp-read failure, propagates `Err` and touches neither
+    /// `published` nor `last_reconciled_at` -- same fail-closed-on-the-
+    /// snapshot, loud-on-the-log shape as [`Self::rebuild`]'s `Err` arm; the
+    /// caller (the policy-poller thread) is what logs it, so the staleness
+    /// warning's suppression state lives with the thread, not here.
+    pub fn poll_once(&self) -> Result<bool, StoreError> {
+        let generation = self.store.policy_generation()?;
+        let previous = *self
+            .last_generation
+            .lock()
+            .expect("control plane mutex poisoned");
+        if previous == Some(generation) {
+            *self
+                .last_reconciled_at
+                .lock()
+                .expect("control plane mutex poisoned") = Instant::now();
+            return Ok(false);
+        }
+        let loaded = self.store.load()?;
+        let snapshot = Self::merge(&self.bootstrap_keys, loaded);
+        self.published.store(Arc::new(snapshot));
+        *self
+            .last_generation
+            .lock()
+            .expect("control plane mutex poisoned") = Some(generation);
+        *self
+            .last_reconciled_at
+            .lock()
+            .expect("control plane mutex poisoned") = Instant::now();
+        Ok(true)
+    }
+
+    /// How long since this replica's snapshot was last confirmed to match
+    /// the store -- either a successful [`Self::poll_once`] (moved or not)
+    /// or [`Self::rebuild`]. This is the raw number; the Prometheus
+    /// `spend_reconciliation_age_seconds` gauge (ADR-0006 §5) that exports it
+    /// lands with WP-62 -- this accessor, plus the policy poller's own
+    /// staleness warning (see [`Self::start_policy_poller`]), is WP-61's half
+    /// of that observability requirement.
+    pub fn snapshot_age(&self) -> Duration {
+        self.last_reconciled_at
+            .lock()
+            .expect("control plane mutex poisoned")
+            .elapsed()
+    }
+
+    /// Starts the background policy-poller thread, ticking roughly every
+    /// `interval` (jittered -- see below). See the module's `PollShutdown`/
+    /// `PolicyPoller` doc for the shutdown shape, which mirrors
+    /// `spend.rs`'s flusher.
+    ///
+    /// Runs UNCONDITIONALLY -- there is no "single replica, skip polling"
+    /// shortcut, including for [`InMemoryControlPlaneStore`]. ADR-0006 §6:
+    /// the embedded store implements the identical contract on purpose, and
+    /// polling against it is nearly free, so the multi-replica code path is
+    /// exercised in every deployment rather than only ever executing for the
+    /// first time in production.
+    ///
+    /// Calling this twice cleanly shuts down and joins the previous thread
+    /// first, same as `spend.rs`'s `start_flusher`.
+    pub fn start_policy_poller(self: &Arc<Self>, interval: Duration) {
+        self.stop_poller_if_running();
+
+        let shutdown = Arc::new(PollShutdown {
+            stop: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        // Rust note: the thread holds a `Weak<ControlPlane>`, NOT an `Arc`.
+        // `Drop for ControlPlane` is what stops this thread, but `Drop` only
+        // runs once the LAST `Arc<ControlPlane>` is dropped -- if the thread
+        // itself held a strong `Arc`, it would BE that last reference, so
+        // `Drop` (and therefore the thread's own stop signal) could never
+        // fire. The thread upgrades the `Weak` once per tick and returns as
+        // soon as that upgrade yields `None`, which is how it notices its
+        // owner is gone with no `Arc` cycle to break.
+        let weak = Arc::downgrade(self);
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join = std::thread::Builder::new()
+            .name("policy-poller".to_string())
+            .spawn(move || run_policy_poller(weak, thread_shutdown, interval))
+            .expect("spawning the policy poller thread must not fail");
+
+        *self.poller.lock().expect("control plane mutex poisoned") =
+            Some(PolicyPoller { shutdown, join });
+    }
+
+    /// Signals and joins a currently-running policy-poller thread, if any --
+    /// shared by [`Self::start_policy_poller`] (replacing a previous thread)
+    /// and `Drop` (shutting down for good). Mirrors `spend.rs`'s
+    /// `stop_flusher_if_running`.
+    fn stop_poller_if_running(&self) {
+        let poller = self
+            .poller
+            .lock()
+            .expect("control plane mutex poisoned")
+            .take();
+        if let Some(poller) = poller {
+            *poller
+                .shutdown
+                .stop
+                .lock()
+                .expect("policy poller shutdown mutex poisoned") = true;
+            poller.shutdown.cv.notify_all();
+            // Rust note: DO NOT join if we ARE the poller thread. That is
+            // reachable, and it is the one sharp edge of the `Weak` design:
+            // the thread upgrades its `Weak` once per tick, so if the last
+            // external `Arc<ControlPlane>` is dropped DURING a tick, the
+            // thread's own upgraded `Arc` becomes the last strong reference,
+            // and dropping it at the end of the tick runs `Drop for
+            // ControlPlane` on the poller thread itself. `pthread_join` on
+            // the calling thread returns `EDEADLK`, which std turns into a
+            // panic inside a `Drop` -- so check first. Setting the stop flag
+            // above is all this case needs anyway: the thread is provably
+            // alive and about to re-lock, see the flag, and return.
+            if std::thread::current().id() == poller.join.thread().id() {
+                return;
+            }
+            // Rust note: ignoring the `Result` matches `stop_flusher_if_
+            // running`'s own note -- `.join()` only errors if the thread
+            // panicked, and that should surface via the usual panic
+            // machinery, not be swallowed here.
+            let _ = poller.join.join();
         }
     }
 
@@ -1348,6 +1684,124 @@ impl ControlPlane {
     }
 }
 
+impl Drop for ControlPlane {
+    /// Shuts the policy-poller thread down, if one was started -- mirrors
+    /// `SpendAccumulator`'s `Drop`, minus the final flush: there is nothing
+    /// for a poller to flush, only a read loop to stop.
+    fn drop(&mut self) {
+        self.stop_poller_if_running();
+    }
+}
+
+/// The policy-poller thread's body. Same `Condvar::wait_timeout` loop shape
+/// as `spend.rs`'s `run_flusher` -- wakes immediately on shutdown, otherwise
+/// wakes once per (jittered) interval, releases the shutdown lock before any
+/// store I/O, and loops back around on a spurious wakeup.
+///
+/// Rust note: `control` is a `Weak<ControlPlane>`, upgraded once per tick.
+/// `None` means the owning `ControlPlane` (and therefore every strong `Arc`
+/// to it) is gone, which is this thread's own signal to return -- see
+/// [`ControlPlane::start_policy_poller`]'s doc for why it cannot hold a
+/// strong `Arc` itself.
+fn run_policy_poller(control: Weak<ControlPlane>, shutdown: Arc<PollShutdown>, interval: Duration) {
+    // CLAUDE.md rule 17: a control that degrades must be loud, but a poller
+    // ticking every tens of seconds must not re-warn every tick while the
+    // store stays down -- that turns the log itself into the incident. These
+    // two fields, private to this one thread, are the suppression state:
+    // warn on the FIRST failure since the last success, or once `last_warn`
+    // is at least ten intervals old, whichever comes first.
+    let mut last_warn: Option<Instant> = None;
+    let mut warned_since_success = false;
+
+    let mut guard = shutdown
+        .stop
+        .lock()
+        .expect("policy poller shutdown mutex poisoned");
+    loop {
+        if *guard {
+            return;
+        }
+        let wait_for = next_poll_delay(interval);
+        let (new_guard, wait_result) = shutdown
+            .cv
+            .wait_timeout(guard, wait_for)
+            .expect("policy poller shutdown condvar poisoned");
+        guard = new_guard;
+        if *guard {
+            return;
+        }
+        if wait_result.timed_out() {
+            // Release the shutdown lock before store I/O -- a concurrent
+            // shutdown request must never wait on this tick's poll to finish
+            // before it can even set the flag.
+            drop(guard);
+
+            // The owning `ControlPlane` (and every strong `Arc` to it) is
+            // gone -- nothing left to poll for, so stop.
+            let Some(cp) = control.upgrade() else {
+                return;
+            };
+            let bound = interval + interval / 4;
+            match cp.poll_once() {
+                Ok(_rebuilt) => {
+                    warned_since_success = false;
+                }
+                Err(err) => {
+                    let snapshot_age = cp.snapshot_age();
+                    let should_warn = !warned_since_success
+                        || last_warn.is_none_or(|at| at.elapsed() >= interval * 10);
+                    if should_warn {
+                        tracing::warn!(
+                            error = %err,
+                            snapshot_age_seconds = snapshot_age.as_secs_f64(),
+                            bound_seconds = bound.as_secs_f64(),
+                            stale = snapshot_age > bound,
+                            "control-plane policy poll failed; serving a stale snapshot"
+                        );
+                        last_warn = Some(Instant::now());
+                        warned_since_success = true;
+                    }
+                }
+            }
+            // `cp` is dropped here, at the end of the tick -- holding it any
+            // longer than one tick's work would be a strong reference this
+            // thread has no business keeping.
+            drop(cp);
+
+            guard = shutdown
+                .stop
+                .lock()
+                .expect("policy poller shutdown mutex poisoned");
+        }
+        // A spurious wakeup with neither shutdown signalled nor a timeout:
+        // loop and wait again.
+    }
+}
+
+/// `interval` plus a uniform-random draw in `[0, interval / 4)` -- the same
+/// shape as `proxy-cluster::health_check`'s `next_delay`, adapted to a fixed
+/// quarter-of-interval jitter rather than a separately configured one: N
+/// replicas that all observed the same generation bump at nearly the same
+/// instant must not all rebuild at the same instant too, or the store sees a
+/// synchronized load spike every time anything changes instead of one read
+/// spread out across up to `interval / 4`.
+///
+/// Rust note: a fresh `rand::thread_rng()` per call, not a stored
+/// `Mutex<StdRng>` -- this runs on its own thread with no shared state to
+/// protect, so (as `next_delay`'s own note says) there is nothing to guard.
+fn next_poll_delay(interval: Duration) -> Duration {
+    let jitter = interval / 4;
+    let jitter_nanos = jitter.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if jitter_nanos == 0 {
+        // Guard against an empty `gen_range` -- an `interval` under 4ns
+        // (never a real config, but not this function's job to assume) would
+        // otherwise panic rather than simply skip the jitter.
+        return interval;
+    }
+    let extra = rand::thread_rng().gen_range(0..jitter_nanos);
+    interval + Duration::from_nanos(extra)
+}
+
 /// Test helper shared across this crate's test modules (`auth.rs`,
 /// `auth_filter.rs`): wraps a fixed [`KeySet`] (no policies) in a fresh
 /// handle that is never [`ControlPlane::rebuild`]-ed. Every filter-behavior
@@ -1365,7 +1819,7 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use http::header::AUTHORIZATION;
     use http::{HeaderMap, HeaderValue};
@@ -1396,6 +1850,9 @@ mod tests {
     impl ControlPlaneStore for SharedStore {
         fn load(&self) -> Result<StoredControlPlane, StoreError> {
             self.0.load()
+        }
+        fn policy_generation(&self) -> Result<u64, StoreError> {
+            self.0.policy_generation()
         }
         fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
             self.0.create_tenant(tenant)
@@ -1440,18 +1897,31 @@ mod tests {
 
     /// A store whose `load` can be toggled to fail on command, via a shared
     /// flag the test keeps a handle to -- proves the fail-closed REFRESH path
-    /// (as opposed to boot, which `FailingStore` below covers).
+    /// (as opposed to boot, which `FailingStore` below covers). Also counts
+    /// `load()` calls (WP-61: `load_calls`, `Arc<AtomicUsize>` so a test keeps
+    /// a handle after the store moves into a `ControlPlane`) -- used by
+    /// `a_generation_that_has_not_moved_does_no_load_work` to prove
+    /// `poll_once` skips `load()` entirely when the stamp is unchanged, per
+    /// this struct's spec rather than a second, near-identical double.
     struct ToggleStore {
         inner: InMemoryControlPlaneStore,
         fail: Arc<AtomicBool>,
+        load_calls: Arc<AtomicUsize>,
     }
 
     impl ControlPlaneStore for ToggleStore {
         fn load(&self) -> Result<StoredControlPlane, StoreError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err(StoreError::Unavailable("toggled off for test".to_string()));
             }
             self.inner.load()
+        }
+        fn policy_generation(&self) -> Result<u64, StoreError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(StoreError::Unavailable("toggled off for test".to_string()));
+            }
+            self.inner.policy_generation()
         }
         fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
             self.inner.create_tenant(tenant)
@@ -1502,6 +1972,11 @@ mod tests {
 
     impl ControlPlaneStore for FailingStore {
         fn load(&self) -> Result<StoredControlPlane, StoreError> {
+            Err(StoreError::Unavailable(
+                "test double: load always fails".to_string(),
+            ))
+        }
+        fn policy_generation(&self) -> Result<u64, StoreError> {
             Err(StoreError::Unavailable(
                 "test double: load always fails".to_string(),
             ))
@@ -1767,6 +2242,7 @@ mod tests {
         let store = ToggleStore {
             inner,
             fail: Arc::clone(&fail_flag),
+            load_calls: Arc::new(AtomicUsize::new(0)),
         };
 
         let cp = ControlPlane::new(
@@ -2831,5 +3307,386 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- WP-61: policy propagation by version-stamp polling ------------------
+
+    // --- the acceptance criterion itself: two `ControlPlane`s over one store,
+    //     one revokes, the other picks it up via `poll_once` -- no shared
+    //     `rebuild()` call between them, only the store and the stamp.
+
+    #[test]
+    fn a_revocation_on_one_control_plane_reaches_another_sharing_the_store() {
+        let secret_bytes = b"operator-secret";
+        let shared = Arc::new(InMemoryControlPlaneStore::default());
+        let cp_a = ControlPlane::new(
+            Box::new(SharedStore(Arc::clone(&shared))),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+        let cp_b = ControlPlane::new(
+            Box::new(SharedStore(Arc::clone(&shared))),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let minted = cp_a
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .expect("mint_key must succeed against a healthy store");
+        let authenticator_b =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp_b.handle());
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+
+        // `cp_b` booted before the mint, so its own poll must pick the new
+        // key up before it can even see it -- this also proves `poll_once`
+        // itself does the rebuild, not just `mint_key`'s own `rebuild()` on
+        // `cp_a`.
+        assert_eq!(
+            cp_b.poll_once(),
+            Ok(true),
+            "a moved generation must trigger a rebuild and report it"
+        );
+        assert!(
+            matches!(
+                authenticator_b.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ),
+            "cp_b must see the key cp_a minted, once polled"
+        );
+
+        // The revocation itself -- written on `cp_a`, never `rebuild()`-ed on
+        // `cp_b` directly. Only `poll_once` closes the gap.
+        cp_a.revoke_key(&KeyId::new("k1"))
+            .expect("revoke must succeed");
+
+        assert_eq!(
+            cp_b.poll_once(),
+            Ok(true),
+            "the revocation bumped the generation again; poll_once must rebuild once more"
+        );
+        match authenticator_b.authenticate(&headers) {
+            AuthOutcome::Rejected(AuthError::RevokedKey) => {}
+            other => panic!(
+                "a key revoked on cp_a must stop authenticating on cp_b after poll_once; \
+                 got Authenticated={}",
+                matches!(other, AuthOutcome::Authenticated(_))
+            ),
+        }
+    }
+
+    // --- a failed poll must leave the published snapshot untouched (same
+    //     fail-closed contract as `rebuild`) and must not reset the
+    //     reconciliation clock `snapshot_age` reports.
+
+    #[test]
+    fn a_failed_poll_leaves_the_published_snapshot_intact_and_ages_it() {
+        let secret_bytes = b"operator-secret";
+        let fail_flag = Arc::new(AtomicBool::new(false));
+        let inner = InMemoryControlPlaneStore::default();
+        inner
+            .put_key(&StoredKey {
+                key_id: KeyId::new("k1"),
+                digest: digest_bytes(secret_bytes, "llmp_still-good-key"),
+                tenant: TenantId::new("tenant-a"),
+                revoked: false,
+            })
+            .unwrap();
+        let store = ToggleStore {
+            inner,
+            fail: Arc::clone(&fail_flag),
+            load_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let cp = ControlPlane::new(
+            Box::new(store),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("boot must succeed while the store is healthy");
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+        let headers = headers_with_authorization("Bearer llmp_still-good-key");
+
+        // Let the snapshot visibly age BEFORE sampling the baseline: sampling
+        // it at t=0 would make the final assertion pass even if the failed
+        // poll reset the clock, because both readings would be microseconds.
+        std::thread::sleep(Duration::from_millis(20));
+        let age_before = cp.snapshot_age();
+
+        fail_flag.store(true, Ordering::SeqCst);
+        assert!(
+            cp.poll_once().is_err(),
+            "a stamp read against a failing store must propagate Err"
+        );
+
+        assert!(
+            matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ),
+            "a failed poll must keep the last published snapshot, not wipe it"
+        );
+        assert!(
+            cp.snapshot_age() >= age_before,
+            "a failed poll must not reset last_reconciled_at -- the snapshot is getting \
+             staler, not fresher, while the store is down"
+        );
+    }
+
+    // --- an unmoved generation must skip `load()` entirely -- the whole
+    //     point of polling the stamp instead of re-reading everything.
+
+    #[test]
+    fn a_generation_that_has_not_moved_does_no_load_work() {
+        let secret_bytes = b"operator-secret";
+        let load_calls = Arc::new(AtomicUsize::new(0));
+        let store = ToggleStore {
+            inner: InMemoryControlPlaneStore::default(),
+            fail: Arc::new(AtomicBool::new(false)),
+            load_calls: Arc::clone(&load_calls),
+        };
+        let cp = ControlPlane::new(
+            Box::new(store),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let calls_after_boot = load_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            calls_after_boot, 1,
+            "ControlPlane::new must load() exactly once at boot"
+        );
+
+        assert_eq!(
+            cp.poll_once(),
+            Ok(false),
+            "nothing wrote to the store since boot -- the generation has not moved"
+        );
+        assert_eq!(
+            load_calls.load(Ordering::SeqCst),
+            calls_after_boot,
+            "poll_once must not call load() when the generation stamp is unchanged"
+        );
+    }
+
+    // --- every tier-2 write bumps InMemoryControlPlaneStore's generation;
+    //     set_spend (tier-3) and a revoke of an unknown key (nothing written)
+    //     must not.
+
+    #[test]
+    fn every_tier_two_write_bumps_the_generation_and_a_spend_write_does_not() {
+        let store = InMemoryControlPlaneStore::default();
+        assert_eq!(store.policy_generation().unwrap(), 0);
+
+        let tenant = TenantId::new("tenant-a");
+        let mut expected = 0u64;
+
+        store.create_tenant(&tenant).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        store
+            .put_key(&StoredKey {
+                key_id: KeyId::new("k1"),
+                digest: digest_bytes(b"secret", "llmp_a"),
+                tenant: tenant.clone(),
+                revoked: false,
+            })
+            .unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        store.set_policy(&tenant, &ModelAccess::All).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(1_000_000),
+            period: Period::Monthly,
+        };
+        store.set_budget(&tenant, Some(&budget)).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        store.revoke_key(&KeyId::new("k1")).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        // Revoking an UNKNOWN key writes nothing -- must not bump.
+        assert!(matches!(
+            store.revoke_key(&KeyId::new("no-such-key")),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            store.policy_generation().unwrap(),
+            expected,
+            "a NotFound revoke wrote nothing and must not bump the generation"
+        );
+
+        // set_spend is tier-3, not tier-2 -- must never bump.
+        store
+            .set_spend(
+                "chain-a",
+                &tenant,
+                &PeriodKey::for_test("2026-09"),
+                5_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store.policy_generation().unwrap(),
+            expected,
+            "set_spend is a tier-3 write and must never bump the tier-2 policy generation"
+        );
+
+        store.delete_tenant(&tenant).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+    }
+
+    // --- same contract, against RedbControlPlaneStore -- proves the bump is
+    //     inside the SAME write transaction as the accompanying write, not a
+    //     separately committed (and therefore possibly torn) step.
+
+    #[test]
+    fn redb_bumps_the_generation_on_tier_two_writes_only() {
+        let path = temp_db_path("generation-bumps");
+        let store = RedbControlPlaneStore::open(&path).unwrap();
+        assert_eq!(store.policy_generation().unwrap(), 0);
+
+        let tenant = TenantId::new("tenant-a");
+        let mut expected = 0u64;
+
+        store.create_tenant(&tenant).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        store
+            .put_key(&StoredKey {
+                key_id: KeyId::new("k1"),
+                digest: digest_bytes(b"secret", "llmp_a"),
+                tenant: tenant.clone(),
+                revoked: false,
+            })
+            .unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        store.set_policy(&tenant, &ModelAccess::All).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(1_000_000),
+            period: Period::Monthly,
+        };
+        store.set_budget(&tenant, Some(&budget)).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        store.revoke_key(&KeyId::new("k1")).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        assert!(matches!(
+            store.revoke_key(&KeyId::new("no-such-key")),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        store
+            .set_spend(
+                "chain-a",
+                &tenant,
+                &PeriodKey::for_test("2026-09"),
+                5_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store.policy_generation().unwrap(),
+            expected,
+            "set_spend must not bump the redb-backed generation either"
+        );
+
+        store.delete_tenant(&tenant).unwrap();
+        expected += 1;
+        assert_eq!(store.policy_generation().unwrap(), expected);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- the poller thread itself, not just poll_once -- proves
+    //     start_policy_poller actually drives poll_once on a timer and picks
+    //     up a revocation with no test code calling poll_once directly.
+    //     Bounded: polls a condition in a loop with a hard deadline rather
+    //     than an unbounded sleep, so a regression fails fast instead of
+    //     hanging out nextest's `terminate-after`.
+
+    #[test]
+    fn the_policy_poller_thread_picks_up_a_revocation_on_its_own() {
+        let secret_bytes = b"operator-secret";
+        let shared = Arc::new(InMemoryControlPlaneStore::default());
+        let cp_a = Arc::new(
+            ControlPlane::new(
+                Box::new(SharedStore(Arc::clone(&shared))),
+                HmacSecret::new(secret_bytes),
+                KeySet::new(),
+            )
+            .expect("empty store must not fail boot"),
+        );
+        let cp_b = Arc::new(
+            ControlPlane::new(
+                Box::new(SharedStore(Arc::clone(&shared))),
+                HmacSecret::new(secret_bytes),
+                KeySet::new(),
+            )
+            .expect("empty store must not fail boot"),
+        );
+
+        let minted = cp_a
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .expect("mint_key must succeed against a healthy store");
+        let authenticator_b =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp_b.handle());
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+
+        // A short interval -- this test's own bound is a small multiple of
+        // it, not the real 48s default (see `parse_poll_interval`'s doc).
+        cp_b.start_policy_poller(Duration::from_millis(20));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(
+                authenticator_b.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the policy poller must pick up cp_a's mint within the test's bound"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        cp_a.revoke_key(&KeyId::new("k1"))
+            .expect("revoke must succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(
+                authenticator_b.authenticate(&headers),
+                AuthOutcome::Rejected(AuthError::RevokedKey)
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the policy poller must pick up cp_a's revoke within the test's bound, with \
+                 no test code calling poll_once directly"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

@@ -1780,6 +1780,9 @@ mod tests {
             fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
                 self.0.load()
             }
+            fn policy_generation(&self) -> Result<u64, StoreError> {
+                self.0.policy_generation()
+            }
             fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
                 self.0.create_tenant(tenant)
             }
@@ -2038,6 +2041,9 @@ mod tests {
     impl ControlPlaneStore for AlwaysFailsSetSpend {
         fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
             self.0.load()
+        }
+        fn policy_generation(&self) -> Result<u64, StoreError> {
+            self.0.policy_generation()
         }
         fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
             self.0.create_tenant(tenant)

@@ -45,6 +45,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use http::header::WWW_AUTHENTICATE;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -211,21 +212,56 @@ fn parse_store(config: &DynamicMessage) -> Result<StoreSpec, ConfigError> {
     }
 }
 
+/// Reads `typed_config.poll_interval_seconds` -- `0` (proto3's implicit
+/// default for an unset `uint32`) means "use the built-in 48-second default",
+/// per the proto's own doc. Modeled exactly on `spend_limit_filter`'s
+/// `parse_flush_interval`, with one difference worth stating: THIS knob is a
+/// correctness bound, not just a durability one (see the proto doc) -- 48
+/// seconds, jittered by up to a quarter, is where the owner's "a revoked key
+/// stops working within 60 seconds" bound comes from
+/// (`48 * 1.25 == 60`).
+fn parse_poll_interval(config: &DynamicMessage) -> Duration {
+    let secs = config
+        .get_field_by_name("poll_interval_seconds")
+        .and_then(|v| v.as_u32())
+        .unwrap_or(0);
+    if secs == 0 {
+        Duration::from_secs(48)
+    } else {
+        Duration::from_secs(u64::from(secs))
+    }
+}
+
+/// [`parse_config`]'s return value -- a named struct rather than a growing
+/// tuple, purely to keep clippy's `type_complexity` quiet as WP-61 added a
+/// fourth field; see each field's doc (mirroring [`parse_config`]'s own) for
+/// why every one of these crosses this boundary in this particular shape.
+#[derive(Debug)]
+struct AuthConfig {
+    /// Raw secret **bytes**, not an [`HmacSecret`] -- as of WP-50 increment
+    /// 3b-i, [`AuthFilterFactory::create`] needs TWO independent
+    /// `HmacSecret`s from the same bytes (one for the request-time
+    /// authenticator, one retained by [`crate::control::ControlPlane`] for a
+    /// future key-mint endpoint), and `HmacSecret` deliberately has no
+    /// accessor back to its bytes once constructed (see its doc) -- so the
+    /// bytes have to be the thing that crosses this boundary, and each
+    /// caller constructs its own `HmacSecret`.
+    secret_bytes: Vec<u8>,
+    bootstrap_keys: KeySet,
+    store_spec: StoreSpec,
+    /// WP-61: how often the policy poller re-checks the store's generation
+    /// stamp -- see [`parse_poll_interval`].
+    poll_interval: Duration,
+}
+
 /// Reads `typed_config` (an `llmproxy.filters.v0.Authentication`) into the
-/// secret bytes + bootstrap key set + store selection the filter needs at
-/// request time. Strict mode: every field either maps in or errors with its
-/// dotted path (ground rule #1).
-///
-/// Returns raw secret **bytes**, not an [`HmacSecret`] -- as of WP-50
-/// increment 3b-i, [`AuthFilterFactory::create`] needs TWO independent
-/// `HmacSecret`s from the same bytes (one for the request-time authenticator,
-/// one retained by [`crate::control::ControlPlane`] for a future key-mint
-/// endpoint), and `HmacSecret` deliberately has no accessor back to its bytes
-/// once constructed (see its doc) -- so the bytes have to be the thing that
-/// crosses this boundary, and each caller constructs its own `HmacSecret`.
-fn parse_config(config: &DynamicMessage) -> Result<(Vec<u8>, KeySet, StoreSpec), ConfigError> {
+/// secret bytes + bootstrap key set + store selection + poll interval the
+/// filter needs at request time. Strict mode: every field either maps in or
+/// errors with its dotted path (ground rule #1).
+fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     let secret_bytes = parse_hmac_secret(config)?;
     let store_spec = parse_store(config)?;
+    let poll_interval = parse_poll_interval(config);
 
     let mut key_set = KeySet::new();
     // Rust note: `HashMap<String, usize>` / `HashMap<Vec<u8>, usize>` remember
@@ -313,7 +349,12 @@ fn parse_config(config: &DynamicMessage) -> Result<(Vec<u8>, KeySet, StoreSpec),
         );
     }
 
-    Ok((secret_bytes, key_set, store_spec))
+    Ok(AuthConfig {
+        secret_bytes,
+        bootstrap_keys: key_set,
+        store_spec,
+        poll_interval,
+    })
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override —
@@ -332,7 +373,12 @@ impl HttpFilterFactory for AuthFilterFactory {
         config: &DynamicMessage,
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let (secret_bytes, bootstrap_keys, store_spec) = parse_config(config)?;
+        let AuthConfig {
+            secret_bytes,
+            bootstrap_keys,
+            store_spec,
+            poll_interval,
+        } = parse_config(config)?;
 
         // WP-50 increment 3b-ii, part B: the `ControlPlane` is now the ONE
         // per-serve instance shared across every worker BUILDING THIS SAME
@@ -397,7 +443,23 @@ impl HttpFilterFactory for AuthFilterFactory {
                         format!("control-plane snapshot could not be built: {e}"),
                     )
                 })?;
-                Ok(Arc::new(cp) as Arc<dyn std::any::Any + Send + Sync>)
+                // WP-61: start the policy poller HERE, not in `main.rs` --
+                // `main.rs` never holds a `ControlPlane` handle at all (this
+                // `get_or_try_init` closure is the one place a fresh
+                // `ControlPlane` gets built, per (scope, TYPE_URL) singleton,
+                // for the whole serve), and `start_policy_poller` needs an
+                // `Arc<ControlPlane>` to hand its background thread a `Weak`
+                // -- so `cp` is wrapped in `Arc` here, one line earlier than
+                // it otherwise would be, purely to make that call possible.
+                //
+                // Same per-serve-pinning caveat as the store and the secret
+                // above: because this slot is built once and reused across a
+                // SIGHUP reload, changing `poll_interval_seconds` and
+                // reloading does NOT restart the poller with the new
+                // interval -- that takes a restart, same as `typed_config.store`.
+                let cp = Arc::new(cp);
+                cp.start_policy_poller(poll_interval);
+                Ok(cp as Arc<dyn std::any::Any + Send + Sync>)
             })?
             .downcast::<ControlPlane>()
             .expect("auth control-plane singleton is always a ControlPlane");
@@ -694,6 +756,24 @@ mod tests {
 
     // --- config parsing ---------------------------------------------------------
 
+    // WP-61: the poll interval is the revocation bound, so pin both ends of
+    // it -- the unset/`0` default AND an explicit value. `48 * 1.25 == 60`
+    // is the owner's stated "a revoked key stops working within 60 seconds";
+    // if the default here ever moves, that sentence moves with it.
+    #[test]
+    fn an_unset_poll_interval_falls_back_to_the_48_second_default() {
+        let config = authentication(inline_secret("secret"), vec![]);
+        assert_eq!(
+            parse_poll_interval(&config),
+            Duration::from_secs(48),
+            "an unset poll_interval_seconds must mean the built-in default, not zero"
+        );
+
+        let mut explicit = authentication(inline_secret("secret"), vec![]);
+        explicit.set_field_by_name("poll_interval_seconds", prost_reflect::Value::U32(90));
+        assert_eq!(parse_poll_interval(&explicit), Duration::from_secs(90));
+    }
+
     // 1: valid config parses AND the resulting filter authenticates a key
     // built with that same secret, end to end through `parse_config`.
     #[test]
@@ -705,8 +785,11 @@ mod tests {
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
 
-        let (secret_bytes, key_set, _store_spec) =
-            parse_config(&config).expect("valid config must parse");
+        let AuthConfig {
+            secret_bytes,
+            bootstrap_keys: key_set,
+            ..
+        } = parse_config(&config).expect("valid config must parse");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             test_snapshot_handle(key_set),
@@ -780,8 +863,11 @@ mod tests {
             filename_secret(&path),
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
-        let (secret_bytes, key_set, _store_spec) =
-            parse_config(&config).expect("valid filename config must parse");
+        let AuthConfig {
+            secret_bytes,
+            bootstrap_keys: key_set,
+            ..
+        } = parse_config(&config).expect("valid filename config must parse");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             test_snapshot_handle(key_set),
@@ -839,8 +925,11 @@ mod tests {
             filename_secret(&path),
             vec![virtual_key("key-1", "tenant-a", &digest, false)],
         );
-        let (secret_bytes, key_set, _store_spec) =
-            parse_config(&config).expect("valid filename config must parse");
+        let AuthConfig {
+            secret_bytes,
+            bootstrap_keys: key_set,
+            ..
+        } = parse_config(&config).expect("valid filename config must parse");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             test_snapshot_handle(key_set),
@@ -975,8 +1064,11 @@ mod tests {
     #[test]
     fn empty_virtual_keys_parses_and_the_filter_401s_every_key() {
         let config = authentication(inline_secret("secret"), vec![]);
-        let (secret_bytes, key_set, _store_spec) =
-            parse_config(&config).expect("empty virtual_keys is legal");
+        let AuthConfig {
+            secret_bytes,
+            bootstrap_keys: key_set,
+            ..
+        } = parse_config(&config).expect("empty virtual_keys is legal");
         let authenticator = VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             test_snapshot_handle(key_set),

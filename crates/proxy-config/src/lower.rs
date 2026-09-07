@@ -384,7 +384,24 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // entry here would be accepted and ignored, which is ground rule #1's
         // exact failure mode arriving from our own change rather than an Envoy
         // bump.
-        "llmproxy.filters.v0.Authentication" => &["hmac_secret", "virtual_keys"],
+        // WP-61: `store` is a `oneof` -- its members (`in_memory`,
+        // `persistent`) appear here under their OWN field names, not under
+        // the oneof's Rust-level name ("store"), because that is how
+        // `check_supported_surface` walks a `oneof` (it sees whichever
+        // variant is actually set, by that variant's field name). Before
+        // this fix, both were absent, so any config that set `persistent`
+        // was rejected by this surface walk with `UnsupportedField` --
+        // making the redb-backed store unreachable through Envoy-mode config
+        // even though `auth_filter::parse_store` fully supported it. The
+        // NEXT `store` variant added must be listed here too, or it repeats
+        // this exact bug.
+        "llmproxy.filters.v0.Authentication" => &[
+            "hmac_secret",
+            "virtual_keys",
+            "in_memory",
+            "persistent",
+            "poll_interval_seconds",
+        ],
         "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
         // Only the `io.llmproxy.provider_auth` namespace under
         // `filter_metadata` is understood -- see

@@ -53,6 +53,11 @@ chrono = { workspace = true }
 # (`DecodingKey::from_rsa_raw_components`), never from a PEM file, so
 # `pem`/`simple_asn1` would be dead weight.
 jsonwebtoken = { version = "9", default-features = false }
+# WP-61: jitters the policy-poller's interval so N replicas observing the
+# same generation bump do not all rebuild at once -- see
+# `control.rs::ControlPlane::start_policy_poller`, modeled on
+# `proxy-cluster::health_check`'s `next_delay`.
+rand = { workspace = true }
 
 [dev-dependencies]
 proxy-api = { workspace = true }

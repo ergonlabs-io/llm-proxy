@@ -1605,6 +1605,7 @@ dependencies = [
  "proxy-config",
  "proxy-http",
  "proxy-observability",
+ "rand",
  "redb",
  "ring",
  "rsa",

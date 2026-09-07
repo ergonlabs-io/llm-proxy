@@ -80,6 +80,19 @@ message Authentication {
     InMemoryStore in_memory = 3;
     PersistentStore persistent = 4;
   }
+
+  // How often this replica polls the store's policy generation stamp (tenant,
+  // key, and budget writes -- see `ControlPlaneStore::policy_generation`), in
+  // seconds. `0` (proto3's implicit default for an unset `uint32`) means "use
+  // the built-in default of 48 seconds".
+  //
+  // Unlike `flush_interval_seconds` on `SpendLimit`, this IS a correctness
+  // knob, not just a durability one: it is the propagation bound of a
+  // security control. The interval is jittered by up to a quarter of itself
+  // so that N replicas observing the same write do not all rebuild at once
+  // (ADR-0006 §3) -- and that means **a revoked key stops working within
+  // `poll_interval_seconds` × 1.25, which is 60 seconds at the default.**
+  uint32 poll_interval_seconds = 5;
 }
 
 // Keeps every minted key, revocation, and tenant policy only in process
