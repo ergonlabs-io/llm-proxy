@@ -23,6 +23,7 @@ use proxy_xds::{
 
 const CDS: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 const RDS: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
+const EDS: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 
 /// Generous bound on the whole test, not a single round-trip: this suite
 /// polls the harness's `RequestLog` rather than reading the client's own
@@ -753,6 +754,106 @@ async fn the_ack_does_not_reach_the_wire_until_the_handler_future_resolves() {
         RequestKind::Ack,
         "expected an ACK once the handler resolved, got {:?}",
         log[1]
+    );
+
+    run.abort();
+    harness.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// WP-21 increment 2b-ii: `ResponseHandler::desired_names` driving a follow-up
+// request.
+// ---------------------------------------------------------------------------
+
+/// Always accepts, and reports a fixed name set for one `type_url` via
+/// `desired_names` -- the minimal handler needed to drive `run_once`'s
+/// follow-up-request behavior without pulling `ResourceApplier`
+/// (`proxy-config`'s edge) into this transport-only test file; `apply.rs`'s
+/// own tests already cover that `ResourceApplier::desired_names` derives the
+/// real EDS name set correctly.
+struct FixedNamesHandler {
+    for_type_url: &'static str,
+    names: BTreeSet<String>,
+}
+
+impl ResponseHandler for FixedNamesHandler {
+    fn handle(
+        &mut self,
+        _resp: &DiscoveryResponse,
+    ) -> impl std::future::Future<Output = Verdict> + Send {
+        std::future::ready(Verdict::Accept)
+    }
+
+    fn desired_names(&self, type_url: &str) -> Option<BTreeSet<String>> {
+        if type_url == self.for_type_url {
+            Some(self.names.clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// This increment's acceptance claim: a `SubscriptionState::set_names` change
+/// -- driven here by the handler reporting a wider EDS name set once it has
+/// handled a response -- causes a follow-up `DiscoveryRequest` on the same
+/// stream, and the ACK for the response that triggered it goes out FIRST.
+///
+/// EDS starts subscribed to no names (the ordinary state before any CDS
+/// response has named an EDS cluster), so it is skipped at stream open --
+/// same fixture as `empty_name_subscription_is_never_requested`. Only once
+/// the (unrelated, in this test) CDS response has been handled does the
+/// handler start reporting `{"my-cluster"}` for EDS, which is what makes the
+/// follow-up request distinguishable from an initial one sent at stream open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_desired_names_change_sends_a_follow_up_request_after_the_triggering_ack() {
+    let harness = Harness::spawn(vec![Step::Send {
+        type_url: CDS.to_string(),
+        version_info: "v1".to_string(),
+        nonce: "n1".to_string(),
+        resources: vec![],
+    }])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![
+        SubscriptionState::new(CDS, Subscription::Wildcard),
+        SubscriptionState::new(EDS, Subscription::Names(BTreeSet::new())),
+    ]);
+    let mut handler = FixedNamesHandler {
+        for_type_url: EDS,
+        names: BTreeSet::from(["my-cluster".to_string()]),
+    };
+    let run = tokio::spawn(async move { ads.run_once(&mut client, &mut handler).await });
+
+    // [0] CDS initial (EDS has nothing to request yet), [1] CDS ACK of v1,
+    // [2] the EDS follow-up request `desired_names` triggers.
+    wait_for_log_len(&harness.log, 3).await;
+
+    let log = harness.log.snapshot();
+    assert!(
+        log.iter().all(|r| r.type_url == CDS || r.type_url == EDS),
+        "unexpected type_url in log: {log:?}"
+    );
+    assert_eq!(log[0].type_url, CDS);
+    assert_eq!(
+        log[1].kind(),
+        RequestKind::Ack,
+        "expected the triggering ACK at [1]"
+    );
+    assert_eq!(log[1].type_url, CDS);
+
+    assert_eq!(
+        log[2].type_url, EDS,
+        "expected the EDS follow-up request at [2], came after the ACK that triggered it"
+    );
+    assert_eq!(
+        log[2].resource_names,
+        vec!["my-cluster".to_string()],
+        "the follow-up request must carry the widened name set"
     );
 
     run.abort();
