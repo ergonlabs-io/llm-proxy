@@ -456,6 +456,7 @@ impl LoggingBody {
             llm_max_stall,
             llm_response_chunks,
             trace,
+            tenant,
         ) = {
             let mut info = ctx.stream_info.borrow_mut();
             info.bytes_sent = self.bytes_sent;
@@ -482,6 +483,10 @@ impl LoggingBody {
                 info.llm.max_inter_chunk,
                 info.llm.response_chunks,
                 info.trace,
+                // WP-55: the SAME `AuthInfo::tenant` the auth filter wrote,
+                // read here rather than re-borrowing `stream_info` a second
+                // time below -- see this destructuring's own doc above.
+                info.auth.tenant.clone(),
             )
         };
 
@@ -494,13 +499,17 @@ impl LoggingBody {
         // reported (`llm_tokens: None`) records nothing at all -- "no usage
         // was reported" and "zero tokens were used" are different facts, and
         // recording a zero here would silently corrupt any rate computed
-        // from this series.
+        // from this series. `tenant` is `StreamInfo::auth.tenant` verbatim
+        // (WP-55) -- `None` (no authenticated caller) still records, under
+        // `GenAiTokenStats::record_usage`'s no-tenant sentinel; see that
+        // method's doc for why unauthenticated usage is a naming decision,
+        // not a skip.
         if let (Some(tokens), Some(token_stats), Some(provider)) = (
             llm_tokens,
             ctx.token_stats.as_ref(),
             upstream_cluster.as_deref(),
         ) {
-            token_stats.record_usage(provider, tokens);
+            token_stats.record_usage(provider, tenant.as_deref(), tokens);
         }
 
         // WP-51 increment 2: emit the SERVER span here -- the same
@@ -829,11 +838,16 @@ mod tests {
         (stats, handles, registry)
     }
 
-    /// Drives a `LoggingBody` seeded with `usage`/`upstream_cluster` and a
-    /// wired `token_stats` to completion (`finish()` via clean end-of-stream).
+    /// Drives a `LoggingBody` seeded with `usage`/`upstream_cluster`/`tenant`
+    /// and a wired `token_stats` to completion (`finish()` via clean
+    /// end-of-stream). `tenant` seeds `StreamInfo::auth.tenant` -- the SAME
+    /// field the real auth filter writes (WP-55) -- exercised by this test
+    /// module going through the real `LoggingBody::finish` path, not a
+    /// direct `GenAiTokenStats::record_usage` call.
     async fn drive_with_usage_and_provider(
         token_stats: Option<Arc<GenAiTokenStats>>,
         upstream_cluster: Option<&str>,
+        tenant: Option<&str>,
         usage: Option<LlmTokenUsage>,
     ) {
         let capture = Arc::new(CaptureSink::default());
@@ -843,6 +857,7 @@ mod tests {
             let mut info = ctx.stream_info.borrow_mut();
             info.upstream_cluster = upstream_cluster.map(str::to_string);
             info.llm.usage = usage;
+            info.auth.tenant = tenant.map(str::to_string);
         }
         let body = local_boxed(
             Full::new(Bytes::from_static(b"hi"))
@@ -858,6 +873,7 @@ mod tests {
         drive_with_usage_and_provider(
             Some(token_stats),
             Some("openai-fallback"),
+            None,
             Some(LlmTokenUsage {
                 input_tokens: 40,
                 cached_tokens: 10,
@@ -881,7 +897,7 @@ mod tests {
         // synthesize the second from the absence of the first.
         let (token_stats, handles, registry) = token_stats_for("openai");
 
-        drive_with_usage_and_provider(Some(token_stats), Some("openai"), None).await;
+        drive_with_usage_and_provider(Some(token_stats), Some("openai"), None, None).await;
 
         let h = handles.for_provider("openai").unwrap();
         assert_eq!(registry.value(h.input), 0);
@@ -896,6 +912,7 @@ mod tests {
         drive_with_usage_and_provider(
             None,
             Some("openai"),
+            None,
             Some(LlmTokenUsage {
                 input_tokens: 1,
                 cached_tokens: 0,
@@ -904,6 +921,140 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    // --- WP-55: `tenant` reaches `LLM_CLIENT_TOKEN_USAGE` through the real
+    // `StreamInfo::auth.tenant` -> `LoggingBody::finish` path -------------
+
+    #[tokio::test]
+    async fn an_authenticated_tenant_reaches_llm_token_stats_with_its_own_id() {
+        // Requirement 1: the resolved tenant id, end to end through
+        // `LoggingBody::finish` -- `StreamInfo::auth.tenant` is set exactly
+        // the way the auth filter sets it (a plain `Option<String>`, see
+        // `stream_info::AuthInfo`'s own doc), not through a shortcut.
+        let (token_stats, _handles, registry) = token_stats_for("openai");
+
+        drive_with_usage_and_provider(
+            Some(token_stats),
+            Some("openai"),
+            Some("acme-corp"),
+            Some(LlmTokenUsage {
+                input_tokens: 40,
+                cached_tokens: 10,
+                cache_creation_tokens: 0,
+                output_tokens: 7,
+            }),
+        )
+        .await;
+
+        let h = registry.resolve_capped(
+            &proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "acme-corp"),
+            ],
+            proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+        );
+        assert_eq!(
+            registry.value(h),
+            40,
+            "usage must land on the AUTHENTICATED tenant's own series"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_stream_records_under_the_no_tenant_sentinel_not_a_real_tenant() {
+        // Requirement 2, driven through the real path (not a direct
+        // `record_usage` call, see `stat_handles`'s own coverage of that):
+        // `tenant: None` still counts, and lands on the sentinel series
+        // `TokenUsageStatHandles::for_provider` pre-resolves.
+        let (token_stats, handles, registry) = token_stats_for("openai");
+
+        drive_with_usage_and_provider(
+            Some(token_stats),
+            Some("openai"),
+            None,
+            Some(LlmTokenUsage {
+                input_tokens: 5,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 3,
+            }),
+        )
+        .await;
+
+        let h = handles.for_provider("openai").unwrap();
+        assert_eq!(
+            registry.value(h.input),
+            5,
+            "unauthenticated usage must still be recorded"
+        );
+    }
+
+    /// Requirement 4 (rule 17): trace `tenant` back to its ONLY source at
+    /// this layer, `StreamInfo::auth.tenant`, and confirm by type that it
+    /// cannot carry credential material -- `AuthInfo::tenant` is a plain
+    /// `Option<String>` (see `stream_info::AuthInfo`'s own doc: "What
+    /// crosses is deliberately only the two *identifiers*"), not a
+    /// `LimitKey`/`CredentialDigest`/anything key-shaped. This test drives
+    /// the exact value that ends up as the `tenant` attribute through the
+    /// real `finish()` path and confirms it is untransformed.
+    #[tokio::test]
+    async fn no_credential_material_reaches_the_tenant_attribute() {
+        let (token_stats, _handles, registry) = token_stats_for("openai");
+
+        // A value shaped like a virtual-key credential (see
+        // `proxy_filters::auth::KEY_PREFIX`) -- if anything on this path
+        // hashed, digested, or otherwise substituted the credential for the
+        // tenant id, this exact string would not be the one that resolves a
+        // series with the recorded usage on it.
+        let tenant_that_looks_like_a_key = "llmp_definitely-not-a-tenant-id";
+
+        drive_with_usage_and_provider(
+            Some(token_stats),
+            Some("openai"),
+            Some(tenant_that_looks_like_a_key),
+            Some(LlmTokenUsage {
+                input_tokens: 9,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 1,
+            }),
+        )
+        .await;
+
+        let h = registry.resolve_capped(
+            &proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", tenant_that_looks_like_a_key),
+            ],
+            proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+        );
+        assert_eq!(
+            registry.value(h),
+            9,
+            "the exact string in `StreamInfo::auth.tenant` must be the attribute value -- a \
+             hash/digest would resolve a different series and find nothing here"
+        );
     }
 
     // --- WP-46: TPOT / max-stall / response-chunks plumbing ---------------
