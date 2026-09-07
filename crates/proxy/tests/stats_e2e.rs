@@ -41,6 +41,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT;
+
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 
 /// Reserves a free ephemeral port and hands back its number -- same
@@ -624,16 +626,23 @@ static_resources:
         .split("\r\n\r\n")
         .nth(1)
         .expect("response has a body separated from headers by a blank line");
+    // WP-55: `tenant` is a third label on this instrument now. This config
+    // has no `auth` filter, so every series carries the no-tenant sentinel,
+    // and the label order is the renderer's own sorted order (provider,
+    // tenant, type) -- not the order they are declared in.
     assert!(
         body.contains(&format!(
-            "envoy_llm_client_token_usage{{provider=\"llm_backend\",type=\"input\"}} {PROMPT_TOKENS}"
+            "envoy_llm_client_token_usage{{provider=\"llm_backend\",\
+             tenant=\"{LLM_CLIENT_TOKEN_USAGE_NO_TENANT}\",type=\"input\"}} {PROMPT_TOKENS}"
         )),
         "expected /stats/prometheus to report {PROMPT_TOKENS} input tokens for provider \
          \"llm_backend\", got body:\n{body}\n(full response: {prometheus_response})"
     );
     assert!(
         body.contains(&format!(
-            "envoy_llm_client_token_usage{{provider=\"llm_backend\",type=\"output\"}} {COMPLETION_TOKENS}"
+            "envoy_llm_client_token_usage{{provider=\"llm_backend\",\
+             tenant=\"{LLM_CLIENT_TOKEN_USAGE_NO_TENANT}\",type=\"output\"}} \
+             {COMPLETION_TOKENS}"
         )),
         "expected /stats/prometheus to report {COMPLETION_TOKENS} output tokens for provider \
          \"llm_backend\", got body:\n{body}\n(full response: {prometheus_response})"

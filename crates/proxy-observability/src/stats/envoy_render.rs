@@ -366,7 +366,11 @@ mod tests {
         let control = StatsControl::new(1);
         let h = control.resolve(
             &instruments::LLM_CLIENT_TOKEN_USAGE,
-            &[("provider", "openai"), ("type", "input")],
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "acme"),
+            ],
         );
         let registry = control.registry();
         registry.incr(WorkerId(0), h, 42);

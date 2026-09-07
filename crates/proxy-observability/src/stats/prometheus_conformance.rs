@@ -76,7 +76,11 @@ fn renderer_produces_a_series_for_every_known_instrument() {
     );
     let tokens = control.resolve(
         &instruments::LLM_CLIENT_TOKEN_USAGE,
-        &[("provider", "openai"), ("type", "input")],
+        &[
+            ("provider", "openai"),
+            ("type", "input"),
+            ("tenant", "acme"),
+        ],
     );
     let latency =
         control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "openai")]);
