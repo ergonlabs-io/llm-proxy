@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 
@@ -43,6 +44,14 @@ impl HostResolver for TokioResolver {
 #[derive(Debug, Default)]
 pub struct FakeResolver {
     records: Mutex<HashMap<String, Vec<IpAddr>>>,
+    /// Per-host artificial resolution latency, set via [`FakeResolver::set_delay`].
+    /// Empty by default, so every existing caller that never calls it sees no
+    /// behavior change (`resolve` skips the `.await` sleep entirely). Exists
+    /// to let a test hold `update_from_snapshot` mid-resolution long enough
+    /// to observe what a *different* cluster's host set looks like while a
+    /// slow `STRICT_DNS` cluster is still resolving -- see
+    /// `manager.rs`'s `a_slow_dns_cluster_does_not_empty_other_clusters_mid_reload`.
+    delays: Mutex<HashMap<String, Duration>>,
 }
 
 impl FakeResolver {
@@ -53,6 +62,12 @@ impl FakeResolver {
     /// Seed or replace the address set `resolve(host)` returns.
     pub fn set(&self, host: &str, addrs: Vec<IpAddr>) {
         self.records.lock().unwrap().insert(host.to_string(), addrs);
+    }
+
+    /// Make `resolve(host)` sleep for `delay` before returning its (already
+    /// seeded) result. Test-only knob -- see the `delays` field doc.
+    pub fn set_delay(&self, host: &str, delay: Duration) {
+        self.delays.lock().unwrap().insert(host.to_string(), delay);
     }
 }
 
@@ -70,7 +85,13 @@ impl HostResolver for FakeResolver {
                     format!("no fake DNS record for `{host}`"),
                 )
             });
-        Box::pin(async move { result })
+        let delay = self.delays.lock().unwrap().get(host).copied();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            result
+        })
     }
 }
 

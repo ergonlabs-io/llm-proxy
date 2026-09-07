@@ -438,12 +438,40 @@ impl ClusterManager {
     /// current cluster's initial resolution.
     ///
     /// v1 rebuilds config-sourced clusters wholesale on every call (a
-    /// cluster whose config changed gets a fresh, empty host set until its
-    /// resolution completes a few lines below) rather than diffing
+    /// cluster whose config changed gets a fresh host set built from a new
+    /// resolution, not a diff against its old one) rather than diffing
     /// `ClusterConfig` for real changes -- `ClusterConfig` has no
     /// `PartialEq`, and Envoy's own cluster-update semantics are a larger
     /// piece of work than this WP. EDS-registered clusters (which never
     /// appear in a config snapshot) are carried over untouched.
+    ///
+    /// WP-59 increment 1: every new cluster is resolved *before* the map is
+    /// published (`self.clusters.store` below), not after. The previous
+    /// ordering stored every cluster with an empty `HostSet` first and
+    /// resolved them one at a time afterward -- for the whole span of that
+    /// serial loop, EVERY cluster (including ones like `STATIC` that need no
+    /// I/O at all) was empty and rejecting traffic, and a slow `STRICT_DNS`
+    /// cluster in the same reload stretched that window for everyone else
+    /// too. Resolving into `next` first means the previously-published map
+    /// keeps serving, untouched, until the fully-resolved replacement is
+    /// ready to swap in atomically. This does NOT yet carry forward an
+    /// unchanged cluster's own `ManagedCluster` (health-check state and
+    /// outlier ejections are still rebuilt -- and therefore lost -- on every
+    /// reload, for a cluster whose config didn't even change); that's
+    /// increment 2, and it needs content equality on `ClusterConfig`, which
+    /// this type deliberately does not have yet.
+    ///
+    /// **The same missing carry-forward loses EDS-delivered membership on
+    /// every reload, and that is worth stating separately** because it is
+    /// not a state-freshness nicety like health flags -- it is the whole
+    /// host set. A cluster declared `discovery: eds` is rebuilt here like any
+    /// other `ClusterSource::Config` entry, with an empty `HostSet`, and
+    /// `resolve_cluster` deliberately does not resolve it (there is nothing
+    /// to resolve). So a SIGHUP reload empties it until the control plane
+    /// next pushes that resource -- which, under SotW EDS, may not be until
+    /// something actually changes upstream. Pre-existing, not introduced by
+    /// this increment's reordering; increment 2's carry-forward is the fix,
+    /// and until then an EDS cluster's membership does not survive a reload.
     ///
     /// A cluster whose `lb_policy` isn't implemented (`RING_HASH`/`MAGLEV`,
     /// WP-17) is rejected rather than silently substituted with another
@@ -470,6 +498,34 @@ impl ClusterManager {
                 }
             }
         }
+
+        // Resolve each freshly-built cluster's own discovery into ITS OWN
+        // `host_set` -- nothing here is reachable through `self.clusters` yet
+        // (the `store` below hasn't happened), so nothing else can observe
+        // these half-resolved `ManagedCluster`s mid-loop. `resolve_cluster`
+        // is the same logic `refresh_cluster` runs (it's the extraction of
+        // that method's body -- see its own doc), so an EDS-typed
+        // `ClusterSource::Config` cluster still isn't resolved here either
+        // (it would return empty and there'd be nothing to carry membership
+        // over from, since this cluster has no EDS delivery yet at
+        // construction time).
+        for (name, managed) in &next {
+            if let Err(err) = self.resolve_cluster(managed).await {
+                // Rust note: a discovery failure doesn't take the cluster
+                // manager down -- Envoy keeps serving the last-known-good
+                // (here: empty, since this is the first resolution) host set
+                // and logs. Real retry/backoff on DNS failure is a future
+                // refinement, not part of this WP. Crucially, this is scoped
+                // to the ONE cluster that failed -- every other entry in
+                // `next` already resolved (or failed) independently above,
+                // so one bad DNS answer never blocks or fails the reload.
+                tracing::warn!(cluster = %name, error = %err, "initial cluster discovery failed");
+            }
+        }
+
+        // Carry EDS-registered clusters over untouched -- they have no
+        // self-driven discovery (see `ClusterSource::Eds`) and never appear
+        // in `clusters` above, so `next` has no entry for them yet.
         for (name, managed) in previous.iter() {
             if matches!(managed.source, ClusterSource::Eds) {
                 next.entry(name.clone())
@@ -477,23 +533,6 @@ impl ClusterManager {
             }
         }
         self.clusters.store(Arc::new(next));
-
-        for name in clusters.keys() {
-            if rejected
-                .iter()
-                .any(|(rejected_name, _)| rejected_name == name)
-            {
-                continue;
-            }
-            if let Err(err) = self.refresh_cluster(name).await {
-                // Rust note: a discovery failure doesn't take the cluster
-                // manager down -- Envoy keeps serving the last-known-good
-                // (here: empty, since this is the first resolution) host set
-                // and logs. Real retry/backoff on DNS failure is a future
-                // refinement, not part of this WP.
-                tracing::warn!(cluster = %name, error = %err, "initial cluster discovery failed");
-            }
-        }
         rejected
     }
 
@@ -549,6 +588,13 @@ impl ClusterManager {
     /// ([`discovery::DEFAULT_DNS_REFRESH_RATE`]) for DNS-discovered
     /// clusters; tests call it directly to drive discovery deterministically
     /// instead of waiting on a real timer.
+    ///
+    /// WP-59 increment 1: this method's contract is unchanged -- it still
+    /// looks the cluster up by name in the CURRENTLY PUBLISHED registry and
+    /// resolves it there. [`Self::resolve_cluster`] is just this method's
+    /// former body, factored out so [`Self::update_from_snapshot`] can run
+    /// the identical resolution logic against a `ManagedCluster` that isn't
+    /// registered yet (see that method's doc for why).
     pub async fn refresh_cluster(&self, name: &str) -> io::Result<HostSetDiff> {
         let managed = self
             .clusters
@@ -556,6 +602,16 @@ impl ClusterManager {
             .get(name)
             .cloned()
             .ok_or_else(|| not_found(name))?;
+        self.resolve_cluster(&managed).await
+    }
+
+    /// Run discovery for `managed` and publish the result into ITS OWN
+    /// `host_set`, returning the diff against whatever it held before. Does
+    /// not touch `self.clusters` at all -- the caller decides whether/how
+    /// `managed` is registered ([`Self::refresh_cluster`] looks it up there
+    /// first; [`Self::update_from_snapshot`] calls this on a cluster that
+    /// hasn't been published yet).
+    async fn resolve_cluster(&self, managed: &ManagedCluster) -> io::Result<HostSetDiff> {
         let config = match &managed.source {
             ClusterSource::Eds => return Ok(HostSetDiff::default()),
             // An aggregate has no endpoints/discovery of its own to
@@ -1838,6 +1894,87 @@ mod tests {
                 .iter()
                 .any(|h| h.address == addr),
             "host must stay out of all_healthy_hosts() while outlier-ejected"
+        );
+    }
+
+    // -------------------------------------------- WP-59 increment 1 --------
+
+    /// The bug: the old `update_from_snapshot` stored every rebuilt cluster
+    /// with an EMPTY `HostSet` first and resolved them one at a time
+    /// afterward, serially. A `STRICT_DNS` cluster slow to resolve therefore
+    /// left every OTHER cluster in the same reload -- including a `STATIC`
+    /// one that needs no I/O at all -- serving empty for the whole span of
+    /// that loop. `#[tokio::test(flavor = "multi_thread")]` is required, not
+    /// `current_thread`: a single-threaded runtime can't run the spawned
+    /// reload and this test's sampling loop concurrently, so it would never
+    /// actually observe the mid-resolution window (CLAUDE.md rule 14).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_dns_cluster_does_not_empty_other_clusters_mid_reload() {
+        let resolver = Arc::new(FakeResolver::new());
+        resolver.set("svc.internal", vec![IpAddr::from([10, 0, 0, 1])]);
+        let manager = Arc::new(ClusterManager::with_default_transport(resolver.clone()));
+
+        let snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::from([
+            (
+                "dns-svc".to_string(),
+                cluster_config(
+                    "dns-svc",
+                    DiscoveryType::StrictDns,
+                    vec![endpoint("svc.internal", 80)],
+                ),
+            ),
+            (
+                "static-svc".to_string(),
+                cluster_config(
+                    "static-svc",
+                    DiscoveryType::Static,
+                    vec![endpoint("10.0.0.9", 80)],
+                ),
+            ),
+        ]);
+        // First reload: both clusters get real, populated host sets.
+        manager.update_from_snapshot(&snapshot).await;
+        assert!(manager
+            .cluster("static-svc")
+            .unwrap()
+            .select_host(&LoadBalancerContext::default())
+            .is_some());
+
+        // Make the second reload's DNS resolution slow enough to hold the
+        // reload open for the whole sampling window below.
+        resolver.set_delay("svc.internal", Duration::from_millis(300));
+
+        let manager_for_reload = Arc::clone(&manager);
+        let snapshot_for_reload = snapshot.clone();
+        let reload = tokio::spawn(async move {
+            manager_for_reload
+                .update_from_snapshot(&snapshot_for_reload)
+                .await;
+        });
+
+        // Sample static-svc's host set repeatedly while the reload is still
+        // in flight. On the buggy sequencing this window goes empty the
+        // instant `update_from_snapshot` stores its freshly-built (all-empty)
+        // map, well before the slow DNS cluster finishes resolving.
+        let ctx = LoadBalancerContext::default();
+        let mut samples = 0;
+        while !reload.is_finished() {
+            let entry = manager
+                .cluster("static-svc")
+                .expect("static-svc must stay registered across the whole reload");
+            assert!(
+                entry.select_host(&ctx).is_some(),
+                "static-svc's host set was empty while an unrelated STRICT_DNS \
+                 cluster in the same reload was still resolving"
+            );
+            samples += 1;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        reload.await.unwrap();
+        assert!(
+            samples > 10,
+            "sampling window too short to actually exercise the concurrent \
+             reload (got {samples} samples) -- resolver delay may need to be longer"
         );
     }
 }
