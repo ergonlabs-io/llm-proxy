@@ -62,6 +62,12 @@ const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster"
 /// Bare type name `Any::type_url` is built from -- matches
 /// `crates/proxy-xds/tests/apply.rs`'s own `CLUSTER_TYPE`.
 const CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
+/// Full `type_url` an EDS `DiscoveryResponse` carries -- matches
+/// `crates/proxy-xds/src/apply.rs`'s own private `EDS_TYPE_URL`.
+const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
+/// Bare type name `Any::type_url` is built from, for a `ClusterLoadAssignment`
+/// -- matches `crates/proxy-xds/tests/apply.rs`'s own `ENDPOINT_TYPE`.
+const ENDPOINT_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
 
 /// How long to wait for the freshly spawned `llm-proxy` to become
 /// connectable -- a liveness backstop, not a speed assertion (matches every
@@ -259,6 +265,43 @@ fn minimal_cluster(name: &str, port: u32) -> cluster_v3::Cluster {
             }],
             ..Default::default()
         }),
+        ..Default::default()
+    }
+}
+
+/// A minimal `ClusterLoadAssignment` naming `cluster_name`, with one endpoint
+/// at `host:port` -- just enough for `proxy_config::lower_dynamic_endpoints`
+/// to accept it. Identical fixture shape to `crates/proxy-xds/tests/apply.rs`'s
+/// own `minimal_assignment` (duplicated per this file's own module doc).
+fn minimal_assignment(
+    cluster_name: &str,
+    host: &str,
+    port: u32,
+) -> endpoint_v3::ClusterLoadAssignment {
+    endpoint_v3::ClusterLoadAssignment {
+        cluster_name: cluster_name.to_string(),
+        endpoints: vec![endpoint_v3::LocalityLbEndpoints {
+            lb_endpoints: vec![endpoint_v3::LbEndpoint {
+                host_identifier: Some(endpoint_v3::lb_endpoint::HostIdentifier::Endpoint(
+                    endpoint_v3::Endpoint {
+                        address: Some(core_v3::Address {
+                            address: Some(core_v3::address::Address::SocketAddress(
+                                core_v3::SocketAddress {
+                                    address: host.to_string(),
+                                    port_specifier: Some(
+                                        core_v3::socket_address::PortSpecifier::PortValue(port),
+                                    ),
+                                    ..Default::default()
+                                },
+                            )),
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
         ..Default::default()
     }
 }
@@ -721,4 +764,179 @@ fn the_proxy_still_serves_static_config_when_its_ads_control_plane_is_unreachabl
 
     terminate(&mut child);
     let _ = std::fs::remove_file(&config_path);
+}
+
+// ------------------------------------------------------------------ test D --
+
+/// The name of the cluster test D's bootstrap declares as `type: EDS`.
+const TEST_D_EDS_CLUSTER: &str = "eds_backend";
+
+/// One static, already-bound listener whose route already names an EDS
+/// cluster -- its membership arrives only over an ADS-delivered
+/// `ClusterLoadAssignment`, never `load_assignment` (`proxy-config`'s own
+/// EDS-cluster check forbids setting both). `dynamic_resources` still needs
+/// `cds_config` set: `convert_dynamic_resources` (WP-21 increment 1, not this
+/// increment's to change) only accepts `ads_config` when at least one of
+/// `lds_config`/`cds_config` also subscribes over it -- EDS has no bootstrap
+/// flag of its own, it rides on a `Cluster`'s own `eds_cluster_config`. The
+/// harness script below never answers the resulting CDS subscription; it
+/// just sits open, harmlessly, alongside the EDS one this test actually
+/// exercises.
+fn bootstrap_static_listener_eds_cluster(listener_port: u16, ads_addr: SocketAddr) -> String {
+    format!(
+        r#"
+node:
+  id: proxy-1
+  cluster: proxy-fleet
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: {{ cluster_name: xds_cluster }}
+  cds_config: {{ ads: {{}}, resource_api_version: V3 }}
+
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {listener_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: {eds_cluster}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: xds_cluster
+      type: STATIC
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {ads_ip}, port_value: {ads_port} }}
+    - name: {eds_cluster}
+      type: EDS
+      eds_cluster_config:
+        eds_config:
+          ads: {{}}
+          resource_api_version: V3
+"#,
+        eds_cluster = TEST_D_EDS_CLUSTER,
+        ads_ip = ads_addr.ip(),
+        ads_port = ads_addr.port(),
+    )
+}
+
+/// WP-21 increment 2b-iii's own acceptance test: an ADS-delivered
+/// `ClusterLoadAssignment` reaches `ClusterManager::accept_eds_update` in the
+/// real binary, and the statically-declared EDS cluster it feeds becomes
+/// routable by real traffic -- the same "observe through a real request, one
+/// unretried read" shape tests A/B use, chosen over `/clusters` because that
+/// endpoint reads `ConfigSnapshot` (`config_dump`'s own source), and an EDS
+/// update deliberately never touches `ConfigSnapshot` at all (see
+/// `apply.rs`'s own doc on `on_eds_response`) -- only a live request actually
+/// exercises the path this increment wires.
+///
+/// Unlike test A/B, there is no CDS response to wait behind: `start_ads`'s
+/// Part 2 seeding means the EDS subscription's initial request already names
+/// `eds_backend` the moment the stream opens (read straight out of the boot
+/// snapshot's `eds_cluster_config.service_name`, not derived from any prior
+/// response) -- so this polls for the first ACK of ANY type_url, rather than
+/// asserting on a fixed log index the way tests A/B do, because the CDS and
+/// EDS initial requests can arrive in either order.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eds_delivered_endpoint_set_makes_a_statically_declared_cluster_routable() {
+    let upstream_addr = spawn_mock_upstream();
+    let harness = Harness::spawn(vec![Step::Send {
+        type_url: EDS_TYPE_URL.to_string(),
+        version_info: "v1".to_string(),
+        nonce: "n1".to_string(),
+        resources: vec![any_of(
+            &minimal_assignment(TEST_D_EDS_CLUSTER, "127.0.0.1", upstream_addr.port() as u32),
+            ENDPOINT_TYPE,
+        )],
+    }])
+    .await
+    .expect("harness spawns");
+
+    let listener_port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-d-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        bootstrap_static_listener_eds_cluster(listener_port, harness.addr),
+    )
+    .expect("write config");
+
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+
+    let listener_ready = wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT);
+    assert!(
+        listener_ready,
+        "listener at 127.0.0.1:{listener_port} did not become connectable in time; \
+         stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+
+    // Bounded poll for ARRIVAL of the EDS ACK (retries fine here, same
+    // reasoning as tests A/B's own `wait_for_second_request`): any recorded
+    // request classifying as an ACK, since the CDS and EDS initial requests
+    // race for which lands first in the log.
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    loop {
+        if harness
+            .log
+            .snapshot()
+            .iter()
+            .any(|r| r.kind() == RequestKind::Ack)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {ACK_TIMEOUT:?} waiting for the EDS ACK to be recorded; \
+                 stderr so far: {:?}",
+                drain_available_lines(&stderr_rx)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The load-bearing read: exactly ONE fresh request, no retry loop -- a
+    // retry loop here would let a `main.rs` that ACKs before
+    // `ClusterManager::accept_eds_update` has actually returned catch up and
+    // pass anyway, the same reasoning as tests A/B's own single unretried
+    // read.
+    let response = get(listener_addr, "/", "test.local");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected \"{TEST_D_EDS_CLUSTER}\"'s host set to already be populated the instant its \
+         EDS ACK was observed on the wire -- got:\n{response}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
 }

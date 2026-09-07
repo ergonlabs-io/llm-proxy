@@ -598,12 +598,15 @@ async fn resource_applier_is_a_response_handler_returning_the_same_verdict_as_on
 // ---------------------------------------------------------------- EDS (2b-ii) --
 
 /// A valid EDS response reaches the sink with the right
-/// `(cluster_name, endpoints)`.
+/// `(cluster_name, endpoints)` -- here the resource name and the cluster name
+/// happen to match, which is the common case; the mismatched-name case (the
+/// Part 1 regression) has its own test below.
 #[tokio::test]
 async fn a_valid_eds_response_reaches_the_sink_with_the_right_name_and_endpoints() {
+    let base = base_with_static_eds_cluster("my-cluster", "my-cluster");
     let (publish, _published) = recording_publisher();
     let (sink, recorded) = recording_endpoint_sink(&[]);
-    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+    let mut applier = ResourceApplier::new(base, publish).with_endpoint_sink(sink);
 
     let resp = eds_response(
         "v1",
@@ -620,13 +623,117 @@ async fn a_valid_eds_response_reaches_the_sink_with_the_right_name_and_endpoints
     assert_eq!(calls[0].1[0].port, 9090);
 }
 
+/// THE PART 1 REGRESSION TEST. The EDS resource's own name
+/// (`ClusterLoadAssignment.cluster_name`) differs from the `Cluster.name` that
+/// subscribes to it via `eds_cluster_config.service_name` -- Envoy allows
+/// this. The sink must be called with the CLUSTER's name, never the resource
+/// name passed straight through. Against the code as it landed in increment
+/// 2b-ii (which called the sink with the assignment's own `cluster_name`),
+/// this fails: the sink is never called at all, because nothing in
+/// `empty_base()` is named `eds-resource-name`, or -- had the bug instead
+/// been "call the sink with the resource name regardless of any cluster" --
+/// it would have called the sink under the wrong name.
+#[tokio::test]
+async fn an_eds_resource_whose_name_differs_from_the_cluster_name_reaches_the_sink_under_the_cluster_name(
+) {
+    let base = base_with_static_eds_cluster("real-cluster-name", "eds-resource-name");
+    let (publish, _published) = recording_publisher();
+    let (sink, recorded) = recording_endpoint_sink(&[]);
+    let mut applier = ResourceApplier::new(base, publish).with_endpoint_sink(sink);
+
+    let resp = eds_response(
+        "v1",
+        &[minimal_assignment(
+            "eds-resource-name",
+            &[("10.0.0.1", 9090)],
+        )],
+    );
+    let verdict = applier.on_response(&resp).await;
+
+    assert_eq!(verdict, Verdict::Accept);
+    let calls = recorded.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0, "real-cluster-name",
+        "the sink must be called with the CLUSTER's name, not the EDS resource name"
+    );
+    assert_eq!(calls[0].1[0].host, "10.0.0.1");
+}
+
+/// Two clusters share one `service_name` -- Envoy allows this too. A single
+/// resource must feed both.
+#[tokio::test]
+async fn two_clusters_sharing_one_eds_resource_are_both_fed_from_a_single_response() {
+    let any_a = any_of(&eds_cluster("cluster-a", "shared-eds"), CLUSTER_TYPE);
+    let any_b = any_of(&eds_cluster("cluster-b", "shared-eds"), CLUSTER_TYPE);
+    let ir_a = lower_dynamic_cluster(&any_a, "static_resources.clusters[0]")
+        .expect("fixture cluster must lower");
+    let ir_b = lower_dynamic_cluster(&any_b, "static_resources.clusters[1]")
+        .expect("fixture cluster must lower");
+    let mut snapshot = ConfigSnapshot::default();
+    snapshot
+        .clusters
+        .insert("cluster-a".to_string(), Arc::new(ir_a));
+    snapshot
+        .clusters
+        .insert("cluster-b".to_string(), Arc::new(ir_b));
+    let base = Arc::new(snapshot);
+
+    let (publish, _published) = recording_publisher();
+    let (sink, recorded) = recording_endpoint_sink(&[]);
+    let mut applier = ResourceApplier::new(base, publish).with_endpoint_sink(sink);
+
+    let resp = eds_response(
+        "v1",
+        &[minimal_assignment("shared-eds", &[("10.0.0.1", 9090)])],
+    );
+    let verdict = applier.on_response(&resp).await;
+
+    assert_eq!(verdict, Verdict::Accept);
+    let calls = recorded.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "both clusters sharing the resource must be fed"
+    );
+    let names: std::collections::BTreeSet<&str> =
+        calls.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["cluster-a", "cluster-b"])
+    );
+}
+
+/// A resource matching no cluster is accepted, calls no sink, and does not
+/// reject -- a control plane pushing a resource nobody subscribed to is its
+/// own bug, not a reason to stall every OTHER resource in the response.
+#[tokio::test]
+async fn an_eds_resource_matching_no_cluster_is_accepted_and_calls_no_sink() {
+    let (publish, _published) = recording_publisher();
+    let (sink, recorded) = recording_endpoint_sink(&[]);
+    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+
+    let resp = eds_response(
+        "v1",
+        &[minimal_assignment(
+            "nobody-subscribed",
+            &[("10.0.0.1", 9090)],
+        )],
+    );
+    let verdict = applier.on_response(&resp).await;
+
+    assert_eq!(verdict, Verdict::Accept);
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
 /// A second, identical EDS response must not reach the sink again -- the
 /// same `unchanged` suppression `Entry`'s `PartialEq` gives CDS/LDS.
 #[tokio::test]
 async fn a_second_identical_eds_response_does_not_reach_the_sink_again() {
+    let base = base_with_static_eds_cluster("my-cluster", "my-cluster");
     let (publish, _published) = recording_publisher();
     let (sink, recorded) = recording_endpoint_sink(&[]);
-    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+    let mut applier = ResourceApplier::new(base, publish).with_endpoint_sink(sink);
 
     let resp = eds_response(
         "v1",
@@ -679,9 +786,10 @@ async fn an_eds_response_with_a_resource_that_fails_to_lower_is_rejected_without
 /// increment's brief names explicitly.
 #[tokio::test]
 async fn a_sink_that_fails_once_is_retried_on_the_next_identical_response() {
+    let base = base_with_static_eds_cluster("my-cluster", "my-cluster");
     let (publish, _published) = recording_publisher();
     let (sink, recorded) = recording_endpoint_sink(&["my-cluster"]);
-    let mut applier = ResourceApplier::new(empty_base(), publish).with_endpoint_sink(sink);
+    let mut applier = ResourceApplier::new(base, publish).with_endpoint_sink(sink);
 
     let resp = eds_response(
         "v1",
