@@ -956,6 +956,7 @@ mod tests {
 
     fn endpoint(host: &str, port: u16) -> EndpointIR {
         EndpointIR {
+            metadata: Default::default(),
             host: host.to_string(),
             port,
             weight: 1,

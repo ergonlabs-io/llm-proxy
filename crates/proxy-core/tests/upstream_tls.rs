@@ -604,6 +604,7 @@ async fn strict_mode_cluster_manager_rejects_a_tls_cluster_without_a_transport_s
         lb_policy: proxy_config::ir::LbPolicy::RoundRobin,
         connect_timeout: Duration::from_secs(5),
         endpoints: vec![proxy_config::ir::EndpointIR {
+            metadata: Default::default(),
             host: "127.0.0.1".to_string(),
             port: 1,
             weight: 1,

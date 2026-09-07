@@ -115,6 +115,7 @@ async fn build_router_with_stats(
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
             endpoints: vec![EndpointIR {
+                metadata: Default::default(),
                 host: addr.ip().to_string(),
                 port: addr.port(),
                 weight: 1,
@@ -225,6 +226,7 @@ async fn build_router_with_access_logs(
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
             endpoints: vec![EndpointIR {
+                metadata: Default::default(),
                 host: addr.ip().to_string(),
                 port: addr.port(),
                 weight: 1,
@@ -553,12 +555,14 @@ async fn a_connect_failure_is_retried_against_a_live_host() {
                     connect_timeout: Duration::from_secs(5),
                     endpoints: vec![
                         EndpointIR {
+                            metadata: Default::default(),
                             host: closed_addr.ip().to_string(),
                             port: closed_addr.port(),
                             weight: 1,
                             priority: 0,
                         },
                         EndpointIR {
+                            metadata: Default::default(),
                             host: live_addr.ip().to_string(),
                             port: live_addr.port(),
                             weight: 1,
@@ -993,6 +997,7 @@ async fn build_router_with_attempt_count_flags(
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
             endpoints: vec![EndpointIR {
+                metadata: Default::default(),
                 host: addr.ip().to_string(),
                 port: addr.port(),
                 weight: 1,

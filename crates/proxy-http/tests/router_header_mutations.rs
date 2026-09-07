@@ -108,6 +108,7 @@ async fn build_router_with_cluster_mutations(
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
             endpoints: vec![EndpointIR {
+                metadata: Default::default(),
                 host: addr.ip().to_string(),
                 port: addr.port(),
                 weight: 1,

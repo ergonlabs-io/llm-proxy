@@ -3993,6 +3993,7 @@ fn convert_endpoint(
         ));
     }
     Ok(EndpointIR {
+        metadata: Default::default(),
         host,
         port,
         weight: lbe.load_balancing_weight.unwrap_or(1),

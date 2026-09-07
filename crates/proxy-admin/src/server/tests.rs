@@ -131,6 +131,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         lb_policy: LbPolicy::RoundRobin,
         connect_timeout: Duration::from_secs(5),
         endpoints: vec![EndpointIR {
+            metadata: Default::default(),
             host: "10.0.0.5".to_string(),
             port: 8080,
             weight: 1,

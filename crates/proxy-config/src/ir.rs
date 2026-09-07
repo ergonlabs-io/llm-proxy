@@ -1042,8 +1042,11 @@ pub enum LbPolicy {
     ClusterProvided,
 }
 
-/// An upstream endpoint. `host` is an IP for STATIC clusters and may be a DNS
-/// name for the DNS discovery types — resolution is the cluster manager's job.
+/// An upstream endpoint. `host` must be a literal IP for STATIC clusters (see
+/// `lower.rs::convert_endpoint`) and for EDS-delivered endpoints (WP-21
+/// increment 2b-i: `discovery::static_hosts` installs those without resolving
+/// them); it may be a DNS name for the DNS discovery types, where resolution
+/// is the cluster manager's job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointIR {
     pub host: String,
@@ -1052,6 +1055,24 @@ pub struct EndpointIR {
     pub weight: u32,
     /// Failover priority; 0 = primary (S5/S7).
     pub priority: u32,
+    /// WP-56: operator-facing labels for this endpoint, lowered from
+    /// `LbEndpoint.metadata.filter_metadata["io.llmproxy.endpoint"]` -- the
+    /// same `filter_metadata` smuggling channel `ClusterConfig`'s
+    /// `request_headers_to_add` and `usage_dialect` already use, under an
+    /// endpoint-scoped namespace of its own.
+    ///
+    /// **Advisory: nothing routes on this, and that is deliberate.** Envoy's
+    /// own convention for endpoint metadata that affects host selection is
+    /// the `envoy.lb` namespace, read by LB subset routing -- which this
+    /// proxy does not implement. Lowering therefore REFUSES `envoy.lb` (and
+    /// every other namespace) by dotted path rather than accepting it into
+    /// this map: quietly taking a subset-routing selector and then not
+    /// routing on it is ground rule #1's exact shape, and it would silently
+    /// send traffic to endpoints the operator meant to exclude.
+    ///
+    /// `BTreeMap` rather than `HashMap` so `/config_dump` and test assertions
+    /// see a deterministic order.
+    pub metadata: BTreeMap<String, String>,
 }
 
 // -------------------------------------------------------------------- routes --

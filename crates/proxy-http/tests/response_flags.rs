@@ -125,6 +125,7 @@ impl Scenario {
         Scenario {
             route_matcher: prefix_matcher("/v1/"),
             endpoints: vec![EndpointIR {
+                metadata: Default::default(),
                 host: addr.ip().to_string(),
                 port: addr.port(),
                 weight: 1,

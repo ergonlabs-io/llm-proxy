@@ -240,6 +240,21 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   these WPs.",
     },
     AllowlistEntry {
+        struct_name: "EndpointIR",
+        field_name: "metadata",
+        kind: EntryKind::KnownInertNameCollision,
+        reason: "WP-56 lowers LbEndpoint.metadata.filter_metadata[\"io.llmproxy.endpoint\"] \
+                  into this map so an operator-meaningful endpoint label (node_id, engine) \
+                  survives config load instead of being a strict-mode rejection. Nothing reads \
+                  it yet: the first reader is WP-57, which points /clusters at ClusterManager's \
+                  live host sets instead of ConfigSnapshot. Recorded as a NAME COLLISION rather \
+                  than plain KnownInert because `has_reader` matches on field name alone and \
+                  `.metadata` is read all over the runtime crates (Cluster.metadata among \
+                  others), so this field reads as covered while nothing touches it -- the guard \
+                  would pass either way, which is exactly why the ledger has to say so by hand. \
+                  Delete when WP-57 lands, and re-verify by hand rather than by the scan.",
+    },
+    AllowlistEntry {
         struct_name: "TracingConfig",
         field_name: "otlp_endpoint",
         kind: EntryKind::KnownInert,
