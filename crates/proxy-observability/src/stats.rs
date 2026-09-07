@@ -78,9 +78,14 @@
 //! split (`&mut self` vs `&self`) to a *type* split:
 //!
 //! - [`Registry`] is the shared, hot-path type. Every method takes `&self`.
-//!   **It has no public `resolve` method at all** — a worker holding only
-//!   `Arc<Registry>` cannot reach resolution, full stop, and that is checked
-//!   by the compiler rather than by a debug assertion or a comment.
+//!   **It has no public `resolve`/`resolve_histogram` at all** — a worker
+//!   holding only `Arc<Registry>` cannot grow the registry for an
+//!   attribute value this process's OWN config didn't already name at boot,
+//!   and that is checked by the compiler rather than by a debug assertion
+//!   or a comment. [`Registry::resolve_capped`] (WP-55) is the one deliberate,
+//!   narrow exception — see its own doc for why: it exists for exactly one
+//!   dimension (`tenant`, on `llm.client.token.usage`) whose values are NOT
+//!   this process's own config, and it is capped rather than general.
 //! - [`StatsControl`] is the control-side owner: it is the *only* type
 //!   exposing [`StatsControl::resolve`]/[`StatsControl::resolve_histogram`].
 //!   It is deliberately not `Clone` — there is exactly one control side per
@@ -455,13 +460,82 @@ pub mod instruments {
     /// now. Attribute keys (`provider`, `type`) match the design brief's own
     /// table rather than semconv's fully qualified attribute names; the
     /// increment-4 Prometheus renderer is where full key names matter.
+    ///
+    /// WP-55: `tenant` is the third attribute key, added so operators can
+    /// build per-tenant usage dashboards over OTel export (the owner's
+    /// (a)-export-only decision — see `internal-docs/IMPLEMENTATION_PLAN.md`
+    /// WP-55 — this proxy never owns a usage datastore). Named `tenant`, not
+    /// `gen_ai.*` anything: there is no upstream semconv attribute for this
+    /// at all (semconv has no multi-tenancy concept), so there is no
+    /// borrowed name to get wrong the way `llm.*` vs `gen_ai.*` was for the
+    /// instrument name itself. The value is `StreamInfo::auth.tenant` — the
+    /// id the auth filter resolved from the caller's own credential, never a
+    /// caller-supplied parameter — verbatim; see
+    /// [`LLM_CLIENT_TOKEN_USAGE_NO_TENANT`] for the unauthenticated case and
+    /// [`LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW`]/
+    /// [`LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING`] for the cardinality
+    /// mitigation. Unlike `provider`/`type`, `tenant` is not bounded by this
+    /// process's own config, so it cannot be pre-resolved for every value at
+    /// boot the way `provider`/`type` are (`proxy_http::stat_handles`) —
+    /// see [`Registry::resolve_capped`].
     pub const LLM_CLIENT_TOKEN_USAGE: Instrument = Instrument {
         name: "llm.client.token.usage",
         kind: InstrumentKind::Counter,
         unit: "{token}",
-        attribute_keys: &["provider", "type"],
+        attribute_keys: &["provider", "type", "tenant"],
         buckets: None,
     };
+
+    /// [`LLM_CLIENT_TOKEN_USAGE`]'s `tenant` value for a stream with no
+    /// authenticated caller (`StreamInfo::auth.tenant` is `None` — no `auth`
+    /// filter configured on the listener, or one configured but the request
+    /// never reached it). Recorded, not skipped: unauthenticated traffic
+    /// still consumes real tokens and operators still need to see it in
+    /// aggregate, so this is a naming decision, not a decision to drop the
+    /// measurement — contrast the module's "no usage records nothing" rule,
+    /// which is the opposite case (usage itself absent, not just the
+    /// tenant).
+    ///
+    /// Chosen so it cannot be confused for a real tenant id: both places a
+    /// tenant id is produced (`auth_filter.rs`'s static `virtual_keys`
+    /// config field, and a JWT's tenant claim) reject an empty string, and
+    /// neither a config author nor a JWT issuer has a reason to pick a value
+    /// that opens AND closes with a hyphen the way a typical account/team
+    /// slug (alphanumeric, maybe an internal dash) would not. That is a
+    /// convention, not a cryptographic guarantee — the same shape as
+    /// Kubernetes reserving the `kube-` namespace prefix — so an operator
+    /// must not name a tenant this.
+    pub const LLM_CLIENT_TOKEN_USAGE_NO_TENANT: &str = "-unauthenticated-";
+
+    /// [`LLM_CLIENT_TOKEN_USAGE`]'s `tenant` value once the cardinality
+    /// ceiling ([`LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING`]) has been reached —
+    /// see [`Registry::resolve_capped`]'s doc for the mechanism. Every
+    /// tenant this process already resolved a series for keeps its own
+    /// series forever; every *new* tenant past the ceiling folds into this
+    /// one shared series instead of growing the registry without bound.
+    /// Same non-collision reasoning and same caveat as
+    /// [`LLM_CLIENT_TOKEN_USAGE_NO_TENANT`], and deliberately a different
+    /// string from it — an operator staring at a dashboard needs to tell
+    /// "nobody was authenticated" apart from "so many tenants showed up we
+    /// stopped giving them their own series".
+    pub const LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW: &str = "-cardinality-overflow-";
+
+    /// The cardinality budget for [`LLM_CLIENT_TOKEN_USAGE`]'s `tenant`
+    /// dimension: the maximum number of resolved *series* (not tenants —
+    /// each tenant contributes up to four, one per `type` bucket, per
+    /// provider) this instrument may hold before
+    /// [`Registry::resolve_capped`] starts folding new tenants into
+    /// [`LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW`] instead of
+    /// growing further. 4000 series is a round, generous, and frankly
+    /// arbitrary starting budget — roughly 1000 distinct tenants summed
+    /// across every configured provider — not derived from a measured
+    /// deployment. It is a hardcoded constant rather than a config field for
+    /// exactly that reason: there is no evidence yet for what the right
+    /// number is, and a wrong config default is worse than an honestly
+    /// unconfigurable one that is easy to find and bump (right here) once
+    /// there is one. Tenants already resolved before the ceiling trips keep
+    /// their own series — see [`Registry::resolve_capped`].
+    pub const LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING: usize = 4_000;
 
     /// Upstream request duration, per cluster, in **milliseconds**.
     ///
@@ -931,6 +1005,85 @@ impl Registry {
         handle
     }
 
+    /// A single, deliberately narrow exception to "no public resolve" above
+    /// (module doc, "Increment 5") — WP-55's tenant dimension. Every other
+    /// instrument's attribute values are this process's OWN config (cluster
+    /// names, listener names), known and bounded at boot, which is exactly
+    /// why the general `resolve`/`resolve_histogram` stay control-side-only:
+    /// a worker never needs to grow the registry for a value it didn't
+    /// already know at boot. `tenant` breaks that premise — it comes from a
+    /// caller's credential (`StreamInfo::auth.tenant`), is not known until a
+    /// request actually authenticates, and (via a JWT claim) is partly
+    /// caller-influenced, so an uncapped version of this method would be a
+    /// real cardinality-exhaustion vector, not just an engineering
+    /// inconvenience. Hence *capped*, not general: reachable from a worker's
+    /// plain `Arc<Registry>` (unlike `resolve`), but growth stops the moment
+    /// `instrument` already has `ceiling` or more resolved series — every
+    /// call past that point resolves `overflow_attrs` instead of `attrs`.
+    /// That is the WP-55 hazard note's own framing: drop the DIMENSION
+    /// (fold into one shared series) rather than the MEASUREMENT (still
+    /// recorded) or the alternative of letting a caller-chosen string grow
+    /// the registry without bound.
+    ///
+    /// The cap check reads `resolved` off the currently-published
+    /// `Snapshot` — the SAME state `resolve` itself maintains for
+    /// rendering, not a second, parallel bookkeeping structure — so a
+    /// tenant this process has already resolved keeps its own series
+    /// (a fast dedup hit inside `resolve`, no growth) for as long as the
+    /// process runs, even after the ceiling trips for anyone new.
+    ///
+    /// Panics under the same conditions as `resolve` (attribute key
+    /// mismatch against `instrument.attribute_keys`, or a `Histogram`
+    /// instrument) — `overflow_attrs` is checked too, since it reaches the
+    /// same call once the ceiling trips. Note this means `validate_attrs`
+    /// (see its own doc) is no longer *provably* off the request path the
+    /// way it was when only `StatsControl` could reach `resolve` — a
+    /// mismatch here would still only be a programming error in this
+    /// module's own call sites (`attrs`/`overflow_attrs` are built from
+    /// `'static` `Instrument`s in `proxy_http::stat_handles`, never from
+    /// caller input), not something a request can trigger.
+    pub fn resolve_capped(
+        &self,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+        ceiling: usize,
+        overflow_attrs: &[(&str, &str)],
+    ) -> Handle {
+        // Rust note: locking once just to peek `lookup` (rather than
+        // reusing `resolve`'s own internal lock for this) keeps this method
+        // simple and correct at the cost of a second lock/unlock on a
+        // genuinely new tenant -- fine here, this instrument is recorded at
+        // most once per completed stream, not per byte. The point of this
+        // peek is purely to avoid double-counting an ALREADY-resolved
+        // tenant against `ceiling` below (which would wrongly divert it to
+        // the overflow bucket once the process has resolved `ceiling` OTHER
+        // tenants, fragmenting its own history) -- `resolve` itself is
+        // idempotent regardless, this only affects which handle a call for
+        // an existing tenant is routed to.
+        let key = Self::resolve_key(instrument, attrs);
+        {
+            let control = self
+                .control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&handle) = control.lookup.get(&key) {
+                return handle;
+            }
+        }
+
+        let already_resolved = self
+            .published
+            .load()
+            .resolved
+            .iter()
+            .filter(|i| i.name == instrument.name)
+            .count();
+        if already_resolved >= ceiling {
+            return self.resolve(instrument, overflow_attrs);
+        }
+        self.resolve(instrument, attrs)
+    }
+
     /// Builds the sorted `(instrument.name, attrs)` dedup key shared by
     /// `resolve` and `resolve_histogram`. Attribute order must not affect
     /// identity, hence the sort.
@@ -1358,10 +1511,11 @@ mod tests {
     #[should_panic(expected = "attribute keys don't match")]
     fn missing_expected_attribute_key_is_rejected_loudly() {
         let control = StatsControl::new(1);
-        // LLM_CLIENT_TOKEN_USAGE expects both "provider" and "type".
+        // LLM_CLIENT_TOKEN_USAGE expects "provider", "type", AND "tenant"
+        // (WP-55) -- "tenant" is missing here.
         control.resolve(
             &instruments::LLM_CLIENT_TOKEN_USAGE,
-            &[("provider", "openai")],
+            &[("provider", "openai"), ("type", "input")],
         );
     }
 
@@ -1372,11 +1526,19 @@ mod tests {
         let control = StatsControl::new(1);
         let a = control.resolve(
             &instruments::LLM_CLIENT_TOKEN_USAGE,
-            &[("provider", "openai"), ("type", "input")],
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "acme"),
+            ],
         );
         let b = control.resolve(
             &instruments::LLM_CLIENT_TOKEN_USAGE,
-            &[("type", "input"), ("provider", "openai")],
+            &[
+                ("tenant", "acme"),
+                ("type", "input"),
+                ("provider", "openai"),
+            ],
         );
         assert_eq!(a, b, "attribute order must not affect handle identity");
     }
@@ -1977,6 +2139,181 @@ mod tests {
             OBS_THREADS as u64 * OBSERVATIONS_PER_THREAD,
             "every observation issued must be reflected exactly, same claim as test 17 but \
              for histograms"
+        );
+    }
+
+    // ---- WP-55: Registry::resolve_capped ---------------------------------
+
+    #[test]
+    fn resolve_capped_below_ceiling_behaves_like_a_plain_resolve() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+
+        let a = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "acme"),
+            ],
+            10,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "OVERFLOW"),
+            ],
+        );
+        let b = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "acme"),
+            ],
+            10,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "OVERFLOW"),
+            ],
+        );
+        assert_eq!(
+            a, b,
+            "the same attrs must dedup to the same handle, well below the ceiling"
+        );
+
+        let c = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "widgetco"),
+            ],
+            10,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "OVERFLOW"),
+            ],
+        );
+        assert_ne!(
+            a, c,
+            "a different tenant must get its own series below the ceiling"
+        );
+    }
+
+    /// The mitigation itself: once `ceiling` resolved series exist for the
+    /// instrument, a genuinely NEW attrs combination folds into
+    /// `overflow_attrs` instead of growing the registry further -- and every
+    /// such new combination shares the SAME overflow handle, not one each
+    /// (which would just move the unbounded-growth problem one level down).
+    #[test]
+    fn resolve_capped_folds_new_attrs_into_one_shared_overflow_series_once_the_ceiling_trips() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let overflow_attrs = [
+            ("provider", "openai"),
+            ("type", "input"),
+            ("tenant", "OVERFLOW"),
+        ];
+        let resolve = |tenant: &str| {
+            registry.resolve_capped(
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[
+                    ("provider", "openai"),
+                    ("type", "input"),
+                    ("tenant", tenant),
+                ],
+                2, // ceiling: only 2 real series allowed
+                &overflow_attrs,
+            )
+        };
+
+        let a = resolve("tenant-a");
+        let b = resolve("tenant-b");
+        assert_ne!(a, b, "both series fit under the ceiling of 2");
+
+        // The ceiling is now exactly met -- a third, never-seen tenant must
+        // NOT get its own series.
+        let c = resolve("tenant-c");
+        let d = resolve("tenant-d");
+        assert_eq!(
+            c, d,
+            "two DIFFERENT overflowing tenants must collapse onto the SAME overflow series, \
+             not each get their own -- otherwise the mitigation just relabels the unbounded \
+             growth instead of bounding it"
+        );
+        assert_ne!(
+            c, a,
+            "the overflow series must not alias a real tenant's series"
+        );
+
+        // The overflow handle must be reachable directly via the overflow
+        // attrs too -- it is a real, first-class series, not a special case.
+        let direct_overflow = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &overflow_attrs,
+            2,
+            &overflow_attrs,
+        );
+        assert_eq!(c, direct_overflow);
+    }
+
+    /// The other half of the mitigation's honesty: a tenant that already had
+    /// its own series BEFORE the ceiling tripped keeps using it afterwards --
+    /// the ceiling only stops NEW growth, it does not retroactively merge
+    /// already-distinguished tenants into the overflow bucket.
+    #[test]
+    fn resolve_capped_does_not_disturb_a_tenant_resolved_before_the_ceiling_tripped() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let overflow_attrs = [
+            ("provider", "openai"),
+            ("type", "input"),
+            ("tenant", "OVERFLOW"),
+        ];
+        let resolve = |tenant: &str| {
+            registry.resolve_capped(
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[
+                    ("provider", "openai"),
+                    ("type", "input"),
+                    ("tenant", tenant),
+                ],
+                1, // ceiling: only 1 real series allowed
+                &overflow_attrs,
+            )
+        };
+
+        let early = resolve("tenant-a");
+        // Trips the ceiling for everyone else.
+        let overflowed = resolve("tenant-b");
+        assert_ne!(early, overflowed);
+
+        // "tenant-a" must still resolve to ITS OWN handle, not the overflow
+        // one, even though the ceiling has since been reached.
+        let early_again = resolve("tenant-a");
+        assert_eq!(
+            early, early_again,
+            "a tenant given its own series before the ceiling tripped must keep it"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute keys don't match")]
+    fn resolve_capped_still_validates_attrs() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        // Missing "tenant" -- same validation `resolve` itself enforces.
+        registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[("provider", "openai"), ("type", "input")],
+            10,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "OVERFLOW"),
+            ],
         );
     }
 }

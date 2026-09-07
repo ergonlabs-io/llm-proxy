@@ -42,11 +42,29 @@
 //! [`StatHandles`]/[`RouterStats`]'s shape exactly (same
 //! resolve-once-at-boot, `ArcSwap`-not-`Mutex`, warn-once-on-a-miss rules),
 //! just for `DOWNSTREAM_CX_TOTAL{listener}` (`crate::listener`'s accept
-//! loop, `proxy-core`) and `LLM_CLIENT_TOKEN_USAGE{provider,type}`
+//! loop, `proxy-core`) and `LLM_CLIENT_TOKEN_USAGE{provider,type,tenant}`
 //! (`crate::access_logging::LoggingBody::finish`) respectively, instead of
 //! `UPSTREAM_RQ`/`UPSTREAM_RQ_TIME`. See each type's own doc for what's
 //! different: a single instrument keyed by listener name for the first, and
 //! four handles per provider (one per token bucket) for the second.
+//!
+//! # WP-55: `tenant` is the one attribute this file resolves OFF the boot
+//! control side
+//!
+//! Every other resolve in this module happens once, at boot (or on a SIGHUP
+//! reload), against this process's own config -- exactly the "why resolution
+//! happens once, at boot" section above. `tenant` cannot follow that rule:
+//! it comes from a caller's credential
+//! (`proxy_http::stream_info::AuthInfo::tenant`), so it isn't known until a
+//! request actually authenticates. [`GenAiTokenStats::record_usage`] resolves
+//! it per call, via [`proxy_observability::stats::Registry::resolve_capped`]
+//! -- reachable from a worker's plain `Arc<Registry>`, unlike the general
+//! `resolve`, and capped so a caller cannot grow the registry without bound
+//! (see that method's doc). [`TokenUsageStatHandles`] still pre-resolves,
+//! at boot, the ONE tenant value that IS known ahead of time for every
+//! provider: "no tenant at all"
+//! (`instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT`) -- unauthenticated
+//! traffic is the common case and stays on the fast, boot-resolved path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -410,8 +428,14 @@ impl DownstreamStats {
     }
 }
 
-/// One provider's four pre-resolved `llm.client.token.usage` handles, one
-/// per token bucket `LlmTokenUsage`/[`LlmTokens`] carries.
+/// Four pre-resolved `llm.client.token.usage` handles, one per token bucket
+/// `LlmTokenUsage`/[`LlmTokens`] carries, ALL sharing the same `provider`
+/// and `tenant` attribute values. [`TokenUsageStatHandles::for_provider`]
+/// hands back the sentinel-tenant ("no authenticated caller") set;
+/// [`GenAiTokenStats::record_usage`] builds the real-tenant equivalent
+/// per call, via [`Registry::resolve_capped`] -- see that method's doc and
+/// the module doc's WP-55 section for why this one attribute can't be
+/// pre-resolved at boot the way the other two are.
 #[derive(Debug, Clone, Copy)]
 pub struct TokenUsageHandles {
     pub input: Handle,
@@ -420,18 +444,23 @@ pub struct TokenUsageHandles {
     pub cache_creation: Handle,
 }
 
-/// Provider (= cluster) name -> [`TokenUsageHandles`], mirroring
+/// Provider (= cluster) name -> [`TokenUsageHandles`] resolved for
+/// [`instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT`] (WP-55: the one tenant
+/// value known ahead of time, for unauthenticated traffic), mirroring
 /// [`StatHandles`]'s `by_cluster` table shape and cadence exactly -- see that
-/// struct's doc.
+/// struct's doc. Also doubles as the "is this a known provider at all" gate
+/// [`GenAiTokenStats::record_usage`] checks before resolving anything
+/// tenant-specific -- an unresolved provider must stay a no-op regardless of
+/// tenant, same as before WP-55.
 pub struct TokenUsageStatHandles {
     by_provider: ArcSwap<HashMap<String, TokenUsageHandles>>,
 }
 
 impl TokenUsageStatHandles {
-    /// Resolves all four `llm.client.token.usage` series for every name
-    /// in `provider_names` (the boot snapshot's cluster names -- any
-    /// cluster can be the member a request actually dials, ground rule #6)
-    /// against `control`. Called once, at boot.
+    /// Resolves the sentinel-tenant `llm.client.token.usage` series for
+    /// every name in `provider_names` (the boot snapshot's cluster names --
+    /// any cluster can be the member a request actually dials, ground rule
+    /// #6) against `control`. Called once, at boot.
     pub fn build<'a>(
         control: &StatsControl,
         provider_names: impl IntoIterator<Item = &'a str>,
@@ -443,9 +472,10 @@ impl TokenUsageStatHandles {
         table
     }
 
-    /// Resolves all four buckets for every name in `provider_names` this
-    /// table doesn't already have an entry for. Called again on a SIGHUP
-    /// reload, same as [`StatHandles::resolve_missing`] -- see that doc.
+    /// Resolves the sentinel-tenant buckets for every name in
+    /// `provider_names` this table doesn't already have an entry for.
+    /// Called again on a SIGHUP reload, same as
+    /// [`StatHandles::resolve_missing`] -- see that doc.
     pub fn resolve_missing<'a>(
         &self,
         control: &StatsControl,
@@ -466,7 +496,11 @@ impl TokenUsageStatHandles {
             let resolve_bucket = |bucket: &str| {
                 control.resolve(
                     &instruments::LLM_CLIENT_TOKEN_USAGE,
-                    &[("provider", name), ("type", bucket)],
+                    &[
+                        ("provider", name),
+                        ("type", bucket),
+                        ("tenant", instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT),
+                    ],
                 )
             };
             let handles = TokenUsageHandles {
@@ -483,8 +517,8 @@ impl TokenUsageStatHandles {
         }
     }
 
-    /// Looks up `provider`'s pre-resolved handles, or `None` if this table
-    /// was never told about that provider.
+    /// Looks up `provider`'s pre-resolved (sentinel-tenant) handles, or
+    /// `None` if this table was never told about that provider.
     pub fn for_provider(&self, provider: &str) -> Option<TokenUsageHandles> {
         self.by_provider.load().get(provider).copied()
     }
@@ -527,17 +561,76 @@ impl GenAiTokenStats {
     /// `access_logging::LoggingBody::finish`, which only calls this when
     /// usage IS present at all). `provider` must be the cluster actually
     /// dialled, never the routed cluster name -- see ground rule #6. A
-    /// no-op, not a panic, for an unresolved provider.
-    pub fn record_usage(&self, provider: &str, tokens: LlmTokens) {
-        match self.handles.for_provider(provider) {
-            Some(h) => {
-                self.registry.incr(self.worker, h.input, tokens.input);
-                self.registry.incr(self.worker, h.output, tokens.output);
-                self.registry.incr(self.worker, h.cached, tokens.cached);
-                self.registry
-                    .incr(self.worker, h.cache_creation, tokens.cache_creation);
-            }
-            None => self.warn_unknown_provider_once(provider),
+    /// no-op, not a panic, for an unresolved provider -- checked BEFORE
+    /// `tenant` is even looked at, so an unknown provider stays silent
+    /// regardless of tenant, same as before WP-55.
+    ///
+    /// `tenant` is `StreamInfo::auth.tenant` verbatim (see
+    /// `access_logging::LoggingBody::finish`'s call site), never a
+    /// `LimitKey`/`CredentialDigest` or anything else credential-shaped --
+    /// `AuthInfo::tenant` is a plain `Option<String>`, the identifier the
+    /// auth filter resolved, not the credential that resolved it. `None`
+    /// uses the pre-resolved sentinel-tenant handles
+    /// (`self.handles.for_provider`, WP-55's boot-resolved fast path);
+    /// `Some` resolves per call, capped, via
+    /// [`Registry::resolve_capped`] -- see the module doc's WP-55 section
+    /// for why this ONE attribute can't be pre-resolved at boot.
+    pub fn record_usage(&self, provider: &str, tenant: Option<&str>, tokens: LlmTokens) {
+        let Some(no_tenant) = self.handles.for_provider(provider) else {
+            self.warn_unknown_provider_once(provider);
+            return;
+        };
+        let h = match tenant {
+            None => no_tenant,
+            Some(tenant_id) => self.resolve_tenant_handles(provider, tenant_id),
+        };
+        self.registry.incr(self.worker, h.input, tokens.input);
+        self.registry.incr(self.worker, h.output, tokens.output);
+        self.registry.incr(self.worker, h.cached, tokens.cached);
+        self.registry
+            .incr(self.worker, h.cache_creation, tokens.cache_creation);
+    }
+
+    /// WP-55: the dynamic half of tenant resolution -- called once per
+    /// [`Self::record_usage`] when `tenant` is `Some`, never cached across
+    /// calls in THIS type (there is nothing here to cache: `Registry`'s own
+    /// dedup map, behind `resolve_capped`, already makes a repeat call for
+    /// the same `(provider, tenant)` cheap and idempotent -- see that
+    /// method's doc). `provider` is assumed already known (`record_usage`
+    /// checks that first), so every bucket resolved here is real, budgeted
+    /// growth or a reuse of the shared overflow series -- never wasted on a
+    /// provider this process doesn't serve.
+    fn resolve_tenant_handles(&self, provider: &str, tenant: &str) -> TokenUsageHandles {
+        // Rust note: `overflow_attrs` is built INSIDE the closure, one array
+        // per call, rather than factored into its own closure returning
+        // `[(&str, &str); 3]` -- that shape ties the returned array's
+        // lifetime to the closure parameter `bucket`'s own per-call
+        // lifetime, and a plain (non-generic) closure can't be generic over
+        // that the way a `fn` can, so the borrow checker can't unify it
+        // across the four calls below. Inlining sidesteps the question
+        // entirely: each call's `overflow_attrs` only needs to live for the
+        // one `resolve_capped` call that borrows it.
+        let resolve_bucket = |bucket: &str| {
+            let overflow_attrs = [
+                ("provider", provider),
+                ("type", bucket),
+                (
+                    "tenant",
+                    instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ];
+            self.registry.resolve_capped(
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[("provider", provider), ("type", bucket), ("tenant", tenant)],
+                instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
+                &overflow_attrs,
+            )
+        };
+        TokenUsageHandles {
+            input: resolve_bucket("input"),
+            output: resolve_bucket("output"),
+            cached: resolve_bucket("cached"),
+            cache_creation: resolve_bucket("cache_creation"),
         }
     }
 
@@ -724,7 +817,7 @@ mod tests {
         let registry = control.registry();
         let stats = GenAiTokenStats::new(registry.clone(), handles.clone(), WorkerId(0));
 
-        stats.record_usage("openai", sample_tokens());
+        stats.record_usage("openai", None, sample_tokens());
 
         let h = handles.for_provider("openai").unwrap();
         assert_eq!(registry.value(h.input), 40);
@@ -740,8 +833,8 @@ mod tests {
         let registry = control.registry();
         let stats = GenAiTokenStats::new(registry.clone(), handles.clone(), WorkerId(0));
 
-        stats.record_usage("openai", sample_tokens());
-        stats.record_usage("openai", sample_tokens());
+        stats.record_usage("openai", None, sample_tokens());
+        stats.record_usage("openai", None, sample_tokens());
 
         // Each bucket accumulates independently -- proves the four `incr`
         // calls are wired to four distinct handles, not one shared one that
@@ -758,7 +851,278 @@ mod tests {
         let registry = control.registry();
         let stats = GenAiTokenStats::new(registry, handles, WorkerId(0));
 
-        // Must not panic -- "openai" is known, "anthropic" is not.
-        stats.record_usage("anthropic", sample_tokens());
+        // Must not panic -- "openai" is known, "anthropic" is not. Checked
+        // with a real tenant too: an unknown provider must stay silent
+        // regardless of the tenant dimension (WP-55).
+        stats.record_usage("anthropic", None, sample_tokens());
+        stats.record_usage("anthropic", Some("acme"), sample_tokens());
+    }
+
+    // ---- WP-55: the `tenant` dimension ------------------------------------
+
+    #[test]
+    fn a_known_tenant_gets_its_own_series_carrying_its_own_id() {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
+        let registry = control.registry();
+        let stats = GenAiTokenStats::new(registry.clone(), handles, WorkerId(0));
+
+        stats.record_usage("openai", Some("acme-corp"), sample_tokens());
+
+        // Resolved independently, straight off the instrument's own attrs
+        // -- proves the value landed on the wire as the literal tenant id
+        // "acme-corp", not a hash, a digest, or a generic "authenticated"
+        // marker.
+        let independently_resolved = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "acme-corp"),
+            ],
+            instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+        );
+        assert_eq!(registry.value(independently_resolved), 40);
+    }
+
+    #[test]
+    fn two_tenants_of_the_same_provider_get_independent_series() {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
+        let registry = control.registry();
+        let stats = GenAiTokenStats::new(registry.clone(), handles, WorkerId(0));
+
+        stats.record_usage("openai", Some("acme-corp"), sample_tokens());
+        stats.record_usage(
+            "openai",
+            Some("widgetco"),
+            LlmTokens {
+                input: 1,
+                output: 1,
+                cached: 0,
+                cache_creation: 0,
+            },
+        );
+
+        let for_tenant = |tenant: &str| {
+            registry.resolve_capped(
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[
+                    ("provider", "openai"),
+                    ("type", "input"),
+                    ("tenant", tenant),
+                ],
+                instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
+                &[
+                    ("provider", "openai"),
+                    ("type", "input"),
+                    (
+                        "tenant",
+                        instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                    ),
+                ],
+            )
+        };
+        assert_eq!(registry.value(for_tenant("acme-corp")), 40);
+        assert_eq!(registry.value(for_tenant("widgetco")), 1);
+    }
+
+    #[test]
+    fn unauthenticated_traffic_still_records_under_the_no_tenant_sentinel() {
+        // Requirement 2: usage is not skipped just because there was no
+        // authenticated caller -- it lands on the boot-resolved sentinel
+        // series (`for_provider`'s own handles), same place it landed before
+        // WP-55 added the dimension.
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
+        let registry = control.registry();
+        let stats = GenAiTokenStats::new(registry.clone(), handles.clone(), WorkerId(0));
+
+        stats.record_usage("openai", None, sample_tokens());
+
+        let h = handles.for_provider("openai").unwrap();
+        assert_eq!(
+            registry.value(h.input),
+            40,
+            "unauthenticated usage must still be counted"
+        );
+
+        // And it is genuinely a DIFFERENT series from any real tenant's --
+        // an unauthenticated caller must never be folded into (or mistaken
+        // for) an authenticated tenant's usage.
+        let acme = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "acme-corp"),
+            ],
+            instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+        );
+        assert_ne!(h.input, acme);
+        assert_eq!(registry.value(acme), 0);
+    }
+
+    /// Requirement 4 (rule 17: verify in the code, not the comment claiming
+    /// it): `record_usage` takes `tenant: Option<&str>` -- a plain string,
+    /// the SAME type `StreamInfo::auth.tenant` is. There is no `LimitKey`,
+    /// no `CredentialDigest`, no hashing anywhere on this path; the value
+    /// that reaches the registry's `tenant` attribute is byte-for-byte
+    /// whatever this test passes in, including a string that LOOKS like key
+    /// material -- proving nothing here transforms, hashes, or otherwise
+    /// launders it (there is simply nothing in this file capable of doing
+    /// that to it).
+    #[test]
+    fn the_tenant_attribute_is_the_plain_id_never_a_digest_or_key() {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
+        let registry = control.registry();
+        let stats = GenAiTokenStats::new(registry.clone(), handles, WorkerId(0));
+
+        let credential_shaped_tenant = "llmp_should-never-be-hashed";
+        stats.record_usage("openai", Some(credential_shaped_tenant), sample_tokens());
+
+        let h = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", credential_shaped_tenant),
+            ],
+            instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+        );
+        assert_eq!(
+            registry.value(h),
+            40,
+            "the exact string passed as `tenant` must be the attribute value resolved against \
+             -- a hash or digest would resolve a DIFFERENT series and this lookup would find 0"
+        );
+    }
+
+    /// Requirement 3: the cardinality mitigation. A ceiling of 4 (one
+    /// tenant's worth of buckets) lets exactly one real tenant through;
+    /// every subsequent, never-seen tenant collapses onto the single
+    /// overflow series instead of growing the registry further -- proven
+    /// through the real production entry point (`record_usage`), not just
+    /// `Registry::resolve_capped` in isolation (that mechanism is unit
+    /// tested directly in `proxy_observability::stats`).
+    #[test]
+    fn cardinality_ceiling_folds_excess_tenants_into_one_shared_series() {
+        const CEILING: usize = instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING;
+        // Sanity on the fixture, not the mitigation: this test only holds
+        // together if a whole tenant (4 buckets) fits under the real
+        // ceiling, which it always will unless the ceiling is ever dropped
+        // below 4 -- fail loudly, at COMPILE time, rather than let a
+        // nonsensical low ceiling silently defeat the test below.
+        const _: () = assert!(instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING >= 4);
+
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
+        let registry = control.registry();
+        let stats = GenAiTokenStats::new(registry.clone(), handles, WorkerId(0));
+
+        // Exhaust the ceiling with distinct tenants first (each resolved
+        // directly, cheaply -- one bucket is enough to consume its "slot"
+        // for this test's purposes since the ceiling counts raw series).
+        for i in 0..CEILING {
+            let tenant = format!("filler-tenant-{i}");
+            registry.resolve_capped(
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[
+                    ("provider", "openai"),
+                    ("type", "input"),
+                    ("tenant", tenant.as_str()),
+                ],
+                CEILING,
+                &[
+                    ("provider", "openai"),
+                    ("type", "input"),
+                    (
+                        "tenant",
+                        instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                    ),
+                ],
+            );
+        }
+
+        // Two BRAND NEW tenants, past the ceiling, via the real
+        // `record_usage` entry point.
+        stats.record_usage("openai", Some("tenant-over-the-line-a"), sample_tokens());
+        stats.record_usage("openai", Some("tenant-over-the-line-b"), sample_tokens());
+
+        let overflow = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+            CEILING,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+        );
+        assert_eq!(
+            registry.value(overflow),
+            80,
+            "both overflowing tenants' usage (40 input tokens each) must land on the ONE \
+             shared overflow series -- the mitigation drops the DIMENSION, not the \
+             MEASUREMENT: usage is still counted, just no longer distinguishable by tenant"
+        );
+
+        // Neither overflowing tenant got its own series.
+        let a = registry.resolve_capped(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                ("tenant", "tenant-over-the-line-a"),
+            ],
+            CEILING,
+            &[
+                ("provider", "openai"),
+                ("type", "input"),
+                (
+                    "tenant",
+                    instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
+                ),
+            ],
+        );
+        assert_eq!(
+            a, overflow,
+            "an overflowing tenant must resolve to the shared series"
+        );
     }
 }
