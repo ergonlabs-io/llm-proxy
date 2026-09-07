@@ -55,6 +55,33 @@ fn lb_endpoint(host: &str, port: u32) -> endpoint_v3::LbEndpoint {
     }
 }
 
+/// Same as [`lb_endpoint`], with `metadata.filter_metadata[namespace]` set
+/// to the given single string field. Used by the WP-56 metadata tests below.
+fn lb_endpoint_with_metadata(
+    host: &str,
+    port: u32,
+    namespace: &str,
+    field: &str,
+    value: prost_types::Value,
+) -> endpoint_v3::LbEndpoint {
+    let mut lbe = lb_endpoint(host, port);
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(field.to_string(), value);
+    let mut filter_metadata = std::collections::HashMap::new();
+    filter_metadata.insert(namespace.to_string(), prost_types::Struct { fields });
+    lbe.metadata = Some(core_v3::Metadata {
+        filter_metadata,
+        ..Default::default()
+    });
+    lbe
+}
+
+fn string_value(s: &str) -> prost_types::Value {
+    prost_types::Value {
+        kind: Some(prost_types::value::Kind::StringValue(s.to_string())),
+    }
+}
+
 /// A `ClusterLoadAssignment` for `cluster_name`, with one locality per
 /// `endpoints` group given.
 fn assignment(
@@ -263,5 +290,69 @@ fn an_eds_endpoint_with_a_hostname_instead_of_a_literal_ip_is_refused() {
         reason.contains("without name resolution"),
         "the message must say why a hostname cannot be used, not just that it was refused: \
          {reason}"
+    );
+}
+
+// -------------------------------------------------------------- WP-56: metadata --
+
+/// The EDS half of WP-56: an EDS-delivered `LbEndpoint.metadata` under the
+/// `io.llmproxy.endpoint` namespace lowers into `EndpointIR::metadata` the
+/// same way the static `load_assignment` path does (see
+/// `endpoint_metadata.rs` for that half) -- this is the whole point for the
+/// consumer who asked, since an operator-facing label attached only at
+/// bootstrap-load time would never reach a host EDS adds later.
+#[test]
+fn an_eds_delivered_endpoints_metadata_lowers_into_endpoint_ir() {
+    let la = assignment(
+        "payments-primary",
+        vec![vec![lb_endpoint_with_metadata(
+            "10.0.0.1",
+            8080,
+            "io.llmproxy.endpoint",
+            "region",
+            string_value("us-east-1"),
+        )]],
+    );
+    let any = any_of(&la, ENDPOINTS_TYPE);
+
+    let (_, endpoints) = lower_dynamic_endpoints(&any, "eds.assignments[payments-primary]")
+        .expect("io.llmproxy.endpoint metadata must lower");
+
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(
+        endpoints[0].metadata.get("region").map(String::as_str),
+        Some("us-east-1")
+    );
+}
+
+/// `envoy.lb` on an EDS-delivered endpoint is refused exactly as it is on a
+/// bootstrap-loaded one -- EDS gets no exemption from ground rule #1.
+#[test]
+fn an_eds_delivered_endpoints_envoy_lb_metadata_is_refused() {
+    let la = assignment(
+        "payments-primary",
+        vec![vec![lb_endpoint_with_metadata(
+            "10.0.0.1",
+            8080,
+            "envoy.lb",
+            "canary",
+            string_value("true"),
+        )]],
+    );
+    let any = any_of(&la, ENDPOINTS_TYPE);
+
+    let err = lower_dynamic_endpoints(&any, "eds.assignments[payments-primary]")
+        .expect_err("envoy.lb must be refused over EDS too");
+    let ConfigError::UnsupportedField { field_path, reason } = &err else {
+        panic!("expected UnsupportedField, got: {err}");
+    };
+    assert_eq!(
+        field_path,
+        "eds.assignments[payments-primary].endpoints[0].lb_endpoints[0]\
+         .metadata.filter_metadata[\"envoy.lb\"]"
+    );
+    assert!(
+        reason.contains("subset routing"),
+        "message must explain envoy.lb is a subset-routing selector, got: {reason}"
     );
 }

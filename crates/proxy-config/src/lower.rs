@@ -483,7 +483,11 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         ],
         "envoy.config.endpoint.v3.ClusterLoadAssignment" => &["cluster_name", "endpoints"],
         "envoy.config.endpoint.v3.LocalityLbEndpoints" => &["lb_endpoints", "priority"],
-        "envoy.config.endpoint.v3.LbEndpoint" => &["endpoint", "load_balancing_weight"],
+        // WP-56: `metadata` lowers into `EndpointIR::metadata` -- see
+        // `convert_endpoint_metadata`. `health_status` stays off this list;
+        // nothing consumes EDS-reported health today, so a config setting it
+        // must fail loudly rather than have the value silently dropped.
+        "envoy.config.endpoint.v3.LbEndpoint" => &["endpoint", "load_balancing_weight", "metadata"],
         "envoy.config.endpoint.v3.Endpoint" => &["address"],
         "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy" => &[
             "stat_prefix",
@@ -3941,6 +3945,79 @@ fn percent(value: Option<u32>, default: u8, path: &str) -> Result<u8, ConfigErro
     }
 }
 
+/// Namespace key this proxy uses to carry operator-facing labels through
+/// `LbEndpoint.metadata.filter_metadata` -- see `EndpointIR::metadata`'s doc
+/// comment in `ir.rs` for the full design.
+const ENDPOINT_METADATA_KEY: &str = "io.llmproxy.endpoint";
+
+/// Lower `LbEndpoint.metadata.filter_metadata["io.llmproxy.endpoint"]` into
+/// [`EndpointIR::metadata`]. Every field's value must be a plain string; any
+/// other shape (a number, bool, nested object, or list) is a hard error
+/// naming its full dotted path rather than a stringified guess -- an
+/// operator who wrote `weight: 5` there meant something specific, and this
+/// isn't the field that carries LB weight (`load_balancing_weight` is).
+///
+/// Unlike [`convert_provider_auth_metadata`], which leaves every namespace
+/// other than its own alone, EVERY namespace other than ours is refused
+/// outright here, by dotted path. `envoy.lb` is named explicitly: it is
+/// Envoy's own LB subset-routing selector, and this proxy implements no
+/// subset routing, so silently accepting it into a map nothing routes on
+/// would leave an operator's exclusion list installed but never enforced --
+/// ground rule #1's exact failure mode. Any third namespace gets the same
+/// refusal with a plainer "unknown namespace" message.
+fn convert_endpoint_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<std::collections::BTreeMap<String, String>, ConfigError> {
+    let Some(metadata) = metadata else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let filter_metadata_path = format!("{path}.metadata.filter_metadata");
+
+    // Rust note: `filter_metadata` is a `HashMap`, so sort keys before
+    // reporting one to keep the error deterministic across runs.
+    let mut namespaces: Vec<&String> = metadata.filter_metadata.keys().collect();
+    namespaces.sort();
+    for ns in namespaces {
+        if ns == ENDPOINT_METADATA_KEY {
+            continue;
+        }
+        let ns_path = format!("{filter_metadata_path}[\"{ns}\"]");
+        if ns == "envoy.lb" {
+            return Err(unsupported(
+                ns_path,
+                "`envoy.lb` is Envoy's LB subset-routing selector; this proxy implements no \
+                 subset routing, so accepting it here would silently send traffic to \
+                 endpoints the operator meant to exclude",
+            ));
+        }
+        return Err(unsupported(
+            ns_path,
+            format!("unknown metadata namespace; only `{ENDPOINT_METADATA_KEY}` is supported"),
+        ));
+    }
+
+    let Some(fields) = metadata.filter_metadata.get(ENDPOINT_METADATA_KEY) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let ns_path = format!("{filter_metadata_path}[\"{ENDPOINT_METADATA_KEY}\"]");
+
+    // Rust note: same determinism reason as the namespace sort above.
+    let mut keys: Vec<&String> = fields.fields.keys().collect();
+    keys.sort();
+    let mut out = std::collections::BTreeMap::new();
+    for key in keys {
+        let value = &fields.fields[key];
+        match &value.kind {
+            Some(prost_types::value::Kind::StringValue(v)) => {
+                out.insert(key.clone(), v.clone());
+            }
+            _ => return Err(invalid(format!("{ns_path}.{key}"), "must be a string")),
+        }
+    }
+    Ok(out)
+}
+
 fn convert_endpoint(
     lbe: &endpoint_v3::LbEndpoint,
     priority: u32,
@@ -3993,7 +4070,7 @@ fn convert_endpoint(
         ));
     }
     Ok(EndpointIR {
-        metadata: Default::default(),
+        metadata: convert_endpoint_metadata(lbe.metadata.as_ref(), path)?,
         host,
         port,
         weight: lbe.load_balancing_weight.unwrap_or(1),
