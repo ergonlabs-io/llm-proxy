@@ -32,7 +32,7 @@ use proxy_observability::stats::{
 };
 use tokio::net::TcpStream;
 
-use crate::server::{serve, AdminServer};
+use crate::server::{serve, AdminServer, Readiness, ReadinessProbe};
 
 /// The HMAC secret every write-API test's `ControlPlane` and matching
 /// [`VirtualKeyAuthenticator`] are built with -- arbitrary, but shared
@@ -189,13 +189,47 @@ async fn start_with_registry(
     .await
 }
 
-/// The full [`serve`] parameter set -- what the write-API tests need to
-/// supply a real `ControlPlane` (via `factory_state`) and/or a bearer token.
+/// [`start`], but with an explicit [`ReadinessProbe`] -- what WP-21 increment
+/// 3's `/ready` tests need. No registry, no `SharedFactoryState`, no admin
+/// token: the same "only the one thing this test is about" shape as
+/// [`start_with_registry`].
+async fn start_with_readiness(
+    snapshot: Arc<ConfigSnapshot>,
+    readiness: ReadinessProbe,
+) -> (AdminServer, SocketAddr) {
+    start_full_with_readiness(
+        snapshot,
+        None,
+        Arc::new(SharedFactoryState::default()),
+        None,
+        Some(readiness),
+    )
+    .await
+}
+
+/// The full [`serve`] parameter set MINUS `readiness` -- what every write-API
+/// test needs to supply a real `ControlPlane` (via `factory_state`) and/or a
+/// bearer token. Kept as its own (unchanged-signature) function rather than
+/// adding a fifth parameter here, so the ~30 existing call sites that predate
+/// WP-21 increment 3 don't all need touching for a param none of them cares
+/// about -- see [`start_full_with_readiness`] for the one that does.
 async fn start_full(
     snapshot: Arc<ConfigSnapshot>,
     registry: Option<Arc<Registry>>,
     factory_state: Arc<SharedFactoryState>,
     admin_token: Option<String>,
+) -> (AdminServer, SocketAddr) {
+    start_full_with_readiness(snapshot, registry, factory_state, admin_token, None).await
+}
+
+/// The full [`serve`] parameter set, including `readiness` -- see
+/// [`start_full`]'s doc for why that one stays four params.
+async fn start_full_with_readiness(
+    snapshot: Arc<ConfigSnapshot>,
+    registry: Option<Arc<Registry>>,
+    factory_state: Arc<SharedFactoryState>,
+    admin_token: Option<String>,
+    readiness: Option<ReadinessProbe>,
 ) -> (AdminServer, SocketAddr) {
     // Rust note: `SnapshotHandles::register` both builds the handle and
     // enrolls it, the same path production code (`WorkerPool::spawn`, and
@@ -209,6 +243,7 @@ async fn start_full(
         Instant::now(),
         factory_state,
         admin_token,
+        readiness,
     )
     .await
     .expect("admin server bind");
@@ -443,6 +478,47 @@ async fn ready_returns_live() {
     let (status, body) = get(addr, "/ready").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "LIVE");
+}
+
+/// WP-21 increment 3: no probe wired keeps the pre-existing behavior --
+/// `200 "LIVE"` -- rather than inventing a new failure mode for a caller
+/// (like [`start`]/[`ready_returns_live`] above) that never had a
+/// `ClusterManager` to ask. This test asserts the SAME thing via the
+/// explicit-`None` path through [`start_full`] instead of [`start`], so a
+/// future change to [`start`]'s defaults can't silently stop covering it.
+#[tokio::test]
+async fn ready_with_no_probe_wired_stays_live() {
+    let (_server, addr) = start_full_with_readiness(
+        snapshot_with_secret(),
+        None,
+        Arc::new(SharedFactoryState::default()),
+        None,
+        None,
+    )
+    .await;
+    let (status, body) = get(addr, "/ready").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "LIVE");
+}
+
+#[tokio::test]
+async fn ready_reports_live_when_the_probe_says_so() {
+    let probe: ReadinessProbe = Arc::new(|| Readiness::Live);
+    let (_server, addr) = start_with_readiness(snapshot_with_secret(), probe).await;
+    let (status, body) = get(addr, "/ready").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "LIVE");
+}
+
+#[tokio::test]
+async fn ready_returns_503_initializing_when_the_probe_says_so() {
+    let probe: ReadinessProbe = Arc::new(|| Readiness::Initializing {
+        warming: vec!["still-warming".to_string()],
+    });
+    let (_server, addr) = start_with_readiness(snapshot_with_secret(), probe).await;
+    let (status, body) = get(addr, "/ready").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, "INITIALIZING");
 }
 
 #[tokio::test]

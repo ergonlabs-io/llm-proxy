@@ -92,6 +92,43 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
 /// allowlist.
 const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
 
+/// What `/ready` should report, as decided by whoever injects the
+/// [`ReadinessProbe`] -- this crate never asks a `ClusterManager` itself
+/// (rule 2 in CLAUDE.md: generated protos and their consuming crates stay out
+/// of `proxy-admin`; the analogous discipline here is "no data-plane crate
+/// dependency", matching `proxy-xds::apply::Publish`'s seam).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readiness {
+    /// Serve traffic: `/ready` returns `200 "LIVE"`.
+    Live,
+    /// At least one cluster has not resolved yet and the caller's warming
+    /// deadline (if any) has not passed: `/ready` returns `503
+    /// "INITIALIZING"`. `warming` names the still-unresolved clusters, for
+    /// logging by whoever built the probe -- this module does not log it
+    /// itself (WP-21 increment 3's spec: `/ready` is polled on a tight loop
+    /// by orchestrators, so logging on every call would become the
+    /// incident; the one-shot "deadline expired" warning belongs to the
+    /// probe's owner, `crates/proxy/src/main.rs`, which knows when the
+    /// deadline fires and can suppress repeats).
+    Initializing { warming: Vec<String> },
+}
+
+/// Where `/ready` gets its answer. A plain synchronous closure (not `async`,
+/// unlike [`proxy_xds::apply::Publish`]) because the real implementation
+/// (`crates/proxy/src/main.rs`) only reads atomics off a `ClusterManager` --
+/// no I/O, nothing to await. `Arc<dyn Fn...>` rather than a `Box` because it
+/// is cloned into every accepted connection's task alongside `config` and
+/// `registry` (see [`serve`]'s accept loop) -- an `Arc` clone is a refcount
+/// bump; a `Box` would need to be reconstructed or the closure would need to
+/// be `Clone` itself, which a `dyn Fn` cannot be.
+///
+/// This crate never depends on `proxy-cluster` to build one -- see this
+/// module's doc and [`Readiness`]'s doc for why. When `serve` is called with
+/// `None` (no probe wired), `/ready` keeps its pre-WP-21 behavior, `200
+/// "LIVE"` unconditionally, rather than inventing a new failure mode for
+/// callers (mostly tests) that never had a `ClusterManager` to ask.
+pub type ReadinessProbe = Arc<dyn Fn() -> Readiness + Send + Sync>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("admin server failed to bind {addr}: {source}")]
@@ -152,6 +189,8 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
 /// it at startup. `admin_token` gates every WRITE endpoint (`/keys`,
 /// `/tenants`, ...); see [`normalize_admin_token`] and [`handle`]'s gate for
 /// the fail-closed semantics -- READ endpoints are unaffected by it.
+/// `readiness` (WP-21 increment 3) answers `/ready`; see [`ReadinessProbe`]'s
+/// doc for why it is an injected closure and what `None` means.
 ///
 /// Rust note: `TcpListener::accept` runs in a loop inside a `tokio::spawn`led
 /// task; each accepted connection gets its own further-spawned task running
@@ -165,6 +204,7 @@ pub async fn serve(
     started_at: Instant,
     factory_state: Arc<SharedFactoryState>,
     admin_token: Option<String>,
+    readiness: Option<ReadinessProbe>,
 ) -> Result<AdminServer, AdminError> {
     let admin_token = normalize_admin_token(admin_token);
     let listener = TcpListener::bind(addr)
@@ -188,12 +228,14 @@ pub async fn serve(
             let registry = registry.clone();
             let factory_state = factory_state.clone();
             let admin_token = admin_token.clone();
+            let readiness = readiness.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let config = config.clone();
                     let registry = registry.clone();
                     let factory_state = factory_state.clone();
                     let admin_token = admin_token.clone();
+                    let readiness = readiness.clone();
                     async move {
                         Ok::<_, std::convert::Infallible>(
                             handle(
@@ -203,6 +245,7 @@ pub async fn serve(
                                 started_at,
                                 &factory_state,
                                 admin_token.as_deref(),
+                                readiness.as_ref(),
                             )
                             .await,
                         )
@@ -231,12 +274,25 @@ async fn handle(
     started_at: Instant,
     factory_state: &SharedFactoryState,
     admin_token: Option<&str>,
+    readiness: Option<&ReadinessProbe>,
 ) -> Response<Full<Bytes>> {
     // ---- Read endpoints: byte-for-byte the read-only increment's behavior,
     // no gate, matched on path alone (as before -- these never distinguished
     // method). ----
     match req.uri().path() {
-        "/ready" => return text(StatusCode::OK, "LIVE"),
+        // WP-21 increment 3: no probe wired keeps the pre-existing
+        // unconditional `200 "LIVE"` -- see `ReadinessProbe`'s doc for why
+        // that is a deliberate "no new failure mode" default rather than an
+        // invented one for callers (mostly tests) with no `ClusterManager`
+        // to ask.
+        "/ready" => {
+            return match readiness.map(|probe| probe()) {
+                None | Some(Readiness::Live) => text(StatusCode::OK, "LIVE"),
+                Some(Readiness::Initializing { .. }) => {
+                    text(StatusCode::SERVICE_UNAVAILABLE, "INITIALIZING")
+                }
+            }
+        }
         "/config_dump" => {
             let snapshot = config.load();
             return json(StatusCode::OK, &ConfigDump::from_snapshot(&snapshot));
