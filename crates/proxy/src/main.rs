@@ -27,7 +27,10 @@ use proxy_core::drain::{
 };
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
-use proxy_xds::{AdsClient, Publish, Reconnect, ResourceApplier, Subscription, SubscriptionState};
+use proxy_xds::{
+    AdsClient, Publish, PublishEndpoints, Reconnect, ResourceApplier, Subscription,
+    SubscriptionState,
+};
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Channel;
 
@@ -726,6 +729,7 @@ async fn run_serve(
         &snapshot,
         service_node.as_deref(),
         service_cluster.as_deref(),
+        &cluster_manager,
     );
 
     let publisher = WorkerPool::spawn(
@@ -1106,6 +1110,9 @@ async fn reload(
 const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 /// Full `type_url` an LDS `DiscoveryRequest` subscribes to.
 const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
+/// Full `type_url` an EDS `DiscoveryRequest` subscribes to. Same duplication
+/// as [`CDS_TYPE_URL`]/[`LDS_TYPE_URL`], and the same reason.
+const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 
 /// What `ResourceApplier`'s `Publish` callback sends to `run_serve`'s control
 /// loop for one accepted `DiscoveryResponse`: an owned snapshot to apply, and
@@ -1149,8 +1156,13 @@ fn effective_node(
 /// fatal to `run_serve` (PLAN.md 8.5: keep serving last-good/static config):
 /// - `snapshot.ads` is `None`: no `dynamic_resources` in bootstrap, today's
 ///   behavior for every release through v0.2.0, untouched by this increment.
-/// - neither `lds` nor `cds` is enabled: nothing to subscribe to, logged at
-///   `info!`.
+/// - none of `lds`, `cds`, or a statically-declared EDS cluster asks for
+///   anything: nothing to subscribe to, logged at `info!`. EDS has no
+///   bootstrap flag of its own -- Envoy expresses it per cluster, via
+///   `eds_cluster_config.eds_config.ads`, already lowered into
+///   `ClusterConfig.eds` -- so this gate also starts an ADS client for a
+///   bootstrap that enables neither `lds` nor `cds` but declares a `Cluster`
+///   whose membership comes over EDS.
 /// - the named ADS cluster has no endpoints: a config error, logged at
 ///   `error!` with the cluster name -- config lowering already guarantees the
 ///   cluster itself exists in `static_resources` (`AdsConfig`'s own doc), so
@@ -1165,14 +1177,16 @@ fn start_ads(
     snapshot: &Arc<ConfigSnapshot>,
     service_node: Option<&str>,
     service_cluster: Option<&str>,
+    cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
 ) -> Option<mpsc::Receiver<AdsApplyMsg>> {
     let ads = snapshot.ads.as_ref()?;
 
-    if !ads.lds && !ads.cds {
+    let has_static_eds_cluster = snapshot.clusters.values().any(|c| c.eds.is_some());
+    if !ads.lds && !ads.cds && !has_static_eds_cluster {
         tracing::info!(
             cluster = %ads.cluster,
-            "ADS configured but neither `lds` nor `cds` is enabled; nothing to subscribe to, \
-             not starting an ADS client"
+            "ADS configured but none of `lds`, `cds`, or a statically-declared EDS cluster asks \
+             for anything; nothing to subscribe to, not starting an ADS client"
         );
         return None;
     }
@@ -1213,14 +1227,6 @@ fn start_ads(
         }
     };
     let mut grpc_client = AggregatedDiscoveryServiceClient::new(channel);
-
-    let mut states = Vec::new();
-    if ads.cds {
-        states.push(SubscriptionState::new(CDS_TYPE_URL, Subscription::Wildcard));
-    }
-    if ads.lds {
-        states.push(SubscriptionState::new(LDS_TYPE_URL, Subscription::Wildcard));
-    }
 
     let node = effective_node(&ads.node, service_node, service_cluster);
 
@@ -1284,7 +1290,57 @@ fn start_ads(
         })
     });
 
-    let applier = ResourceApplier::new(Arc::clone(snapshot), publish);
+    // WP-21 increment 2b-iii: an accepted EDS endpoint update goes straight
+    // to `ClusterManager::accept_eds_update` -- an `arc_swap` store on the
+    // cluster's own `HostSet`, nothing more -- rather than through the
+    // `apply_tx`/`Publish` channel above. That channel exists because a
+    // CDS/LDS response runs the WHOLE `apply_snapshot` sequence (install
+    // clusters into `cluster_manager`, THEN publish to every worker), and
+    // `Publish`'s own doc comment is what explains why that sequencing needs
+    // a round trip through this function's control loop. Installing
+    // endpoints into a cluster that already exists needs none of that -- the
+    // cluster is already live, and there is no worker-visible snapshot to
+    // publish -- so this sink calls `accept_eds_update` directly on the
+    // `Arc<ClusterManager>` this closure closes over, instead of inventing a
+    // second channel back to the same loop.
+    let cluster_manager = Arc::clone(cluster_manager);
+    let endpoint_sink: PublishEndpoints = Box::new(move |name, endpoints| {
+        let cluster_manager = Arc::clone(&cluster_manager);
+        Box::pin(async move {
+            cluster_manager
+                .accept_eds_update(&name, &endpoints)
+                .map(|_diff| ())
+                .map_err(|err| err.to_string())
+        })
+    });
+
+    let applier =
+        ResourceApplier::new(Arc::clone(snapshot), publish).with_endpoint_sink(endpoint_sink);
+
+    let mut states = Vec::new();
+    if ads.cds {
+        states.push(SubscriptionState::new(CDS_TYPE_URL, Subscription::Wildcard));
+    }
+    if ads.lds {
+        states.push(SubscriptionState::new(LDS_TYPE_URL, Subscription::Wildcard));
+    }
+    // Seeded from the applier's OWN view of the boot snapshot, not left to
+    // populate itself after the first response arrives. `ResponseHandler::
+    // desired_names` (which `client.rs`'s pump calls) is only consulted
+    // AFTER a response, so without this seed a bootstrap that declares a
+    // static EDS cluster against a control plane that serves only EDS (never
+    // any CDS/LDS response to trigger a `desired_names` call) would never
+    // send an initial EDS subscription at all and sit there forever. Built
+    // as `Subscription::Names`, never `Subscription::Wildcard` -- EDS is a
+    // by-name subscription (S8), and an empty name set renders identically
+    // to a wildcard on the wire (`SubscriptionState::has_nothing_to_request`'s
+    // own doc), which would ask for every EDS resource the control plane has
+    // instead of none.
+    states.push(SubscriptionState::new(
+        EDS_TYPE_URL,
+        Subscription::Names(applier.eds_resource_names()),
+    ));
+
     let mut client = AdsClient::new(states).with_node(node);
     let reconnect = Reconnect::real();
 

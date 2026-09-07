@@ -115,6 +115,15 @@ pub type Publish =
 /// stay free of that edge, exactly as `apply.rs`'s own module doc says of
 /// `proxy-config`).
 ///
+/// The first parameter is a **cluster name** (`Cluster.name`, what
+/// `ClusterManager::accept_eds_update` is keyed by) -- NOT the EDS resource
+/// name the `ClusterLoadAssignment` arrived under. Envoy allows those to
+/// differ (`EdsClusterConfig.service_name` names the resource; a cluster may
+/// even leave it unset and subscribe under its own name) and allows several
+/// clusters to share one EDS resource, so `on_eds_response` resolves resource
+/// name to cluster name(s) itself before ever calling this sink -- see its
+/// own doc.
+///
 /// Unlike `Publish`, this one returns `Result<(), String>`. Endpoints do not
 /// go into a `ConfigSnapshot` at all -- they go straight to the cluster
 /// manager, which is a fallible operation for real (a DNS-discovery cluster
@@ -369,9 +378,17 @@ impl ResourceApplier {
     /// EDS has no `finish` call -- unlike CDS/LDS, an accepted endpoint
     /// update never touches `ConfigSnapshot` or `self.publish` (see
     /// `endpoints`'s own doc); it goes straight to the injected
-    /// [`PublishEndpoints`] sink instead, once per name actually `added` or
-    /// `updated` (never `unchanged` -- that suppression is the whole point of
-    /// `Entry`'s byte comparison).
+    /// [`PublishEndpoints`] sink instead, once per **cluster** actually fed by
+    /// a resource `added` or `updated` (never `unchanged` -- that suppression
+    /// is the whole point of `Entry`'s byte comparison).
+    ///
+    /// A `ClusterLoadAssignment`'s own `cluster_name` field is the EDS
+    /// resource name -- what `EdsClusterConfig.service_name` subscribes to --
+    /// not necessarily any `Cluster.name`; Envoy allows those to differ and
+    /// allows several clusters to share one resource. So this resolves each
+    /// resource to every cluster in `self.current` whose `eds.service_name`
+    /// names it, and calls the sink once per matching cluster, with that
+    /// cluster's OWN name -- never the resource name straight through.
     async fn on_eds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
         let Some(sink) = self.endpoint_sink.as_mut() else {
             return Verdict::Reject(format!(
@@ -412,31 +429,64 @@ impl ResourceApplier {
         // store -- BEFORE the sink below has run. See `SotwSet::forget`'s own
         // doc for why that ordering needs a fix-up rather than being left
         // alone: this increment's chosen fix is (a), forgetting exactly the
-        // names whose sink call failed, so a later retransmission of
-        // identical bytes reads as `added` again instead of `unchanged` and
-        // reaches the sink a second time. Names that succeeded stay recorded
-        // -- there is no reason to make the sink redo work it already did.
-        let mut failed = Vec::new();
+        // RESOURCE names for which any fed cluster's sink call failed, so a
+        // later retransmission of identical bytes reads as `added` again
+        // instead of `unchanged` and reaches the sink a second time. Names
+        // that succeeded stay recorded -- there is no reason to make the sink
+        // redo work it already did. The store stays keyed by resource name
+        // throughout (it is a cache of what arrived on the wire); only the
+        // sink call itself is keyed by cluster name.
+        let mut failed_resources: BTreeSet<String> = BTreeSet::new();
+        let mut failure_detail: Vec<String> = Vec::new();
         for name in outcome.added.iter().chain(outcome.updated.iter()) {
             let entry = self
                 .endpoints
                 .get(name)
                 .expect("a name SotwSet::apply just reported added/updated must be present");
             let endpoints = (*entry.ir).clone();
-            if let Err(err) = sink(name.clone(), endpoints).await {
-                failed.push((name.clone(), err));
+
+            // Resolve resource name -> cluster name(s): every cluster in the
+            // CURRENT snapshot whose `eds_cluster_config.service_name` names
+            // this resource. Not the `Any`'s own name -- see this method's
+            // doc.
+            let cluster_names: Vec<String> = self
+                .current
+                .clusters
+                .iter()
+                .filter(|(_, cluster)| {
+                    cluster.eds.as_ref().map(|eds| &eds.service_name) == Some(name)
+                })
+                .map(|(cluster_name, _)| cluster_name.clone())
+                .collect();
+
+            if cluster_names.is_empty() {
+                // A control plane pushing a resource nobody subscribed to is
+                // ITS bug, not a reason to NACK the whole response and stall
+                // every other resource in it that DID match a cluster --
+                // same "loud, not a reject" shape as `shadowed_by_static` in
+                // `finish` above.
+                tracing::warn!(
+                    resource = %name,
+                    "EDS resource `{name}` matches no cluster's `eds_cluster_config.service_name`; \
+                     accepted on the wire but not installed anywhere"
+                );
+                continue;
+            }
+
+            for cluster_name in cluster_names {
+                if let Err(err) = sink(cluster_name.clone(), endpoints.clone()).await {
+                    failed_resources.insert(name.clone());
+                    failure_detail.push(format!("{cluster_name} (resource `{name}`): {err}"));
+                }
             }
         }
 
-        if !failed.is_empty() {
-            let names: BTreeSet<String> = failed.iter().map(|(name, _)| name.clone()).collect();
-            self.endpoints.forget(&names);
-            let detail = failed
-                .into_iter()
-                .map(|(name, err)| format!("{name}: {err}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Verdict::Reject(format!("EDS endpoint sink rejected: {detail}"));
+        if !failed_resources.is_empty() {
+            self.endpoints.forget(&failed_resources);
+            return Verdict::Reject(format!(
+                "EDS endpoint sink rejected: {}",
+                failure_detail.join("; ")
+            ));
         }
 
         Verdict::Accept
