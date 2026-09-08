@@ -65,6 +65,7 @@ use crate::auth::{
 use crate::control::{
     ControlPlane, ControlPlaneStore, InMemoryControlPlaneStore, RedbControlPlaneStore,
 };
+use crate::control_redis::RedisControlPlaneStore;
 
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
@@ -73,6 +74,57 @@ fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigEr
     ConfigError::InvalidValue {
         field_path: field_path.into(),
         reason: reason.into(),
+    }
+}
+
+/// Reads an `envoy.config.core.v3.DataSource` message's bytes -- shared by
+/// [`parse_hmac_secret`]'s `hmac_secret` and [`parse_store`]'s
+/// `shared.url`. `field_path` is the CALLER's own dotted path (e.g.
+/// `typed_config.hmac_secret`, `typed_config.store.shared.url`) so every
+/// error below still names exactly where the offending value came from --
+/// this function itself never sees the full path to the `DataSource`
+/// message, only the field one level up.
+///
+/// Only `filename` and `inline_string` specifiers are supported -- not
+/// because either call site could not read the others, but because
+/// `DataSource`'s supported surface is declared once for the whole project
+/// (`proxy-config`'s `allowed_fields`), and `environment_variable` /
+/// `inline_bytes` are not implemented at the other sites `DataSource`
+/// already appears (TLS certificates, `direct_response` bodies). Widening
+/// it here would silently claim support at those sites too.
+fn read_data_source_bytes(
+    data_source: &DynamicMessage,
+    field_path: &str,
+) -> Result<Vec<u8>, ConfigError> {
+    if data_source.has_field_by_name("filename") {
+        let filename = data_source
+            .get_field_by_name("filename")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        // The io::Error's Display never includes file contents -- only the
+        // path and a kernel-level reason (e.g. "No such file or
+        // directory") -- so it is safe to fold straight into the reason
+        // string. Never read the file again for logging purposes.
+        let raw = fs::read(&filename)
+            .map_err(|e| invalid(format!("{field_path}.filename"), format!("{e}")))?;
+        // Trailing whitespace is stripped -- see `auth::secret_bytes_from_file`
+        // for why this is load-bearing rather than tidy (`echo secret > file`
+        // adds a newline that would otherwise silently become part of the
+        // value). `--mode keygen` reads `hmac_secret`'s file through the
+        // same function, so the generator and this verifier cannot disagree;
+        // a `shared.url` file gets the identical treatment for the identical
+        // reason (`echo redis://... > file` appends a newline too).
+        Ok(crate::auth::secret_bytes_from_file(&raw).to_vec())
+    } else if data_source.has_field_by_name("inline_string") {
+        Ok(data_source
+            .get_field_by_name("inline_string")
+            .and_then(|v| v.as_str().map(|s| s.as_bytes().to_vec()))
+            .unwrap_or_default())
+    } else {
+        Err(invalid(
+            field_path,
+            "only `filename` and `inline_string` data source specifiers are supported",
+        ))
     }
 }
 
@@ -91,34 +143,7 @@ fn parse_hmac_secret(config: &DynamicMessage) -> Result<Vec<u8>, ConfigError> {
         .and_then(|v| v.as_message().cloned())
         .ok_or_else(|| invalid("typed_config.hmac_secret", "must be a DataSource message"))?;
 
-    let bytes = if data_source.has_field_by_name("filename") {
-        let filename = data_source
-            .get_field_by_name("filename")
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default();
-        // The io::Error's Display never includes file contents -- only the
-        // path and a kernel-level reason (e.g. "No such file or
-        // directory") -- so it is safe to fold straight into the reason
-        // string. Never read the file again for logging purposes.
-        let raw = fs::read(&filename)
-            .map_err(|e| invalid("typed_config.hmac_secret.filename", format!("{e}")))?;
-        // Trailing whitespace is stripped -- see `auth::secret_bytes_from_file`
-        // for why this is load-bearing rather than tidy (`echo secret > file`
-        // adds a newline that would otherwise silently become part of the
-        // key). `--mode keygen` reads the same file through the same
-        // function, so the generator and this verifier cannot disagree.
-        crate::auth::secret_bytes_from_file(&raw).to_vec()
-    } else if data_source.has_field_by_name("inline_string") {
-        data_source
-            .get_field_by_name("inline_string")
-            .and_then(|v| v.as_str().map(|s| s.as_bytes().to_vec()))
-            .unwrap_or_default()
-    } else {
-        return Err(invalid(
-            "typed_config.hmac_secret",
-            "only `filename` and `inline_string` data source specifiers are supported",
-        ));
-    };
+    let bytes = read_data_source_bytes(&data_source, "typed_config.hmac_secret")?;
 
     if bytes.is_empty() {
         // `ring::hmac::Key::new` happily accepts a zero-length key, which
@@ -178,10 +203,39 @@ fn parse_digest_hex(raw: &str, index: usize) -> Result<Vec<u8>, ConfigError> {
 /// WHEN to build one -- see [`AuthFilterFactory::create`], which builds the
 /// real store only inside the shared-singleton closure, so a persistent
 /// store's file is opened exactly once per serve.
-#[derive(Debug)]
 enum StoreSpec {
     InMemory,
     Persistent(String),
+    /// WP-62 increment 3: the Redis-backed shared store. `url` may embed a
+    /// Redis password (`redis://:password@host:6379/0`) -- see the hand-
+    /// written [`std::fmt::Debug`] impl below for why this variant does
+    /// NOT derive it.
+    Shared {
+        url: String,
+        namespace: Option<String>,
+    },
+}
+
+// Rust note: `StoreSpec` does NOT derive `Debug` -- a derived one would print
+// `Shared`'s `url` verbatim, and that url may carry a Redis password. This
+// hand-written impl prints every other variant exactly as the derive would,
+// but replaces `Shared`'s url with a fixed placeholder and prints only its
+// namespace. `AuthConfig` (below) holds a `StoreSpec` and itself derives
+// `Debug`; a derive only ever calls through to each field's own `Debug`
+// impl, so the redaction here is what keeps that derive safe too. If this
+// impl is ever "tidied" back into a derive, the password comes back with it.
+impl std::fmt::Debug for StoreSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreSpec::InMemory => write!(f, "InMemory"),
+            StoreSpec::Persistent(path) => f.debug_tuple("Persistent").field(path).finish(),
+            StoreSpec::Shared { namespace, .. } => f
+                .debug_struct("Shared")
+                .field("url", &"<redacted>")
+                .field("namespace", namespace)
+                .finish(),
+        }
+    }
 }
 
 /// Reads `typed_config.store` (the `oneof` on `llmproxy.filters.v0.Authentication`).
@@ -205,6 +259,45 @@ fn parse_store(config: &DynamicMessage) -> Result<StoreSpec, ConfigError> {
             ));
         }
         Ok(StoreSpec::Persistent(path))
+    } else if config.has_field_by_name("shared") {
+        let shared = config
+            .get_field_by_name("shared")
+            .and_then(|v| v.as_message().cloned())
+            .ok_or_else(|| invalid("typed_config.store.shared", "must be a message"))?;
+        if !shared.has_field_by_name("url") {
+            return Err(invalid(
+                "typed_config.store.shared.url",
+                "is required and must not be empty",
+            ));
+        }
+        let data_source = shared
+            .get_field_by_name("url")
+            .and_then(|v| v.as_message().cloned())
+            .ok_or_else(|| {
+                invalid(
+                    "typed_config.store.shared.url",
+                    "must be a DataSource message",
+                )
+            })?;
+        let bytes = read_data_source_bytes(&data_source, "typed_config.store.shared.url")?;
+        // A non-UTF-8 file (or inline_string, though prost-reflect cannot
+        // produce non-UTF-8 bytes from a proto `string` field) is a named
+        // error, not a lossy conversion -- `String::from_utf8_lossy` would
+        // silently mangle a malformed URL into one that then fails to parse
+        // somewhere else, with nothing here to explain why.
+        let url = String::from_utf8(bytes)
+            .map_err(|_| invalid("typed_config.store.shared.url", "must be valid UTF-8"))?;
+        if url.is_empty() {
+            return Err(invalid(
+                "typed_config.store.shared.url",
+                "is required and must not be empty",
+            ));
+        }
+        let namespace = shared
+            .get_field_by_name("namespace")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+        Ok(StoreSpec::Shared { url, namespace })
     } else {
         // Covers both `in_memory` explicitly set and the oneof left unset --
         // the proto's doc makes unset's default explicit.
@@ -432,6 +525,36 @@ impl HttpFilterFactory for AuthFilterFactory {
                             invalid(
                                 "typed_config.store.persistent.path",
                                 format!("could not open the control-plane store: {e}"),
+                            )
+                        })?)
+                    }
+                    StoreSpec::Shared { url, namespace } => {
+                        // Verified against redis 0.27.6's `connection.rs`
+                        // (the version pinned in the workspace `Cargo.toml`):
+                        // `RedisControlPlaneStore::open`/`open_with_namespace`
+                        // call ONLY `redis::Client::open`, which performs no
+                        // I/O -- it parses the URL into a `ConnectionInfo`
+                        // and nothing more. Every `fail!` reachable from that
+                        // parse (`IntoConnectionInfo for &str`,
+                        // `url_to_tcp_connection_info`) carries a FIXED,
+                        // static description -- "Redis URL did not parse",
+                        // "Missing hostname", "Invalid database number", and
+                        // so on -- with no case that interpolates the URL,
+                        // host, username, or password. `StoreError::Unavailable`'s
+                        // `Display` (`store_err`) is therefore safe to fold
+                        // into the reason string here, exactly as the
+                        // `persistent` arm above does for its own
+                        // `StoreError`. The dotted path already names where
+                        // the URL came from, so the URL itself is still
+                        // never echoed.
+                        let store = match namespace {
+                            Some(ns) => RedisControlPlaneStore::open_with_namespace(&url, ns),
+                            None => RedisControlPlaneStore::open(&url),
+                        };
+                        Box::new(store.map_err(|e| {
+                            invalid(
+                                "typed_config.store.shared.url",
+                                format!("could not open the shared control-plane store: {e}"),
                             )
                         })?)
                     }
@@ -725,6 +848,32 @@ mod tests {
         let mut store = DynamicMessage::new(persistent_store_desc());
         store.set_field_by_name("path", prost_reflect::Value::String(path.to_string()));
         config.set_field_by_name("persistent", prost_reflect::Value::Message(store));
+        config
+    }
+
+    fn shared_store_desc() -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.SharedStore")
+            .expect("SharedStore is compiled into proxy-api")
+    }
+
+    /// Sets `typed_config.store` to `shared { url: <inline_string> }`.
+    fn with_shared_store(mut config: DynamicMessage, url: &str) -> DynamicMessage {
+        let mut store = DynamicMessage::new(shared_store_desc());
+        store.set_field_by_name("url", prost_reflect::Value::Message(inline_secret(url)));
+        config.set_field_by_name("shared", prost_reflect::Value::Message(store));
+        config
+    }
+
+    /// As [`with_shared_store`], but the url comes from a `filename`
+    /// `DataSource` instead of `inline_string`.
+    fn with_shared_store_filename(
+        mut config: DynamicMessage,
+        path: &std::path::Path,
+    ) -> DynamicMessage {
+        let mut store = DynamicMessage::new(shared_store_desc());
+        store.set_field_by_name("url", prost_reflect::Value::Message(filename_secret(path)));
+        config.set_field_by_name("shared", prost_reflect::Value::Message(store));
         config
     }
 
@@ -1716,6 +1865,113 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    // --- WP-62 increment 3: the `shared` (Redis) store -------------------------
+
+    // 27: an inline-string url parses to `StoreSpec::Shared` with no namespace.
+    #[test]
+    fn parse_store_returns_shared_for_an_inline_url() {
+        let config = with_shared_store(
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            "redis://127.0.0.1:6390/0",
+        );
+        match parse_store(&config).expect("a shared store with an inline url must parse") {
+            StoreSpec::Shared { url, namespace } => {
+                assert_eq!(url, "redis://127.0.0.1:6390/0");
+                assert_eq!(namespace, None);
+            }
+            other => panic!("expected StoreSpec::Shared, got {other:?}"),
+        }
+    }
+
+    // 28: a `filename`-sourced url has its trailing newline stripped, exactly
+    // like `hmac_secret` -- `echo redis://... > file` appends one.
+    #[test]
+    fn parse_store_reads_a_url_from_a_filename_and_strips_a_trailing_newline() {
+        let path = std::env::temp_dir().join(format!(
+            "llm-proxy-auth-filter-test-shared-url-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"redis://127.0.0.1:6390/0\n").expect("write temp url file");
+
+        let config = with_shared_store_filename(
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            &path,
+        );
+        let result = parse_store(&config);
+        std::fs::remove_file(&path).ok();
+
+        match result.expect("a shared store with a filename url must parse") {
+            StoreSpec::Shared { url, .. } => {
+                assert_eq!(
+                    url, "redis://127.0.0.1:6390/0",
+                    "the file's trailing newline must not become part of the url"
+                );
+            }
+            other => panic!("expected StoreSpec::Shared, got {other:?}"),
+        }
+    }
+
+    // 29: an empty url is InvalidValue at the exact dotted path, like an empty
+    // `persistent.path`.
+    #[test]
+    fn parse_store_rejects_an_empty_shared_url_with_its_field_path() {
+        let config = with_shared_store(
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            "",
+        );
+        let err = parse_store(&config).expect_err("an empty shared.url must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.store.shared.url");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // 30: an unsupported DataSource specifier under `shared.url` is rejected
+    // with its dotted path, same as `hmac_secret`.
+    #[test]
+    fn parse_store_rejects_an_unsupported_data_source_specifier_under_shared_url() {
+        let mut store = DynamicMessage::new(shared_store_desc());
+        store.set_field_by_name(
+            "url",
+            prost_reflect::Value::Message(environment_variable_secret("REDIS_URL")),
+        );
+        let mut config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+        config.set_field_by_name("shared", prost_reflect::Value::Message(store));
+
+        let err = parse_store(&config).expect_err("environment_variable must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.store.shared.url");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // 31: THE redaction test -- the whole point of `StoreSpec`'s hand-written
+    // `Debug` impl. A Redis URL can carry a password
+    // (`redis://:password@host/`); the `Debug` render of a `StoreSpec::Shared`
+    // holding one must never contain it.
+    #[test]
+    fn shared_store_spec_debug_never_contains_the_password() {
+        let spec = StoreSpec::Shared {
+            url: "redis://:hunter2@127.0.0.1:6390/0".to_string(),
+            namespace: Some("my-namespace".to_string()),
+        };
+        let rendered = format!("{spec:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "StoreSpec::Shared's Debug render must never contain the url's password: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("my-namespace"),
+            "the namespace is not secret and should still be visible for debugging: \
+             {rendered}"
+        );
     }
 
     // --- SharedFactoryState scope fix: two chains must never collide -----------

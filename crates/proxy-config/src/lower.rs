@@ -400,9 +400,14 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "virtual_keys",
             "in_memory",
             "persistent",
+            "shared",
             "poll_interval_seconds",
         ],
         "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
+        // WP-62 increment 3: the Redis-backed shared store. `url` is an
+        // `envoy.config.core.v3.DataSource`, already listed above under its
+        // own entry -- same reasoning as `hmac_secret`.
+        "llmproxy.filters.v0.SharedStore" => &["url", "namespace"],
         // Only the `io.llmproxy.provider_auth` namespace under
         // `filter_metadata` is understood -- see
         // `convert_provider_auth_metadata`. `typed_filter_metadata` is not

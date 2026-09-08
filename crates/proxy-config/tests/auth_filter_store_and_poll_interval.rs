@@ -102,6 +102,77 @@ fn an_auth_filter_configuring_a_persistent_store_lowers() {
 }
 
 #[test]
+fn an_auth_filter_configuring_a_shared_store_lowers() {
+    let yaml = listener_yaml(
+        r#"                      shared:
+                        url: { inline_string: "redis://127.0.0.1:6390/0" }
+"#,
+    );
+    let snapshot = snapshot_from(&yaml).expect(
+        "a config selecting `shared` must lower cleanly -- the allowed_fields entry must \
+         list `shared` under its own field name, exactly like `persistent`",
+    );
+    let config = auth_config(&snapshot);
+    let shared = config
+        .get_field_by_name("shared")
+        .and_then(|v| v.as_message().cloned())
+        .expect("`shared` must survive the surface walk into the filter's own config");
+    let url = shared
+        .get_field_by_name("url")
+        .and_then(|v| v.as_message().cloned())
+        .expect("`shared.url` must survive the surface walk");
+    assert_eq!(
+        url.get_field_by_name("inline_string")
+            .and_then(|v| v.as_str().map(str::to_string)),
+        Some("redis://127.0.0.1:6390/0".to_string()),
+    );
+}
+
+#[test]
+fn an_auth_filter_configuring_a_shared_store_with_a_namespace_lowers() {
+    let yaml = listener_yaml(
+        r#"                      shared:
+                        url: { inline_string: "redis://127.0.0.1:6390/0" }
+                        namespace: "tenant-a-deployment"
+"#,
+    );
+    let snapshot = snapshot_from(&yaml)
+        .expect("a `shared` store with an explicit `namespace` must lower cleanly");
+    let config = auth_config(&snapshot);
+    let shared = config
+        .get_field_by_name("shared")
+        .and_then(|v| v.as_message().cloned())
+        .expect("`shared` must survive the surface walk");
+    assert_eq!(
+        shared
+            .get_field_by_name("namespace")
+            .and_then(|v| v.as_str().map(str::to_string)),
+        Some("tenant-a-deployment".to_string()),
+    );
+}
+
+/// Proves the `"llmproxy.filters.v0.SharedStore" => &["url", "namespace"]`
+/// allowlist entry is doing real work, not just present: an unknown field
+/// under `shared` must be rejected by the strict surface walk with its own
+/// dotted path, exactly like any other unlisted field in this project.
+#[test]
+fn an_unknown_field_under_shared_store_is_rejected_with_its_dotted_path() {
+    let yaml = listener_yaml(
+        r#"                      shared:
+                        url: { inline_string: "redis://127.0.0.1:6390/0" }
+                        unknown_field: "surprise"
+"#,
+    );
+    let err = snapshot_from(&yaml)
+        .expect_err("an unknown field under `shared` must be rejected, not silently ignored");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("unknown_field"),
+        "the error must name the offending field; got: {rendered}"
+    );
+}
+
+#[test]
 fn an_auth_filter_setting_poll_interval_seconds_lowers() {
     let yaml = listener_yaml("                      poll_interval_seconds: 90\n");
     let snapshot = snapshot_from(&yaml).expect(
