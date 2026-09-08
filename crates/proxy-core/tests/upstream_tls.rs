@@ -104,6 +104,7 @@ async fn spawn_tls_http_upstream(
     body: &'static [u8],
 ) -> SocketAddr {
     let spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(cert, key)],
         params: default_params(),
         alpn_protocols: vec![],

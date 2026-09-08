@@ -2161,6 +2161,11 @@ fn convert_downstream_tls(
 
     Ok(DownstreamTlsSpec {
         certificates,
+        // WP-22 increment 2a lowers `tls_certificate_sds_secret_configs` here.
+        // Unreachable-empty rather than a silent drop until then: the field is
+        // absent from `CommonTlsContext`'s `allowed_fields` entry, so a config
+        // that sets it is refused by dotted path before reaching this line.
+        certificate_sds_names: Vec::new(),
         params,
         alpn_protocols: common.alpn_protocols.clone(),
         validation,

@@ -100,6 +100,22 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     //     still inert; each says what will read it, corrected 2026-09-05 to
     //     name the increment that actually will.
     AllowlistEntry {
+        struct_name: "DownstreamTlsSpec",
+        field_name: "certificate_sds_names",
+        kind: EntryKind::KnownInert,
+        reason: "WP-22 increment 2: the IR shape landed one commit ahead of \
+                  its lowering and its reader, because delegation rule 4 keeps \
+                  ir.rs's public shape in the orchestrator while the rest of \
+                  increment 2a is delegated. Nothing constructs a non-empty \
+                  value yet -- `convert_downstream_tls` writes Vec::new() and \
+                  `tls_certificate_sds_secret_configs` is still absent from \
+                  `CommonTlsContext`'s allowed_fields, so no config can reach \
+                  it. Increment 2a's `ResourceApplier::sds_resource_names` \
+                  (proxy-xds) is the first reader. DELETE THIS ENTRY THEN -- \
+                  this list is re-checked, so it will fail the moment the \
+                  reader lands, which is the intent.",
+    },
+    AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "ads",
         kind: EntryKind::KnownInert,

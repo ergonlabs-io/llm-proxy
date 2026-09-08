@@ -150,6 +150,7 @@ async fn happy_path_round_trip_and_version() {
     let server_cert = mint_leaf(&ca, &["server.example.com"], &server_key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &server_key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -195,6 +196,7 @@ async fn version_negotiation_falls_back_to_tls12() {
     let server_cert = mint_leaf(&ca, &["server.example.com"], &server_key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &server_key)],
         params: default_params(), // server: V1_2..=V1_3
         alpn_protocols: vec![],
@@ -232,6 +234,7 @@ async fn alpn_negotiates_h2() {
     let server_cert = mint_leaf(&ca, &["server.example.com"], &server_key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &server_key)],
         params: default_params(),
         alpn_protocols: vec!["h2".to_string(), "http/1.1".to_string()],
@@ -263,6 +266,7 @@ async fn dual_cert_all_default_client_gets_ecdsa() {
     let rsa_cert = mint_leaf(&ca, &["server.example.com"], &rsa_key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![
             tls_cert_ir(&rsa_cert, &rsa_key),
             tls_cert_ir(&ecdsa_cert, &ecdsa_key),
@@ -299,6 +303,7 @@ async fn no_validation_upstream_accepts_self_signed_server() {
     let cert = mint_self_signed("self-signed.example.com", &key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&cert, &key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -328,6 +333,7 @@ async fn trusted_ca_upstream_rejects_wrong_ca() {
     let server_cert = mint_leaf(&other_ca, &["server.example.com"], &key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -361,6 +367,7 @@ async fn trusted_ca_upstream_bypasses_hostname_mismatch() {
     let server_cert = mint_leaf(&ca, &["server.example.com"], &key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -393,6 +400,7 @@ async fn mtls_requires_client_cert_when_mandatory() {
     let client_cert = mint_leaf(&ca, &["client.example.com"], &client_key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &server_key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -448,6 +456,7 @@ async fn hot_reload_serves_new_certificate() {
     let cert_b = mint_leaf(&ca, &["server.example.com"], &key_b);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&cert_a, &key_a)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -506,6 +515,7 @@ async fn handshake_with_upstream_san_matchers(
     std::io::Error,
 > {
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(server_cert, server_key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -634,6 +644,7 @@ async fn san_matcher_downstream_client_cert_dns_match_succeeds() {
     let client_cert = mint_leaf(&ca, &["client.example.com"], &client_key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &server_key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -668,6 +679,7 @@ async fn san_matcher_downstream_client_cert_dns_mismatch_fails() {
     let client_cert = mint_leaf(&ca, &["client.example.com"], &client_key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&server_cert, &server_key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -710,6 +722,7 @@ async fn expired_certificate_rejected_by_default() {
     let expired_cert = mint_expired_leaf(&ca, &["server.example.com"], &key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&expired_cert, &key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -743,6 +756,7 @@ async fn allow_expired_certificate_accepts_expired_cert_with_right_ca() {
     let expired_cert = mint_expired_leaf(&ca, &["server.example.com"], &key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&expired_cert, &key)],
         params: default_params(),
         alpn_protocols: vec![],
@@ -772,6 +786,7 @@ async fn allow_expired_certificate_still_rejects_wrong_ca() {
     let expired_cert = mint_expired_leaf(&other_ca, &["server.example.com"], &key);
 
     let downstream_spec = DownstreamTlsSpec {
+        certificate_sds_names: Vec::new(),
         certificates: vec![tls_cert_ir(&expired_cert, &key)],
         params: default_params(),
         alpn_protocols: vec![],

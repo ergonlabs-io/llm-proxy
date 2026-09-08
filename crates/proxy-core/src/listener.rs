@@ -2470,6 +2470,7 @@ mod tests {
 
     fn downstream_tls_spec(cert: &rcgen::Certificate, key: &KeyPair) -> DownstreamTlsSpec {
         DownstreamTlsSpec {
+            certificate_sds_names: Vec::new(),
             certificates: vec![tls_cert_ir(cert, key)],
             params: tls_params(),
             alpn_protocols: vec![],
@@ -3024,6 +3025,7 @@ mod tests {
             "unused",
         );
         listener_ir.filter_chains[0].transport_socket = Some(DownstreamTlsSpec {
+            certificate_sds_names: Vec::new(),
             certificates: vec![TlsCertificateIR {
                 cert_chain: DataSourceIR::Inline("not a certificate".to_string()),
                 private_key: DataSourceIR::Inline("not a key".to_string()),
@@ -3052,6 +3054,7 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let mut listener_ir = match_all_listener("l1", addr, "unused");
             listener_ir.filter_chains[0].transport_socket = Some(DownstreamTlsSpec {
+                certificate_sds_names: Vec::new(),
                 certificates: vec![TlsCertificateIR {
                     cert_chain: DataSourceIR::Inline("garbage".to_string()),
                     private_key: DataSourceIR::Inline("garbage".to_string()),

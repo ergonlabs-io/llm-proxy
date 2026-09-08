@@ -1479,9 +1479,33 @@ pub enum HeaderAppendAction {
 /// implements.
 #[derive(Debug)]
 pub struct DownstreamTlsSpec {
-    /// At least one; multiple entries = one cert per key type (RSA + ECDSA),
-    /// selected per-handshake like Envoy/BoringSSL.
+    /// Inline certificates. Multiple entries = one cert per key type (RSA +
+    /// ECDSA), selected per-handshake like Envoy/BoringSSL.
+    ///
+    /// Empty ONLY when [`Self::certificate_sds_names`] is non-empty -- the
+    /// two are mutually exclusive and exactly one of them is set. Lowering
+    /// enforces both halves of that invariant; nothing else constructs this
+    /// struct.
     pub certificates: Vec<TlsCertificateIR>,
+    /// `CommonTlsContext.tls_certificate_sds_secret_configs` names, in
+    /// declaration order (WP-22 increment 2). Non-empty means the serving
+    /// certificates arrive over SDS and the listener binds with an EMPTY
+    /// cert set: it accepts TCP and fails every TLS handshake until the
+    /// control plane delivers, rather than serving in the clear.
+    ///
+    /// **Divergence from Envoy, deliberate.** Envoy documents
+    /// `tls_certificate_sds_secret_configs` as *ignored* when
+    /// `tls_certificates` is also set. Silently ignoring a set field is
+    /// exactly what ground rule #1 forbids, so lowering rejects the mixed
+    /// case with its dotted path instead of applying Envoy's precedence.
+    /// Recorded in `internal-docs/envoy-divergences.md`.
+    ///
+    /// Each name here must carry an ADS `sds_config`; an `SdsSecretConfig`
+    /// with no `sds_config` means "look this up in
+    /// `static_resources.secrets`", which is [`ConfigSnapshot::secrets`] --
+    /// still a stub ([`TlsSecret`] carries only a name), so lowering refuses
+    /// it by path rather than resolving to nothing.
+    pub certificate_sds_names: Vec<SecretName>,
     pub params: TlsParametersIR,
     /// Offered via ALPN in server order; empty = no ALPN extension.
     pub alpn_protocols: Vec<String>,
