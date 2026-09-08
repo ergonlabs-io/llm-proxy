@@ -33,6 +33,10 @@ base64 = { workspace = true }
 redb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# WP-62: `RedbControlPlaneStore`'s Redis-backed sibling -- see
+# `control_redis.rs`'s module doc for the key layout and why `add_spend`
+# needs a Lua script rather than a pipeline.
+redis = { workspace = true }
 # WP-34: warns loudly (rather than failing closed) when a budget applies to a
 # request but usage could not be read -- see `token_limit_filter`'s module doc.
 tracing = { workspace = true }

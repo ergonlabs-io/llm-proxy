@@ -60,6 +60,7 @@ pub mod auth_filter;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
 pub mod control;
+pub mod control_redis;
 pub mod jwt_auth;
 pub mod model_authz;
 pub mod model_authz_filter;
