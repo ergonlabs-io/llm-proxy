@@ -52,12 +52,17 @@
 //!    `on_sds_response` lower their resource and hand the result to an
 //!    injected [`PublishEndpoints`]/[`PublishSecrets`] sink, the same
 //!    seam-not-dependency shape [`Publish`] already uses for listeners and
-//!    clusters. **What SDS increment 1 deliberately leaves undone**: nothing
-//!    names which secrets to subscribe to yet (`desired_names` still answers
-//!    `None` for SDS, same as CDS/LDS), because that naming comes from a
-//!    listener's `tls_certificate_sds_secret_configs`, which needs `ir.rs`
-//!    (owned by another lane this batch) -- increment 2's job, alongside
-//!    wiring [`PublishSecrets`] to the real `SwapCertResolver`.
+//!    clusters. **SDS names its subscription as of WP-22 increment 2a**:
+//!    [`ResourceApplier::sds_resource_names`] reads every listener's
+//!    `DownstreamTlsSpec::certificate_sds_names`, so `desired_names` answers
+//!    a real set for SDS the same way it does for EDS. **What increment 2a
+//!    still leaves undone**: an accepted secret reaches the injected
+//!    [`PublishSecrets`] sink and stops there -- nothing maps a secret name
+//!    back to the `DownstreamTlsFactory` serving that chain, so the proxy
+//!    subscribes and ACKs but does not yet serve what arrives. That registry
+//!    is increment 2b's, and until it lands an SDS-named chain binds with an
+//!    empty cert set and fails every handshake, loudly (see
+//!    `DownstreamTlsFactory::build`).
 //!
 //! # Ordering is `SotwSet::apply`'s job, not this module's
 //!
@@ -369,6 +374,31 @@ impl ResourceApplier {
             .clusters
             .values()
             .filter_map(|cluster| cluster.eds.as_ref().map(|eds| eds.service_name.clone()))
+            .collect()
+    }
+
+    /// Every secret name a listener in the current snapshot subscribes to,
+    /// across both `filter_chains` and `default_filter_chain` (WP-22
+    /// increment 2a). A `BTreeSet` both deduplicates -- two chains, or two
+    /// listeners, may name the same secret -- and orders, which is what the
+    /// subscription's name set wants.
+    ///
+    /// Only chains whose `SdsSecretConfig` carried an ADS `sds_config` reach
+    /// here: lowering refuses the name-only form (it would mean
+    /// `static_resources.secrets`, still a stub), so a non-empty
+    /// `certificate_sds_names` is always a real ADS subscription.
+    pub fn sds_resource_names(&self) -> BTreeSet<String> {
+        self.current
+            .listeners
+            .values()
+            .flat_map(|listener| {
+                listener
+                    .filter_chains
+                    .iter()
+                    .chain(listener.default_filter_chain.as_ref())
+            })
+            .filter_map(|chain| chain.transport_socket.as_ref())
+            .flat_map(|tls| tls.certificate_sds_names.iter().cloned())
             .collect()
     }
 
@@ -729,21 +759,21 @@ impl ResponseHandler for ResourceApplier {
         self.on_response(resp)
     }
 
-    /// EDS is the only type this applier derives a name set for -- CDS/LDS
-    /// are wildcard subscriptions (see `subscription.rs`'s own doc on why
-    /// `set_names` panics for those), RDS is not applied here at all, and SDS
-    /// -- though applied, as of WP-22 increment 1 -- deliberately answers
-    /// `None` too: naming which secrets to subscribe to comes from a
-    /// listener's `tls_certificate_sds_secret_configs`, which needs `ir.rs`
-    /// wiring this increment does not do (see this module's own doc).
-    /// `client.rs`'s pump calls this after every response, for every state it
-    /// holds; returning `None` for anything but EDS is what makes those calls
-    /// no-ops.
+    /// EDS and SDS are the two types this applier derives a name set for --
+    /// CDS/LDS are wildcard subscriptions (see `subscription.rs`'s own doc on
+    /// why `set_names` panics for those) and RDS is not applied here at all,
+    /// so both answer `None`. `client.rs`'s pump calls this after every
+    /// response, for every state it holds; returning `None` is what makes
+    /// those calls no-ops.
+    ///
+    /// SDS joined EDS in WP-22 increment 2a, once
+    /// `DownstreamTlsSpec::certificate_sds_names` gave the snapshot somewhere
+    /// to read the names from.
     fn desired_names(&self, type_url: &str) -> Option<BTreeSet<String>> {
-        if type_url == EDS_TYPE_URL {
-            Some(self.eds_resource_names())
-        } else {
-            None
+        match type_url {
+            EDS_TYPE_URL => Some(self.eds_resource_names()),
+            SDS_TYPE_URL => Some(self.sds_resource_names()),
+            _ => None,
         }
     }
 }

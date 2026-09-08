@@ -17,6 +17,7 @@ use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
 use proxy_api::envoy::config::listener::v3 as listener_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
+use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::{ConfigSnapshot, EndpointIR};
 use proxy_config::lower_dynamic_cluster;
@@ -29,6 +30,8 @@ const ENDPOINT_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
 const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
+const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
+const DOWNSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
 
 /// Wrap an encoded proto message as a `google.protobuf.Any`, the same shape
 /// an ADS `DiscoveryResponse.resources` entry carries on the wire.
@@ -851,4 +854,100 @@ async fn eds_resource_names_picks_up_a_static_eds_clusters_service_name() {
         names,
         std::collections::BTreeSet::from(["payments-eds".to_string()])
     );
+}
+
+// -------------------------------------------------------------------------
+// WP-22 increment 2a: SDS names its subscription from the listeners it holds.
+
+/// An `SdsSecretConfig` naming `secret` over ADS -- the only form lowering
+/// accepts (a name-only entry would mean `static_resources.secrets`, which is
+/// still a stub, so `convert_certificate_sds_configs` refuses it).
+fn ads_sds_secret_config(secret: &str) -> tls_v3::SdsSecretConfig {
+    tls_v3::SdsSecretConfig {
+        name: secret.to_string(),
+        sds_config: Some(core_v3::ConfigSource {
+            resource_api_version: core_v3::ApiVersion::V3 as i32,
+            config_source_specifier: Some(core_v3::config_source::ConfigSourceSpecifier::Ads(
+                core_v3::AggregatedConfigSource {},
+            )),
+            ..Default::default()
+        }),
+    }
+}
+
+/// [`minimal_listener`] plus a downstream TLS transport socket whose serving
+/// certificates come from SDS under `secrets`.
+fn listener_with_sds_certs(
+    name: &str,
+    cluster: &str,
+    port: u32,
+    secrets: &[&str],
+) -> listener_v3::Listener {
+    let mut listener = minimal_listener(name, cluster, port);
+    let ctx = tls_v3::DownstreamTlsContext {
+        common_tls_context: Some(tls_v3::CommonTlsContext {
+            tls_certificate_sds_secret_configs: secrets
+                .iter()
+                .map(|s| ads_sds_secret_config(s))
+                .collect(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    listener.filter_chains[0].transport_socket = Some(core_v3::TransportSocket {
+        name: "envoy.transport_sockets.tls".to_string(),
+        config_type: Some(core_v3::transport_socket::ConfigType::TypedConfig(any_of(
+            &ctx,
+            DOWNSTREAM_TLS_TYPE,
+        ))),
+    });
+    listener
+}
+
+/// An applied LDS listener whose chain names SDS secrets makes those names the
+/// SDS subscription: `desired_names` answers a real set, where before
+/// increment 2a it answered `None` for SDS unconditionally.
+#[tokio::test]
+async fn sds_desired_names_come_from_the_applied_listeners() {
+    let (publish, _published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    // Nothing applied yet: an empty set, not `None` -- an empty set is what
+    // unsubscribes, and it is the honest answer once SDS is name-driven.
+    assert_eq!(
+        applier.desired_names(SDS_TYPE_URL),
+        Some(std::collections::BTreeSet::new())
+    );
+
+    let resp = lds_response(
+        "v1",
+        &[
+            listener_with_sds_certs("l1", "my-cluster", 8443, &["cert-rsa", "cert-ecdsa"]),
+            // Same secret named twice across two listeners: deduplicated.
+            listener_with_sds_certs("l2", "my-cluster", 8444, &["cert-rsa"]),
+        ],
+    );
+    assert!(matches!(applier.on_response(&resp).await, Verdict::Accept));
+
+    assert_eq!(
+        applier.sds_resource_names(),
+        std::collections::BTreeSet::from(["cert-ecdsa".to_string(), "cert-rsa".to_string()])
+    );
+    assert_eq!(
+        applier.desired_names(SDS_TYPE_URL),
+        Some(applier.sds_resource_names())
+    );
+}
+
+/// A listener with no SDS-named chain contributes nothing -- an inline-cert or
+/// plaintext chain must not widen the subscription.
+#[tokio::test]
+async fn a_listener_without_sds_certs_names_no_secrets() {
+    let (publish, _published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let resp = lds_response("v1", &[minimal_listener("l1", "my-cluster", 8080)]);
+    assert!(matches!(applier.on_response(&resp).await, Verdict::Accept));
+
+    assert!(applier.sds_resource_names().is_empty());
 }

@@ -828,3 +828,85 @@ fn factories_are_send_sync() {
     assert_send_sync::<DownstreamTlsFactory>();
     assert_send_sync::<UpstreamTlsFactory>();
 }
+
+// ---------------------------------------------------------------------------
+// WP-22 increment 2a: an SDS-named chain binds with an empty cert set.
+
+/// The whole point of the empty build: the listener comes up, accepts the TCP
+/// connection, and fails the handshake -- it never serves in the clear, and it
+/// never refuses to start. `update_certificates` (the SDS delivery path, wired
+/// in increment 2b) then makes the same factory serve without a rebuild.
+#[tokio::test]
+async fn an_sds_named_chain_builds_empty_then_serves_after_delivery() {
+    let ca = mint_ca("test CA");
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert = mint_leaf(&ca, &["server.example.com"], &server_key);
+
+    let downstream_spec = DownstreamTlsSpec {
+        certificates: vec![],
+        certificate_sds_names: vec!["server-cert".to_string()],
+        params: default_params(),
+        alpn_protocols: vec![],
+        validation: None,
+        require_client_certificate: false,
+        disable_stateless_session_resumption: false,
+    };
+    let downstream =
+        DownstreamTlsFactory::build(&downstream_spec, "test").expect("an SDS chain must build");
+
+    let upstream_spec = UpstreamTlsSpec {
+        sni: None,
+        params: default_params(),
+        alpn_protocols: vec![],
+        client_certificate: None,
+        validation: Some(trusted_ca_validation(&ca)),
+    };
+    let upstream = UpstreamTlsFactory::build(&upstream_spec, "test").unwrap();
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let err = tokio::try_join!(
+        downstream.wrap(server_io),
+        upstream.wrap(client_io, "server.example.com")
+    )
+    .expect_err("a chain with no certificates yet must fail the handshake");
+    assert!(
+        !format!("{err}").is_empty(),
+        "the handshake must fail with a reason"
+    );
+
+    // Delivery: the same factory, no rebuild.
+    downstream
+        .update_certificates(&[tls_cert_ir(&server_cert, &server_key)], "test")
+        .expect("SDS delivery must load");
+    let (mut server, mut client) = handshake(&downstream, &upstream, "server.example.com").await;
+    client.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    server.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+}
+
+/// The invariant `DownstreamTlsSpec::certificates` documents -- exactly one of
+/// the two is set -- is enforced by lowering. A hand-built spec that breaks it
+/// must still be refused here rather than yielding a listener that binds and
+/// can never serve.
+#[test]
+fn a_spec_with_neither_certificates_nor_sds_names_is_refused() {
+    let spec = DownstreamTlsSpec {
+        certificates: vec![],
+        certificate_sds_names: vec![],
+        params: default_params(),
+        alpn_protocols: vec![],
+        validation: None,
+        require_client_certificate: false,
+        disable_stateless_session_resumption: false,
+    };
+    // Rust note: `DownstreamTlsFactory` is not `Debug`, so `expect_err` (which
+    // needs to format the Ok side) does not apply -- match the error out.
+    let Err(err) = DownstreamTlsFactory::build(&spec, "test") else {
+        panic!("neither inline certificates nor SDS names must not build");
+    };
+    assert!(
+        format!("{err}").contains("at least one certificate is required"),
+        "got: {err}"
+    );
+}
