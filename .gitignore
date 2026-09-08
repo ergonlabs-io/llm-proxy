@@ -38,3 +38,10 @@ testing/diffrig/captures/
 !internal-docs/**/*.md
 !internal-docs/**/*.yaml
 !internal-docs/**/*.json
+# The published documentation site. Every page under here is Markdown, so
+# `*.md` denied all of them by default and each one had to be `git add -f`'d
+# — which means a page an author forgot to force-add was invisible to
+# `git status` and simply never shipped. Found 2026-09-08, when a finished
+# `operations/running-in-production.md` read as "never written" because the
+# only thing `git status` showed was the sidebar entry pointing at it.
+!docs/site/**/*.md
