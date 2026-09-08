@@ -79,6 +79,7 @@ message Authentication {
   oneof store {
     InMemoryStore in_memory = 3;
     PersistentStore persistent = 4;
+    SharedStore shared = 6;
   }
 
   // How often this replica polls the store's policy generation stamp (tenant,
@@ -112,6 +113,39 @@ message PersistentStore {
   // because of a typo'd path would lose every key minted at runtime with
   // nothing in the logs to explain why.
   string path = 1;
+}
+
+// Shares every minted key, revocation, and tenant policy across every
+// replica through Redis (`RedisControlPlaneStore`, WP-62) -- the multi-
+// replica counterpart to `persistent` above. Where `persistent` gives ONE
+// process durability across its own restarts, `shared` gives EVERY replica
+// the same view: a key revoked on one replica is refused by all of them
+// within `poll_interval_seconds`, and accrued spend from every replica
+// converges on one total rather than each enforcing against its own traffic
+// alone. See `internal-docs/adr/0006-shared-state-tiers.md` for the full
+// tier taxonomy this sits in.
+message SharedStore {
+  // Required. The Redis connection URL (e.g.
+  // `redis://:password@host:6379/0`).
+  //
+  // A `DataSource` for exactly the reason `hmac_secret` above is one: a
+  // Redis URL may embed a password, so it must be able to live in a file
+  // instead of the config document.
+  //
+  // Supported specifiers are `filename` and `inline_string`, and ONLY those
+  // two, for the same reason `hmac_secret` gives: `DataSource`'s supported
+  // surface is declared once for the whole project (`proxy-config`'s
+  // `allowed_fields`), and widening it here would silently claim
+  // `environment_variable` support at the TLS and `direct_response` sites
+  // too. A config that sets either one is rejected with its dotted path
+  // rather than ignored.
+  envoy.config.core.v3.DataSource url = 1;
+
+  // Optional. Prefixes every Redis key this store touches, so two
+  // deployments (or two test runs) can share one Redis without their keys
+  // colliding. Defaults to `RedisControlPlaneStore::DEFAULT_NAMESPACE`
+  // (`"llmproxy"`) when unset or empty.
+  string namespace = 2;
 }
 
 // One virtual key. The plaintext key NEVER appears in configuration.

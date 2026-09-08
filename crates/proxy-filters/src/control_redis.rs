@@ -641,9 +641,12 @@ impl ControlPlaneStore for RedisControlPlaneStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::spend::{MicroUsd, Period};
+    use chrono::TimeZone;
+
+    use crate::spend::{Charge, MicroUsd, Period, SpendAccumulator};
 
     // ------------------------------------------------------------------
     // Unit tests: no Redis needed. `Client::open` only parses the URL, so
@@ -998,5 +1001,163 @@ mod tests {
             Some(ModelAccess::All)
         ));
         assert!(loaded.budgets.contains_key(&tenant));
+    }
+
+    // ------------------------------------------------------------------
+    // WP-62 increment 3's acceptance, at the `SpendAccumulator` level:
+    // "three processes against one Redis converge on spend" and "a killed
+    // process's backlog flushes on restart and the ledger self-heals".
+    //
+    // WHAT THESE TWO TESTS PROVE, AND WHAT THEY DO NOT: CLAUDE.md rule 15
+    // forbids a worktree-isolated agent from spawning OS processes or
+    // binding ports, so "three processes" below is three `SpendAccumulator`s
+    // with three DISTINCT `node_id`s sharing ONE `RedisControlPlaneStore`,
+    // in this one test process, and "a killed process" is a `SpendAccumulator`
+    // dropped and a fresh one built over the same store and `node_id`. This
+    // proves the STORE's dedup/composable-write path handles multiple
+    // independent writers and that a fresh accumulator resumes from the
+    // store's own total rather than the in-memory state of the one that
+    // came before it. It does NOT exercise process supervision, a real
+    // `kill -9`, socket reconnection after a network partition, or anything
+    // else that is specifically about being a separate OS process -- only
+    // the store-level convergence and resume properties those processes
+    // would rely on.
+    // ------------------------------------------------------------------
+
+    fn dt(y: i32, mo: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, mo, d, 12, 0, 0).unwrap()
+    }
+
+    fn record_micros(
+        accumulator: &SpendAccumulator,
+        tenant: &TenantId,
+        at: chrono::DateTime<chrono::Utc>,
+        m: u64,
+    ) {
+        accumulator.record(
+            tenant,
+            at,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(m)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_three_accumulators_with_distinct_node_ids_converge_on_one_total() {
+        let store: Arc<dyn ControlPlaneStore> = Arc::new(test_store("three-way"));
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 7);
+        let period_key = Period::Daily.key_for(now);
+
+        // THREE DISTINCT node ids over the SAME store -- see M4 in this
+        // increment's review: sharing one node id here would not exercise
+        // convergence at all, because every write past the first would be
+        // deduped as a replay of that shared id's own sequence.
+        let replica_a = SpendAccumulator::new(
+            "chain-a".to_string(),
+            Arc::clone(&store),
+            Period::Daily,
+            "node-a".to_string(),
+        );
+        let replica_b = SpendAccumulator::new(
+            "chain-a".to_string(),
+            Arc::clone(&store),
+            Period::Daily,
+            "node-b".to_string(),
+        );
+        let replica_c = SpendAccumulator::new(
+            "chain-a".to_string(),
+            Arc::clone(&store),
+            Period::Daily,
+            "node-c".to_string(),
+        );
+
+        record_micros(&replica_a, &tenant, now, 10_000_000);
+        record_micros(&replica_b, &tenant, now, 5_000_000);
+        record_micros(&replica_c, &tenant, now, 7_000_000);
+
+        replica_a.flush_now().unwrap();
+        replica_b.flush_now().unwrap();
+        replica_c.flush_now().unwrap();
+
+        assert_eq!(
+            store.load_spend("chain-a", &tenant, &period_key).unwrap(),
+            22_000_000,
+            "three accumulators with distinct node ids must all land in the store and \
+             compose into one total, not clobber or drop each other"
+        );
+
+        // The total alone does not distinguish "three distinct node ids" from
+        // "one shared node id, three sequential flushes": each accumulator's
+        // `next_seq` is lazily seeded from `last_flush_seq` on its own first
+        // flush (see `spend.rs`), so a SHARED id still composes correctly
+        // when the flushes happen one after another rather than racing --
+        // sequential in-process calls, exactly what CLAUDE.md rule 15 confines
+        // this test to, cannot reproduce the concurrent-race collision a
+        // shared node id risks in real deployment. This assertion catches
+        // the shared-id case anyway, by checking WHERE the sequence landed:
+        // with three distinct ids, each one's own high-water mark is 1: it
+        // was the only writer under that id.
+        for node_id in ["node-a", "node-b", "node-c"] {
+            assert_eq!(
+                store
+                    .last_flush_seq("chain-a", &tenant, &period_key, node_id)
+                    .unwrap(),
+                1,
+                "each of the three distinct node ids must show exactly one flush of its own; \
+                 a shared node id would advance one id's sequence to 3 and leave the other two \
+                 at 0 (never written), which the total-only assertion above cannot tell apart \
+                 from three-way convergence"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_a_restarted_accumulator_reusing_its_node_id_resumes_rather_than_resetting() {
+        let store: Arc<dyn ControlPlaneStore> = Arc::new(test_store("restart-self-heal"));
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 7);
+        let period_key = Period::Daily.key_for(now);
+
+        {
+            let before_restart = SpendAccumulator::new(
+                "chain-a".to_string(),
+                Arc::clone(&store),
+                Period::Daily,
+                "node-a".to_string(),
+            );
+            record_micros(&before_restart, &tenant, now, 3_000_000);
+            before_restart.flush_now().unwrap();
+            // Dropped at the end of this block -- standing in for the
+            // process exiting, per this section's doc comment.
+        }
+
+        let after_restart = SpendAccumulator::new(
+            "chain-a".to_string(),
+            Arc::clone(&store),
+            Period::Daily,
+            "node-a".to_string(),
+        );
+        assert_eq!(
+            after_restart.current_total(&tenant, &period_key),
+            3_000_000,
+            "a fresh accumulator over the same store and node_id must resume from the \
+             store's own total the moment it touches this bucket, not reset to zero"
+        );
+
+        record_micros(&after_restart, &tenant, now, 4_000_000);
+        after_restart.flush_now().unwrap();
+
+        assert_eq!(
+            store.load_spend("chain-a", &tenant, &period_key).unwrap(),
+            7_000_000,
+            "the restarted accumulator's flush must land on top of the pre-restart total \
+             -- neither resetting it (losing the 3,000,000 already flushed) nor double- \
+             charging it (re-sending a total the store already has)"
+        );
     }
 }
