@@ -4,7 +4,7 @@ summary: How downstream authentication works — the `auth:` block, the
   `llmp_`-prefixed bearer credential, keyed HMAC-SHA256 verification, and why
   the token limiter buckets on the resolved tenant rather than the client's
   header.
-last_updated: 2026-08-24
+last_updated: 2026-09-07
 related:
   - ../authentication/managing-secrets/
   - ../configuration/configuration-file/
@@ -37,12 +37,22 @@ purpose:
   configured policy may use every model and every provider. Restriction is
   opt-in.
 
-This second point matters for what to expect today: `TenantPolicy`, the type
-that would carry a model allow-list or a budget, is defined and attached to
-every authenticated caller, but it is empty — no fields yet
-(`crates/proxy-filters/src/auth.rs`'s `TenantPolicy`). Per-tenant allow-lists,
-budgets, and admin CRUD for managing them are WP-50 increment 3 and are not
-built. An `auth:` block today answers only "who", never "what may they do".
+This second point matters for what to expect today. `TenantPolicy` carries a
+per-tenant model allow-list and spend ceiling, not empty placeholder fields
+(`crates/proxy-filters/src/auth.rs:226-251`, the `model_access` and `budget`
+fields). Both default open: an unconfigured tenant may use every model and
+has no spend ceiling (`crates/proxy-filters/src/model_authz.rs:106-108`,
+`ModelAccess::default`; `crates/proxy-filters/src/auth.rs:233-249`, the
+`budget` field's doc on why `None` means unlimited). Two more Lane-H filters
+enforce these policies, `llmproxy.model_authz` and `llmproxy.spend_limit`
+(`crates/proxy-filters/src/model_authz_filter.rs`,
+`crates/proxy-filters/src/spend_limit_filter.rs`), and an operator sets a
+tenant's allow-list or budget through the admin write API — see "Managing
+keys and tenants at runtime" below. None of this reaches the `auth:` block
+itself: `schema/llmproxy-v0.schema.json`'s `Auth` type has no allow-list or
+budget field, so the `llmproxy` dialect cannot pre-configure either from the
+config file. An `auth:` block alone still answers only "who", never "what
+may they do".
 
 ## What a virtual key looks like, and how it verifies
 
@@ -214,15 +224,73 @@ Place `llmproxy.auth` before any other Lane-H filter in `http_filters` — see
 "The token limiter keys on the identity the proxy assigned" above for why
 order is load-bearing, not stylistic.
 
+## Managing keys and tenants at runtime
+
+Minting a key, revoking one, creating or deleting a tenant, and setting a
+tenant's model allow-list or spend budget are all bearer-gated HTTP calls
+against the admin server, not config-file edits: `POST /keys`,
+`DELETE /keys/{id}`, `POST /tenants`, `DELETE /tenants/{id}`,
+`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`, and a read-only
+`GET /tenants/{id}/spend` (`crates/proxy-admin/src/server.rs:61-79`'s
+`AVAILABLE_ENDPOINTS`, and the method table at `:547-555`). Each of these
+paths also has a scoped form, `/chains/{stat_prefix}/...`, that names the
+target HTTP connection manager by its own `stat_prefix`. Use the scoped
+form when more than one chain in this serve configures `llmproxy.auth`:
+the unscoped paths are an alias that works only when exactly one chain
+does, and refuse rather than guess when more than one does
+(`crates/proxy-admin/src/lib.rs:47-63`, and `resolve_control_plane` in
+`crates/proxy-admin/src/server.rs`). Each call writes
+the store first and republishes immediately, so the change is visible to
+every worker's very next request rather than waiting on a periodic refresh
+(`crates/proxy-filters/src/control.rs:1713-1775`, `ControlPlane::mint_key`,
+`revoke_key`, `set_policy`, `set_budget`, each documented "then republishes").
+The write API is fail-closed: with `LLMPROXY_ADMIN_TOKEN` unset, empty, or
+whitespace-only, every write returns `403` and a log line naming the endpoint,
+never a silent open door (`crates/proxy-admin/src/server.rs:387-395`,
+`normalize_admin_token` at `:163-174`). Read endpoints are unaffected by the
+token.
+
+Keys and tenant policy live in one of two stores, selected by
+`typed_config.store` on the `llmproxy.auth` filter. The default,
+`in_memory`, holds everything only for the life of the process. Setting
+`typed_config.store.persistent.path` selects `RedbControlPlaneStore`, an
+embedded on-disk store that survives a restart of that one process
+(`crates/proxy-filters/src/auth_filter.rs:182-213`, `StoreSpec` and
+`parse_store`). This selection is Envoy-mode only: the dialect's schema
+(`schema/llmproxy-v0.schema.json`) has no `store` field under `auth`, and its
+lowering only ever emits `hmac_secret` and `virtual_keys`
+(`crates/proxy-simple-config/src/lower.rs:1367-1368`) — a config written in
+the `llmproxy` dialect always runs the in-memory store. The admin write API
+itself works the same way regardless of dialect, since it talks to whichever
+store the chain built.
+
+A `SIGHUP` reload does not change any of this for an already-running
+listener. The HMAC secret, the config's bootstrap key list, the store
+selection, and the policy-poll interval are all read once, the first time a
+worker builds this filter chain, and are reused as-is on every later reload
+of that same chain — editing `auth.keys`, `typed_config.store`, or
+`poll_interval_seconds` and sending `SIGHUP` has no effect; only a process
+restart picks up the new value
+(`crates/proxy-filters/src/auth_filter.rs:404-409`, `:455-459`). The admin
+write API is the supported way to change keys, allow-lists, and budgets on a
+running process; a config reload is not.
+
 ## What is not built yet
 
-- **A persistent or shared credential store.** Keys live only in the parsed
-  configuration; a `SIGHUP` reload rebuilds the whole key set from the config
-  file on disk (WP-50 increment 2b, `CredentialStore`, not implemented).
 - **OIDC/JWT authentication.** The seam exists — a JWT-shaped bearer value is
   treated as `NoCredential`, not `Rejected`, specifically so a second
   authenticator can claim it later — but there is no JWT validator today
   (WP-50 increment 2c).
-- **Tenant policy: model allow-lists, budgets, and admin CRUD for managing
-  keys.** `TenantPolicy` is defined and empty; every authenticated tenant may
-  use every model and provider (WP-50 increment 3).
+- **A shared, multi-replica store.** `RedisControlPlaneStore` exists and its
+  own tests pass against a real Redis
+  (`crates/proxy-filters/src/control_redis.rs`), but nothing can select it:
+  `StoreSpec` only has `InMemory` and `Persistent` variants, and `parse_store`
+  only matches `in_memory` and `persistent`
+  (`crates/proxy-filters/src/auth_filter.rs:182-213`). Today every store is
+  single-process; running more than one replica means each has its own,
+  independent key set and budget.
+- **Model allow-lists or budgets from the `llmproxy` dialect's config file.**
+  `schema/llmproxy-v0.schema.json`'s `Auth` type has no such field. Setting
+  either requires the admin write API or a hand-written Envoy-mode
+  `llmproxy.model_authz`/`llmproxy.spend_limit` `typed_config` — see
+  "Managing keys and tenants at runtime" above.
