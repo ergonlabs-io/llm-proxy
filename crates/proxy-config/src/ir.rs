@@ -562,7 +562,15 @@ pub struct HttpFilterSpec {
 // ----------------------------------------------------------------- clusters --
 
 /// IR for `envoy.config.cluster.v3.Cluster` (supported surface).
-#[derive(Debug)]
+///
+/// `PartialEq` (WP-59 increment 2) is a derive over every field, not a
+/// hand-written comparison — `ClusterManager::update_from_snapshot` uses it
+/// to decide whether an incoming cluster's config actually changed, and a
+/// hand-written `eq` that skipped a field would silently treat a real change
+/// to that field as "unchanged" and carry forward a `ManagedCluster` that
+/// should have been rebuilt. Deriving means a field added later is compared
+/// automatically instead of by whoever remembers to update a hand-written impl.
+#[derive(Debug, PartialEq)]
 pub struct ClusterConfig {
     pub name: ClusterName,
     pub discovery: DiscoveryType,
@@ -705,7 +713,7 @@ pub struct EdsClusterConfig {
 /// Envoy marks `timeout`, `interval`, `unhealthy_threshold` and
 /// `healthy_threshold` required in its own PGV rules, so none of the four has
 /// a default to fall back on here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HealthCheckIR {
     /// Spacing between probes of one host.
     pub interval: Duration,
@@ -730,7 +738,7 @@ pub struct HealthCheckIR {
 /// oneof, narrowed to the two modes the engine implements. `grpc_health_check`
 /// and `custom_health_check` are rejected at lowering: a stub that always
 /// reported healthy would be worse than refusing the config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HealthCheckKindIR {
     /// `HttpHealthCheck`: a `GET path` with `Connection: close` and an
     /// optional `Host` override. An empty `expected_statuses` means 200 only,
@@ -1490,7 +1498,7 @@ pub struct DownstreamTlsSpec {
 }
 
 /// Upstream TLS origination config for a cluster (WP-08).
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct UpstreamTlsSpec {
     pub sni: Option<String>,
     pub params: TlsParametersIR,
@@ -1504,7 +1512,7 @@ pub struct UpstreamTlsSpec {
 }
 
 /// One `TlsCertificate` (supported subset: chain + key from file/inline).
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct TlsCertificateIR {
     pub cert_chain: DataSourceIR,
     pub private_key: DataSourceIR,
@@ -1556,7 +1564,7 @@ pub enum TlsEcdhCurve {
 }
 
 /// `CertificateValidationContext` subset.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ValidationContextIR {
     pub ca: CaSource,
     /// `match_typed_subject_alt_names`: cert accepted if ANY matcher matches
@@ -1566,7 +1574,7 @@ pub struct ValidationContextIR {
 }
 
 /// Where trust anchors come from.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum CaSource {
     /// `trusted_ca` PEM bundle.
     TrustedCa(DataSourceIR),
@@ -1576,7 +1584,7 @@ pub enum CaSource {
 
 /// `SubjectAltNameMatcher` (supported SAN types only; EMAIL/OTHER_NAME are
 /// rejected at lowering).
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct SanMatcherIR {
     pub san_type: SanType,
     pub matcher: StringMatcherIR,
@@ -1613,6 +1621,70 @@ pub enum StringMatcherIR {
     },
     /// Full-string match, like Envoy's safe_regex.
     SafeRegex(regex::Regex),
+}
+
+/// Hand-written, not derived — `regex::Regex` itself has no `PartialEq`
+/// (WP-59 increment 2 needs this for `ValidationContextIR`'s `san_matchers`,
+/// pulled in through `ClusterConfig::transport_socket`). This does not skip
+/// any field the way `apply.rs`'s `Entry<T>` comparison does: `compile_regex`
+/// (`lower.rs`) is a pure function of the pattern string (`^(?:{pattern})$`,
+/// no other input), so two `Regex`es built from equal `as_str()` output are
+/// guaranteed to match identically — comparing the pattern string compares
+/// the regex's whole behavior, not a subset of it.
+impl PartialEq for StringMatcherIR {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Exact {
+                    value: v1,
+                    ignore_case: i1,
+                },
+                Self::Exact {
+                    value: v2,
+                    ignore_case: i2,
+                },
+            ) => v1 == v2 && i1 == i2,
+            (
+                Self::Prefix {
+                    value: v1,
+                    ignore_case: i1,
+                },
+                Self::Prefix {
+                    value: v2,
+                    ignore_case: i2,
+                },
+            ) => v1 == v2 && i1 == i2,
+            (
+                Self::Suffix {
+                    value: v1,
+                    ignore_case: i1,
+                },
+                Self::Suffix {
+                    value: v2,
+                    ignore_case: i2,
+                },
+            ) => v1 == v2 && i1 == i2,
+            (
+                Self::Contains {
+                    value: v1,
+                    ignore_case: i1,
+                },
+                Self::Contains {
+                    value: v2,
+                    ignore_case: i2,
+                },
+            ) => v1 == v2 && i1 == i2,
+            (Self::SafeRegex(r1), Self::SafeRegex(r2)) => r1.as_str() == r2.as_str(),
+            // Cross-variant (and, if a variant is ever added, unmatched-new-variant)
+            // pairs fall here. That is conservative in the caller's favor for
+            // `update_from_snapshot`'s carry-forward check: it can only ever make
+            // two `StringMatcherIR`s that are secretly equal compare as "changed"
+            // (costing a spurious `ManagedCluster` rebuild), never the reverse
+            // (treating a real difference as unchanged and wrongly carrying a
+            // stale cluster forward).
+            _ => false,
+        }
+    }
 }
 
 impl StringMatcherIR {

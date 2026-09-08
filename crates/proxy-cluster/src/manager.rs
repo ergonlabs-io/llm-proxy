@@ -167,10 +167,12 @@ struct ManagedCluster {
 impl Drop for ManagedCluster {
     /// A dropped `JoinHandle` does **not** abort its task -- it only detaches
     /// from it, and the check loop keeps running with nobody left to stop it.
-    /// `ClusterManager::update_from_snapshot` rebuilds every config-sourced
-    /// cluster wholesale on each call (its own doc says so), so without this,
-    /// every config reload -- and this proxy reloads on SIGHUP in production
-    /// -- would leak one permanently-running probe loop per host, forever.
+    /// `ClusterManager::update_from_snapshot` rebuilds a config-sourced
+    /// cluster whenever its config actually changed (WP-59 increment 2 --
+    /// unless it is carried forward unchanged, see that method's own doc),
+    /// so without this, every rebuild -- and this proxy reloads on SIGHUP in
+    /// production -- would leak one permanently-running probe loop per host,
+    /// forever.
     fn drop(&mut self) {
         // Rust note: `Mutex::lock`'s `Err` case is poisoning (a prior holder
         // panicked mid-critical-section) -- `if let Ok` rather than
@@ -410,11 +412,12 @@ pub struct ClusterManager {
     // itself, and the `HashMap` it wraps, are never copied), and every clone
     // still `.load()`s whatever `update_from_snapshot` most recently
     // published. Late binding matters because `update_from_snapshot`
-    // rebuilds every config-sourced cluster wholesale on every call (see its
-    // own doc) -- a member resolved *eagerly*, at the aggregate's own
-    // construction time, would keep pointing at a specific `Arc<ManagedCluster>`
-    // that the very next reload replaces, silently freezing that member's
-    // discovery even though the config for it kept updating.
+    // rebuilds a config-sourced cluster whenever its own config changed
+    // (WP-59 increment 2 -- unless it is carried forward unchanged, see that
+    // method's own doc) -- a member resolved *eagerly*, at the aggregate's
+    // own construction time, would keep pointing at a specific
+    // `Arc<ManagedCluster>` that a later reload replaces, silently freezing
+    // that member's discovery even though the config for it kept updating.
     clusters: Arc<ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>>,
     resolver: Arc<dyn HostResolver>,
     transport_builder: TransportSocketBuilder,
@@ -441,41 +444,59 @@ impl ClusterManager {
     /// Reconcile against a config snapshot's cluster map and kick off each
     /// current cluster's initial resolution.
     ///
-    /// v1 rebuilds config-sourced clusters wholesale on every call (a
-    /// cluster whose config changed gets a fresh host set built from a new
-    /// resolution, not a diff against its old one) rather than diffing
-    /// `ClusterConfig` for real changes -- `ClusterConfig` has no
-    /// `PartialEq`, and Envoy's own cluster-update semantics are a larger
-    /// piece of work than this WP. EDS-registered clusters (which never
-    /// appear in a config snapshot) are carried over untouched.
+    /// WP-59 increment 2: a cluster whose config is unchanged from the
+    /// currently-published one is carried forward as the exact same
+    /// `Arc<ManagedCluster>` -- host set, health-check engine, outlier
+    /// detector and its running task handles all survive untouched -- rather
+    /// than being rebuilt and re-resolved. "Unchanged" is `Arc::ptr_eq` OR
+    /// `ClusterConfig`'s derived `PartialEq` (see that type's doc for why the
+    /// derive, not a hand-written `eq`, is load-bearing here). Both halves
+    /// earn their place:
+    /// - `Arc::ptr_eq` is the free short-circuit that covers the ADS path.
+    ///   `SotwSet::apply` (`proxy-xds/src/store.rs`) keeps the *old* resource
+    ///   entry when a CDS push compares a resource `unchanged`, and
+    ///   `ResourceApplier::assemble_snapshot` (`proxy-xds/src/apply.rs`)
+    ///   `Arc::clone`s it into the next snapshot -- so a CDS push that only
+    ///   changes cluster B hands this method the pointer-identical
+    ///   `Arc<ClusterConfig>` for cluster A. Statically-declared clusters are
+    ///   likewise never re-lowered across a call. This is the motivating
+    ///   scenario in the WP-59 card: a control-plane heartbeat silently
+    ///   clearing ejection state proxy-wide.
+    /// - Content equality is what additionally covers a SIGHUP file reload,
+    ///   where every `Arc` is freshly lowered from scratch and no pointer
+    ///   from the previous generation survives at all.
+    ///   Pointer equality alone is conservative in the safe direction (two
+    ///   pointer-equal `Arc`s are trivially content-equal too, since these
+    ///   `ClusterConfig`s are never mutated in place) -- content equality is
+    ///   what makes the carry-forward complete rather than just cheap.
     ///
-    /// WP-59 increment 1: every new cluster is resolved *before* the map is
-    /// published (`self.clusters.store` below), not after. The previous
-    /// ordering stored every cluster with an empty `HostSet` first and
-    /// resolved them one at a time afterward -- for the whole span of that
-    /// serial loop, EVERY cluster (including ones like `STATIC` that need no
-    /// I/O at all) was empty and rejecting traffic, and a slow `STRICT_DNS`
-    /// cluster in the same reload stretched that window for everyone else
-    /// too. Resolving into `next` first means the previously-published map
-    /// keeps serving, untouched, until the fully-resolved replacement is
-    /// ready to swap in atomically. This does NOT yet carry forward an
-    /// unchanged cluster's own `ManagedCluster` (health-check state and
-    /// outlier ejections are still rebuilt -- and therefore lost -- on every
-    /// reload, for a cluster whose config didn't even change); that's
-    /// increment 2, and it needs content equality on `ClusterConfig`, which
-    /// this type deliberately does not have yet.
+    /// A cluster whose config DID change still goes through the full
+    /// rebuild-then-resolve path below, in `next`'s own resolve loop -- only
+    /// freshly-built clusters ever reach it now.
     ///
-    /// **The same missing carry-forward loses EDS-delivered membership on
-    /// every reload, and that is worth stating separately** because it is
-    /// not a state-freshness nicety like health flags -- it is the whole
-    /// host set. A cluster declared `discovery: eds` is rebuilt here like any
-    /// other `ClusterSource::Config` entry, with an empty `HostSet`, and
-    /// `resolve_cluster` deliberately does not resolve it (there is nothing
-    /// to resolve). So a SIGHUP reload empties it until the control plane
-    /// next pushes that resource -- which, under SotW EDS, may not be until
-    /// something actually changes upstream. Pre-existing, not introduced by
-    /// this increment's reordering; increment 2's carry-forward is the fix,
-    /// and until then an EDS cluster's membership does not survive a reload.
+    /// WP-59 increment 1 (kept from before): every freshly-built cluster is
+    /// resolved *before* the map is published (`self.clusters.store` below),
+    /// not after. The previous ordering stored every cluster with an empty
+    /// `HostSet` first and resolved them one at a time afterward -- for the
+    /// whole span of that serial loop, EVERY cluster (including ones like
+    /// `STATIC` that need no I/O at all) was empty and rejecting traffic, and
+    /// a slow `STRICT_DNS` cluster in the same reload stretched that window
+    /// for everyone else too. Resolving into `next` first means the
+    /// previously-published map keeps serving, untouched, until the
+    /// fully-resolved replacement is ready to swap in atomically.
+    ///
+    /// **EDS-delivered membership on a config-sourced EDS cluster now
+    /// survives an unrelated reload, via the same carry-forward.** Previously
+    /// this was the sharpest consequence of the missing carry-forward: a
+    /// cluster declared `discovery: eds` is `ClusterSource::Config` (not
+    /// `ClusterSource::Eds` -- see that variant's doc), so every reload
+    /// rebuilt it from scratch with an empty `HostSet`, and `resolve_cluster`
+    /// deliberately does not resolve an EDS-typed config cluster (there is
+    /// nothing to resolve) -- so a SIGHUP reload emptied it until the control
+    /// plane next pushed that resource. Since that config never changes on
+    /// an unrelated reload, it now takes the carry-forward branch below like
+    /// any other cluster, and its externally-delivered `host_set` (installed
+    /// by [`Self::accept_eds_update`]) rides along on the same `Arc`.
     ///
     /// A cluster whose `lb_policy` isn't implemented (`RING_HASH`/`MAGLEV`,
     /// WP-17) is rejected rather than silently substituted with another
@@ -491,14 +512,34 @@ impl ClusterManager {
         let mut next: HashMap<ClusterName, Arc<ManagedCluster>> =
             HashMap::with_capacity(clusters.len());
         let mut rejected = Vec::new();
+        // Freshly-built clusters only -- these are the only ones that need
+        // `resolve_cluster` below. A carried-forward cluster's `host_set` is
+        // already live and must not be touched (see this method's own doc).
+        let mut freshly_built: Vec<ClusterName> = Vec::new();
         for (name, config) in clusters {
-            match ManagedCluster::from_config(Arc::clone(config), &self.transport_builder) {
-                Ok(managed) => {
-                    next.insert(name.clone(), Arc::new(managed));
+            let carried = match previous.get(name).map(|m| (&m.source, m)) {
+                Some((ClusterSource::Config(old), managed))
+                    if Arc::ptr_eq(old, config) || **old == **config =>
+                {
+                    Some(Arc::clone(managed))
                 }
-                Err(err) => {
-                    tracing::error!(cluster = %name, error = %err, "cluster rejected");
-                    rejected.push((name.clone(), err));
+                _ => None,
+            };
+            match carried {
+                Some(managed) => {
+                    next.insert(name.clone(), managed);
+                }
+                None => {
+                    match ManagedCluster::from_config(Arc::clone(config), &self.transport_builder) {
+                        Ok(managed) => {
+                            next.insert(name.clone(), Arc::new(managed));
+                            freshly_built.push(name.clone());
+                        }
+                        Err(err) => {
+                            tracing::error!(cluster = %name, error = %err, "cluster rejected");
+                            rejected.push((name.clone(), err));
+                        }
+                    }
                 }
             }
         }
@@ -513,7 +554,8 @@ impl ClusterManager {
         // (it would return empty and there'd be nothing to carry membership
         // over from, since this cluster has no EDS delivery yet at
         // construction time).
-        for (name, managed) in &next {
+        for name in &freshly_built {
+            let managed = &next[name];
             if let Err(err) = self.resolve_cluster(managed).await {
                 // Rust note: a discovery failure doesn't take the cluster
                 // manager down -- Envoy keeps serving the last-known-good
@@ -898,6 +940,64 @@ mod tests {
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
             endpoints,
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+            usage_dialect: None,
+            health_check: None,
+            outlier_detection: None,
+        })
+    }
+
+    /// Same shape as `cluster_config`, plus a caller-supplied
+    /// `connect_timeout` -- WP-59 increment 2's tests use this to build a
+    /// second config that's a genuine, if inconsequential, content change
+    /// from the first (`ClusterConfig` has no `Clone`, only `PartialEq`, so
+    /// this is a second constructor rather than a `..base` update).
+    fn cluster_config_with_connect_timeout(
+        name: &str,
+        discovery: DiscoveryType,
+        endpoints: Vec<EndpointIR>,
+        connect_timeout: Duration,
+    ) -> Arc<ClusterConfig> {
+        Arc::new(ClusterConfig {
+            eds: None,
+            name: name.to_string(),
+            discovery,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout,
+            endpoints,
+            kind: ClusterKind::Endpoints,
+            transport_socket: None,
+            per_connection_buffer_limit_bytes: 1 << 20,
+            circuit_breakers: Default::default(),
+            upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            request_headers_to_add: Vec::new(),
+            usage_dialect: None,
+            health_check: None,
+            outlier_detection: None,
+        })
+    }
+
+    /// A config-sourced EDS cluster (`discovery: eds`, so
+    /// `ClusterSource::Config`, not `ClusterSource::Eds` -- see that
+    /// variant's doc): membership arrives via
+    /// [`ClusterManager::accept_eds_update`], never `endpoints`/`discovery`
+    /// resolution. WP-59 increment 2's test for the paragraph in
+    /// `update_from_snapshot`'s own doc about this shape surviving a reload.
+    fn cluster_config_eds(name: &str) -> Arc<ClusterConfig> {
+        Arc::new(ClusterConfig {
+            eds: Some(proxy_config::ir::EdsClusterConfig {
+                service_name: name.to_string(),
+            }),
+            name: name.to_string(),
+            discovery: DiscoveryType::Eds,
+            lb_policy: LbPolicy::RoundRobin,
+            connect_timeout: Duration::from_secs(5),
+            endpoints: Vec::new(),
             kind: ClusterKind::Endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
@@ -1592,12 +1692,16 @@ mod tests {
     }
 
     /// A config reload must not leak the previous generation's probes.
-    /// `update_from_snapshot` rebuilds every config-sourced `ManagedCluster`
-    /// wholesale on every call (its own doc comment says so) -- reload the
-    /// identical single-host config several times and confirm the hit rate
-    /// against that host's listener stays at roughly one generation's worth,
-    /// rather than scaling with the number of reloads (which is exactly what
-    /// a dropped-but-not-aborted `JoinHandle` per reload would produce).
+    /// `update_from_snapshot` rebuilds a config-sourced `ManagedCluster`
+    /// whenever its config actually changed -- reload a single-host config
+    /// several times, each with a genuinely different `interval` (WP-59
+    /// increment 2's carry-forward means reloading the SAME config, as this
+    /// test used to, now skips the rebuild entirely and no probe is ever
+    /// aborted -- it would pass without exercising the `Drop` path it exists
+    /// to prove), and confirm the hit rate against that host's listener stays
+    /// at roughly one generation's worth, rather than scaling with the number
+    /// of reloads (which is exactly what a dropped-but-not-aborted
+    /// `JoinHandle` per reload would produce).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_config_reload_does_not_leak_the_previous_generations_probes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1607,25 +1711,31 @@ mod tests {
 
         let resolver = Arc::new(FakeResolver::new());
         let manager = ClusterManager::with_default_transport(resolver);
-        let mut snapshot = HashMap::new();
-        snapshot.insert(
-            "reload".to_string(),
-            cluster_config_with_health_check(
-                "reload",
-                DiscoveryType::Static,
-                vec![endpoint(&addr.ip().to_string(), addr.port())],
-                tcp_health_check(1, 1, Duration::from_millis(15)),
-            ),
-        );
-        manager.update_from_snapshot(&snapshot).await;
+        let reload_config = |interval_ms: u64| {
+            let mut snapshot = HashMap::new();
+            snapshot.insert(
+                "reload".to_string(),
+                cluster_config_with_health_check(
+                    "reload",
+                    DiscoveryType::Static,
+                    vec![endpoint(&addr.ip().to_string(), addr.port())],
+                    tcp_health_check(1, 1, Duration::from_millis(interval_ms)),
+                ),
+            );
+            snapshot
+        };
+        manager.update_from_snapshot(&reload_config(15)).await;
         wait_until(Duration::from_secs(5), || hits.load(Ordering::SeqCst) >= 3).await;
 
         let baseline_start = hits.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(250)).await;
         let baseline = hits.load(Ordering::SeqCst) - baseline_start;
 
-        for _ in 0..4 {
-            manager.update_from_snapshot(&snapshot).await;
+        // Each reload's `interval` differs from the last, so
+        // `ClusterConfig`'s content equality never carry-forwards this
+        // cluster -- every one of these four calls really rebuilds it.
+        for i in 0..4u64 {
+            manager.update_from_snapshot(&reload_config(15 + i)).await;
         }
 
         let after_start = hits.load(Ordering::SeqCst);
@@ -1983,8 +2093,43 @@ mod tests {
         // reload open for the whole sampling window below.
         resolver.set_delay("svc.internal", Duration::from_millis(300));
 
+        // WP-59 increment 2: reloading the identical `snapshot` map (as this
+        // test used to) now carries BOTH clusters forward by content
+        // equality, so `dns-svc` is never rebuilt or resolved and the
+        // reload returns near-instantly -- defeating the whole point of this
+        // test. Give `dns-svc` a real, if inconsequential, config change (a
+        // different `connect_timeout`) so it still takes the rebuild path
+        // and its slow resolution genuinely holds the reload open;
+        // `static-svc`'s `Arc<ClusterConfig>` is untouched, so it is exactly
+        // the carried-forward cluster this sampling loop is asserting stays
+        // populated throughout.
+        let mut snapshot_for_reload = snapshot.clone();
+        snapshot_for_reload.insert(
+            "dns-svc".to_string(),
+            Arc::new(ClusterConfig {
+                // Same shape as `cluster_config`'s literal, but a genuinely
+                // different `connect_timeout` -- `ClusterConfig` has no
+                // `Clone` (only `PartialEq`, WP-59 increment 2), so this is
+                // written out rather than `..base.clone()`.
+                eds: None,
+                name: "dns-svc".to_string(),
+                discovery: DiscoveryType::StrictDns,
+                lb_policy: LbPolicy::RoundRobin,
+                connect_timeout: Duration::from_secs(6),
+                endpoints: vec![endpoint("svc.internal", 80)],
+                kind: ClusterKind::Endpoints,
+                transport_socket: None,
+                per_connection_buffer_limit_bytes: 1 << 20,
+                circuit_breakers: Default::default(),
+                upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+                request_headers_to_add: Vec::new(),
+                usage_dialect: None,
+                health_check: None,
+                outlier_detection: None,
+            }),
+        );
+
         let manager_for_reload = Arc::clone(&manager);
-        let snapshot_for_reload = snapshot.clone();
         let reload = tokio::spawn(async move {
             manager_for_reload
                 .update_from_snapshot(&snapshot_for_reload)
@@ -2014,6 +2159,316 @@ mod tests {
             samples > 10,
             "sampling window too short to actually exercise the concurrent \
              reload (got {samples} samples) -- resolver delay may need to be longer"
+        );
+    }
+
+    // -------------------------------------------- WP-59 increment 2 --------
+
+    /// The ADS path: `SotwSet::apply` (`proxy-xds/src/store.rs`) keeps the
+    /// OLD resource `Arc` for anything a CDS push compares `unchanged`, and
+    /// `ResourceApplier::assemble_snapshot` (`proxy-xds/src/apply.rs`)
+    /// `Arc::clone`s it into the next snapshot -- so this method sees the
+    /// exact same `Arc<ClusterConfig>` pointer again for a cluster nothing
+    /// changed. Proves the cheap `Arc::ptr_eq` half of the carry-forward
+    /// condition: reload with the SAME `Arc`, and the published
+    /// `Arc<ManagedCluster>` must be the same one too.
+    #[tokio::test]
+    async fn pointer_equal_config_is_carried_forward() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config("a", DiscoveryType::Static, vec![endpoint("10.0.0.1", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let managed_before = manager.clusters.load().get("a").unwrap().clone();
+
+        // Reload with the IDENTICAL map -- every `Arc<ClusterConfig>` inside
+        // it is `Arc::clone`d, not rebuilt, so this is pointer-identical to
+        // what `update_from_snapshot` already saw, exactly like a CDS push
+        // that only touched some other resource.
+        manager.update_from_snapshot(&snapshot).await;
+        let managed_after = manager.clusters.load().get("a").unwrap().clone();
+
+        assert!(
+            Arc::ptr_eq(&managed_before, &managed_after),
+            "a pointer-identical ClusterConfig must carry the ManagedCluster forward"
+        );
+    }
+
+    /// The SIGHUP path: every `Arc<ClusterConfig>` is freshly lowered from
+    /// bytes on disk, so no pointer from the previous generation survives at
+    /// all -- content equality is the only signal available. Built via the
+    /// same `cluster_config` helper twice, deliberately, to prove this is
+    /// content equality doing the work, not `Arc::ptr_eq` (test above) by
+    /// accident.
+    #[tokio::test]
+    async fn content_equal_config_is_carried_forward() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config("a", DiscoveryType::Static, vec![endpoint("10.0.0.1", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let managed_before = manager.clusters.load().get("a").unwrap().clone();
+
+        let fresh = cluster_config("a", DiscoveryType::Static, vec![endpoint("10.0.0.1", 80)]);
+        assert!(
+            !Arc::ptr_eq(&snapshot["a"], &fresh),
+            "test setup: must be a distinct Arc, or this doesn't exercise content equality"
+        );
+        let mut snapshot2 = HashMap::new();
+        snapshot2.insert("a".to_string(), fresh);
+        manager.update_from_snapshot(&snapshot2).await;
+        let managed_after = manager.clusters.load().get("a").unwrap().clone();
+
+        assert!(
+            Arc::ptr_eq(&managed_before, &managed_after),
+            "a freshly-lowered but content-equal ClusterConfig must still carry \
+             the ManagedCluster forward"
+        );
+    }
+
+    /// The other side of the same condition: a real change to a cluster's
+    /// own config (`connect_timeout` here) must rebuild it, not carry the
+    /// old `ManagedCluster` forward serving a stale value.
+    #[tokio::test]
+    async fn a_changed_cluster_is_rebuilt() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config("a", DiscoveryType::Static, vec![endpoint("10.0.0.1", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let managed_before = manager.clusters.load().get("a").unwrap().clone();
+        assert_eq!(managed_before.connect_timeout, Duration::from_secs(5));
+
+        let mut snapshot2 = HashMap::new();
+        snapshot2.insert(
+            "a".to_string(),
+            cluster_config_with_connect_timeout(
+                "a",
+                DiscoveryType::Static,
+                vec![endpoint("10.0.0.1", 80)],
+                Duration::from_secs(9),
+            ),
+        );
+        manager.update_from_snapshot(&snapshot2).await;
+        let managed_after = manager.clusters.load().get("a").unwrap().clone();
+
+        assert!(
+            !Arc::ptr_eq(&managed_before, &managed_after),
+            "a real config change must rebuild the ManagedCluster, not carry the old one forward"
+        );
+        assert_eq!(
+            managed_after.connect_timeout,
+            Duration::from_secs(9),
+            "the rebuilt cluster must serve the new connect_timeout, not the stale one"
+        );
+    }
+
+    /// The WP-59 card's own acceptance test and motivating scenario: a
+    /// control-plane heartbeat that only changes cluster B must not silently
+    /// clear an ejection on unrelated cluster A. Eject A's only host, push a
+    /// snapshot where only B's config changed, and confirm both that A's
+    /// `ManagedCluster` is the exact same `Arc` (not just behaviorally
+    /// equivalent) and that its ejection survived.
+    #[tokio::test]
+    async fn an_unrelated_clusters_change_leaves_an_ejection_in_place() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config_with_outlier("a", vec![endpoint("10.0.0.1", 80)], 3),
+        );
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.2", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry_a = manager.cluster("a").unwrap();
+        let target = SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80);
+
+        let a_healthy = || {
+            manager
+                .clusters
+                .load()
+                .get("a")
+                .unwrap()
+                .host_set
+                .load()
+                .all_healthy_hosts()
+                .iter()
+                .any(|h| h.address == target)
+        };
+
+        // Three consecutive 5xx crosses the threshold (enforced 100%, 100%
+        // cap) and ejects a's only host.
+        entry_a.report_outlier_result(target, RequestResult::Http5xx);
+        entry_a.report_outlier_result(target, RequestResult::Http5xx);
+        entry_a.report_outlier_result(target, RequestResult::Http5xx);
+        assert!(!a_healthy(), "three consecutive 5xx must eject a's host");
+
+        let managed_a_before = manager.clusters.load().get("a").unwrap().clone();
+
+        // Reload with ONLY b's config changed -- a's config is byte-for-byte
+        // the same (a fresh, content-equal Arc, same shape as a real SIGHUP
+        // reload's lowering).
+        let mut snapshot2 = HashMap::new();
+        snapshot2.insert(
+            "a".to_string(),
+            cluster_config_with_outlier("a", vec![endpoint("10.0.0.1", 80)], 3),
+        );
+        snapshot2.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.99", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot2).await;
+
+        let managed_a_after = manager.clusters.load().get("a").unwrap().clone();
+        assert!(
+            Arc::ptr_eq(&managed_a_before, &managed_a_after),
+            "a's ManagedCluster must be carried forward, not rebuilt, by an unrelated \
+             cluster's config change"
+        );
+        assert!(
+            !a_healthy(),
+            "an unrelated cluster's config change must not clear a's outlier ejection"
+        );
+    }
+
+    /// The paragraph `update_from_snapshot`'s own doc now makes about EDS
+    /// membership surviving a reload: a config-sourced EDS cluster
+    /// (`discovery: eds`, `ClusterSource::Config`, not `ClusterSource::Eds`
+    /// -- see [`cluster_config_eds`]) fed via
+    /// [`ClusterManager::accept_eds_update`], then a reload that changes an
+    /// unrelated cluster's config, must not empty it.
+    #[tokio::test]
+    async fn eds_membership_survives_an_unrelated_config_reload() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert("eds-cfg".to_string(), cluster_config_eds("eds-cfg"));
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.2", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+
+        let eds_target = SocketAddr::new(IpAddr::from([10, 0, 0, 50]), 80);
+        manager
+            .accept_eds_update("eds-cfg", &[endpoint("10.0.0.50", 80)])
+            .unwrap();
+        let eds_has_host = || {
+            manager
+                .clusters
+                .load()
+                .get("eds-cfg")
+                .unwrap()
+                .host_set
+                .load()
+                .all_hosts()
+                .iter()
+                .any(|h| h.address == eds_target)
+        };
+        assert!(eds_has_host(), "the externally-fed EDS update must land");
+
+        // Reload with ONLY b's config changed.
+        let mut snapshot2 = HashMap::new();
+        snapshot2.insert("eds-cfg".to_string(), cluster_config_eds("eds-cfg"));
+        snapshot2.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.99", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot2).await;
+
+        assert!(
+            eds_has_host(),
+            "an unrelated cluster's config change must not empty EDS-delivered \
+             membership on a config-sourced EDS cluster"
+        );
+    }
+
+    /// Mirrors `refresh_cluster_carries_over_health_flags_for_unchanged_hosts`,
+    /// but across `update_from_snapshot` rather than `refresh_cluster`: an
+    /// active-health-check failure flag flipped directly on a host must
+    /// survive an unrelated cluster's config change in the same snapshot.
+    #[tokio::test]
+    async fn active_health_check_flags_survive_an_unrelated_config_reload() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        // A very long interval: the probe this spawns must not fire (and
+        // overwrite the flag this test sets) during the test's own runtime.
+        let hc = tcp_health_check(1, 1, Duration::from_secs(3600));
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "hc-svc".to_string(),
+            cluster_config_with_health_check(
+                "hc-svc",
+                DiscoveryType::Static,
+                vec![endpoint("10.0.0.1", 80)],
+                hc.clone(),
+            ),
+        );
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.2", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+
+        let addr = SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80);
+        let managed = manager.clusters.load().get("hc-svc").unwrap().clone();
+        managed
+            .host_set
+            .store(Arc::new(HostSet::from_hosts(vec![Arc::new(Host {
+                address: addr,
+                hostname: None,
+                weight: 1,
+                priority: 0,
+                health_flags: HealthFlags {
+                    failed_active_hc: true,
+                    failed_outlier_check: false,
+                },
+                active_requests: std::sync::atomic::AtomicU64::new(0),
+            })])));
+
+        // Reload with ONLY b's config changed.
+        let mut snapshot2 = HashMap::new();
+        snapshot2.insert(
+            "hc-svc".to_string(),
+            cluster_config_with_health_check(
+                "hc-svc",
+                DiscoveryType::Static,
+                vec![endpoint("10.0.0.1", 80)],
+                hc,
+            ),
+        );
+        snapshot2.insert(
+            "b".to_string(),
+            cluster_config("b", DiscoveryType::Static, vec![endpoint("10.0.0.99", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot2).await;
+
+        let host = manager
+            .clusters
+            .load()
+            .get("hc-svc")
+            .unwrap()
+            .host_set
+            .load()
+            .all_hosts()
+            .into_iter()
+            .find(|h| h.address == addr)
+            .expect("host must still be present after the reload");
+        assert!(
+            !host.is_healthy(),
+            "an unrelated cluster's config change must not clear an active-health-check flag"
         );
     }
 }
