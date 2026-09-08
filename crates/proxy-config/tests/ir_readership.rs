@@ -233,11 +233,18 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "secrets",
-        kind: EntryKind::KnownInert,
+        kind: EntryKind::KnownInertNameCollision,
         reason: "WP-08/WP-22: no runtime code looks up a TlsSecret by name \
                   yet (SDS-delivered secrets aren't consulted anywhere outside \
                   proxy-config); TlsSecret's own doc comment already names \
-                  these WPs.",
+                  these WPs. Recorded as a NAME COLLISION since WP-22 increment 1: \
+                  `ResourceApplier` in `crates/proxy-xds/src/apply.rs` gained its own \
+                  `secrets` field (a `SotwSet` of SDS-delivered `DynamicSecret`s), and \
+                  `has_reader` matches on field name alone, so this reads as covered \
+                  while nothing consults `ConfigSnapshot.secrets`. The two are \
+                  unrelated: one is the file-config secret ledger, the other is the \
+                  xDS subscription cache. Delete when a real reader lands, and \
+                  re-verify by hand rather than by the scan.",
     },
     AllowlistEntry {
         struct_name: "EndpointIR",
