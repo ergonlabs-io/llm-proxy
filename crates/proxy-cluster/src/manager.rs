@@ -59,12 +59,27 @@ enum ClusterSource {
     /// `DiscoveryType` (STATIC/STRICT_DNS/LOGICAL_DNS -- see
     /// [`crate::discovery`]).
     Config(Arc<ClusterConfig>),
-    /// Membership fed externally (EDS, WP-20). The IR's `DiscoveryType` has
-    /// no EDS variant yet (`lower.rs` rejects EDS clusters at proto
-    /// conversion), so these are registered directly against the manager via
+    /// Membership fed externally, registered directly against the manager by
     /// [`ClusterManager::add_eds_cluster`] rather than arriving through
-    /// [`ClusterManager::update_from_snapshot`] -- a stand-in for the real
-    /// xDS wiring.
+    /// [`ClusterManager::update_from_snapshot`].
+    ///
+    /// **Superseded, and every caller is a test** (`manager.rs`'s own tests
+    /// plus `proxy/src/main.rs`'s `manager_with_one_never_fed_cluster`
+    /// helper). This variant was a stand-in from when the claim below it --
+    /// "the IR's `DiscoveryType` has no EDS variant yet, `lower.rs` rejects
+    /// EDS clusters at proto conversion" -- was true. It stopped being true
+    /// in WP-21 increment 1: `DiscoveryType::Eds` exists, `lower.rs` lowers
+    /// it, and a real EDS cluster arrives as
+    /// `ClusterSource::Config(config)` with `config.discovery ==
+    /// DiscoveryType::Eds`, short-circuiting in the same places this variant
+    /// does (see [`ClusterManager::resolve_cluster`]).
+    ///
+    /// So the tests that use it configure a shape production never produces
+    /// -- rule 16's failure mode. WP-21's card owns the removal: delete this
+    /// variant, [`ManagedCluster::eds`], [`ClusterManager::add_eds_cluster`],
+    /// the carry-over block in `update_from_snapshot`, and the four
+    /// defensive match arms, and rebuild those tests on a real EDS
+    /// `ClusterConfig` instead.
     Eds,
 }
 
