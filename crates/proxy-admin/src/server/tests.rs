@@ -327,6 +327,7 @@ fn register_spend_accumulator(
         stat_prefix.to_string(),
         Arc::new(InMemoryControlPlaneStore::default()),
         default_period,
+        "test-node".to_string(),
     ));
     factory_state
         .get_or_try_init(

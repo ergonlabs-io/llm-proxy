@@ -104,7 +104,7 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::auth::TenantId;
-use crate::control::{ControlPlaneStore, StoreError};
+use crate::control::{ControlPlaneStore, FlushToken, StoreError};
 use crate::usage::TokenUsage;
 
 /// An amount of money in integer micro-dollars (1e-6 USD). See the module
@@ -646,8 +646,25 @@ pub struct TenantBudget {
 /// in building or reading it.
 #[derive(Debug, Clone, Default)]
 struct Bucket {
-    /// The tenant's absolute spend for this period, in micro-dollars.
-    total_micros: u64,
+    /// The last total the STORE confirmed for this row, in micro-dollars.
+    /// Includes every other replica's spend, because it is whatever
+    /// [`ControlPlaneStore::add_spend`] returned on the last successful
+    /// flush -- this is the field that makes the flusher a reconciliation
+    /// point rather than only a writer. Seeded from
+    /// [`ControlPlaneStore::load_spend`] on first touch.
+    base_micros: u64,
+    /// Spend recorded in THIS process since `base_micros` was last
+    /// confirmed. Handed to the store as a delta and folded into
+    /// `base_micros` when the store confirms; never written to `base_micros`
+    /// directly, or a replica would double-count its own spend the moment
+    /// the store echoed it back.
+    pending_delta_micros: u64,
+    /// The sequence number the NEXT flush of this row will use, or `None`
+    /// until it has been seeded from
+    /// [`ControlPlaneStore::last_flush_seq`] -- see [`Inner::flush_now`] for
+    /// why the seed is read at flush time and not when the bucket is
+    /// created.
+    next_seq: Option<u64>,
     /// Requests this period whose `(cluster, model)` had no configured
     /// price -- see [`Charge::Unpriced`]'s doc. Charged nothing, but kept
     /// discoverable per the design brief's "the gap must stay discoverable"
@@ -678,6 +695,10 @@ struct Bucket {
 struct Inner {
     stat_prefix: String,
     store: Arc<dyn ControlPlaneStore>,
+    /// This replica's identity, from `service_node`. Half of every
+    /// [`FlushToken`] this accumulator builds -- see that type's doc for
+    /// what two replicas sharing one node id cost.
+    node_id: String,
     /// The period used ONLY for a tenant with no configured [`TenantBudget`]
     /// -- see this section's "`record` takes its `Period` explicitly" note.
     /// Never consulted for a tenant `record` is called with an explicit
@@ -737,38 +758,123 @@ impl Inner {
                         }
                     };
                 Bucket {
-                    total_micros,
+                    base_micros: total_micros,
                     ..Bucket::default()
                 }
             })
     }
 
-    /// Writes every in-memory bucket's ABSOLUTE total to the store. See
-    /// [`ControlPlaneStore::set_spend`]'s doc for why absolute, not a
-    /// delta. Best-effort across buckets: one tenant's write failing does
-    /// not stop the rest from flushing, but the first failure is still
-    /// returned so a caller (the flusher thread's warning, or a test) can
-    /// tell the flush was not fully durable.
+    /// Flushes every in-memory bucket to the store as a DELTA, and adopts
+    /// the total the store returns.
     ///
-    /// [`Self::last_flush_at`] is advanced to `Utc::now()` ONLY when every
+    /// # This is a reconciliation point, not only a write
+    ///
+    /// [`ControlPlaneStore::add_spend`] returns the row's new authoritative
+    /// total -- this replica's delta plus everything every other replica has
+    /// added since. Adopting it into `base_micros` is what makes two
+    /// accumulators sharing one store converge; an implementation that
+    /// discards the return value still writes correctly and still enforces
+    /// against its own spend alone, which is the pre-WP-60 behaviour wearing
+    /// a new signature.
+    ///
+    /// A bucket with NOTHING to add is flushed anyway, with a delta of zero.
+    /// That is deliberate and is not a wasted call: a replica serving no
+    /// traffic still has to learn what the others spent, or it admits
+    /// requests against a ceiling it thinks is empty. There is likewise no
+    /// single-replica short circuit -- the embedded store implements the
+    /// same contract, and skipping the path in embedded mode would leave the
+    /// multi-replica path exercised only in production (ADR-0006 §5).
+    ///
+    /// # At most once per flush window
+    ///
+    /// Additive writes are composable but not idempotent, so this owns
+    /// delivery: each attempt carries `(node_id, seq)`, and `seq` advances
+    /// ONLY after the store confirms. A failed or lost write is retried next
+    /// tick under the SAME sequence, so if the first attempt did land and
+    /// only its response was lost, the store recognises the replay and
+    /// returns the total instead of charging twice. The cost of a crash is
+    /// therefore bounded at one flush interval of un-flushed spend, never a
+    /// double charge.
+    ///
+    /// Best-effort across buckets: one tenant's write failing does not stop
+    /// the rest, but the first failure is returned so the caller (the
+    /// flusher thread's warning, or a test) can tell the flush was not fully
+    /// durable.
+    ///
+    /// [`Self::last_flush_at`] advances to `Utc::now()` ONLY when every
     /// bucket wrote successfully -- see that field's doc for why a partial
     /// or total failure must leave it exactly where it was: a report that
     /// claimed a flush just succeeded when it did not would be a durability
-    /// lie, not a rounding one, but the same shape of "unreproducible wrong
-    /// answer" the module doc elsewhere warns against.
+    /// lie.
     fn flush_now(&self) -> Result<(), StoreError> {
-        let buckets = self
+        // Rust note: the buckets lock is held across store I/O, as it was
+        // before WP-60. That blocks `record` for the duration of a flush,
+        // and it is what lets the read-modify-write of `base_micros` and
+        // `pending_delta_micros` below be a plain subtraction rather than a
+        // compare-and-swap.
+        let mut buckets = self
             .buckets
             .lock()
             .expect("spend accumulator mutex poisoned");
         let mut first_err = None;
-        for ((tenant, period_key), bucket) in buckets.iter() {
-            if let Err(err) =
-                self.store
-                    .set_spend(&self.stat_prefix, tenant, period_key, bucket.total_micros)
-            {
-                if first_err.is_none() {
-                    first_err = Some(err);
+        for ((tenant, period_key), bucket) in buckets.iter_mut() {
+            // Seed the sequence from the store on first flush of this row.
+            // Read here rather than in `get_or_load_bucket` because that
+            // runs on the REQUEST path, where an extra store read costs
+            // every first request of a period, and where a failure must not
+            // be able to stop the flush from being retried.
+            let seq = match bucket.next_seq {
+                Some(seq) => seq,
+                None => {
+                    match self.store.last_flush_seq(
+                        &self.stat_prefix,
+                        tenant,
+                        period_key,
+                        &self.node_id,
+                    ) {
+                        Ok(last) => {
+                            let seq = last + 1;
+                            bucket.next_seq = Some(seq);
+                            seq
+                        }
+                        Err(err) => {
+                            // Do NOT guess a sequence -- see
+                            // `ControlPlaneStore::last_flush_seq`'s doc. A
+                            // guess that lands below the stored one makes
+                            // every future flush of this row a silent no-op.
+                            // Skipping costs one interval; guessing costs the
+                            // spend.
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+            let delta = bucket.pending_delta_micros;
+            match self.store.add_spend(
+                &self.stat_prefix,
+                tenant,
+                period_key,
+                delta,
+                FlushToken {
+                    node_id: &self.node_id,
+                    seq,
+                },
+            ) {
+                Ok(total) => {
+                    bucket.base_micros = total;
+                    bucket.pending_delta_micros = bucket.pending_delta_micros.saturating_sub(delta);
+                    bucket.next_seq = Some(seq + 1);
+                }
+                Err(err) => {
+                    // Leave `next_seq` where it is: the retry must reuse this
+                    // sequence, or a write that did land becomes a second
+                    // charge instead of a recognised replay.
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
                 }
             }
         }
@@ -848,15 +954,25 @@ impl SpendAccumulator {
     ///
     /// `default_period` is used ONLY for a tenant [`Self::record`] is never
     /// given an explicit period for -- see [`Inner::default_period`]'s doc.
+    /// `node_id` MUST be unique per replica -- it is half of every
+    /// [`FlushToken`] this accumulator writes, and two replicas sharing one
+    /// id share one dedup sequence space, so each silently drops the other's
+    /// flushes. It is a required argument rather than an `Option` with a
+    /// default for exactly that reason: a wrong value here loses money
+    /// quietly, so it must be a thing the caller states. `service_node` in
+    /// the bootstrap supplies it; see `spend_limit_filter` for what happens
+    /// when the operator left it unset.
     pub fn new(
         stat_prefix: String,
         store: Arc<dyn ControlPlaneStore>,
         default_period: Period,
+        node_id: String,
     ) -> Self {
         SpendAccumulator {
             inner: Arc::new(Inner {
                 stat_prefix,
                 store,
+                node_id,
                 default_period,
                 buckets: Mutex::new(HashMap::new()),
                 last_flush_at: Mutex::new(None),
@@ -909,7 +1025,9 @@ impl SpendAccumulator {
 
         match charge {
             Charge::Priced(amount) => {
-                bucket.total_micros = bucket.total_micros.saturating_add(amount.as_micros());
+                bucket.pending_delta_micros = bucket
+                    .pending_delta_micros
+                    .saturating_add(amount.as_micros());
             }
             Charge::Unpriced => {
                 bucket.unpriced_requests += 1;
@@ -964,9 +1082,14 @@ impl SpendAccumulator {
             .buckets
             .lock()
             .expect("spend accumulator mutex poisoned");
-        self.inner
-            .get_or_load_bucket(&mut buckets, tenant, period)
-            .total_micros
+        let bucket = self.inner.get_or_load_bucket(&mut buckets, tenant, period);
+        // Everything the store has confirmed, plus what this replica has
+        // recorded since. Enforcement reads THIS, not the store -- see this
+        // section's "Enforcement reads live memory" note -- so a replica
+        // never under-counts its own spend while waiting for a flush.
+        bucket
+            .base_micros
+            .saturating_add(bucket.pending_delta_micros)
     }
 
     /// Writes every bucket's current absolute total to the store. Callable
@@ -1015,7 +1138,9 @@ impl SpendAccumulator {
         // the design brief's "sorted for stable output" requirement.
         let unpriced_pairs: Vec<(String, String)> = bucket.unpriced_pairs.iter().cloned().collect();
         let report = SpendReport {
-            total_micros: bucket.total_micros,
+            total_micros: bucket
+                .base_micros
+                .saturating_add(bucket.pending_delta_micros),
             unpriced_requests: bucket.unpriced_requests,
             unpriced_pairs,
             unpriced_pairs_truncated: bucket.unpriced_pairs_truncated,
@@ -1498,6 +1623,7 @@ mod tests {
             "test-chain".to_string(),
             Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
             period,
+            "test-node".to_string(),
         );
         (accumulator, store)
     }
@@ -1642,6 +1768,7 @@ mod tests {
             "test-chain".to_string(),
             Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
             Period::Monthly,
+            "test-node".to_string(),
         );
 
         let daily_tenant = TenantId::new("tenant-daily");
@@ -1725,8 +1852,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             total, 5_000_000,
-            "an absolute write flushed twice with no intervening record must leave the \
-             stored total unchanged -- an additive write would double it"
+            "a second flush with nothing recorded in between must send a delta of ZERO. \
+             WP-60 made the write additive, so a flusher that re-sent its running total \
+             instead of what it has yet to hand over would double the charge on every \
+             tick"
         );
     }
 
@@ -1743,6 +1872,7 @@ mod tests {
                 "test-chain".to_string(),
                 Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
                 Period::Daily,
+                "test-node".to_string(),
             );
             accumulator_a.record(
                 &tenant,
@@ -1759,6 +1889,7 @@ mod tests {
             "test-chain".to_string(),
             Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
             Period::Daily,
+            "test-node".to_string(),
         );
         let period_key = Period::Daily.key_for(now);
         assert_eq!(
@@ -1809,14 +1940,35 @@ mod tests {
             ) -> Result<(), StoreError> {
                 self.0.set_budget(tenant, budget)
             }
-            fn set_spend(
+            fn add_spend(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                delta_micros: u64,
+                token: FlushToken<'_>,
+            ) -> Result<u64, StoreError> {
+                self.0
+                    .add_spend(stat_prefix, tenant, period, delta_micros, token)
+            }
+            fn overwrite_spend(
                 &self,
                 stat_prefix: &str,
                 tenant: &TenantId,
                 period: &PeriodKey,
                 total_micros: u64,
             ) -> Result<(), StoreError> {
-                self.0.set_spend(stat_prefix, tenant, period, total_micros)
+                self.0
+                    .overwrite_spend(stat_prefix, tenant, period, total_micros)
+            }
+            fn last_flush_seq(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                node_id: &str,
+            ) -> Result<u64, StoreError> {
+                self.0.last_flush_seq(stat_prefix, tenant, period, node_id)
             }
             fn load_spend(
                 &self,
@@ -1832,7 +1984,12 @@ mod tests {
 
         let store: Arc<dyn ControlPlaneStore> =
             Arc::new(AlwaysFailsLoadSpend(InMemoryControlPlaneStore::default()));
-        let accumulator = SpendAccumulator::new("test-chain".to_string(), store, Period::Daily);
+        let accumulator = SpendAccumulator::new(
+            "test-chain".to_string(),
+            store,
+            Period::Daily,
+            "test-node".to_string(),
+        );
         let tenant = TenantId::new("tenant-a");
         let now = dt(2026, 8, 31, 12, 0, 0);
 
@@ -1933,6 +2090,7 @@ mod tests {
             "test-chain".to_string(),
             Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
             Period::Daily,
+            "test-node".to_string(),
         ));
         // A very long interval: for the life of this test, the flusher
         // thread is running but will never tick -- functionally
@@ -1984,6 +2142,7 @@ mod tests {
                 "test-chain".to_string(),
                 Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
                 Period::Daily,
+                "test-node".to_string(),
             ));
             // A long interval so the flusher thread is started but has no
             // realistic chance to tick before the accumulator drops -- if
@@ -2031,14 +2190,14 @@ mod tests {
         );
     }
 
-    /// A store double whose `set_spend` always fails -- the mirror image of
+    /// A store double whose `add_spend` always fails -- the mirror image of
     /// `AlwaysFailsLoadSpend` above, used to prove a FAILED flush must not
     /// advance `last_flush_at`. Pinned by `a_failed_flush_does_not_advance_last_flush_at`;
     /// its mutation pin has `Inner::flush_now` set `last_flush_at`
     /// unconditionally instead of only in the `None` (no error) arm.
-    struct AlwaysFailsSetSpend(InMemoryControlPlaneStore);
+    struct AlwaysFailsAddSpend(InMemoryControlPlaneStore);
 
-    impl ControlPlaneStore for AlwaysFailsSetSpend {
+    impl ControlPlaneStore for AlwaysFailsAddSpend {
         fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
             self.0.load()
         }
@@ -2071,7 +2230,19 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.0.set_budget(tenant, budget)
         }
-        fn set_spend(
+        fn add_spend(
+            &self,
+            _stat_prefix: &str,
+            _tenant: &TenantId,
+            _period: &PeriodKey,
+            _delta_micros: u64,
+            _token: FlushToken<'_>,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Unavailable(
+                "test double: add_spend always fails".to_string(),
+            ))
+        }
+        fn overwrite_spend(
             &self,
             _stat_prefix: &str,
             _tenant: &TenantId,
@@ -2079,8 +2250,17 @@ mod tests {
             _total_micros: u64,
         ) -> Result<(), StoreError> {
             Err(StoreError::Unavailable(
-                "test double: set_spend always fails".to_string(),
+                "test double: overwrite_spend always fails".to_string(),
             ))
+        }
+        fn last_flush_seq(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            node_id: &str,
+        ) -> Result<u64, StoreError> {
+            self.0.last_flush_seq(stat_prefix, tenant, period, node_id)
         }
         fn load_spend(
             &self,
@@ -2095,8 +2275,13 @@ mod tests {
     #[test]
     fn a_failed_flush_does_not_advance_last_flush_at() {
         let store: Arc<dyn ControlPlaneStore> =
-            Arc::new(AlwaysFailsSetSpend(InMemoryControlPlaneStore::default()));
-        let accumulator = SpendAccumulator::new("test-chain".to_string(), store, Period::Daily);
+            Arc::new(AlwaysFailsAddSpend(InMemoryControlPlaneStore::default()));
+        let accumulator = SpendAccumulator::new(
+            "test-chain".to_string(),
+            store,
+            Period::Daily,
+            "test-node".to_string(),
+        );
         let tenant = TenantId::new("tenant-a");
         let now = dt(2026, 8, 31, 12, 0, 0);
 
@@ -2204,5 +2389,432 @@ mod tests {
             ],
             "unpriced_pairs must be sorted regardless of record order"
         );
+    }
+
+    // --- WP-60: two replicas over one store ---------------------------------
+    //
+    // The acceptance test this work package exists for, plus the properties
+    // that make it hold. `control.rs` covers the store contract these lean
+    // on; these cover the accumulator's half -- adopting the returned total,
+    // and never advancing a sequence the store has not confirmed.
+
+    /// Builds an accumulator over an EXISTING store, so several can share
+    /// one -- `test_accumulator` above always makes its own.
+    fn accumulator_on(
+        store: &Arc<InMemoryControlPlaneStore>,
+        node_id: &str,
+        period: Period,
+    ) -> SpendAccumulator {
+        SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+            period,
+            node_id.to_string(),
+        )
+    }
+
+    fn record_micros(accumulator: &SpendAccumulator, tenant: &TenantId, at: DateTime<Utc>, m: u64) {
+        accumulator.record(
+            tenant,
+            at,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(m)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+    }
+
+    /// THE acceptance test (ADR-0006 §3): two replicas metering the same
+    /// tenant against one shared store converge on the true total. It was
+    /// not writable while the store took absolute totals -- whichever
+    /// replica flushed last simply erased the other, and the budget it
+    /// enforced was its own traffic only.
+    #[test]
+    fn two_accumulators_sharing_one_store_converge_on_the_true_total() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 3, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        let replica_a = accumulator_on(&store, "node-a", Period::Daily);
+        let replica_b = accumulator_on(&store, "node-b", Period::Daily);
+
+        record_micros(&replica_a, &tenant, now, 10_000_000);
+        record_micros(&replica_b, &tenant, now, 5_000_000);
+
+        // Before any flush each replica knows only its own traffic. That is
+        // expected, and it is the window the flush interval bounds.
+        assert_eq!(replica_a.current_total(&tenant, &period_key), 10_000_000);
+        assert_eq!(replica_b.current_total(&tenant, &period_key), 5_000_000);
+
+        replica_a.flush_now().unwrap();
+        replica_b.flush_now().unwrap();
+
+        assert_eq!(
+            store
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            15_000_000,
+            "both replicas' spend must be in the store; an absolute write would leave \
+             whichever flushed last"
+        );
+        assert_eq!(
+            replica_b.current_total(&tenant, &period_key),
+            15_000_000,
+            "replica B flushed second, so `add_spend` returned the combined total and B \
+             must have ADOPTED it -- a replica that ignores the return value enforces \
+             against its own traffic alone, which is the bug this replaces"
+        );
+
+        // One more tick and A, which has recorded nothing since, has caught
+        // up too. A replica converges by FLUSHING, not by serving traffic.
+        replica_a.flush_now().unwrap();
+        assert_eq!(replica_a.current_total(&tenant, &period_key), 15_000_000);
+
+        // And converged means STABLE: flushing again must not re-add either
+        // replica's own contribution on top of the total it adopted.
+        replica_a.flush_now().unwrap();
+        replica_b.flush_now().unwrap();
+        assert_eq!(
+            store
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            15_000_000,
+            "a flush with nothing new recorded must be a zero delta; a replica that \
+             re-sends its running total charges itself again on every tick"
+        );
+    }
+
+    /// An idle replica still reconciles. This is why `flush_now` has no
+    /// "nothing to do" early return, and why ADR-0006 §5 forbids a
+    /// single-replica short circuit: a replica serving no traffic that never
+    /// calls the store would admit requests against a ceiling it believes is
+    /// empty.
+    #[test]
+    fn a_replica_that_recorded_nothing_still_learns_the_other_replicas_spend() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 3, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        let busy = accumulator_on(&store, "node-busy", Period::Daily);
+        let idle = accumulator_on(&store, "node-idle", Period::Daily);
+
+        record_micros(&busy, &tenant, now, 9_000_000);
+        busy.flush_now().unwrap();
+
+        // Touch the row on the idle replica so it has a bucket at all, then
+        // flush with nothing of its own to contribute.
+        assert_eq!(idle.current_total(&tenant, &period_key), 9_000_000);
+        idle.flush_now().unwrap();
+
+        assert_eq!(
+            store
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            9_000_000,
+            "the idle replica's zero-delta flush must not disturb the total"
+        );
+        assert_eq!(idle.current_total(&tenant, &period_key), 9_000_000);
+    }
+
+    /// A restarted replica keeps its own sequence going. Without seeding
+    /// from [`ControlPlaneStore::last_flush_seq`] the new process starts at
+    /// 1, the store sees a sequence it has already accepted, and every flush
+    /// is silently dropped as a replay -- spend accruing in memory forever
+    /// while the store never moves.
+    #[test]
+    fn a_restarted_replica_reusing_its_node_id_still_gets_its_flushes_accepted() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 3, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        {
+            let before_restart = accumulator_on(&store, "node-a", Period::Daily);
+            record_micros(&before_restart, &tenant, now, 3_000_000);
+            before_restart.flush_now().unwrap();
+            // A second tick, so the pre-restart sequence is provably past 1.
+            before_restart.flush_now().unwrap();
+        }
+
+        let after_restart = accumulator_on(&store, "node-a", Period::Daily);
+        record_micros(&after_restart, &tenant, now, 4_000_000);
+        after_restart.flush_now().unwrap();
+
+        assert_eq!(
+            store
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            7_000_000,
+            "the restarted process's flush must land; starting its sequence from 1 makes \
+             the store read it as a replay of the previous process and drop it"
+        );
+        assert_eq!(after_restart.current_total(&tenant, &period_key), 7_000_000);
+    }
+
+    /// At-most-once delivery: a flush whose write landed but whose response
+    /// was lost is retried under the SAME sequence, so the store recognises
+    /// it rather than charging twice.
+    #[test]
+    fn a_failed_flush_is_retried_under_the_same_sequence_and_never_double_charges() {
+        /// Fails the FIRST `add_spend` after the delta has already been
+        /// applied to the wrapped store -- the "write landed, response lost"
+        /// case, which is the only one a retry can get wrong.
+        struct LosesTheFirstResponse {
+            inner: InMemoryControlPlaneStore,
+            failed_once: std::sync::atomic::AtomicBool,
+        }
+
+        impl ControlPlaneStore for LosesTheFirstResponse {
+            fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
+                self.inner.load()
+            }
+            fn policy_generation(&self) -> Result<u64, StoreError> {
+                self.inner.policy_generation()
+            }
+            fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+                self.inner.create_tenant(tenant)
+            }
+            fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+                self.inner.delete_tenant(tenant)
+            }
+            fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), StoreError> {
+                self.inner.put_key(rec)
+            }
+            fn revoke_key(&self, key_id: &crate::auth::KeyId) -> Result<(), StoreError> {
+                self.inner.revoke_key(key_id)
+            }
+            fn set_policy(
+                &self,
+                tenant: &TenantId,
+                access: &crate::model_authz::ModelAccess,
+            ) -> Result<(), StoreError> {
+                self.inner.set_policy(tenant, access)
+            }
+            fn set_budget(
+                &self,
+                tenant: &TenantId,
+                budget: Option<&TenantBudget>,
+            ) -> Result<(), StoreError> {
+                self.inner.set_budget(tenant, budget)
+            }
+            fn add_spend(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                delta_micros: u64,
+                token: FlushToken<'_>,
+            ) -> Result<u64, StoreError> {
+                let total =
+                    self.inner
+                        .add_spend(stat_prefix, tenant, period, delta_micros, token)?;
+                if !self
+                    .failed_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(StoreError::Unavailable(
+                        "test double: the write landed, the response did not".to_string(),
+                    ));
+                }
+                Ok(total)
+            }
+            fn overwrite_spend(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                total_micros: u64,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .overwrite_spend(stat_prefix, tenant, period, total_micros)
+            }
+            fn last_flush_seq(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                node_id: &str,
+            ) -> Result<u64, StoreError> {
+                self.inner
+                    .last_flush_seq(stat_prefix, tenant, period, node_id)
+            }
+            fn load_spend(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+            ) -> Result<u64, StoreError> {
+                self.inner.load_spend(stat_prefix, tenant, period)
+            }
+        }
+
+        let store = Arc::new(LosesTheFirstResponse {
+            inner: InMemoryControlPlaneStore::default(),
+            failed_once: std::sync::atomic::AtomicBool::new(false),
+        });
+        let accumulator = SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::clone(&store) as Arc<dyn ControlPlaneStore>,
+            Period::Daily,
+            "node-a".to_string(),
+        );
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 3, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        record_micros(&accumulator, &tenant, now, 6_000_000);
+        accumulator
+            .flush_now()
+            .expect_err("the first flush must report the lost response");
+        // The write DID land, so the store already holds it.
+        assert_eq!(
+            store
+                .inner
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            6_000_000
+        );
+
+        accumulator.flush_now().unwrap();
+        assert_eq!(
+            store
+                .inner
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            6_000_000,
+            "the retry must reuse the sequence of the attempt that failed, so the store \
+             recognises it as a replay; a fresh sequence charges the same spend twice"
+        );
+        assert_eq!(accumulator.current_total(&tenant, &period_key), 6_000_000);
+    }
+
+    /// The crash bound: everything recorded BEFORE a successful flush is
+    /// durable, and only what was recorded after it is at risk. One flush
+    /// interval, no more -- the "crash refund" the design accepts.
+    #[test]
+    fn a_crash_loses_at_most_the_spend_recorded_since_the_last_flush() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 3, 12, 0, 0);
+        let period_key = Period::Daily.key_for(now);
+
+        let before_crash = accumulator_on(&store, "node-a", Period::Daily);
+        record_micros(&before_crash, &tenant, now, 8_000_000);
+        before_crash.flush_now().unwrap();
+        record_micros(&before_crash, &tenant, now, 2_000_000);
+        // No flush, and no `drop` either -- `Drop` flushes, which a crash
+        // does not do. `forget` is what makes this a crash rather than a
+        // clean shutdown.
+        assert_eq!(before_crash.current_total(&tenant, &period_key), 10_000_000);
+        std::mem::forget(before_crash);
+
+        let after_crash = accumulator_on(&store, "node-a", Period::Daily);
+        assert_eq!(
+            after_crash.current_total(&tenant, &period_key),
+            8_000_000,
+            "the flushed 8 survives and only the unflushed 2 is refunded -- losing the 8 \
+             as well would make a bounce reset the ceiling"
+        );
+    }
+
+    /// `overwrite_spend` is admin-only. The flush path must never reach it,
+    /// or a replica's absolute total would erase every other replica's
+    /// spend -- the exact failure additive writes exist to remove.
+    #[test]
+    fn the_flush_path_never_calls_overwrite_spend() {
+        struct PanicsOnOverwrite(InMemoryControlPlaneStore);
+
+        impl ControlPlaneStore for PanicsOnOverwrite {
+            fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
+                self.0.load()
+            }
+            fn policy_generation(&self) -> Result<u64, StoreError> {
+                self.0.policy_generation()
+            }
+            fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+                self.0.create_tenant(tenant)
+            }
+            fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+                self.0.delete_tenant(tenant)
+            }
+            fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), StoreError> {
+                self.0.put_key(rec)
+            }
+            fn revoke_key(&self, key_id: &crate::auth::KeyId) -> Result<(), StoreError> {
+                self.0.revoke_key(key_id)
+            }
+            fn set_policy(
+                &self,
+                tenant: &TenantId,
+                access: &crate::model_authz::ModelAccess,
+            ) -> Result<(), StoreError> {
+                self.0.set_policy(tenant, access)
+            }
+            fn set_budget(
+                &self,
+                tenant: &TenantId,
+                budget: Option<&TenantBudget>,
+            ) -> Result<(), StoreError> {
+                self.0.set_budget(tenant, budget)
+            }
+            fn add_spend(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                delta_micros: u64,
+                token: FlushToken<'_>,
+            ) -> Result<u64, StoreError> {
+                self.0
+                    .add_spend(stat_prefix, tenant, period, delta_micros, token)
+            }
+            fn overwrite_spend(
+                &self,
+                _stat_prefix: &str,
+                _tenant: &TenantId,
+                _period: &PeriodKey,
+                _total_micros: u64,
+            ) -> Result<(), StoreError> {
+                panic!(
+                    "the spend flush path reached overwrite_spend; an absolute write from a \
+                     replica erases every other replica's spend"
+                );
+            }
+            fn last_flush_seq(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+                node_id: &str,
+            ) -> Result<u64, StoreError> {
+                self.0.last_flush_seq(stat_prefix, tenant, period, node_id)
+            }
+            fn load_spend(
+                &self,
+                stat_prefix: &str,
+                tenant: &TenantId,
+                period: &PeriodKey,
+            ) -> Result<u64, StoreError> {
+                self.0.load_spend(stat_prefix, tenant, period)
+            }
+        }
+
+        let store: Arc<dyn ControlPlaneStore> =
+            Arc::new(PanicsOnOverwrite(InMemoryControlPlaneStore::default()));
+        let accumulator = SpendAccumulator::new(
+            "test-chain".to_string(),
+            store,
+            Period::Daily,
+            "node-a".to_string(),
+        );
+        let tenant = TenantId::new("tenant-a");
+        let now = dt(2026, 9, 3, 12, 0, 0);
+
+        record_micros(&accumulator, &tenant, now, 1_000_000);
+        accumulator.flush_now().unwrap();
+        // And through `Drop`'s final flush, which is a second call site.
+        drop(accumulator);
     }
 }

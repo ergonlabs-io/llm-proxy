@@ -136,6 +136,51 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// Identifies ONE spend flush attempt, so [`ControlPlaneStore::add_spend`]
+/// can drop a replay instead of charging twice. ADR-0006 §2.
+///
+/// # Both fields are required, and the `node_id` is the one that is easy to
+/// drop
+///
+/// A store MUST compare `seq` against the highest sequence it has accepted
+/// **for this `node_id` and this spend row**, and apply the delta only when
+/// `seq` is strictly greater. Dedup state keyed by `seq` alone is the trap
+/// this type exists to prevent: two replicas both reach seq 7, the store
+/// treats the second one as a duplicate and silently drops a real charge, and
+/// spend goes missing exactly the way the absolute writes it replaced used to
+/// lose it. The bug arrives from the opposite direction and looks impossible,
+/// because additive writes are supposed to have fixed precisely this.
+///
+/// `node_id` comes from `service_node` / `NodeIdentity`, which already exists
+/// as an xDS concept; this path is what makes it REQUIRED rather than
+/// optional. Two replicas sharing one node id are indistinguishable to the
+/// store and WILL lose each other's writes, so the caller is responsible for
+/// it being genuinely per-replica -- see
+/// [`crate::spend::SpendAccumulator::new`]'s doc for how that is enforced.
+///
+/// # Why a sequence number and not a UUID
+///
+/// A monotonic per-row sequence lets the store keep ONE `u64` per
+/// (writer, row) instead of an ever-growing set of seen tokens with a
+/// retention policy of its own. "Highest accepted wins" is O(1) state and
+/// needs no expiry. The cost is that the caller must not advance its sequence
+/// until a write is CONFIRMED -- an unconfirmed attempt has to be retried
+/// under the SAME number, or the retry is a fresh charge rather than a
+/// replay. [`crate::spend::SpendAccumulator`]'s flusher does exactly that.
+///
+/// Borrowed rather than owned: the node id is fixed for the process's
+/// lifetime and one is built per bucket per flush, so there is no reason to
+/// allocate a `String` on each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushToken<'a> {
+    /// This replica's identity. See the type doc: dedup keyed without it
+    /// loses spend across replicas.
+    pub node_id: &'a str,
+    /// Monotonic per spend row, per writer. Advances only after a confirmed
+    /// write.
+    pub seq: u64,
+}
+
 /// Where the control plane's durable state lives. ADR-0005's four
 /// requirements, explicitly: a failure channel on reads (`load`'s `Result`),
 /// a stated boot/refresh failure policy (see the module doc, not this
@@ -146,6 +191,24 @@ impl std::error::Error for StoreError {}
 /// `Send + Sync`: a `Box<dyn ControlPlaneStore>` is meant to be shared the
 /// same way `Box<dyn Authenticator>` already is elsewhere in this crate --
 /// see `auth.rs`'s `Authenticator` trait doc.
+///
+/// # Counters only. Usage history does not belong here.
+///
+/// The spend rows this trait holds ([`Self::add_spend`]) are CURRENT-WINDOW
+/// COUNTERS and nothing else. Per-request usage history is EXPORTED --
+/// access logs and the usage filter -- and is never written into this store.
+/// ADR-0006 §7 puts this sentence in the trait's own doc rather than only in
+/// a backlog note, because the trait is what the next person reads, and
+/// WP-55's card named the exact moment the pressure would arrive:
+///
+/// > the day a shared store arrives for rate limiting, writing usage history
+/// > into it will be tempting because the dependency is already there -- that
+/// > is how (b) arrives without anyone deciding it.
+///
+/// The owner decided export-only on 2026-09-06 and that decision stands. A
+/// counter store sized for a bounded set of live windows becomes an unbounded
+/// event log the moment history lands in it, with a retention question, a
+/// cardinality question, and a privacy question nobody scoped.
 pub trait ControlPlaneStore: Send + Sync {
     /// The snapshot-build read: everything a rebuild needs, in one call.
     fn load(&self) -> Result<StoredControlPlane, StoreError>;
@@ -166,7 +229,7 @@ pub trait ControlPlaneStore: Send + Sync {
     /// every flush interval and trigger a full policy rebuild on every
     /// replica every flush interval, for a write this counter has nothing to
     /// say about (tier 2 identity/policy, not tier 3 accrued counters -- see
-    /// ADR-0006 §1's tier table). [`Self::set_spend`] does not call this.
+    /// ADR-0006 §1's tier table). [`Self::add_spend`] and [`Self::overwrite_spend`] do not call this.
     ///
     /// # A never-written store reads `0`
     ///
@@ -223,54 +286,108 @@ pub trait ControlPlaneStore: Send + Sync {
     // "RESOLVED -- addressing follows Envoy" section -- the same
     // operator-chosen `stat_prefix` A1 already uses to address a chain from
     // the admin server.
+    /// Adds `delta_micros` to the spend total for `(stat_prefix, tenant,
+    /// period)` and returns the **new authoritative total**. ADR-0006 §2,
+    /// which is normative for this method.
+    ///
+    /// Three properties, each load-bearing, and none of them optional for an
+    /// implementation of this trait:
+    ///
+    /// **Additive.** Deltas compose, so two writers cannot clobber each
+    /// other. The absolute write this replaced was last-writer-wins: A
+    /// flushes 1300, B flushes 1200, the row reads 1200, and A's spend is
+    /// silently GONE. Under-counting makes budgets trip late or never, which
+    /// is the unsafe direction for a spend ceiling. `INCRBY` in Redis; a
+    /// read-modify-write inside ONE transaction here and in redb.
+    ///
+    /// **Idempotent per writer, via `token`.** Additive writes are not
+    /// idempotent on their own -- a retried delta double-charges -- so the
+    /// caller carries a [`FlushToken`] and the store drops a replay. An
+    /// implementation MUST key its dedup state per writer
+    /// ([`FlushToken::node_id`]) and MUST NOT key it by the sequence number
+    /// alone: two replicas both emit seq 7, a store that dedups on the
+    /// number alone treats the second as a duplicate and drops it, and spend
+    /// is lost again -- the original bug through the opposite door, now
+    /// disguised by additive writes that look like they made it impossible.
+    /// See [`FlushToken`]'s own doc for the required comparison.
+    ///
+    /// **Returns the new total.** `INCRBY` returns it for free and redb can
+    /// too, so every flush hands back the authoritative global number at no
+    /// extra cost and [`crate::spend::SpendAccumulator`] adopts it as its new
+    /// base. This is what makes the flusher a RECONCILIATION POINT rather
+    /// than a write-only mirror, and it is what fixes enforcement across
+    /// replicas without leases, extra round trips, or hot-path I/O.
+    ///
+    /// A deduplicated call is not an error: it returns the current total
+    /// unchanged, exactly as if the delta had been applied once (which, on
+    /// the accepted attempt, it was). The caller cannot tell the difference
+    /// and must not need to.
+    ///
+    /// A `delta_micros` of `0` is legal and expected -- an idle replica still
+    /// calls this every flush interval to learn what the other replicas have
+    /// spent. It is a reconciliation read that happens to be spelled as a
+    /// write.
+    fn add_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        delta_micros: u64,
+        token: FlushToken<'_>,
+    ) -> Result<u64, StoreError>;
+
     /// Sets the ABSOLUTE spend total for `(stat_prefix, tenant, period)`,
-    /// overwriting whatever was stored. Deliberately NOT additive.
+    /// overwriting whatever was stored.
     ///
-    /// An absolute write is idempotent: a caller that retries after an
-    /// AMBIGUOUS failure (a timeout or a dropped connection, where the
-    /// first attempt's outcome is unknown) simply re-sends the same total
-    /// it already computed, and the retry is a no-op rather than a second
-    /// charge. An additive write is not idempotent -- a retried delta
-    /// double-counts -- and for a spend CEILING a double-count denies a
-    /// tenant service they already paid for, which is the wrong direction
-    /// to fail in for a control whose entire job is "did they pay enough".
-    /// [`crate::spend::SpendAccumulator`] is the only production caller,
-    /// and it always sends the FULL current total for the bucket it is
-    /// flushing, never a delta -- see that module's doc.
+    /// # ADMIN ONLY. The flush path must never reach this.
     ///
-    /// # SINGLE-WRITER ONLY. Read this before implementing a remote store.
+    /// This exists for an operator zeroing or correcting a tenant's spend,
+    /// and for nothing else. It is last-writer-wins by construction, so a
+    /// second writer's total is silently discarded -- which is precisely the
+    /// bug [`Self::add_spend`] was introduced to fix (ADR-0006 §2). The
+    /// hazard existed in the first place partly because ONE method served
+    /// both purposes and only its doc distinguished them; the rename is the
+    /// guard rail, so do not route flushing back through here for
+    /// convenience.
     ///
-    /// "Absolute" is correct for ONE writer and actively wrong for two. Two
-    /// processes flushing the same `(stat_prefix, tenant, period)` are
-    /// last-writer-wins: process A flushes 300, process B flushes 200, the
-    /// row is 200, and A's 300 is silently GONE. Sharing a store between
-    /// replicas would therefore LOSE spend rather than double-count it --
-    /// quieter, and worse, than the per-process ceiling it looks like it
-    /// would fix.
-    ///
-    /// Today that is unreachable rather than guarded: [`RedbControlPlaneStore`]
-    /// takes an exclusive file lock, so a second process fails loudly at
-    /// open. The trap opens the moment someone implements a REMOTE
-    /// `ControlPlaneStore` (Redis, Postgres) behind this trait -- which is
-    /// exactly what the trait was shaped to allow (see the 3b brief's
-    /// distributed-readiness section). Such an implementation MUST NOT reuse
-    /// these absolute-write semantics for spend: it needs an additive or
-    /// compare-and-swap primitive plus a way for enforcement to see other
-    /// writers' totals, because
-    /// [`crate::spend::SpendAccumulator::current_total`] reads THIS process's
-    /// memory and nothing else.
-    ///
-    /// The ceiling is consequently enforced PER PROCESS: N replicas enforce
-    /// N independent budgets. That is the same shape as the per-worker budget
-    /// bug fixed in `0dc91d1`, one level up, and it is documented rather than
-    /// solved -- see `internal-docs/wp-50-3c-spend-budgets.md`.
-    fn set_spend(
+    /// It also does not touch dedup state. An `overwrite_spend` followed by
+    /// a replayed [`Self::add_spend`] with an already-seen token stays
+    /// deduplicated: the operator's correction stands, and the replay does
+    /// not re-apply on top of it.
+    fn overwrite_spend(
         &self,
         stat_prefix: &str,
         tenant: &TenantId,
         period: &PeriodKey,
         total_micros: u64,
     ) -> Result<(), StoreError>;
+
+    /// The highest flush sequence this store has accepted from `node_id` for
+    /// this spend row, or `0` if it has accepted none.
+    ///
+    /// # This is what makes a RESTART safe, and it is not optional
+    ///
+    /// [`Self::add_spend`] drops a token whose `seq` is not greater than the
+    /// last one accepted from the same writer. A replica that restarts and
+    /// begins counting from 1 again would therefore have every flush
+    /// silently dropped until it caught up with its own pre-restart
+    /// sequence -- spend accruing in memory, the store never moving, and no
+    /// error anywhere. [`crate::spend::SpendAccumulator`]'s flusher calls
+    /// this once per spend row to seed itself with `last + 1`, so the
+    /// sequence continues across restarts without the store having to
+    /// remember which process wrote it.
+    ///
+    /// A caller that cannot read this MUST NOT guess: flushing under a
+    /// guessed sequence is exactly the silent-loss case above. Skip the
+    /// flush and retry -- the spend is still in memory, and enforcement
+    /// reads memory, not the store.
+    fn last_flush_seq(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        node_id: &str,
+    ) -> Result<u64, StoreError>;
 
     /// Reads the spend total for `(stat_prefix, tenant, period)`. A row
     /// that has never been written -- a period nothing has charged yet, or
@@ -319,10 +436,30 @@ struct InMemoryState {
     // its own key), so this needs no separate reverse index the way
     // `keys_by_tenant` does for `keys`.
     spend: HashMap<(String, TenantId, PeriodKey), u64>,
+    // WP-60: the highest flush sequence accepted for each (row, writer). One
+    // `u64` per writer per row, not a set of every token ever seen -- see
+    // `FlushToken`'s doc for why "highest accepted wins" is the whole dedup
+    // policy. `overwrite_spend` does NOT touch this map.
+    spend_seq: HashMap<SpendWriter, u64>,
     // WP-61: bumped by every tier-2 write below, under this SAME mutex
     // acquisition -- see `ControlPlaneStore::policy_generation`'s doc for why
-    // a spend write (`set_spend` above) must never touch this field.
+    // a spend write (`add_spend` above) must never touch this field.
     generation: u64,
+}
+
+/// The dedup key for [`InMemoryControlPlaneStore`]: one spend row plus the
+/// replica writing it.
+///
+/// A named struct rather than a 4-tuple because the tuple trips clippy's
+/// `type_complexity` inside the `HashMap`, and because the `node_id` field is
+/// the one a future edit is most likely to drop -- naming it makes its
+/// absence visible in a diff. See [`FlushToken`] for what dropping it costs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SpendWriter {
+    stat_prefix: String,
+    tenant: TenantId,
+    period: PeriodKey,
+    node_id: String,
 }
 
 impl InMemoryControlPlaneStore {
@@ -334,6 +471,7 @@ impl InMemoryControlPlaneStore {
                 policies: HashMap::new(),
                 budgets: HashMap::new(),
                 spend: HashMap::new(),
+                spend_seq: HashMap::new(),
                 generation: 0,
             }),
         }
@@ -458,7 +596,46 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         Ok(())
     }
 
-    fn set_spend(
+    fn add_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        delta_micros: u64,
+        token: FlushToken<'_>,
+    ) -> Result<u64, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        let row = (stat_prefix.to_string(), tenant.clone(), period.clone());
+        let writer = SpendWriter {
+            stat_prefix: stat_prefix.to_string(),
+            tenant: tenant.clone(),
+            period: period.clone(),
+            node_id: token.node_id.to_string(),
+        };
+        let current = state.spend.get(&row).copied().unwrap_or(0);
+        // The dedup check and the add happen under ONE mutex acquisition, so
+        // no second writer can slip between them and apply a delta this
+        // replay would then be compared against.
+        let last_seq = state.spend_seq.get(&writer).copied();
+        if last_seq.is_some_and(|last| token.seq <= last) {
+            // Replay. Return the CURRENT total rather than an error: the
+            // caller's flush did land, it just landed already, and the total
+            // is what it needs to reconcile against.
+            return Ok(current);
+        }
+        // Rust note: `saturating_add` rather than `+`. A u64 of micro-dollars
+        // cannot realistically overflow, but a panic here would take down the
+        // flusher thread of every replica sharing this store at once.
+        let total = current.saturating_add(delta_micros);
+        state.spend.insert(row, total);
+        state.spend_seq.insert(writer, token.seq);
+        Ok(total)
+    }
+
+    fn overwrite_spend(
         &self,
         stat_prefix: &str,
         tenant: &TenantId,
@@ -474,6 +651,29 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             total_micros,
         );
         Ok(())
+    }
+
+    fn last_flush_seq(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        node_id: &str,
+    ) -> Result<u64, StoreError> {
+        let state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        Ok(state
+            .spend_seq
+            .get(&SpendWriter {
+                stat_prefix: stat_prefix.to_string(),
+                tenant: tenant.clone(),
+                period: period.clone(),
+                node_id: node_id.to_string(),
+            })
+            .copied()
+            .unwrap_or(0))
     }
 
     fn load_spend(
@@ -522,6 +722,12 @@ const BUDGETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("budget
 // impl, so encoding a bare integer through `serde_json` would only add an
 // allocation and a round trip for no benefit.
 const SPEND_TABLE: TableDefinition<(&str, &str, &str), u64> = TableDefinition::new("spend");
+// WP-60: the redb twin of `InMemoryState::spend_seq`. Keyed on the spend row
+// PLUS the writing node -- a key without the node id makes two replicas share
+// one sequence space and silently drop each other's flushes. See
+// `FlushToken`'s doc.
+const SPEND_SEQ_TABLE: TableDefinition<(&str, &str, &str, &str), u64> =
+    TableDefinition::new("spend_seq");
 // WP-61: a single row, keyed `"policy"`, holding the tier-2 generation
 // counter -- see `ControlPlaneStore::policy_generation`'s doc. A dedicated
 // table (rather than a row inside, say, `TENANTS_TABLE`) so bumping it is one
@@ -736,9 +942,9 @@ impl RedbControlPlaneStore {
         Ok(store)
     }
 
-    /// Creates all tables if they do not already exist -- six as of WP-61
-    /// (the doc used to say "all four"; `SPEND_TABLE` and `GENERATION_TABLE`
-    /// are the two that arrived since).
+    /// Creates all tables if they do not already exist -- seven as of WP-60
+    /// (the doc used to say "all four"; `SPEND_TABLE`, `GENERATION_TABLE`
+    /// and `SPEND_SEQ_TABLE` are the three that arrived since).
     ///
     /// Rust note: this runs a WRITE transaction even though it inserts no
     /// rows -- `WriteTransaction::open_table` is the only `redb` API that
@@ -756,6 +962,7 @@ impl RedbControlPlaneStore {
         txn.open_table(POLICIES_TABLE).map_err(store_err)?;
         txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
+        txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
         txn.open_table(GENERATION_TABLE).map_err(store_err)?;
         txn.commit().map_err(store_err)?;
         Ok(())
@@ -1042,7 +1249,52 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Ok(())
     }
 
-    fn set_spend(
+    fn add_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        delta_micros: u64,
+        token: FlushToken<'_>,
+    ) -> Result<u64, StoreError> {
+        // ONE write transaction covers the dedup read, the read-modify-write
+        // of the total, and the sequence update. redb serializes write
+        // transactions, so this is what makes concurrent replicas add rather
+        // than clobber -- splitting it into a read txn plus a write txn would
+        // reintroduce exactly the lost-update race the absolute writes had.
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let total = {
+            let mut seq_table = txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
+            let mut spend_table = txn.open_table(SPEND_TABLE).map_err(store_err)?;
+            let row = (stat_prefix, tenant.as_str(), period.as_str());
+            let current = spend_table
+                .get(row)
+                .map_err(store_err)?
+                .map(|guard| guard.value())
+                .unwrap_or(0);
+            let seq_key = (stat_prefix, tenant.as_str(), period.as_str(), token.node_id);
+            let last_seq = seq_table
+                .get(seq_key)
+                .map_err(store_err)?
+                .map(|guard| guard.value());
+            if last_seq.is_some_and(|last| token.seq <= last) {
+                // Replay: abort rather than commit, so a duplicate leaves no
+                // trace in the WAL at all.
+                drop(spend_table);
+                drop(seq_table);
+                txn.abort().map_err(store_err)?;
+                return Ok(current);
+            }
+            let total = current.saturating_add(delta_micros);
+            spend_table.insert(row, total).map_err(store_err)?;
+            seq_table.insert(seq_key, token.seq).map_err(store_err)?;
+            total
+        };
+        txn.commit().map_err(store_err)?;
+        Ok(total)
+    }
+
+    fn overwrite_spend(
         &self,
         stat_prefix: &str,
         tenant: &TenantId,
@@ -1061,6 +1313,23 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         }
         txn.commit().map_err(store_err)?;
         Ok(())
+    }
+
+    fn last_flush_seq(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        node_id: &str,
+    ) -> Result<u64, StoreError> {
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
+        let seq = table
+            .get((stat_prefix, tenant.as_str(), period.as_str(), node_id))
+            .map_err(store_err)?
+            .map(|guard| guard.value())
+            .unwrap_or(0);
+        Ok(seq)
     }
 
     fn load_spend(
@@ -1414,7 +1683,7 @@ impl ControlPlane {
     /// (`typed_config.store` on `llmproxy.auth` -- in-memory or a redb file),
     /// not a private one of its own. Handing back a fresh
     /// `InMemoryControlPlaneStore` instead would leave 3c-ii-b's whole
-    /// persistence path -- `set_spend`/`load_spend` on redb, absolute writes,
+    /// persistence path -- `add_spend`/`load_spend` on redb, additive writes,
     /// restart-resume -- wired to nothing, and a monthly ceiling would reset
     /// to zero on every process restart: a budget an operator could escape by
     /// bouncing the proxy. See `spend_limit_filter`'s module doc.
@@ -1876,14 +2145,35 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.0.set_budget(tenant, budget)
         }
-        fn set_spend(
+        fn add_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            delta_micros: u64,
+            token: FlushToken<'_>,
+        ) -> Result<u64, StoreError> {
+            self.0
+                .add_spend(stat_prefix, tenant, period, delta_micros, token)
+        }
+        fn overwrite_spend(
             &self,
             stat_prefix: &str,
             tenant: &TenantId,
             period: &PeriodKey,
             total_micros: u64,
         ) -> Result<(), StoreError> {
-            self.0.set_spend(stat_prefix, tenant, period, total_micros)
+            self.0
+                .overwrite_spend(stat_prefix, tenant, period, total_micros)
+        }
+        fn last_flush_seq(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            node_id: &str,
+        ) -> Result<u64, StoreError> {
+            self.0.last_flush_seq(stat_prefix, tenant, period, node_id)
         }
         fn load_spend(
             &self,
@@ -1945,7 +2235,18 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.inner.set_budget(tenant, budget)
         }
-        fn set_spend(
+        fn add_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            delta_micros: u64,
+            token: FlushToken<'_>,
+        ) -> Result<u64, StoreError> {
+            self.inner
+                .add_spend(stat_prefix, tenant, period, delta_micros, token)
+        }
+        fn overwrite_spend(
             &self,
             stat_prefix: &str,
             tenant: &TenantId,
@@ -1953,7 +2254,17 @@ mod tests {
             total_micros: u64,
         ) -> Result<(), StoreError> {
             self.inner
-                .set_spend(stat_prefix, tenant, period, total_micros)
+                .overwrite_spend(stat_prefix, tenant, period, total_micros)
+        }
+        fn last_flush_seq(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            node_id: &str,
+        ) -> Result<u64, StoreError> {
+            self.inner
+                .last_flush_seq(stat_prefix, tenant, period, node_id)
         }
         fn load_spend(
             &self,
@@ -2003,7 +2314,17 @@ mod tests {
         ) -> Result<(), StoreError> {
             Ok(())
         }
-        fn set_spend(
+        fn add_spend(
+            &self,
+            _stat_prefix: &str,
+            _tenant: &TenantId,
+            _period: &PeriodKey,
+            _delta_micros: u64,
+            _token: FlushToken<'_>,
+        ) -> Result<u64, StoreError> {
+            Ok(0)
+        }
+        fn overwrite_spend(
             &self,
             _stat_prefix: &str,
             _tenant: &TenantId,
@@ -2011,6 +2332,15 @@ mod tests {
             _total_micros: u64,
         ) -> Result<(), StoreError> {
             Ok(())
+        }
+        fn last_flush_seq(
+            &self,
+            _stat_prefix: &str,
+            _tenant: &TenantId,
+            _period: &PeriodKey,
+            _node_id: &str,
+        ) -> Result<u64, StoreError> {
+            Ok(0)
         }
         fn load_spend(
             &self,
@@ -3216,11 +3546,15 @@ mod tests {
             // they are checked directly against BOTH stores below rather
             // than through `assert_stored_control_planes_match`.
             store
-                .set_spend(
+                .add_spend(
                     "chain-a",
                     &TenantId::new("tenant-a"),
                     &PeriodKey::for_test("2026-08"),
                     12_500_000,
+                    FlushToken {
+                        node_id: "node-a",
+                        seq: 1,
+                    },
                 )
                 .unwrap();
         }
@@ -3472,7 +3806,7 @@ mod tests {
     }
 
     // --- every tier-2 write bumps InMemoryControlPlaneStore's generation;
-    //     set_spend (tier-3) and a revoke of an unknown key (nothing written)
+    //     add_spend (tier-3) and a revoke of an unknown key (nothing written)
     //     must not.
 
     #[test]
@@ -3525,19 +3859,23 @@ mod tests {
             "a NotFound revoke wrote nothing and must not bump the generation"
         );
 
-        // set_spend is tier-3, not tier-2 -- must never bump.
+        // add_spend is tier-3, not tier-2 -- must never bump.
         store
-            .set_spend(
+            .add_spend(
                 "chain-a",
                 &tenant,
                 &PeriodKey::for_test("2026-09"),
                 5_000_000,
+                FlushToken {
+                    node_id: "node-a",
+                    seq: 1,
+                },
             )
             .unwrap();
         assert_eq!(
             store.policy_generation().unwrap(),
             expected,
-            "set_spend is a tier-3 write and must never bump the tier-2 policy generation"
+            "add_spend is a tier-3 write and must never bump the tier-2 policy generation"
         );
 
         store.delete_tenant(&tenant).unwrap();
@@ -3596,17 +3934,21 @@ mod tests {
         assert_eq!(store.policy_generation().unwrap(), expected);
 
         store
-            .set_spend(
+            .add_spend(
                 "chain-a",
                 &tenant,
                 &PeriodKey::for_test("2026-09"),
                 5_000_000,
+                FlushToken {
+                    node_id: "node-a",
+                    seq: 1,
+                },
             )
             .unwrap();
         assert_eq!(
             store.policy_generation().unwrap(),
             expected,
-            "set_spend must not bump the redb-backed generation either"
+            "add_spend must not bump the redb-backed generation either"
         );
 
         store.delete_tenant(&tenant).unwrap();
@@ -3688,5 +4030,365 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    // --- WP-60: additive spend, and the dedup that makes it at-most-once ----
+    //
+    // These test the STORE's half of the contract. The accumulator's half
+    // (adopting the returned total, retrying under the same sequence) is in
+    // `spend.rs`. Both backends are covered: the in-memory store is what
+    // embedded mode runs, and ADR-0006 §5 forbids treating that as a special
+    // case, so it must satisfy the identical contract.
+
+    fn spend_row() -> (String, TenantId, PeriodKey) {
+        (
+            "chain-a".to_string(),
+            TenantId::new("tenant-a"),
+            PeriodKey::for_test("2026-09"),
+        )
+    }
+
+    /// The property absolute writes could not have: two replicas' spend adds
+    /// up instead of the later write erasing the earlier one.
+    #[test]
+    fn two_writers_add_to_the_same_row_instead_of_overwriting_each_other() {
+        let store = InMemoryControlPlaneStore::default();
+        let (prefix, tenant, period) = spend_row();
+
+        let after_a = store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                100,
+                FlushToken {
+                    node_id: "node-a",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+        let after_b = store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                50,
+                FlushToken {
+                    node_id: "node-b",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(after_a, 100);
+        assert_eq!(
+            after_b, 150,
+            "node-b's flush must ADD to node-a's, and must return the new total including \
+             it -- returning only node-b's own contribution would leave every replica \
+             enforcing against its own spend alone"
+        );
+        assert_eq!(store.load_spend(&prefix, &tenant, &period).unwrap(), 150);
+    }
+
+    /// The trap ADR-0006 §2 names: dedup keyed by the sequence alone would
+    /// see node-b's `seq: 1` as a replay of node-a's and silently drop a real
+    /// charge. Distinct from the test above -- that one would still pass if
+    /// the two writers happened to pick different sequences.
+    #[test]
+    fn two_writers_using_the_same_sequence_number_both_land() {
+        let store = InMemoryControlPlaneStore::default();
+        let (prefix, tenant, period) = spend_row();
+
+        for node_id in ["node-a", "node-b", "node-c"] {
+            store
+                .add_spend(
+                    &prefix,
+                    &tenant,
+                    &period,
+                    10,
+                    FlushToken { node_id, seq: 7 },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.load_spend(&prefix, &tenant, &period).unwrap(),
+            30,
+            "three replicas that all reached sequence 7 must all be charged; dedup state \
+             keyed on the sequence alone drops two of them and loses the spend"
+        );
+    }
+
+    /// A retry of a write that DID land must not charge twice, and must
+    /// still hand back a usable total.
+    #[test]
+    fn a_replayed_flush_token_is_a_no_op_that_still_returns_the_total() {
+        let store = InMemoryControlPlaneStore::default();
+        let (prefix, tenant, period) = spend_row();
+        let token = FlushToken {
+            node_id: "node-a",
+            seq: 1,
+        };
+
+        assert_eq!(
+            store
+                .add_spend(&prefix, &tenant, &period, 100, token)
+                .unwrap(),
+            100
+        );
+        assert_eq!(
+            store
+                .add_spend(&prefix, &tenant, &period, 100, token)
+                .unwrap(),
+            100,
+            "a replay must return the CURRENT total, not an error and not a second charge \
+             -- the caller cannot tell its first attempt landed, so this is the answer it \
+             needs to reconcile against"
+        );
+        assert_eq!(store.load_spend(&prefix, &tenant, &period).unwrap(), 100);
+    }
+
+    /// Dedup is per ROW as well as per writer: the same sequence against a
+    /// different period is a different flush, not a replay.
+    #[test]
+    fn the_same_sequence_against_a_different_row_is_not_a_replay() {
+        let store = InMemoryControlPlaneStore::default();
+        let (prefix, tenant, _) = spend_row();
+        let token = FlushToken {
+            node_id: "node-a",
+            seq: 1,
+        };
+        let september = PeriodKey::for_test("2026-09");
+        let october = PeriodKey::for_test("2026-10");
+
+        store
+            .add_spend(&prefix, &tenant, &september, 100, token)
+            .unwrap();
+        store
+            .add_spend(&prefix, &tenant, &october, 40, token)
+            .unwrap();
+
+        assert_eq!(store.load_spend(&prefix, &tenant, &september).unwrap(), 100);
+        assert_eq!(
+            store.load_spend(&prefix, &tenant, &october).unwrap(),
+            40,
+            "a period rollover restarts the sequence for the new row; treating that as a \
+             replay would lose the first flush of every period"
+        );
+    }
+
+    /// What [`ControlPlaneStore::last_flush_seq`] exists for -- a restarted
+    /// replica has to find out where its own sequence got to, or every flush
+    /// it makes is dropped as a replay of its previous life.
+    #[test]
+    fn last_flush_seq_reports_this_writers_high_water_mark_only() {
+        let store = InMemoryControlPlaneStore::default();
+        let (prefix, tenant, period) = spend_row();
+
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "node-a")
+                .unwrap(),
+            0,
+            "a writer that has never flushed this row starts at zero"
+        );
+
+        for seq in [1, 2, 3] {
+            store
+                .add_spend(
+                    &prefix,
+                    &tenant,
+                    &period,
+                    10,
+                    FlushToken {
+                        node_id: "node-a",
+                        seq,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                10,
+                FlushToken {
+                    node_id: "node-b",
+                    seq: 99,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "node-a")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "node-b")
+                .unwrap(),
+            99,
+            "each writer has its own sequence space; reading another writer's high-water \
+             mark would make a restarted replica skip ahead or stall"
+        );
+    }
+
+    /// `overwrite_spend` is the admin escape hatch, and it must stay
+    /// absolute -- it is the only way to correct a row, so it must not be
+    /// quietly additive too.
+    #[test]
+    fn overwrite_spend_replaces_the_total_and_leaves_dedup_state_alone() {
+        let store = InMemoryControlPlaneStore::default();
+        let (prefix, tenant, period) = spend_row();
+
+        store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                100,
+                FlushToken {
+                    node_id: "node-a",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+        store.overwrite_spend(&prefix, &tenant, &period, 7).unwrap();
+
+        assert_eq!(store.load_spend(&prefix, &tenant, &period).unwrap(), 7);
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "node-a")
+                .unwrap(),
+            1,
+            "an admin correction must not reset the writer's sequence -- that would make \
+             the replica's next flush look like a replay of its own seq 1"
+        );
+    }
+
+    /// Every assertion above, against the persistent backend. ADR-0006 §5:
+    /// the two backends implement ONE contract, and a divergence here is how
+    /// embedded mode ends up being the only path anyone ever exercises.
+    #[test]
+    fn the_redb_backend_satisfies_the_same_additive_and_dedup_contract() {
+        let store = RedbControlPlaneStore::in_memory();
+        let (prefix, tenant, period) = spend_row();
+
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "node-a")
+                .unwrap(),
+            0
+        );
+
+        let after_a = store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                100,
+                FlushToken {
+                    node_id: "node-a",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+        let after_b = store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                50,
+                FlushToken {
+                    node_id: "node-b",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!((after_a, after_b), (100, 150));
+
+        let replayed = store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                50,
+                FlushToken {
+                    node_id: "node-b",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            replayed, 150,
+            "the replay must be dropped and the current total returned, exactly as the \
+             in-memory backend does"
+        );
+
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "node-b")
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.load_spend(&prefix, &tenant, &period).unwrap(), 150);
+
+        store.overwrite_spend(&prefix, &tenant, &period, 7).unwrap();
+        assert_eq!(store.load_spend(&prefix, &tenant, &period).unwrap(), 7);
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "node-b")
+                .unwrap(),
+            1
+        );
+    }
+
+    /// A zero delta is a legal, EXPECTED call -- it is how a replica serving
+    /// no traffic learns what the others spent. It must still consume its
+    /// sequence and still return the true total.
+    #[test]
+    fn a_zero_delta_flush_reads_the_true_total_and_still_advances_the_sequence() {
+        let store = InMemoryControlPlaneStore::default();
+        let (prefix, tenant, period) = spend_row();
+
+        store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                100,
+                FlushToken {
+                    node_id: "busy",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+        let seen = store
+            .add_spend(
+                &prefix,
+                &tenant,
+                &period,
+                0,
+                FlushToken {
+                    node_id: "idle",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            seen, 100,
+            "an idle replica must still see the busy one's spend, or it admits requests \
+             against a ceiling it believes is empty"
+        );
+        assert_eq!(
+            store
+                .last_flush_seq(&prefix, &tenant, &period, "idle")
+                .unwrap(),
+            1
+        );
     }
 }

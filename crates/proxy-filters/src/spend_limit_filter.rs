@@ -92,7 +92,7 @@
 //! A private store here would have been the quiet failure. Budgets would
 //! persist while SPEND reset to zero on every restart, so a monthly ceiling
 //! would be escapable by bouncing the proxy, and 3c-ii-b's entire
-//! persistence path (`set_spend`/`load_spend` on redb, absolute writes,
+//! persistence path (`add_spend`/`load_spend` on redb, additive writes,
 //! restart-resume) would be wired to nothing while still passing its own
 //! tests.
 //! # Loud on unreadable usage, but never fail-closed -- restated from
@@ -340,6 +340,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                     ctx.stat_prefix.clone(),
                     store,
                     default_period,
+                    resolve_node_id(ctx.node_id(), &ctx.stat_prefix),
                 ));
                 accumulator.start_flusher(flush_interval);
                 Ok(Arc::new(SharedSpendLimitState {
@@ -713,6 +714,59 @@ impl HttpFilter for SpendLimitFilterInstance {
         self.record_if_present(cb);
         FilterTrailersStatus::Continue
     }
+}
+
+/// This replica's spend-writer identity: `service_node` if the operator
+/// configured one, otherwise a synthesised id that is unique to this process.
+///
+/// # Why an unset `service_node` warns instead of failing either way
+///
+/// The id is half of every [`crate::control::FlushToken`], and two replicas
+/// sharing one id silently drop each other's flushes -- lost spend, which is
+/// a budget escape. So an empty id must not be passed through.
+///
+/// The two obvious responses are both wrong here:
+///
+/// - Refusing the config fails CLOSED, and metering must not start refusing
+///   traffic -- the same call `token_limit` already made for unreadable usage
+///   (CLAUDE.md rule 17). It would also reject nearly every deployment that
+///   works today: a fully static bootstrap does not carry a node id into the
+///   IR at all.
+/// - Passing the empty string through fails OPEN and SILENTLY, which is the
+///   one outcome this whole work package exists to prevent.
+///
+/// Synthesising loses nothing. A unique id cannot collide, so no flush is
+/// ever dropped as another replica's replay; the only property given up is
+/// that a RESTARTED process no longer recognises its own pre-restart
+/// sequence, which costs at most the one un-acknowledged flush already
+/// bounded by the crash-refund window. The `warn!` is what makes the
+/// unconfigured state visible rather than merely survivable.
+fn resolve_node_id(configured: &str, stat_prefix: &str) -> String {
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    // Rust note: process id plus process start time. The pid alone recycles
+    // across restarts on the same host, and the timestamp alone collides
+    // between two replicas started in the same nanosecond; together they are
+    // unique in the only way that matters, which is "not equal to another
+    // live replica's".
+    let unique = format!(
+        "unconfigured-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    tracing::warn!(
+        stat_prefix = %stat_prefix,
+        node_id = %unique,
+        "llmproxy.spend_limit: no service_node is configured, so this replica has no stable \
+         identity to write spend under; using a synthesised one. Spend is still counted \
+         correctly, but set service_node in the bootstrap to keep a restarted replica's \
+         identity stable"
+    );
+    unique
 }
 
 #[cfg(test)]
@@ -1126,6 +1180,7 @@ mod tests {
             "test-chain".to_string(),
             store,
             default_period,
+            "test-node".to_string(),
         ));
         FilterHarness {
             price_table: Arc::new(price_table),
