@@ -118,6 +118,17 @@ rlimit = "0.10"
 # "redb data model" section.
 redb = "4.2"
 
+# WP-62: the Redis-backed `ControlPlaneStore` -- tier-2 identity/policy plus
+# tier-3 spend counters, shared across replicas instead of embedded per
+# process (ADR-0006). **Sync connections only, no `tokio-comp`/`aio`
+# feature.** The trait this implements is synchronous by design, and
+# ADR-0005's rule is that no WORKER ever holds a store connection -- only the
+# control runtime's poller and the spend flusher thread call it, both off the
+# request path, so there is nothing here for an async runtime to buy. `script`
+# is on for `redis::Script`, which `add_spend`'s Lua compare-then-INCRBY needs
+# to be atomic (see `control_redis.rs`).
+redis = { version = "0.27", features = ["script"] }
+
 # ---------------------------------------------------------------- profiles --
 # This section is a DISK-SIZE measure, not a speed one. Say so plainly,
 # because the obvious assumption is the opposite.

@@ -760,10 +760,10 @@ const GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("gener
 ///   is latency-sensitive, so the extra allocation and (de)serialization
 ///   cost of JSON is free in context.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct EncodedKeyRow {
-    digest: [u8; 32],
-    tenant: String,
-    revoked: bool,
+pub(crate) struct EncodedKeyRow {
+    pub(crate) digest: [u8; 32],
+    pub(crate) tenant: String,
+    pub(crate) revoked: bool,
 }
 
 /// [`ModelAccess`] as `serde_json` sees it. A local mirror rather than
@@ -772,7 +772,7 @@ struct EncodedKeyRow {
 /// and giving it a serde impl would be a public-API decision belonging to
 /// that module's owner, not something to smuggle in via this store.
 #[derive(serde::Serialize, serde::Deserialize)]
-enum EncodedModelAccess {
+pub(crate) enum EncodedModelAccess {
     All,
     Only(Vec<String>),
 }
@@ -804,7 +804,7 @@ impl From<EncodedModelAccess> for ModelAccess {
 /// [`EncodedModelAccess`]'s doc: `Period` lives in `spend.rs`, which this
 /// increment's scope does not otherwise need to touch for a serde impl.
 #[derive(serde::Serialize, serde::Deserialize)]
-enum EncodedPeriod {
+pub(crate) enum EncodedPeriod {
     Daily,
     Monthly,
 }
@@ -831,7 +831,7 @@ impl From<EncodedPeriod> for crate::spend::Period {
 /// derive on the real type" reasoning as [`EncodedModelAccess`] and
 /// [`EncodedPeriod`] above.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct EncodedTenantBudget {
+pub(crate) struct EncodedTenantBudget {
     max_micros: u64,
     period: EncodedPeriod,
 }
@@ -854,7 +854,7 @@ impl From<EncodedTenantBudget> for TenantBudget {
     }
 }
 
-fn encode_json<T: serde::Serialize>(value: &T) -> Vec<u8> {
+pub(crate) fn encode_json<T: serde::Serialize>(value: &T) -> Vec<u8> {
     // Rust note: `.expect`, not `?` -- every value passed here is one of
     // this module's own plain-data types (`EncodedKeyRow`, `EncodedModelAccess`,
     // `Vec<String>`), none of which can fail to serialize (no `f32::NAN`-style
@@ -866,7 +866,7 @@ fn encode_json<T: serde::Serialize>(value: &T) -> Vec<u8> {
 /// The read-side counterpart of [`encode_json`]. Unlike encoding, decoding
 /// CAN fail on real operational grounds (a hand-edited or corrupted `.redb`
 /// file), so this reports a [`StoreError`] rather than panicking.
-fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
+pub(crate) fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
     serde_json::from_slice(bytes)
         .map_err(|err| StoreError::Unavailable(format!("corrupt control-plane store row: {err}")))
 }
@@ -884,7 +884,7 @@ fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreE
 /// type) so one function serves every `redb` error type used below --
 /// each `.map_err(store_err)` call site monomorphizes it for whichever
 /// error type that particular `redb` call actually returns.
-fn store_err(err: impl std::fmt::Display) -> StoreError {
+pub(crate) fn store_err(err: impl std::fmt::Display) -> StoreError {
     StoreError::Unavailable(err.to_string())
 }
 
