@@ -39,16 +39,25 @@
 //!    keeps serving -- `internal-docs/envoy-divergences.md` already records
 //!    this as a deliberate divergence from Envoy's own silence here.
 //! 6. **RDS is refused by name**, not silently ignored (ground rule #1's
-//!    shape); **EDS is applied, as of WP-21 increment 2b-ii.** RDS still
-//!    belongs to WP-21's warming logic, uncorrected since 2026-09-06: a
+//!    shape); **EDS is applied, as of WP-21 increment 2b-ii, and SDS is
+//!    applied, as of WP-22 increment 1.** RDS still belongs to WP-21's
+//!    warming logic, uncorrected since 2026-09-06: a
 //!    `HttpConnectionManagerConfig` carries its route table inline as an
 //!    `Arc<RouteTable>` with no by-name variant, so applying an RDS response
 //!    would mean inventing an IR shape whose warming rules are not this
-//!    increment's to own. EDS had no such obstacle -- `EndpointIR` is already
-//!    a plain `Vec`, not a listener-shaped dependency -- so `on_eds_response`
-//!    lowers it and hands the result to an injected [`PublishEndpoints`] sink,
-//!    the same seam-not-dependency shape [`Publish`] already uses for
-//!    listeners and clusters.
+//!    increment's to own. EDS and SDS had no such obstacle -- `EndpointIR` is
+//!    already a plain `Vec`, and [`DynamicSecret`] (in `secret.rs`, a
+//!    WP-22-increment-1-only home -- see its own doc) is not a
+//!    listener-shaped dependency either -- so `on_eds_response`/
+//!    `on_sds_response` lower their resource and hand the result to an
+//!    injected [`PublishEndpoints`]/[`PublishSecrets`] sink, the same
+//!    seam-not-dependency shape [`Publish`] already uses for listeners and
+//!    clusters. **What SDS increment 1 deliberately leaves undone**: nothing
+//!    names which secrets to subscribe to yet (`desired_names` still answers
+//!    `None` for SDS, same as CDS/LDS), because that naming comes from a
+//!    listener's `tls_certificate_sds_secret_configs`, which needs `ir.rs`
+//!    (owned by another lane this batch) -- increment 2's job, alongside
+//!    wiring [`PublishSecrets`] to the real `SwapCertResolver`.
 //!
 //! # Ordering is `SotwSet::apply`'s job, not this module's
 //!
@@ -67,6 +76,7 @@ use prost::Message;
 use proxy_api::envoy::config::cluster::v3::Cluster as ClusterProto;
 use proxy_api::envoy::config::endpoint::v3::ClusterLoadAssignment as ClusterLoadAssignmentProto;
 use proxy_api::envoy::config::listener::v3::Listener as ListenerProto;
+use proxy_api::envoy::extensions::transport_sockets::tls::v3::Secret as SecretProto;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::{
     ClusterConfig, ConfigSnapshot, EndpointIR, ListenerConfig, SnapshotVersion,
@@ -74,6 +84,7 @@ use proxy_config::ir::{
 use proxy_config::{lower_dynamic_cluster, lower_dynamic_endpoints, lower_dynamic_listener};
 
 use crate::client::ResponseHandler;
+use crate::secret::{decode_secret, DynamicSecret};
 use crate::store::{ApplyError, ApplyOutcome, SetSemantics, SotwSet};
 use crate::subscription::Verdict;
 
@@ -87,6 +98,10 @@ const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listene
 const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
 /// EDS's `type_url` -- same reasoning as [`RDS_TYPE_URL`].
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
+/// Full `type_url` an SDS `DiscoveryResponse` carries -- verified against
+/// `secret.proto`'s own `package envoy.extensions.transport_sockets.tls.v3;`
+/// plus its `message Secret`, not just copied from memory.
+const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
 
 /// Where a newly assembled snapshot goes once every resource in a response
 /// has lowered cleanly.
@@ -134,6 +149,31 @@ pub type Publish =
 /// nothing to report back.
 pub type PublishEndpoints = Box<
     dyn FnMut(String, Vec<EndpointIR>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send,
+>;
+
+/// Where a newly assembled SDS resource's decoded secret goes once it lowers
+/// cleanly -- WP-22 increment 1's counterpart to [`PublishEndpoints`], same
+/// shape and same reasoning (an injected callback, not a dependency on the
+/// real sink; the real one is the WP-08 `ArcSwap` cert resolver, wired in
+/// increment 2, and this crate must stay free of that edge).
+///
+/// The second parameter is `Arc<DynamicSecret>` rather than an owned value --
+/// unlike [`PublishEndpoints`]'s `Vec<EndpointIR>`, a secret's bytes are the
+/// kind of payload worth sharing rather than cloning per call, and
+/// `SotwSet<Entry<DynamicSecret>>` already holds its own `Arc<DynamicSecret>`
+/// per entry (see `Entry`'s own doc), so handing the sink a clone of that
+/// `Arc` costs nothing.
+///
+/// This increment wires the sink from `on_sds_response` only -- it is not
+/// yet reachable from any listener's `tls_certificate_sds_secret_configs`,
+/// because naming which secrets to subscribe to needs `ir.rs` (increment 2,
+/// owned by another lane this batch; see this module's SDS scope note below).
+pub type PublishSecrets = Box<
+    dyn FnMut(
+            String,
+            Arc<DynamicSecret>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send,
 >;
 
@@ -195,6 +235,15 @@ fn eds_path(any: &prost_types::Any, index: usize) -> String {
     }
 }
 
+/// Same idea as [`cds_path`], for SDS -- `Secret.name` is the resource's own
+/// name field (what an `SdsSecretConfig.name` subscribes to).
+fn sds_path(any: &prost_types::Any, index: usize) -> String {
+    match SecretProto::decode(any.value.as_slice()) {
+        Ok(s) if !s.name.is_empty() => format!("sds.secrets[{}]", s.name),
+        _ => format!("sds.secrets[{index}]"),
+    }
+}
+
 /// Turns accepted `DiscoveryResponse`s into published [`ConfigSnapshot`]s.
 ///
 /// Holds one independent [`SotwSet`] per resource type (CDS, LDS), each
@@ -230,6 +279,23 @@ pub struct ResourceApplier {
     /// primary one, a statically-declared `Cluster` whose `eds_cluster_config`
     /// names a resource this applier is meant to keep populated.
     endpoints: SotwSet<Entry<Vec<EndpointIR>>>,
+    /// SDS's own set -- `PerName`, like `endpoints` above and for the same
+    /// reason: an SDS response only ever carries the secrets a control plane
+    /// feels like (re)declaring right now, not every secret ever
+    /// subscribed to, so absence must not read as removal (S8: "SDS ... like
+    /// EDS ... absence != removal" -- this increment's own brief draws the
+    /// parallel explicitly).
+    ///
+    /// Its static-name set is deliberately EMPTY too, for a parallel reason
+    /// to `endpoints`'s: a `Secret.name` and a bootstrap
+    /// `static_resources.secrets` entry's name share one proto-level
+    /// namespace, but which one actually governs a given listener is decided
+    /// by whether that listener's `SdsSecretConfig` sets `sds_config` at all
+    /// (unset -> static; set -> SDS) -- not by first-come-first-served over
+    /// the name itself, the way CDS/LDS static/dynamic shadowing works. That
+    /// decision is `ir.rs`'s to encode once listener wiring lands
+    /// (increment 2); seeding a shadow set here now would just be a guess.
+    secrets: SotwSet<Entry<DynamicSecret>>,
     /// The snapshot most recently published -- `base` itself until the first
     /// response that actually changes something.
     current: Arc<ConfigSnapshot>,
@@ -238,6 +304,10 @@ pub struct ResourceApplier {
     /// [`ResourceApplier::with_endpoint_sink`] wires one -- until then, an
     /// EDS response is refused (see `on_eds_response`).
     endpoint_sink: Option<PublishEndpoints>,
+    /// Where accepted SDS secrets go. `None` until
+    /// [`ResourceApplier::with_secret_sink`] wires one -- until then, an SDS
+    /// response is refused (see `on_sds_response`).
+    secret_sink: Option<PublishSecrets>,
 }
 
 impl ResourceApplier {
@@ -251,10 +321,13 @@ impl ResourceApplier {
             listeners: SotwSet::new(SetSemantics::FullState, static_listeners),
             // Empty static-name set on purpose -- see the field's own doc.
             endpoints: SotwSet::new(SetSemantics::PerName, BTreeSet::new()),
+            // Empty static-name set on purpose -- see the field's own doc.
+            secrets: SotwSet::new(SetSemantics::PerName, BTreeSet::new()),
             current: Arc::clone(&base),
             base,
             publish,
             endpoint_sink: None,
+            secret_sink: None,
         }
     }
 
@@ -266,6 +339,14 @@ impl ResourceApplier {
     /// EDS by name (ground rule #1's shape) instead of silently no-op'ing.
     pub fn with_endpoint_sink(mut self, sink: PublishEndpoints) -> Self {
         self.endpoint_sink = Some(sink);
+        self
+    }
+
+    /// Wire the sink accepted SDS secrets are handed to. Same consuming-
+    /// builder shape as [`ResourceApplier::with_endpoint_sink`] and the same
+    /// reason: without this, `on_sds_response` keeps refusing SDS by name.
+    pub fn with_secret_sink(mut self, sink: PublishSecrets) -> Self {
+        self.secret_sink = Some(sink);
         self
     }
 
@@ -308,6 +389,7 @@ impl ResourceApplier {
             CDS_TYPE_URL => self.on_cds_response(resp).await,
             LDS_TYPE_URL => self.on_lds_response(resp).await,
             EDS_TYPE_URL => self.on_eds_response(resp).await,
+            SDS_TYPE_URL => self.on_sds_response(resp).await,
             RDS_TYPE_URL => Verdict::Reject(format!(
                 "RDS (`{RDS_TYPE_URL}`) is not applied: a listener references its route table \
                  inline, and the by-name variant plus the warming rules that go with it are \
@@ -492,6 +574,82 @@ impl ResourceApplier {
         Verdict::Accept
     }
 
+    /// Like `on_eds_response`, but simpler: an SDS secret is not resolved to
+    /// any other name before reaching the sink -- `Secret.name` IS the name
+    /// the sink is called under, since (unlike EDS's resource-name-vs-
+    /// cluster-name split) there is no other resource in `self.current` for
+    /// an SDS name to resolve through in this increment (that correlation --
+    /// a listener's `SdsSecretConfig.name` -- is increment 2's, per this
+    /// module's SDS scope note). No `finish` call either, for the same
+    /// reason `on_eds_response` skips it: an accepted secret never touches
+    /// `ConfigSnapshot` or `self.publish`, only the injected sink.
+    async fn on_sds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
+        let Some(sink) = self.secret_sink.as_mut() else {
+            return Verdict::Reject(format!(
+                "SDS (`{SDS_TYPE_URL}`) is not applied: this ResourceApplier has no secret \
+                 sink wired -- see `ResourceApplier::with_secret_sink`"
+            ));
+        };
+
+        let mut pairs = Vec::with_capacity(resp.resources.len());
+        for (index, any) in resp.resources.iter().enumerate() {
+            let path = sds_path(any, index);
+            let secret = match decode_secret(any, &path) {
+                Ok(secret) => secret,
+                // Rule 1 (all-or-nothing): bail out before touching
+                // `self.secrets` at all -- nothing lowered so far is
+                // applied, and the sink is never called for this response.
+                Err(err) => return Verdict::Reject(err.to_string()),
+            };
+            let name = secret.name.clone();
+            pairs.push((
+                name,
+                Entry {
+                    raw: any.value.clone(),
+                    ir: Arc::new(secret),
+                },
+            ));
+        }
+
+        let outcome = match self.secrets.apply(pairs) {
+            Ok(outcome) => outcome,
+            Err(ApplyError::DuplicateName(name)) => {
+                return Verdict::Reject(format!(
+                    "SDS response named secret `{name}` more than once"
+                ));
+            }
+        };
+
+        // Same store-consistency fix-up as `on_eds_response`: `apply` above
+        // already recorded every added/updated name BEFORE the sink below
+        // has run, so a sink failure must `forget` exactly the names it
+        // failed for -- otherwise an identical retransmission would compare
+        // `unchanged` and never reach the sink again. See `SotwSet::forget`'s
+        // own doc.
+        let mut failed: BTreeSet<String> = BTreeSet::new();
+        let mut failure_detail: Vec<String> = Vec::new();
+        for name in outcome.added.iter().chain(outcome.updated.iter()) {
+            let entry = self
+                .secrets
+                .get(name)
+                .expect("a name SotwSet::apply just reported added/updated must be present");
+            if let Err(err) = sink(name.clone(), Arc::clone(&entry.ir)).await {
+                failed.insert(name.clone());
+                failure_detail.push(format!("{name}: {err}"));
+            }
+        }
+
+        if !failed.is_empty() {
+            self.secrets.forget(&failed);
+            return Verdict::Reject(format!(
+                "SDS secret sink rejected: {}",
+                failure_detail.join("; ")
+            ));
+        }
+
+        Verdict::Accept
+    }
+
     /// Common tail of both `on_*_response` methods: warn on anything shadowed
     /// (rule 5), publish a fresh snapshot iff something actually changed
     /// (rule 4), and accept either way -- a `SotwSet::apply` that ran at all
@@ -573,7 +731,11 @@ impl ResponseHandler for ResourceApplier {
 
     /// EDS is the only type this applier derives a name set for -- CDS/LDS
     /// are wildcard subscriptions (see `subscription.rs`'s own doc on why
-    /// `set_names` panics for those), and RDS is not applied here at all.
+    /// `set_names` panics for those), RDS is not applied here at all, and SDS
+    /// -- though applied, as of WP-22 increment 1 -- deliberately answers
+    /// `None` too: naming which secrets to subscribe to comes from a
+    /// listener's `tls_certificate_sds_secret_configs`, which needs `ir.rs`
+    /// wiring this increment does not do (see this module's own doc).
     /// `client.rs`'s pump calls this after every response, for every state it
     /// holds; returning `None` for anything but EDS is what makes those calls
     /// no-ops.
@@ -583,5 +745,304 @@ impl ResponseHandler for ResourceApplier {
         } else {
             None
         }
+    }
+}
+
+/// WP-22 increment 1 acceptance tests for `on_sds_response`, colocated here
+/// (rather than in `tests/apply.rs`, which this increment does not own) --
+/// same idiom `store.rs` already uses for its own `SotwSet` tests. Fixture
+/// shape mirrors `tests/apply.rs`'s EDS fixtures as closely as a single-file
+/// test module can: hand-build the proto, wrap it via `any_of`, drive
+/// `ResourceApplier::on_response` directly.
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use proxy_api::envoy::config::core::v3::data_source::Specifier;
+    use proxy_api::envoy::config::core::v3::DataSource;
+    use proxy_api::envoy::extensions::transport_sockets::tls::v3::secret::Type as SecretOneof;
+    use proxy_api::envoy::extensions::transport_sockets::tls::v3::{
+        CertificateValidationContext, TlsCertificate,
+    };
+    use proxy_config::ir::ConfigSnapshot;
+
+    use super::*;
+    use crate::secret::SecretKind;
+
+    const SECRET_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.Secret";
+
+    fn any_of<T: Message>(msg: &T, type_name: &str) -> prost_types::Any {
+        prost_types::Any {
+            type_url: format!("type.googleapis.com/{type_name}"),
+            value: msg.encode_to_vec(),
+        }
+    }
+
+    fn inline_bytes(bytes: &[u8]) -> DataSource {
+        DataSource {
+            specifier: Some(Specifier::InlineBytes(bytes.to_vec())),
+            ..Default::default()
+        }
+    }
+
+    fn tls_cert_secret(name: &str, chain: &[u8], key: &[u8]) -> SecretProto {
+        SecretProto {
+            name: name.to_string(),
+            r#type: Some(SecretOneof::TlsCertificate(TlsCertificate {
+                certificate_chain: Some(inline_bytes(chain)),
+                private_key: Some(inline_bytes(key)),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn validation_context_secret(name: &str, trusted_ca: &[u8]) -> SecretProto {
+        SecretProto {
+            name: name.to_string(),
+            r#type: Some(SecretOneof::ValidationContext(
+                CertificateValidationContext {
+                    trusted_ca: Some(inline_bytes(trusted_ca)),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn sds_response(version: &str, secrets: &[SecretProto]) -> DiscoveryResponse {
+        DiscoveryResponse {
+            version_info: version.to_string(),
+            type_url: SDS_TYPE_URL.to_string(),
+            nonce: format!("n-{version}"),
+            resources: secrets.iter().map(|s| any_of(s, SECRET_TYPE)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn empty_base() -> Arc<ConfigSnapshot> {
+        Arc::new(ConfigSnapshot::default())
+    }
+
+    fn recording_publisher() -> (Publish, Arc<Mutex<Vec<Arc<ConfigSnapshot>>>>) {
+        let published: Arc<Mutex<Vec<Arc<ConfigSnapshot>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&published);
+        let publish: Publish = Box::new(move |snapshot| {
+            recorded.lock().unwrap().push(snapshot);
+            Box::pin(std::future::ready(()))
+        });
+        (publish, published)
+    }
+
+    /// What [`recording_secret_sink`] hands back: every successful sink call,
+    /// in order, as `(name, secret)`.
+    type RecordedSecretCalls = Arc<Mutex<Vec<(String, Arc<DynamicSecret>)>>>;
+
+    /// A recording [`PublishSecrets`]: same shape as `tests/apply.rs`'s own
+    /// `recording_endpoint_sink` -- `fail_names` lists secret names whose
+    /// FIRST call must return `Err`, consumed on that first failure so a
+    /// later retry for the same name succeeds.
+    fn recording_secret_sink(fail_names: &[&str]) -> (PublishSecrets, RecordedSecretCalls) {
+        let recorded: RecordedSecretCalls = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::clone(&recorded);
+        let mut still_failing: HashSet<String> = fail_names.iter().map(|s| s.to_string()).collect();
+        let sink: PublishSecrets = Box::new(move |name, secret| {
+            if still_failing.remove(&name) {
+                return Box::pin(std::future::ready(Err(format!(
+                    "sink deliberately failed for `{name}`"
+                ))));
+            }
+            calls.lock().unwrap().push((name, secret));
+            Box::pin(std::future::ready(Ok(())))
+        });
+        (sink, recorded)
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_inline_tls_certificate_secret_reaches_the_sink() {
+        let (publish, _published) = recording_publisher();
+        let (sink, recorded) = recording_secret_sink(&[]);
+        let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
+
+        let resp = sds_response("v1", &[tls_cert_secret("cert-1", b"chain", b"key")]);
+        let verdict = applier.on_response(&resp).await;
+
+        assert_eq!(verdict, Verdict::Accept);
+        let calls = recorded.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "cert-1");
+        match &calls[0].1.kind {
+            SecretKind::TlsCertificate {
+                certificate_chain,
+                private_key,
+            } => {
+                assert_eq!(certificate_chain, b"chain");
+                assert_eq!(private_key, b"key");
+            }
+            SecretKind::ValidationContext { .. } => panic!("expected TlsCertificate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_validation_context_secret_lowers_and_reaches_the_sink() {
+        let (publish, _published) = recording_publisher();
+        let (sink, recorded) = recording_secret_sink(&[]);
+        let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
+
+        let resp = sds_response("v1", &[validation_context_secret("ca-1", b"ca-bytes")]);
+        let verdict = applier.on_response(&resp).await;
+
+        assert_eq!(verdict, Verdict::Accept);
+        let calls = recorded.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "ca-1");
+        match &calls[0].1.kind {
+            SecretKind::ValidationContext { trusted_ca } => {
+                assert_eq!(trusted_ca, b"ca-bytes");
+            }
+            SecretKind::TlsCertificate { .. } => panic!("expected ValidationContext"),
+        }
+    }
+
+    /// PerName semantics (S8: SDS absence != removal), proven the same way
+    /// `store.rs`'s own `SotwSet` tests prove it: a THIRD response resending
+    /// `cert-a`'s identical bytes must still compare `unchanged` and NOT
+    /// reach the sink again, even though the middle response never mentioned
+    /// `cert-a` at all. If the second response had (wrongly) treated the
+    /// omission as a removal, this third response would read as `added`
+    /// again and call the sink a second time.
+    #[tokio::test]
+    async fn a_second_response_omitting_a_previously_seen_secret_does_not_remove_it() {
+        let (publish, _published) = recording_publisher();
+        let (sink, recorded) = recording_secret_sink(&[]);
+        let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
+
+        let resp_a = sds_response("v1", &[tls_cert_secret("cert-a", b"chain-a", b"key-a")]);
+        let verdict = applier.on_response(&resp_a).await;
+        assert_eq!(verdict, Verdict::Accept);
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+
+        // Second response carries only `cert-b` -- `cert-a` is absent, not
+        // resent.
+        let resp_b = sds_response("v2", &[tls_cert_secret("cert-b", b"chain-b", b"key-b")]);
+        let verdict = applier.on_response(&resp_b).await;
+        assert_eq!(verdict, Verdict::Accept);
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+
+        // Third response resends `cert-a`'s EXACT bytes. Under PerName, the
+        // store never forgot it, so this compares `unchanged` and the sink is
+        // not called again.
+        let verdict = applier.on_response(&resp_a).await;
+        assert_eq!(verdict, Verdict::Accept);
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            2,
+            "cert-a was never removed by its absence from the middle response, so resending its \
+             identical bytes must compare unchanged, not added"
+        );
+    }
+
+    /// The store-consistency fix-up on `on_sds_response`, same deliverable as
+    /// `tests/apply.rs`'s own
+    /// `a_sink_that_fails_once_is_retried_on_the_next_identical_response` for
+    /// EDS: `apply` records a name as added/updated before the sink runs, so
+    /// a sink failure must `forget` it -- otherwise a later identical
+    /// retransmission would compare `unchanged` and the secret would stay
+    /// permanently unpublished while the store reports it fine.
+    #[tokio::test]
+    async fn a_sink_failure_leaves_the_set_as_if_the_secret_never_arrived() {
+        let (publish, _published) = recording_publisher();
+        let (sink, recorded) = recording_secret_sink(&["cert-1"]);
+        let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
+
+        let resp = sds_response("v1", &[tls_cert_secret("cert-1", b"chain", b"key")]);
+
+        let first = applier.on_response(&resp).await;
+        assert!(
+            matches!(first, Verdict::Reject(_)),
+            "expected the first attempt to reject (sink fails), got {first:?}"
+        );
+        assert!(recorded.lock().unwrap().is_empty());
+
+        // Same bytes again. If the store were left believing the first
+        // attempt applied, this would come back `unchanged` and the sink
+        // would never be asked again.
+        let second = applier.on_response(&resp).await;
+        assert_eq!(
+            second,
+            Verdict::Accept,
+            "the retry must reach the sink, which now succeeds"
+        );
+        let calls = recorded.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the sink must be called on the retry");
+        assert_eq!(calls[0].0, "cert-1");
+    }
+
+    #[tokio::test]
+    async fn an_sds_response_with_no_sink_wired_is_rejected_naming_the_reason() {
+        let (publish, _published) = recording_publisher();
+        let mut applier = ResourceApplier::new(empty_base(), publish);
+
+        let resp = sds_response("v1", &[tls_cert_secret("cert-1", b"chain", b"key")]);
+        let verdict = applier.on_response(&resp).await;
+        let Verdict::Reject(message) = verdict else {
+            panic!("expected Reject, got {verdict:?}");
+        };
+        assert!(
+            message.contains("no secret sink"),
+            "message should say why, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_sds_response_naming_a_secret_twice_is_rejected() {
+        let (publish, _published) = recording_publisher();
+        let (sink, recorded) = recording_secret_sink(&[]);
+        let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
+
+        let resp = sds_response(
+            "v1",
+            &[
+                tls_cert_secret("dup", b"chain-1", b"key-1"),
+                tls_cert_secret("dup", b"chain-2", b"key-2"),
+            ],
+        );
+        let verdict = applier.on_response(&resp).await;
+        assert!(
+            matches!(verdict, Verdict::Reject(_)),
+            "expected Reject, got {verdict:?}"
+        );
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    /// A `filename` `DataSource` is refused with its full dotted path --
+    /// response-level parity with `secret.rs`'s own decode-level test, since
+    /// the acceptance list asks for both.
+    #[tokio::test]
+    async fn an_sds_response_with_a_filename_data_source_is_rejected_with_its_full_dotted_path() {
+        let (publish, _published) = recording_publisher();
+        let (sink, recorded) = recording_secret_sink(&[]);
+        let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
+
+        let bad = SecretProto {
+            name: "cert-1".to_string(),
+            r#type: Some(SecretOneof::TlsCertificate(TlsCertificate {
+                certificate_chain: Some(DataSource {
+                    specifier: Some(Specifier::Filename("/etc/certs/chain.pem".to_string())),
+                    ..Default::default()
+                }),
+                private_key: Some(inline_bytes(b"key")),
+                ..Default::default()
+            })),
+        };
+        let resp = sds_response("v1", &[bad]);
+        let verdict = applier.on_response(&resp).await;
+        let Verdict::Reject(message) = verdict else {
+            panic!("expected Reject, got {verdict:?}");
+        };
+        assert!(
+            message.contains("sds.secrets[cert-1].tls_certificate.certificate_chain.filename"),
+            "message should carry the full dotted path, got: {message}"
+        );
+        assert!(recorded.lock().unwrap().is_empty());
     }
 }
