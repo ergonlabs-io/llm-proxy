@@ -226,7 +226,30 @@ pub struct DownstreamTlsFactory {
 impl DownstreamTlsFactory {
     pub fn build(spec: &DownstreamTlsSpec, context: &str) -> Result<Self, TlsBuildError> {
         let provider = build_crypto_provider(&spec.params);
-        let cert_set = resolver::build_cert_set(&spec.certificates, &provider, context)?;
+        // WP-22 increment 2a: an SDS-named chain binds with an EMPTY cert set
+        // rather than refusing to build. `SwapCertResolver::resolve` answers
+        // `None` for that set, so the listener accepts TCP and fails every TLS
+        // handshake until the control plane delivers -- never serving in the
+        // clear. Both-empty still errors, from `build_cert_set` itself: the
+        // lowering invariant on `DownstreamTlsSpec::certificates` says exactly
+        // one of the two is set, and a hand-built spec that breaks it must not
+        // get a silently-unserving listener.
+        //
+        // Rule 17 shape: this is a control that has not engaged yet, so it is
+        // loud. Fires per accept-loop worker on bind and on every snapshot
+        // rebuild -- not per connection.
+        let cert_set = if spec.certificates.is_empty() && !spec.certificate_sds_names.is_empty() {
+            tracing::warn!(
+                context,
+                secrets = ?spec.certificate_sds_names,
+                "TLS chain has no certificates yet: its serving certificates arrive over SDS \
+                 and none have been delivered, so every TLS handshake on this chain will fail \
+                 until the control plane sends them"
+            );
+            resolver::CertSet::default()
+        } else {
+            resolver::build_cert_set(&spec.certificates, &provider, context)?
+        };
         let cert_resolver = Arc::new(SwapCertResolver::new(cert_set));
 
         let versions = protocol_versions(&spec.params);

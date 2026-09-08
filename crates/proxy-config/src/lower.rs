@@ -659,9 +659,15 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.extensions.transport_sockets.tls.v3.CommonTlsContext" => &[
             "tls_params",
             "tls_certificates",
+            "tls_certificate_sds_secret_configs",
             "validation_context",
             "alpn_protocols",
         ],
+        // Listed even though its only two fields (`name`, `sds_config`) are
+        // both already handled explicitly -- a future proto bump that adds a
+        // third field should fail loudly here rather than pass through
+        // unchecked (ground rule #1).
+        "envoy.extensions.transport_sockets.tls.v3.SdsSecretConfig" => &["name", "sds_config"],
         "envoy.extensions.transport_sockets.tls.v3.TlsParameters" => &[
             "tls_minimum_protocol_version",
             "tls_maximum_protocol_version",
@@ -2123,10 +2129,37 @@ fn convert_downstream_tls(
         &format!("{common_path}.tls_params"),
         true,
     )?;
-    let certificates = convert_downstream_certificates(
-        &common.tls_certificates,
-        &format!("{common_path}.tls_certificates"),
-    )?;
+    let tls_certificates_path = format!("{common_path}.tls_certificates");
+    let certificates = if common.tls_certificates.is_empty() {
+        Vec::new()
+    } else {
+        convert_downstream_certificates(&common.tls_certificates, &tls_certificates_path)?
+    };
+    let sds_path = format!("{common_path}.tls_certificate_sds_secret_configs");
+    let certificate_sds_names =
+        convert_certificate_sds_configs(&common.tls_certificate_sds_secret_configs, &sds_path)?;
+
+    // Divergence #5 (internal-docs/envoy-divergences.md): Envoy's own proto
+    // comment says `tls_certificate_sds_secret_configs` "is ignored" when
+    // `tls_certificates` is set. Ground rule #1 forbids silently ignoring a
+    // set field, so we reject the mixed case by path instead.
+    match (certificates.is_empty(), certificate_sds_names.is_empty()) {
+        (false, false) => {
+            return Err(invalid(
+                sds_path,
+                "tls_certificates is also set; exactly one of tls_certificates and \
+                 tls_certificate_sds_secret_configs may be set",
+            ))
+        }
+        (true, true) => {
+            return Err(invalid(
+                tls_certificates_path,
+                "either tls_certificates or tls_certificate_sds_secret_configs must be set",
+            ))
+        }
+        _ => {}
+    }
+
     let validation = convert_validation_context(common, &common_path)?;
 
     let require_client_certificate = ctx.require_client_certificate.unwrap_or(false);
@@ -2161,11 +2194,7 @@ fn convert_downstream_tls(
 
     Ok(DownstreamTlsSpec {
         certificates,
-        // WP-22 increment 2a lowers `tls_certificate_sds_secret_configs` here.
-        // Unreachable-empty rather than a silent drop until then: the field is
-        // absent from `CommonTlsContext`'s `allowed_fields` entry, so a config
-        // that sets it is refused by dotted path before reaching this line.
-        certificate_sds_names: Vec::new(),
+        certificate_sds_names,
         params,
         alpn_protocols: common.alpn_protocols.clone(),
         validation,
@@ -2324,16 +2353,15 @@ fn convert_tls_certificate(
 /// Downstream: 1 or 2 certificates (one per key type — RSA and ECDSA — like
 /// Envoy/BoringSSL). Which entry is which key type is resolved when the
 /// rustls socket loads the keys (WP-08 chunk B), not here.
+///
+/// Callers only invoke this for a non-empty slice; the "must be non-empty"
+/// half of the invariant lives in `convert_downstream_tls`, alongside the
+/// `tls_certificate_sds_secret_configs` mutual-exclusion check it shares a
+/// path with (WP-22 increment 2a).
 fn convert_downstream_certificates(
     certs: &[tls_v3::TlsCertificate],
     path: &str,
 ) -> Result<Vec<TlsCertificateIR>, ConfigError> {
-    if certs.is_empty() {
-        return Err(invalid(
-            path,
-            "at least one tls_certificates entry is required (SDS is not implemented yet — WP-22)",
-        ));
-    }
     if certs.len() > 2 {
         return Err(invalid(
             path,
@@ -2345,6 +2373,53 @@ fn convert_downstream_certificates(
         .enumerate()
         .map(|(i, c)| convert_tls_certificate(c, &format!("{path}[{i}]")))
         .collect()
+}
+
+/// `tls_certificate_sds_secret_configs` -> secret names the SDS subscription
+/// will request (WP-22 increment 2a). Each entry must carry an ADS
+/// `sds_config`; a name-only entry means "look this up in
+/// `static_resources.secrets`", which is refused below rather than resolved
+/// to nothing -- see the doc on `DownstreamTlsSpec::certificate_sds_names`.
+fn convert_certificate_sds_configs(
+    configs: &[tls_v3::SdsSecretConfig],
+    path: &str,
+) -> Result<Vec<SecretName>, ConfigError> {
+    if configs.len() > 2 {
+        return Err(invalid(
+            path,
+            "Envoy allows at most one certificate per key type (RSA, ECDSA)",
+        ));
+    }
+    // Rust note: collecting into `Vec` (not `HashSet`) preserves declaration
+    // order, which the IR doc promises callers -- the duplicate check below
+    // is a linear `contains` scan instead of a set insert for that reason.
+    let mut names: Vec<SecretName> = Vec::with_capacity(configs.len());
+    for (i, cfg) in configs.iter().enumerate() {
+        let entry_path = format!("{path}[{i}]");
+        if cfg.name.is_empty() {
+            return Err(invalid(
+                format!("{entry_path}.name"),
+                "an SDS secret config must name the secret it subscribes to",
+            ));
+        }
+        if names.contains(&cfg.name) {
+            return Err(invalid(
+                path,
+                format!("`{}` is named more than once in the same chain", cfg.name),
+            ));
+        }
+        let sds_config_path = format!("{entry_path}.sds_config");
+        if !check_ads_source(cfg.sds_config.as_ref(), &sds_config_path)? {
+            return Err(unsupported(
+                sds_config_path,
+                "a name-only SdsSecretConfig resolves against static_resources.secrets, \
+                 whose TlsSecret is still a stub carrying only a name, so there is nothing \
+                 to resolve to yet (WP-22, a later increment)",
+            ));
+        }
+        names.push(cfg.name.clone());
+    }
+    Ok(names)
 }
 
 /// Upstream: at most one client (mTLS) certificate.

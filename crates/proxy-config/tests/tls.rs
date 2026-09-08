@@ -38,6 +38,11 @@ fn err_path(err: &ConfigError) -> &str {
     match err {
         ConfigError::UnsupportedField { field_path, .. } => field_path,
         ConfigError::InvalidValue { field_path, .. } => field_path,
+        // `SdsSecretConfig.name`'s `min_len: 1` PGV constraint is caught
+        // during `parse_bootstrap`, before `convert_certificate_sds_configs`
+        // ever runs -- same defense-in-depth relationship as
+        // `health_check.rs`'s `err_path`.
+        ConfigError::Validation { field_path, .. } => field_path,
         other => panic!("expected a field-scoped error, got: {other}"),
     }
 }
@@ -330,7 +335,11 @@ fn zero_downstream_certificates_is_rejected() {
         err_path(&err),
         format!("{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificates")
     );
-    assert!(err.to_string().contains("WP-22"), "got: {err}");
+    assert!(
+        err.to_string()
+            .contains("tls_certificate_sds_secret_configs"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -499,4 +508,177 @@ fn upstream_happy_path() {
     ));
     let validation = tls.validation.as_ref().expect("validation_context");
     assert!(matches!(validation.ca, CaSource::SystemRoots));
+}
+
+// --------------------------------------------------------------- case  5 --
+// WP-22 increment 2a: `tls_certificate_sds_secret_configs` lowering.
+
+#[test]
+fn sds_only_chain_lowers_with_empty_certificates() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server-cert
+                    sds_config: { ads: {}, resource_api_version: V3 }
+"#;
+    let snapshot = downstream_snapshot(ctx).expect("must lower");
+    let tls = downstream_tls_of(&snapshot);
+    assert!(tls.certificates.is_empty());
+    assert_eq!(tls.certificate_sds_names, vec!["server-cert".to_string()]);
+}
+
+#[test]
+fn two_sds_names_lower_in_declaration_order() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server-cert-rsa
+                    sds_config: { ads: {}, resource_api_version: V3 }
+                  - name: server-cert-ecdsa
+                    sds_config: { ads: {}, resource_api_version: V3 }
+"#;
+    let snapshot = downstream_snapshot(ctx).expect("must lower");
+    let tls = downstream_tls_of(&snapshot);
+    assert!(tls.certificates.is_empty());
+    assert_eq!(
+        tls.certificate_sds_names,
+        vec![
+            "server-cert-rsa".to_string(),
+            "server-cert-ecdsa".to_string()
+        ]
+    );
+}
+
+#[test]
+fn tls_certificates_and_sds_together_is_rejected() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { inline_string: "c" }
+                    private_key: { inline_string: "k" }
+                tls_certificate_sds_secret_configs:
+                  - name: server-cert
+                    sds_config: { ads: {}, resource_api_version: V3 }
+"#;
+    let err =
+        downstream_snapshot(ctx).expect_err("mixing tls_certificates and SDS must be rejected");
+    assert_eq!(
+        err_path(&err),
+        format!("{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificate_sds_secret_configs")
+    );
+    assert!(err.to_string().contains("tls_certificates"), "got: {err}");
+}
+
+#[test]
+fn neither_tls_certificates_nor_sds_is_rejected() {
+    let ctx = r#"
+              common_tls_context: {}
+"#;
+    let err = downstream_snapshot(ctx).expect_err("at least one of the two must be set");
+    assert_eq!(
+        err_path(&err),
+        format!("{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificates")
+    );
+    assert!(
+        err.to_string()
+            .contains("tls_certificate_sds_secret_configs"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn three_sds_names_is_rejected() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: c1
+                    sds_config: { ads: {}, resource_api_version: V3 }
+                  - name: c2
+                    sds_config: { ads: {}, resource_api_version: V3 }
+                  - name: c3
+                    sds_config: { ads: {}, resource_api_version: V3 }
+"#;
+    let err = downstream_snapshot(ctx).expect_err("3 SDS names must be rejected");
+    assert_eq!(
+        err_path(&err),
+        format!("{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificate_sds_secret_configs")
+    );
+    assert!(err.to_string().contains("key type"), "got: {err}");
+}
+
+#[test]
+fn duplicate_sds_names_is_rejected() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server-cert
+                    sds_config: { ads: {}, resource_api_version: V3 }
+                  - name: server-cert
+                    sds_config: { ads: {}, resource_api_version: V3 }
+"#;
+    let err = downstream_snapshot(ctx).expect_err("duplicate SDS names must be rejected");
+    assert_eq!(
+        err_path(&err),
+        format!("{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificate_sds_secret_configs")
+    );
+    assert!(err.to_string().contains("server-cert"), "got: {err}");
+}
+
+#[test]
+fn empty_sds_name_is_rejected() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - sds_config: { ads: {}, resource_api_version: V3 }
+"#;
+    let err = downstream_snapshot(ctx).expect_err("an empty SDS name must be rejected");
+    assert_eq!(
+        err_path(&err),
+        format!(
+            "{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificate_sds_secret_configs[0].name"
+        )
+    );
+}
+
+#[test]
+fn missing_sds_config_is_rejected() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server-cert
+"#;
+    let err = downstream_snapshot(ctx).expect_err("a name-only SDS entry must be rejected");
+    assert_eq!(
+        err_path(&err),
+        format!(
+            "{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificate_sds_secret_configs[0].sds_config"
+        )
+    );
+    assert!(
+        err.to_string().contains("static_resources.secrets"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn sds_config_with_api_config_source_is_rejected() {
+    let ctx = r#"
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server-cert
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc: { cluster_name: xds_cluster }
+"#;
+    let err = downstream_snapshot(ctx).expect_err("a per-type api_config_source must be rejected");
+    assert_eq!(
+        err_path(&err),
+        format!(
+            "{DOWNSTREAM_TLS_PATH}.common_tls_context.tls_certificate_sds_secret_configs[0].sds_config.api_config_source"
+        )
+    );
 }
