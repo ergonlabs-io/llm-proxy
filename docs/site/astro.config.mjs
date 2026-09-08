@@ -97,7 +97,7 @@ export default defineConfig({
 				{
 					label: 'Operations',
 					items: [
-						// { label: 'Running in production', slug: 'operations/running-in-production' },
+						{ label: 'Running in production', slug: 'operations/running-in-production' },
 						{ label: 'Config reload', slug: 'operations/config-reload' },
 						{ label: 'Draining and shutdown', slug: 'operations/draining-and-shutdown' },
 						{ label: 'xDS conformance', slug: 'operations/xds-conformance' },
