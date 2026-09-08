@@ -543,6 +543,28 @@ async fn run_serve(
         Arc::new(proxy_cluster::resolver::TokioResolver),
         proxy_core::tls::transport_socket_builder(),
     ));
+    // ADR-0006 §2 / WP-60 prerequisite: the effective node id, computed
+    // ONCE here so both `factory_state` below and `start_ads` further down
+    // use the exact same value -- see `effective_node`'s own doc for the
+    // override rule. The bootstrap side of that rule is `snapshot.ads`'s own
+    // `node` field, the only place today's IR carries the bootstrap `node`
+    // proto field (`convert_dynamic_resources`, `proxy-config`); a fully
+    // static bootstrap (no `dynamic_resources`) has none, so this falls back
+    // to `NodeIdentity::default()` -- an empty id, matching
+    // `SharedFactoryState::node_id`'s own "empty means unconfigured"
+    // contract rather than inventing a second meaning for "no bootstrap
+    // node" here.
+    let bootstrap_node = snapshot
+        .ads
+        .as_ref()
+        .map(|ads| ads.node.clone())
+        .unwrap_or_default();
+    let node = effective_node(
+        &bootstrap_node,
+        service_node.as_deref(),
+        service_cluster.as_deref(),
+    );
+
     // WP-50 3b-ii part B: one `SharedFactoryState` shared across every
     // worker, same "control builds it once, workers get a clone of the same
     // instance" shape as `cluster_manager` above. The HTTP filter chain is
@@ -550,10 +572,13 @@ async fn run_serve(
     // each worker's own `LocalSet`, ADR-0003), so a filter factory that needs
     // ONE process-wide singleton registers it in this slot on its first
     // `create()` call and every other worker's `create()` for the same
-    // filter reads the same instance back. Nothing reads or writes it yet
-    // (this increment is pure plumbing) -- a later increment wires the auth
-    // control plane through it.
-    let factory_state = Arc::new(proxy_http::filter::SharedFactoryState::default());
+    // filter reads the same instance back. WP-60 prerequisite: also carries
+    // this process's effective node id (`node.id` above), so a filter that
+    // needs to disambiguate itself across replicas (the spend flush token,
+    // ADR-0006 §2) can reach it via `FactoryContext::node_id()`.
+    let factory_state = Arc::new(proxy_http::filter::SharedFactoryState::for_node(
+        node.id.clone(),
+    ));
     let rejected = cluster_manager
         .update_from_snapshot(&snapshot.clusters)
         .await;
@@ -744,12 +769,7 @@ async fn run_serve(
     // means nothing was started; see `start_ads`'s own doc for the three
     // (non-fatal) ways that happens. The receiver is read from inside the
     // `select!` in this function's own signal loop, further down.
-    let mut ads_apply_rx = start_ads(
-        &snapshot,
-        service_node.as_deref(),
-        service_cluster.as_deref(),
-        &cluster_manager,
-    );
+    let mut ads_apply_rx = start_ads(&snapshot, &node, &cluster_manager);
 
     let publisher = WorkerPool::spawn(
         WorkerPoolConfig {
@@ -1192,10 +1212,15 @@ fn effective_node(
 /// serving. [`AdsClient::run`] reconnects forever with a jittered backoff (see
 /// its own doc comment), and a lazy channel is what lets the FIRST attempt
 /// fail into that loop instead of into a startup error here.
+///
+/// `node` is the ALREADY-RESOLVED [`effective_node`] result -- `run_serve`
+/// computes it once, before this call, so it can also hand the same value to
+/// `SharedFactoryState::for_node`; this function no longer calls
+/// `effective_node` itself, to keep that a single call site (see `run_serve`'s
+/// own comment on `node`).
 fn start_ads(
     snapshot: &Arc<ConfigSnapshot>,
-    service_node: Option<&str>,
-    service_cluster: Option<&str>,
+    node: &NodeIdentity,
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
 ) -> Option<mpsc::Receiver<AdsApplyMsg>> {
     let ads = snapshot.ads.as_ref()?;
@@ -1246,8 +1271,6 @@ fn start_ads(
         }
     };
     let mut grpc_client = AggregatedDiscoveryServiceClient::new(channel);
-
-    let node = effective_node(&ads.node, service_node, service_cluster);
 
     // Bounded at 1: `ResourceApplier` (via `AdsClient::run_once`) applies one
     // `DiscoveryResponse` at a time and its `Publish` future awaits the
@@ -1360,7 +1383,7 @@ fn start_ads(
         Subscription::Names(applier.eds_resource_names()),
     ));
 
-    let mut client = AdsClient::new(states).with_node(node);
+    let mut client = AdsClient::new(states).with_node(node.clone());
     let reconnect = Reconnect::real();
 
     // Rust note: spawned and the `JoinHandle` dropped -- `AdsClient::run`
@@ -2155,5 +2178,30 @@ routes:
             effective_node(&bootstrap, Some(""), None),
             node("", "bootstrap-cluster")
         );
+    }
+
+    // ---- ADR-0006 §2 / WP-60 prerequisite: node id reaches
+    // `SharedFactoryState` ---------------------------------------------------
+    //
+    // Mirrors `run_serve`'s own three-step pipeline (bootstrap node id ->
+    // `effective_node` -> `SharedFactoryState::for_node`) at unit-test
+    // granularity, rather than booting a whole serve to prove it -- see
+    // `effective_node`'s tests above for the same reasoning, and CLAUDE.md's
+    // rule against a test binding a port.
+
+    #[test]
+    fn service_node_override_reaches_shared_factory_state() {
+        let bootstrap = node("bootstrap-id", "bootstrap-cluster");
+        let effective = effective_node(&bootstrap, Some("cli-id"), None);
+        let state = proxy_http::filter::SharedFactoryState::for_node(effective.id.clone());
+        assert_eq!(state.node_id(), "cli-id");
+    }
+
+    #[test]
+    fn bootstrap_node_id_reaches_shared_factory_state_with_no_override() {
+        let bootstrap = node("bootstrap-id", "bootstrap-cluster");
+        let effective = effective_node(&bootstrap, None, None);
+        let state = proxy_http::filter::SharedFactoryState::for_node(effective.id.clone());
+        assert_eq!(state.node_id(), "bootstrap-id");
     }
 }

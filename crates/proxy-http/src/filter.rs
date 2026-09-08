@@ -505,6 +505,15 @@ pub trait PerRouteConfig: Send + Sync {
 pub struct SharedFactoryState {
     singletons: Mutex<HashMap<SingletonKey, Arc<dyn Any + Send + Sync>>>,
     by_name: Mutex<HashMap<SingletonKey, Arc<dyn Any + Send + Sync>>>,
+    /// The effective node id of this process (ADR-0006 §2): the
+    /// `--service-node` CLI override if given, else the bootstrap's
+    /// `node.id`. An empty string means no node identity was configured --
+    /// via `#[derive(Default)]`, every test `SharedFactoryState::default()`
+    /// gets one. It is NOT this type's job to reject that; a consuming
+    /// filter (e.g. the spend flush token, which needs a node id to
+    /// disambiguate its counter across replicas) decides for itself whether
+    /// an empty id is fatal to its own purpose.
+    node_id: String,
 }
 
 /// `SharedFactoryState`'s map key -- pulled out to a named type purely to
@@ -514,6 +523,25 @@ pub struct SharedFactoryState {
 type SingletonKey = (String, &'static str);
 
 impl SharedFactoryState {
+    /// Production constructor: build state for one serve carrying `node_id`
+    /// as this process's effective node identity. `main.rs` computes
+    /// `node_id` once (`effective_node`) and calls this instead of
+    /// `::default()`; tests that have no need of a node identity keep using
+    /// `::default()`, which leaves it `""`.
+    pub fn for_node(node_id: String) -> Self {
+        Self {
+            node_id,
+            ..Default::default()
+        }
+    }
+
+    /// This process's effective node id (ADR-0006 §2), or `""` if none was
+    /// configured -- see the field's own doc for why an empty value is not
+    /// rejected here.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     /// Return the singleton under `(scope, type_url)`, building and inserting
     /// it via `init` on the first call for that key. Concurrent first-callers
     /// (workers build their chains on separate runtimes) serialize on the
@@ -699,6 +727,14 @@ impl FactoryContext {
     /// context's own `scope`.
     pub fn get(&self, type_url: &'static str) -> Option<Arc<dyn Any + Send + Sync>> {
         self.shared.get(&self.scope, type_url)
+    }
+
+    /// Thin wrapper over [`SharedFactoryState::node_id`] -- the ergonomic
+    /// form a filter factory calls (e.g. spend-flush tokens, ADR-0006 §2)
+    /// instead of reaching through `.shared` directly, same pattern as
+    /// [`Self::get_or_try_init`].
+    pub fn node_id(&self) -> &str {
+        self.shared.node_id()
     }
 }
 
@@ -921,5 +957,25 @@ mod tests {
             state.get_by_name("chain-a", "other-type-url").is_none(),
             "a different type_url under the same stat_prefix must not resolve"
         );
+    }
+
+    /// ADR-0006 §2 plumbing: a filter factory reaches the process's node id
+    /// through `FactoryContext::node_id()`, which must return exactly what
+    /// `SharedFactoryState::for_node` was constructed with.
+    #[test]
+    fn factory_context_node_id_returns_what_shared_state_was_built_with() {
+        let ctx = FactoryContext {
+            shared: Arc::new(SharedFactoryState::for_node("replica-7".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(ctx.node_id(), "replica-7");
+    }
+
+    /// `::default()` (used by ~15 other test sites in this crate and its
+    /// dependents) must keep yielding an empty node id, not panic or require
+    /// a node identity -- see the field's own doc for why that is by design.
+    #[test]
+    fn shared_factory_state_default_has_empty_node_id() {
+        assert_eq!(SharedFactoryState::default().node_id(), "");
     }
 }
