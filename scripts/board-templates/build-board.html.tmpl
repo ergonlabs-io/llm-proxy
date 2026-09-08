@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 62 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-07 · 1772 tests passed, 16 skipped as of 2026-09-07 (cargo nextest, workspace, via a full <code>make ci</code> — fmt, clippy and doctests included, all green) · + black-box QA suite (Go, 10 cases)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 62 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-08 · 1844 tests passed, 26 skipped as of 2026-09-08 (cargo nextest, workspace, via a full <code>make ci</code> — fmt, clippy and doctests included, all green) · + black-box QA suite (Go, 10 cases)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -239,12 +239,22 @@
     every other cluster in the same reload empty and rejecting traffic for the whole span.
     <code>swap_under_load.rs</code>, which closed v0.2.0's zero-dropped-streams clause, uses
     STATIC clusters only and structurally could not see it.
-    <b>Three more work packages, scoped 2026-09-07 from a design review on running multiple
-    replicas (ADR-0006):</b> WP-60 (composable spend counters — the absolute-write design loses
-    spend with two writers rather than double-counting it, which is the unsafe direction),
-    WP-61 (policy propagation by version-stamp polling — <code>rebuild()</code> is only called
-    from local admin writes, so sharing a store propagates NOTHING and a revoked key keeps
-    authenticating on other replicas), and WP-62 (the Redis implementation, blocked on both).
+    <b>WP-60 and WP-61 shipped 2026-09-07</b> (composable spend counters — the absolute-write
+    design loses spend with two writers rather than double-counting it, the unsafe direction —
+    and policy propagation by version-stamp polling, bound decided at 60s), which unblocked
+    <b>WP-62 (Redis-backed shared stores): increments 1-3 landed 2026-09-07</b> — reconciliation
+    staleness is observable, a Redis-backed store (Lua scripts for the token check, 13 tests
+    green against real Redis 7), and the store is now selectable from config. <b>Not proven yet,
+    named rather than hidden:</b> no test exercises a real <code>kill -9</code>, socket
+    reconnection after a partition, or process supervision — that is the Go QA suite's job and it
+    is not written. None of WP-60/61/62 touches the v0.3.0 gate; they ship in this milestone by
+    placement (ADR-0006, running multiple replicas), not by dependency on it.
+    <b>WP-59 is now DONE, both increments (2026-09-08)</b> — increment 2 is the carry-forward
+    itself: an unrelated cluster's config change no longer wipes health-check state, outlier
+    ejections, or EDS membership for clusters whose own config didn't change (6 more tests,
+    103 → 109). <b>WP-22 increment 1 landed 2026-09-08</b> — SDS ingest only: the proxy
+    subscribes to, decodes, and ACK/NACKs <code>...tls.v3.Secret</code>. Nothing yet serves a
+    rotated certificate; that's increment 2. Neither WP-59 nor WP-22 moves the v0.3.0 gate.
     <b>Four new work packages, scoped 2026-09-07, three of them driven by an external consumer:</b>
     a sibling project (<code>remote-llm</code>) is building a sidecar that registers GPU inference
     nodes, and asked for per-endpoint metadata (WP-56), a <code>/clusters</code> view that shows
@@ -314,13 +324,21 @@
     go-control-plane on its first run — evidence for why that opt-in target exists, since our own
     puppet harness structurally cannot reproduce it. <b>Read that as the ADS client working, not
     as the gate moving</b>: RDS and EDS are both still refused by name, not silently dropped, and
-    both are now WP-21's. <b>WP-21 started 2026-09-06</b> — increment 1 landed the EDS cluster IR
-    surface, config surface only, nothing subscribes to EDS or applies an endpoint update yet.
-    Make-before-break cluster warming, listener warming on RDS dependency, and the churn
-    acceptance test are all still ahead of WP-21, and that is what this gate is actually waiting
-    on now. WP-22 remains blocked on WP-21; WP-28 (the control-plane test harness) has landed the
-    DropStream/Wait chunk WP-20's own reconnect-resync scenario needed and is otherwise still
-    scaffolding. One of the four in-scope WPs (WP-20) is done.</span>
+    both are now WP-21's. <b>WP-21 started 2026-09-06, three increments landed:</b> increment 1
+    added the EDS cluster IR surface; increment 2 (2026-09-07) wired EDS ingest end to end,
+    proven over a real socket; increment 3 (2026-09-07) wired <code>/ready</code> to gate on
+    cluster warming, giving <code>is_initialized</code> its first production caller — though the
+    deadline only stops warming from gating readiness, it never marks a cluster initialized.
+    Listener warming on an RDS dependency (RDS is still refused by name), active/warming/draining
+    listener sets, the init manager and the make-before-break churn test are all still ahead of
+    WP-21, and that is what this gate is actually waiting on now. <b>WP-22 increment 1 landed
+    2026-09-08</b> — SDS ingest only, nothing serves a rotated certificate yet. WP-28 (the
+    control-plane test harness) has landed the DropStream/Wait chunk WP-20's own reconnect-resync
+    scenario needed and is otherwise still scaffolding. <b>WP-59 (incremental cluster
+    application) shipped complete 2026-09-08</b> — a direct safety consequence of this gate's own
+    subject (a fast CDS heartbeat would otherwise clear ejection state proxy-wide on a timer) but
+    not itself a gate requirement. One of the four in-scope WPs (WP-20) is done; WP-21 and
+    WP-22 are started, WP-28 is scaffolding only.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
