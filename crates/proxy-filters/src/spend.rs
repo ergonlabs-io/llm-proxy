@@ -94,6 +94,7 @@
 //! produce one. So [`PriceTable`] is keyed on exact model strings, full stop.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -640,6 +641,97 @@ pub struct TenantBudget {
     pub period: Period,
 }
 
+/// What this replica does when its spend state has gone STALE -- when the
+/// accumulator has not reconciled with the store for longer than
+/// [`ReconciliationPolicy::bound`].
+///
+/// # Only one variant, deliberately
+///
+/// ADR-0006 §5 asks for this to be a NAMED behaviour with only `allow`
+/// wired, so tightening the policy later is a config value rather than a
+/// redesign. `deny` and `degrade` are named in the config surface
+/// (`llmproxy.filters.v0.SpendLimit.on_reconciliation_expired`) and REJECTED
+/// at config load, which is the strict-config-mode answer (ground rule 1):
+/// an operator who asks for a behaviour this build does not implement gets a
+/// load error naming the field, never a silent downgrade to `Allow`.
+///
+/// # Why `allow` is the one that ships
+///
+/// Same call budgets already make, and the same one Envoy's global rate
+/// limit filter makes with `failure_mode_deny: false`: a metering hiccup
+/// must not start refusing traffic (CLAUDE.md rule 17). Note what that buys
+/// and what it does not -- the over-admission becomes VISIBLE
+/// ([`SpendReport::unreconciled_admissions`], and the flusher's warning),
+/// not CLOSED.
+///
+/// Our degradation is still better than Envoy's, because each replica keeps
+/// enforcing against `last confirmed global total + its own accrual` and
+/// still trips on its own traffic; Envoy holds no counter state at all and
+/// admits everything for the duration of an outage. See ADR-0006 §5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnReconciliationExpired {
+    /// Keep serving. Each replica enforces against what it last confirmed
+    /// plus what it has accrued locally since.
+    #[default]
+    Allow,
+}
+
+/// How long this replica may go without reconciling with the store before
+/// it says so, and what it does about it.
+///
+/// # Why this has a default and `node_id` does not
+///
+/// [`SpendAccumulator::new`] takes `node_id` as a required argument because
+/// a wrong value there loses money silently. This is the opposite kind of
+/// knob: getting the bound wrong changes only WHEN an operator is warned,
+/// never what is charged or admitted. So it defaults, and an operator who
+/// never thinks about it gets a sane value instead of a load error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciliationPolicy {
+    /// How stale this replica's view of the global total may get before
+    /// [`SpendAccumulator::is_reconciled`] reports `false`, the flusher
+    /// warns, and admissions start being counted as unreconciled.
+    ///
+    /// Measured from the last flush in which EVERY bucket was written
+    /// successfully -- or, if none ever has, from when the accumulator was
+    /// constructed. A process that has never once reached the store is the
+    /// most unreconciled a process can be, so it must not read as
+    /// "reconciled" merely for lack of a previous flush to compare against.
+    pub bound: Duration,
+    /// What to do once `bound` has elapsed. See
+    /// [`OnReconciliationExpired`].
+    pub on_expired: OnReconciliationExpired,
+}
+
+/// The default staleness bound: 60 seconds.
+///
+/// Twelve missed ticks at the default 5-second flush interval -- far past
+/// "one blip", squarely in "this replica cannot reach the store". Set
+/// deliberately rather than derived from the flush interval, because
+/// `start_flusher` learns the interval only after construction and a bound
+/// that silently changes with an unrelated knob is worse than a stated one.
+///
+/// ADR-0006 §4 requires the three staleness bounds to be stated SEPARATELY.
+/// This one happening to equal WP-61's 60-second revocation bound is a
+/// coincidence of both meaning "about a minute", not a shared constant: a
+/// deployment that tightens one has said nothing about the other.
+pub const DEFAULT_RECONCILIATION_BOUND: Duration = Duration::from_secs(60);
+
+impl Default for ReconciliationPolicy {
+    fn default() -> Self {
+        ReconciliationPolicy {
+            bound: DEFAULT_RECONCILIATION_BOUND,
+            on_expired: OnReconciliationExpired::Allow,
+        }
+    }
+}
+
+/// [`Inner::last_flush_millis`]'s "no flush has ever fully succeeded"
+/// sentinel. `i64::MIN` rather than `0`, because `0` is a real
+/// [`DateTime<Utc>`] (the Unix epoch) and a store of `0` would otherwise be
+/// indistinguishable from a clock that genuinely read 1970.
+const NEVER_FLUSHED: i64 = i64::MIN;
+
 /// One `(tenant, period)`'s live, in-memory spend state. Same shape as
 /// `crate::token_limit::InProcessBudgetStore`'s window map -- a plain
 /// struct behind the accumulator's one `Mutex`, with no store I/O involved
@@ -706,15 +798,39 @@ struct Inner {
     default_period: Period,
     buckets: Mutex<HashMap<(TenantId, PeriodKey), Bucket>>,
     /// WP-50 increment 3c-iv: when [`Inner::flush_now`] last wrote every
-    /// bucket to the store WITHOUT ERROR -- `None` until the first such
-    /// flush. A FAILED flush (see [`Inner::flush_now`]'s `first_err`) must
-    /// NEVER advance this: it would otherwise claim durability the store
-    /// does not actually have, which is exactly the kind of unreproducible
-    /// wrong answer the module doc's "Money is integer" section warns
-    /// against for a different reason. The admin spend read
-    /// ([`SpendAccumulator::report`]) surfaces this so an operator can see
-    /// the crash-refund window directly rather than assuming it.
-    last_flush_at: Mutex<Option<DateTime<Utc>>>,
+    /// bucket to the store WITHOUT ERROR, as Unix milliseconds, or
+    /// [`NEVER_FLUSHED`] until the first such flush. A FAILED flush (see
+    /// [`Inner::flush_now`]'s `first_err`) must NEVER advance this: it would
+    /// otherwise claim durability the store does not actually have, which is
+    /// exactly the kind of unreproducible wrong answer the module doc's
+    /// "Money is integer" section warns against for a different reason. The
+    /// admin spend read ([`SpendAccumulator::report`]) surfaces this so an
+    /// operator can see the crash-refund window directly rather than
+    /// assuming it.
+    ///
+    /// Rust note: an atomic, not the `Mutex<Option<DateTime<Utc>>>` this was
+    /// before WP-62. Reading it moved onto the REQUEST path (see
+    /// [`SpendAccumulator::note_admission`], called once per admitted
+    /// request under a budget), and rule 17's "keep the suppression state
+    /// off the healthy hot path" rules out taking a lock there. `Relaxed`
+    /// ordering throughout: this value guards nothing else, and a reader
+    /// that sees the previous flush's timestamp is off by one flush
+    /// interval on a staleness estimate -- not wrong about money.
+    last_flush_millis: AtomicI64,
+    /// When this accumulator was constructed, as Unix milliseconds. The
+    /// origin [`SpendAccumulator::reconciliation_age`] measures from when no
+    /// flush has ever succeeded -- see [`ReconciliationPolicy::bound`]'s doc
+    /// for why "never flushed" must read as very stale rather than as
+    /// unknown.
+    created_at_millis: i64,
+    /// This accumulator's staleness bound and expiry behaviour.
+    reconciliation: ReconciliationPolicy,
+    /// Requests admitted under a configured budget while this replica was
+    /// past its reconciliation bound -- ADR-0006 §5's required "counter of
+    /// admissions made while unreconciled". Monotonic for the life of the
+    /// process; it counts an operational event, not a per-period quantity,
+    /// so it deliberately does NOT reset on a period rollover.
+    unreconciled_admissions: AtomicU64,
 }
 
 impl Inner {
@@ -806,6 +922,23 @@ impl Inner {
     /// or total failure must leave it exactly where it was: a report that
     /// claimed a flush just succeeded when it did not would be a durability
     /// lie.
+    /// How long since the last flush in which EVERY bucket was written --
+    /// or since construction, if there has never been one. See
+    /// [`SpendAccumulator::reconciliation_age`], which is this method's
+    /// public face and carries the reasoning.
+    ///
+    /// Lives on `Inner` (not only on [`SpendAccumulator`]) because the
+    /// flusher thread holds an `Arc<Inner>` and nothing else -- see
+    /// [`Inner`]'s own doc for why it cannot hold the accumulator.
+    fn reconciliation_age(&self, now: DateTime<Utc>) -> Duration {
+        let since_millis = match self.last_flush_millis.load(Ordering::Relaxed) {
+            NEVER_FLUSHED => self.created_at_millis,
+            millis => millis,
+        };
+        let elapsed = now.timestamp_millis().saturating_sub(since_millis);
+        Duration::from_millis(u64::try_from(elapsed).unwrap_or(0))
+    }
+
     fn flush_now(&self) -> Result<(), StoreError> {
         // Rust note: the buckets lock is held across store I/O, as it was
         // before WP-60. That blocks `record` for the duration of a flush,
@@ -881,10 +1014,8 @@ impl Inner {
         match first_err {
             Some(err) => Err(err),
             None => {
-                *self
-                    .last_flush_at
-                    .lock()
-                    .expect("spend accumulator mutex poisoned") = Some(Utc::now());
+                self.last_flush_millis
+                    .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
                 Ok(())
             }
         }
@@ -935,6 +1066,25 @@ pub struct SpendReport {
     /// successfully -- `None` if it never has. See
     /// [`SpendAccumulator::last_flush_at`]'s doc.
     pub last_flush_at: Option<DateTime<Utc>>,
+    /// Whole seconds since this replica last reconciled with the store --
+    /// ADR-0006 §5's `spend_reconciliation_age_seconds`, surfaced through
+    /// the admin API rather than the stats registry because filters have no
+    /// handle to the registry today (see
+    /// [`SpendAccumulator::reconciliation_age`], which this rounds down).
+    /// A replica that has never flushed reports its age since construction,
+    /// not zero.
+    pub reconciliation_age_seconds: u64,
+    /// `true` once [`Self::reconciliation_age_seconds`] has passed the
+    /// configured bound: this replica's `total_micros` may be missing other
+    /// replicas' spend, so a budget can be over-admitted by roughly
+    /// `(N-1) x per-replica spend` for the duration. ADR-0006 §5.
+    pub reconciliation_expired: bool,
+    /// Requests this PROCESS has admitted under a configured budget while
+    /// [`Self::reconciliation_expired`] was true. Process-wide and
+    /// monotonic, unlike every other counter here, which is per
+    /// `(tenant, period)` -- it measures an operational condition, not this
+    /// tenant's usage.
+    pub unreconciled_admissions: u64,
 }
 
 /// Per-`(tenant, period)` spend, accumulated in memory with no store I/O on
@@ -968,6 +1118,32 @@ impl SpendAccumulator {
         default_period: Period,
         node_id: String,
     ) -> Self {
+        Self::with_reconciliation(
+            stat_prefix,
+            store,
+            default_period,
+            node_id,
+            ReconciliationPolicy::default(),
+        )
+    }
+
+    /// [`Self::new`] with an explicit [`ReconciliationPolicy`] instead of
+    /// the default one -- the form the filter factory uses, since the bound
+    /// and the expiry behaviour are both config fields
+    /// (`SpendLimit.reconciliation_bound_seconds`,
+    /// `SpendLimit.on_reconciliation_expired`).
+    ///
+    /// A separate constructor rather than a fifth argument on [`Self::new`]
+    /// because most callers -- every test that does not care about
+    /// staleness, and any embedded single-replica setup -- want the default
+    /// and gain nothing from restating it.
+    pub fn with_reconciliation(
+        stat_prefix: String,
+        store: Arc<dyn ControlPlaneStore>,
+        default_period: Period,
+        node_id: String,
+        reconciliation: ReconciliationPolicy,
+    ) -> Self {
         SpendAccumulator {
             inner: Arc::new(Inner {
                 stat_prefix,
@@ -975,7 +1151,10 @@ impl SpendAccumulator {
                 node_id,
                 default_period,
                 buckets: Mutex::new(HashMap::new()),
-                last_flush_at: Mutex::new(None),
+                last_flush_millis: AtomicI64::new(NEVER_FLUSHED),
+                created_at_millis: Utc::now().timestamp_millis(),
+                reconciliation,
+                unreconciled_admissions: AtomicU64::new(0),
             }),
             flusher: Mutex::new(None),
         }
@@ -1105,11 +1284,80 @@ impl SpendAccumulator {
     /// See [`Inner::last_flush_at`]'s doc for why a failed (even partially
     /// failed) flush must never advance this.
     pub fn last_flush_at(&self) -> Option<DateTime<Utc>> {
-        *self
-            .inner
-            .last_flush_at
-            .lock()
-            .expect("spend accumulator mutex poisoned")
+        let millis = self.inner.last_flush_millis.load(Ordering::Relaxed);
+        if millis == NEVER_FLUSHED {
+            return None;
+        }
+        DateTime::<Utc>::from_timestamp_millis(millis)
+    }
+
+    /// This accumulator's staleness bound and expiry behaviour, as
+    /// configured.
+    pub fn reconciliation_policy(&self) -> ReconciliationPolicy {
+        self.inner.reconciliation
+    }
+
+    /// How long it has been since this replica last reconciled with the
+    /// store -- ADR-0006 §5's required `spend_reconciliation_age_seconds`,
+    /// as a [`Duration`] the caller renders.
+    ///
+    /// # Not an `Option`, on purpose
+    ///
+    /// A process that has NEVER completed a flush measures from its own
+    /// construction, so it reports a growing age rather than `None`. Never
+    /// having reached the store is the most unreconciled a replica can be;
+    /// returning "unknown" for it would invite every caller to treat the
+    /// worst case as the benign one, which is the fail-open-and-silent shape
+    /// CLAUDE.md rule 17 exists to stop.
+    ///
+    /// Clock note: this is wall-clock arithmetic on [`Utc::now`], not a
+    /// monotonic [`std::time::Instant`], because the value it derives from
+    /// (`last_flush_at`) is itself a wall-clock timestamp an operator reads
+    /// out of the admin API. A backwards NTP step can therefore make this
+    /// briefly read `0`; it saturates rather than panicking, and one
+    /// under-reported interval is not worth a second clock source here.
+    pub fn reconciliation_age(&self, now: DateTime<Utc>) -> Duration {
+        self.inner.reconciliation_age(now)
+    }
+
+    /// Whether this replica is within its configured reconciliation bound.
+    pub fn is_reconciled(&self, now: DateTime<Utc>) -> bool {
+        self.reconciliation_age(now) <= self.inner.reconciliation.bound
+    }
+
+    /// Counts one request admitted under a CONFIGURED BUDGET, and returns
+    /// whether it was admitted while this replica was past its
+    /// reconciliation bound.
+    ///
+    /// # Call this only where the control was meant to apply
+    ///
+    /// A tenant with no configured budget is unlimited, so admitting its
+    /// request while stale is not an over-admission and must not be counted
+    /// or warned about (CLAUDE.md rule 17: "only warn where the control was
+    /// actually meant to apply"). `spend_limit_filter` calls this on the
+    /// admit path only after it has resolved a budget.
+    ///
+    /// # Cost on the healthy path
+    ///
+    /// Two relaxed atomic loads and an integer comparison; the counter is
+    /// touched only when the bound has already been exceeded. No lock, and
+    /// nothing allocated.
+    pub fn note_admission(&self, now: DateTime<Utc>) -> bool {
+        if self.is_reconciled(now) {
+            return false;
+        }
+        self.inner
+            .unreconciled_admissions
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Total requests this process admitted under a configured budget while
+    /// past its reconciliation bound. Process-wide and monotonic: it counts
+    /// an operational condition, not a tenant's usage, so it deliberately
+    /// does not reset on a period rollover.
+    pub fn unreconciled_admissions(&self) -> u64 {
+        self.inner.unreconciled_admissions.load(Ordering::Relaxed)
     }
 
     /// WP-50 increment 3c-iv -- the admin spend read's data source. Returns
@@ -1127,6 +1375,7 @@ impl SpendAccumulator {
     /// spent" as a failure. An operator asking about a tenant that has not
     /// made a request yet gets a valid, boring answer.
     pub fn report(&self, tenant: &TenantId, period: &PeriodKey) -> SpendReport {
+        let now = Utc::now();
         let mut buckets = self
             .inner
             .buckets
@@ -1150,6 +1399,9 @@ impl SpendAccumulator {
             // drops) only so every field of `report` is assembled in one
             // place.
             last_flush_at: self.last_flush_at(),
+            reconciliation_age_seconds: self.reconciliation_age(now).as_secs(),
+            reconciliation_expired: !self.is_reconciled(now),
+            unreconciled_admissions: self.unreconciled_admissions(),
         };
         drop(buckets);
         report
@@ -1251,11 +1503,36 @@ fn run_flusher(inner: Arc<Inner>, shutdown: Arc<ShutdownSignal>, interval: Durat
             // finish before it can even set the flag.
             drop(guard);
             if let Err(err) = inner.flush_now() {
+                // Two log lines, not one, because they say different things
+                // and an operator acts on them differently: the first is
+                // "this tick failed", the second is "enforcement has been
+                // degraded for longer than you said you would tolerate"
+                // (ADR-0006 §5's required warning past the bound).
                 tracing::warn!(
                     stat_prefix = %inner.stat_prefix,
                     error = %err,
                     "spend flusher: periodic flush failed; will retry next interval"
                 );
+                // Only on a FAILED tick, which is what keeps this off the
+                // healthy path entirely -- a replica flushing normally
+                // evaluates none of it, and one that is broken logs at most
+                // once per flush interval (CLAUDE.md rule 17: suppress
+                // repeats, or the log becomes the incident).
+                let age = inner.reconciliation_age(Utc::now());
+                if age > inner.reconciliation.bound {
+                    tracing::warn!(
+                        stat_prefix = %inner.stat_prefix,
+                        node_id = %inner.node_id,
+                        age_seconds = age.as_secs(),
+                        bound_seconds = inner.reconciliation.bound.as_secs(),
+                        on_expired = ?inner.reconciliation.on_expired,
+                        unreconciled_admissions =
+                            inner.unreconciled_admissions.load(Ordering::Relaxed),
+                        "spend accumulator has not reconciled with the store within its \
+                         configured bound; this replica is enforcing against its own accrual \
+                         only and budgets shared with other replicas may be over-admitted"
+                    );
+                }
             }
             guard = shutdown
                 .stop
@@ -2816,5 +3093,215 @@ mod tests {
         accumulator.flush_now().unwrap();
         // And through `Drop`'s final flush, which is a second call site.
         drop(accumulator);
+    }
+
+    // --- WP-62: reconciliation staleness (ADR-0006 §5) ----------------------
+    //
+    // These read the clock, so they take `now` as `Utc::now()` offset by a
+    // chrono `Duration` rather than the fixed `dt(...)` timestamps the rest
+    // of this module uses: `reconciliation_age` measures against the
+    // accumulator's own construction time, which is real wall-clock, and a
+    // hardcoded 2026-09-03 would measure the distance to that date instead
+    // of the thing under test. Only the STALENESS clock is real here; no
+    // test sleeps.
+
+    fn accumulator_with_bound(bound: Duration) -> SpendAccumulator {
+        SpendAccumulator::with_reconciliation(
+            "test-chain".to_string(),
+            Arc::new(InMemoryControlPlaneStore::default()) as Arc<dyn ControlPlaneStore>,
+            Period::Daily,
+            "node-a".to_string(),
+            ReconciliationPolicy {
+                bound,
+                on_expired: OnReconciliationExpired::Allow,
+            },
+        )
+    }
+
+    fn seconds_from_now(secs: i64) -> DateTime<Utc> {
+        Utc::now() + chrono::Duration::seconds(secs)
+    }
+
+    /// A replica that has NEVER reached the store measures its staleness
+    /// from construction, not from zero. This is the whole shape of the
+    /// fix: a process that came up while the store was down is the MOST
+    /// unreconciled it can be, and reporting that as "age 0, reconciled"
+    /// would be the fail-open-and-silent failure rule 17 exists to stop.
+    ///
+    /// Mutation: have `Inner::reconciliation_age` return
+    /// `Duration::ZERO` in the `NEVER_FLUSHED` arm.
+    #[test]
+    fn a_replica_that_never_reached_the_store_is_stale_from_construction() {
+        let accumulator = accumulator_with_bound(Duration::from_secs(60));
+
+        assert_eq!(
+            accumulator.last_flush_at(),
+            None,
+            "precondition: nothing has flushed"
+        );
+        assert!(
+            accumulator.reconciliation_age(seconds_from_now(90)) >= Duration::from_secs(90),
+            "a never-flushed replica must measure its age from construction; reporting zero \
+             would call the worst case healthy"
+        );
+        assert!(
+            !accumulator.is_reconciled(seconds_from_now(90)),
+            "90s past construction with a 60s bound is expired"
+        );
+        assert!(
+            accumulator.is_reconciled(seconds_from_now(1)),
+            "and it is NOT expired before the bound elapses -- otherwise every process would \
+             warn for its first minute"
+        );
+    }
+
+    /// A successful flush is the reconciliation point, so it resets the age.
+    ///
+    /// Mutation: drop the `last_flush_millis.store(...)` at the end of
+    /// `Inner::flush_now`.
+    #[test]
+    fn a_successful_flush_resets_the_reconciliation_age() {
+        let accumulator = accumulator_with_bound(Duration::from_secs(60));
+        let tenant = TenantId::new("tenant-a");
+        record_micros(&accumulator, &tenant, dt(2026, 9, 3, 12, 0, 0), 1_000_000);
+
+        accumulator.flush_now().unwrap();
+
+        // Measured against the recorded flush instant rather than against
+        // `Utc::now()`: a never-flushed accumulator is also only
+        // milliseconds old, so "the age is small" passes whether or not the
+        // flush reset anything. Anchoring on `last_flush_at` is what makes
+        // this assert the actual invariant -- after a flush the age is
+        // measured FROM THE FLUSH, not from construction.
+        let flushed_at = accumulator
+            .last_flush_at()
+            .expect("a successful flush is the reconciliation point");
+        let now = flushed_at + chrono::Duration::seconds(10);
+        assert_eq!(
+            accumulator.reconciliation_age(now),
+            Duration::from_secs(10),
+            "a flush that wrote every bucket reconciled this replica with the store"
+        );
+        assert!(accumulator.is_reconciled(now));
+    }
+
+    /// A FAILED flush leaves the replica stale. Same reasoning as
+    /// `a_failed_flush_does_not_advance_last_flush_at`, one level up: the
+    /// age is what the warning and the admin read are computed from, so a
+    /// failed flush that reset it would silence exactly the outage the
+    /// bound exists to surface.
+    ///
+    /// Mutation: move the `last_flush_millis.store(...)` in
+    /// `Inner::flush_now` above the `if let Some(err)` return.
+    #[test]
+    fn a_failed_flush_leaves_the_replica_unreconciled() {
+        let store: Arc<dyn ControlPlaneStore> =
+            Arc::new(AlwaysFailsAddSpend(InMemoryControlPlaneStore::default()));
+        let accumulator = SpendAccumulator::with_reconciliation(
+            "test-chain".to_string(),
+            store,
+            Period::Daily,
+            "node-a".to_string(),
+            ReconciliationPolicy {
+                bound: Duration::from_secs(60),
+                on_expired: OnReconciliationExpired::Allow,
+            },
+        );
+        let tenant = TenantId::new("tenant-a");
+        record_micros(&accumulator, &tenant, dt(2026, 9, 3, 12, 0, 0), 1_000_000);
+
+        accumulator.flush_now().unwrap_err();
+
+        assert!(
+            accumulator.reconciliation_age(seconds_from_now(90)) >= Duration::from_secs(90),
+            "the store rejected the write, so this replica has still never reconciled"
+        );
+        assert!(!accumulator.is_reconciled(seconds_from_now(90)));
+    }
+
+    /// `note_admission` counts an admission only once the bound has passed,
+    /// and reports whether it counted so the caller can act on it.
+    ///
+    /// Mutation: drop the `is_reconciled` early return in
+    /// `note_admission`, so every admission counts. The healthy assertions
+    /// below go red.
+    #[test]
+    fn note_admission_counts_only_admissions_made_past_the_bound() {
+        let accumulator = accumulator_with_bound(Duration::from_secs(60));
+
+        assert!(
+            !accumulator.note_admission(seconds_from_now(1)),
+            "an admission made while reconciled is not an over-admission"
+        );
+        assert_eq!(accumulator.unreconciled_admissions(), 0);
+
+        assert!(
+            accumulator.note_admission(seconds_from_now(90)),
+            "past the bound, this replica may be missing what other replicas spent"
+        );
+        assert!(accumulator.note_admission(seconds_from_now(91)));
+        assert_eq!(
+            accumulator.unreconciled_admissions(),
+            2,
+            "the counter is monotonic: it counts an operational condition, not a tenant's usage"
+        );
+    }
+
+    /// The three ADR-0006 §5 observability values reach the admin read.
+    /// Filters have no handle to the stats registry, so `SpendReport` IS
+    /// the surface -- if these fields are not populated the numbers exist
+    /// nowhere an operator can see them.
+    ///
+    /// Mutation: hardcode `reconciliation_expired: false` in `report`.
+    #[test]
+    fn the_spend_report_carries_the_reconciliation_state() {
+        // `report` reads its own `Utc::now()`, so the only way to make it
+        // observe an expired replica deterministically is a zero bound plus
+        // a nonzero age. Spin (sub-millisecond, never a sleep) until the
+        // clock has moved off the construction instant.
+        let accumulator = accumulator_with_bound(Duration::ZERO);
+        while accumulator.reconciliation_age(Utc::now()) == Duration::ZERO {
+            std::hint::spin_loop();
+        }
+        let tenant = TenantId::new("tenant-a");
+        accumulator.note_admission(seconds_from_now(90));
+
+        let report = accumulator.report(&tenant, &PeriodKey::for_test("2026-09-03"));
+
+        assert!(
+            report.reconciliation_expired,
+            "a zero bound on a replica that never flushed is expired once the clock moves"
+        );
+        assert_eq!(report.unreconciled_admissions, 1);
+        assert_eq!(
+            report.reconciliation_age_seconds,
+            accumulator.reconciliation_age(Utc::now()).as_secs(),
+            "the report rounds the same age down to whole seconds; it does not compute a \
+             second, differently-shaped one"
+        );
+    }
+
+    /// The default bound is 60 seconds, stated rather than derived from the
+    /// flush interval -- ADR-0006 §4 requires each staleness bound to be
+    /// stated separately, so a deployment that retunes `flush_interval_seconds`
+    /// does not silently move how long it may go unnoticed while stale.
+    #[test]
+    fn the_default_reconciliation_policy_is_sixty_seconds_and_allow() {
+        let policy = ReconciliationPolicy::default();
+        assert_eq!(policy.bound, Duration::from_secs(60));
+        assert_eq!(policy.bound, DEFAULT_RECONCILIATION_BOUND);
+        assert_eq!(policy.on_expired, OnReconciliationExpired::Allow);
+
+        let accumulator = SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::new(InMemoryControlPlaneStore::default()) as Arc<dyn ControlPlaneStore>,
+            Period::Daily,
+            "node-a".to_string(),
+        );
+        assert_eq!(
+            accumulator.reconciliation_policy(),
+            ReconciliationPolicy::default(),
+            "`new` is `with_reconciliation` at the default policy, not a second set of values"
+        );
     }
 }

@@ -47,6 +47,66 @@ message SpendLimit {
   // memory" below), so treating unset as "pick a sane default" is safe in a
   // way an unset ceiling or an unset price would not be.
   uint32 flush_interval_seconds = 3;
+
+  // How long this replica may go without RECONCILING with the shared store
+  // before it says so, in seconds. `0` (proto3's implicit default) means the
+  // built-in 60 seconds. WP-62, ADR-0006 section 5.
+  //
+  // "Reconciling" means a flush in which every bucket was written and the
+  // store handed back the authoritative total -- see
+  // `proxy_filters::spend::SpendAccumulator::flush_now`. Past this bound the
+  // replica's view of a shared budget may be missing what OTHER replicas
+  // spent, so the budget can be over-admitted by roughly
+  // `(replicas - 1) x per-replica spend` for the duration. The proxy warns,
+  // counts the admissions it made while stale, and reports both through the
+  // admin spend read.
+  //
+  // A durability/visibility knob, not a correctness one, so unset picks a
+  // default instead of failing the load -- the same reasoning as
+  // `flush_interval_seconds` above. Note the default deliberately does not
+  // scale with `flush_interval_seconds`: a staleness bound that silently
+  // moved when an unrelated knob changed is worse than a stated one, and
+  // ADR-0006 section 4 requires each staleness bound to be stated
+  // separately.
+  uint32 reconciliation_bound_seconds = 4;
+
+  // What this replica does once `reconciliation_bound_seconds` has elapsed.
+  // `ON_RECONCILIATION_EXPIRED_UNSPECIFIED` means `ALLOW`.
+  OnReconciliationExpired on_reconciliation_expired = 5;
+}
+
+// What a replica does when its spend state is stale -- ADR-0006 section 5.
+//
+// Only `ALLOW` is implemented. `DENY` and `DEGRADE` are named here on
+// purpose, so that tightening the policy later is a config value rather than
+// a redesign of this message; until they are implemented, selecting one is a
+// LOAD ERROR naming this field, never a silent downgrade to `ALLOW` (ground
+// rule 1: silently ignoring a config field is a P0 bug).
+//
+// This mirrors Envoy's newer rate-limit-quota filter's expired-assignment
+// behaviour. Check that filter's exact field naming against the targeted
+// Envoy version before treating these names as final.
+enum OnReconciliationExpired {
+  // proto3's implicit zero value. Means `ALLOW`, which is also what an
+  // operator who never touches this field wants: a metering hiccup must not
+  // start refusing traffic.
+  ON_RECONCILIATION_EXPIRED_UNSPECIFIED = 0;
+
+  // Keep serving. Each replica keeps enforcing against the last total the
+  // store confirmed plus its own accrual since, so a replica that has burned
+  // the budget on its OWN traffic still returns 429. This is strictly better
+  // than Envoy's global rate limit filter under an outage, which holds no
+  // counter state and admits everything.
+  ALLOW = 1;
+
+  // NOT IMPLEMENTED -- rejected at config load. Refuse requests for tenants
+  // with a configured budget while the replica is stale.
+  DENY = 2;
+
+  // NOT IMPLEMENTED -- rejected at config load. Reserved for a partial
+  // enforcement mode (for example, admitting only up to this replica's own
+  // share of the ceiling).
+  DEGRADE = 3;
 }
 
 // A calendar-aligned accounting window. See

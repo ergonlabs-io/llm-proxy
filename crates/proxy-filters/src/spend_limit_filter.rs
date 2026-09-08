@@ -132,7 +132,10 @@ use proxy_observability::ResponseFlag;
 use crate::auth::TenantId;
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
-use crate::spend::{parse_micro_usd, ModelPrices, Period, PriceTable, SpendAccumulator};
+use crate::spend::{
+    self, parse_micro_usd, ModelPrices, OnReconciliationExpired, Period, PriceTable,
+    ReconciliationPolicy, SpendAccumulator,
+};
 use crate::usage::TokenUsage;
 
 /// Type URL this filter is registered under.
@@ -273,6 +276,68 @@ fn parse_flush_interval(config: &DynamicMessage) -> Duration {
     }
 }
 
+/// Reads `typed_config.reconciliation_bound_seconds` and
+/// `typed_config.on_reconciliation_expired` into a [`ReconciliationPolicy`]
+/// (WP-62, ADR-0006 §5).
+///
+/// `0` seconds means [`spend::DEFAULT_RECONCILIATION_BOUND`], per the proto's
+/// own doc -- same "a visibility knob may default" reasoning as
+/// [`parse_flush_interval`].
+///
+/// The BEHAVIOUR field is the opposite case and is why this returns a
+/// `Result`. `DENY` (2) and `DEGRADE` (3) are named in the proto so that
+/// tightening the policy later is a config change rather than a redesign,
+/// but neither is implemented -- so selecting one is a load error naming the
+/// field's full dotted path. Accepting it and behaving as `ALLOW` would be
+/// silently ignoring a config field, which ground rule 1 calls a P0 bug, and
+/// it would fail in the worst direction: an operator who deliberately asked
+/// for the strict behaviour would get the permissive one and no indication.
+fn parse_reconciliation(config: &DynamicMessage) -> Result<ReconciliationPolicy, ConfigError> {
+    let secs = config
+        .get_field_by_name("reconciliation_bound_seconds")
+        .and_then(|v| v.as_u32())
+        .unwrap_or(0);
+    let bound = if secs == 0 {
+        spend::DEFAULT_RECONCILIATION_BOUND
+    } else {
+        Duration::from_secs(u64::from(secs))
+    };
+
+    let raw = config
+        .get_field_by_name("on_reconciliation_expired")
+        .and_then(|v| v.as_enum_number())
+        .unwrap_or(0);
+    let on_expired = match raw {
+        0 | 1 => OnReconciliationExpired::Allow,
+        2 => {
+            return Err(invalid(
+                "typed_config.on_reconciliation_expired",
+                "DENY is declared in the config surface but not implemented in this build -- \
+                 only ALLOW is. Refusing rather than quietly serving ALLOW, because an \
+                 operator who asked for the strict behaviour would otherwise get the \
+                 permissive one silently",
+            ));
+        }
+        3 => {
+            return Err(invalid(
+                "typed_config.on_reconciliation_expired",
+                "DEGRADE is declared in the config surface but not implemented in this build \
+                 -- only ALLOW is. Refusing rather than quietly serving ALLOW, because an \
+                 operator who asked for the strict behaviour would otherwise get the \
+                 permissive one silently",
+            ));
+        }
+        other => {
+            return Err(invalid(
+                "typed_config.on_reconciliation_expired",
+                format!("unrecognized OnReconciliationExpired enum value `{other}`"),
+            ));
+        }
+    };
+
+    Ok(ReconciliationPolicy { bound, on_expired })
+}
+
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override --
 /// this increment has no per-route config; the trait default
 /// (`ConfigError::Unimplemented`) is correct.
@@ -292,6 +357,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         let price_table = Arc::new(parse_pricing(config)?);
         let default_period = parse_default_period(config)?;
         let flush_interval = parse_flush_interval(config);
+        let reconciliation = parse_reconciliation(config)?;
 
         // WP-50 3c-iii-b: resolve the SAME `ControlPlane` singleton
         // `llmproxy.auth`'s factory registers -- see `model_authz_filter`'s
@@ -336,11 +402,12 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         let store = control_plane.store();
         let shared = ctx
             .get_or_try_init(TYPE_URL, || {
-                let accumulator = Arc::new(SpendAccumulator::new(
+                let accumulator = Arc::new(SpendAccumulator::with_reconciliation(
                     ctx.stat_prefix.clone(),
                     store,
                     default_period,
                     resolve_node_id(ctx.node_id(), &ctx.stat_prefix),
+                    reconciliation,
                 ));
                 accumulator.start_flusher(flush_interval);
                 Ok(Arc::new(SharedSpendLimitState {
@@ -674,6 +741,32 @@ impl HttpFilter for SpendLimitFilterInstance {
             return FilterHeadersStatus::Continue;
         }
 
+        // Admitted, under a CONFIGURED budget. If this replica has not
+        // reconciled with the store within its bound, `current_micros` above
+        // may be missing what other replicas spent, so this admission is one
+        // the shared ceiling might not actually have had room for.
+        //
+        // Counted, not refused: ADR-0006 §5's `on_reconciliation_expired`,
+        // of which only `Allow` is implemented -- a metering hiccup must not
+        // start refusing traffic (rule 17). The counter and the flusher's
+        // warning are what make the over-admission VISIBLE rather than
+        // silent, which is the whole difference between this and the
+        // fail-open bug rule 17 was written for.
+        //
+        // Deliberately after the deny check, so a replica that has already
+        // burned the budget on its OWN traffic still returns 429 while
+        // stale -- that is the enforcement that survives a store outage, and
+        // counting it as an admission would misreport it.
+        //
+        // Deliberately inside the `Some(budget)` path: a tenant with no
+        // ceiling cannot be over-admitted, so counting it would bury the
+        // real signal (rule 17: only where the control was meant to apply).
+        match self.accumulator.reconciliation_policy().on_expired {
+            OnReconciliationExpired::Allow => {
+                self.accumulator.note_admission(now);
+            }
+        }
+
         FilterHeadersStatus::Continue
     }
 
@@ -970,6 +1063,67 @@ mod tests {
         assert_eq!(parse_flush_interval(&msg), Duration::from_secs(30));
     }
 
+    // --- WP-62: the reconciliation policy (ADR-0006 §5) --------------------
+
+    #[test]
+    fn zero_reconciliation_bound_means_the_stated_default() {
+        let policy = parse_reconciliation(&spend_limit_config(vec![])).expect("valid config");
+        assert_eq!(policy.bound, spend::DEFAULT_RECONCILIATION_BOUND);
+        assert_eq!(policy.on_expired, OnReconciliationExpired::Allow);
+    }
+
+    #[test]
+    fn a_configured_reconciliation_bound_is_honored() {
+        let mut msg = spend_limit_config(vec![]);
+        msg.set_field_by_name(
+            "reconciliation_bound_seconds",
+            prost_reflect::Value::U32(120),
+        );
+        let policy = parse_reconciliation(&msg).expect("valid config");
+        assert_eq!(policy.bound, Duration::from_secs(120));
+    }
+
+    /// The unset enum and an explicit `ALLOW` are the same policy -- an
+    /// operator who never touches this field gets the behaviour that is
+    /// implemented, not a load error.
+    #[test]
+    fn explicit_allow_and_unset_are_the_same_policy() {
+        let mut msg = spend_limit_config(vec![]);
+        msg.set_field_by_name(
+            "on_reconciliation_expired",
+            prost_reflect::Value::EnumNumber(1),
+        );
+        assert_eq!(
+            parse_reconciliation(&msg).expect("ALLOW is implemented"),
+            parse_reconciliation(&spend_limit_config(vec![])).expect("unset means ALLOW"),
+        );
+    }
+
+    /// Ground rule 1: a declared-but-unimplemented behaviour is a LOAD
+    /// ERROR naming its full dotted path, never a silent downgrade to the
+    /// permissive policy. This is the one direction the failure must not
+    /// take -- an operator who asked for DENY and silently got ALLOW would
+    /// believe a control is enforcing when it is not.
+    ///
+    /// Mutation: return `Ok(ReconciliationPolicy { bound, on_expired:
+    /// Allow })` from the `2` and `3` arms of `parse_reconciliation`.
+    #[test]
+    fn declared_but_unimplemented_expiry_behaviours_are_rejected_at_load() {
+        for value in [2, 3] {
+            let mut msg = spend_limit_config(vec![]);
+            msg.set_field_by_name(
+                "on_reconciliation_expired",
+                prost_reflect::Value::EnumNumber(value),
+            );
+            match parse_reconciliation(&msg).expect_err("must be rejected, not downgraded") {
+                ConfigError::InvalidValue { field_path, .. } => {
+                    assert_eq!(field_path, "typed_config.on_reconciliation_expired");
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
     // --- test scaffolding ------------------------------------------------
 
     fn route_named(name: &str) -> Arc<RouteEntry> {
@@ -1190,6 +1344,39 @@ mod tests {
         }
     }
 
+    /// `filter_with`, but with a reconciliation bound of ZERO, so the
+    /// accumulator is already past its bound by the time a request runs --
+    /// the state an operator sees when the shared store is unreachable.
+    /// The spin (sub-millisecond, never a sleep) is what makes "past the
+    /// bound" true rather than merely likely: `is_reconciled` compares with
+    /// `<=`, so a zero bound is still reconciled at age exactly zero.
+    fn stale_filter_with(
+        control_plane: &Arc<ControlPlane>,
+        price_table: PriceTable,
+        default_period: Period,
+    ) -> FilterHarness {
+        let store: Arc<dyn ControlPlaneStore> = Arc::new(InMemoryControlPlaneStore::default());
+        let accumulator = Arc::new(SpendAccumulator::with_reconciliation(
+            "test-chain".to_string(),
+            store,
+            default_period,
+            "test-node".to_string(),
+            ReconciliationPolicy {
+                bound: Duration::ZERO,
+                on_expired: OnReconciliationExpired::Allow,
+            },
+        ));
+        while accumulator.reconciliation_age(chrono::Utc::now()) == Duration::ZERO {
+            std::hint::spin_loop();
+        }
+        FilterHarness {
+            price_table: Arc::new(price_table),
+            accumulator,
+            usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+            snapshot: control_plane.handle(),
+        }
+    }
+
     /// Drives one full request/response cycle against a FRESH
     /// `SpendLimitFilterInstance` from `harness` -- one stream, exactly like
     /// production's `create_filter` per connection. Mirrors
@@ -1231,6 +1418,87 @@ mod tests {
         fn clone(&self) -> Self {
             unreachable!("only `local_reply` is ever cloned out of a TestCallbacks")
         }
+    }
+
+    // --- WP-62: over-admission while stale ---------------------------------
+
+    /// A stale replica keeps serving (only `Allow` is implemented), and
+    /// every admission it makes under a CONFIGURED budget is counted, so
+    /// the bypass is visible instead of silent (rule 17).
+    ///
+    /// Mutation: delete the `note_admission` call in `decode_headers`.
+    #[test]
+    fn a_budgeted_request_admitted_while_stale_is_counted() {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                max_micros: MicroUsd::from_micros(1_000_000),
+                period: Period::Daily,
+            },
+        )]);
+        let harness = stale_filter_with(&cp, PriceTable::new(), Period::Monthly);
+
+        let (reply, _cb) = run_request(&harness, "tenant-a", None, Some(10));
+
+        assert!(
+            reply.is_none(),
+            "a metering hiccup must not start refusing traffic"
+        );
+        assert_eq!(
+            harness.accumulator.unreconciled_admissions(),
+            1,
+            "the admission was made against a total that may be missing other replicas' spend"
+        );
+    }
+
+    /// A tenant with NO ceiling cannot be over-admitted, so its requests
+    /// must not be counted -- rule 17's "only warn where the control was
+    /// actually meant to apply". Counting them would bury the real signal
+    /// under whatever share of traffic happens to be unbudgeted.
+    ///
+    /// Mutation: move the `note_admission` call above the `Some(budget)`
+    /// check in `decode_headers`.
+    #[test]
+    fn an_unbudgeted_request_admitted_while_stale_is_not_counted() {
+        let cp = control_plane_with(&[]);
+        let harness = stale_filter_with(&cp, PriceTable::new(), Period::Monthly);
+
+        let (reply, _cb) = run_request(&harness, "tenant-no-budget", None, Some(10));
+
+        assert!(reply.is_none(), "no budget means unlimited");
+        assert_eq!(
+            harness.accumulator.unreconciled_admissions(),
+            0,
+            "an unlimited tenant has no ceiling to over-admit against"
+        );
+    }
+
+    /// Enforcement SURVIVES a store outage: a replica that has already
+    /// burned the ceiling on its own traffic still returns 429 while stale,
+    /// and a denial is not an admission. This is ADR-0006 §5's claim that
+    /// degrading here beats a filter that holds no counter state at all.
+    ///
+    /// Mutation: move the `note_admission` call above the deny check.
+    #[test]
+    fn a_stale_replica_still_denies_and_a_denial_is_not_counted() {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                max_micros: MicroUsd::from_micros(0),
+                period: Period::Daily,
+            },
+        )]);
+        let harness = stale_filter_with(&cp, PriceTable::new(), Period::Monthly);
+
+        let (reply, _cb) = run_request(&harness, "tenant-a", None, Some(10));
+
+        let (status, _headers) = reply.expect("a zero ceiling denies the first request");
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            harness.accumulator.unreconciled_admissions(),
+            0,
+            "a refused request was not admitted, stale or not"
+        );
     }
 
     // --- no tenant / no budget: admitted -----------------------------------

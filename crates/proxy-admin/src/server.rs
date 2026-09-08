@@ -1279,6 +1279,18 @@ fn handle_get_spend(
             "budget_micro_usd": budget_micros,
             "remaining_micro_usd": remaining_micros,
             "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
+            // WP-62 / ADR-0006 §5. `last_flush_at` alone answers "when",
+            // which forces every reader to do the subtraction and to know
+            // what bound this deployment configured; these three answer
+            // "is this replica's number trustworthy right now", which is
+            // what an operator reading a spend figure during an incident
+            // actually needs. A replica that has NEVER flushed reports its
+            // age since start here rather than `null`, so "never reached the
+            // store" cannot be misread as "fine" -- see
+            // `SpendAccumulator::reconciliation_age`.
+            "reconciliation_age_seconds": report.reconciliation_age_seconds,
+            "reconciliation_expired": report.reconciliation_expired,
+            "unreconciled_admissions": report.unreconciled_admissions,
             "unpriced_requests": report.unpriced_requests,
             "unpriced_pairs": report.unpriced_pairs,
             "unpriced_pairs_truncated": report.unpriced_pairs_truncated,

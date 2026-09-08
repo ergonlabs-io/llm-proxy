@@ -1597,6 +1597,52 @@ async fn spend_read_on_a_tenant_that_never_spent_is_zeros_not_an_error() {
     assert_eq!(value["remaining_micro_usd"], serde_json::Value::Null);
 }
 
+/// The spend read carries this replica's reconciliation state (WP-62,
+/// ADR-0006 §5). Filters hold no handle to the stats registry, so this
+/// endpoint IS the surface for `spend_reconciliation_age_seconds` and the
+/// count of admissions made while stale -- if these keys are missing, the
+/// numbers exist nowhere an operator can reach them, and a spend figure
+/// read during a store outage looks exactly like a healthy one.
+///
+/// Pinned by mutation: delete the three keys from the `json!` body.
+#[tokio::test]
+async fn spend_read_reports_the_replicas_reconciliation_state() {
+    let (factory_state, _handle, _accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+    // A fresh accumulator inside the default 60-second bound: not expired,
+    // nothing admitted while stale. The point of the assertion is that the
+    // keys are PRESENT and typed, which `is_number`/`is_boolean` say and a
+    // missing key (rendering as JSON null) does not.
+    assert!(
+        value["reconciliation_age_seconds"].is_number(),
+        "the age must be reported as a number, not omitted: {body}"
+    );
+    assert_eq!(
+        value["reconciliation_expired"],
+        serde_json::Value::Bool(false)
+    );
+    assert_eq!(value["unreconciled_admissions"], 0);
+}
+
 /// A tenant with no configured budget is unlimited: `budget_micro_usd` and
 /// `remaining_micro_usd` render `null`, never a fabricated ceiling, even
 /// though the tenant HAS spent something.
