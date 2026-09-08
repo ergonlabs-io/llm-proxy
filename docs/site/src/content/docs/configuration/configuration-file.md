@@ -152,8 +152,13 @@ client-ip`, any other `header:<name>`, `requests_per_minute`,
 one of these still loads and serves traffic — it is not rejected — but the
 limit itself does nothing until a later schema version implements it.
 
-Limits are enforced per proxy instance in this schema version. Fleet-wide
-limits need a shared budget store, which does not exist yet.
+Limits are enforced per proxy instance in this schema version. Two replicas
+each admit up to `tokens_per_minute`, so the fleet admits twice that.
+
+The shared `ControlPlaneStore` that llm-proxy has does not change this. That
+store reconciles currency *spend* for the Envoy-mode `llmproxy.spend_limit`
+filter. It holds no token-rate-limit counters, and this schema version cannot
+reach it.
 
 ## `observability` (`Observability`)
 
