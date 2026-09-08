@@ -332,6 +332,24 @@ impl RedisControlPlaneStore {
     }
 }
 
+/// The four replies [`RedisControlPlaneStore::load`]'s single pipeline comes
+/// back with, in the order the commands were queued: the tenant set, then
+/// the keys, policies and budgets hashes as raw `encode_json` bytes.
+///
+/// Rust note: this annotation is not decoration. `redis`'s `query` is
+/// generic over `FromRedisValue`, and a pipeline's reply decodes into a
+/// TUPLE -- so the element types are what tells inference to read reply 1
+/// as a `Vec<String>` and replies 2-4 as maps, and there is no other
+/// expression in `load` to infer them from. Written inline it is also
+/// exactly the shape clippy's `type_complexity` lint exists to catch, hence
+/// the alias rather than a four-line type ascription at the binding.
+type LoadReply = (
+    Vec<String>,
+    HashMap<String, Vec<u8>>,
+    HashMap<String, Vec<u8>>,
+    HashMap<String, Vec<u8>>,
+);
+
 impl ControlPlaneStore for RedisControlPlaneStore {
     /// One pipeline: `SMEMBERS tenants`, `HGETALL keys`, `HGETALL policies`,
     /// `HGETALL budgets` -- run inside `MULTI`/`EXEC` (`.atomic()`) so a
@@ -344,24 +362,20 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let policies_key = self.policies_key();
         let budgets_key = self.budgets_key();
 
-        let (tenants_raw, keys_raw, policies_raw, budgets_raw): (
-            Vec<String>,
-            HashMap<String, Vec<u8>>,
-            HashMap<String, Vec<u8>>,
-            HashMap<String, Vec<u8>>,
-        ) = self.with_connection(|conn| {
-            redis::pipe()
-                .atomic()
-                .cmd("SMEMBERS")
-                .arg(&tenants_key)
-                .cmd("HGETALL")
-                .arg(&keys_key)
-                .cmd("HGETALL")
-                .arg(&policies_key)
-                .cmd("HGETALL")
-                .arg(&budgets_key)
-                .query(conn)
-        })?;
+        let (tenants_raw, keys_raw, policies_raw, budgets_raw): LoadReply =
+            self.with_connection(|conn| {
+                redis::pipe()
+                    .atomic()
+                    .cmd("SMEMBERS")
+                    .arg(&tenants_key)
+                    .cmd("HGETALL")
+                    .arg(&keys_key)
+                    .cmd("HGETALL")
+                    .arg(&policies_key)
+                    .cmd("HGETALL")
+                    .arg(&budgets_key)
+                    .query(conn)
+            })?;
 
         let tenants = tenants_raw.into_iter().map(TenantId::new).collect();
 
