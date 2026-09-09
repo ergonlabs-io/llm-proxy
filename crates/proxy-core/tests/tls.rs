@@ -3,11 +3,13 @@
 //! `tokio::io::duplex` pipes (no real sockets needed since both factories'
 //! `wrap` are generic over `AsyncRead + AsyncWrite`).
 
+use std::sync::Arc;
+
 use proxy_config::ir::{
     CaSource, DataSourceIR, DownstreamTlsSpec, SanMatcherIR, SanType, StringMatcherIR,
     TlsCertificateIR, TlsParametersIR, TlsVersion, UpstreamTlsSpec, ValidationContextIR,
 };
-use proxy_core::tls::{DownstreamTlsFactory, UpstreamTlsFactory};
+use proxy_core::tls::{DownstreamTlsFactory, SdsSecretRegistry, UpstreamTlsFactory};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -909,4 +911,190 @@ fn a_spec_with_neither_certificates_nor_sds_names_is_refused() {
         format!("{err}").contains("at least one certificate is required"),
         "got: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// WP-22 increment 2b: `SdsSecretRegistry` -- the seam that maps a published
+// SDS secret NAME back to the `DownstreamTlsFactory` instances that named it.
+// See `crates/proxy-core/src/tls/secret_registry.rs`'s module doc for the two
+// orderings these tests pin independently.
+
+/// A `DownstreamTlsSpec` naming exactly one SDS secret and no inline
+/// certificates -- the shape `build_listener_tls` hands to
+/// `SdsSecretRegistry::register` for a chain like this.
+fn sds_only_spec(name: &str) -> DownstreamTlsSpec {
+    DownstreamTlsSpec {
+        certificates: vec![],
+        certificate_sds_names: vec![name.to_string()],
+        params: default_params(),
+        alpn_protocols: vec![],
+        validation: None,
+        require_client_certificate: false,
+        disable_stateless_session_resumption: false,
+    }
+}
+
+fn upstream_for(ca: &Ca) -> UpstreamTlsFactory {
+    UpstreamTlsFactory::build(
+        &UpstreamTlsSpec {
+            sni: None,
+            params: default_params(),
+            alpn_protocols: vec![],
+            client_certificate: None,
+            validation: Some(trusted_ca_validation(ca)),
+        },
+        "test",
+    )
+    .unwrap()
+}
+
+/// "Factory first, secret later" (the ordinary case, per the module doc): a
+/// factory registers with an empty cert set, so its first handshake fails --
+/// then `SdsSecretRegistry::publish` hot-swaps in the delivered cert on the
+/// SAME factory, with no rebuild, and the next handshake serves it.
+#[tokio::test]
+async fn publish_then_serve() {
+    let ca = mint_ca("test CA");
+    let key = KeyPair::generate().unwrap();
+    let cert = mint_leaf(&ca, &["server.example.com"], &key);
+
+    let downstream = Arc::new(
+        DownstreamTlsFactory::build(&sds_only_spec("cert-1"), "test")
+            .expect("an SDS-only chain must build with an empty cert set"),
+    );
+    let upstream = upstream_for(&ca);
+
+    let registry = SdsSecretRegistry::new();
+    registry
+        .register(&["cert-1".to_string()], &downstream, "test")
+        .expect("registering with nothing published yet must succeed");
+
+    // Empty cert set: the handshake fails.
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::try_join!(
+        downstream.wrap(server_io),
+        upstream.wrap(client_io, "server.example.com")
+    )
+    .expect_err("an SDS-named chain with nothing published yet must fail the handshake");
+
+    // Publish: the same factory now serves it, no rebuild.
+    registry
+        .publish("cert-1", vec![tls_cert_ir(&cert, &key)])
+        .expect("publish must reach the registered factory");
+
+    let (mut server, mut client) = handshake(&downstream, &upstream, "server.example.com").await;
+    let peer = client.get_ref().1.peer_certificates().unwrap()[0]
+        .as_ref()
+        .to_vec();
+    assert_eq!(peer, cert.der().as_ref());
+    client.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    server.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+}
+
+/// "Secret first, factory later" (the normal case, per the module doc): the
+/// control plane's delivery already arrived by the time a rebuilt factory
+/// registers -- `register` must replay the cached cert immediately, with no
+/// second `publish` call, rather than leaving the factory unserved until a
+/// resend that may never come.
+#[tokio::test]
+async fn late_registration_serves_immediately_without_a_second_publish() {
+    let ca = mint_ca("test CA");
+    let key = KeyPair::generate().unwrap();
+    let cert = mint_leaf(&ca, &["server.example.com"], &key);
+
+    let registry = SdsSecretRegistry::new();
+    // Published before any factory has registered for this name.
+    registry
+        .publish("cert-2", vec![tls_cert_ir(&cert, &key)])
+        .expect("publishing to a name with no factory yet must still be Ok");
+
+    let downstream = Arc::new(
+        DownstreamTlsFactory::build(&sds_only_spec("cert-2"), "test")
+            .expect("an SDS-only chain must build with an empty cert set"),
+    );
+    // Registering must replay the cached cert -- no further `publish` call
+    // below, on purpose.
+    registry
+        .register(&["cert-2".to_string()], &downstream, "test")
+        .expect("register must hot-swap in the already-delivered cert");
+
+    let upstream = upstream_for(&ca);
+    let (_server, client) = handshake(&downstream, &upstream, "server.example.com").await;
+    let peer = client.get_ref().1.peer_certificates().unwrap()[0]
+        .as_ref()
+        .to_vec();
+    assert_eq!(peer, cert.der().as_ref());
+}
+
+/// A dropped factory must not keep the registry's bookkeeping growing (or
+/// keep a stale `Weak` around forever): once the only `Arc` referencing a
+/// registered factory is dropped, a later `publish` for its name must still
+/// be `Ok`, must not panic, and `registered_factory_count` must read the
+/// dead entry as pruned.
+#[tokio::test]
+async fn pruning_drops_dead_factories_without_error() {
+    let ca = mint_ca("test CA");
+    let key = KeyPair::generate().unwrap();
+    let cert = mint_leaf(&ca, &["server.example.com"], &key);
+
+    let registry = SdsSecretRegistry::new();
+    let downstream = Arc::new(
+        DownstreamTlsFactory::build(&sds_only_spec("cert-3"), "test")
+            .expect("an SDS-only chain must build with an empty cert set"),
+    );
+    registry
+        .register(&["cert-3".to_string()], &downstream, "test")
+        .unwrap();
+    assert_eq!(registry.registered_factory_count("cert-3"), 1);
+
+    drop(downstream);
+
+    let result = registry.publish("cert-3", vec![tls_cert_ir(&cert, &key)]);
+    assert!(
+        result.is_ok(),
+        "publishing to a name whose only factory has been dropped must not error: {result:?}"
+    );
+    assert_eq!(
+        registry.registered_factory_count("cert-3"),
+        0,
+        "the dead factory must be pruned, not counted as still live"
+    );
+}
+
+/// A name nobody has ever registered a factory for is not an error --
+/// `publish` caches it, and a factory that registers for that name later
+/// still gets caught up, exactly as in the "secret first, factory later"
+/// test above, but exercised from the angle of `publish`'s own return value
+/// on an orphaned name.
+#[tokio::test]
+async fn publish_to_an_unregistered_name_is_ok_and_delivered_on_a_later_register() {
+    let ca = mint_ca("test CA");
+    let key = KeyPair::generate().unwrap();
+    let cert = mint_leaf(&ca, &["server.example.com"], &key);
+
+    let registry = SdsSecretRegistry::new();
+    let result = registry.publish("cert-4", vec![tls_cert_ir(&cert, &key)]);
+    assert!(
+        result.is_ok(),
+        "publishing to a name with no registered factory must be Ok: {result:?}"
+    );
+    assert_eq!(registry.registered_factory_count("cert-4"), 0);
+
+    let downstream = Arc::new(
+        DownstreamTlsFactory::build(&sds_only_spec("cert-4"), "test")
+            .expect("an SDS-only chain must build with an empty cert set"),
+    );
+    registry
+        .register(&["cert-4".to_string()], &downstream, "test")
+        .unwrap();
+    assert_eq!(registry.registered_factory_count("cert-4"), 1);
+
+    let upstream = upstream_for(&ca);
+    let (_server, client) = handshake(&downstream, &upstream, "server.example.com").await;
+    let peer = client.get_ref().1.peer_certificates().unwrap()[0]
+        .as_ref()
+        .to_vec();
+    assert_eq!(peer, cert.der().as_ref());
 }

@@ -21,7 +21,10 @@ use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::{ConfigSnapshot, EndpointIR};
 use proxy_config::lower_dynamic_cluster;
-use proxy_xds::{Publish, PublishEndpoints, ResourceApplier, ResponseHandler, Verdict};
+use proxy_xds::{
+    DynamicSecret, Publish, PublishEndpoints, PublishSecrets, ResourceApplier, ResponseHandler,
+    Verdict,
+};
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
 const CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
@@ -950,4 +953,120 @@ async fn a_listener_without_sds_certs_names_no_secrets() {
     assert!(matches!(applier.on_response(&resp).await, Verdict::Accept));
 
     assert!(applier.sds_resource_names().is_empty());
+}
+
+// -------------------------------------------------------------------------
+// WP-22 increment 2b: a `validation_context` secret is refused by the real
+// sink, not silently accepted.
+//
+// `crates/proxy-xds/src/apply.rs`'s own unit tests (increment 1) already
+// prove `a_well_formed_validation_context_secret_lowers_and_reaches_the_sink`
+// -- that is `on_sds_response`'s sink-agnostic plumbing, and a
+// `CertificateValidationContext` DOES lower and reach whatever sink is
+// wired. What increment 2b adds is the REAL sink `crates/proxy/src/main.rs`'s
+// `start_ads` builds, which has nowhere to route a validation_context secret
+// yet (`DynamicSecret::tls_certificate_ir` answers `None` for it) and so must
+// turn that into an explicit rejection rather than an accept. This test
+// exercises that rejection shape end to end through `ResourceApplier`, using
+// the same sink logic `main.rs` wires (mirrored here since the sink itself is
+// a closure private to `main`, not something this crate exports).
+
+fn tls_cert_secret(name: &str, chain: &[u8], key: &[u8]) -> tls_v3::Secret {
+    tls_v3::Secret {
+        name: name.to_string(),
+        r#type: Some(tls_v3::secret::Type::TlsCertificate(
+            tls_v3::TlsCertificate {
+                certificate_chain: Some(core_v3::DataSource {
+                    specifier: Some(core_v3::data_source::Specifier::InlineBytes(chain.to_vec())),
+                    ..Default::default()
+                }),
+                private_key: Some(core_v3::DataSource {
+                    specifier: Some(core_v3::data_source::Specifier::InlineBytes(key.to_vec())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+fn validation_context_secret(name: &str, trusted_ca: &[u8]) -> tls_v3::Secret {
+    tls_v3::Secret {
+        name: name.to_string(),
+        r#type: Some(tls_v3::secret::Type::ValidationContext(
+            tls_v3::CertificateValidationContext {
+                trusted_ca: Some(core_v3::DataSource {
+                    specifier: Some(core_v3::data_source::Specifier::InlineBytes(
+                        trusted_ca.to_vec(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+const SECRET_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.Secret";
+
+fn sds_response(version: &str, secrets: &[tls_v3::Secret]) -> DiscoveryResponse {
+    DiscoveryResponse {
+        version_info: version.to_string(),
+        type_url: SDS_TYPE_URL.to_string(),
+        nonce: format!("n-{version}"),
+        resources: secrets.iter().map(|s| any_of(s, SECRET_TYPE)).collect(),
+        ..Default::default()
+    }
+}
+
+/// `main.rs`'s `start_ads` secret sink: `TlsCertificate` publishes into an
+/// `SdsSecretRegistry` (out of scope here -- this test only needs to prove
+/// the rejection shape, not the registry itself, which `proxy-core`'s own
+/// `tests/tls.rs` already covers), and `ValidationContext` is refused naming
+/// WP-22 increment 2c, matching `main.rs`'s own message.
+fn main_rs_shaped_secret_sink() -> PublishSecrets {
+    Box::new(move |name, secret: Arc<DynamicSecret>| {
+        Box::pin(async move {
+            match secret.tls_certificate_ir() {
+                Ok(Some(_ir)) => Ok(()),
+                Ok(None) => Err(format!(
+                    "secret `{name}` is a validation_context (trusted-CA) secret; rotating a \
+                     trust anchor over SDS is WP-22 increment 2c and is not implemented"
+                )),
+                Err(err) => Err(err.to_string()),
+            }
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_validation_context_secret_is_nacked_naming_increment_2c() {
+    let (publish, _published) = recording_publisher();
+    let mut applier =
+        ResourceApplier::new(empty_base(), publish).with_secret_sink(main_rs_shaped_secret_sink());
+
+    let resp = sds_response("v1", &[validation_context_secret("ca-1", b"ca-bytes")]);
+    let verdict = applier.on_response(&resp).await;
+
+    let Verdict::Reject(message) = verdict else {
+        panic!("expected Reject, got {verdict:?}");
+    };
+    assert!(
+        message.contains("increment 2c"),
+        "message should name WP-22 increment 2c, got: {message}"
+    );
+}
+
+/// The same sink accepts an ordinary TLS certificate secret -- the rejection
+/// above is specific to `validation_context`, not a blanket SDS refusal.
+#[tokio::test]
+async fn a_tls_certificate_secret_is_accepted_by_the_same_sink_that_nacks_validation_context() {
+    let (publish, _published) = recording_publisher();
+    let mut applier =
+        ResourceApplier::new(empty_base(), publish).with_secret_sink(main_rs_shaped_secret_sink());
+
+    let resp = sds_response("v1", &[tls_cert_secret("cert-1", b"chain", b"key")]);
+    let verdict = applier.on_response(&resp).await;
+
+    assert!(matches!(verdict, Verdict::Accept), "got {verdict:?}");
 }

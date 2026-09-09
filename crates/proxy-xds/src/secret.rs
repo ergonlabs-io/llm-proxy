@@ -39,6 +39,7 @@ use proxy_api::envoy::extensions::transport_sockets::tls::v3::secret::Type as Se
 use proxy_api::envoy::extensions::transport_sockets::tls::v3::{
     CertificateValidationContext, Secret as SecretProto, TlsCertificate,
 };
+use proxy_config::ir::{DataSourceIR, TlsCertificateIR};
 use proxy_config::ConfigError;
 
 /// One decoded SDS `Secret`, restricted to the two cases this proxy acts on.
@@ -330,6 +331,50 @@ pub fn decode_secret(any: &prost_types::Any, path: &str) -> Result<DynamicSecret
     };
 
     Ok(DynamicSecret { name, kind })
+}
+
+impl DynamicSecret {
+    /// Lower `self` into the IR type `proxy-core`'s `SdsSecretRegistry::publish`
+    /// consumes -- `None` for a [`SecretKind::ValidationContext`] secret,
+    /// which this proxy has nowhere to route yet (trusted-CA rotation
+    /// over SDS is WP-22 increment 2c; see `crates/proxy/src/main.rs`'s secret
+    /// sink, which turns that `None` into an explicit NACK rather than a
+    /// silent drop -- ground rule #1).
+    ///
+    /// SDS delivers a secret's bytes inline (this module's own doc explains
+    /// why `filename`/`environment_variable` are refused at decode time), and
+    /// they are PEM text, so this always builds [`DataSourceIR::Inline`] --
+    /// never `DataSourceIR::File`, which exists only for the static
+    /// bootstrap-config path. A chain/key that isn't valid UTF-8 is a decode
+    /// error, never a lossy `String::from_utf8_lossy` -- silently mangling
+    /// certificate bytes would produce a cert that fails to parse downstream
+    /// with an error that no longer points at the real cause.
+    pub fn tls_certificate_ir(&self) -> Result<Option<TlsCertificateIR>, ConfigError> {
+        let (certificate_chain, private_key) = match &self.kind {
+            SecretKind::TlsCertificate {
+                certificate_chain,
+                private_key,
+            } => (certificate_chain, private_key),
+            SecretKind::ValidationContext { .. } => return Ok(None),
+        };
+        let cert_chain = utf8_pem(certificate_chain, &self.name, "certificate_chain")?;
+        let private_key = utf8_pem(private_key, &self.name, "private_key")?;
+        Ok(Some(TlsCertificateIR {
+            cert_chain: DataSourceIR::Inline(cert_chain),
+            private_key: DataSourceIR::Inline(private_key),
+        }))
+    }
+}
+
+/// Decode one of [`DynamicSecret::tls_certificate_ir`]'s two byte fields as
+/// UTF-8 PEM text -- `field` names which one (`certificate_chain`/
+/// `private_key`) for the error's dotted path, mirroring `decode_secret`'s
+/// own `sds.secrets[<name>]` path shape.
+fn utf8_pem(bytes: &[u8], secret_name: &str, field: &str) -> Result<String, ConfigError> {
+    String::from_utf8(bytes.to_vec()).map_err(|e| ConfigError::InvalidValue {
+        field_path: format!("sds.secrets[{secret_name}].tls_certificate.{field}"),
+        reason: format!("not valid UTF-8 PEM text: {e}"),
+    })
 }
 
 #[cfg(test)]
