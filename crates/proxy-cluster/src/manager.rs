@@ -255,13 +255,19 @@ impl ManagedCluster {
                 // it resolves straight through to whichever member actually
                 // served the host (see `ClusterHandle::select_aggregate_member`)
                 // -- so `RoundRobin`/`RawTransportSocket`/`Http1` here are
-                // inert placeholders, never real answers, exactly like
-                // `eds()`'s defaults below. `initialized` starts `true`:
-                // there is nothing here to resolve, and leaving it `false`
-                // would make WP-21 warming wait forever on a cluster that
-                // never runs discovery. `connect_timeout` is read from the
-                // real config anyway (it costs nothing and stays correct if
-                // this arm's pool is ever actually dialed). `health_engine`
+                // inert placeholders, never real answers. (This used to add
+                // "exactly like `eds()`'s defaults below"; that constructor
+                // was production-dead and was deleted 2026-09-08, leaving
+                // this arm the only one that builds a `ManagedCluster` it
+                // never resolves.) `initialized` starts `true`: there is
+                // nothing here to resolve, and leaving it `false` would make
+                // WP-21 warming wait forever on a cluster that never runs
+                // discovery -- and, since WP-58, would 503 every request
+                // routed at an aggregate, because the router now refuses an
+                // un-initialized cluster before host selection.
+                // `connect_timeout` is read from the real config anyway (it
+                // costs nothing and stays correct if this arm's pool is ever
+                // actually dialed). `health_engine`
                 // stays `None` for the same reason as the rest of this arm:
                 // an aggregate has no hosts of its own to probe -- probing
                 // happens on the member cluster, which has its own real
