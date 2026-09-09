@@ -478,6 +478,7 @@ mod tests {
             upstream_host: None,
             upstream_cluster: None,
             downstream_remote_address: None,
+            response_code_details: None,
             llm_tokens: None,
             llm_ttft: None,
             llm_max_stall: None,

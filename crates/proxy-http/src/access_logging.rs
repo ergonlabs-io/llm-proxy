@@ -457,6 +457,7 @@ impl LoggingBody {
             llm_response_chunks,
             trace,
             tenant,
+            response_code_details,
         ) = {
             let mut info = ctx.stream_info.borrow_mut();
             info.bytes_sent = self.bytes_sent;
@@ -487,6 +488,10 @@ impl LoggingBody {
                 // read here rather than re-borrowing `stream_info` a second
                 // time below -- see this destructuring's own doc above.
                 info.auth.tenant.clone(),
+                // WP-58: `%RESPONSE_CODE_DETAILS%` -- cloned out alongside
+                // everything else `LogContext` borrows, same reasoning as
+                // this destructure's own doc above.
+                info.response_code_details.clone(),
             )
         };
 
@@ -579,6 +584,7 @@ impl LoggingBody {
             upstream_host: upstream_host.as_deref(),
             upstream_cluster: upstream_cluster.as_deref(),
             downstream_remote_address: Some(&ctx.downstream_remote_address),
+            response_code_details: response_code_details.as_deref(),
             llm_tokens,
             llm_ttft,
             llm_max_stall,

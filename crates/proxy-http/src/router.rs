@@ -543,25 +543,50 @@ impl RouterHandler {
             _ => 0,
         };
         let Some(cluster_name) = select_cluster(&fwd.target, &head.headers, draw) else {
-            dcb.stream_info()
-                .set_response_flag(ResponseFlag::NoClusterFound);
+            let mut info = dcb.stream_info();
+            info.set_response_flag(ResponseFlag::NoClusterFound);
+            info.response_code_details = Some("cluster_not_found".to_string());
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no cluster");
         };
         let cluster_name = cluster_name.to_string();
 
         let Some(entry) = self.clusters.cluster(&cluster_name) else {
-            dcb.stream_info()
-                .set_response_flag(ResponseFlag::NoClusterFound);
+            let mut info = dcb.stream_info();
+            info.set_response_flag(ResponseFlag::NoClusterFound);
+            info.response_code_details = Some("cluster_not_found".to_string());
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
+
+        // WP-58: a cluster that exists but has never completed its first
+        // resolution/EDS update must NOT reach host selection -- Envoy never
+        // publishes a warming cluster to its worker thread-local cluster map
+        // at all, so a request routed at one takes the SAME `cluster ==
+        // nullptr` path (NC/503) as a wholly unknown cluster on the real
+        // wire. We reuse `NoClusterFound` rather than inventing a new
+        // `ResponseFlag` for exactly that reason -- `flags.rs`'s module doc
+        // requires short codes to match Envoy's vocabulary exactly, and Envoy
+        // has no warming-specific one -- and rely on
+        // `%RESPONSE_CODE_DETAILS%` (this WP) to make the two conditions
+        // distinguishable in the access log instead. Checked here, before
+        // `select_host`, so an upstream that's merely mid-DNS-resolution
+        // never gets treated as "all hosts ejected" (`UH`) -- see
+        // `apply_forward`'s identical check for why BOTH cluster-lookup sites
+        // need this (an upgrade request is the bypass risk if only one did).
+        if !self.clusters.is_initialized(&cluster_name) {
+            let mut info = dcb.stream_info();
+            info.set_response_flag(ResponseFlag::NoClusterFound);
+            info.response_code_details = Some("cluster_not_warmed".to_string());
+            return local_reply(StatusCode::SERVICE_UNAVAILABLE, "cluster not warmed");
+        }
 
         // Single host pick, no `LoadBalancerContext::attempted_clusters`
         // accumulation -- there is no second attempt to steer away from the
         // first one's pick.
         let ctx = LoadBalancerContext::default();
         let Some(sel) = entry.select_host(&ctx) else {
-            dcb.stream_info()
-                .set_response_flag(ResponseFlag::NoHealthyUpstream);
+            let mut info = dcb.stream_info();
+            info.set_response_flag(ResponseFlag::NoHealthyUpstream);
+            info.response_code_details = Some("no_healthy_upstream".to_string());
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
         };
         let host = sel.host;
@@ -823,8 +848,9 @@ impl RouterHandler {
                 response_flag = "NC",
                 "forward target resolved to no cluster"
             );
-            dcb.stream_info()
-                .set_response_flag(ResponseFlag::NoClusterFound);
+            let mut info = dcb.stream_info();
+            info.set_response_flag(ResponseFlag::NoClusterFound);
+            info.response_code_details = Some("cluster_not_found".to_string());
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no cluster");
         };
         // Rust note: `select_cluster` borrows `cluster_name` from
@@ -836,10 +862,25 @@ impl RouterHandler {
 
         let Some(entry) = self.clusters.cluster(&cluster_name) else {
             tracing::debug!(response_flag = "NC", cluster = %cluster_name, "unknown cluster");
-            dcb.stream_info()
-                .set_response_flag(ResponseFlag::NoClusterFound);
+            let mut info = dcb.stream_info();
+            info.set_response_flag(ResponseFlag::NoClusterFound);
+            info.response_code_details = Some("cluster_not_found".to_string());
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
+
+        // WP-58: same admission check as `handle_upgrade` -- see that call
+        // site's Rust note for the full "why NC, not a new flag" reasoning.
+        // Both cluster-lookup sites need this, not just this one: an upgrade
+        // request never reaches `apply_forward` at all, so without the
+        // sibling check there a warming cluster would be bypassable simply by
+        // asking for an upgrade.
+        if !self.clusters.is_initialized(&cluster_name) {
+            tracing::debug!(response_flag = "NC", cluster = %cluster_name, "cluster not warmed");
+            let mut info = dcb.stream_info();
+            info.set_response_flag(ResponseFlag::NoClusterFound);
+            info.response_code_details = Some("cluster_not_warmed".to_string());
+            return local_reply(StatusCode::SERVICE_UNAVAILABLE, "cluster not warmed");
+        }
 
         let mut head = head;
         apply_request_transforms(fwd, matcher, request_headers_to_add, &mut head);
@@ -931,8 +972,9 @@ impl RouterHandler {
 
                 let Some(sel) = entry.select_host(&ctx) else {
                     tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
-                    dcb.stream_info()
-                        .set_response_flag(ResponseFlag::NoHealthyUpstream);
+                    let mut info = dcb.stream_info();
+                    info.set_response_flag(ResponseFlag::NoHealthyUpstream);
+                    info.response_code_details = Some("no_healthy_upstream".to_string());
                     return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
                 };
                 let host = sel.host;
