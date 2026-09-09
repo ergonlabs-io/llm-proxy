@@ -53,36 +53,6 @@ pub enum ClusterBuildError {
     TransportSocket(#[from] TransportSocketError),
 }
 
-/// Where a managed cluster's membership comes from.
-enum ClusterSource {
-    /// A cluster present in the config snapshot; discovery follows its
-    /// `DiscoveryType` (STATIC/STRICT_DNS/LOGICAL_DNS -- see
-    /// [`crate::discovery`]).
-    Config(Arc<ClusterConfig>),
-    /// Membership fed externally, registered directly against the manager by
-    /// [`ClusterManager::add_eds_cluster`] rather than arriving through
-    /// [`ClusterManager::update_from_snapshot`].
-    ///
-    /// **Superseded, and every caller is a test** (`manager.rs`'s own tests
-    /// plus `proxy/src/main.rs`'s `manager_with_one_never_fed_cluster`
-    /// helper). This variant was a stand-in from when the claim below it --
-    /// "the IR's `DiscoveryType` has no EDS variant yet, `lower.rs` rejects
-    /// EDS clusters at proto conversion" -- was true. It stopped being true
-    /// in WP-21 increment 1: `DiscoveryType::Eds` exists, `lower.rs` lowers
-    /// it, and a real EDS cluster arrives as
-    /// `ClusterSource::Config(config)` with `config.discovery ==
-    /// DiscoveryType::Eds`, short-circuiting in the same places this variant
-    /// does (see [`ClusterManager::resolve_cluster`]).
-    ///
-    /// So the tests that use it configure a shape production never produces
-    /// -- rule 16's failure mode. WP-21's card owns the removal: delete this
-    /// variant, [`ManagedCluster::eds`], [`ClusterManager::add_eds_cluster`],
-    /// the carry-over block in `update_from_snapshot`, and the four
-    /// defensive match arms, and rebuild those tests on a real EDS
-    /// `ClusterConfig` instead.
-    Eds,
-}
-
 /// One cluster's live state: where its membership comes from, its current
 /// host-set snapshot, and its warming status.
 ///
@@ -95,7 +65,11 @@ enum ClusterSource {
 /// `host_set`/`host_picker`/`transport`/`upstream_protocol` below are all
 /// inert placeholders -- see [`ManagedCluster::from_config`]'s aggregate arm.
 struct ManagedCluster {
-    source: ClusterSource,
+    /// The config this cluster was built from; discovery follows its
+    /// `DiscoveryType` (STATIC/STRICT_DNS/LOGICAL_DNS -- see
+    /// [`crate::discovery`]), except `EDS`, whose membership arrives through
+    /// [`ClusterManager::accept_eds_update`] instead.
+    config: Arc<ClusterConfig>,
     /// Rust note: `Arc<ArcSwap<..>>` (not a bare `ArcSwap<..>`) so
     /// [`health_check::HealthCheckEngine::spawn_for_host`] -- which needs an
     /// owned handle to publish transitions onto, since its check loop
@@ -210,10 +184,6 @@ impl Drop for ManagedCluster {
     }
 }
 
-/// Envoy's own default for `Cluster.connect_timeout` when a config doesn't
-/// set one -- see `ClusterConfig::connect_timeout`'s doc comment in the IR.
-const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 impl ManagedCluster {
     /// Builds a config-sourced cluster's state. Branches on `config.kind`:
     /// an `Endpoints` cluster gets a real load balancer and transport socket
@@ -263,7 +233,7 @@ impl ManagedCluster {
                     None => (None, None),
                 };
                 Ok(Self {
-                    source: ClusterSource::Config(config),
+                    config,
                     host_set,
                     initialized: AtomicBool::new(false),
                     host_picker: HostPicker::new(policy),
@@ -298,7 +268,7 @@ impl ManagedCluster {
                 // `ManagedCluster` and its own `health_engine`.
                 let connect_timeout = config.connect_timeout;
                 Ok(Self {
-                    source: ClusterSource::Config(config),
+                    config,
                     host_set: Arc::new(ArcSwap::from_pointee(HostSet::default())),
                     initialized: AtomicBool::new(true),
                     host_picker: HostPicker::new(
@@ -357,55 +327,19 @@ impl ManagedCluster {
         }
     }
 
-    /// EDS clusters have no `ClusterConfig`/`lb_policy` of their own (see
-    /// [`ClusterSource::Eds`]); default to `ROUND_ROBIN`, matching Envoy's
-    /// own cluster-wide default, to plaintext (there's no
-    /// `transport_socket` field to read), and to Envoy's own
-    /// `connect_timeout` default (there's no field to read that either).
-    /// `health_engine` is `None` for the same reason: there's no
-    /// `ClusterConfig.health_check` to build one from.
-    fn eds() -> Self {
-        Self {
-            source: ClusterSource::Eds,
-            host_set: Arc::new(ArcSwap::from_pointee(HostSet::default())),
-            initialized: AtomicBool::new(false),
-            host_picker: HostPicker::new(
-                load_balancer::build(LbPolicy::RoundRobin).expect("round robin always builds"),
-            ),
-            default_cb: CircuitBreakerState::default(),
-            high_cb: CircuitBreakerState::default(),
-            upstream_protocol: UpstreamProtocol::Http1,
-            transport: Arc::new(transport::RawTransportSocket),
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            health_engine: None,
-            probes: Mutex::new(HashMap::new()),
-            // EDS clusters have no `ClusterConfig` to read an
-            // `outlier_detection` block from (see `ClusterSource::Eds`).
-            outlier_detector: None,
-            outlier_sweep: Mutex::new(None),
-        }
-    }
-
     /// True for an aggregate cluster (`ClusterConfig::kind` is `Aggregate`).
     /// [`ClusterHandle::select_aggregate_member`] uses this to refuse
     /// recursing into a member that is itself an aggregate.
     fn is_aggregate(&self) -> bool {
-        matches!(
-            &self.source,
-            ClusterSource::Config(c) if matches!(c.kind, ClusterKind::Aggregate { .. })
-        )
+        matches!(self.config.kind, ClusterKind::Aggregate { .. })
     }
 
     /// This cluster's aggregate member list, in config order -- `None` for
-    /// anything [`Self::is_aggregate`] says isn't one (an `Endpoints`
-    /// cluster, or an EDS cluster, which has no `ClusterConfig` at all).
+    /// anything [`Self::is_aggregate`] says isn't one.
     fn aggregate_members(&self) -> Option<&[ClusterName]> {
-        match &self.source {
-            ClusterSource::Config(c) => match &c.kind {
-                ClusterKind::Aggregate { members } => Some(members),
-                ClusterKind::Endpoints => None,
-            },
-            ClusterSource::Eds => None,
+        match &self.config.kind {
+            ClusterKind::Aggregate { members } => Some(members),
+            ClusterKind::Endpoints => None,
         }
     }
 }
@@ -503,8 +437,8 @@ impl ClusterManager {
     /// **EDS-delivered membership on a config-sourced EDS cluster now
     /// survives an unrelated reload, via the same carry-forward.** Previously
     /// this was the sharpest consequence of the missing carry-forward: a
-    /// cluster declared `discovery: eds` is `ClusterSource::Config` (not
-    /// `ClusterSource::Eds` -- see that variant's doc), so every reload
+    /// cluster declared `discovery: eds` is an ordinary config-sourced
+    /// cluster like any other, so every reload
     /// rebuilt it from scratch with an empty `HostSet`, and `resolve_cluster`
     /// deliberately does not resolve an EDS-typed config cluster (there is
     /// nothing to resolve) -- so a SIGHUP reload emptied it until the control
@@ -532,9 +466,9 @@ impl ClusterManager {
         // already live and must not be touched (see this method's own doc).
         let mut freshly_built: Vec<ClusterName> = Vec::new();
         for (name, config) in clusters {
-            let carried = match previous.get(name).map(|m| (&m.source, m)) {
-                Some((ClusterSource::Config(old), managed))
-                    if Arc::ptr_eq(old, config) || **old == **config =>
+            let carried = match previous.get(name) {
+                Some(managed)
+                    if Arc::ptr_eq(&managed.config, config) || *managed.config == **config =>
                 {
                     Some(Arc::clone(managed))
                 }
@@ -565,7 +499,7 @@ impl ClusterManager {
         // these half-resolved `ManagedCluster`s mid-loop. `resolve_cluster`
         // is the same logic `refresh_cluster` runs (it's the extraction of
         // that method's body -- see its own doc), so an EDS-typed
-        // `ClusterSource::Config` cluster still isn't resolved here either
+        // cluster still isn't resolved here either
         // (it would return empty and there'd be nothing to carry membership
         // over from, since this cluster has no EDS delivery yet at
         // construction time).
@@ -583,30 +517,8 @@ impl ClusterManager {
                 tracing::warn!(cluster = %name, error = %err, "initial cluster discovery failed");
             }
         }
-
-        // Carry EDS-registered clusters over untouched -- they have no
-        // self-driven discovery (see `ClusterSource::Eds`) and never appear
-        // in `clusters` above, so `next` has no entry for them yet.
-        for (name, managed) in previous.iter() {
-            if matches!(managed.source, ClusterSource::Eds) {
-                next.entry(name.clone())
-                    .or_insert_with(|| Arc::clone(managed));
-            }
-        }
         self.clusters.store(Arc::new(next));
         rejected
-    }
-
-    /// Register a cluster whose membership will arrive via
-    /// [`Self::accept_eds_update`] rather than self-driven discovery. A
-    /// no-op if a cluster of that name already exists.
-    pub fn add_eds_cluster(&self, name: ClusterName) {
-        self.clusters.rcu(|current| {
-            let mut next = (**current).clone();
-            next.entry(name.clone())
-                .or_insert_with(|| Arc::new(ManagedCluster::eds()));
-            next
-        });
     }
 
     /// Apply an externally-supplied endpoint set to an EDS-registered
@@ -673,33 +585,27 @@ impl ClusterManager {
     /// first; [`Self::update_from_snapshot`] calls this on a cluster that
     /// hasn't been published yet).
     async fn resolve_cluster(&self, managed: &ManagedCluster) -> io::Result<HostSetDiff> {
-        let config = match &managed.source {
-            ClusterSource::Eds => return Ok(HostSetDiff::default()),
-            // An aggregate has no endpoints/discovery of its own to
-            // resolve -- an explicit no-op arm, the same as `Eds` above,
-            // not a resolve of zero endpoints (which would go through
-            // `discovery::resolve` and diff against an always-empty set for
-            // no reason).
-            ClusterSource::Config(config)
-                if matches!(config.kind, ClusterKind::Aggregate { .. }) =>
-            {
-                return Ok(HostSetDiff::default())
-            }
-            // WP-21 increment 1: an EDS cluster declared in STATIC config is
-            // `ClusterSource::Config`, not `ClusterSource::Eds` (that variant
-            // is for clusters `add_eds_cluster` registered), so it reaches
-            // here -- and it must short-circuit for the same reason the two
-            // arms above do, plus a sharper one. Production re-runs this on
-            // the DNS refresh timer; `discovery::resolve` returns an EMPTY
-            // host set for `DiscoveryType::Eds`, so falling through would
-            // diff the EDS-delivered membership against nothing and wipe it
-            // on the next tick. Found while adding the IR variant, not by a
-            // test -- there is no EDS delivery path to regress yet.
-            ClusterSource::Config(config) if config.discovery == DiscoveryType::Eds => {
-                return Ok(HostSetDiff::default())
-            }
-            ClusterSource::Config(config) => config,
-        };
+        // Two shapes have nothing to resolve, and both return an explicit
+        // no-op rather than a resolve of zero endpoints (which would go
+        // through `discovery::resolve` and diff against an always-empty set
+        // for no reason).
+        //
+        // An aggregate has no endpoints or discovery of its own.
+        //
+        // WP-21 increment 1: an EDS cluster's membership arrives through
+        // [`ClusterManager::accept_eds_update`], and short-circuiting matters
+        // more sharply here. Production re-runs this on the DNS refresh
+        // timer; `discovery::resolve` returns an EMPTY host set for
+        // `DiscoveryType::Eds`, so falling through would diff the
+        // EDS-delivered membership against nothing and wipe it on the next
+        // tick. Found while adding the IR variant, not by a test -- there was
+        // no EDS delivery path to regress yet.
+        let config = &managed.config;
+        if matches!(config.kind, ClusterKind::Aggregate { .. })
+            || config.discovery == DiscoveryType::Eds
+        {
+            return Ok(HostSetDiff::default());
+        }
         let new_set = discovery::resolve(config, self.resolver.as_ref()).await?;
         let old_set = managed.host_set.load();
         let diff = diff_host_sets(&old_set, &new_set);
@@ -905,18 +811,12 @@ impl ClusterEntry for ClusterHandle {
     }
 
     fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation] {
-        // EDS clusters have no `ClusterConfig` (see `ClusterSource::Eds`), so
-        // there's nowhere for this to come from -- empty, same as the
-        // `upstream_protocol`/`transport` defaults above. An aggregate's own
-        // `request_headers_to_add` is likewise never read here: the router
-        // calls this on the *member's* entry (`HostSelection::member`), not
-        // the aggregate's, so this arm never actually executes for an
-        // aggregate in practice -- but it stays correct (empty) rather than
-        // panicking if it ever did.
-        match &self.managed.source {
-            ClusterSource::Config(config) => &config.request_headers_to_add,
-            ClusterSource::Eds => &[],
-        }
+        // An aggregate's own `request_headers_to_add` is never read here: the
+        // router calls this on the *member's* entry
+        // (`HostSelection::member`), not the aggregate's. Ground rule #6 --
+        // anything per-provider belongs on the cluster that is actually
+        // dialled -- is the reason that matters.
+        &self.managed.config.request_headers_to_add
     }
 
     fn report_outlier_result(&self, addr: SocketAddr, result: RequestResult) {
@@ -997,11 +897,9 @@ mod tests {
         })
     }
 
-    /// A config-sourced EDS cluster (`discovery: eds`, so
-    /// `ClusterSource::Config`, not `ClusterSource::Eds` -- see that
-    /// variant's doc): membership arrives via
-    /// [`ClusterManager::accept_eds_update`], never `endpoints`/`discovery`
-    /// resolution. WP-59 increment 2's test for the paragraph in
+    /// A config-sourced EDS cluster (`discovery: eds`): membership arrives
+    /// via [`ClusterManager::accept_eds_update`], never
+    /// `endpoints`/`discovery` resolution. WP-59 increment 2's test for the paragraph in
     /// `update_from_snapshot`'s own doc about this shape surviving a reload.
     fn cluster_config_eds(name: &str) -> Arc<ClusterConfig> {
         Arc::new(ClusterConfig {
@@ -1303,7 +1201,9 @@ mod tests {
     async fn eds_cluster_starts_uninitialized_then_accepts_an_update() {
         let resolver = Arc::new(FakeResolver::new());
         let manager = ClusterManager::with_default_transport(resolver);
-        manager.add_eds_cluster("eds-svc".to_string());
+        let mut snapshot = HashMap::new();
+        snapshot.insert("eds-svc".to_string(), cluster_config_eds("eds-svc"));
+        manager.update_from_snapshot(&snapshot).await;
 
         assert!(manager.cluster("eds-svc").is_some());
         assert!(!manager.is_initialized("eds-svc"));
@@ -1322,7 +1222,9 @@ mod tests {
     async fn force_initialize_marks_an_unresolved_cluster_ready() {
         let resolver = Arc::new(FakeResolver::new());
         let manager = ClusterManager::with_default_transport(resolver);
-        manager.add_eds_cluster("never-fed".to_string());
+        let mut snapshot = HashMap::new();
+        snapshot.insert("never-fed".to_string(), cluster_config_eds("never-fed"));
+        manager.update_from_snapshot(&snapshot).await;
         assert!(!manager.is_initialized("never-fed"));
         manager.force_initialize("never-fed");
         assert!(manager.is_initialized("never-fed"));
@@ -1341,8 +1243,8 @@ mod tests {
                 vec![endpoint("10.0.0.1", 80)],
             ),
         );
+        snapshot.insert("never-fed".to_string(), cluster_config_eds("never-fed"));
         manager.update_from_snapshot(&snapshot).await;
-        manager.add_eds_cluster("never-fed".to_string());
 
         let warming = manager.warming_clusters();
         assert_eq!(warming, vec!["never-fed".to_string()]);
@@ -2360,8 +2262,7 @@ mod tests {
 
     /// The paragraph `update_from_snapshot`'s own doc now makes about EDS
     /// membership surviving a reload: a config-sourced EDS cluster
-    /// (`discovery: eds`, `ClusterSource::Config`, not `ClusterSource::Eds`
-    /// -- see [`cluster_config_eds`]) fed via
+    /// (`discovery: eds` -- see [`cluster_config_eds`]) fed via
     /// [`ClusterManager::accept_eds_update`], then a reload that changes an
     /// unrelated cluster's config, must not empty it.
     #[tokio::test]

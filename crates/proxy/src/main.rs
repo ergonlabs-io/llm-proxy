@@ -1881,12 +1881,39 @@ mod tests {
 
     /// A `ClusterManager` carrying one cluster that has never resolved --
     /// what every [`build_readiness_probe`] test below drives against,
-    /// avoiding any real DNS/EDS traffic.
-    fn manager_with_one_never_fed_cluster() -> Arc<proxy_cluster::manager::ClusterManager> {
+    /// avoiding any real DNS/EDS traffic. An EDS cluster is the shape that
+    /// stays unresolved for free: `resolve_cluster` short-circuits on
+    /// `DiscoveryType::Eds` (membership arrives through
+    /// `ClusterManager::accept_eds_update`, which this never calls), so the
+    /// cluster is registered and `is_initialized` stays false with no I/O.
+    async fn manager_with_one_never_fed_cluster() -> Arc<proxy_cluster::manager::ClusterManager> {
         let manager = proxy_cluster::manager::ClusterManager::with_default_transport(Arc::new(
             proxy_cluster::resolver::TokioResolver,
         ));
-        manager.add_eds_cluster("never-fed".to_string());
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "never-fed".to_string(),
+            Arc::new(proxy_config::ir::ClusterConfig {
+                name: "never-fed".to_string(),
+                discovery: proxy_config::ir::DiscoveryType::Eds,
+                eds: Some(proxy_config::ir::EdsClusterConfig {
+                    service_name: "never-fed".to_string(),
+                }),
+                lb_policy: proxy_config::ir::LbPolicy::RoundRobin,
+                connect_timeout: Duration::from_secs(5),
+                endpoints: Vec::new(),
+                kind: proxy_config::ir::ClusterKind::Endpoints,
+                transport_socket: None,
+                per_connection_buffer_limit_bytes: 1 << 20,
+                circuit_breakers: Default::default(),
+                upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
+                request_headers_to_add: Vec::new(),
+                usage_dialect: None,
+                health_check: None,
+                outlier_detection: None,
+            }),
+        );
+        manager.update_from_snapshot(&snapshot).await;
         Arc::new(manager)
     }
 
@@ -1900,7 +1927,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_probe_reports_initializing_before_the_deadline() {
-        let manager = manager_with_one_never_fed_cluster();
+        let manager = manager_with_one_never_fed_cluster().await;
         let probe = build_readiness_probe(manager.clone(), Duration::from_secs(60), Instant::now());
         match probe() {
             proxy_admin::Readiness::Initializing { warming } => {
@@ -1920,7 +1947,7 @@ mod tests {
     /// test pass on `Readiness::Live` but fail on `is_initialized`.
     #[tokio::test]
     async fn readiness_probe_reports_live_past_the_deadline_but_leaves_is_initialized_false() {
-        let manager = manager_with_one_never_fed_cluster();
+        let manager = manager_with_one_never_fed_cluster().await;
         // Backdated, not slept-past: the deadline already elapsed before the
         // first call.
         let deadline_started_at = Instant::now() - Duration::from_secs(60);
