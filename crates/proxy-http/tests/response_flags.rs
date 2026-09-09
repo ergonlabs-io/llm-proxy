@@ -34,9 +34,9 @@ use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::resolver::FakeResolver;
 use proxy_config::ir::{
     AccessLogFormat, AccessLogIR, AccessLogSink, CircuitBreakerThresholds, CircuitBreakers,
-    ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, ForwardAction,
-    ForwardTarget, LbPolicy, PathMatch, RouteActionIR, RouteEntry, RouteMatcher, RouteTable,
-    VirtualHostIR,
+    ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EdsClusterConfig, EndpointIR,
+    ForwardAction, ForwardTarget, LbPolicy, PathMatch, RouteActionIR, RouteEntry, RouteMatcher,
+    RouteTable, UpgradeConfig, VirtualHostIR,
 };
 use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
@@ -109,7 +109,12 @@ fn test_router_stats(cluster_names: &[&str]) -> Arc<RouterStats> {
 /// The knobs every test in this file needs to vary: the route's own path
 /// matcher (so `NR` can mismatch it), whether/how many endpoints cluster
 /// `"up"` has (`UH` needs zero), its circuit breakers (`UO` needs
-/// `max_requests: 0`), and the forward action (timeouts, for `UT`).
+/// `max_requests: 0`), the forward action (timeouts, for `UT`), and (WP-58)
+/// its discovery type -- `Eds` with no `accept_eds_update` ever sent is how a
+/// cluster is made to sit registered-but-never-warmed, the real condition
+/// behind `cluster_not_warmed` (see `ClusterManager::resolve_cluster`'s doc:
+/// an EDS cluster's `initialized` flag is untouched by `update_from_snapshot`,
+/// unlike every other discovery type).
 struct Scenario {
     route_matcher: RouteMatcher,
     endpoints: Vec<EndpointIR>,
@@ -118,6 +123,12 @@ struct Scenario {
     /// `UR` is the only flag here that needs h2: REFUSED_STREAM is a
     /// stream-level reset, and h1 has no such frame.
     protocol: proxy_config::ir::UpstreamProtocol,
+    discovery: DiscoveryType,
+    eds: Option<EdsClusterConfig>,
+    /// WP-58: the upgrade path's own `NoClusterFound`/warming check needs an
+    /// enabled upgrade type to ever reach `handle_upgrade` at all -- empty
+    /// (the default) is what every non-upgrade test here wants.
+    upgrade_configs: Vec<UpgradeConfig>,
 }
 
 impl Scenario {
@@ -134,6 +145,29 @@ impl Scenario {
             circuit_breakers: CircuitBreakers::default(),
             fwd,
             protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            discovery: DiscoveryType::Static,
+            eds: None,
+            upgrade_configs: Vec::new(),
+        }
+    }
+
+    /// WP-58: a cluster that's registered but has never completed its first
+    /// resolution -- `Eds` discovery, no endpoints, and (crucially) the
+    /// caller never calls `ClusterManager::accept_eds_update` on it, so
+    /// `is_initialized` stays `false` forever. No live upstream is needed:
+    /// every test using this must be refused before any dial is attempted.
+    fn warming(fwd: ForwardAction) -> Self {
+        Scenario {
+            route_matcher: prefix_matcher("/v1/"),
+            endpoints: Vec::new(),
+            circuit_breakers: CircuitBreakers::default(),
+            fwd,
+            protocol: proxy_config::ir::UpstreamProtocol::Http1,
+            discovery: DiscoveryType::Eds,
+            eds: Some(EdsClusterConfig {
+                service_name: "up".to_string(),
+            }),
+            upgrade_configs: Vec::new(),
         }
     }
 }
@@ -144,10 +178,9 @@ async fn build_router(scenario: Scenario, access_logs: &[AccessLogIR]) -> Filter
     snapshot.insert(
         "up".to_string(),
         Arc::new(ClusterConfig {
-            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
-            eds: None,
+            eds: scenario.eds,
             name: "up".to_string(),
-            discovery: DiscoveryType::Static,
+            discovery: scenario.discovery,
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
             endpoints: scenario.endpoints,
@@ -186,7 +219,8 @@ async fn build_router(scenario: Scenario, access_logs: &[AccessLogIR]) -> Filter
     .unwrap();
 
     let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
-        RouterFilterFactory::new(Arc::new(manager), test_router_stats(&["up"])),
+        RouterFilterFactory::new(Arc::new(manager), test_router_stats(&["up"]))
+            .with_upgrade_configs(scenario.upgrade_configs),
     );
     FilterChainHandler::new_with_access_logs(
         Vec::new(),
@@ -215,6 +249,41 @@ fn request(path: &'static str) -> HttpRequestParts {
         ),
         downstream: DownstreamInfo::loopback(),
         on_upgrade: None,
+    }
+}
+
+/// WP-58: a request carrying `Upgrade: websocket` -- routes through
+/// `RouterHandler::handle_upgrade` rather than `apply_forward`, which is
+/// exactly the bypass this file's warming tests need to rule out. Same shape
+/// as `router_upgrade_e2e.rs`'s own `upgrade_request` (duplicated here, same
+/// reasoning as that file's doc: each `tests/*.rs` is its own compilation
+/// unit).
+fn upgrade_request(path: &'static str) -> HttpRequestParts {
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::HOST, HeaderValue::from_static("test.local"));
+    headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+    headers.insert(
+        http::header::CONNECTION,
+        HeaderValue::from_static("Upgrade"),
+    );
+    let mut synthetic = http::Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .body(())
+        .unwrap();
+    let on_upgrade = hyper::upgrade::on(&mut synthetic);
+    HttpRequestParts {
+        head: RequestHeaders {
+            method: Method::GET,
+            uri: Uri::from_static(path),
+            headers,
+        },
+        body: local_boxed(
+            Full::new(Bytes::new())
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        ),
+        downstream: DownstreamInfo::loopback(),
+        on_upgrade: Some(on_upgrade),
     }
 }
 
@@ -337,7 +406,10 @@ async fn zero_endpoints_records_and_renders_the_uh_flag() {
             scenario.endpoints = Vec::new();
             let handler = build_router(
                 scenario,
-                &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
+                &[text_logger(
+                    &path,
+                    "%RESPONSE_CODE% %RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%\n",
+                )],
             )
             .await;
 
@@ -345,8 +417,141 @@ async fn zero_endpoints_records_and_renders_the_uh_flag() {
             assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
             resp.body.collect().await.unwrap();
 
-            assert_eq!(read_to_string(&path), "503 UH\n");
+            assert_eq!(
+                read_to_string(&path),
+                "503 UH no_healthy_upstream\n",
+                "WP-58: an initialized cluster whose hosts are all ejected/absent must render \
+                 UH + no_healthy_upstream, NOT cluster_not_warmed -- see \
+                 `cluster_not_warmed_is_distinguishable_from_all_hosts_ejected` for the direct \
+                 comparison"
+            );
             std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+// --- WP-58: a never-warmed cluster must be distinguishable from UH ----------
+//
+// `internal-docs/IMPLEMENTATION_PLAN.md`'s WP-21 card: "nothing consults
+// `is_initialized` before routing, so an un-initialized cluster still fails a
+// request through the same generic `NoHealthyUpstream` path as a cluster
+// whose hosts are all ejected". These three tests are the fix's acceptance
+// criteria: the warming case renders `NC` (not `UH`) with a
+// `cluster_not_warmed` detail, through BOTH `apply_forward` and
+// `handle_upgrade` (the bypass risk a check on only one site would leave),
+// and is provably distinct from the ejected-hosts case above.
+
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_not_warmed_records_and_renders_the_nc_flag_via_forward() {
+    LocalSet::new()
+        .run_until(async {
+            let path = temp_path("warming-flag-forward");
+            let scenario = Scenario::warming(forward_to(ForwardTarget::Cluster("up".into())));
+            let handler = build_router(
+                scenario,
+                &[text_logger(
+                    &path,
+                    "%RESPONSE_CODE% %RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%\n",
+                )],
+            )
+            .await;
+
+            let resp = handler.handle(request("/v1/chat/completions")).await;
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            resp.body.collect().await.unwrap();
+
+            assert_eq!(
+                read_to_string(&path),
+                "503 NC cluster_not_warmed\n",
+                "a cluster that exists but never completed its first resolution must render NC \
+                 (matching Envoy's real `cluster == nullptr` path for a warming cluster) with a \
+                 details string that tells it apart from an unknown cluster or an ejected one"
+            );
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_not_warmed_records_and_renders_the_nc_flag_via_upgrade() {
+    LocalSet::new()
+        .run_until(async {
+            let path = temp_path("warming-flag-upgrade");
+            let mut scenario = Scenario::warming(forward_to(ForwardTarget::Cluster("up".into())));
+            scenario.upgrade_configs = vec![UpgradeConfig {
+                upgrade_type: "websocket".to_string(),
+                enabled: true,
+            }];
+            let handler = build_router(
+                scenario,
+                &[text_logger(
+                    &path,
+                    "%RESPONSE_CODE% %RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%\n",
+                )],
+            )
+            .await;
+
+            let resp = handler.handle(upgrade_request("/v1/chat")).await;
+            assert_eq!(
+                resp.head.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the warming check must fire on the upgrade path too, not just apply_forward -- \
+                 an upgrade request is exactly how the check would be bypassed if only one of \
+                 the two cluster-lookup sites enforced it"
+            );
+            resp.body.collect().await.unwrap();
+
+            assert_eq!(read_to_string(&path), "503 NC cluster_not_warmed\n");
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_not_warmed_is_distinguishable_from_all_hosts_ejected() {
+    LocalSet::new()
+        .run_until(async {
+            let fmt = "%RESPONSE_CODE% %RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%\n";
+
+            // The warming case: registered, never resolved.
+            let warming_path = temp_path("distinguish-warming");
+            let warming_handler = build_router(
+                Scenario::warming(forward_to(ForwardTarget::Cluster("up".into()))),
+                &[text_logger(&warming_path, fmt)],
+            )
+            .await;
+            let warming_resp = warming_handler
+                .handle(request("/v1/chat/completions"))
+                .await;
+            assert_eq!(warming_resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            warming_resp.body.collect().await.unwrap();
+            let warming_line = read_to_string(&warming_path);
+            std::fs::remove_file(&warming_path).unwrap();
+
+            // The ejected case: resolved and initialized, zero healthy hosts.
+            let ejected_path = temp_path("distinguish-ejected");
+            let mut ejected_scenario = Scenario::forwarding_to(
+                "127.0.0.1:1".parse().unwrap(),
+                forward_to(ForwardTarget::Cluster("up".into())),
+            );
+            ejected_scenario.endpoints = Vec::new();
+            let ejected_handler =
+                build_router(ejected_scenario, &[text_logger(&ejected_path, fmt)]).await;
+            let ejected_resp = ejected_handler
+                .handle(request("/v1/chat/completions"))
+                .await;
+            assert_eq!(ejected_resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            ejected_resp.body.collect().await.unwrap();
+            let ejected_line = read_to_string(&ejected_path);
+            std::fs::remove_file(&ejected_path).unwrap();
+
+            assert_eq!(warming_line, "503 NC cluster_not_warmed\n");
+            assert_eq!(ejected_line, "503 UH no_healthy_upstream\n");
+            assert_ne!(
+                warming_line, ejected_line,
+                "WP-58's whole point: a never-warmed cluster and an all-hosts-ejected cluster \
+                 must be distinguishable in the access log, not share one generic path"
+            );
         })
         .await;
 }

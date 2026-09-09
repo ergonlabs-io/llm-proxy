@@ -379,7 +379,7 @@ async fn unknown_cluster_records_and_renders_the_nc_flag() {
                 None,
                 vec![text_logger(
                     &path,
-                    "%RESPONSE_CODE% %RESPONSE_FLAGS%\n",
+                    "%RESPONSE_CODE% %RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%\n",
                     None,
                 )],
             )
@@ -390,7 +390,12 @@ async fn unknown_cluster_records_and_renders_the_nc_flag() {
             resp.body.collect().await.unwrap();
 
             let logged = read_to_string(&path);
-            assert_eq!(logged, "503 NC\n");
+            // WP-58: `cluster_not_found` -- a wholly unknown cluster name --
+            // is distinct from `cluster_not_warmed` (a registered cluster
+            // that's never completed its first resolution; see
+            // `response_flags.rs`'s WP-58 tests for that case), even though
+            // both render the same `NC` short code.
+            assert_eq!(logged, "503 NC cluster_not_found\n");
 
             std::fs::remove_file(&path).unwrap();
         })

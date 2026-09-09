@@ -47,6 +47,13 @@ pub enum FormatOp {
     Protocol,
     ResponseCode,
     ResponseFlags,
+    /// WP-58: `%RESPONSE_CODE_DETAILS%` -- the free-text reason a response
+    /// took the status it did (e.g. `cluster_not_found`, `no_healthy_upstream`,
+    /// `cluster_not_warmed`). Distinguishes conditions that share one
+    /// [`ResponseFlag`] short code -- see
+    /// `proxy_http::stream_info::StreamInfo::response_code_details`'s doc for
+    /// who populates it.
+    ResponseCodeDetails,
     Duration,
     BytesReceived,
     BytesSent,
@@ -324,6 +331,10 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::ResponseFlags
         }
+        "RESPONSE_CODE_DETAILS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::ResponseCodeDetails
+        }
         "DURATION" => {
             bare(name, args, truncate, input)?;
             FormatOp::Duration
@@ -448,6 +459,10 @@ pub struct LogContext<'a> {
     pub upstream_host: Option<&'a str>,
     pub upstream_cluster: Option<&'a str>,
     pub downstream_remote_address: Option<&'a str>,
+    /// WP-58: `%RESPONSE_CODE_DETAILS%` -- `None` when whoever finalized the
+    /// response never set one (most successful responses today), rendered as
+    /// `-` like every other absent [`Option`] field in this struct.
+    pub response_code_details: Option<&'a str>,
     /// WP-33: provider-reported token usage. `None` when the response
     /// carried none -- a non-LLM route, or a provider that reported nothing.
     pub llm_tokens: Option<LlmTokens>,
@@ -527,6 +542,7 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::DownstreamRemoteAddress => {
             out.push_str(ctx.downstream_remote_address.unwrap_or("-"))
         }
+        FormatOp::ResponseCodeDetails => out.push_str(ctx.response_code_details.unwrap_or("-")),
         // WP-33: these six feed billing, so absent usage must render `-`,
         // never a confident-looking `0` -- `None` means "the provider told
         // us nothing", not "zero tokens were used".
@@ -810,6 +826,7 @@ mod tests {
             ("%PROTOCOL%", FormatOp::Protocol),
             ("%RESPONSE_CODE%", FormatOp::ResponseCode),
             ("%RESPONSE_FLAGS%", FormatOp::ResponseFlags),
+            ("%RESPONSE_CODE_DETAILS%", FormatOp::ResponseCodeDetails),
             ("%DURATION%", FormatOp::Duration),
             ("%BYTES_RECEIVED%", FormatOp::BytesReceived),
             ("%BYTES_SENT%", FormatOp::BytesSent),
@@ -901,6 +918,7 @@ mod tests {
             upstream_host: Some("10.0.0.1:8080"),
             upstream_cluster: Some("my_cluster"),
             downstream_remote_address: Some("127.0.0.1:1234"),
+            response_code_details: None,
             llm_tokens: None,
             llm_ttft: None,
             llm_max_stall: None,
@@ -967,6 +985,26 @@ mod tests {
         let c = ctx(&empty, &empty, &empty, &flags);
         let fs = parse("%RESPONSE_FLAGS%");
         assert_eq!(render(&fs, &c), "UF,URX");
+    }
+
+    // -------------------------------------------- WP-58: RESPONSE_CODE_DETAILS --
+
+    #[test]
+    fn response_code_details_renders_when_present() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        c.response_code_details = Some("cluster_not_warmed");
+        let fs = parse("%RESPONSE_CODE_DETAILS%");
+        assert_eq!(render(&fs, &c), "cluster_not_warmed");
+    }
+
+    #[test]
+    fn response_code_details_renders_dash_when_absent() {
+        let empty = http::HeaderMap::new();
+        let c = ctx(&empty, &empty, &empty, &[]);
+        assert_eq!(c.response_code_details, None);
+        let fs = parse("%RESPONSE_CODE_DETAILS%");
+        assert_eq!(render(&fs, &c), "-");
     }
 
     #[test]
