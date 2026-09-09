@@ -66,6 +66,21 @@ enum EntryKind {
     /// against a work package that will wire it up. Once it does, this entry
     /// becomes stale and must be deleted.
     KnownInert,
+    /// The field HAS a real reader and is acted on in production -- the
+    /// reader just lives outside [`RUNTIME_CRATES`], on the control side
+    /// (`proxy`, `proxy-admin`, `proxy-observability`). Nothing here is
+    /// pending: this is the text-based scan's blind spot, not a gap in the
+    /// data plane, and the entry stays for as long as the reader lives where
+    /// it does. Added 2026-09-08, because filing these as `KnownInert` said
+    /// something false -- `ConfigSnapshot.admin`'s reason claimed
+    /// `proxy-admin` was a stub long after it had grown to 1917 lines and
+    /// `main.rs` was binding the address this field carries.
+    ///
+    /// The staleness recheck still applies: a reader appearing inside
+    /// `RUNTIME_CRATES` means the field no longer needs an exemption at all.
+    /// The reason string must name the reader, by path, so it can be
+    /// re-verified by hand.
+    ReadOutsideRuntimeCrates,
     /// Same as `KnownInert`, but the field's *name* collides with an
     /// unrelated field of the same name on a different struct that genuinely
     /// is read — the text-based `.field_name` scan this test uses can't tell
@@ -225,10 +240,18 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "admin",
-        kind: EntryKind::KnownInert,
-        reason: "WP-25: the admin server crate (proxy-admin) is a stub — its \
-                  `src/lib.rs` doesn't yet bind or read the admin address this \
-                  field carries. Field's own doc comment already names WP-25.",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "Read and acted on by `crates/proxy/src/main.rs`'s `run_serve`, which \
+                  passes it to `start_admin` -- the admin listener binds this address, \
+                  or does not bind at all when it is `None`. `proxy-admin/src/dump.rs` \
+                  renders it into `/config_dump` as well. Neither crate is in \
+                  RUNTIME_CRATES, so the scan cannot see either. **The previous reason \
+                  here was false and had been for a long time** -- it said `proxy-admin` \
+                  was a stub whose `src/lib.rs` did not bind the address, written when \
+                  that was true and never revisited; the crate is 1917 lines and WP-50 \
+                  shipped the surface. Corrected 2026-09-08. It stayed green throughout, \
+                  which is the point of this entry kind: a KnownInert entry whose field \
+                  gained a CONTROL-side reader can never go stale on its own.",
     },
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
@@ -264,7 +287,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "TracingConfig",
         field_name: "otlp_endpoint",
-        kind: EntryKind::KnownInert,
+        kind: EntryKind::ReadOutsideRuntimeCrates,
         reason: "WP-51 increment 3a: the OTLP exporter that reads this field \
                   (`proxy_observability::otlp::run_exporter`, called from \
                   `crates/proxy/src/main.rs`'s `run_serve`) lives on the \
@@ -542,9 +565,12 @@ fn allowlist_has_no_stale_entries() {
         // entries can't be auto-rechecked either, for the opposite reason: an
         // unrelated same-named field elsewhere already reads as "found", so
         // the assertion would always fail even while the entry stays correct.
-        // Only plain `KnownInert` entries should start failing this assertion
-        // (proving they're stale) the moment their owning WP wires up a real
-        // reader.
+        // Only plain `KnownInert` and `ReadOutsideRuntimeCrates` entries
+        // should start failing this assertion (proving they're stale) the
+        // moment a reader appears inside the runtime crates -- for the
+        // former because its owning WP wired one up, for the latter because
+        // the data plane now reads what only the control side read before,
+        // which means the exemption is no longer needed at all.
         if entry.kind == EntryKind::ConsumedInternally
             || entry.kind == EntryKind::KnownInertNameCollision
         {
