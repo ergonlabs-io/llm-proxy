@@ -50,7 +50,7 @@ use crate::drain::ConnectionRegistry;
 use crate::filter_chain::{select_filter_chain, ConnectionProperties};
 use crate::header_mutation_filter::HeaderMutationFactory;
 use crate::tcp_proxy::{self, TcpProxyParams};
-use crate::tls::{DownstreamTlsFactory, TlsBuildError};
+use crate::tls::{DownstreamTlsFactory, SdsSecretRegistry, TlsBuildError};
 use crate::tls_inspector::inspect_client_hello;
 use crate::WorkerConfigHandle;
 
@@ -164,13 +164,29 @@ impl ListenerTls {
 /// configured. `None` transport_socket -> `None` slot (plaintext); a build
 /// error names the listener + chain in its `TlsBuildError::context` and
 /// propagates, letting the caller decide fatal-vs-log-and-skip.
-fn build_listener_tls(listener: &ListenerConfig) -> Result<ListenerTls, TlsBuildError> {
+///
+/// WP-22 increment 2b: any chain whose `transport_socket` names SDS secrets
+/// (`certificate_sds_names` non-empty -- `DownstreamTlsFactory::build` builds
+/// it with an empty cert set in that case, deliberately, since the cert
+/// hasn't arrived yet) is registered with `secret_registry` so a later --
+/// or, per the registry's own doc, already-delivered -- secret reaches this
+/// factory. A registration failure (a cached secret this factory's crypto
+/// provider can't load) is a `TlsBuildError`, same as a build failure, since
+/// it means this chain still can't actually serve TLS.
+fn build_listener_tls(
+    listener: &ListenerConfig,
+    secret_registry: &Arc<SdsSecretRegistry>,
+) -> Result<ListenerTls, TlsBuildError> {
     let mut chain_factories = Vec::with_capacity(listener.filter_chains.len());
     for (i, chain) in listener.filter_chains.iter().enumerate() {
         let factory = match &chain.transport_socket {
             Some(spec) => {
                 let context = format!("listener '{}' filter_chains[{i}]", listener.name);
-                Some(Arc::new(DownstreamTlsFactory::build(spec, &context)?))
+                let factory = Arc::new(DownstreamTlsFactory::build(spec, &context)?);
+                if !spec.certificate_sds_names.is_empty() {
+                    secret_registry.register(&spec.certificate_sds_names, &factory, &context)?;
+                }
+                Some(factory)
             }
             None => None,
         };
@@ -183,7 +199,11 @@ fn build_listener_tls(listener: &ListenerConfig) -> Result<ListenerTls, TlsBuild
     {
         Some(spec) => {
             let context = format!("listener '{}' default_filter_chain", listener.name);
-            Some(Arc::new(DownstreamTlsFactory::build(spec, &context)?))
+            let factory = Arc::new(DownstreamTlsFactory::build(spec, &context)?);
+            if !spec.certificate_sds_names.is_empty() {
+                secret_registry.register(&spec.certificate_sds_names, &factory, &context)?;
+            }
+            Some(factory)
         }
         None => None,
     };
@@ -445,6 +465,12 @@ struct WorkerShared<'a> {
     /// `cluster_manager` above. Threaded down to [`build_hcm_handler`], which
     /// hands it to every `HttpFilterFactory::create` via `FactoryContext`.
     factory_state: &'a Arc<SharedFactoryState>,
+    /// WP-22 increment 2b: the one per-serve [`SdsSecretRegistry`] slot --
+    /// same cadence and construction site as `factory_state` above
+    /// (`crates/proxy/src/main.rs`'s `run_serve`). Threaded down to
+    /// [`build_listener_tls`], which registers every SDS-named chain it
+    /// builds against it.
+    secret_registry: &'a Arc<SdsSecretRegistry>,
 }
 
 fn spawn_bound(
@@ -456,7 +482,7 @@ fn spawn_bound(
     // Built before the socket bind: no point opening a listening socket for a
     // filter chain whose certs won't load, or whose HTTP filter chain
     // references an unregistered filter.
-    let tls = build_listener_tls(listener_ir)?;
+    let tls = build_listener_tls(listener_ir, shared.secret_registry)?;
     let hcm = build_listener_hcm(
         listener_ir,
         shared.cluster_manager,
@@ -487,6 +513,7 @@ fn spawn_bound(
             token_stats: shared.token_stats.clone(),
             tracing_handles: shared.tracing.clone(),
             factory_state: shared.factory_state.clone(),
+            secret_registry: shared.secret_registry.clone(),
         },
     );
     Ok(BoundListener { addr, task })
@@ -527,6 +554,11 @@ fn bind_and_spawn(
 ///
 /// On success, hand the returned map to [`run_listener_manager`], which picks
 /// up reconciliation against subsequent config pushes from there.
+// WP-22 increment 2b: `secret_registry` tips this over clippy's 7-arg
+// ceiling, same reasoning as `reconcile`'s own `#[allow]` (it is a distinct
+// per-serve shared handle, not a stats recorder, so it doesn't fold into
+// `stats`).
+#[allow(clippy::too_many_arguments)]
 pub fn initial_bind(
     snapshot: &Arc<ConfigSnapshot>,
     config: &Arc<WorkerConfigHandle>,
@@ -535,6 +567,7 @@ pub fn initial_bind(
     cluster_manager: &Arc<ClusterManager>,
     stats: &StatsRecorders,
     factory_state: &Arc<SharedFactoryState>,
+    secret_registry: &Arc<SdsSecretRegistry>,
 ) -> Result<HashMap<ListenerName, BoundListener>, InitialBindError> {
     let shared = WorkerShared {
         config,
@@ -546,6 +579,7 @@ pub fn initial_bind(
         token_stats: &stats.token,
         tracing: &stats.tracing,
         factory_state,
+        secret_registry,
     };
     let mut bound: HashMap<ListenerName, BoundListener> = HashMap::new();
     for (name, listener_ir) in snapshot.listeners.iter() {
@@ -608,6 +642,11 @@ struct AcceptLoopShared {
     /// [`spawn_bound`] time) for the identical reason `token_stats` is (the
     /// runtime HCM rebuild below).
     factory_state: Arc<SharedFactoryState>,
+    /// This worker's [`SdsSecretRegistry`] handle -- see
+    /// [`WorkerShared::secret_registry`]; needed here (not just at
+    /// [`spawn_bound`] time) because the accept loop's own runtime TLS
+    /// rebuild below calls [`build_listener_tls`] again directly.
+    secret_registry: Arc<SdsSecretRegistry>,
 }
 
 /// One accept loop per bound listener, spawned with `spawn_local` (this
@@ -634,6 +673,7 @@ fn spawn_accept_loop(
         token_stats,
         tracing_handles,
         factory_state,
+        secret_registry,
     } = shared;
     tokio::task::spawn_local(async move {
         // Rust note: `mut` locals, not behind a lock -- this whole task is
@@ -691,7 +731,7 @@ fn spawn_accept_loop(
             // synchronous (no `.await`), so it can't stall new accepts.
             if snapshot.version != tls_version {
                 if let Some(l) = snapshot.listeners.get(&name) {
-                    match build_listener_tls(l) {
+                    match build_listener_tls(l, &secret_registry) {
                         Ok(rebuilt) => tls_cache = Rc::new(rebuilt),
                         Err(err) => {
                             tracing::warn!(listener = %name, error = %err, "failed to rebuild TLS factories after config change; TLS-requiring chains on this listener will reset connections until fixed");
@@ -1404,7 +1444,8 @@ fn reset(stream: &TcpStream, listener: &str) {
 // is a different kind of shared handle) without muddying that bundle's own
 // documented purpose, so this leaf allows the extra arg instead, same
 // tradeoff `crates/proxy/src/main.rs`'s `worker_main` already made for
-// `tracing_handles`.
+// `tracing_handles`. WP-22 increment 2b: `secret_registry` rides along the
+// same way, for the same reason.
 #[allow(clippy::too_many_arguments)]
 fn reconcile(
     snapshot: &Arc<ConfigSnapshot>,
@@ -1415,6 +1456,7 @@ fn reconcile(
     cluster_manager: &Arc<ClusterManager>,
     stats: &StatsRecorders,
     factory_state: &Arc<SharedFactoryState>,
+    secret_registry: &Arc<SdsSecretRegistry>,
 ) {
     let shared = WorkerShared {
         config,
@@ -1426,6 +1468,7 @@ fn reconcile(
         token_stats: &stats.token,
         tracing: &stats.tracing,
         factory_state,
+        secret_registry,
     };
     // Removed: present in `bound`, absent from the new snapshot. Stop
     // accepting; established connections under the old listener keep their
@@ -1489,7 +1532,8 @@ fn reconcile(
 /// loop that spawned them.
 // WP-50 3b-ii part B: `factory_state` tips this over clippy's 7-arg ceiling,
 // same reasoning as `reconcile`'s own `#[allow]` just above (this function's
-// only job with it is forwarding it there every reconcile).
+// only job with it is forwarding it there every reconcile). WP-22 increment
+// 2b: `secret_registry` rides along the same way.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_listener_manager(
     mut bound: HashMap<ListenerName, BoundListener>,
@@ -1500,6 +1544,7 @@ pub async fn run_listener_manager(
     cluster_manager: Arc<ClusterManager>,
     stats: StatsRecorders,
     factory_state: Arc<SharedFactoryState>,
+    secret_registry: Arc<SdsSecretRegistry>,
 ) {
     loop {
         tokio::select! {
@@ -1517,6 +1562,7 @@ pub async fn run_listener_manager(
                     &cluster_manager,
                     &stats,
                     &factory_state,
+                    &secret_registry,
                 );
             }
             _ = shutdown.changed() => {
@@ -2099,6 +2145,7 @@ mod tests {
             tracing: None,
         };
         let factory_state = Arc::new(SharedFactoryState::default());
+        let secret_registry = Arc::new(SdsSecretRegistry::new());
 
         let bound = initial_bind(
             &initial,
@@ -2108,6 +2155,7 @@ mod tests {
             &cluster_manager,
             &stats,
             &factory_state,
+            &secret_registry,
         )
         .expect("initial_bind should succeed in tests");
 
@@ -2120,6 +2168,7 @@ mod tests {
             cluster_manager,
             stats,
             factory_state,
+            secret_registry,
         ));
 
         Harness {
@@ -3037,7 +3086,8 @@ mod tests {
             disable_stateless_session_resumption: false,
         });
 
-        let err = match build_listener_tls(&listener_ir) {
+        let secret_registry = Arc::new(SdsSecretRegistry::new());
+        let err = match build_listener_tls(&listener_ir, &secret_registry) {
             Ok(_) => panic!("garbage PEM must fail to build"),
             Err(err) => err,
         };
@@ -3079,6 +3129,7 @@ mod tests {
                 tracing: None,
             };
             let factory_state = Arc::new(SharedFactoryState::default());
+            let secret_registry = Arc::new(SdsSecretRegistry::new());
 
             let result = initial_bind(
                 &snapshot,
@@ -3088,6 +3139,7 @@ mod tests {
                 &cluster_manager,
                 &stats,
                 &factory_state,
+                &secret_registry,
             );
             match result {
                 Err(err @ InitialBindError::Tls(_)) => {

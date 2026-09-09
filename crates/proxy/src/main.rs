@@ -28,9 +28,10 @@ use proxy_core::drain::{
 };
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
+use proxy_core::tls::SdsSecretRegistry;
 use proxy_xds::{
-    AdsClient, Publish, PublishEndpoints, Reconnect, ResourceApplier, Subscription,
-    SubscriptionState,
+    AdsClient, DynamicSecret, Publish, PublishEndpoints, PublishSecrets, Reconnect,
+    ResourceApplier, Subscription, SubscriptionState,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Channel;
@@ -579,6 +580,14 @@ async fn run_serve(
     let factory_state = Arc::new(proxy_http::filter::SharedFactoryState::for_node(
         node.id.clone(),
     ));
+    // WP-22 increment 2b: the one per-serve `SdsSecretRegistry`, same "control
+    // builds it once, workers/`start_ads` get a clone of the same instance"
+    // shape as `factory_state` just above -- see `proxy_core::tls::
+    // SdsSecretRegistry`'s own doc for what it does. Every worker's
+    // `build_listener_tls` registers its SDS-named chains against this one
+    // instance (via `run_listener_manager`), and `start_ads`'s secret sink
+    // publishes into it whenever the control plane delivers a named secret.
+    let secret_registry = Arc::new(SdsSecretRegistry::new());
     let rejected = cluster_manager
         .update_from_snapshot(&snapshot.clusters)
         .await;
@@ -769,7 +778,7 @@ async fn run_serve(
     // means nothing was started; see `start_ads`'s own doc for the three
     // (non-fatal) ways that happens. The receiver is read from inside the
     // `select!` in this function's own signal loop, further down.
-    let mut ads_apply_rx = start_ads(&snapshot, &node, &cluster_manager);
+    let mut ads_apply_rx = start_ads(&snapshot, &node, &cluster_manager, &secret_registry);
 
     let publisher = WorkerPool::spawn(
         WorkerPoolConfig {
@@ -790,6 +799,7 @@ async fn run_serve(
                 token_usage_stat_handles.clone(),
                 tracing_handles.clone(),
                 factory_state.clone(),
+                secret_registry.clone(),
             )
         },
     );
@@ -1222,6 +1232,7 @@ fn start_ads(
     snapshot: &Arc<ConfigSnapshot>,
     node: &NodeIdentity,
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
+    secret_registry: &Arc<SdsSecretRegistry>,
 ) -> Option<mpsc::Receiver<AdsApplyMsg>> {
     let ads = snapshot.ads.as_ref()?;
 
@@ -1356,8 +1367,37 @@ fn start_ads(
         })
     });
 
-    let applier =
-        ResourceApplier::new(Arc::clone(snapshot), publish).with_endpoint_sink(endpoint_sink);
+    // WP-22 increment 2b: an accepted SDS secret goes straight to
+    // `SdsSecretRegistry::publish` -- same "no round trip through this
+    // function's control loop" shape as `endpoint_sink` just above, and for
+    // the same reason: the registry is already live shared state (an
+    // `Arc<SdsSecretRegistry>`, not a worker-visible `ConfigSnapshot`), so
+    // there is nothing for `apply_snapshot`'s sequencing to add.
+    //
+    // A `SecretKind::ValidationContext` secret has nowhere to go yet --
+    // `DynamicSecret::tls_certificate_ir` answers `None` for it -- and MUST
+    // be refused rather than silently accepted (ground rule #1): accepting
+    // it here would ACK a secret this proxy is not actually serving, telling
+    // the control plane a trust-anchor rotation succeeded when nothing
+    // happened. Trusted-CA rotation over SDS is WP-22 increment 2c.
+    let secret_registry = Arc::clone(secret_registry);
+    let secret_sink: PublishSecrets = Box::new(move |name, secret: Arc<DynamicSecret>| {
+        let secret_registry = Arc::clone(&secret_registry);
+        Box::pin(async move {
+            match secret.tls_certificate_ir() {
+                Ok(Some(ir)) => secret_registry.publish(&name, vec![ir]),
+                Ok(None) => Err(format!(
+                    "secret `{name}` is a validation_context (trusted-CA) secret; rotating a \
+                     trust anchor over SDS is WP-22 increment 2c and is not implemented"
+                )),
+                Err(err) => Err(err.to_string()),
+            }
+        })
+    });
+
+    let applier = ResourceApplier::new(Arc::clone(snapshot), publish)
+        .with_endpoint_sink(endpoint_sink)
+        .with_secret_sink(secret_sink);
 
     let mut states = Vec::new();
     if ads.cds {
@@ -1604,6 +1644,10 @@ async fn worker_main(
     // `SharedFactoryState` -- see `run_serve`'s own comment on the Arc this
     // is cloned from.
     factory_state: Arc<proxy_http::filter::SharedFactoryState>,
+    // WP-22 increment 2b: this worker's clone of the ONE per-serve
+    // `SdsSecretRegistry` -- see `run_serve`'s own comment on the Arc this is
+    // cloned from.
+    secret_registry: Arc<SdsSecretRegistry>,
 ) {
     let registry = ConnectionRegistry::new();
     // WP-23 increment 6a: built fresh per worker -- `stats_registry`/
@@ -1655,6 +1699,7 @@ async fn worker_main(
         &cluster_manager,
         &stats,
         &factory_state,
+        &secret_registry,
     ) {
         Ok(bound) => {
             let _ = bind_tx.send((ctx.id, Ok(())));
@@ -1681,6 +1726,7 @@ async fn worker_main(
         cluster_manager.clone(),
         stats,
         factory_state,
+        secret_registry,
     ));
 
     drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;

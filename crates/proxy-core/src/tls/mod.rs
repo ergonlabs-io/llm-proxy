@@ -15,6 +15,7 @@
 //!   `allow_expired_certificate`).
 
 mod resolver;
+mod secret_registry;
 mod verify;
 
 use std::io;
@@ -37,6 +38,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use resolver::SwapCertResolver;
+pub use secret_registry::SdsSecretRegistry;
 use verify::{
     clone_san_matchers, AcceptAnyServerCert, CarveoutClientCertVerifier,
     HostnameBypassServerCertVerifier,
