@@ -95,10 +95,11 @@ over-budget cluster never opens the socket
 being exhausted produces the same outcome: `503`, the `UO` response flag, and
 an `x-envoy-overloaded: true` response header
 (`max_requests_zero_records_and_renders_the_uo_flag` in
-`crates/proxy-http/tests/response_flags.rs`). `max_pending_requests` and
-`max_retries` are parsed and recorded but not enforced by anything yet
-(`CircuitBreakerState::try_acquire_pending`/`try_acquire_retry` in
-`crates/proxy-cluster/src/lib.rs` are unused dead code today).
+`crates/proxy-http/tests/response_flags.rs`). `max_pending_requests` is a
+bounded parking queue in front of `max_connections`: when all connection
+slots are held, a caller parks only if it can acquire a pending slot; a full
+pending queue produces the same immediate overload response. `max_retries`
+is parsed and recorded but has no enforcement call site yet.
 
 ## Bootstrap configuration: a worked weighted example
 

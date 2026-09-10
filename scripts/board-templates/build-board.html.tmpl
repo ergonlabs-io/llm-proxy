@@ -382,10 +382,10 @@
     the LLM layer stacks on serving foundations that were not finished at the time. Two have since
     closed: downstream h2 landed 2026-08-02 (only h2c and S10 upgrades remain, WP-10), and h2
     upstream connection pooling went from connect-per-stream to a bounded per-key connection set
-    that measured 808 concurrent streams, 4x its prior ceiling (WP-15 slice C, 2026-08-22). Still
-    open: h1 upstream pooling (still connect-per-stream) and watermarks aliased to buffering
-    rather than real backpressure (WP-11) — neither exercised by the tests that closed v0.1.0's
-    gate.
+    that measured 808 concurrent streams, 4x its prior ceiling (WP-15 slice C, 2026-08-22). h1
+    upstream keep-alive reuse and connection-level circuit breakers also landed (WP-15 slices B/D);
+    watermarks remain aliased to buffering rather than real backpressure (WP-11), a caveat not
+    exercised by the tests that closed v0.1.0's gate.
     <b>WP-41, the black-box QA suite, found five real bugs across the two milestones</b> — no
     dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too),
     no response flag on a mid-stream failure, a JSON-float usage report silently billed as zero
