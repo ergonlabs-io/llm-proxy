@@ -32,8 +32,8 @@ use proxy_http::filter::SharedFactoryState;
 use proxy_http::handler::stub::FixedResponseHandler;
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::stat_handles::{
-    DownstreamStatHandles, DownstreamStats, GenAiTokenStats, RouterStats, StatHandles,
-    TokenUsageStatHandles,
+    DownstreamStatHandles, DownstreamStats, GenAiLatencyStats, GenAiTokenStats, RouterStats,
+    StatHandles, TokenUsageStatHandles,
 };
 use proxy_observability::stats::{StatsControl, WorkerId};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
@@ -308,11 +308,16 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         token_usage_handles,
         WorkerId(0),
     ));
+    let latency_stats = Arc::new(GenAiLatencyStats::new(
+        stats_control.registry(),
+        WorkerId(0),
+    ));
 
     let stats = proxy_core::listener::StatsRecorders {
         router: router_stats,
         downstream: downstream_stats,
         token: token_stats,
+        latency: latency_stats,
         tracing: None,
     };
 
