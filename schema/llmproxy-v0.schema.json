@@ -71,6 +71,10 @@
     "observability": {
       "description": "Metrics and access logging. Access logging is fully implemented, including token counts and TTFT/TPOT. Metrics are recorded and served on the admin endpoint at `/stats` and `/stats/prometheus`: per-cluster upstream request counts and an upstream request-time histogram. Two instruments are defined but NOT yet recorded and so never appear -- downstream connection counts, and GenAI token usage -- so do not build alerting on those two.",
       "$ref": "#/$defs/Observability"
+    },
+    "pricing": {
+      "description": "Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. Updating a file source requires config reload.",
+      "$ref": "#/$defs/Pricing"
     }
   },
   "$defs": {
@@ -398,6 +402,51 @@
             }
           }
         }
+      }
+    },
+    "Pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "price_list_file": { "type": "string" },
+        "price_list": { "$ref": "#/$defs/PriceList" }
+      },
+      "oneOf": [
+        { "required": ["price_list_file"], "not": { "required": ["price_list"] } },
+        { "required": ["price_list"], "not": { "required": ["price_list_file"] } }
+      ]
+    },
+    "PriceList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effective_from", "entries"],
+      "properties": {
+        "version": { "type": "string", "description": "Human label; recorded version includes a content hash." },
+        "effective_from": { "type": "string", "format": "date-time" },
+        "entries": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PriceEntry" } }
+      }
+    },
+    "PriceEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_type", "model", "tier_mode", "tiers"],
+      "properties": {
+        "provider_type": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "tier_mode": { "enum": ["whole_request", "graduated"] },
+        "tiers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PricingTier" } }
+      }
+    },
+    "PricingTier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_nanodollars_per_token", "cached_input_nanodollars_per_token", "cache_write_nanodollars_per_token", "output_nanodollars_per_token"],
+      "properties": {
+        "up_to": { "type": "integer", "minimum": 0 },
+        "input_nanodollars_per_token": { "type": "integer", "minimum": 0 },
+        "cached_input_nanodollars_per_token": { "type": "integer", "minimum": 0 },
+        "cache_write_nanodollars_per_token": { "type": "integer", "minimum": 0 },
+        "output_nanodollars_per_token": { "type": "integer", "minimum": 0 }
       }
     }
   }

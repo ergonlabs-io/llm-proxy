@@ -242,6 +242,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
 
     let auth_filter = lower_auth(config, &mut warnings)?;
     let token_limit_filter = lower_limits(config, &mut warnings)?;
+    lower_pricing(config, &mut warnings)?;
 
     let access_log = config
         .observability
@@ -283,6 +284,140 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         bootstrap,
         warnings,
     })
+}
+
+// -------------------------------------------------------------- pricing --
+
+/// Validate the rate-card input at dialect load. It is intentionally separate
+/// from the pricing library: this frontend must not pull the data plane into
+/// `--mode translate`, and errors must name operator-facing dotted paths.
+fn lower_pricing(
+    config: &SimpleConfig,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<(), ConfigError> {
+    let Some(pricing) = config.pricing.as_ref() else {
+        return Ok(());
+    };
+    match (&pricing.price_list_file, &pricing.price_list) {
+        (Some(file), None) => {
+            warnings.push(warning(
+                "pricing.price_list_file",
+                "the price list is read once at startup; update it with a config reload",
+            ));
+            let contents = std::fs::read_to_string(file).map_err(|e| ConfigError::Io {
+                path: file.clone(),
+                reason: e.to_string(),
+            })?;
+            let de = serde_yaml::Deserializer::from_str(&contents);
+            let list: PriceListDef = serde_path_to_error::deserialize(de).map_err(|error| {
+                ConfigError::InvalidValue {
+                    field_path: pricing_file_path(&error.path().to_string()),
+                    reason: error.inner().to_string(),
+                }
+            })?;
+            validate_price_list(&list)?;
+        }
+        (None, Some(list)) => validate_price_list(list)?,
+        (None, None) => {
+            return Err(ConfigError::InvalidValue {
+                field_path: "pricing".into(),
+                reason: "set exactly one of price_list_file or price_list".into(),
+            })
+        }
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::InvalidValue {
+                field_path: "pricing".into(),
+                reason: "set exactly one of price_list_file or price_list, not both".into(),
+            })
+        }
+    };
+    Ok(())
+}
+
+fn pricing_file_path(path: &str) -> String {
+    if path.is_empty() || path == "." {
+        "pricing.price_list".into()
+    } else {
+        format!("pricing.price_list.{path}")
+    }
+}
+
+fn validate_price_list(list: &PriceListDef) -> Result<(), ConfigError> {
+    chrono::DateTime::parse_from_rfc3339(&list.effective_from).map_err(|error| {
+        ConfigError::InvalidValue {
+            field_path: "pricing.price_list.effective_from".into(),
+            reason: format!("must be RFC3339: {error}"),
+        }
+    })?;
+    if list.entries.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field_path: "pricing.price_list.entries".into(),
+            reason: "at least one entry is required".into(),
+        });
+    }
+    let mut seen = HashMap::new();
+    for (entry_index, entry) in list.entries.iter().enumerate() {
+        let path = format!("pricing.price_list.entries[{entry_index}]");
+        if entry.provider_type.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.provider_type"),
+                reason: "must not be empty".into(),
+            });
+        }
+        if entry.model.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.model"),
+                reason: "must not be empty".into(),
+            });
+        }
+        if let Some(first) = seen.insert((&entry.provider_type, &entry.model), entry_index) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.model"),
+                reason: format!("duplicate (provider_type, model), first used at entries[{first}]"),
+            });
+        }
+        if entry.tier_mode.is_none() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.tier_mode"),
+                reason: "required; whole_request and graduated have different money semantics"
+                    .into(),
+            });
+        }
+        if entry.tiers.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.tiers"),
+                reason: "at least one tier is required".into(),
+            });
+        }
+        let mut previous = None;
+        let mut open_ended = 0;
+        for (tier_index, tier) in entry.tiers.iter().enumerate() {
+            if let Some(up_to) = tier.up_to {
+                if previous.is_some_and(|previous| up_to <= previous) {
+                    return Err(ConfigError::InvalidValue {
+                        field_path: format!("{path}.tiers[{tier_index}].up_to"),
+                        reason: "must strictly increase".into(),
+                    });
+                }
+                previous = Some(up_to);
+            } else {
+                open_ended += 1;
+            }
+        }
+        if open_ended != 1 {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.tiers"),
+                reason: "exactly one open-ended tier is required".into(),
+            });
+        }
+        if entry.tiers.last().is_some_and(|tier| tier.up_to.is_some()) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.tiers[{}].up_to", entry.tiers.len() - 1),
+                reason: "the open-ended tier must be last".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- providers --
