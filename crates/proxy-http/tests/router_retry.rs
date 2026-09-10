@@ -53,6 +53,7 @@ fn retry_policy(retry_on: &str, num_retries: u32) -> RetryPolicyIR {
         retry_on: RetryOn::parse(retry_on),
         num_retries,
         per_try_timeout: None,
+        hedge_on_per_try_timeout: false,
         retriable_status_codes: Vec::new(),
         retry_back_off: fast_backoff(),
         host_selection_retry_max_attempts: 1,
@@ -303,6 +304,12 @@ fn request_with_body(path: &'static str, body: &'static [u8]) -> HttpRequestPart
 
 fn request(path: &'static str) -> HttpRequestParts {
     request_with_body(path, b"")
+}
+
+fn get_request(path: &'static str) -> HttpRequestParts {
+    let mut request = request(path);
+    request.head.method = Method::GET;
+    request
 }
 
 /// Read one HTTP/1.1 request off `stream` up through its body (using
@@ -730,6 +737,82 @@ async fn spawn_upstream_stalls_then_answers(stall_count: usize) -> (SocketAddr, 
     (addr, count)
 }
 
+/// A deliberately asymmetric pair of responses for the hedge tests.  The
+/// first request will only respond after it has observed that the proxy sent
+/// a second request, then wins that race.  A normal timeout-and-retry drops
+/// the first response, so seeing `x-upstream-attempt: 0` at the client proves
+/// the original request stayed live while its hedge was issued.
+async fn spawn_upstream_original_wins_hedge() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_task = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let attempt = count_task.fetch_add(1, Ordering::SeqCst);
+            let count = count_task.clone();
+            tokio::spawn(async move {
+                let _ = read_one_request(&mut stream).await;
+                if attempt == 0 {
+                    // If the second request never arrives, this request must
+                    // not accidentally make a non-hedging test pass.
+                    while count.load(Ordering::SeqCst) < 2 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                } else {
+                    // Leave a large enough gap that the original is the
+                    // unambiguous winner once it remains alive.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nx-upstream-attempt: {attempt}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// The original connection fails only after the hedge has been observed; the
+/// hedge then supplies a valid response.  This pins Envoy's important rule
+/// that an error from a timed-out original is discarded while its hedge is
+/// still able to produce response headers.
+async fn spawn_upstream_original_errors_then_hedge_succeeds() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_task = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let attempt = count_task.fetch_add(1, Ordering::SeqCst);
+            let count = count_task.clone();
+            tokio::spawn(async move {
+                let _ = read_one_request(&mut stream).await;
+                if attempt == 0 {
+                    while count.load(Ordering::SeqCst) < 2 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    // An invalid status line becomes a codec error, not an
+                    // HTTP response head the router is allowed to select.
+                    let _ = stream.write_all(b"not an HTTP response\r\n\r\n").await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nx-upstream-attempt: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                }
+            });
+        }
+    });
+    addr
+}
+
 fn retry_policy_with_per_try_timeout(
     retry_on: &str,
     num_retries: u32,
@@ -739,6 +822,7 @@ fn retry_policy_with_per_try_timeout(
         retry_on: RetryOn::parse(retry_on),
         num_retries,
         per_try_timeout: Some(per_try_timeout),
+        hedge_on_per_try_timeout: false,
         retriable_status_codes: Vec::new(),
         retry_back_off: fast_backoff(),
         host_selection_retry_max_attempts: 1,
@@ -804,6 +888,101 @@ async fn per_try_timeout_with_no_retry_budget_left_yields_504() {
     })
     .await
     .expect("the per-try timeout should fire well within this guard, not hang");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_safe_request_hedges_without_cancelling_the_original_attempt() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, count) = spawn_upstream_original_wins_hedge().await;
+                let mut policy =
+                    retry_policy_with_per_try_timeout("5xx", 1, Duration::from_millis(50));
+                policy.hedge_on_per_try_timeout = true;
+                let router = build_router(addr, forward_to_up(Some(policy))).await;
+
+                let response = router.handle(get_request("/v1/chat")).await;
+                assert_eq!(response.head.status, StatusCode::OK);
+                assert_eq!(
+                    response.head.headers.get("x-upstream-attempt").unwrap(),
+                    "0",
+                    "the still-live original response must win; a normal retry would return \
+                     the second response instead"
+                );
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    2,
+                    "one original plus one hedge"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the hedge must complete well within this guard");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_hedge_can_succeed_after_the_timed_out_original_errors() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        LocalSet::new()
+            .run_until(async {
+                let addr = spawn_upstream_original_errors_then_hedge_succeeds().await;
+                let mut policy =
+                    retry_policy_with_per_try_timeout("5xx", 1, Duration::from_millis(50));
+                policy.hedge_on_per_try_timeout = true;
+                let router = build_router(addr, forward_to_up(Some(policy))).await;
+
+                let response = router.handle(get_request("/v1/chat")).await;
+                assert_eq!(response.head.status, StatusCode::OK);
+                assert_eq!(
+                    response.head.headers.get("x-upstream-attempt").unwrap(),
+                    "1",
+                    "the live hedge must win after the original's transport error"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the live hedge must succeed well within this guard");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hedge_policy_does_not_concurrently_replay_an_unsafe_method() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, count) = spawn_upstream_original_wins_hedge().await;
+                let mut policy = retry_policy_with_per_try_timeout(
+                    "5xx",
+                    1,
+                    // This is intentionally longer than the second
+                    // response's 250ms delay.  The first attempt still
+                    // times out, but the ordinary retry gets a fresh full
+                    // per-try budget to return its response.
+                    Duration::from_millis(500),
+                );
+                policy.hedge_on_per_try_timeout = true;
+                let router = build_router(addr, forward_to_up(Some(policy))).await;
+
+                // `request` is POST.  Its first attempt is abandoned at the
+                // per-try timeout and only then is the ordinary retry sent.
+                let response = router.handle(request("/v1/chat")).await;
+                assert_eq!(response.head.status, StatusCode::OK);
+                assert_eq!(
+                    response.head.headers.get("x-upstream-attempt").unwrap(),
+                    "1",
+                    "POST must use the existing cancel-then-retry path, never a concurrent hedge"
+                );
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    2,
+                    "one original plus one retry"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the ordinary retry must complete well within this guard");
 }
 
 #[tokio::test(flavor = "current_thread")]

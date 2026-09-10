@@ -100,6 +100,16 @@ use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, Up
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 
+/// A hedge sends a second request before the first has finished, so it is
+/// restricted to HTTP's safe methods. Idempotency alone is insufficient:
+/// replaying a `PUT` concurrently can still expose intermediate state.
+fn hedge_safe_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    )
+}
+
 /// What `apply_forward`'s attempt loop got back from connecting to the
 /// picked host: a [`LeasedH1`] from the worker's bounded-idle h1 connection
 /// cache -- possibly a reused, already-handshaken connection, possibly a
@@ -114,6 +124,21 @@ use idle::IdleTimeoutBody;
 enum Connected {
     Http1(LeasedH1),
     Http2(PooledSendRequest),
+}
+
+/// A timed-out attempt kept alive while its one budgeted hedge is dispatched.
+/// Dropping the request must also cancel the detached local task: unlike an
+/// ordinary retry, a hedge intentionally survives its timer, but it must not
+/// survive the downstream request or the route-wide timeout.
+struct HedgedResponse {
+    receiver: tokio::sync::oneshot::Receiver<Result<HttpResponseParts, UpstreamCodecError>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HedgedResponse {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 mod guarded;
@@ -932,6 +957,12 @@ impl RouterHandler {
         // (see the Rust note just below for why that's sound).
         let mut attempt_number: u32 = 0;
 
+        // Set only after a per-try timer launches a hedge.  It lives outside
+        // the loop because the hedge is the *next* loop iteration; that
+        // iteration races this original response with its own newly-issued
+        // replay.
+        let mut hedged_response: Option<HedgedResponse> = None;
+
         // Rust note: this `async` block (no `move`) captures `dcb` (a `&mut
         // dyn DecoderCallbacks`) by unique reborrow, not by value -- so once
         // this future is dropped (whether by completing or by the outer
@@ -969,6 +1000,9 @@ impl RouterHandler {
                         .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
                     return resp;
                 };
+                // A hedge moves the original attempt's guard into its local
+                // task; ordinary response handling retains it here.
+                let mut rq_guard = Some(rq_guard);
 
                 let Some(sel) = entry.select_host(&ctx) else {
                     tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
@@ -1266,7 +1300,7 @@ impl RouterHandler {
                 // side can decide (in `H1ReuseBody`'s `Drop`) whether the
                 // connection it just used is safe to hand to the NEXT
                 // request.
-                let send: std::pin::Pin<
+                let mut send: std::pin::Pin<
                     Box<
                         dyn std::future::Future<
                             Output = Result<HttpResponseParts, UpstreamCodecError>,
@@ -1300,10 +1334,104 @@ impl RouterHandler {
                     .retry_policy
                     .as_ref()
                     .and_then(|policy| policy.per_try_timeout);
-                let attempt_result = match per_try_timeout {
-                    Some(d) => match tokio::time::timeout(d, send).await {
-                        Ok(result) => result,
-                        Err(_elapsed) => {
+                let hedge_candidate = fwd.retry_policy.as_ref().is_some_and(|policy| {
+                    policy.hedge_on_per_try_timeout
+                        && hedge_safe_method(&head.method)
+                        && hedged_response.is_none()
+                        // A hedge is a replay, so it must be subject to the
+                        // exact same trigger, attempt-budget, and buffered-
+                        // body checks as an ordinary retry.  In particular,
+                        // do not spawn an original-attempt task for a body
+                        // `RetryState` has already declared unreplayable.
+                        && retry_state.as_ref().is_some_and(|state| {
+                            state.should_retry(&AttemptOutcome::PerTryTimeout)
+                        })
+                });
+                let mut response_already_guarded = false;
+                let attempt_result = if let Some(hedge) = hedged_response.as_mut() {
+                    // The original request was still alive when the previous
+                    // iteration dispatched this replay.  Both sends are now
+                    // in flight, and the first response head wins.  A
+                    // transport error is *not* a response head, though: the
+                    // other live attempt is still allowed to produce one.
+                    // Dropping `hedged_response` immediately below aborts
+                    // whichever response is still the loser.
+                    let result = tokio::select! {
+                        first = &mut hedge.receiver => {
+                            response_already_guarded = true;
+                            match first.expect("hedged attempt task must outlive its receiver") {
+                                Ok(response) => Ok(response),
+                                // Envoy discards an error from the timed-out
+                                // attempt while the hedge is live.  Let the
+                                // newly-issued attempt decide this race
+                                // instead of turning a recoverable original
+                                // reset into an immediate downstream 502.
+                                Err(_) => {
+                                    response_already_guarded = false;
+                                    (&mut send).await
+                                }
+                            }
+                        }
+                        second = &mut send => match second {
+                            Ok(response) => Ok(response),
+                            Err(second_error) => {
+                                // Symmetrically, a failed hedge must not
+                                // cancel an original that can still return a
+                                // response head.  If both fail, preserve the
+                                // hedge error so the normal retry/error path
+                                // below remains responsible for it.
+                                response_already_guarded = true;
+                                match (&mut hedge.receiver)
+                                    .await
+                                    .expect("hedged attempt task must outlive its receiver")
+                                {
+                                    Ok(response) => Ok(response),
+                                    Err(_) => Err(second_error),
+                                }
+                            }
+                        },
+                    };
+                    hedged_response = None;
+                    result
+                } else if hedge_candidate {
+                    // `timeout(send)` would drop `send` at expiry, which is
+                    // exactly right for a retry but the opposite of a hedge.
+                    // Drive it in a local task instead; the receiver lets us
+                    // race its headers against the timer without cancelling
+                    // the original socket/stream.  The task also owns this
+                    // attempt's request guard, so its S5 slot remains held
+                    // until either it loses the race or its response body is
+                    // finally dropped.
+                    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+                    // Keep `rq_guard` itself in this loop frame.  Moving the
+                    // guard value (rather than its `Option` wrapper) makes
+                    // the later normal-response path structurally safe: it
+                    // can only take a guard that still belongs to this
+                    // attempt.
+                    let original_guard = rq_guard.take().expect("hedge owns this attempt guard");
+                    let task = tokio::task::spawn_local(async move {
+                        let result = send.await.map(|mut response| {
+                            response.body =
+                                local_boxed(GuardedBody::new(response.body, original_guard));
+                            response
+                        });
+                        let _ = sender.send(result);
+                    });
+                    let d = per_try_timeout.expect("hedging requires per_try_timeout");
+                    // `tokio::time::timeout(receiver)` would consume the
+                    // receiver on expiry, preventing the next loop
+                    // iteration from racing the still-live original request
+                    // against its hedge.  Select by mutable borrow instead.
+                    let first_response = tokio::select! {
+                        result = &mut receiver => Some(result),
+                        _ = tokio::time::sleep(d) => None,
+                    };
+                    match first_response {
+                        Some(result) => {
+                            response_already_guarded = true;
+                            result.expect("hedged attempt task must outlive its receiver")
+                        }
+                        None => {
                             self.stats.record_attempt_duration_since(
                                 attempt_cluster,
                                 attempt_dispatched_at,
@@ -1317,16 +1445,21 @@ impl RouterHandler {
                                     addr: host.address,
                                     start: attempt_started_system,
                                     status: SpanStatus::Error,
-                                    outcome: "per_try_timeout",
+                                    outcome: "per_try_timeout_hedged",
                                     extra_attributes: Vec::new(),
                                 },
                             );
                             if let Some(state) = &mut retry_state {
                                 if state.should_retry(&outcome) {
-                                    sleep_backoff_and_record(state).await;
+                                    // A hedge is a retry that starts NOW, so
+                                    // consume its one normal retry budget but
+                                    // deliberately skip S3.3 backoff.
+                                    state.record_attempt();
+                                    hedged_response = Some(HedgedResponse { receiver, task });
                                     continue;
                                 }
                             }
+                            task.abort();
                             tracing::debug!(
                                 response_flag = "UT",
                                 cluster = %attempt_cluster,
@@ -1341,8 +1474,56 @@ impl RouterHandler {
                                 "upstream request timeout",
                             );
                         }
-                    },
-                    None => send.await,
+                    }
+                } else {
+                    match per_try_timeout {
+                        Some(d) => match tokio::time::timeout(d, send).await {
+                            Ok(result) => result,
+                            Err(_elapsed) => {
+                                self.stats.record_attempt_duration_since(
+                                    attempt_cluster,
+                                    attempt_dispatched_at,
+                                );
+                                let outcome = AttemptOutcome::PerTryTimeout;
+                                report_outlier(attempt_entry, host.address, &outcome);
+                                self.emit_client_span(
+                                    attempt_trace,
+                                    ClientSpanOutcome {
+                                        cluster: attempt_cluster,
+                                        addr: host.address,
+                                        start: attempt_started_system,
+                                        status: SpanStatus::Error,
+                                        outcome: "per_try_timeout",
+                                        extra_attributes: Vec::new(),
+                                    },
+                                );
+                                if let Some(state) = &mut retry_state {
+                                    if state.should_retry(&outcome) {
+                                        sleep_backoff_and_record(state).await;
+                                        continue;
+                                    }
+                                }
+                                tracing::debug!(
+                                    response_flag = "UT",
+                                    cluster = %attempt_cluster,
+                                    timeout_ms = d.as_millis(),
+                                    "upstream per-try timeout waiting for response headers"
+                                );
+                                dcb.stream_info()
+                                    .set_response_flag(ResponseFlag::UpstreamRequestTimeout);
+                                record_retry_limit_exceeded_if_applicable(
+                                    &retry_state,
+                                    &outcome,
+                                    dcb,
+                                );
+                                return local_reply(
+                                    StatusCode::GATEWAY_TIMEOUT,
+                                    "upstream request timeout",
+                                );
+                            }
+                        },
+                        None => send.await,
+                    }
                 };
 
                 match attempt_result {
@@ -1402,7 +1583,14 @@ impl RouterHandler {
                         // last response frame is produced or the body is
                         // dropped, whichever comes first -- not just until
                         // headers arrive.
-                        resp.body = local_boxed(GuardedBody::new(resp.body, rq_guard));
+                        if !response_already_guarded {
+                            resp.body = local_boxed(GuardedBody::new(
+                                resp.body,
+                                rq_guard
+                                    .take()
+                                    .expect("normal response owns this attempt guard"),
+                            ));
+                        }
                         return resp;
                     }
                     Err(err) => {
@@ -3379,6 +3567,7 @@ mod tests {
             retry_on: proxy_config::ir::RetryOn::parse("refused-stream"),
             num_retries: 1,
             per_try_timeout: None,
+            hedge_on_per_try_timeout: false,
             retriable_status_codes: Vec::new(),
             retry_back_off: proxy_config::ir::RetryBackOff {
                 base_interval: Duration::from_millis(1),

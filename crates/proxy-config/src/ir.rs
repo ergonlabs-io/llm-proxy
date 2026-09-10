@@ -1373,6 +1373,12 @@ pub struct RetryPolicyIR {
     pub retry_on: RetryOn,
     pub num_retries: u32,
     pub per_try_timeout: Option<Duration>,
+    /// S3 hedging: when a safe request has not produced response headers by
+    /// `per_try_timeout`, leave that attempt running and issue one replay.
+    /// The router returns whichever response head arrives first.  This is
+    /// deliberately attached to the retry policy because a hedge spends the
+    /// same attempt budget and has no meaning without one.
+    pub hedge_on_per_try_timeout: bool,
     pub retriable_status_codes: Vec<u16>,
     /// S3.3 fully-jittered exponential backoff parameters.
     pub retry_back_off: RetryBackOff,

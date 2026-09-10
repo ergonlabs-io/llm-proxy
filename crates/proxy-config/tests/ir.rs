@@ -300,6 +300,81 @@ fn retry_policy_defaults_and_parsing() {
     assert_eq!(rp.host_selection_retry_max_attempts, 1);
 }
 
+/// WP-14 hedging is opt-in and deliberately narrow: it only uses the existing
+/// per-try timeout/retry budget rather than accepting an independent retry
+/// mechanism that the router could not account for.
+#[test]
+fn hedge_on_per_try_timeout_lowers_into_the_retry_policy() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx"
+                              num_retries: 1
+                              per_try_timeout: 0.050s
+                            hedge_policy:
+                              hedge_on_per_try_timeout: true
+"#,
+    );
+    let table = route_table(&snapshot);
+    let RouteActionIR::Forward(f) = &table.virtual_hosts[0].routes[0].action else {
+        panic!("expected forward");
+    };
+    let policy = f.retry_policy.as_ref().expect("retry policy");
+    assert!(policy.hedge_on_per_try_timeout);
+    assert_eq!(policy.per_try_timeout, Some(Duration::from_millis(50)));
+}
+
+#[test]
+fn hedge_on_per_try_timeout_requires_a_retriable_per_try_policy() {
+    let err = hcm_snapshot_err(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            hedge_policy:
+                              hedge_on_per_try_timeout: true
+"#,
+    );
+    let message = err.to_string();
+    assert!(message.contains("hedge_policy.hedge_on_per_try_timeout"));
+    assert!(message.contains("retry_policy"));
+}
+
+#[test]
+fn unsupported_multi_initial_request_hedging_is_rejected() {
+    let err = hcm_snapshot_err(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx"
+                              per_try_timeout: 0.050s
+                            hedge_policy:
+                              initial_requests: 2
+                              hedge_on_per_try_timeout: true
+"#,
+    );
+    let message = err.to_string();
+    assert!(message.contains("hedge_policy.initial_requests"));
+    assert!(message.contains("default of 1"));
+}
+
 /// S3.3: an explicit `retry_back_off` with only `base_interval` set derives
 /// `max_interval` as 10x the base.
 #[test]
