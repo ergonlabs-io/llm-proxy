@@ -68,7 +68,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use proxy_observability::access_log::LlmTokens;
@@ -538,6 +538,90 @@ pub struct GenAiTokenStats {
     warned_unknown_providers: Mutex<HashSet<String>>,
 }
 
+/// Upper bound for each GenAI latency histogram's model-labelled series.
+/// `requested_model` is body-derived but still supplied by callers, unlike a
+/// cluster name from this process's configuration. Once the ceiling is hit,
+/// new model values fold into one visible overflow series instead of growing
+/// the registry without bound.
+pub const GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING: usize = 1_000;
+pub const GEN_AI_LATENCY_MODEL_CARDINALITY_OVERFLOW: &str = "-cardinality-overflow-";
+
+/// Records OTel GenAI latency histograms at stream completion. Unlike token
+/// usage, model labels cannot be resolved at boot: the model is extracted
+/// from each request body by the body-rewrite filter. `resolve_histogram_capped`
+/// is therefore intentionally the only request-path resolution involved.
+pub struct GenAiLatencyStats {
+    registry: Arc<Registry>,
+    worker: WorkerId,
+}
+
+impl GenAiLatencyStats {
+    pub fn new(registry: Arc<Registry>, worker: WorkerId) -> Self {
+        Self { registry, worker }
+    }
+
+    /// Records the semconv-v1.27 TTFT histogram whenever the response
+    /// successfully reached a first body byte. Records TPOT only when the
+    /// provider reported at least two output tokens and the total duration is
+    /// no shorter than TTFT: semconv defines it as time *after the first
+    /// token*, divided by output tokens after that first token.
+    pub fn record(
+        &self,
+        operation: &str,
+        model: &str,
+        system: &str,
+        time_to_first_body_byte: Option<Duration>,
+        stream_duration: Duration,
+        output_tokens: Option<u64>,
+    ) {
+        let attrs = [
+            ("gen_ai.operation.name", operation),
+            ("gen_ai.request.model", model),
+            ("gen_ai.system", system),
+        ];
+        let overflow_attrs = [
+            ("gen_ai.operation.name", operation),
+            (
+                "gen_ai.request.model",
+                GEN_AI_LATENCY_MODEL_CARDINALITY_OVERFLOW,
+            ),
+            ("gen_ai.system", system),
+        ];
+
+        if let Some(ttft) = time_to_first_body_byte {
+            let handle = self.registry.resolve_histogram_capped(
+                &instruments::GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
+                &attrs,
+                GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
+                &overflow_attrs,
+            );
+            self.registry
+                .observe(self.worker, handle, ttft.as_secs_f64());
+        }
+
+        let Some(output_tokens) = output_tokens.filter(|&n| n >= 2) else {
+            return;
+        };
+        let Some(ttft) = time_to_first_body_byte else {
+            return;
+        };
+        let Some(after_first) = stream_duration.checked_sub(ttft) else {
+            return;
+        };
+        let handle = self.registry.resolve_histogram_capped(
+            &instruments::GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN,
+            &attrs,
+            GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
+            &overflow_attrs,
+        );
+        self.registry.observe(
+            self.worker,
+            handle,
+            after_first.as_secs_f64() / (output_tokens - 1) as f64,
+        );
+    }
+}
+
 impl GenAiTokenStats {
     pub fn new(
         registry: Arc<Registry>,
@@ -653,6 +737,73 @@ impl GenAiTokenStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn latency_histogram(
+        registry: &Registry,
+        name: &str,
+    ) -> (
+        HistogramHandle,
+        proxy_observability::stats::HistogramSnapshot,
+    ) {
+        let (handle, _, _) = registry
+            .histograms()
+            .find(|(_, instrument, _)| instrument.name == name)
+            .unwrap_or_else(|| panic!("missing histogram {name}"));
+        let snapshot = registry.histogram_snapshot(handle);
+        (handle, snapshot)
+    }
+
+    #[test]
+    fn gen_ai_latency_records_semconv_ttft_and_tpot_with_correct_units_and_formula() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let stats = GenAiLatencyStats::new(registry.clone(), WorkerId(0));
+
+        stats.record(
+            "chat",
+            "gpt-4o",
+            "openai",
+            Some(Duration::from_millis(100)),
+            Duration::from_secs(1),
+            Some(5),
+        );
+
+        let (_, ttft) = latency_histogram(&registry, "gen_ai.server.time_to_first_token");
+        assert_eq!(ttft.count, 1);
+        assert!((ttft.sum - 0.1).abs() < f64::EPSILON, "TTFT is seconds");
+
+        let (_, tpot) = latency_histogram(&registry, "gen_ai.server.time_per_output_token");
+        assert_eq!(tpot.count, 1);
+        assert!(
+            (tpot.sum - 0.225).abs() < f64::EPSILON,
+            "(1.0 - 0.1) / (5 - 1) seconds"
+        );
+    }
+
+    #[test]
+    fn gen_ai_latency_does_not_invent_tpot_without_two_output_tokens() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let stats = GenAiLatencyStats::new(registry.clone(), WorkerId(0));
+
+        stats.record(
+            "chat",
+            "gpt-4o",
+            "openai",
+            Some(Duration::from_millis(100)),
+            Duration::from_secs(1),
+            Some(1),
+        );
+
+        let (_, ttft) = latency_histogram(&registry, "gen_ai.server.time_to_first_token");
+        assert_eq!(ttft.count, 1);
+        assert!(
+            registry
+                .histograms()
+                .all(|(_, instrument, _)| instrument.name != "gen_ai.server.time_per_output_token"),
+            "one output token leaves no post-first-token duration to report"
+        );
+    }
 
     fn control_and_handles(names: &[&str]) -> (StatsControl, Arc<StatHandles>) {
         let control = StatsControl::new(1);

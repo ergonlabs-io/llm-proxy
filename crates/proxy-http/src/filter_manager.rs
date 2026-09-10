@@ -139,7 +139,7 @@ use crate::handler::{
     StreamHandler,
 };
 use crate::route::{match_route, RouteMatch, RouteRequest};
-use crate::stat_handles::GenAiTokenStats;
+use crate::stat_handles::{GenAiLatencyStats, GenAiTokenStats};
 use crate::stream_info::StreamInfo;
 use proxy_observability::trace::{SpanSink, TraceContext};
 
@@ -435,6 +435,10 @@ pub struct FilterChainHandler {
     /// happens once, at stream end, from `access_logging::LoggingBody::finish`
     /// -- never here.
     token_stats: Option<Arc<GenAiTokenStats>>,
+    /// WP-33b: OTel GenAI TTFT/TPOT histograms. It shares LoggingBody's
+    /// stream-end hook with token accounting because both require final
+    /// usage/timing and must run even without an access logger configured.
+    latency_stats: Option<Arc<GenAiLatencyStats>>,
     /// WP-51 increment 2: this HCM's span sink + head-sampling ratio, if
     /// boot/reload wired one (`proxy-core`'s `build_hcm_handler` does so
     /// whenever `ConfigSnapshot::tracing` is `Some` -- see
@@ -480,6 +484,7 @@ impl FilterChainHandler {
             access_loggers: Rc::new(Vec::new()),
             per_route: Arc::new(PerRouteTable::default()),
             token_stats: None,
+            latency_stats: None,
             tracing: None,
         }
     }
@@ -600,6 +605,14 @@ impl FilterChainHandler {
     /// uses one layer down (`RouterFilterFactory`).
     pub fn with_token_stats(mut self, token_stats: Arc<GenAiTokenStats>) -> Self {
         self.token_stats = Some(token_stats);
+        self
+    }
+
+    /// Attaches the OTel GenAI latency recorder. A builder keeps the many
+    /// test-only constructors unchanged while real HCM builds wire it once
+    /// per worker alongside token stats.
+    pub fn with_gen_ai_latency_stats(mut self, latency_stats: Arc<GenAiLatencyStats>) -> Self {
+        self.latency_stats = Some(latency_stats);
         self
     }
 
@@ -771,6 +784,7 @@ impl StreamHandler for FilterChainHandler {
             // instruments.
             if self.access_loggers.is_empty()
                 && self.token_stats.is_none()
+                && self.latency_stats.is_none()
                 && self.tracing.is_none()
             {
                 return resp;
@@ -795,6 +809,7 @@ impl StreamHandler for FilterChainHandler {
                 response_code: resp.head.status.as_u16(),
                 downstream_remote_address,
                 token_stats: self.token_stats.clone(),
+                latency_stats: self.latency_stats.clone(),
                 span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
             };
             HttpResponseParts {
