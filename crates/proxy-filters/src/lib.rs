@@ -64,6 +64,7 @@ pub mod control_redis;
 pub mod jwt_auth;
 pub mod model_authz;
 pub mod model_authz_filter;
+pub mod pricing;
 pub mod spend;
 pub mod spend_limit_filter;
 pub mod token_limit;

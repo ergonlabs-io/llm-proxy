@@ -50,6 +50,10 @@ pub struct SimpleConfig {
     pub limits: Vec<Limit>,
     #[serde(default)]
     pub observability: Option<Observability>,
+    /// Versioned provider model rate card. The list is read once at startup;
+    /// replacing it requires a config reload.
+    #[serde(default)]
+    pub pricing: Option<Pricing>,
 }
 
 /// Deserializes `models:` into a `BTreeMap`, erroring on a literal duplicate
@@ -450,6 +454,56 @@ fn default_tracing_sample_ratio() -> f64 {
 /// the kind of thing that drifts silently).
 pub(crate) fn default_force_usage_reporting() -> bool {
     true
+}
+
+/// Strict WP-53 rate-card configuration. Exactly one source is required so a
+/// file can never silently override an inline list (or vice versa).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pricing {
+    #[serde(default)]
+    pub price_list_file: Option<String>,
+    #[serde(default)]
+    pub price_list: Option<PriceListDef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceListDef {
+    #[serde(default)]
+    pub version: Option<String>,
+    pub effective_from: String,
+    pub entries: Vec<PriceEntryDef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceEntryDef {
+    pub provider_type: String,
+    pub model: String,
+    /// Required even for a one-tier entry: a later edit adding tiers must not
+    /// change money semantics by guessing a default.
+    #[serde(default)]
+    pub tier_mode: Option<TierModeDef>,
+    pub tiers: Vec<TierDef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierDef {
+    #[serde(default)]
+    pub up_to: Option<u64>,
+    pub input_nanodollars_per_token: u64,
+    pub cached_input_nanodollars_per_token: u64,
+    pub cache_write_nanodollars_per_token: u64,
+    pub output_nanodollars_per_token: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierModeDef {
+    WholeRequest,
+    Graduated,
 }
 
 #[derive(Debug, Deserialize)]

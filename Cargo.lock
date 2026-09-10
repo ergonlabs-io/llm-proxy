@@ -1804,6 +1804,7 @@ name = "proxy-simple-config"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "chrono",
  "http",
  "http-body-util",
  "proxy-cluster",
