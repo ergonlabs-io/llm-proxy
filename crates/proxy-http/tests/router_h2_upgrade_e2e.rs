@@ -135,6 +135,7 @@ async fn build_router(
                 matcher: prefix_matcher("/"),
                 action: RouteActionIR::Forward(forward_to_up()),
                 request_headers_to_add: Vec::new(),
+                streaming_strict: false,
                 typed_per_filter_config: BTreeMap::new(),
                 route_index: 0,
                 include_request_attempt_count: false,

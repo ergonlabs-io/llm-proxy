@@ -207,6 +207,7 @@ async fn build_router(scenario: Scenario, access_logs: &[AccessLogIR]) -> Filter
                 matcher: scenario.route_matcher,
                 action: RouteActionIR::Forward(scenario.fwd),
                 request_headers_to_add: Vec::new(),
+                streaming_strict: false,
                 typed_per_filter_config: BTreeMap::new(),
                 route_index: 0,
                 include_request_attempt_count: false,

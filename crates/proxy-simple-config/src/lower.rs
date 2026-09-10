@@ -934,6 +934,14 @@ fn lower_route(
 
     let mut route = json!({ "match": r#match, "route": action });
 
+    if matches!(rule.streaming, Some(crate::model::StreamingMode::Strict)) {
+        route["metadata"] = json!({
+            "filter_metadata": {
+                "io.llmproxy.streaming": { "strict": true }
+            }
+        });
+    }
+
     // Token accounting follows the ROUTE's provider, not the listener's: one
     // listener serves `gpt-*` from OpenAI and `claude-*` from Anthropic, and a
     // single listener-level dialect would be wrong for whichever one it isn't.

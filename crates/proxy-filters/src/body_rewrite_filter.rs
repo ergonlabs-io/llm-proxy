@@ -202,6 +202,10 @@ impl HttpFilterFactory for BodyRewriteFilterFactory {
         TYPE_URL
     }
 
+    fn may_buffer_response(&self) -> bool {
+        false
+    }
+
     fn create(
         &self,
         config: &DynamicMessage,

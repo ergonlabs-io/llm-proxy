@@ -2444,6 +2444,7 @@ fn route_table_two_routes() -> Arc<RouteTable> {
                 prefix_rewrite: None,
             }),
             request_headers_to_add: Vec::new(),
+            streaming_strict: false,
             typed_per_filter_config: BTreeMap::new(),
             route_index: 0,
             include_request_attempt_count: false,
@@ -2685,6 +2686,10 @@ impl HttpFilterFactory for TagFactory {
         "type.llmproxy.dev/test.TagFilter"
     }
 
+    fn may_buffer_response(&self) -> bool {
+        false
+    }
+
     fn create(
         &self,
         _config: &prost_reflect::DynamicMessage,
@@ -2781,6 +2786,7 @@ fn route_table_with_all_levels(
             prefix_rewrite: None,
         }),
         request_headers_to_add: Vec::new(),
+        streaming_strict: false,
         typed_per_filter_config: route_overrides,
         route_index: 0,
         include_request_attempt_count: false,
@@ -2799,6 +2805,91 @@ fn route_table_with_all_levels(
         )
         .expect("single catch-all route is valid"),
     )
+}
+
+/// A single strict route, intentionally with no per-filter overrides: the
+/// streaming assertion is a property of the route and every configured
+/// factory, not a filter-specific override.
+fn strict_route_table() -> Arc<RouteTable> {
+    let route = Arc::new(RouteEntry {
+        name: Some("strict-route".to_string()),
+        matcher: RouteMatcher {
+            path: PathMatch::Prefix("/".to_string()),
+            case_sensitive: true,
+            headers: Vec::new(),
+        },
+        action: RouteActionIR::Forward(ForwardAction {
+            target: ForwardTarget::Cluster("cluster-a".to_string()),
+            timeout: None,
+            idle_timeout: None,
+            retry_policy: None,
+            host_rewrite_literal: None,
+            prefix_rewrite: None,
+        }),
+        request_headers_to_add: Vec::new(),
+        streaming_strict: true,
+        typed_per_filter_config: BTreeMap::new(),
+        route_index: 0,
+        include_request_attempt_count: false,
+        include_attempt_count_in_response: false,
+    });
+    Arc::new(
+        RouteTable::new(
+            "test-routes".to_string(),
+            vec![VirtualHostIR {
+                name: "vh".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![route],
+                typed_per_filter_config: BTreeMap::new(),
+            }],
+            BTreeMap::new(),
+        )
+        .expect("a single catch-all strict route is valid"),
+    )
+}
+
+/// A newly-written factory that does not state an encode capability. The
+/// trait default must treat it as potentially buffering, otherwise strict
+/// routes would silently become weaker when a new filter is introduced.
+struct UnspecifiedResponseCapabilityFactory;
+
+impl HttpFilterFactory for UnspecifiedResponseCapabilityFactory {
+    fn type_url(&self) -> &'static str {
+        "type.llmproxy.dev/test.UnspecifiedResponseCapability"
+    }
+
+    fn create(
+        &self,
+        _config: &prost_reflect::DynamicMessage,
+        _ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        panic!("factory creation is not exercised by static strict-streaming validation")
+    }
+}
+
+#[test]
+fn strict_streaming_rejects_a_filter_without_flush_through_capability() {
+    let names = vec!["new-filter".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> =
+        vec![Arc::new(UnspecifiedResponseCapabilityFactory)];
+    let err = build_per_route_table(&names, &factories, &strict_route_table())
+        .expect_err("a strict route must reject a filter that may buffer responses");
+    match err {
+        ConfigError::Validation { field_path, rule } => {
+            assert!(field_path.contains("io.llmproxy.streaming"), "{field_path}");
+            assert!(rule.contains("new-filter"), "{rule}");
+            assert!(rule.contains("can buffer response bytes"), "{rule}");
+        }
+        other => panic!("expected strict-streaming validation error, got {other:?}"),
+    }
+}
+
+#[test]
+fn strict_streaming_accepts_an_explicit_flush_through_filter() {
+    let names = vec!["flush-through".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(TagFactory)];
+    build_per_route_table(&names, &factories, &strict_route_table())
+        .expect("a filter that explicitly never buffers responses is strict-safe");
 }
 
 /// Like [`run_chain_req_with_route_table`], but also attaches a resolved
@@ -3175,6 +3266,7 @@ fn route_table_two_routes_with_tags() -> (
                 prefix_rewrite: None,
             }),
             request_headers_to_add: Vec::new(),
+            streaming_strict: false,
             typed_per_filter_config: overrides,
             route_index: 0,
             include_request_attempt_count: false,

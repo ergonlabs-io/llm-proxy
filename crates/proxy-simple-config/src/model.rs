@@ -355,6 +355,16 @@ pub struct RouteRule {
     pub retries: Option<Retries>,
     #[serde(default)]
     pub idle_timeout: Option<SimpleDuration>,
+    /// Require every filter serving this route to flush response bytes through.
+    #[serde(default)]
+    pub streaming: Option<StreamingMode>,
+}
+
+/// The v0 dialect's route-level streaming assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StreamingMode {
+    Strict,
 }
 
 #[derive(Debug, Deserialize)]

@@ -349,6 +349,10 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         TYPE_URL
     }
 
+    fn may_buffer_response(&self) -> bool {
+        false
+    }
+
     fn create(
         &self,
         config: &DynamicMessage,
@@ -1139,6 +1143,7 @@ mod tests {
                 body: None,
             },
             request_headers_to_add: vec![],
+            streaming_strict: false,
             typed_per_filter_config: Default::default(),
             route_index: 0,
             include_request_attempt_count: false,
