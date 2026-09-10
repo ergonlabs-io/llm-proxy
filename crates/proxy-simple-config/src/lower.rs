@@ -91,8 +91,7 @@ const TOKEN_LIMIT_FILTER_NAME: &str = "llmproxy.token_limit";
 /// Must equal `proxy_filters::token_limit_filter::TYPE_URL`. Duplicated for
 /// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
 /// `dialect.rs`'s IR-survival test pins the two together the same way.
-const TOKEN_LIMIT_FILTER_TYPE_URL: &str =
-    "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
+const TOKEN_LIMIT_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
 
 /// The only `LimitKey` the thin-slice token limiter enforces: its bucket key
 /// is hardcoded to the `authorization` header (see `token_limit_filter`'s

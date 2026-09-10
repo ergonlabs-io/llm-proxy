@@ -160,9 +160,7 @@ outcome than a visible failure
 ## Bootstrap configuration
 
 The underlying filter is `llmproxy.token_limit`
-(`type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings` — a config
-message borrowed for its shape, not its original Envoy purpose; see the
-filter's own module doc for why). It must be placed **after**
+(`type.llmproxy.dev/llmproxy.filters.v0.TokenLimit`). It must be placed **after**
 `llmproxy.auth` in `http_filters`, for the same reason `auth:` must exist for
 this endpoint to authenticate anyone: decode-path callbacks run in config
 order, and the limiter reads `auth.tenant` on decode.
@@ -181,7 +179,7 @@ http_filters:
           revoked: false
   - name: llmproxy.token_limit
     typed_config:
-      "@type": type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings
+      "@type": type.llmproxy.dev/llmproxy.filters.v0.TokenLimit
       max_tokens: 100000
       fill_rate: 1666.6666666666667
   - name: envoy.filters.http.router
@@ -193,6 +191,10 @@ http_filters:
 window as `max_tokens / fill_rate` seconds, so a 100,000-token,
 60-second window needs `fill_rate = 100000 / 60`
 (`crates/proxy-filters/src/token_limit_filter.rs`'s `parse_config`).
+For one release, hand-written bootstraps using the former borrowed
+`type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings` type still load
+with the same semantics but emit a deprecation warning; migrate them to
+`TokenLimit` now. The dialect always emits the owned type.
 `crates/proxy-config/src/lower.rs`'s `check_lane_h_filter_order` rejects the
 wrong filter order at load time — this is a hand-written bootstrap's own
 responsibility; the dialect above always emits the correct order.

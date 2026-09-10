@@ -90,6 +90,13 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::token_limit_filter::TokenLimitFilterFactory,
         ));
+        // WP-47 migration compatibility: hand-written bootstraps using the
+        // borrowed Envoy RateLimitSettings continue to load for one release.
+        // Its factory emits a deprecation warning and has the same runtime
+        // semantics as the owned TokenLimit message above.
+        registry.register(Arc::new(
+            proxy_filters::token_limit_filter::LegacyTokenLimitFilterFactory,
+        ));
         // WP-50 increment 2a (Lane H): downstream authentication. Must be
         // configured BEFORE `llmproxy.token_limit` in any listener's
         // `http_filters` list -- decode callbacks run in FORWARD config order
@@ -4655,7 +4662,7 @@ static_resources:
                 http_filters:
                   - name: llmproxy.token_limit
                     typed_config:
-                      "@type": type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings
+                      "@type": type.llmproxy.dev/llmproxy.filters.v0.TokenLimit
                       max_tokens: 100
                       fill_rate: 0.001
                   - name: llmproxy.usage

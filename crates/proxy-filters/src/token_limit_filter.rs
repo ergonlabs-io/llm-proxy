@@ -62,33 +62,19 @@
 //! `continue_decoding()`, per `token_limit`'s "Making this distributed"
 //! section) only has one call site to change.
 //!
-//! # Config: a thin slice, `envoy.config.core.v3.RateLimitSettings`
+//! # Config: `llmproxy.filters.v0.TokenLimit`
 //!
-//! `envoy.type.v3.TokenBucket` (`max_tokens` + `fill_interval`) would have
-//! been the obvious proto to reuse here, and was tried first — but it is
-//! vendored without ever being compiled into `proxy-api`'s descriptor pool
-//! (`proxy-api/build.rs`'s `roots` only pull in what bootstrap/HCM/router/
-//! tcp_proxy/tls/access-log config transitively imports, and none of those
-//! reach `envoy/type/v3/token_bucket.proto`); see
-//! `tests::rate_limit_settings_resolves_in_the_descriptor_pool` for the check
-//! that would have caught reusing an unresolvable message. `DataSource`,
-//! `RuntimeFeatureFlag`, and `HeaderValueOption` were already taken by other
-//! filters under `type.llmproxy.dev/` (`FilterRegistry::register` asserts on
-//! a duplicate `type_url`), so the fallback is `envoy.config.core.v3.RateLimitSettings`
-//! (from `config_source.proto`, reachable via the ADS/xDS roots) — itself a
-//! genuine token-bucket-shaped rate-limit config, just for a different
-//! Envoy feature (adaptive concurrency of xDS discovery requests) than the
-//! one this filter implements: `max_tokens` (`google.protobuf.UInt32Value`,
-//! required here) maps onto [`crate::token_limit::LimitRule::max_tokens`]
-//! directly, and `fill_rate` (`google.protobuf.DoubleValue`, tokens per
-//! second, required here) is converted into
-//! [`crate::token_limit::LimitRule::window`] as `max_tokens / fill_rate`
-//! seconds — "how long, at the configured refill rate, it takes to earn back
-//! the whole bucket" is exactly this limiter's fixed-window length. This is
-//! a genuine unit conversion, not a coincidence of field names, and it is
-//! the one place in this filter where the config-reuse convention other
-//! filters established (matching *shape*, not necessarily *meaning*) is worth
-//! calling out explicitly as slightly stretched.
+//! WP-47 gives the limiter an owned, versioned config message.  Its required
+//! `max_tokens` and `fill_rate` fields map directly onto this filter's fixed
+//! window semantics; `fill_rate` is tokens per second and the window is
+//! `max_tokens / fill_rate` seconds.  Unlike the retired
+//! `envoy.config.core.v3.RateLimitSettings` stand-in, the type URL tells an
+//! operator what it configures instead of describing xDS discovery throttling.
+//!
+//! The borrowed Envoy type remains accepted for one release as
+//! [`LEGACY_TYPE_URL`]. It uses a separate factory so the registry can decode
+//! its wrapped fields exactly, emits a deprecation warning, and cannot become
+//! the default accidentally. New configuration must use [`TYPE_URL`].
 //!
 //! This increment does not expose per-descriptor configurability:
 //! [`crate::token_limit::LimitOn::Total`] is hardcoded, and the bucket key is
@@ -208,17 +194,65 @@ use crate::token_limit::{
 };
 use crate::usage::TokenUsage;
 
-/// Type URL this filter is registered under (see the module doc for why
-/// `RateLimitSettings`, not `TokenBucket`).
-pub const TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
+/// Canonical owned type URL for this filter.
+pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
 
-/// Read `max_tokens`/`fill_rate` out of a `RateLimitSettings`-shaped
-/// `typed_config` and convert them into a [`LimitRule`] (see the module
-/// doc's "Config" section for the `fill_rate` -> `window` conversion). Both
-/// fields are required here even though neither is `required` on the proto
-/// itself (Envoy defaults them for its own discovery-throttling use; this
-/// filter has no analogous default to fall back to). `on` is always
-/// [`LimitOn::Total`] in this increment.
+/// Borrowed type URL accepted for one release after the WP-47 migration.
+pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
+
+/// Convert validated scalar budget values into the one-rule thin slice.
+///
+/// The legacy Envoy stand-in nests values in wrappers while `TokenLimit`
+/// owns scalars directly, so callers provide the exact paths their operators
+/// wrote. Compatibility must not make a useful legacy error point at a field
+/// that did not exist in that config shape.
+fn parse_rule(
+    max_tokens: u64,
+    fill_rate: f64,
+    max_tokens_path: &str,
+    fill_rate_path: &str,
+) -> Result<LimitRule, ConfigError> {
+    let invalid = |field_path: &str, reason: String| ConfigError::InvalidValue {
+        field_path: field_path.to_string(),
+        reason,
+    };
+    if max_tokens == 0 {
+        return Err(invalid(
+            max_tokens_path,
+            "must be greater than 0".to_string(),
+        ));
+    }
+    if !(fill_rate.is_finite() && fill_rate > 0.0) {
+        return Err(invalid(
+            fill_rate_path,
+            format!("must be a finite number greater than 0, got `{fill_rate}`"),
+        ));
+    }
+
+    let window_secs = (max_tokens as f64 / fill_rate).round();
+    let window = if window_secs.is_sign_negative() {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(window_secs as u64)
+    };
+    if window.is_zero() {
+        return Err(invalid(
+            fill_rate_path,
+            "implies a fill window of zero seconds (max_tokens / fill_rate rounds to 0); \
+             lower `fill_rate` or raise `max_tokens`"
+                .to_string(),
+        ));
+    }
+
+    Ok(LimitRule {
+        on: LimitOn::Total,
+        max_tokens,
+        window,
+    })
+}
+
+/// Read the owned `TokenLimit` message. `optional` fields preserve presence,
+/// so omitted and explicitly-invalid values report distinct, exact paths.
 fn parse_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError> {
     let invalid = |field_path: &str, reason: String| ConfigError::InvalidValue {
         field_path: field_path.to_string(),
@@ -233,15 +267,8 @@ fn parse_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError> {
     }
     let max_tokens = config
         .get_field_by_name("max_tokens")
-        .and_then(|v| v.as_message().cloned())
-        .and_then(|m| m.get_field_by_name("value").and_then(|v| v.as_u32()))
+        .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    if max_tokens == 0 {
-        return Err(invalid(
-            "typed_config.max_tokens.value",
-            "must be greater than 0".to_string(),
-        ));
-    }
 
     if !config.has_field_by_name("fill_rate") {
         return Err(invalid(
@@ -251,46 +278,60 @@ fn parse_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError> {
     }
     let fill_rate = config
         .get_field_by_name("fill_rate")
-        .and_then(|v| v.as_message().cloned())
-        .and_then(|m| m.get_field_by_name("value").and_then(|v| v.as_f64()));
+        .and_then(|v| v.as_f64());
     let Some(fill_rate) = fill_rate else {
         return Err(invalid(
-            "typed_config.fill_rate.value",
+            "typed_config.fill_rate",
             "must be a valid double".to_string(),
         ));
     };
-    if !(fill_rate.is_finite() && fill_rate > 0.0) {
-        return Err(invalid(
-            "typed_config.fill_rate.value",
-            format!("must be a finite number greater than 0, got `{fill_rate}`"),
-        ));
-    }
+    parse_rule(
+        max_tokens,
+        fill_rate,
+        "typed_config.max_tokens",
+        "typed_config.fill_rate",
+    )
+}
 
-    // "How long, at this refill rate, it takes to earn back the whole
-    // bucket" -- see the module doc. `f64 as u64` saturates rather than
-    // panicking/wrapping (same convention as `token_limit::record`'s own
-    // weighted-token arithmetic), so a pathological `fill_rate` clamps to a
-    // very long window instead of misbehaving.
-    let window_secs = (max_tokens as f64 / fill_rate).round();
-    let window = if window_secs.is_sign_negative() {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(window_secs as u64)
+/// Decode the borrowed one-release compatibility message.
+fn parse_legacy_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError> {
+    let invalid = |field_path: &str, reason: String| ConfigError::InvalidValue {
+        field_path: field_path.to_string(),
+        reason,
     };
-    if window.is_zero() {
+    if !config.has_field_by_name("max_tokens") {
         return Err(invalid(
-            "typed_config.fill_rate.value",
-            "implies a fill window of zero seconds (max_tokens / fill_rate rounds to 0); \
-             lower `fill_rate` or raise `max_tokens`"
-                .to_string(),
+            "typed_config.max_tokens",
+            "the `max_tokens` field is required".to_string(),
         ));
     }
-
-    Ok(LimitRule {
-        on: LimitOn::Total,
-        max_tokens: max_tokens as u64,
-        window,
-    })
+    let max_tokens = config
+        .get_field_by_name("max_tokens")
+        .and_then(|v| v.as_message().cloned())
+        .and_then(|m| m.get_field_by_name("value").and_then(|v| v.as_u32()))
+        .unwrap_or(0);
+    if !config.has_field_by_name("fill_rate") {
+        return Err(invalid(
+            "typed_config.fill_rate",
+            "the `fill_rate` field is required".to_string(),
+        ));
+    }
+    let fill_rate = config
+        .get_field_by_name("fill_rate")
+        .and_then(|v| v.as_message().cloned())
+        .and_then(|m| m.get_field_by_name("value").and_then(|v| v.as_f64()))
+        .ok_or_else(|| {
+            invalid(
+                "typed_config.fill_rate.value",
+                "must be a valid double".to_string(),
+            )
+        })?;
+    parse_rule(
+        u64::from(max_tokens),
+        fill_rate,
+        "typed_config.max_tokens.value",
+        "typed_config.fill_rate.value",
+    )
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override —
@@ -313,76 +354,116 @@ impl HttpFilterFactory for TokenLimitFilterFactory {
         config: &DynamicMessage,
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let rule = parse_config(config)?;
-
-        // One store (and one `UsageMissingWarner`) per (filter config,
-        // listener) -- exactly the lifetime the budget needs: it must
-        // outlive any single stream (that's the whole point of a *budget*),
-        // but a fresh listener config gets a fresh one. The HTTP filter
-        // chain is rebuilt once PER WORKER (ADR-0003; `build_hcm_handler` in
-        // `proxy-core`), and `create` runs once per worker for the same
-        // chain -- so a bare `Arc::new` here (the pre-follow-up shape) built
-        // a FRESH, unshared store on every worker, and a configured
-        // 1000-tokens/minute budget admitted roughly `1000 * worker_count`
-        // per minute: a real quota bypass, not a theoretical one.
-        //
-        // The fix is `SharedFactoryState` (`ctx.shared`, from `proxy-http`):
-        // every worker building THIS SAME CHAIN resolves the SAME slot and
-        // gets back the SAME `Arc<SharedTokenLimitState>`, so the budget is
-        // actually shared process-wide -- see `auth_filter::create`'s
-        // `ControlPlane` resolution for the identical pattern.
-        //
-        // This filter uses the UNDERLYING form (`ctx.shared.get_or_try_init`
-        // with a scope built here) rather than `ctx.get_or_try_init` (which
-        // would use `ctx.scope` alone), because `ctx.scope` names a whole
-        // CHAIN, not a filter instance within it: two `llmproxy.token_limit`
-        // filters with DIFFERENT rules in the SAME chain are expressible
-        // config, and keying on `ctx.scope` alone would let the second one's
-        // `create` silently find the first one's slot already filled and
-        // inherit ITS rule and ITS budget -- the same bug class this whole
-        // change fixes, one level down. So the scope is `ctx.scope` plus a
-        // deterministic rendering of every `LimitRule` field that changes
-        // the budget's MEANING (`on`, `max_tokens`, `window` -- all three; a
-        // rendering that dropped one would let two differently-configured
-        // limiters collide on that field). This gives exactly the property
-        // needed: identical across workers (same chain, same parsed config
-        // -> same string -> one shared store) and distinct for a different
-        // rule (two limiters in one chain don't collide). `{:?}` on
-        // `Duration`/`LimitOn` is stable enough for a same-process string
-        // key (this is not a wire format, unlike `hash_credential`, which
-        // has to survive a different toolchain on the other end).
-        let scope = format!(
-            "{}::token_limit(on={:?},max_tokens={},window={:?})",
-            ctx.scope, rule.on, rule.max_tokens, rule.window
-        );
-
-        // WP-50 3c-ii-a: `ctx.stat_prefix` is passed through unchanged here so
-        // the call compiles against the new two-identity signature; nothing
-        // in `proxy-admin` addresses a `token_limit` singleton by name today,
-        // so the by-name index this populates is inert for this filter. If
-        // that changes, note that two `llmproxy.token_limit` filters in one
-        // chain (distinguished above by `scope`, not `ctx.stat_prefix`) would
-        // collide on the SAME `(stat_prefix, TYPE_URL)` name-index slot --
-        // the narrow uniqueness check in `proxy-config`'s lowering only
-        // covers `llmproxy.auth`, deliberately (see that check's doc).
-        let shared = ctx
-            .shared
-            .get_or_try_init(&scope, &ctx.stat_prefix, TYPE_URL, || {
-                let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new(rule));
-                let usage_missing_warner = Arc::new(UsageMissingWarner::new());
-                Ok(Arc::new(SharedTokenLimitState {
-                    store,
-                    usage_missing_warner,
-                }) as Arc<dyn std::any::Any + Send + Sync>)
-            })?
-            .downcast::<SharedTokenLimitState>()
-            .expect("token_limit singleton is always a SharedTokenLimitState");
-
-        Ok(Box::new(TokenLimitInstanceFactory {
-            store: Arc::clone(&shared.store),
-            usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
-        }))
+        create_filter_factory(parse_config(config)?, TYPE_URL, ctx)
     }
+}
+
+/// Decoder for [`LEGACY_TYPE_URL`].  It deliberately has its own registry
+/// identity: a `TokenLimit` factory cannot decode the different field wire
+/// types in Envoy's old `RateLimitSettings` message.
+#[derive(Default)]
+pub struct LegacyTokenLimitFilterFactory;
+
+impl HttpFilterFactory for LegacyTokenLimitFilterFactory {
+    fn type_url(&self) -> &'static str {
+        LEGACY_TYPE_URL
+    }
+
+    fn may_buffer_response(&self) -> bool {
+        false
+    }
+
+    fn create(
+        &self,
+        config: &DynamicMessage,
+        ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        tracing::warn!(
+            legacy_type_url = LEGACY_TYPE_URL,
+            replacement_type_url = TYPE_URL,
+            "llmproxy.token_limit uses a deprecated borrowed typed_config; migrate to llmproxy.filters.v0.TokenLimit before the next release"
+        );
+        create_filter_factory(parse_legacy_config(config)?, LEGACY_TYPE_URL, ctx)
+    }
+}
+
+/// Build the shared budget state from either supported wire representation.
+/// Both decoders converge before this point so the compatibility path cannot
+/// acquire different runtime semantics by accident.
+fn create_filter_factory(
+    rule: LimitRule,
+    config_type_url: &'static str,
+    ctx: &FactoryContext,
+) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+    // One store (and one `UsageMissingWarner`) per (filter config,
+    // listener) -- exactly the lifetime the budget needs: it must
+    // outlive any single stream (that's the whole point of a *budget*),
+    // but a fresh listener config gets a fresh one. The HTTP filter
+    // chain is rebuilt once PER WORKER (ADR-0003; `build_hcm_handler` in
+    // `proxy-core`), and `create` runs once per worker for the same
+    // chain -- so a bare `Arc::new` here (the pre-follow-up shape) built
+    // a FRESH, unshared store on every worker, and a configured
+    // 1000-tokens/minute budget admitted roughly `1000 * worker_count`
+    // per minute: a real quota bypass, not a theoretical one.
+    //
+    // The fix is `SharedFactoryState` (`ctx.shared`, from `proxy-http`):
+    // every worker building THIS SAME CHAIN resolves the SAME slot and
+    // gets back the SAME `Arc<SharedTokenLimitState>`, so the budget is
+    // actually shared process-wide -- see `auth_filter::create`'s
+    // `ControlPlane` resolution for the identical pattern.
+    //
+    // This filter uses the UNDERLYING form (`ctx.shared.get_or_try_init`
+    // with a scope built here) rather than `ctx.get_or_try_init` (which
+    // would use `ctx.scope` alone), because `ctx.scope` names a whole
+    // CHAIN, not a filter instance within it: two `llmproxy.token_limit`
+    // filters with DIFFERENT rules in the SAME chain are expressible
+    // config, and keying on `ctx.scope` alone would let the second one's
+    // `create` silently find the first one's slot already filled and
+    // inherit ITS rule and ITS budget -- the same bug class this whole
+    // change fixes, one level down. So the scope is `ctx.scope` plus a
+    // deterministic rendering of every `LimitRule` field that changes
+    // the budget's MEANING (`on`, `max_tokens`, `window` -- all three; a
+    // rendering that dropped one would let two differently-configured
+    // limiters collide on that field), plus the decoded config type URL.
+    // The latter keeps a deliberate chain that contains both the legacy
+    // and canonical one-release entries from silently sharing one store.
+    // This gives exactly the property needed: identical across workers
+    // (same chain, same parsed config -> same string -> one shared store)
+    // and distinct for a different configured filter. `{:?}` on
+    // `Duration`/`LimitOn` is stable enough for a same-process string
+    // key (this is not a wire format, unlike `hash_credential`, which
+    // has to survive a different toolchain on the other end).
+    let scope = format!(
+        "{}::token_limit(type_url={config_type_url},on={:?},max_tokens={},window={:?})",
+        ctx.scope, rule.on, rule.max_tokens, rule.window
+    );
+
+    // WP-50 3c-ii-a: `ctx.stat_prefix` is passed through unchanged here so
+    // the call compiles against the new two-identity signature; nothing
+    // in `proxy-admin` addresses a `token_limit` singleton by name today,
+    // so the by-name index this populates is inert for this filter. If
+    // that changes, note that two `llmproxy.token_limit` filters in one
+    // chain (distinguished above by `scope`, not `ctx.stat_prefix`) would
+    // collide on the SAME `(stat_prefix, TYPE_URL)` name-index slot --
+    // the narrow uniqueness check in `proxy-config`'s lowering only
+    // covers `llmproxy.auth`, deliberately (see that check's doc).
+    let shared = ctx
+        .shared
+        .get_or_try_init(&scope, &ctx.stat_prefix, config_type_url, || {
+            let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new(rule));
+            let usage_missing_warner = Arc::new(UsageMissingWarner::new());
+            Ok(Arc::new(SharedTokenLimitState {
+                store,
+                usage_missing_warner,
+            }) as Arc<dyn std::any::Any + Send + Sync>)
+        })?
+        .downcast::<SharedTokenLimitState>()
+        .expect("token_limit singleton is always a SharedTokenLimitState");
+
+    Ok(Box::new(TokenLimitInstanceFactory {
+        store: Arc::clone(&shared.store),
+        usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
+    }))
 }
 
 /// The pair of pieces that must be shared across every worker building the
@@ -906,32 +987,47 @@ mod tests {
         msg
     }
 
+    fn token_limit_desc() -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.TokenLimit")
+            .expect("TokenLimit is compiled into proxy-api")
+    }
+
+    fn token_limit(max_tokens: u64, fill_rate: f64) -> DynamicMessage {
+        let mut msg = DynamicMessage::new(token_limit_desc());
+        msg.set_field_by_name("max_tokens", prost_reflect::Value::U64(max_tokens));
+        msg.set_field_by_name("fill_rate", prost_reflect::Value::F64(fill_rate));
+        msg
+    }
+
     #[test]
-    fn rate_limit_settings_resolves_in_the_descriptor_pool() {
-        // Pins the type-URL choice: see `body_rewrite_filter`'s equivalent
-        // test for why this matters (an unresolvable message fails every
-        // bootstrap using this filter with an opaque `UnknownTypeUrl`, not
-        // here where the reason is obvious). Also see the module doc: this
-        // is the message the *first-choice* `envoy.type.v3.TokenBucket`
-        // failed this exact check for.
-        let resolved = proxy_api::descriptor_pool()
-            .get_message_by_name("envoy.config.core.v3.RateLimitSettings");
+    fn token_limit_resolves_in_the_descriptor_pool() {
+        let resolved =
+            proxy_api::descriptor_pool().get_message_by_name("llmproxy.filters.v0.TokenLimit");
         assert!(resolved.is_some(), "{TYPE_URL} must resolve");
     }
 
     #[test]
     fn config_parses_max_tokens_and_derives_window_from_fill_rate() {
         // max_tokens=60, fill_rate=1.0 token/sec -> a 60s window.
-        let rule = parse_config(&rate_limit_settings(60, 1.0)).expect("valid config");
+        let rule = parse_config(&token_limit(60, 1.0)).expect("valid config");
         assert_eq!(rule.on, TlLimitOn::Total);
         assert_eq!(rule.max_tokens, 60);
         assert_eq!(rule.window, Duration::from_secs(60));
     }
 
     #[test]
+    fn owned_config_is_not_artificially_capped_at_the_legacy_uint32_limit() {
+        let max_tokens = u64::from(u32::MAX) + 1;
+        let rule = parse_config(&token_limit(max_tokens, 1.0))
+            .expect("the owned uint64 budget must decode");
+        assert_eq!(rule.max_tokens, max_tokens);
+    }
+
+    #[test]
     fn config_rejects_missing_max_tokens() {
-        let mut msg = DynamicMessage::new(rate_limit_settings_desc());
-        msg.set_field_by_name("fill_rate", wrapped_f64(1.0));
+        let mut msg = DynamicMessage::new(token_limit_desc());
+        msg.set_field_by_name("fill_rate", prost_reflect::Value::F64(1.0));
 
         let err = parse_config(&msg).expect_err("missing max_tokens must be rejected");
         match err {
@@ -944,8 +1040,8 @@ mod tests {
 
     #[test]
     fn config_rejects_missing_fill_rate() {
-        let mut msg = DynamicMessage::new(rate_limit_settings_desc());
-        msg.set_field_by_name("max_tokens", wrapped_u32(10));
+        let mut msg = DynamicMessage::new(token_limit_desc());
+        msg.set_field_by_name("max_tokens", prost_reflect::Value::U64(10));
 
         let err = parse_config(&msg).expect_err("missing fill_rate must be rejected");
         match err {
@@ -958,11 +1054,10 @@ mod tests {
 
     #[test]
     fn config_rejects_zero_max_tokens() {
-        let err = parse_config(&rate_limit_settings(0, 1.0))
-            .expect_err("zero max_tokens must be rejected");
+        let err = parse_config(&token_limit(0, 1.0)).expect_err("zero max_tokens must be rejected");
         match err {
             ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(field_path, "typed_config.max_tokens.value");
+                assert_eq!(field_path, "typed_config.max_tokens");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
@@ -971,14 +1066,35 @@ mod tests {
     #[test]
     fn config_rejects_non_positive_fill_rate() {
         for bad in [0.0, -1.0, f64::NAN, f64::NEG_INFINITY] {
-            let err = parse_config(&rate_limit_settings(10, bad))
+            let err = parse_config(&token_limit(10, bad))
                 .expect_err(&format!("fill_rate {bad} must be rejected"));
             match err {
                 ConfigError::InvalidValue { field_path, .. } => {
-                    assert_eq!(field_path, "typed_config.fill_rate.value");
+                    assert_eq!(field_path, "typed_config.fill_rate");
                 }
                 other => panic!("expected InvalidValue for fill_rate {bad}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn legacy_config_still_decodes_with_the_same_rule() {
+        let rule = parse_legacy_config(&rate_limit_settings(60, 1.0))
+            .expect("one-release legacy config remains valid");
+        assert_eq!(rule.on, TlLimitOn::Total);
+        assert_eq!(rule.max_tokens, 60);
+        assert_eq!(rule.window, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn legacy_config_preserves_its_wrapped_error_path() {
+        let err = parse_legacy_config(&rate_limit_settings(0, 1.0))
+            .expect_err("a zero legacy max_tokens must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.max_tokens.value");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 
@@ -1668,7 +1784,7 @@ mod tests {
             scope: "listener 'l' filter_chains[0]".to_string(),
             stat_prefix: "l".to_string(),
         };
-        let config = rate_limit_settings(10, 1.0); // max_tokens=10, window=10s
+        let config = token_limit(10, 1.0); // max_tokens=10, window=10s
 
         let mut filter_worker_1 = TokenLimitFilterFactory
             .create(&config, &ctx)
@@ -1716,8 +1832,8 @@ mod tests {
             scope: "listener 'l' filter_chains[0]".to_string(),
             stat_prefix: "l".to_string(),
         };
-        let config_a = rate_limit_settings(10, 1.0); // max_tokens=10, window=10s
-        let config_b = rate_limit_settings(500, 1.0); // a different rule, same chain
+        let config_a = token_limit(10, 1.0); // max_tokens=10, window=10s
+        let config_b = token_limit(500, 1.0); // a different rule, same chain
 
         let mut filter_a = TokenLimitFilterFactory
             .create(&config_a, &ctx)

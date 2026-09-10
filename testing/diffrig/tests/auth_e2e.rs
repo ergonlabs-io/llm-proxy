@@ -167,6 +167,8 @@ static_resources:
               runtime_key: openai
           - name: llmproxy.token_limit
             typed_config:
+              # WP-47 compatibility fixture: real-binary coverage for the
+              # one-release decoder of the old borrowed token-limit type.
               '@type': type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings
               fill_rate: {fill_rate}
               max_tokens: {max_tokens}

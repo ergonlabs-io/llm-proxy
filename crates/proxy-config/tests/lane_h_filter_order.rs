@@ -20,8 +20,9 @@ use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, S
 // leave `lower.rs` free to drift from both.
 use proxy_config::lower::{
     AUTH_FILTER_TYPE as AUTH, BODY_REWRITE_FILTER_TYPE as BODY_REWRITE,
-    MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT,
-    TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT, USAGE_FILTER_TYPE as USAGE,
+    LEGACY_TOKEN_LIMIT_FILTER_TYPE as LEGACY_TOKEN_LIMIT, MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ,
+    SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT,
+    USAGE_FILTER_TYPE as USAGE,
 };
 
 /// `lower.rs` cannot import the filters' constants — `proxy-filters` depends
@@ -50,6 +51,13 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
         proxy_filters::token_limit_filter::TYPE_URL,
         "the token limiter's type URL changed; update `TOKEN_LIMIT_FILTER_TYPE` in \
          proxy-config/src/lower.rs or BOTH ordering rules silently stop firing"
+    );
+    assert_eq!(
+        LEGACY_TOKEN_LIMIT,
+        proxy_filters::token_limit_filter::LEGACY_TYPE_URL,
+        "the legacy token limiter type URL changed; update \
+         `LEGACY_TOKEN_LIMIT_FILTER_TYPE` in proxy-config/src/lower.rs or old configs \
+         will lose ordering protection during the one-release compatibility window"
     );
     assert_eq!(
         USAGE,
@@ -89,6 +97,7 @@ fn filter_entry(name: &str, type_url: &str) -> String {
             "\n                      hmac_secret: { inline_string: \"s\" }\n                      virtual_keys: []"
         }
         TOKEN_LIMIT => "\n                      max_tokens: 10\n                      fill_rate: 1.0",
+        LEGACY_TOKEN_LIMIT => "\n                      max_tokens: 10\n                      fill_rate: 1.0",
         USAGE => "\n                      inline_string: \"\"",
         BODY_REWRITE => "\n                      default_value: true\n                      runtime_key: openai",
         MODEL_AUTHZ => "\n                      policies: []",
@@ -162,6 +171,39 @@ fn auth_before_token_limit_is_accepted() {
         ("llmproxy.token_limit", TOKEN_LIMIT),
     ])
     .expect("auth ahead of the limiter is the correct order");
+}
+
+#[test]
+fn legacy_token_limit_keeps_the_same_ordering_protection() {
+    chain(&[
+        ("llmproxy.auth", AUTH),
+        ("llmproxy.token_limit", LEGACY_TOKEN_LIMIT),
+        ("llmproxy.usage", USAGE),
+    ])
+    .expect("the one-release legacy type keeps the canonical ordering rules");
+
+    let (_, reason) = expect_invalid(chain(&[
+        ("llmproxy.token_limit", LEGACY_TOKEN_LIMIT),
+        ("llmproxy.auth", AUTH),
+    ]));
+    assert!(
+        reason.contains("authorization"),
+        "legacy configs must not lose the security ordering check: {reason}"
+    );
+}
+
+#[test]
+fn canonical_and_legacy_limiters_are_each_checked_when_both_are_configured() {
+    let (_, reason) = expect_invalid(chain(&[
+        ("llmproxy.auth", AUTH),
+        ("llmproxy.token_limit", TOKEN_LIMIT),
+        ("llmproxy.usage", USAGE),
+        ("llmproxy.token_limit_legacy", LEGACY_TOKEN_LIMIT),
+    ]));
+    assert!(
+        reason.contains("REVERSE"),
+        "the legacy entry after usage must still be rejected: {reason}"
+    );
 }
 
 /// **The security-relevant one.** Reversed, the limiter's `decode_headers`
