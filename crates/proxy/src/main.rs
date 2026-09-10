@@ -1377,22 +1377,23 @@ fn start_ads(
     // `Arc<SdsSecretRegistry>`, not a worker-visible `ConfigSnapshot`), so
     // there is nothing for `apply_snapshot`'s sequencing to add.
     //
-    // A `SecretKind::ValidationContext` secret has nowhere to go yet --
-    // `DynamicSecret::tls_certificate_ir` answers `None` for it -- and MUST
-    // be refused rather than silently accepted (ground rule #1): accepting
-    // it here would ACK a secret this proxy is not actually serving, telling
-    // the control plane a trust-anchor rotation succeeded when nothing
-    // happened. Trusted-CA rotation over SDS is WP-22 increment 2c.
+    // Certificate and validation-context secrets use distinct live TLS
+    // seams. The latter rebuilds then atomically swaps ServerConfig because
+    // rustls bakes the client verifier (trust anchors) into it; an invalid CA
+    // is returned here as an SDS NACK while the prior config keeps serving.
     let secret_registry = Arc::clone(secret_registry);
     let secret_sink: PublishSecrets = Box::new(move |name, secret: Arc<DynamicSecret>| {
         let secret_registry = Arc::clone(&secret_registry);
         Box::pin(async move {
             match secret.tls_certificate_ir() {
                 Ok(Some(ir)) => secret_registry.publish(&name, vec![ir]),
-                Ok(None) => Err(format!(
-                    "secret `{name}` is a validation_context (trusted-CA) secret; rotating a \
-                     trust anchor over SDS is WP-22 increment 2c and is not implemented"
-                )),
+                Ok(None) => match secret.validation_context_ir() {
+                    Ok(Some(validation)) => {
+                        secret_registry.publish_validation_context(&name, validation)
+                    }
+                    Ok(None) => Err(format!("secret `{name}` has no supported SDS TLS payload")),
+                    Err(err) => Err(err.to_string()),
+                },
                 Err(err) => Err(err.to_string()),
             }
         })

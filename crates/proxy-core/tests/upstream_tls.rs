@@ -109,6 +109,7 @@ async fn spawn_tls_http_upstream(
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };

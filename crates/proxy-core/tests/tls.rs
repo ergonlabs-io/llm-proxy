@@ -157,6 +157,7 @@ async fn happy_path_round_trip_and_version() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -203,6 +204,7 @@ async fn version_negotiation_falls_back_to_tls12() {
         params: default_params(), // server: V1_2..=V1_3
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -241,6 +243,7 @@ async fn alpn_negotiates_h2() {
         params: default_params(),
         alpn_protocols: vec!["h2".to_string(), "http/1.1".to_string()],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -276,6 +279,7 @@ async fn dual_cert_all_default_client_gets_ecdsa() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -310,6 +314,7 @@ async fn no_validation_upstream_accepts_self_signed_server() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -340,6 +345,7 @@ async fn trusted_ca_upstream_rejects_wrong_ca() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -374,6 +380,7 @@ async fn trusted_ca_upstream_bypasses_hostname_mismatch() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -407,6 +414,7 @@ async fn mtls_requires_client_cert_when_mandatory() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: Some(trusted_ca_validation(&ca)),
+        validation_sds_name: None,
         require_client_certificate: true,
         disable_stateless_session_resumption: false,
     };
@@ -463,6 +471,7 @@ async fn hot_reload_serves_new_certificate() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -522,6 +531,7 @@ async fn handshake_with_upstream_san_matchers(
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -655,6 +665,7 @@ async fn san_matcher_downstream_client_cert_dns_match_succeeds() {
             vec![exact_dns_matcher("client.example.com")],
             false,
         )),
+        validation_sds_name: None,
         require_client_certificate: true,
         disable_stateless_session_resumption: false,
     };
@@ -690,6 +701,7 @@ async fn san_matcher_downstream_client_cert_dns_mismatch_fails() {
             vec![exact_dns_matcher("nobody.example.com")],
             false,
         )),
+        validation_sds_name: None,
         require_client_certificate: true,
         disable_stateless_session_resumption: false,
     };
@@ -729,6 +741,7 @@ async fn expired_certificate_rejected_by_default() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -763,6 +776,7 @@ async fn allow_expired_certificate_accepts_expired_cert_with_right_ca() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -793,6 +807,7 @@ async fn allow_expired_certificate_still_rejects_wrong_ca() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -850,6 +865,7 @@ async fn an_sds_named_chain_builds_empty_then_serves_after_delivery() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -899,6 +915,7 @@ fn a_spec_with_neither_certificates_nor_sds_names_is_refused() {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
@@ -929,6 +946,7 @@ fn sds_only_spec(name: &str) -> DownstreamTlsSpec {
         params: default_params(),
         alpn_protocols: vec![],
         validation: None,
+        validation_sds_name: None,
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     }
@@ -1097,4 +1115,72 @@ async fn publish_to_an_unregistered_name_is_ok_and_delivered_on_a_later_register
         .as_ref()
         .to_vec();
     assert_eq!(peer, cert.der().as_ref());
+}
+
+/// A dynamic validation context is fail-closed before SDS delivers the CA,
+/// then updates the same serving factory without rebuilding its certificates.
+/// This pins the distinct trust-anchor seam (an atomic ServerConfig swap), not
+/// the certificate resolver seam exercised by the tests above.
+#[tokio::test]
+async fn validation_context_sds_delivery_unblocks_mtls_on_the_same_factory() {
+    let ca = mint_ca("client CA");
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert = mint_leaf(&ca, &["server.example.com"], &server_key);
+    let client_key = KeyPair::generate().unwrap();
+    let client_cert = mint_leaf(&ca, &["client.example.com"], &client_key);
+
+    let downstream = Arc::new(
+        DownstreamTlsFactory::build(
+            &DownstreamTlsSpec {
+                certificates: vec![tls_cert_ir(&server_cert, &server_key)],
+                certificate_sds_names: vec![],
+                params: default_params(),
+                alpn_protocols: vec![],
+                validation: None,
+                validation_sds_name: Some("client-ca".to_string()),
+                require_client_certificate: true,
+                disable_stateless_session_resumption: false,
+            },
+            "test",
+        )
+        .unwrap(),
+    );
+    let upstream = UpstreamTlsFactory::build(
+        &UpstreamTlsSpec {
+            sni: None,
+            params: default_params(),
+            alpn_protocols: vec![],
+            client_certificate: Some(tls_cert_ir(&client_cert, &client_key)),
+            validation: Some(trusted_ca_validation(&ca)),
+        },
+        "test",
+    )
+    .unwrap();
+
+    let registry = SdsSecretRegistry::new();
+    registry
+        .register_validation_context("client-ca", &downstream, "test")
+        .unwrap();
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::try_join!(
+        downstream.wrap(server_io),
+        upstream.wrap(client_io, "server.example.com")
+    )
+    .expect_err("a validation context not yet delivered over SDS must fail closed");
+
+    registry
+        .publish_validation_context("client-ca", trusted_ca_validation(&ca))
+        .expect("a usable dynamic trust anchor must update the registered factory");
+    let _ = handshake(&downstream, &upstream, "server.example.com").await;
+
+    let bad_update = registry.publish_validation_context(
+        "client-ca",
+        ValidationContextIR {
+            ca: CaSource::TrustedCa(DataSourceIR::Inline("not a PEM bundle".to_string())),
+            san_matchers: vec![],
+            allow_expired_certificate: false,
+        },
+    );
+    assert!(bad_update.is_err(), "invalid trust anchors must NACK");
+    let _ = handshake(&downstream, &upstream, "server.example.com").await;
 }

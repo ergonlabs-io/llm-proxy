@@ -661,6 +661,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "tls_certificates",
             "tls_certificate_sds_secret_configs",
             "validation_context",
+            "validation_context_sds_secret_config",
             "alpn_protocols",
         ],
         // Listed even though its only two fields (`name`, `sds_config`) are
@@ -2160,13 +2161,14 @@ fn convert_downstream_tls(
         _ => {}
     }
 
-    let validation = convert_validation_context(common, &common_path)?;
+    let (validation, validation_sds_name) = convert_validation_context(common, &common_path)?;
 
     let require_client_certificate = ctx.require_client_certificate.unwrap_or(false);
-    if require_client_certificate && validation.is_none() {
+    if require_client_certificate && validation.is_none() && validation_sds_name.is_none() {
         return Err(invalid(
             format!("{cfg_path}.require_client_certificate"),
-            "require_client_certificate requires a validation_context",
+            "require_client_certificate requires a validation_context or \
+             validation_context_sds_secret_config",
         ));
     }
 
@@ -2198,6 +2200,7 @@ fn convert_downstream_tls(
         params,
         alpn_protocols: common.alpn_protocols.clone(),
         validation,
+        validation_sds_name,
         require_client_certificate,
         disable_stateless_session_resumption,
     })
@@ -2682,26 +2685,29 @@ fn convert_ads_grpc_service(svc: &core_v3::GrpcService, path: &str) -> Result<St
     }
 }
 
-/// Only the plain (static) `validation_context` oneof member is implemented;
-/// the SDS/combined/certificate-provider members are secret-delivery
-/// mechanisms that land with WP-22. In strict mode `check_supported_surface`
-/// already rejects those members before we get here (they're not in
-/// `CommonTlsContext`'s allowed-fields list) — the explicit arms below exist
-/// so this function never silently drops one if that surface check is ever
-/// relaxed.
+/// Lower the static or SDS validation-context oneof. The SDS member has the
+/// same ADS-only restriction as serving-certificate SDS config: a name-only
+/// entry would resolve against the not-yet-implemented static secret store.
 fn convert_validation_context(
     common: &tls_v3::CommonTlsContext,
     common_path: &str,
-) -> Result<Option<ValidationContextIR>, ConfigError> {
+) -> Result<(Option<ValidationContextIR>, Option<SecretName>), ConfigError> {
     use tls_v3::common_tls_context::ValidationContextType;
     match &common.validation_context_type {
-        None => Ok(None),
-        Some(ValidationContextType::ValidationContext(vc)) => Ok(Some(
-            convert_validation_context_inner(vc, &format!("{common_path}.validation_context"))?,
+        None => Ok((None, None)),
+        Some(ValidationContextType::ValidationContext(vc)) => Ok((
+            Some(convert_validation_context_inner(
+                vc,
+                &format!("{common_path}.validation_context"),
+            )?),
+            None,
         )),
-        Some(ValidationContextType::ValidationContextSdsSecretConfig(_)) => Err(unsupported(
-            format!("{common_path}.validation_context_sds_secret_config"),
-            "SDS-delivered validation contexts are not implemented yet (WP-22)",
+        Some(ValidationContextType::ValidationContextSdsSecretConfig(cfg)) => Ok((
+            None,
+            Some(convert_validation_context_sds_config(
+                cfg,
+                &format!("{common_path}.validation_context_sds_secret_config"),
+            )?),
         )),
         Some(ValidationContextType::CombinedValidationContext(_)) => Err(unsupported(
             format!("{common_path}.combined_validation_context"),
@@ -2718,6 +2724,28 @@ fn convert_validation_context(
             ))
         }
     }
+}
+
+fn convert_validation_context_sds_config(
+    cfg: &tls_v3::SdsSecretConfig,
+    path: &str,
+) -> Result<SecretName, ConfigError> {
+    if cfg.name.is_empty() {
+        return Err(invalid(
+            format!("{path}.name"),
+            "an SDS secret config must name the secret it subscribes to",
+        ));
+    }
+    let sds_config_path = format!("{path}.sds_config");
+    if !check_ads_source(cfg.sds_config.as_ref(), &sds_config_path)? {
+        return Err(unsupported(
+            sds_config_path,
+            "a name-only SdsSecretConfig resolves against static_resources.secrets, \
+             whose TlsSecret is still a stub carrying only a name, so there is nothing \
+             to resolve to yet (WP-22, a later increment)",
+        ));
+    }
+    Ok(cfg.name.clone())
 }
 
 fn convert_validation_context_inner(
@@ -4218,7 +4246,13 @@ fn convert_upstream_tls(
     // Envoy parity: no validation_context configured means the upstream
     // certificate is NOT verified at all — dangerous, but that's the
     // documented default, and the IR's doc comment says as much.
-    let validation = convert_validation_context(common, &common_path)?;
+    let (validation, validation_sds_name) = convert_validation_context(common, &common_path)?;
+    if validation_sds_name.is_some() {
+        return Err(unsupported(
+            format!("{common_path}.validation_context_sds_secret_config"),
+            "SDS-delivered validation contexts are implemented only for downstream TLS (WP-22)",
+        ));
+    }
 
     Ok(UpstreamTlsSpec {
         sni: (!ctx.sni.is_empty()).then(|| ctx.sni.clone()),

@@ -398,7 +398,12 @@ impl ResourceApplier {
                     .chain(listener.default_filter_chain.as_ref())
             })
             .filter_map(|chain| chain.transport_socket.as_ref())
-            .flat_map(|tls| tls.certificate_sds_names.iter().cloned())
+            .flat_map(|tls| {
+                tls.certificate_sds_names
+                    .iter()
+                    .cloned()
+                    .chain(tls.validation_sds_name.iter().cloned())
+            })
             .collect()
     }
 

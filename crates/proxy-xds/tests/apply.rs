@@ -907,6 +907,39 @@ fn listener_with_sds_certs(
     listener
 }
 
+/// The same TLS listener shape with a dynamic downstream client-auth trust
+/// anchor. A server certificate is still required independently; the extra
+/// SDS name must join the same subscription set.
+fn listener_with_sds_validation_context(
+    name: &str,
+    cluster: &str,
+    port: u32,
+    cert_secret: &str,
+    validation_secret: &str,
+) -> listener_v3::Listener {
+    let mut listener = listener_with_sds_certs(name, cluster, port, &[cert_secret]);
+    let socket = listener.filter_chains[0]
+        .transport_socket
+        .as_mut()
+        .expect("fixture installs a TLS transport socket");
+    let Some(core_v3::transport_socket::ConfigType::TypedConfig(any)) = socket.config_type.as_mut()
+    else {
+        panic!("fixture TLS socket must have typed config");
+    };
+    let mut context = tls_v3::DownstreamTlsContext::decode(any.value.as_slice()).unwrap();
+    context
+        .common_tls_context
+        .as_mut()
+        .unwrap()
+        .validation_context_type = Some(
+        tls_v3::common_tls_context::ValidationContextType::ValidationContextSdsSecretConfig(
+            ads_sds_secret_config(validation_secret),
+        ),
+    );
+    any.value = context.encode_to_vec();
+    listener
+}
+
 /// An applied LDS listener whose chain names SDS secrets makes those names the
 /// SDS subscription: `desired_names` answers a real set, where before
 /// increment 2a it answered `None` for SDS unconditionally.
@@ -928,13 +961,25 @@ async fn sds_desired_names_come_from_the_applied_listeners() {
             listener_with_sds_certs("l1", "my-cluster", 8443, &["cert-rsa", "cert-ecdsa"]),
             // Same secret named twice across two listeners: deduplicated.
             listener_with_sds_certs("l2", "my-cluster", 8444, &["cert-rsa"]),
+            listener_with_sds_validation_context(
+                "l3",
+                "my-cluster",
+                8445,
+                "cert-l3",
+                "client-ca-l3",
+            ),
         ],
     );
     assert!(matches!(applier.on_response(&resp).await, Verdict::Accept));
 
     assert_eq!(
         applier.sds_resource_names(),
-        std::collections::BTreeSet::from(["cert-ecdsa".to_string(), "cert-rsa".to_string()])
+        std::collections::BTreeSet::from([
+            "cert-ecdsa".to_string(),
+            "cert-rsa".to_string(),
+            "cert-l3".to_string(),
+            "client-ca-l3".to_string(),
+        ])
     );
     assert_eq!(
         applier.desired_names(SDS_TYPE_URL),
@@ -956,8 +1001,8 @@ async fn a_listener_without_sds_certs_names_no_secrets() {
 }
 
 // -------------------------------------------------------------------------
-// WP-22 increment 2b: a `validation_context` secret is refused by the real
-// sink, not silently accepted.
+// WP-22 increment 2c: a `validation_context` secret reaches the real sink
+// shape rather than being ACKed and discarded.
 //
 // `crates/proxy-xds/src/apply.rs`'s own unit tests (increment 1) already
 // prove `a_well_formed_validation_context_secret_lowers_and_reaches_the_sink`
@@ -1019,20 +1064,19 @@ fn sds_response(version: &str, secrets: &[tls_v3::Secret]) -> DiscoveryResponse 
     }
 }
 
-/// `main.rs`'s `start_ads` secret sink: `TlsCertificate` publishes into an
-/// `SdsSecretRegistry` (out of scope here -- this test only needs to prove
-/// the rejection shape, not the registry itself, which `proxy-core`'s own
-/// `tests/tls.rs` already covers), and `ValidationContext` is refused naming
-/// WP-22 increment 2c, matching `main.rs`'s own message.
+/// `main.rs`'s `start_ads` secret sink shape. The registry itself is covered
+/// in `proxy-core`; this proves neither supported secret kind is discarded at
+/// the transport/apply boundary.
 fn main_rs_shaped_secret_sink() -> PublishSecrets {
     Box::new(move |name, secret: Arc<DynamicSecret>| {
         Box::pin(async move {
             match secret.tls_certificate_ir() {
                 Ok(Some(_ir)) => Ok(()),
-                Ok(None) => Err(format!(
-                    "secret `{name}` is a validation_context (trusted-CA) secret; rotating a \
-                     trust anchor over SDS is WP-22 increment 2c and is not implemented"
-                )),
+                Ok(None) => match secret.validation_context_ir() {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err(format!("secret `{name}` has no supported SDS TLS payload")),
+                    Err(err) => Err(err.to_string()),
+                },
                 Err(err) => Err(err.to_string()),
             }
         })
@@ -1040,7 +1084,7 @@ fn main_rs_shaped_secret_sink() -> PublishSecrets {
 }
 
 #[tokio::test]
-async fn a_validation_context_secret_is_nacked_naming_increment_2c() {
+async fn a_validation_context_secret_is_accepted_by_the_increment_2c_sink() {
     let (publish, _published) = recording_publisher();
     let mut applier =
         ResourceApplier::new(empty_base(), publish).with_secret_sink(main_rs_shaped_secret_sink());
@@ -1048,19 +1092,13 @@ async fn a_validation_context_secret_is_nacked_naming_increment_2c() {
     let resp = sds_response("v1", &[validation_context_secret("ca-1", b"ca-bytes")]);
     let verdict = applier.on_response(&resp).await;
 
-    let Verdict::Reject(message) = verdict else {
-        panic!("expected Reject, got {verdict:?}");
-    };
-    assert!(
-        message.contains("increment 2c"),
-        "message should name WP-22 increment 2c, got: {message}"
-    );
+    assert!(matches!(verdict, Verdict::Accept), "got {verdict:?}");
 }
 
 /// The same sink accepts an ordinary TLS certificate secret -- the rejection
 /// above is specific to `validation_context`, not a blanket SDS refusal.
 #[tokio::test]
-async fn a_tls_certificate_secret_is_accepted_by_the_same_sink_that_nacks_validation_context() {
+async fn a_tls_certificate_secret_is_accepted_by_the_same_increment_2c_sink() {
     let (publish, _published) = recording_publisher();
     let mut applier =
         ResourceApplier::new(empty_base(), publish).with_secret_sink(main_rs_shaped_secret_sink());

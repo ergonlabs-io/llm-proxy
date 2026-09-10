@@ -528,6 +528,25 @@ fn sds_only_chain_lowers_with_empty_certificates() {
 }
 
 #[test]
+fn validation_context_sds_secret_config_lowers_as_a_separate_sds_name() {
+    let ctx = r#"
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server-cert
+                    sds_config: { ads: {}, resource_api_version: V3 }
+                validation_context_sds_secret_config:
+                  name: client-ca
+                  sds_config: { ads: {}, resource_api_version: V3 }
+"#;
+    let snapshot = downstream_snapshot(ctx).expect("must lower");
+    let tls = downstream_tls_of(&snapshot);
+    assert!(tls.validation.is_none());
+    assert_eq!(tls.validation_sds_name.as_deref(), Some("client-ca"));
+    assert!(tls.require_client_certificate);
+}
+
+#[test]
 fn two_sds_names_lower_in_declaration_order() {
     let ctx = r#"
               common_tls_context:

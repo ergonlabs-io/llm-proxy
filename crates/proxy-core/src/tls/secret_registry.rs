@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-use proxy_config::ir::{SecretName, TlsCertificateIR};
+use proxy_config::ir::{SecretName, TlsCertificateIR, ValidationContextIR};
 
 use super::{DownstreamTlsFactory, TlsBuildError};
 
@@ -55,12 +55,14 @@ struct Inner {
     /// `Option`, so a dead entry costs nothing beyond eventually being
     /// pruned -- never a strong reference this registry has no business
     /// holding.
-    factories: HashMap<SecretName, Vec<Weak<DownstreamTlsFactory>>>,
+    certificate_factories: HashMap<SecretName, Vec<Weak<DownstreamTlsFactory>>>,
+    validation_factories: HashMap<SecretName, Vec<Weak<DownstreamTlsFactory>>>,
     /// The last certs delivered for each name, so a factory that registers
     /// AFTER a secret already arrived (the normal case -- see the module
     /// doc) can be caught up immediately instead of waiting for a resend
     /// that may never come.
-    delivered: HashMap<SecretName, Vec<TlsCertificateIR>>,
+    delivered_certificates: HashMap<SecretName, Vec<TlsCertificateIR>>,
+    delivered_validation_contexts: HashMap<SecretName, ValidationContextIR>,
 }
 
 /// Maps an SDS `Secret.name` to the [`DownstreamTlsFactory`] instances
@@ -81,8 +83,10 @@ impl SdsSecretRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
-                factories: HashMap::new(),
-                delivered: HashMap::new(),
+                certificate_factories: HashMap::new(),
+                validation_factories: HashMap::new(),
+                delivered_certificates: HashMap::new(),
+                delivered_validation_contexts: HashMap::new(),
             }),
         }
     }
@@ -115,7 +119,7 @@ impl SdsSecretRegistry {
             // without bound -- `Weak::strong_count` is enough to tell a dead
             // entry apart from a live one without paying for a full
             // `upgrade` on each.
-            let list = inner.factories.entry(name.clone()).or_default();
+            let list = inner.certificate_factories.entry(name.clone()).or_default();
             list.retain(|w| w.strong_count() > 0);
             list.push(weak.clone());
         }
@@ -126,9 +130,33 @@ impl SdsSecretRegistry {
         // once from `&mut inner` is fine, but keeping the two concerns in
         // separate loops reads clearer than interleaving them.
         for name in names {
-            if let Some(certs) = inner.delivered.get(name) {
+            if let Some(certs) = inner.delivered_certificates.get(name) {
                 factory.update_certificates(certs, context)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Register a factory for a downstream
+    /// `validation_context_sds_secret_config`. This deliberately has a
+    /// separate map/cache from certificate registration: an SDS name denotes
+    /// one secret *kind*, and delivering a certificate where a trust anchor
+    /// is expected must never accidentally mutate the other reload seam.
+    pub fn register_validation_context(
+        &self,
+        name: &str,
+        factory: &Arc<DownstreamTlsFactory>,
+        context: &str,
+    ) -> Result<(), TlsBuildError> {
+        let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
+        let list = inner
+            .validation_factories
+            .entry(name.to_string())
+            .or_default();
+        list.retain(|w| w.strong_count() > 0);
+        list.push(Arc::downgrade(factory));
+        if let Some(validation) = inner.delivered_validation_contexts.get(name) {
+            factory.update_validation_context(validation, context)?;
         }
         Ok(())
     }
@@ -149,7 +177,7 @@ impl SdsSecretRegistry {
     /// is not.
     pub fn publish(&self, name: &str, certs: Vec<TlsCertificateIR>) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
-        inner.delivered.insert(name.to_string(), certs);
+        inner.delivered_certificates.insert(name.to_string(), certs);
 
         // Rust note: `list` below is cloned (not held as a borrow of
         // `inner.factories`) specifically so the borrow checker sees the
@@ -158,7 +186,10 @@ impl SdsSecretRegistry {
         // count), so this costs nothing but is what lets us then borrow
         // `inner.delivered` immutably for `certs` below without the two
         // borrows fighting over the same `MutexGuard`.
-        let list = inner.factories.entry(name.to_string()).or_default();
+        let list = inner
+            .certificate_factories
+            .entry(name.to_string())
+            .or_default();
         // Pruning here is what makes a publish to a name whose only
         // registered factory has since been dropped read as "no factories",
         // not as a dangling `Weak` that upgrades to nothing on every call
@@ -167,7 +198,7 @@ impl SdsSecretRegistry {
         let list = list.clone();
 
         let certs = inner
-            .delivered
+            .delivered_certificates
             .get(name)
             .expect("just inserted this name's entry above");
 
@@ -213,6 +244,63 @@ impl SdsSecretRegistry {
         Ok(())
     }
 
+    /// Record and publish a validation-context SDS secret. The new
+    /// `ServerConfig` is built before any factory swaps it in; a bad CA bundle
+    /// therefore NACKs while every affected listener retains its previous
+    /// trust anchors (or its initial fail-closed pending config).
+    pub fn publish_validation_context(
+        &self,
+        name: &str,
+        validation: ValidationContextIR,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
+        let list = inner
+            .validation_factories
+            .entry(name.to_string())
+            .or_default();
+        list.retain(|w| w.strong_count() > 0);
+        let list = list.clone();
+
+        let context = format!("SDS validation_context secret `{name}`");
+        let mut reached = 0usize;
+        let mut failures = Vec::new();
+        for weak in &list {
+            let Some(factory) = weak.upgrade() else {
+                continue;
+            };
+            match factory.update_validation_context(&validation, &context) {
+                Ok(()) => reached += 1,
+                Err(err) => failures.push(err.to_string()),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "validation_context secret `{name}` rejected by {} registered TLS chain(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ));
+        }
+        // Cache only a fully accepted value. If construction failed above,
+        // retaining an invalid CA would make a later factory registration
+        // fail against a secret the control plane has already been NACKed.
+        inner
+            .delivered_validation_contexts
+            .insert(name.to_string(), validation);
+        if reached > 0 {
+            tracing::info!(
+                secret = name,
+                factories = reached,
+                "SDS validation context delivered: serving TLS trust anchors updated"
+            );
+        } else {
+            tracing::debug!(
+                secret = name,
+                "SDS validation context published with no registered TLS chain yet; cached for a later registration"
+            );
+        }
+        Ok(())
+    }
+
     /// The number of currently-live factories registered under `name` --
     /// i.e. after pruning dead `Weak`s. Not used by production code; exists
     /// so `crates/proxy-core/tests/tls.rs` can assert the pruning behavior
@@ -221,7 +309,10 @@ impl SdsSecretRegistry {
     /// anything gated on this crate's own `cfg(test)`).
     pub fn registered_factory_count(&self, name: &str) -> usize {
         let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
-        let list = inner.factories.entry(name.to_string()).or_default();
+        let list = inner
+            .certificate_factories
+            .entry(name.to_string())
+            .or_default();
         list.retain(|w| w.strong_count() > 0);
         list.len()
     }

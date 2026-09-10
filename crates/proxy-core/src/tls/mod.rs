@@ -21,12 +21,13 @@ mod verify;
 use std::io;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
 use proxy_cluster::transport::UpstreamTransportSocket;
 use proxy_cluster::BoxedUpstreamIo;
 use proxy_config::ir::{
     CaSource, ClusterConfig, DownstreamTlsSpec, TlsCertificateIR, TlsCipherSuite, TlsEcdhCurve,
-    TlsParametersIR, TlsVersion, UpstreamProtocol, UpstreamTlsSpec,
+    TlsParametersIR, TlsVersion, UpstreamProtocol, UpstreamTlsSpec, ValidationContextIR,
 };
 use rustls::crypto::ring::{cipher_suite, kx_group};
 use rustls::crypto::CryptoProvider;
@@ -41,7 +42,7 @@ use resolver::SwapCertResolver;
 pub use secret_registry::SdsSecretRegistry;
 use verify::{
     clone_san_matchers, AcceptAnyServerCert, CarveoutClientCertVerifier,
-    HostnameBypassServerCertVerifier,
+    HostnameBypassServerCertVerifier, PendingSdsClientCertVerifier,
 };
 
 /// Error building a TLS factory from IR. `context` is caller-supplied (e.g.
@@ -218,16 +219,26 @@ fn build_root_store(ca: &CaSource, context: &str) -> Result<RootCertStore, TlsBu
 
 /// Downstream (server-side) TLS termination for one filter chain.
 pub struct DownstreamTlsFactory {
-    server_config: Arc<ServerConfig>,
+    // Unlike certificates (whose resolver is already hot-swappable), a
+    // trust-anchor rotation changes rustls's client verifier. Keep the whole
+    // immutable ServerConfig behind ArcSwap so a completed SDS update becomes
+    // visible to new handshakes atomically while established connections keep
+    // their config alive.
+    server_config: ArcSwap<ServerConfig>,
     // Rust note: kept as the concrete resolver type (not `Arc<dyn
     // ResolvesServerCert>`) purely so `update_certificates` can call
     // `SwapCertResolver::store` directly without downcasting.
     cert_resolver: Arc<SwapCertResolver>,
+    provider: Arc<CryptoProvider>,
+    params: TlsParametersIR,
+    alpn_protocols: Vec<String>,
+    require_client_certificate: bool,
+    disable_stateless_session_resumption: bool,
 }
 
 impl DownstreamTlsFactory {
     pub fn build(spec: &DownstreamTlsSpec, context: &str) -> Result<Self, TlsBuildError> {
-        let provider = build_crypto_provider(&spec.params);
+        let provider = Arc::new(build_crypto_provider(&spec.params));
         // WP-22 increment 2a: an SDS-named chain binds with an EMPTY cert set
         // rather than refusing to build. `SwapCertResolver::resolve` answers
         // `None` for that set, so the listener accepts TCP and fails every TLS
@@ -253,51 +264,79 @@ impl DownstreamTlsFactory {
             resolver::build_cert_set(&spec.certificates, &provider, context)?
         };
         let cert_resolver = Arc::new(SwapCertResolver::new(cert_set));
+        let server_config = Self::build_server_config(
+            &provider,
+            &spec.params,
+            &spec.alpn_protocols,
+            spec.require_client_certificate,
+            spec.disable_stateless_session_resumption,
+            &cert_resolver,
+            spec.validation.as_ref(),
+            spec.validation_sds_name.is_some(),
+            context,
+        )?;
 
-        let versions = protocol_versions(&spec.params);
-        let builder = ServerConfig::builder_with_provider(Arc::new(provider))
-            .with_protocol_versions(versions)
+        Ok(Self {
+            server_config: ArcSwap::new(Arc::new(server_config)),
+            cert_resolver,
+            provider,
+            params: spec.params.clone(),
+            alpn_protocols: spec.alpn_protocols.clone(),
+            require_client_certificate: spec.require_client_certificate,
+            disable_stateless_session_resumption: spec.disable_stateless_session_resumption,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_server_config(
+        provider: &Arc<CryptoProvider>,
+        params: &TlsParametersIR,
+        alpn_protocols: &[String],
+        require_client_certificate: bool,
+        disable_stateless_session_resumption: bool,
+        cert_resolver: &Arc<SwapCertResolver>,
+        validation: Option<&ValidationContextIR>,
+        pending_sds_validation: bool,
+        context: &str,
+    ) -> Result<ServerConfig, TlsBuildError> {
+        let builder = ServerConfig::builder_with_provider(Arc::clone(provider))
+            .with_protocol_versions(protocol_versions(params))
             .map_err(|e| TlsBuildError::new(context, format!("protocol versions: {e}")))?;
-
-        let mut server_config = match &spec.validation {
-            None => builder
-                .with_no_client_auth()
-                .with_cert_resolver(cert_resolver.clone() as Arc<dyn ResolvesServerCert>),
+        let resolver = cert_resolver.clone() as Arc<dyn ResolvesServerCert>;
+        let mut server_config = match validation {
             Some(vc) => {
                 let roots = Arc::new(build_root_store(&vc.ca, context)?);
                 let mut cv_builder = WebPkiClientVerifier::builder(roots);
-                if !spec.require_client_certificate {
+                if !require_client_certificate {
                     cv_builder = cv_builder.allow_unauthenticated();
                 }
                 let inner = cv_builder
                     .build()
                     .map_err(|e| TlsBuildError::new(context, format!("client verifier: {e}")))?;
-                let verifier = Arc::new(CarveoutClientCertVerifier::new(
-                    inner,
-                    clone_san_matchers(&vc.san_matchers),
-                    vc.allow_expired_certificate,
-                ));
                 builder
-                    .with_client_cert_verifier(verifier)
-                    .with_cert_resolver(cert_resolver.clone() as Arc<dyn ResolvesServerCert>)
+                    .with_client_cert_verifier(Arc::new(CarveoutClientCertVerifier::new(
+                        inner,
+                        clone_san_matchers(&vc.san_matchers),
+                        vc.allow_expired_certificate,
+                    )))
+                    .with_cert_resolver(resolver)
             }
+            None if pending_sds_validation => builder
+                .with_client_cert_verifier(Arc::new(PendingSdsClientCertVerifier::new(Arc::clone(
+                    provider,
+                ))))
+                .with_cert_resolver(resolver),
+            None => builder.with_no_client_auth().with_cert_resolver(resolver),
         };
-
-        server_config.alpn_protocols = spec
-            .alpn_protocols
+        server_config.alpn_protocols = alpn_protocols
             .iter()
             .map(|p| p.as_bytes().to_vec())
             .collect();
-
-        if !spec.disable_stateless_session_resumption {
+        if !disable_stateless_session_resumption {
             server_config.ticketer = rustls::crypto::ring::Ticketer::new()
                 .map_err(|e| TlsBuildError::new(context, format!("session ticketer: {e}")))?;
         }
-
-        Ok(Self {
-            server_config: Arc::new(server_config),
-            cert_resolver,
-        })
+        Ok(server_config)
     }
 
     /// TLS-terminate an accepted connection.
@@ -305,7 +344,7 @@ impl DownstreamTlsFactory {
         &self,
         io: IO,
     ) -> io::Result<tokio_rustls::server::TlsStream<IO>> {
-        TlsAcceptor::from(self.server_config.clone())
+        TlsAcceptor::from(self.server_config.load_full())
             .accept(io)
             .await
     }
@@ -321,9 +360,31 @@ impl DownstreamTlsFactory {
         // the new certs are validated against the same algorithm set as the
         // ones `build` loaded -- `ServerConfig` doesn't expose its provider
         // directly, but `crypto_provider()` returns it.
-        let provider = self.server_config.crypto_provider();
-        let set = resolver::build_cert_set(certs, provider, context)?;
+        let set = resolver::build_cert_set(certs, &self.provider, context)?;
         self.cert_resolver.store(set);
+        Ok(())
+    }
+
+    /// Atomically replace downstream client-auth trust anchors after an SDS
+    /// validation-context delivery. Construction happens before the swap, so
+    /// invalid PEM or an unusable CA bundle leaves the prior config serving.
+    pub fn update_validation_context(
+        &self,
+        validation: &ValidationContextIR,
+        context: &str,
+    ) -> Result<(), TlsBuildError> {
+        let config = Self::build_server_config(
+            &self.provider,
+            &self.params,
+            &self.alpn_protocols,
+            self.require_client_certificate,
+            self.disable_stateless_session_resumption,
+            &self.cert_resolver,
+            Some(validation),
+            false,
+            context,
+        )?;
+        self.server_config.store(Arc::new(config));
         Ok(())
     }
 }

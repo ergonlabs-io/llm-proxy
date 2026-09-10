@@ -401,6 +401,82 @@ pub(super) struct CarveoutClientCertVerifier {
     allow_expired_certificate: bool,
 }
 
+/// Fail-closed verifier used while a downstream
+/// `validation_context_sds_secret_config` is named but has not arrived yet.
+/// A bare `with_no_client_auth` during that interval would silently turn an
+/// mTLS listener into a non-mTLS listener. Instead we request a certificate,
+/// require one, and reject every offered certificate until the real trust
+/// anchors atomically replace this verifier.
+#[derive(Debug)]
+pub(super) struct PendingSdsClientCertVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl PendingSdsClientCertVerifier {
+    pub(super) fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+impl ClientCertVerifier for PendingSdsClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        Err(Error::General(
+            "client trust anchors are waiting for SDS validation_context delivery".to_string(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 impl CarveoutClientCertVerifier {
     pub(super) fn new(
         inner: Arc<dyn ClientCertVerifier>,

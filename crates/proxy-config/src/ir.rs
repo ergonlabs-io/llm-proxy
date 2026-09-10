@@ -1512,6 +1512,16 @@ pub struct DownstreamTlsSpec {
     /// Client-certificate (mTLS) verification. `None` = no client certs
     /// requested at all.
     pub validation: Option<ValidationContextIR>,
+    /// `CommonTlsContext.validation_context_sds_secret_config` name, when
+    /// the downstream client-auth trust anchor arrives over ADS/SDS. While
+    /// this is set and no secret has reached the serving factory, it remains
+    /// fail-closed: no client is authenticated against an absent CA bundle.
+    ///
+    /// This is deliberately a separate field from [`Self::validation`]. The
+    /// protobuf members are a oneof, so lowering permits exactly one of the
+    /// static and SDS forms; `combined_validation_context` remains refused
+    /// until its static-plus-dynamic merge semantics are implemented.
+    pub validation_sds_name: Option<SecretName>,
     /// Envoy: reject connections without a valid client certificate.
     /// Lowering enforces that this requires `validation` to be present.
     pub require_client_certificate: bool,
@@ -1583,11 +1593,32 @@ impl DynamicSecret {
             } => (certificate_chain, private_key),
             SecretKind::ValidationContext { .. } => return Ok(None),
         };
-        let cert_chain = sds_utf8_pem(certificate_chain, &self.name, "certificate_chain")?;
-        let private_key = sds_utf8_pem(private_key, &self.name, "private_key")?;
+        let cert_chain = sds_utf8_pem(
+            certificate_chain,
+            &self.name,
+            "tls_certificate.certificate_chain",
+        )?;
+        let private_key = sds_utf8_pem(private_key, &self.name, "tls_certificate.private_key")?;
         Ok(Some(TlsCertificateIR {
             cert_chain: DataSourceIR::Inline(cert_chain),
             private_key: DataSourceIR::Inline(private_key),
+        }))
+    }
+
+    /// Convert a validation-context secret into the TLS IR consumed by the
+    /// downstream trust-anchor reload seam. SDS currently supports only an
+    /// inline `trusted_ca`; the decoder rejects every other validation field,
+    /// so the resulting context has no hidden defaults to merge.
+    pub fn validation_context_ir(&self) -> Result<Option<ValidationContextIR>, crate::ConfigError> {
+        let trusted_ca = match &self.kind {
+            SecretKind::TlsCertificate { .. } => return Ok(None),
+            SecretKind::ValidationContext { trusted_ca } => trusted_ca,
+        };
+        let trusted_ca = sds_utf8_pem(trusted_ca, &self.name, "validation_context.trusted_ca")?;
+        Ok(Some(ValidationContextIR {
+            ca: CaSource::TrustedCa(DataSourceIR::Inline(trusted_ca)),
+            san_matchers: Vec::new(),
+            allow_expired_certificate: false,
         }))
     }
 }
@@ -1598,7 +1629,7 @@ fn sds_utf8_pem(
     field: &str,
 ) -> Result<String, crate::ConfigError> {
     String::from_utf8(bytes.to_vec()).map_err(|err| crate::ConfigError::InvalidValue {
-        field_path: format!("sds.secrets[{secret_name}].tls_certificate.{field}"),
+        field_path: format!("sds.secrets[{secret_name}].{field}"),
         reason: format!("not valid UTF-8 PEM text: {err}"),
     })
 }

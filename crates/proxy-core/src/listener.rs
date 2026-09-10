@@ -186,6 +186,9 @@ fn build_listener_tls(
                 if !spec.certificate_sds_names.is_empty() {
                     secret_registry.register(&spec.certificate_sds_names, &factory, &context)?;
                 }
+                if let Some(name) = &spec.validation_sds_name {
+                    secret_registry.register_validation_context(name, &factory, &context)?;
+                }
                 Some(factory)
             }
             None => None,
@@ -202,6 +205,9 @@ fn build_listener_tls(
             let factory = Arc::new(DownstreamTlsFactory::build(spec, &context)?);
             if !spec.certificate_sds_names.is_empty() {
                 secret_registry.register(&spec.certificate_sds_names, &factory, &context)?;
+            }
+            if let Some(name) = &spec.validation_sds_name {
+                secret_registry.register_validation_context(name, &factory, &context)?;
             }
             Some(factory)
         }
@@ -2524,6 +2530,7 @@ mod tests {
             params: tls_params(),
             alpn_protocols: vec![],
             validation: None,
+            validation_sds_name: None,
             require_client_certificate: false,
             disable_stateless_session_resumption: false,
         }
@@ -3082,6 +3089,7 @@ mod tests {
             params: tls_params(),
             alpn_protocols: vec![],
             validation: None,
+            validation_sds_name: None,
             require_client_certificate: false,
             disable_stateless_session_resumption: false,
         });
@@ -3112,6 +3120,7 @@ mod tests {
                 params: tls_params(),
                 alpn_protocols: vec![],
                 validation: None,
+                validation_sds_name: None,
                 require_client_certificate: false,
                 disable_stateless_session_resumption: false,
             });
