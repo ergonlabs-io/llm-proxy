@@ -1542,6 +1542,67 @@ pub struct TlsCertificateIR {
     pub private_key: DataSourceIR,
 }
 
+/// One SDS-delivered TLS secret after xDS has decoded its protobuf envelope.
+///
+/// This is configuration IR rather than xDS-client state: the discovery
+/// transport decodes it, while the TLS serving layer consumes it. Keeping the
+/// payload here prevents either layer from depending on the other (WP-22).
+#[derive(Debug, Clone)]
+pub struct DynamicSecret {
+    /// `Secret.name` -- what an `SdsSecretConfig.name` subscribes to.
+    pub name: SecretName,
+    pub kind: SecretKind,
+}
+
+/// Which supported `Secret.type` oneof case a [`DynamicSecret`] holds.
+#[derive(Debug, Clone)]
+pub enum SecretKind {
+    TlsCertificate {
+        certificate_chain: Vec<u8>,
+        private_key: Vec<u8>,
+    },
+    ValidationContext {
+        trusted_ca: Vec<u8>,
+    },
+}
+
+impl DynamicSecret {
+    /// Convert a certificate secret into the TLS IR the serving registry
+    /// consumes. A validation-context secret has no certificate material and
+    /// therefore returns `None`; its trust-anchor delivery is WP-22
+    /// increment 2c's distinct update path.
+    ///
+    /// SDS carries certificate bytes inline. They must be UTF-8 PEM so the
+    /// existing `DataSourceIR::Inline` TLS loader can consume them; invalid
+    /// UTF-8 is rejected rather than lossy-converted.
+    pub fn tls_certificate_ir(&self) -> Result<Option<TlsCertificateIR>, crate::ConfigError> {
+        let (certificate_chain, private_key) = match &self.kind {
+            SecretKind::TlsCertificate {
+                certificate_chain,
+                private_key,
+            } => (certificate_chain, private_key),
+            SecretKind::ValidationContext { .. } => return Ok(None),
+        };
+        let cert_chain = sds_utf8_pem(certificate_chain, &self.name, "certificate_chain")?;
+        let private_key = sds_utf8_pem(private_key, &self.name, "private_key")?;
+        Ok(Some(TlsCertificateIR {
+            cert_chain: DataSourceIR::Inline(cert_chain),
+            private_key: DataSourceIR::Inline(private_key),
+        }))
+    }
+}
+
+fn sds_utf8_pem(
+    bytes: &[u8],
+    secret_name: &str,
+    field: &str,
+) -> Result<String, crate::ConfigError> {
+    String::from_utf8(bytes.to_vec()).map_err(|err| crate::ConfigError::InvalidValue {
+        field_path: format!("sds.secrets[{secret_name}].tls_certificate.{field}"),
+        reason: format!("not valid UTF-8 PEM text: {err}"),
+    })
+}
+
 /// `TlsParameters` subset. Defaults are direction-dependent in Envoy
 /// (`TLS_AUTO`): min TLSv1.2 both ways; max TLSv1.3 downstream but TLSv1.2
 /// upstream — the lowering resolves `TLS_AUTO` per direction so consumers

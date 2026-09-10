@@ -84,12 +84,12 @@ use proxy_api::envoy::config::listener::v3::Listener as ListenerProto;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3::Secret as SecretProto;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::{
-    ClusterConfig, ConfigSnapshot, EndpointIR, ListenerConfig, SnapshotVersion,
+    ClusterConfig, ConfigSnapshot, DynamicSecret, EndpointIR, ListenerConfig, SnapshotVersion,
 };
 use proxy_config::{lower_dynamic_cluster, lower_dynamic_endpoints, lower_dynamic_listener};
 
 use crate::client::ResponseHandler;
-use crate::secret::{decode_secret, DynamicSecret};
+use crate::secret::decode_secret;
 use crate::store::{ApplyError, ApplyOutcome, SetSemantics, SotwSet};
 use crate::subscription::Verdict;
 
@@ -798,7 +798,7 @@ mod tests {
     use proxy_config::ir::ConfigSnapshot;
 
     use super::*;
-    use crate::secret::SecretKind;
+    use proxy_config::ir::SecretKind;
 
     const SECRET_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.Secret";
 

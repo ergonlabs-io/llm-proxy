@@ -68,6 +68,9 @@ const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.Cluster
 /// Bare type name `Any::type_url` is built from, for a `ClusterLoadAssignment`
 /// -- matches `crates/proxy-xds/tests/apply.rs`'s own `ENDPOINT_TYPE`.
 const ENDPOINT_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
+/// Full `type_url` an SDS `DiscoveryRequest` subscribes to -- matches
+/// `crates/proxy-xds/src/apply.rs`'s own private `SDS_TYPE_URL`.
+const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
 
 /// How long to wait for the freshly spawned `llm-proxy` to become
 /// connectable -- a liveness backstop, not a speed assertion (matches every
@@ -934,6 +937,132 @@ async fn an_eds_delivered_endpoint_set_makes_a_statically_declared_cluster_routa
         response.starts_with("HTTP/1.1 200"),
         "expected \"{TEST_D_EDS_CLUSTER}\"'s host set to already be populated the instant its \
          EDS ACK was observed on the wire -- got:\n{response}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}
+
+// ------------------------------------------------------------------ test E --
+
+/// The certificate name the static listener in test E requests over ADS.
+const TEST_E_SDS_SECRET: &str = "ingress-cert";
+
+/// A static TLS listener which cannot serve a handshake until SDS delivers
+/// `TEST_E_SDS_SECRET`. The test intentionally needs no scripted response:
+/// the load-bearing claim is the initial request emitted by the real binary,
+/// before a control plane has sent anything that could update subscriptions.
+fn bootstrap_sds_only_listener(listener_port: u16, ads_addr: SocketAddr) -> String {
+    format!(
+        r#"
+node:
+  id: proxy-1
+  cluster: proxy-fleet
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: {{ cluster_name: xds_cluster }}
+  cds_config: {{ ads: {{}}, resource_api_version: V3 }}
+
+static_resources:
+  listeners:
+    - name: ingress_tls
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {listener_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tls
+                cluster: xds_cluster
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: {secret}
+                    sds_config: {{ ads: {{}}, resource_api_version: V3 }}
+
+  clusters:
+    - name: xds_cluster
+      type: STATIC
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {ads_ip}, port_value: {ads_port} }}
+"#,
+        secret = TEST_E_SDS_SECRET,
+        ads_ip = ads_addr.ip(),
+        ads_port = ads_addr.port(),
+    )
+}
+
+/// WP-22's delivered-secret path is only useful if `start_ads` initially
+/// subscribes to an SDS-only listener's named certificate. `ResourceApplier`
+/// unit tests already prove it can derive this name after an LDS update, but
+/// the static boot snapshot has no update to trigger that path; this is the
+/// binary boundary that used to omit SDS from its subscription list entirely.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_sds_only_listener_subscribes_to_its_certificate_at_boot() {
+    let harness = Harness::spawn(vec![]).await.expect("harness spawns");
+    let listener_port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-e-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        bootstrap_sds_only_listener(listener_port, harness.addr),
+    )
+    .expect("write config");
+
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+
+    let listener_ready = wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT);
+    assert!(
+        listener_ready,
+        "SDS-only listener at 127.0.0.1:{listener_port} did not bind in time; stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+
+    // Poll only for arrival. The exact request fields below are the
+    // load-bearing assertion: this must be a by-name SDS subscription, not
+    // a wildcard request or an unrelated ADS request that happened to arrive
+    // first alongside CDS/LDS/EDS.
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    let request = loop {
+        if let Some(request) = harness
+            .log
+            .snapshot()
+            .into_iter()
+            .find(|request| request.type_url == SDS_TYPE_URL)
+        {
+            break request;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {ACK_TIMEOUT:?} waiting for the SDS subscription for \\
+                 `{TEST_E_SDS_SECRET}`; ADS requests so far: {:?}; stderr so far: {:?}",
+                harness.log.snapshot(),
+                drain_available_lines(&stderr_rx)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(request.kind(), RequestKind::Initial, "got {request:?}");
+    assert_eq!(
+        request.resource_names,
+        vec![TEST_E_SDS_SECRET],
+        "got {request:?}"
     );
 
     terminate(&mut child);

@@ -1162,6 +1162,9 @@ const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listene
 /// Full `type_url` an EDS `DiscoveryRequest` subscribes to. Same duplication
 /// as [`CDS_TYPE_URL`]/[`LDS_TYPE_URL`], and the same reason.
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
+/// Full `type_url` an SDS `DiscoveryRequest` subscribes to. Same duplication
+/// as [`CDS_TYPE_URL`]/[`LDS_TYPE_URL`], and the same reason.
+const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
 
 /// What `ResourceApplier`'s `Publish` callback sends to `run_serve`'s control
 /// loop for one accepted `DiscoveryResponse`: an owned snapshot to apply, and
@@ -1421,6 +1424,20 @@ fn start_ads(
     states.push(SubscriptionState::new(
         EDS_TYPE_URL,
         Subscription::Names(applier.eds_resource_names()),
+    ));
+    // Seeded for the same reason as EDS above, plus one that is not about
+    // subscribing at all: `client.rs`'s pump resolves an incoming response's
+    // `type_url` against THIS list, and a response whose type_url is absent
+    // returns `AdsError::UnknownTypeUrl`, which propagates out of the pump
+    // and tears down the WHOLE ADS stream -- CDS and LDS with it, not just
+    // the secret. So the state is pushed unconditionally, even when the boot
+    // snapshot names no SDS secrets at all: an empty `Names` set sends no
+    // initial request (`SubscriptionState::has_nothing_to_request`), but it
+    // still makes an SDS response the proxy did not ask for a NACK instead of
+    // a disconnect. `Names`, never `Wildcard` -- SDS is by-name like EDS (S8).
+    states.push(SubscriptionState::new(
+        SDS_TYPE_URL,
+        Subscription::Names(applier.sds_resource_names()),
     ));
 
     let mut client = AdsClient::new(states).with_node(node.clone());
