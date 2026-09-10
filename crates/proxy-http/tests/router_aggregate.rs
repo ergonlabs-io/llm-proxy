@@ -76,6 +76,7 @@ fn retry_policy(retry_on: &str, num_retries: u32) -> RetryPolicyIR {
         retry_on: RetryOn::parse(retry_on),
         num_retries,
         per_try_timeout: None,
+        hedge_on_per_try_timeout: false,
         retriable_status_codes: Vec::new(),
         retry_back_off: fast_backoff(),
         host_selection_retry_max_attempts: 1,

@@ -627,6 +627,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "timeout",
             "idle_timeout",
             "retry_policy",
+            "hedge_policy",
             "host_rewrite_literal",
             "prefix_rewrite",
         ],
@@ -641,6 +642,11 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "host_selection_retry_max_attempts",
         ],
         "envoy.config.route.v3.RetryPolicy.RetryBackOff" => &["base_interval", "max_interval"],
+        "envoy.config.route.v3.HedgePolicy" => &[
+            "initial_requests",
+            "additional_request_chance",
+            "hedge_on_per_try_timeout",
+        ],
         "envoy.config.route.v3.RedirectAction" => &[
             "host_redirect",
             "path_redirect",
@@ -4500,11 +4506,55 @@ fn convert_route_action(
         .map(|rp| convert_retry_policy(rp, &format!("{path}.retry_policy")))
         .transpose()?;
 
+    // S3 hedging is deliberately a narrow first increment: Envoy's default
+    // one initial request, no probabilistic extra request, and a replay only
+    // when the per-try timer fires.  Do not accept the other knobs merely to
+    // drop them in the router.
+    let hedge_on_per_try_timeout = match ra.hedge_policy.as_ref() {
+        None => false,
+        Some(hedge) => {
+            if hedge
+                .initial_requests
+                .as_ref()
+                .is_some_and(|requests| *requests != 1)
+            {
+                return Err(unsupported(
+                    format!("{path}.hedge_policy.initial_requests"),
+                    "only the Envoy default of 1 initial request is implemented",
+                ));
+            }
+            if hedge.additional_request_chance.is_some() {
+                return Err(unsupported(
+                    format!("{path}.hedge_policy.additional_request_chance"),
+                    "probabilistic additional requests are not implemented",
+                ));
+            }
+            hedge.hedge_on_per_try_timeout
+        }
+    };
+    if hedge_on_per_try_timeout {
+        let Some(retry) = retry_policy.as_ref() else {
+            return Err(invalid(
+                format!("{path}.hedge_policy.hedge_on_per_try_timeout"),
+                "requires a retry_policy with a per_try_timeout and at least one retry",
+            ));
+        };
+        if retry.per_try_timeout.is_none() || retry.num_retries == 0 {
+            return Err(invalid(
+                format!("{path}.hedge_policy.hedge_on_per_try_timeout"),
+                "requires a retry_policy with a per_try_timeout and at least one retry",
+            ));
+        }
+    }
+
     Ok(ForwardAction {
         target,
         timeout,
         idle_timeout,
-        retry_policy,
+        retry_policy: retry_policy.map(|mut retry| {
+            retry.hedge_on_per_try_timeout = hedge_on_per_try_timeout;
+            retry
+        }),
         host_rewrite_literal: match &ra.host_rewrite_specifier {
             Some(route_v3::route_action::HostRewriteSpecifier::HostRewriteLiteral(h)) => {
                 Some(h.clone())
@@ -4639,6 +4689,7 @@ fn convert_retry_policy(
             .as_ref()
             .map(|d| to_std_duration(d, &format!("{path}.per_try_timeout")))
             .transpose()?,
+        hedge_on_per_try_timeout: false,
         retriable_status_codes: codes,
         retry_back_off,
         host_selection_retry_max_attempts,

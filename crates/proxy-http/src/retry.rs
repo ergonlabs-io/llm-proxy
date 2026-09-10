@@ -3,10 +3,9 @@
 //! Pure logic only: trigger evaluation (S3.2) and fully-jittered exponential
 //! backoff (S3.3) are synchronous, allocation-free functions with randomness
 //! injected through a closure, so every distribution/attempt-count claim can
-//! be pinned with a deterministic unit test. Wiring this into the router --
-//! actually issuing a retried attempt, driving per-try timeouts, hedging --
-//! is a follow-up chunk; this module has no I/O and does not touch
-//! `router.rs`.
+//! be pinned with a deterministic unit test. `router.rs` consumes this pure
+//! state to issue retries, enforce per-try timeouts, and launch safe hedges;
+//! this module itself has no I/O.
 
 use std::time::Duration;
 
@@ -213,11 +212,9 @@ pub struct RetryState<'a> {
     attempts_used: u32,
     /// S3.4: a request whose body was streamed past the buffer limit is not
     /// retriable at all, regardless of what the trigger table says
-    /// (Envoy's `no_retry_body_too_large`). Nothing sets this to `false`
-    /// yet -- request buffering isn't wired up in the router -- so it
-    /// defaults to `true`. It exists now so callers don't get to silently
-    /// assume every request is replayable once that wiring lands; whoever
-    /// adds body buffering must call `mark_body_not_retriable`.
+    /// (Envoy's `no_retry_body_too_large`). The router marks it false when
+    /// its captured request body exceeds the replay limit, so a hedge is
+    /// structurally subject to this same gate as an ordinary retry.
     body_retriable: bool,
 }
 
@@ -289,6 +286,7 @@ mod tests {
             retry_on: RetryOn::parse(retry_on),
             num_retries,
             per_try_timeout: None,
+            hedge_on_per_try_timeout: false,
             retriable_status_codes: vec![429],
             retry_back_off: RetryBackOff::ENVOY_DEFAULT,
             host_selection_retry_max_attempts: 1,
