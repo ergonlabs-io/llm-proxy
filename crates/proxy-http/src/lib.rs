@@ -24,6 +24,7 @@
 
 pub mod access_logging;
 pub mod codec;
+mod credential_provider;
 pub mod filter;
 pub mod filter_manager;
 pub mod handler;

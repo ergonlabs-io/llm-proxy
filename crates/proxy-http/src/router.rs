@@ -85,6 +85,7 @@ use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, T
 use proxy_observability::ResponseFlag;
 
 use crate::codec::UpstreamCodecError;
+use crate::credential_provider::{CredentialProvider, StaticHeaderCredentials};
 use crate::filter::{
     DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
     RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
@@ -1220,25 +1221,6 @@ impl RouterHandler {
                     uri: head.uri.clone(),
                     headers: head.headers.clone(),
                 };
-                // WP-35: apply the *cluster's* header mutations here, inside
-                // the retry loop, to this attempt's own head -- never
-                // hoisted up next to `apply_request_transforms` above, which
-                // only sees the route. `attempt_entry` is the cluster this
-                // attempt actually dialed -- the routed `entry` itself for a
-                // plain cluster, or the resolved member for an aggregate --
-                // so a later attempt that falls back to a different provider
-                // gets that provider's credentials, never a previous
-                // attempt's. This is what keeps a provider credential from
-                // following the routing decision instead of the connection
-                // (see `ClusterConfig::request_headers_to_add`'s doc, and
-                // `ClusterKind::Aggregate`'s for why the member -- not the
-                // aggregate, which carries none -- is what has to supply
-                // this). Applied after the route-level mutations above, so a
-                // cluster-level value wins on a key collision.
-                apply_header_mutations(
-                    attempt_entry.request_headers_to_add(),
-                    &mut attempt_head.headers,
-                );
                 // WP-51 increment 2: propagate this attempt's CLIENT trace
                 // context to the upstream leg -- `HeaderMap::insert`
                 // deliberately (not `append`), so this OVERWRITES any
@@ -1263,6 +1245,25 @@ impl RouterHandler {
                     attempt_head
                         .headers
                         .insert("x-envoy-attempt-count", HeaderValue::from(attempt_number));
+                }
+                // WP-49: apply credentials only after every decode filter
+                // has produced the final body and the router has completed
+                // its own per-attempt header changes. `attempt_entry` is the
+                // member actually dialed, so failover cannot leak another
+                // provider's credential. Static headers are the sole current
+                // implementation; Bedrock's future SigV4 signer belongs at
+                // this exact point because it signs these final bytes.
+                if let Err(err) =
+                    StaticHeaderCredentials::new(attempt_entry.request_headers_to_add())
+                        .apply(&mut attempt_head, &body_bytes)
+                {
+                    tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
+                    dcb.stream_info()
+                        .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
+                    return local_reply(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "provider credential failure",
+                    );
                 }
                 // Rust note: `body_bytes` is plain `Bytes`, cheap
                 // (refcounted) to `.clone()` fresh for every attempt --
@@ -1881,7 +1882,7 @@ fn apply_request_transforms(
 /// using `HeaderMap`'s `contains_key`/`get`/`insert`/`append` (all of which
 /// key off the canonical `HeaderName`) gives case-insensitive matching for
 /// free -- no `.to_ascii_lowercase()` needed anywhere here.
-fn apply_header_mutations(
+pub(crate) fn apply_header_mutations(
     mutations: &[proxy_config::ir::HeaderMutation],
     headers: &mut http::HeaderMap,
 ) {
