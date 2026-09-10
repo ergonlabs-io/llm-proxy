@@ -137,6 +137,7 @@ async fn build_router_with_cluster_mutations(
                 matcher: prefix_matcher("/v1/"),
                 action: RouteActionIR::Forward(fwd),
                 request_headers_to_add: mutations,
+                streaming_strict: false,
                 typed_per_filter_config: BTreeMap::new(),
                 route_index: 0,
                 include_request_attempt_count: false,

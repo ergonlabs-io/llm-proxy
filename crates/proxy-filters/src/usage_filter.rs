@@ -87,6 +87,10 @@ impl HttpFilterFactory for UsageFilterFactory {
         TYPE_URL
     }
 
+    fn may_buffer_response(&self) -> bool {
+        false
+    }
+
     fn create(
         &self,
         config: &DynamicMessage,

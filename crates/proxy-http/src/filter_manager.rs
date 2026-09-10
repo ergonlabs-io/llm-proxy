@@ -320,6 +320,35 @@ fn build_per_route_table(
 ) -> Result<PerRouteTable, ConfigError> {
     let filter_count = names.len();
 
+    // WP-33: the assertion is checked against the factories actually
+    // registered in this listener's chain, not a hand-maintained list in the
+    // config crate. A new filter therefore fails strict routes by default
+    // until its author explicitly documents that its encode path never holds
+    // response bytes (`HttpFilterFactory::may_buffer_response`).
+    for (vhost_idx, vhost) in route_table.virtual_hosts.iter().enumerate() {
+        for route_entry in &vhost.routes {
+            if !route_entry.streaming_strict {
+                continue;
+            }
+            if let Some((filter_idx, _)) = factories
+                .iter()
+                .enumerate()
+                .find(|(_, factory)| factory.may_buffer_response())
+            {
+                return Err(ConfigError::Validation {
+                    field_path: format!(
+                        "{}.virtual_hosts[{vhost_idx}].routes[route_index={}].metadata.filter_metadata[\"io.llmproxy.streaming\"].strict",
+                        route_table.name, route_entry.route_index
+                    ),
+                    rule: format!(
+                        "route requires `streaming: strict`, but HTTP filter '{}' can buffer response bytes",
+                        names[filter_idx]
+                    ),
+                });
+            }
+        }
+    }
+
     let route_config = resolve_per_filter_row(
         &route_table.typed_per_filter_config,
         names,

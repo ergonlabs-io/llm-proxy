@@ -153,6 +153,39 @@ routes:
     }
 }
 
+#[test]
+fn route_streaming_strict_reaches_the_ir_assertion() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - model: "*"
+    provider: openai
+    streaming: strict
+"#,
+    )
+    .expect("strict streaming config must parse");
+    let loaded =
+        lower_to_loaded(&config).expect("strict streaming must survive strict Envoy parsing");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must lower to IR");
+    let listener = snapshot
+        .listeners
+        .get("llmproxy_listener")
+        .expect("simple lowering names its listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("simple listener's first network filter must be an HCM");
+    };
+    let route = &hcm.route_table.virtual_hosts[0].routes[0];
+    assert!(
+        route.streaming_strict,
+        "route metadata must become the IR assertion"
+    );
+}
+
 /// An `https://` provider with an explicit `ca_file` uses it verbatim
 /// (`trusted_ca`), not the system trust store.
 #[test]

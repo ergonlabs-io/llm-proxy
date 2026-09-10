@@ -600,6 +600,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "route",
             "redirect",
             "direct_response",
+            "metadata",
             "request_headers_to_add",
             "typed_per_filter_config",
         ],
@@ -3402,6 +3403,52 @@ fn provider_auth_string_field(
 /// later increment plumbs the cluster value through to it.
 const USAGE_DIALECT_METADATA_KEY: &str = "io.llmproxy.usage";
 
+/// Namespace for the route-level strict streaming assertion.  Route metadata
+/// is an Envoy-native extensibility carrier, so the simple dialect can express
+/// this without inventing a field that the strict Envoy parser would discard.
+const STREAMING_METADATA_KEY: &str = "io.llmproxy.streaming";
+
+/// Read `Route.metadata.filter_metadata["io.llmproxy.streaming"]`.
+///
+/// The only accepted form is `{ strict: true }`.  `false` is rejected instead
+/// of silently acting like an absent assertion: the simple dialect exposes an
+/// enum (`streaming: strict`), not a boolean whose false value has ambiguous
+/// compatibility semantics.
+fn convert_streaming_strict_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<bool, ConfigError> {
+    let Some(streaming) = metadata.and_then(|m| m.filter_metadata.get(STREAMING_METADATA_KEY))
+    else {
+        return Ok(false);
+    };
+    let streaming_path = format!("{path}.metadata.filter_metadata[\"{STREAMING_METADATA_KEY}\"]");
+    let mut unknown: Vec<&String> = streaming
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "strict")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{streaming_path}.{key}"),
+            format!("`{STREAMING_METADATA_KEY}` only supports `strict: true`"),
+        ));
+    }
+    match streaming.fields.get("strict").and_then(|v| v.kind.as_ref()) {
+        Some(prost_types::value::Kind::BoolValue(true)) => Ok(true),
+        Some(prost_types::value::Kind::BoolValue(false)) => Err(invalid(
+            format!("{streaming_path}.strict"),
+            "must be true; omit `io.llmproxy.streaming` when strict streaming is not required",
+        )),
+        Some(_) => Err(invalid(
+            format!("{streaming_path}.strict"),
+            "must be a boolean",
+        )),
+        None => Err(invalid(format!("{streaming_path}.strict"), "is required")),
+    }
+}
+
 /// Lower `Cluster.metadata.filter_metadata["io.llmproxy.usage"]` into
 /// [`ClusterConfig::usage_dialect`]. The expected shape is
 /// `{ dialect: "openai" | "anthropic" }`.
@@ -4360,12 +4407,14 @@ fn convert_route(
         &r.typed_per_filter_config,
         &format!("{path}.typed_per_filter_config"),
     )?;
+    let streaming_strict = convert_streaming_strict_metadata(r.metadata.as_ref(), path)?;
 
     Ok(RouteEntry {
         name: (!r.name.is_empty()).then(|| r.name.clone()),
         matcher,
         action,
         request_headers_to_add,
+        streaming_strict,
         typed_per_filter_config,
         // Rust note: real value assigned in bulk by `RouteTable::new` (via
         // `Arc::get_mut`) once every route in the table has been built --

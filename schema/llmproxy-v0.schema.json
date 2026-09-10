@@ -305,6 +305,10 @@
           "$ref": "#/$defs/Duration",
           "default": "90s",
           "description": "Maximum time with NO bytes flowing (between response chunks / SSE events / WebSocket frames). There is deliberately no total-duration timeout by default — LLM generations and realtime sessions are long-lived; idle-based timeouts are the correct guard."
+        },
+        "streaming": {
+          "enum": ["strict"],
+          "description": "Assert that every configured HTTP filter for this route flushes response bytes through. Configuration loading fails if any installed filter can buffer a response; omit this field for the normal streaming-by-default behavior."
         }
       }
     },

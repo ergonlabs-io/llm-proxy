@@ -1230,6 +1230,10 @@ pub struct RouteEntry {
     pub action: RouteActionIR,
     /// Request header mutations applied on match.
     pub request_headers_to_add: Vec<HeaderMutation>,
+    /// A route-level assertion that every configured HTTP filter flushes
+    /// response bytes through.  It is validated against the real filter
+    /// factories while the listener chain is built.
+    pub streaming_strict: bool,
     /// `Route.typed_per_filter_config`.
     pub typed_per_filter_config: BTreeMap<String, PerFilterConfig>,
     /// Dense index, unique within the owning [`RouteTable`], assigned by

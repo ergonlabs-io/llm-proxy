@@ -756,6 +756,17 @@ pub trait HttpFilterFactory: Send + Sync {
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError>;
 
+    /// Whether this filter can buffer response-body bytes.  The default is
+    /// deliberately conservative: a newly-added filter must explicitly opt
+    /// into a route's `streaming: strict` assertion after its encode path has
+    /// been shown to flush through.
+    ///
+    /// This is a config-time capability, not a promise about one particular
+    /// request. A filter that conditionally buffers still returns `true`.
+    fn may_buffer_response(&self) -> bool {
+        true
+    }
+
     /// Parse per-route overrides. Default: this filter has no per-route config.
     fn parse_per_route(
         &self,
