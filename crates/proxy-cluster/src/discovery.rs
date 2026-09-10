@@ -75,6 +75,7 @@ pub(crate) fn static_hosts(endpoints: &[EndpointIR]) -> io::Result<Vec<Arc<Host>
             Ok(Arc::new(Host {
                 address: SocketAddr::new(ip, e.port),
                 hostname: None,
+                metadata: e.metadata.clone(),
                 weight: e.weight,
                 priority: e.priority,
                 health_flags: HealthFlags::default(),
@@ -97,6 +98,7 @@ async fn strict_dns_hosts(
             Arc::new(Host {
                 address: SocketAddr::new(ip, e.port),
                 hostname: Some(e.host.clone()),
+                metadata: e.metadata.clone(),
                 weight: e.weight,
                 priority: e.priority,
                 health_flags: HealthFlags::default(),
@@ -121,6 +123,7 @@ async fn logical_dns_hosts(
             hosts.push(Arc::new(Host {
                 address: SocketAddr::new(ip, e.port),
                 hostname: Some(e.host.clone()),
+                metadata: e.metadata.clone(),
                 weight: e.weight,
                 priority: e.priority,
                 health_flags: HealthFlags::default(),

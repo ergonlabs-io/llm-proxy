@@ -355,6 +355,7 @@ fn apply_health_transition(host_set: &ArcSwap<HostSet>, addr: SocketAddr, status
                     Arc::new(Host {
                         address: h.address,
                         hostname: h.hostname.clone(),
+                        metadata: h.metadata.clone(),
                         weight: h.weight,
                         priority: h.priority,
                         health_flags: HealthFlags {
@@ -450,6 +451,7 @@ mod tests {
         Arc::new(Host {
             address: addr,
             hostname: None,
+            metadata: Default::default(),
             weight: 1,
             priority,
             health_flags: HealthFlags::default(),

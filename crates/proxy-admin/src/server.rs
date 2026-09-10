@@ -53,7 +53,7 @@ use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::dump::{ClusterDump, ConfigDump};
+use crate::dump::{clusters_from_snapshot_and_live, ClusterDump, ConfigDump, LiveCluster};
 
 /// The endpoints this crate serves, used both to route requests and to list
 /// "available endpoints" in a 404 body. `{id}` segments are literal in this
@@ -129,6 +129,13 @@ pub enum Readiness {
 /// callers (mostly tests) that never had a `ClusterManager` to ask.
 pub type ReadinessProbe = Arc<dyn Fn() -> Readiness + Send + Sync>;
 
+/// Supplies a runtime host-set snapshot for one config snapshot. Keeping this
+/// as an injected closure preserves the admin crate's control-plane-only
+/// dependency direction: the binary can adapt `ClusterManager` state without
+/// making this crate depend on the data plane or on generated protos.
+pub type ClusterStateProvider =
+    Arc<dyn Fn(&proxy_config::ir::ConfigSnapshot) -> Vec<LiveCluster> + Send + Sync>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("admin server failed to bind {addr}: {source}")]
@@ -191,6 +198,9 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
 /// the fail-closed semantics -- READ endpoints are unaffected by it.
 /// `readiness` (WP-21 increment 3) answers `/ready`; see [`ReadinessProbe`]'s
 /// doc for why it is an injected closure and what `None` means.
+/// `cluster_state` (WP-57) supplies the current host sets for `/clusters`.
+/// Passing `None` preserves the standalone config-only view used by older
+/// embedders and tests; the shipped binary always passes the real provider.
 ///
 /// Rust note: `TcpListener::accept` runs in a loop inside a `tokio::spawn`led
 /// task; each accepted connection gets its own further-spawned task running
@@ -205,6 +215,7 @@ pub async fn serve(
     factory_state: Arc<SharedFactoryState>,
     admin_token: Option<String>,
     readiness: Option<ReadinessProbe>,
+    cluster_state: Option<ClusterStateProvider>,
 ) -> Result<AdminServer, AdminError> {
     let admin_token = normalize_admin_token(admin_token);
     let listener = TcpListener::bind(addr)
@@ -229,6 +240,7 @@ pub async fn serve(
             let factory_state = factory_state.clone();
             let admin_token = admin_token.clone();
             let readiness = readiness.clone();
+            let cluster_state = cluster_state.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let config = config.clone();
@@ -236,6 +248,7 @@ pub async fn serve(
                     let factory_state = factory_state.clone();
                     let admin_token = admin_token.clone();
                     let readiness = readiness.clone();
+                    let cluster_state = cluster_state.clone();
                     async move {
                         Ok::<_, std::convert::Infallible>(
                             handle(
@@ -246,6 +259,7 @@ pub async fn serve(
                                 &factory_state,
                                 admin_token.as_deref(),
                                 readiness.as_ref(),
+                                cluster_state.as_ref(),
                             )
                             .await,
                         )
@@ -275,6 +289,7 @@ async fn handle(
     factory_state: &SharedFactoryState,
     admin_token: Option<&str>,
     readiness: Option<&ReadinessProbe>,
+    cluster_state: Option<&ClusterStateProvider>,
 ) -> Response<Full<Bytes>> {
     // ---- Read endpoints: byte-for-byte the read-only increment's behavior,
     // no gate, matched on path alone (as before -- these never distinguished
@@ -299,12 +314,18 @@ async fn handle(
         }
         "/clusters" => {
             let snapshot = config.load();
-            let mut clusters: Vec<ClusterDump> = snapshot
-                .clusters
-                .values()
-                .map(|c| ClusterDump::from_ir(c))
-                .collect();
-            clusters.sort_by(|a, b| a.name.cmp(&b.name));
+            let clusters = match cluster_state {
+                Some(provider) => clusters_from_snapshot_and_live(&snapshot, &provider(&snapshot)),
+                None => {
+                    let mut clusters: Vec<ClusterDump> = snapshot
+                        .clusters
+                        .values()
+                        .map(|c| ClusterDump::from_ir(c))
+                        .collect();
+                    clusters.sort_by(|a, b| a.name.cmp(&b.name));
+                    clusters
+                }
+            };
             return json(StatusCode::OK, &clusters);
         }
         "/server_info" => {
