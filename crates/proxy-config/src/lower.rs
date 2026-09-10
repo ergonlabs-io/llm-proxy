@@ -404,6 +404,15 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "poll_interval_seconds",
         ],
         "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
+        // WP-47 increment 2: the owned token-budget shape.  Keep both fields
+        // here even though the factory performs the required/value checks:
+        // this is the forward-compat guard that rejects a future proto field
+        // until a reader is deliberately added.
+        "llmproxy.filters.v0.TokenLimit" => &["max_tokens", "fill_rate"],
+        // One-release compatibility for the old borrowed token-limit type.
+        // RateLimitSettings has unrelated xDS fields; accepting any of them
+        // would claim the limiter honors a knob it never reads.
+        "envoy.config.core.v3.RateLimitSettings" => &["max_tokens", "fill_rate"],
         // WP-62 increment 3: the Redis-backed shared store. `url` is an
         // `envoy.config.core.v3.DataSource`, already listed above under its
         // own entry -- same reasoning as `hmac_secret`.
@@ -1646,7 +1655,11 @@ fn convert_upgrade_configs(
 // equal to the filters' own -- pinning a private copy the test re-declares
 // would pin nothing.
 pub const AUTH_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
-pub const TOKEN_LIMIT_FILTER_TYPE: &str =
+pub const TOKEN_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
+/// One-release compatibility alias for the WP-47 token-limit migration.
+/// Kept public so the ordering tests pin its relationship to the filter
+/// factory just as they pin the canonical type URL.
+pub const LEGACY_TOKEN_LIMIT_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
 pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
 pub const BODY_REWRITE_FILTER_TYPE: &str =
@@ -1731,10 +1744,23 @@ fn check_lane_h_filter_order(
     http_filters: &[HttpFilterSpec],
     path: &str,
 ) -> Result<(), ConfigError> {
-    // Rust note: `position` returns the index of the FIRST match. A duplicate
-    // Lane-H filter is already impossible -- `FilterRegistry` keys on
-    // `type_url` -- so first-match is the only match.
-    let index_of = |type_url: &str| http_filters.iter().position(|f| f.type_url == type_url);
+    // A duplicate exact type URL is impossible (`FilterRegistry` keys on it),
+    // but WP-47 keeps one legacy TokenLimit alias registered for a release.
+    // A chain may therefore contain one old and one canonical limiter, so
+    // each ordering rule must inspect EVERY matching position rather than
+    // only the first and accidentally leave one unprotected.
+    let indices_of = |type_urls: &[&str]| {
+        http_filters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, f)| {
+                type_urls
+                    .iter()
+                    .any(|type_url| f.type_url == *type_url)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>()
+    };
 
     let rules = [
         (
@@ -1801,15 +1827,27 @@ fn check_lane_h_filter_order(
     for (first_type, first_name, second_type, second_name, reason) in rules {
         // A rule only applies when BOTH filters are present -- either one
         // alone is a perfectly ordinary chain.
-        if let (Some(first), Some(second)) = (index_of(first_type), index_of(second_type)) {
-            if first > second {
-                return Err(invalid(
-                    format!("{path}.http_filters[{first}]"),
-                    format!(
-                        "`{first_name}` must be configured BEFORE `{second_name}` \
-                         (currently at index {second}): {reason}"
-                    ),
-                ));
+        let first_types = if first_type == TOKEN_LIMIT_FILTER_TYPE {
+            &[TOKEN_LIMIT_FILTER_TYPE, LEGACY_TOKEN_LIMIT_FILTER_TYPE][..]
+        } else {
+            &[first_type][..]
+        };
+        let second_types = if second_type == TOKEN_LIMIT_FILTER_TYPE {
+            &[TOKEN_LIMIT_FILTER_TYPE, LEGACY_TOKEN_LIMIT_FILTER_TYPE][..]
+        } else {
+            &[second_type][..]
+        };
+        for first in indices_of(first_types) {
+            for second in indices_of(second_types) {
+                if first > second {
+                    return Err(invalid(
+                        format!("{path}.http_filters[{first}]"),
+                        format!(
+                            "`{first_name}` must be configured BEFORE `{second_name}` \
+                             (currently at index {second}): {reason}"
+                        ),
+                    ));
+                }
             }
         }
     }

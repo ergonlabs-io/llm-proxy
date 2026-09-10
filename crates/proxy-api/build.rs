@@ -42,6 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // root NOT under `vendor/envoy`: `scripts/vendor-protos.sh` does not
         // manage it, because it is ours and is not re-fetched on a proto bump.
         "llmproxy/filters/v0/auth.proto",
+        // WP-47 increment 2: owned token-budget configuration.  The legacy
+        // Envoy RateLimitSettings decoder remains registered for one release,
+        // but new configs lower to this message.
+        "llmproxy/filters/v0/token_limit.proto",
         // WP-50 increment 3a: per-tenant model allow-lists.
         "llmproxy/filters/v0/model_authz.proto",
         // WP-50 increment 3c-i: the spend-budget filter's (cluster, model)

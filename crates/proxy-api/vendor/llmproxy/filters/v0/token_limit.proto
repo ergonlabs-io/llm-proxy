@@ -1,0 +1,29 @@
+// Token-budget configuration for the llm-proxy data plane (WP-34 / WP-47).
+//
+// This owns the limiter's vocabulary instead of borrowing Envoy's
+// RateLimitSettings, whose similarly named fields configure xDS discovery
+// throttling rather than request token budgets.  It intentionally describes
+// the one-rule thin slice implemented today.  Future descriptor/bucket-key
+// work can extend this versioned message without reusing another Envoy type.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+// Configures `llmproxy.token_limit`.
+message TokenLimit {
+  // Required. The largest total token cost admitted in one fixed window.
+  //
+  // This is a uint64 rather than the uint32 wrapper on the retired Envoy
+  // stand-in: a budget is our domain value and LimitRule already represents it
+  // as uint64.  `optional` preserves presence, so an omitted value is a
+  // precise configuration error instead of proto3's ambiguous zero default.
+  optional uint64 max_tokens = 1;
+
+  // Required. Tokens earned per second.  The fixed-window implementation
+  // derives its window as max_tokens / fill_rate seconds.
+  //
+  // `optional` distinguishes an omitted value from an explicit zero, letting
+  // validation report the right field for each invalid configuration.
+  optional double fill_rate = 2;
+}
