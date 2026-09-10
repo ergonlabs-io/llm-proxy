@@ -1,6 +1,6 @@
 //! Per-stream bookkeeping shared by filters, the router, access logs, and stats.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proxy_observability::trace::TraceContext;
 use proxy_observability::ResponseFlag;
@@ -44,6 +44,26 @@ impl LlmTokenUsage {
     }
 }
 
+/// The response wire system the usage filter identified for a stream.
+///
+/// This stays a small closed enum rather than a caller-provided string: it is
+/// used as an OTel `gen_ai.system` attribute, so accepting arbitrary values
+/// here would create a cardinality path from the request into metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenAiSystem {
+    OpenAi,
+    Anthropic,
+}
+
+impl GenAiSystem {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// WP-33: the GenAI observations for one stream, filled in by the usage filter
 /// on the encode path.
 ///
@@ -54,8 +74,18 @@ impl LlmTokenUsage {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LlmStats {
     pub usage: Option<LlmTokenUsage>,
+    /// The response dialect selected from the route's usage-filter config.
+    /// `None` means no usage filter ran, so GenAI latency metrics must not
+    /// guess a system from a cluster name.
+    pub system: Option<GenAiSystem>,
     /// Time-to-first-token: response headers → first byte of response body.
     pub time_to_first_byte: Option<Duration>,
+    /// Time from the downstream request entering the filter chain to the
+    /// first response-body byte. Unlike `time_to_first_byte`, this includes
+    /// the upstream's time to headers and is the value OTel latency metrics
+    /// need. It intentionally leaves the existing access-log TTFT meaning
+    /// unchanged.
+    pub time_to_first_body_byte: Option<Duration>,
     /// Largest gap between two consecutive body chunks — the tail of the TPOT
     /// (time-per-output-token) distribution, which is what users feel as a
     /// stall. The full histogram lands with stats in WP-33b.
@@ -107,8 +137,13 @@ pub struct AuthInfo {
 /// `router::apply_forward` (flags, upstream host/cluster, protocol, at the
 /// dial site) and `router::logging::LoggingBody` (`bytes_sent`, finalized at
 /// stream end, not at header-flush time).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamInfo {
+    /// Monotonic baseline established when this stream enters the HCM. Kept
+    /// private to this crate; filters publish only derived durations so no
+    /// cross-crate API can accidentally compare `Instant`s from unrelated
+    /// streams.
+    pub(crate) request_started_at: Instant,
     // Rust note: private field + public accessor methods below keep the
     // "no duplicate flags" invariant enforceable in one place.
     response_flags: Vec<ResponseFlag>,
@@ -180,7 +215,35 @@ pub struct StreamInfo {
     pub on_upgrade: Option<hyper::upgrade::OnUpgrade>,
 }
 
+impl Default for StreamInfo {
+    fn default() -> Self {
+        Self {
+            request_started_at: Instant::now(),
+            response_flags: Vec::new(),
+            response_code_details: None,
+            is_local_reply: false,
+            upstream_host: None,
+            upstream_cluster: None,
+            protocol: None,
+            bytes_received: 0,
+            bytes_sent: 0,
+            llm: LlmStats::default(),
+            auth: AuthInfo::default(),
+            requested_model: None,
+            trace: None,
+            on_upgrade: None,
+        }
+    }
+}
+
 impl StreamInfo {
+    /// Returns `now - request_started_at` without exposing the raw monotonic
+    /// instant outside `proxy-http`. Encode filters use this to publish an
+    /// end-to-end first-body-byte duration for OTel metrics.
+    pub fn elapsed_since_request_started(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.request_started_at)
+    }
+
     pub fn set_response_flag(&mut self, flag: ResponseFlag) {
         if !self.response_flags.contains(&flag) {
             self.response_flags.push(flag);

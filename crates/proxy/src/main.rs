@@ -1697,8 +1697,12 @@ async fn worker_main(
     // above -- this is what `crate::listener::build_hcm_handler` wires into
     // every real `FilterChainHandler` it builds, via `.with_token_stats`.
     let token_stats = Arc::new(proxy_http::stat_handles::GenAiTokenStats::new(
-        stats_registry,
+        stats_registry.clone(),
         token_usage_stat_handles,
+        proxy_observability::stats::WorkerId(ctx.id.0),
+    ));
+    let latency_stats = Arc::new(proxy_http::stat_handles::GenAiLatencyStats::new(
+        stats_registry,
         proxy_observability::stats::WorkerId(ctx.id.0),
     ));
 
@@ -1706,6 +1710,7 @@ async fn worker_main(
         router: router_stats,
         downstream: downstream_stats,
         token: token_stats,
+        latency: latency_stats,
         tracing: tracing_handles,
     };
 

@@ -42,6 +42,7 @@ use proxy_http::filter::{
     FilterTrailersStatus, HttpFilter, HttpFilterFactory, PerRouteConfig, ResponseHeaders,
     ResponseTrailers,
 };
+use proxy_http::stream_info::GenAiSystem;
 use proxy_http::LlmTokenUsage;
 
 use crate::usage::{extract_json_usage, Dialect, SseUsageScanner, TokenUsage};
@@ -147,6 +148,7 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
             headers_at: None,
             last_chunk_at: None,
             time_to_first_byte: None,
+            time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 0,
             finalized: false,
@@ -184,6 +186,10 @@ struct UsageFilterInstance {
     /// from `Some(Instant)` meaning "seen one, here's when".
     last_chunk_at: Option<Instant>,
     time_to_first_byte: Option<Duration>,
+    /// Request-entered-HCM → first response-body byte. Kept separately from
+    /// `time_to_first_byte`, whose response-header baseline is an
+    /// access-log compatibility contract.
+    time_to_first_body_byte: Option<Duration>,
     max_inter_chunk: Option<Duration>,
     response_chunks: u64,
     /// Guards against writing `StreamInfo` twice — `encode_data` with
@@ -217,7 +223,7 @@ impl UsageFilterInstance {
     /// Update chunk-timing bookkeeping for one arriving body chunk. Called
     /// once per `encode_data`, before the chunk is handed to the body-mode
     /// scanner, so timing is tracked even in [`BodyMode::Inert`].
-    fn record_chunk_timing(&mut self) {
+    fn record_chunk_timing(&mut self, cb: &mut dyn EncoderCallbacks) {
         let now = Instant::now();
         // The gap is measured from the previous chunk, or — for the very
         // first chunk — from when headers flushed (the TTFT definition).
@@ -227,6 +233,8 @@ impl UsageFilterInstance {
 
         if self.response_chunks == 0 {
             self.time_to_first_byte = Some(gap);
+            self.time_to_first_body_byte =
+                Some(cb.stream_info().elapsed_since_request_started(now));
         } else {
             self.max_inter_chunk = Some(match self.max_inter_chunk {
                 Some(running_max) => running_max.max(gap),
@@ -270,7 +278,12 @@ impl UsageFilterInstance {
         // response that reported no usage at all (WP-34's rule; this number
         // feeds billing, and a wrong zero is worse than an honest "unknown").
         stream_info.llm.usage = usage.map(LlmTokenUsage::from);
+        stream_info.llm.system = Some(match self.dialect {
+            Dialect::OpenAi | Dialect::OpenAiResponses => GenAiSystem::OpenAi,
+            Dialect::Anthropic => GenAiSystem::Anthropic,
+        });
         stream_info.llm.time_to_first_byte = self.time_to_first_byte;
+        stream_info.llm.time_to_first_body_byte = self.time_to_first_body_byte;
         stream_info.llm.max_inter_chunk = self.max_inter_chunk;
         stream_info.llm.response_chunks = self.response_chunks;
     }
@@ -320,7 +333,7 @@ impl HttpFilter for UsageFilterInstance {
         // (`%LLM_TTFT%` and `%LLM_TPOT%` were unaffected: TTFT is the first
         // gap and TPOT divides by `output_tokens`, not by this count.)
         if !data.is_empty() {
-            self.record_chunk_timing();
+            self.record_chunk_timing(cb);
         }
 
         match &mut self.mode {
@@ -476,6 +489,7 @@ mod tests {
             headers_at: None,
             last_chunk_at: None,
             time_to_first_byte: None,
+            time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 0,
             finalized: false,

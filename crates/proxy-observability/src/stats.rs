@@ -346,6 +346,20 @@ pub const ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS: [f64; 19] = [
     60000.0, 300000.0, 600000.0, 1800000.0, 3600000.0,
 ];
 
+/// OTel GenAI v1.27's recommended explicit boundaries for time to first
+/// token, in seconds. These deliberately do not reuse Envoy's millisecond
+/// request-time buckets: an instrument's unit and its boundaries are one
+/// contract, and these names are exported through OTLP as OTel metrics.
+pub const GEN_AI_TIME_TO_FIRST_TOKEN_BUCKETS_SECONDS: [f64; 16] = [
+    0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
+
+/// OTel GenAI v1.27's recommended explicit boundaries for time per output
+/// token, in seconds.
+pub const GEN_AI_TIME_PER_OUTPUT_TOKEN_BUCKETS_SECONDS: [f64; 13] = [
+    0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5,
+];
+
 /// Which OTel instrument shape a metric follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstrumentKind {
@@ -400,7 +414,10 @@ pub struct Instrument {
 /// increment 5). Named `instruments` so call sites read as
 /// `instruments::UPSTREAM_RQ`, matching the design brief's own examples.
 pub mod instruments {
-    use super::{Instrument, InstrumentKind, ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS};
+    use super::{
+        Instrument, InstrumentKind, ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS,
+        GEN_AI_TIME_PER_OUTPUT_TOKEN_BUCKETS_SECONDS, GEN_AI_TIME_TO_FIRST_TOKEN_BUCKETS_SECONDS,
+    };
 
     /// Upstream requests issued to a cluster, one per request.
     ///
@@ -552,6 +569,40 @@ pub mod instruments {
         unit: "ms",
         attribute_keys: &["cluster"],
         buckets: Some(&ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS),
+    };
+
+    /// OTel GenAI semantic conventions v1.27: proxy-observed time from
+    /// receiving the downstream request to the first response-body byte.
+    ///
+    /// This is emitted only for successful LLM responses whose route exposed
+    /// a trusted body-derived model name. `gen_ai.request.model` is therefore
+    /// never fabricated from a provider/cluster name, and its unbounded input
+    /// is capped by `GenAiLatencyStats` before it reaches the registry.
+    pub const GEN_AI_SERVER_TIME_TO_FIRST_TOKEN: Instrument = Instrument {
+        name: "gen_ai.server.time_to_first_token",
+        kind: InstrumentKind::Histogram,
+        unit: "s",
+        attribute_keys: &[
+            "gen_ai.operation.name",
+            "gen_ai.request.model",
+            "gen_ai.system",
+        ],
+        buckets: Some(&GEN_AI_TIME_TO_FIRST_TOKEN_BUCKETS_SECONDS),
+    };
+
+    /// OTel GenAI semantic conventions v1.27: proxy-observed mean decode
+    /// time per output token after the first token. See the recorder for the
+    /// exact eligibility and arithmetic rules.
+    pub const GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN: Instrument = Instrument {
+        name: "gen_ai.server.time_per_output_token",
+        kind: InstrumentKind::Histogram,
+        unit: "s",
+        attribute_keys: &[
+            "gen_ai.operation.name",
+            "gen_ai.request.model",
+            "gen_ai.system",
+        ],
+        buckets: Some(&GEN_AI_TIME_PER_OUTPUT_TOKEN_BUCKETS_SECONDS),
     };
 }
 
@@ -1082,6 +1133,52 @@ impl Registry {
             return self.resolve(instrument, overflow_attrs);
         }
         self.resolve(instrument, attrs)
+    }
+
+    /// Histogram counterpart to [`Self::resolve_capped`]. This is the one
+    /// deliberate worker-side histogram-resolution escape hatch: the model
+    /// name comes from a request body and therefore cannot be pre-resolved at
+    /// boot, but it must not make a public proxy an unbounded-series source.
+    /// Existing series always retain their handles; only new attribute sets
+    /// past `ceiling` fold into the supplied shared overflow series.
+    pub fn resolve_histogram_capped(
+        &self,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+        ceiling: usize,
+        overflow_attrs: &[(&str, &str)],
+    ) -> HistogramHandle {
+        assert_eq!(
+            instrument.kind,
+            InstrumentKind::Histogram,
+            "stats::Registry::resolve_histogram_capped: {} is not a Histogram",
+            instrument.name
+        );
+        Self::validate_attrs(instrument, attrs);
+        Self::validate_attrs(instrument, overflow_attrs);
+
+        let key = Self::resolve_key(instrument, attrs);
+        {
+            let control = self
+                .control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&handle) = control.histogram_lookup.get(&key) {
+                return handle;
+            }
+        }
+
+        let already_resolved = self
+            .published
+            .load()
+            .resolved_histograms
+            .iter()
+            .filter(|i| i.name == instrument.name)
+            .count();
+        if already_resolved >= ceiling {
+            return self.resolve_histogram(instrument, overflow_attrs);
+        }
+        self.resolve_histogram(instrument, attrs)
     }
 
     /// Builds the sorted `(instrument.name, attrs)` dedup key shared by
@@ -2297,6 +2394,42 @@ mod tests {
             early, early_again,
             "a tenant given its own series before the ceiling tripped must keep it"
         );
+    }
+
+    #[test]
+    fn resolve_histogram_capped_folds_new_models_into_one_shared_overflow_series() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let overflow_attrs = [
+            ("gen_ai.operation.name", "chat"),
+            ("gen_ai.request.model", "-cardinality-overflow-"),
+            ("gen_ai.system", "openai"),
+        ];
+        let resolve = |model: &str| {
+            registry.resolve_histogram_capped(
+                &instruments::GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.request.model", model),
+                    ("gen_ai.system", "openai"),
+                ],
+                2,
+                &overflow_attrs,
+            )
+        };
+
+        let a = resolve("model-a");
+        let b = resolve("model-b");
+        let c = resolve("model-c");
+        let d = resolve("model-d");
+
+        assert_ne!(a, b, "two models fit below the ceiling");
+        assert_eq!(
+            c, d,
+            "new models above the ceiling must share the overflow histogram"
+        );
+        assert_ne!(c, a);
+        assert_eq!(c, resolve("-cardinality-overflow-"));
     }
 
     #[test]

@@ -37,7 +37,7 @@ use proxy_http::filter::{
 use proxy_http::filter_manager::{ConfiguredHttpFilter, FilterChainHandler};
 use proxy_http::handler::{DownstreamInfo, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
-use proxy_http::stat_handles::{DownstreamStats, GenAiTokenStats, RouterStats};
+use proxy_http::stat_handles::{DownstreamStats, GenAiLatencyStats, GenAiTokenStats, RouterStats};
 use proxy_observability::trace::SpanSink;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
@@ -267,6 +267,7 @@ fn build_listener_hcm(
     cluster_manager: &Arc<ClusterManager>,
     router_stats: &Arc<RouterStats>,
     token_stats: &Arc<GenAiTokenStats>,
+    latency_stats: &Arc<GenAiLatencyStats>,
     tracing_handles: Option<&TracingHandles>,
     factory_state: &Arc<SharedFactoryState>,
 ) -> Result<ListenerHcm, HttpFilterChainBuildError> {
@@ -281,6 +282,7 @@ fn build_listener_hcm(
                     cluster_manager,
                     router_stats,
                     token_stats,
+                    latency_stats,
                     tracing_handles,
                     factory_state,
                 )?)
@@ -302,6 +304,7 @@ fn build_listener_hcm(
                 cluster_manager,
                 router_stats,
                 token_stats,
+                latency_stats,
                 tracing_handles,
                 factory_state,
             )?)
@@ -401,6 +404,7 @@ pub struct StatsRecorders {
     pub router: Arc<RouterStats>,
     pub downstream: Arc<DownstreamStats>,
     pub token: Arc<GenAiTokenStats>,
+    pub latency: Arc<GenAiLatencyStats>,
     /// This worker's span sink + head-sampling ratio, if
     /// `ConfigSnapshot::tracing` is `Some` -- `None` (tracing off) means
     /// [`build_hcm_handler`] never calls `FilterChainHandler::with_tracing`/
@@ -459,6 +463,7 @@ struct WorkerShared<'a> {
     /// `FilterChainHandler` via
     /// [`proxy_http::filter_manager::FilterChainHandler::with_token_stats`].
     token_stats: &'a Arc<GenAiTokenStats>,
+    latency_stats: &'a Arc<GenAiLatencyStats>,
     /// WP-51 increment 2: this worker's span sink + head-sampling ratio, if
     /// `ConfigSnapshot::tracing` is `Some` -- same per-worker cadence as
     /// `token_stats` above, threaded down to [`build_hcm_handler`], which
@@ -494,6 +499,7 @@ fn spawn_bound(
         shared.cluster_manager,
         shared.router_stats,
         shared.token_stats,
+        shared.latency_stats,
         shared.tracing.as_ref(),
         shared.factory_state,
     )?;
@@ -517,6 +523,7 @@ fn spawn_bound(
             router_stats: shared.router_stats.clone(),
             downstream_stats: shared.downstream_stats.clone(),
             token_stats: shared.token_stats.clone(),
+            latency_stats: shared.latency_stats.clone(),
             tracing_handles: shared.tracing.clone(),
             factory_state: shared.factory_state.clone(),
             secret_registry: shared.secret_registry.clone(),
@@ -583,6 +590,7 @@ pub fn initial_bind(
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
         token_stats: &stats.token,
+        latency_stats: &stats.latency,
         tracing: &stats.tracing,
         factory_state,
         secret_registry,
@@ -636,6 +644,7 @@ struct AcceptLoopShared {
     /// rebuild (on a snapshot version change) calls [`build_listener_hcm`]
     /// again directly.
     token_stats: Arc<GenAiTokenStats>,
+    latency_stats: Arc<GenAiLatencyStats>,
     /// This worker's span sink + head-sampling ratio -- see
     /// [`WorkerShared::tracing`]; needed here for the identical reason
     /// `token_stats` is (the runtime HCM rebuild below). Named
@@ -677,6 +686,7 @@ fn spawn_accept_loop(
         router_stats,
         downstream_stats,
         token_stats,
+        latency_stats,
         tracing_handles,
         factory_state,
         secret_registry,
@@ -752,6 +762,7 @@ fn spawn_accept_loop(
                         &cluster_manager,
                         &router_stats,
                         &token_stats,
+                        &latency_stats,
                         tracing_handles.as_ref(),
                         &factory_state,
                     ) {
@@ -1212,6 +1223,7 @@ fn build_hcm_handler(
     cluster_manager: &Arc<ClusterManager>,
     router_stats: &Arc<RouterStats>,
     token_stats: &Arc<GenAiTokenStats>,
+    latency_stats: &Arc<GenAiLatencyStats>,
     tracing_handles: Option<&TracingHandles>,
     factory_state: &Arc<SharedFactoryState>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
@@ -1327,6 +1339,7 @@ fn build_hcm_handler(
         reason: format!("failed to build filter chain: {e}"),
     })?
     .with_token_stats(token_stats.clone());
+    handler = handler.with_gen_ai_latency_stats(latency_stats.clone());
     // WP-51 increment 2: `.with_tracing` on the FilterChainHandler half of
     // this build -- see the `router_factory` one above for the other half
     // (the CLIENT-span-emitting router terminal); this half is what mints
@@ -1472,6 +1485,7 @@ fn reconcile(
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
         token_stats: &stats.token,
+        latency_stats: &stats.latency,
         tracing: &stats.tracing,
         factory_state,
         secret_registry,
@@ -2137,6 +2151,15 @@ mod tests {
         ))
     }
 
+    fn latency_stats_for(
+        control: &proxy_observability::stats::StatsControl,
+    ) -> Arc<GenAiLatencyStats> {
+        Arc::new(GenAiLatencyStats::new(
+            control.registry(),
+            proxy_observability::stats::WorkerId(0),
+        ))
+    }
+
     async fn spawn_manager(initial: Arc<ConfigSnapshot>) -> Harness {
         let config = Arc::new(WorkerConfigHandle::new(initial.clone()));
         let (config_tx, config_rx) = watch::channel(initial.version);
@@ -2148,6 +2171,7 @@ mod tests {
             router: router_stats_for(&stats_control, &initial),
             downstream: downstream_stats_for(&stats_control, &initial),
             token: token_stats_for(&stats_control, &initial),
+            latency: latency_stats_for(&stats_control),
             tracing: None,
         };
         let factory_state = Arc::new(SharedFactoryState::default());
@@ -3135,6 +3159,7 @@ mod tests {
                 router: router_stats_for(&stats_control, &snapshot),
                 downstream: downstream_stats_for(&stats_control, &snapshot),
                 token: token_stats_for(&stats_control, &snapshot),
+                latency: latency_stats_for(&stats_control),
                 tracing: None,
             };
             let factory_state = Arc::new(SharedFactoryState::default());
@@ -4145,6 +4170,7 @@ static_resources:
         let stats_control = proxy_observability::stats::StatsControl::new(1);
         let router_stats = router_stats_for(&stats_control, &snapshot);
         let token_stats = token_stats_for(&stats_control, &snapshot);
+        let latency_stats = latency_stats_for(&stats_control);
         let factory_state = Arc::new(SharedFactoryState::default());
 
         let err = match build_listener_hcm(
@@ -4152,6 +4178,7 @@ static_resources:
             &cluster_manager,
             &router_stats,
             &token_stats,
+            &latency_stats,
             None,
             &factory_state,
         ) {
@@ -4274,6 +4301,7 @@ static_resources:
         let stats_control = proxy_observability::stats::StatsControl::new(1);
         let router_stats = router_stats_for(&stats_control, &snapshot);
         let token_stats = token_stats_for(&stats_control, &snapshot);
+        let latency_stats = latency_stats_for(&stats_control);
         let factory_state = Arc::new(SharedFactoryState::default());
 
         build_listener_hcm(
@@ -4281,6 +4309,7 @@ static_resources:
             &cluster_manager,
             &router_stats,
             &token_stats,
+            &latency_stats,
             None,
             &factory_state,
         )
@@ -4290,6 +4319,7 @@ static_resources:
             &cluster_manager,
             &router_stats,
             &token_stats,
+            &latency_stats,
             None,
             &factory_state,
         )

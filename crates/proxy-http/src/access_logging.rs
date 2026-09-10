@@ -49,7 +49,7 @@ use proxy_observability::ResponseFlag;
 
 use crate::handler::{BodyError, StreamBody};
 use crate::router::idle::IdleTimeoutError;
-use crate::stat_handles::GenAiTokenStats;
+use crate::stat_handles::{GenAiLatencyStats, GenAiTokenStats};
 use crate::stream_info::StreamInfo;
 
 /// One configured logger, resolved at HCM-bind time (mirrors
@@ -229,6 +229,22 @@ pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestS
     }
 }
 
+/// Maps the three GenAI request targets this proxy understands to OTel's
+/// operation label. `responses` is deliberately the documented custom value
+/// for OpenAI's Responses API: semconv v1.27 only standardizes `chat` and
+/// `text_completion`, and calling Responses "chat" would be a false label.
+fn gen_ai_operation(path: &str) -> Option<&'static str> {
+    if path.ends_with("/chat/completions") || path.ends_with("/messages") {
+        Some("chat")
+    } else if path.ends_with("/completions") {
+        Some("text_completion")
+    } else if path.ends_with("/responses") {
+        Some("responses")
+    } else {
+        None
+    }
+}
+
 /// Everything [`LoggingBody`] needs to render + write a line once the
 /// response stream ends (or is dropped mid-stream) -- assembled once, in
 /// `FilterChainHandler::handle`, before the body starts streaming to the
@@ -248,6 +264,9 @@ pub(crate) struct AccessLogContext {
     /// caller, and any HCM `proxy-core` never resolved provider handles
     /// for). See [`LoggingBody::finish`] for the one call site.
     pub(crate) token_stats: Option<Arc<GenAiTokenStats>>,
+    /// OTel GenAI TTFT/TPOT recorder. Like token stats, it runs at stream end
+    /// even when no access log destination is configured.
+    pub(crate) latency_stats: Option<Arc<GenAiLatencyStats>>,
     /// WP-51 increment 2: this stream's span sink, if the HCM has one wired
     /// (`FilterChainHandler::with_tracing`) -- `None` on any handler tracing
     /// is off for. [`LoggingBody::finish`] emits the SERVER span through
@@ -439,6 +458,7 @@ impl LoggingBody {
             // Already logged (`poll_frame` beat `Drop` to it, or vice versa).
             return;
         };
+        let stream_duration = ctx.start_instant.elapsed();
 
         // Rust note: `stream_info`'s snapshot has to be pulled out of the
         // `RefCell` and its borrow dropped before `LogContext` is built --
@@ -455,6 +475,9 @@ impl LoggingBody {
             llm_ttft,
             llm_max_stall,
             llm_response_chunks,
+            llm_system,
+            llm_time_to_first_body_byte,
+            requested_model,
             trace,
             tenant,
             response_code_details,
@@ -483,6 +506,9 @@ impl LoggingBody {
                 info.llm.time_to_first_byte,
                 info.llm.max_inter_chunk,
                 info.llm.response_chunks,
+                info.llm.system,
+                info.llm.time_to_first_body_byte,
+                info.requested_model.clone(),
                 info.trace,
                 // WP-55: the SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
@@ -515,6 +541,32 @@ impl LoggingBody {
             upstream_cluster.as_deref(),
         ) {
             token_stats.record_usage(provider, tenant.as_deref(), tokens);
+        }
+
+        // Semconv v1.27's latency metrics require an operation, requested
+        // model, and GenAI system. Each comes from a trustworthy local source:
+        // operation from the request target, model from the body-rewrite
+        // filter's parsed `requested_model` (never a cluster-name substitute),
+        // and system from the route-selected usage filter. Missing any one is
+        // an honest absence, not a reason to invent a label. Failed/truncated
+        // responses are excluded because both semconv metrics are for
+        // successful responses.
+        if response_flags.is_empty() && (200..300).contains(&ctx.response_code) {
+            if let (Some(latency_stats), Some(operation), Some(model), Some(system)) = (
+                ctx.latency_stats.as_ref(),
+                gen_ai_operation(&ctx.request.path),
+                requested_model.as_deref(),
+                llm_system,
+            ) {
+                latency_stats.record(
+                    operation,
+                    model,
+                    system.as_str(),
+                    llm_time_to_first_body_byte,
+                    stream_duration,
+                    llm_tokens.map(|tokens| tokens.output),
+                );
+            }
         }
 
         // WP-51 increment 2: emit the SERVER span here -- the same
@@ -578,7 +630,7 @@ impl LoggingBody {
             protocol: protocol.as_deref(),
             response_code: Some(ctx.response_code),
             response_flags: &response_flags,
-            duration: Some(ctx.start_instant.elapsed()),
+            duration: Some(stream_duration),
             bytes_received,
             bytes_sent: self.bytes_sent,
             upstream_host: upstream_host.as_deref(),
@@ -769,6 +821,7 @@ mod tests {
             response_code: StatusCode::OK.as_u16(),
             downstream_remote_address: "127.0.0.1:0".to_string(),
             token_stats: None,
+            latency_stats: None,
             span_sink: None,
         };
 
@@ -794,7 +847,9 @@ mod tests {
                 cache_creation_tokens: 33,
                 output_tokens: 44,
             }),
+            system: None,
             time_to_first_byte: Some(std::time::Duration::from_millis(250)),
+            time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 1,
         };
@@ -1074,7 +1129,9 @@ mod tests {
     async fn llm_max_stall_and_response_chunks_reach_the_rendered_line() {
         let llm = crate::stream_info::LlmStats {
             usage: None,
+            system: None,
             time_to_first_byte: None,
+            time_to_first_body_byte: None,
             max_inter_chunk: Some(std::time::Duration::from_millis(150)),
             response_chunks: 7,
         };
@@ -1108,7 +1165,9 @@ mod tests {
                 cache_creation_tokens: 0,
                 output_tokens: 10,
             }),
+            system: None,
             time_to_first_byte: Some(std::time::Duration::from_millis(0)),
+            time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 1,
         };
@@ -1198,7 +1257,52 @@ mod tests {
             // recorder wired" case, which is also what an HCM without stats
             // produces in production.
             token_stats: None,
+            latency_stats: None,
             span_sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_llm_stream_reaches_both_gen_ai_latency_histograms() {
+        let capture = Arc::new(CaptureSink::default());
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let registry = control.registry();
+        let mut ctx = flags_ctx(&capture);
+        ctx.request.path = "/v1/chat/completions".to_string();
+        ctx.start_instant = Instant::now() - std::time::Duration::from_secs(1);
+        ctx.latency_stats = Some(Arc::new(GenAiLatencyStats::new(
+            registry.clone(),
+            proxy_observability::stats::WorkerId(0),
+        )));
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.requested_model = Some("gpt-4o".to_string());
+            info.llm.system = Some(crate::stream_info::GenAiSystem::OpenAi);
+            info.llm.time_to_first_body_byte = Some(std::time::Duration::from_millis(100));
+            info.llm.usage = Some(LlmTokenUsage {
+                input_tokens: 1,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 5,
+            });
+        }
+
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        let _ = LoggingBody::new(body, ctx).collect().await.unwrap();
+
+        for name in [
+            "gen_ai.server.time_to_first_token",
+            "gen_ai.server.time_per_output_token",
+        ] {
+            let (handle, _, attrs) = registry
+                .histograms()
+                .find(|(_, instrument, _)| instrument.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(attrs.contains(&("gen_ai.request.model".to_string(), "gpt-4o".to_string())));
+            assert_eq!(registry.histogram_snapshot(handle).count, 1);
         }
     }
 
