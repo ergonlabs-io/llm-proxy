@@ -763,6 +763,7 @@ impl OutlierDetector {
                     Arc::new(Host {
                         address: h.address,
                         hostname: h.hostname.clone(),
+                        metadata: h.metadata.clone(),
                         weight: h.weight,
                         priority: h.priority,
                         health_flags: HealthFlags {
@@ -855,6 +856,7 @@ mod tests {
         Arc::new(Host {
             address: addr(last),
             hostname: None,
+            metadata: Default::default(),
             weight: 1,
             priority: 0,
             health_flags: HealthFlags::default(),
@@ -1331,6 +1333,7 @@ mod tests {
                         Arc::new(Host {
                             address: h.address,
                             hostname: h.hostname.clone(),
+                            metadata: h.metadata.clone(),
                             weight: h.weight,
                             priority: h.priority,
                             health_flags: HealthFlags {

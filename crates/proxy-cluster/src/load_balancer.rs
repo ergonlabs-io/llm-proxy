@@ -446,6 +446,7 @@ mod tests {
         Arc::new(Host {
             address: addr(last),
             hostname: None,
+            metadata: Default::default(),
             weight,
             priority,
             health_flags: HealthFlags {

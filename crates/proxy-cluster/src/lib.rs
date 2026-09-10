@@ -6,6 +6,7 @@
 //! WP-13) and the cluster lane — changes to these traits require cross-lane review
 //! (ground rule #4).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -138,6 +139,12 @@ pub struct Host {
     /// public CA issues certificates for IP addresses. Envoy keeps the same
     /// thing on its own `Host` (`hostname()`), for the same reason.
     pub hostname: Option<String>,
+    /// Operator-facing endpoint labels, copied from the accepted
+    /// `io.llmproxy.endpoint` metadata namespace. They are intentionally
+    /// carried with the live host rather than re-read from config: a host set
+    /// may have arrived through EDS, and `/clusters` must describe the set
+    /// traffic can actually select.
+    pub metadata: BTreeMap<String, String>,
     pub weight: u32,
     /// Failover priority this host belongs to; 0 = primary (S5/S7).
     pub priority: u32,
@@ -150,7 +157,7 @@ pub struct Host {
     /// finish; until those land it stays 0 for every host, which just makes
     /// `LEAST_REQUEST` degrade to uniform random.
     pub active_requests: AtomicU64,
-    // TODO(WP-16+): locality, metadata.
+    // TODO(WP-16+): locality.
 }
 
 impl Host {

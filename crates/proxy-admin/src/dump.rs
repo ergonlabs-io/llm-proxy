@@ -7,6 +7,7 @@
 //! that would re-expose everything on the day a new IR field is added,
 //! silently.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use proxy_config::ir::{
@@ -360,6 +361,11 @@ pub struct ClusterDump {
     /// key material -- see module doc.
     pub tls: bool,
     pub endpoints: Vec<EndpointDump>,
+    /// Present only on `/clusters` when its live-state provider is wired.
+    /// `/config_dump` remains a configuration dump and intentionally omits
+    /// this runtime-only value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initialized: Option<bool>,
     pub circuit_breakers: CircuitBreakersDump,
 }
 
@@ -380,13 +386,37 @@ impl ClusterDump {
                     port: e.port,
                     weight: e.weight,
                     priority: e.priority,
+                    hostname: None,
+                    health_flags: None,
+                    metadata: None,
                 })
                 .collect(),
+            initialized: None,
             circuit_breakers: CircuitBreakersDump {
                 default: ThresholdsDump::from_ir(&c.circuit_breakers.default),
                 high: ThresholdsDump::from_ir(&c.circuit_breakers.high),
             },
         }
+    }
+
+    /// Build the `/clusters` view from safe configuration fields plus the
+    /// manager's live host-set snapshot. If the manager cannot prove that it
+    /// owns the same configuration (a reload is between manager install and
+    /// config publication), `live` is `None`: report no endpoints rather
+    /// than leaking a future configuration's members into this snapshot.
+    pub(crate) fn from_ir_and_live(c: &ClusterConfig, live: Option<&LiveCluster>) -> Self {
+        let mut dump = Self::from_ir(c);
+        dump.endpoints = live
+            .map(|cluster| {
+                cluster
+                    .endpoints
+                    .iter()
+                    .map(EndpointDump::from_live)
+                    .collect()
+            })
+            .unwrap_or_default();
+        dump.initialized = Some(live.is_some_and(|cluster| cluster.initialized));
+        dump
     }
 }
 
@@ -396,6 +426,75 @@ pub struct EndpointDump {
     pub port: u16,
     pub weight: u32,
     pub priority: u32,
+    /// DNS name used to resolve this live address, if any. The `host` field
+    /// remains the concrete address traffic currently dials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Envoy-compatible health-flag rendering (`""` means healthy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_flags: Option<String>,
+    /// Explicit endpoint labels only; opaque config/filter blobs never reach
+    /// this allowlisted view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, String>>,
+}
+
+impl EndpointDump {
+    fn from_live(endpoint: &LiveEndpoint) -> Self {
+        Self {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            weight: endpoint.weight,
+            priority: endpoint.priority,
+            hostname: endpoint.hostname.clone(),
+            health_flags: Some(endpoint.health_flags.clone()),
+            metadata: Some(endpoint.metadata.clone()),
+        }
+    }
+}
+
+/// Runtime host-set input to `/clusters`. It intentionally uses only plain
+/// owned values: `proxy-admin` remains independent of the data-plane cluster
+/// crate and, in particular, generated proto types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveCluster {
+    pub name: String,
+    pub initialized: bool,
+    pub endpoints: Vec<LiveEndpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub hostname: Option<String>,
+    pub weight: u32,
+    pub priority: u32,
+    pub health_flags: String,
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Render every configured cluster against the corresponding live host set.
+/// Names absent from `live` deliberately render an empty endpoint list: that
+/// means the provider could not prove it describes this config snapshot, and
+/// showing configured/stale endpoints would be less honest than empty.
+pub(crate) fn clusters_from_snapshot_and_live(
+    snapshot: &ConfigSnapshot,
+    live: &[LiveCluster],
+) -> Vec<ClusterDump> {
+    let live_by_name: HashMap<&str, &LiveCluster> = live
+        .iter()
+        .map(|cluster| (cluster.name.as_str(), cluster))
+        .collect();
+    let mut clusters: Vec<ClusterDump> = snapshot
+        .clusters
+        .values()
+        .map(|cluster| {
+            ClusterDump::from_ir_and_live(cluster, live_by_name.get(cluster.name.as_str()).copied())
+        })
+        .collect();
+    clusters.sort_by(|a, b| a.name.cmp(&b.name));
+    clusters
 }
 
 #[derive(Debug, Serialize)]

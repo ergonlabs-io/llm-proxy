@@ -709,6 +709,37 @@ async fn run_serve(
     let readiness =
         build_readiness_probe(cluster_manager.clone(), readiness_timeout, Instant::now());
 
+    // WP-57 keeps proxy-admin free of data-plane/proto dependencies: this
+    // binary is the narrow adapter from ClusterManager's plain runtime view
+    // to the admin crate's equally plain input view. The manager filters by
+    // the exact config snapshot passed by `/clusters`, so manager-first
+    // reload installation cannot leak a future host set into an old config
+    // response.
+    let cluster_manager_for_admin = cluster_manager.clone();
+    let cluster_state: proxy_admin::ClusterStateProvider = Arc::new(move |snapshot| {
+        cluster_manager_for_admin
+            .live_clusters_for(&snapshot.clusters)
+            .into_iter()
+            .map(|cluster| proxy_admin::LiveCluster {
+                name: cluster.name,
+                initialized: cluster.initialized,
+                endpoints: cluster
+                    .endpoints
+                    .into_iter()
+                    .map(|endpoint| proxy_admin::LiveEndpoint {
+                        host: endpoint.address.ip().to_string(),
+                        port: endpoint.address.port(),
+                        hostname: endpoint.hostname,
+                        weight: endpoint.weight,
+                        priority: endpoint.priority,
+                        health_flags: endpoint.health_flags,
+                        metadata: endpoint.metadata,
+                    })
+                    .collect(),
+            })
+            .collect()
+    });
+
     // WP-50 increment 1: the read-only admin surface. Opt-in -- only binds
     // when the config names an `admin` address -- and, like a listener's
     // `initial_bind`, a bind failure here is a startup error, not a silent
@@ -723,6 +754,7 @@ async fn run_serve(
         &snapshot_handles,
         factory_state.clone(),
         Some(readiness),
+        Some(cluster_state),
     )
     .await
     {
@@ -1607,6 +1639,7 @@ async fn start_admin(
     snapshot_handles: &SnapshotHandles,
     factory_state: Arc<proxy_http::filter::SharedFactoryState>,
     readiness: Option<proxy_admin::ReadinessProbe>,
+    cluster_state: Option<proxy_admin::ClusterStateProvider>,
 ) -> Result<Option<proxy_admin::AdminServer>, String> {
     let Some(addr) = admin else {
         return Ok(None);
@@ -1621,6 +1654,7 @@ async fn start_admin(
         factory_state,
         admin_token,
         readiness,
+        cluster_state,
     )
     .await
     .map_err(|err| err.to_string())?;
@@ -1855,6 +1889,7 @@ mod tests {
             &SnapshotHandles::new(),
             Arc::new(proxy_http::filter::SharedFactoryState::default()),
             None,
+            None,
         )
         .await
         .expect("start_admin(None, ..) must not fail");
@@ -1880,6 +1915,7 @@ mod tests {
             Instant::now(),
             &SnapshotHandles::new(),
             Arc::new(proxy_http::filter::SharedFactoryState::default()),
+            None,
             None,
         )
         .await
@@ -1911,6 +1947,7 @@ mod tests {
             Instant::now(),
             &snapshot_handles,
             Arc::new(proxy_http::filter::SharedFactoryState::default()),
+            None,
             None,
         )
         .await

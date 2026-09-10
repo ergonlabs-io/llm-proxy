@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use http_body_util::{BodyExt, Full};
@@ -32,7 +32,8 @@ use proxy_observability::stats::{
 };
 use tokio::net::TcpStream;
 
-use crate::server::{serve, AdminServer, Readiness, ReadinessProbe};
+use crate::dump::{LiveCluster, LiveEndpoint};
+use crate::server::{serve, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe};
 
 /// The HMAC secret every write-API test's `ControlPlane` and matching
 /// [`VirtualKeyAuthenticator`] are built with -- arbitrary, but shared
@@ -79,6 +80,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         route_index: 0,
         include_request_attempt_count: false,
         include_attempt_count_in_response: false,
+        streaming_strict: false,
     });
     let vhost = VirtualHostIR {
         name: "default".to_string(),
@@ -244,6 +246,31 @@ async fn start_full_with_readiness(
         factory_state,
         admin_token,
         readiness,
+        None,
+    )
+    .await
+    .expect("admin server bind");
+    let addr = server.local_addr();
+    (server, addr)
+}
+
+/// Starts the real HTTP admin socket with a caller-controlled live host-set
+/// provider. This is the same injected seam production uses, without making
+/// these admin tests depend on `proxy-cluster`.
+async fn start_with_cluster_state(
+    snapshot: Arc<ConfigSnapshot>,
+    cluster_state: ClusterStateProvider,
+) -> (AdminServer, SocketAddr) {
+    let config = SnapshotHandles::new().register(snapshot);
+    let server = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        config,
+        None,
+        Instant::now(),
+        Arc::new(SharedFactoryState::default()),
+        None,
+        None,
+        Some(cluster_state),
     )
     .await
     .expect("admin server bind");
@@ -571,6 +598,85 @@ async fn clusters_lists_name_endpoints_and_discovery_type() {
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0]["host"], "10.0.0.5");
     assert_eq!(endpoints[0]["port"], 8080);
+}
+
+/// `/clusters` is a runtime endpoint view, not a second spelling of the
+/// snapshot's configured `EndpointIR`s. In particular, a DNS/EDS IP can be
+/// present even when no literal endpoint was declared in the snapshot.
+#[tokio::test]
+async fn clusters_renders_live_hosts_with_safe_endpoint_fields() {
+    let live: ClusterStateProvider = Arc::new(|_snapshot| {
+        vec![LiveCluster {
+            name: "upstream".to_string(),
+            initialized: true,
+            endpoints: vec![LiveEndpoint {
+                host: "192.0.2.44".to_string(),
+                port: 9443,
+                hostname: Some("inference.internal".to_string()),
+                weight: 7,
+                priority: 2,
+                health_flags: "/failed_outlier_check".to_string(),
+                metadata: BTreeMap::from([
+                    ("engine".to_string(), "vllm".to_string()),
+                    ("node_id".to_string(), "gpu-a7".to_string()),
+                ]),
+            }],
+        }]
+    });
+    let (_server, addr) = start_with_cluster_state(snapshot_with_secret(), live).await;
+    let (status, body) = get(addr, "/clusters").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let endpoint = &value[0]["endpoints"][0];
+    assert_eq!(endpoint["host"], "192.0.2.44");
+    assert_eq!(endpoint["port"], 9443);
+    assert_eq!(endpoint["hostname"], "inference.internal");
+    assert_eq!(endpoint["weight"], 7);
+    assert_eq!(endpoint["priority"], 2);
+    assert_eq!(endpoint["health_flags"], "/failed_outlier_check");
+    assert_eq!(endpoint["metadata"]["node_id"], "gpu-a7");
+    assert_eq!(value[0]["initialized"], true);
+    assert!(
+        !body.contains(SENTINEL_API_KEY),
+        "route credentials must not enter the live endpoint allowlist: {body}"
+    );
+}
+
+/// The provider is queried on every poll. This is the external property that
+/// proves a DNS refresh / EDS push is visible without restarting admin or
+/// rebuilding its config handle.
+#[tokio::test]
+async fn clusters_re_reads_live_hosts_on_every_poll() {
+    let hosts = Arc::new(Mutex::new(vec![LiveCluster {
+        name: "upstream".to_string(),
+        initialized: true,
+        endpoints: vec![LiveEndpoint {
+            host: "192.0.2.10".to_string(),
+            port: 443,
+            hostname: None,
+            weight: 1,
+            priority: 0,
+            health_flags: String::new(),
+            metadata: BTreeMap::new(),
+        }],
+    }]));
+    let state = hosts.clone();
+    let live: ClusterStateProvider =
+        Arc::new(move |_snapshot| state.lock().expect("test state mutex").clone());
+    let (_server, addr) = start_with_cluster_state(snapshot_with_secret(), live).await;
+
+    let (_, first) = get(addr, "/clusters").await;
+    assert!(first.contains("192.0.2.10"));
+    hosts.lock().expect("test state mutex")[0].endpoints[0].host = "192.0.2.11".to_string();
+    let (_, second) = get(addr, "/clusters").await;
+    assert!(
+        second.contains("192.0.2.11"),
+        "updated live host missing: {second}"
+    );
+    assert!(
+        !second.contains("192.0.2.10"),
+        "stale host remained: {second}"
+    );
 }
 
 #[tokio::test]

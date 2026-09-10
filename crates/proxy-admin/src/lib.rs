@@ -115,4 +115,5 @@
 pub mod dump;
 pub mod server;
 
-pub use server::{serve, AdminError, AdminServer, Readiness, ReadinessProbe};
+pub use dump::{LiveCluster, LiveEndpoint};
+pub use server::{serve, AdminError, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe};

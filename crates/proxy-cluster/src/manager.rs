@@ -14,7 +14,7 @@
 //! `proxy/src/main.rs` for the production wiring, and note this only gates
 //! `/ready`, not request routing (that's WP-58).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +51,34 @@ pub enum ClusterBuildError {
     Lb(#[from] LbError),
     #[error(transparent)]
     TransportSocket(#[from] TransportSocketError),
+}
+
+/// A copyable, control-plane-facing snapshot of one cluster's active host
+/// set. This deliberately contains only runtime values and standard-library
+/// types: consumers such as the admin server need no generated-proto
+/// dependency (and never receive a `ManagedCluster` internals handle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveCluster {
+    pub name: ClusterName,
+    pub initialized: bool,
+    pub endpoints: Vec<LiveEndpoint>,
+}
+
+/// One endpoint selected from a [`LiveCluster`]'s current host set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEndpoint {
+    pub address: SocketAddr,
+    /// The DNS origin, when discovery resolved a DNS endpoint. `address` is
+    /// always the actual address traffic dials; this is supplementary SNI /
+    /// operator context, never a replacement for it.
+    pub hostname: Option<String>,
+    pub weight: u32,
+    pub priority: u32,
+    pub health_flags: String,
+    /// The explicitly accepted endpoint-label namespace. Values are copied
+    /// into the immutable host set on discovery/EDS ingest, so this follows
+    /// live membership rather than the configured endpoint shape.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// One cluster's live state: where its membership comes from, its current
@@ -676,6 +704,52 @@ impl ClusterManager {
             .cloned()
             .collect()
     }
+
+    /// Snapshot the runtime host sets whose cluster configuration matches the
+    /// supplied config snapshot. A reload installs a replacement manager map
+    /// before it publishes the matching `ConfigSnapshot`; filtering by the
+    /// exact/equal config prevents an admin reader holding the old snapshot
+    /// from accidentally reporting endpoints from that next, unpublished
+    /// configuration. The returned endpoint lists are copies, so callers
+    /// cannot retain a `ManagedCluster` or mutate a live host set.
+    pub fn live_clusters_for(
+        &self,
+        configs: &HashMap<ClusterName, Arc<ClusterConfig>>,
+    ) -> Vec<LiveCluster> {
+        let registry = self.clusters.load();
+        let mut clusters = Vec::with_capacity(configs.len());
+        for (name, config) in configs {
+            let Some(managed) = registry.get(name) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&managed.config, config) && *managed.config != **config {
+                continue;
+            }
+            let host_set = managed.host_set.load();
+            let mut endpoints: Vec<LiveEndpoint> = host_set
+                .all_hosts()
+                .into_iter()
+                .map(|host| LiveEndpoint {
+                    address: host.address,
+                    hostname: host.hostname.clone(),
+                    weight: host.weight,
+                    priority: host.priority,
+                    health_flags: host.health_flags.to_string(),
+                    metadata: host.metadata.clone(),
+                })
+                .collect();
+            endpoints.sort_by(|a, b| {
+                (a.priority, a.address, &a.hostname).cmp(&(b.priority, b.address, &b.hostname))
+            });
+            clusters.push(LiveCluster {
+                name: name.clone(),
+                initialized: managed.initialized.load(Ordering::Acquire),
+                endpoints,
+            });
+        }
+        clusters.sort_by(|a, b| a.name.cmp(&b.name));
+        clusters
+    }
 }
 
 /// The router-facing view of one cluster (implements [`ClusterEntry`]).
@@ -1201,6 +1275,14 @@ mod tests {
             diff.unchanged,
             vec![SocketAddr::new(IpAddr::from([10, 0, 0, 2]), 80)]
         );
+        let live = manager.live_clusters_for(&snapshot);
+        assert_eq!(live[0].endpoints.len(), 2);
+        assert_eq!(live[0].endpoints[0].address, "10.0.0.2:80".parse().unwrap());
+        assert_eq!(
+            live[0].endpoints[0].hostname.as_deref(),
+            Some("svc.internal")
+        );
+        assert_eq!(live[0].endpoints[1].address, "10.0.0.3:80".parse().unwrap());
     }
 
     #[tokio::test]
@@ -1222,6 +1304,56 @@ mod tests {
             vec![SocketAddr::new(IpAddr::from([10, 0, 0, 5]), 80)]
         );
         assert!(manager.is_initialized("eds-svc"));
+    }
+
+    /// The admin seam must snapshot what EDS installed, including the
+    /// endpoint labels, rather than falling back to the empty configured
+    /// endpoint list that an EDS cluster necessarily has.
+    #[tokio::test]
+    async fn live_cluster_snapshot_exposes_eds_membership_and_metadata() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert("eds-svc".to_string(), cluster_config_eds("eds-svc"));
+        manager.update_from_snapshot(&snapshot).await;
+
+        let mut eds_endpoint = endpoint("10.0.0.55", 8443);
+        eds_endpoint
+            .metadata
+            .insert("node_id".to_string(), "gpu-a7".to_string());
+        manager
+            .accept_eds_update("eds-svc", &[eds_endpoint])
+            .expect("EDS update");
+
+        let live = manager.live_clusters_for(&snapshot);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].name, "eds-svc");
+        assert!(live[0].initialized);
+        assert_eq!(live[0].endpoints.len(), 1);
+        assert_eq!(
+            live[0].endpoints[0].address,
+            "10.0.0.55:8443".parse().unwrap()
+        );
+        assert_eq!(
+            live[0].endpoints[0]
+                .metadata
+                .get("node_id")
+                .map(String::as_str),
+            Some("gpu-a7")
+        );
+
+        // A config snapshot that differs from the installed manager entry
+        // must not borrow its host set during the manager-first half of a
+        // reload. Empty is safe; a future endpoint would not be.
+        let changed = HashMap::from([(
+            "eds-svc".to_string(),
+            cluster_config(
+                "eds-svc",
+                DiscoveryType::Static,
+                vec![endpoint("10.0.0.99", 80)],
+            ),
+        )]);
+        assert!(manager.live_clusters_for(&changed).is_empty());
     }
 
     #[tokio::test]
@@ -1530,6 +1662,7 @@ mod tests {
             .store(Arc::new(HostSet::from_hosts(vec![Arc::new(Host {
                 address: addr,
                 hostname: Some("svc.internal".to_string()),
+                metadata: Default::default(),
                 weight: 1,
                 priority: 0,
                 health_flags: HealthFlags {
@@ -2351,6 +2484,7 @@ mod tests {
             .store(Arc::new(HostSet::from_hosts(vec![Arc::new(Host {
                 address: addr,
                 hostname: None,
+                metadata: Default::default(),
                 weight: 1,
                 priority: 0,
                 health_flags: HealthFlags {

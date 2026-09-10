@@ -148,6 +148,7 @@ pub fn carry_over_health_flags(old: &HostSet, new: HostSet, diff: &HostSetDiff) 
             Some(flags) if *flags != h.health_flags => Arc::new(Host {
                 address: h.address,
                 hostname: h.hostname.clone(),
+                metadata: h.metadata.clone(),
                 weight: h.weight,
                 priority: h.priority,
                 health_flags: *flags,
@@ -168,6 +169,7 @@ mod tests {
         Arc::new(Host {
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port),
             hostname: None,
+            metadata: BTreeMap::new(),
             weight: 1,
             priority,
             health_flags: crate::HealthFlags::default(),
