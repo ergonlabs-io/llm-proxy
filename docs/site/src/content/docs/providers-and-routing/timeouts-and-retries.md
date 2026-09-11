@@ -125,6 +125,24 @@ predicates are rejected at config load. The `envoy-ratelimited` `retry_on`
 token is also rejected because nothing yet sets the
 `x-envoy-ratelimited` response header it watches for.
 
+### Retry concurrency budget
+
+At the upstream cluster, a raw Envoy bootstrap may set
+`circuit_breakers.thresholds[].retry_budget`. It overrides that threshold's
+fixed `max_retries` cap. The maximum active retries is
+`max(min_retry_concurrency, floor(budget_percent × (active requests + pending requests)))`.
+Omitted fields use Envoy's defaults: 20% and a minimum of 3. Both ordinary
+retries and per-try-timeout hedges consume this same budget.
+
+```yaml
+circuit_breakers:
+  thresholds:
+    - priority: DEFAULT
+      retry_budget:
+        budget_percent: { value: 20.0 }
+        min_retry_concurrency: 3
+```
+
 ### `x-envoy-attempt-count`
 
 A raw bootstrap configuration's `VirtualHost` has two more fields with no

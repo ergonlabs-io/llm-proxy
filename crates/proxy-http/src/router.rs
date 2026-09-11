@@ -36,9 +36,9 @@
 //! before dialing and held for the whole response stream via
 //! `router::guarded::GuardedBody` -- exceeding it sheds load as `UO` + 503 +
 //! `x-envoy-overloaded` rather than piling onto a struggling upstream. The
-//! other three S5 budgets (`max_connections`, `max_pending_requests`,
-//! `max_retries`) have real counters in `proxy_cluster::CircuitBreakerState`
-//! but no call site yet -- see the `TODO`s there.
+//! `max_connections`/`max_pending_requests` are enforced by the pool, and
+//! retries plus safe hedges acquire the same fixed `max_retries` or dynamic
+//! `retry_budget` guard before dispatch.
 //!
 //! Deferred (known feature gaps, not silent drops -- ground rule #1):
 //! - S9 request-header transforms: XFF, `x-request-id`, `:authority`
@@ -76,7 +76,7 @@ use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::outlier::RequestResult;
 use proxy_cluster::{
-    ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
+    CbGuard, ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
 };
 use proxy_config::ir::{
     DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher, UpgradeConfig,
@@ -967,6 +967,10 @@ impl RouterHandler {
         // iteration races this original response with its own newly-issued
         // replay.
         let mut hedged_response: Option<HedgedResponse> = None;
+        // Set only after this request is admitted as a retry (ordinary or
+        // hedge). It crosses the loop boundary because the budget is held for
+        // the retry attempt's full response stream, just like max_requests.
+        let mut retry_guard: Option<CbGuard> = None;
 
         // Rust note: this `async` block (no `move`) captures `dcb` (a `&mut
         // dyn DecoderCallbacks`) by unique reborrow, not by value -- so once
@@ -1151,8 +1155,10 @@ impl RouterHandler {
                             },
                         );
                         if let Some(state) = &mut retry_state {
-                            if state.should_retry(&outcome) {
-                                sleep_backoff_and_record(state).await;
+                            if state.should_retry(&outcome)
+                                && sleep_backoff_and_reserve_retry(state, cb, &mut retry_guard)
+                                    .await
+                            {
                                 continue;
                             }
                         }
@@ -1355,6 +1361,11 @@ impl RouterHandler {
                         })
                 });
                 let mut response_already_guarded = false;
+                // A hedge races its newly-issued retry against the original.
+                // Only the former owns `retry_guard`; if the original wins,
+                // release the hedge budget immediately rather than pinning it
+                // to an unrelated response body.
+                let mut response_from_hedge = false;
                 let attempt_result = if let Some(hedge) = hedged_response.as_mut() {
                     // The original request was still alive when the previous
                     // iteration dispatched this replay.  Both sends are now
@@ -1375,12 +1386,16 @@ impl RouterHandler {
                                 // reset into an immediate downstream 502.
                                 Err(_) => {
                                     response_already_guarded = false;
+                                    response_from_hedge = true;
                                     (&mut send).await
                                 }
                             }
                         }
                         second = &mut send => match second {
-                            Ok(response) => Ok(response),
+                            Ok(response) => {
+                                response_from_hedge = true;
+                                Ok(response)
+                            }
                             Err(second_error) => {
                                 // Symmetrically, a failed hedge must not
                                 // cancel an original that can still return a
@@ -1461,9 +1476,13 @@ impl RouterHandler {
                                     // A hedge is a retry that starts NOW, so
                                     // consume its one normal retry budget but
                                     // deliberately skip S3.3 backoff.
-                                    state.record_attempt();
-                                    hedged_response = Some(HedgedResponse { receiver, task });
-                                    continue;
+                                    retry_guard.take();
+                                    if let Some(guard) = cb.try_acquire_retry() {
+                                        retry_guard = Some(guard);
+                                        state.record_attempt();
+                                        hedged_response = Some(HedgedResponse { receiver, task });
+                                        continue;
+                                    }
                                 }
                             }
                             task.abort();
@@ -1505,8 +1524,14 @@ impl RouterHandler {
                                     },
                                 );
                                 if let Some(state) = &mut retry_state {
-                                    if state.should_retry(&outcome) {
-                                        sleep_backoff_and_record(state).await;
+                                    if state.should_retry(&outcome)
+                                        && sleep_backoff_and_reserve_retry(
+                                            state,
+                                            cb,
+                                            &mut retry_guard,
+                                        )
+                                        .await
+                                    {
                                         continue;
                                     }
                                 }
@@ -1560,13 +1585,18 @@ impl RouterHandler {
                         let retriable = retry_state
                             .as_ref()
                             .is_some_and(|state| state.should_retry(&outcome));
-                        if retriable {
+                        if retriable
+                            && sleep_backoff_and_reserve_retry(
+                                retry_state.as_mut().expect("checked Some above"),
+                                cb,
+                                &mut retry_guard,
+                            )
+                            .await
+                        {
                             // Drain the failed attempt's response body before
                             // retrying so its connection isn't left dangling
                             // mid-read.
                             let _ = resp.body.collect().await;
-                            let state = retry_state.as_mut().expect("checked Some above");
-                            sleep_backoff_and_record(state).await;
                             continue;
                         }
                         // WP-24: this is the one `URX` site that isn't
@@ -1597,6 +1627,11 @@ impl RouterHandler {
                                     .take()
                                     .expect("normal response owns this attempt guard"),
                             ));
+                        }
+                        if !response_already_guarded || response_from_hedge {
+                            if let Some(guard) = retry_guard.take() {
+                                resp.body = local_boxed(GuardedBody::new(resp.body, guard));
+                            }
                         }
                         return resp;
                     }
@@ -1629,8 +1664,10 @@ impl RouterHandler {
                             },
                         );
                         if let Some(state) = &mut retry_state {
-                            if state.should_retry(&outcome) {
-                                sleep_backoff_and_record(state).await;
+                            if state.should_retry(&outcome)
+                                && sleep_backoff_and_reserve_retry(state, cb, &mut retry_guard)
+                                    .await
+                            {
                                 continue;
                             }
                         }
@@ -1712,10 +1749,24 @@ impl RouterHandler {
 /// threading a `rand::Rng` through) since this is the one real (not
 /// deterministically-tested) call site -- `retry.rs`'s own tests inject a
 /// fixed closure instead.
-async fn sleep_backoff_and_record(state: &mut RetryState<'_>) {
+async fn sleep_backoff_and_reserve_retry(
+    state: &mut RetryState<'_>,
+    cb: &proxy_cluster::CircuitBreakerState,
+    retry_guard: &mut Option<CbGuard>,
+) -> bool {
     let delay = state.backoff_delay(&mut rand::random::<f64>);
     tokio::time::sleep(delay).await;
+    // A prior retry has just finished; it cannot consume a slot while this
+    // request asks to issue its next retry. The request guard is still alive
+    // in the caller's loop frame, so the percentage denominator remains
+    // accurate through this hand-off.
+    retry_guard.take();
+    let Some(guard) = cb.try_acquire_retry() else {
+        return false;
+    };
+    *retry_guard = Some(guard);
     state.record_attempt();
+    true
 }
 
 /// WP-24: the one call site for `ResponseFlag::UpstreamRetryLimitExceeded`

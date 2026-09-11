@@ -219,9 +219,9 @@ pub struct LoadBalancerContext {
 }
 
 /// Circuit-breaker accounting for one (cluster, priority) — S5's four
-/// per-priority budgets. Only `max_requests` is checked at a call site today
-/// (the router, WP-13/WP-15 thin slice); the other three keep real
-/// counters/guards so wiring them up later is additive, not a redesign.
+/// per-priority budgets. The router enforces `max_requests` and retry
+/// admission (fixed `max_retries` or a configured dynamic `retry_budget`);
+/// connection and pending-request limits are enforced by the pool.
 ///
 /// Rust note: the gauges live behind `Arc<AtomicU32>` rather than borrowed --
 /// [`CbGuard`] rides inside a streaming response body that must outlive the
@@ -232,7 +232,23 @@ pub struct CircuitBreakerState {
     connections: BudgetHandle,
     pending: BudgetHandle,
     requests: BudgetHandle,
-    retries: BudgetHandle,
+    retries: RetryLimit,
+}
+
+/// The retry breaker is either Envoy's fixed `max_retries` ceiling or its
+/// dynamic `retry_budget`. Keeping both alternatives behind one acquisition
+/// method prevents router call sites from accidentally treating a configured
+/// percentage budget as an additional fixed cap (Envoy says it *replaces*
+/// `max_retries`).
+#[derive(Debug, Clone)]
+enum RetryLimit {
+    Fixed(BudgetHandle),
+    Budget {
+        retries: BudgetHandle,
+        requests: BudgetHandle,
+        pending: BudgetHandle,
+        config: proxy_config::ir::RetryBudget,
+    },
 }
 
 /// A budget's live gauge plus its limit, with the gauge pre-wrapped in `Arc`
@@ -291,10 +307,18 @@ impl BudgetHandle {
     /// anything itself -- the guard's `Drop` is the operation other threads
     /// need to observe, and that already uses `Release`.
     fn try_acquire(&self) -> Option<CbGuard> {
+        self.try_acquire_with_limit(self.limit)
+    }
+
+    /// The same atomic claim as [`Self::try_acquire`], but with a limit
+    /// calculated at the call site. This is only used for Envoy's dynamic
+    /// retry budget; its own gauge remains the atomic being claimed, so two
+    /// workers cannot both observe a free retry slot and over-admit it.
+    fn try_acquire_with_limit(&self, limit: u32) -> Option<CbGuard> {
         let prev = self
             .active
             .fetch_add(1, std::sync::atomic::Ordering::Acquire);
-        if prev >= self.limit {
+        if prev >= limit {
             self.active
                 .fetch_sub(1, std::sync::atomic::Ordering::Release);
             return None;
@@ -338,11 +362,23 @@ impl Drop for CbGuard {
 impl CircuitBreakerState {
     /// Builds all four budgets from a cluster's lowered [`CircuitBreakerThresholds`].
     pub fn from_thresholds(t: proxy_config::ir::CircuitBreakerThresholds) -> Self {
+        let connections = BudgetHandle::new_with_notify(t.max_connections);
+        let pending = BudgetHandle::new(t.max_pending_requests);
+        let requests = BudgetHandle::new(t.max_requests);
+        let retries = match t.retry_budget {
+            None => RetryLimit::Fixed(BudgetHandle::new(t.max_retries)),
+            Some(config) => RetryLimit::Budget {
+                retries: BudgetHandle::new(u32::MAX),
+                requests: requests.clone(),
+                pending: pending.clone(),
+                config,
+            },
+        };
         Self {
-            connections: BudgetHandle::new_with_notify(t.max_connections),
-            pending: BudgetHandle::new(t.max_pending_requests),
-            requests: BudgetHandle::new(t.max_requests),
-            retries: BudgetHandle::new(t.max_retries),
+            connections,
+            pending,
+            requests,
+            retries,
         }
     }
 
@@ -388,10 +424,34 @@ impl CircuitBreakerState {
             .expect("the connections budget always carries a Notify (see from_thresholds)")
     }
 
-    // TODO(WP-14 retries): check max_retries in the retry engine.
-    #[allow(dead_code)]
+    /// Claim a slot for a retry or hedge. A configured Envoy `retry_budget`
+    /// overrides `max_retries` and calculates its cap as
+    /// `max(min_retry_concurrency, floor(percent * (active + pending)))`.
+    /// The request/pending gauges are sampled immediately before the retry
+    /// gauge's atomic claim. Their values can naturally change a moment
+    /// later as requests finish, but the retry gauge itself is claimed and
+    /// rolled back atomically, so concurrent workers can never both consume
+    /// the same slot.
     pub fn try_acquire_retry(&self) -> Option<CbGuard> {
-        self.retries.try_acquire()
+        match &self.retries {
+            RetryLimit::Fixed(retries) => retries.try_acquire(),
+            RetryLimit::Budget {
+                retries,
+                requests,
+                pending,
+                config,
+            } => {
+                let denominator = requests
+                    .active
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .saturating_add(pending.active.load(std::sync::atomic::Ordering::Acquire));
+                let proportional = ((f64::from(denominator) * config.budget_percent) / 100.0)
+                    .floor()
+                    .min(f64::from(u32::MAX)) as u32;
+                let limit = proportional.max(config.min_retry_concurrency);
+                retries.try_acquire_with_limit(limit)
+            }
+        }
     }
 }
 
@@ -596,6 +656,33 @@ mod cb_tests {
         );
         drop(g1);
         drop(g2);
+    }
+
+    #[test]
+    fn retry_budget_uses_percent_floor_and_minimum_concurrency() {
+        let cb = CircuitBreakerState::from_thresholds(proxy_config::ir::CircuitBreakerThresholds {
+            max_requests: 10,
+            retry_budget: Some(proxy_config::ir::RetryBudget {
+                budget_percent: 20.0,
+                min_retry_concurrency: 1,
+            }),
+            ..proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT
+        });
+
+        // Two active requests make 20% == 0.4, floored to zero, so the
+        // configured minimum admits exactly one retry.
+        let _rq1 = cb.try_acquire_request().unwrap();
+        let _rq2 = cb.try_acquire_request().unwrap();
+        let retry1 = cb.try_acquire_retry().expect("minimum permits one retry");
+        assert!(cb.try_acquire_retry().is_none(), "minimum is a real cap");
+
+        // Ten active requests make the proportional cap two. The existing
+        // retry occupies one; adding eight requests raises the cap enough for
+        // a second without replacing the dynamic budget by max_retries.
+        let _more: Vec<_> = (0..8).map(|_| cb.try_acquire_request().unwrap()).collect();
+        let retry2 = cb.try_acquire_retry().expect("20% of ten permits two");
+        assert!(cb.try_acquire_retry().is_none());
+        drop((retry1, retry2));
     }
 
     #[test]

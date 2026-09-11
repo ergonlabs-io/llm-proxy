@@ -430,16 +430,20 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // by the surface walk with its dotted path (ground rule #1) rather
         // than silently ignored.
         "envoy.config.cluster.v3.CircuitBreakers" => &["thresholds"],
-        // `retry_budget`, `track_remaining`, and `max_connection_pools` are
-        // not implemented (no retry-budget engine, no stats publishing, no
-        // per-cluster pool cap yet) and stay out of this list on purpose --
-        // setting them must fail loudly, not vanish.
+        // `track_remaining` and `max_connection_pools` stay out on purpose:
+        // this build has neither their stats surface nor per-cluster pool
+        // cap. `retry_budget` is different: WP-14 lowers and enforces it.
         "envoy.config.cluster.v3.CircuitBreakers.Thresholds" => &[
             "priority",
             "max_connections",
             "max_pending_requests",
             "max_requests",
             "max_retries",
+            "retry_budget",
+        ],
+        "envoy.config.cluster.v3.CircuitBreakers.Thresholds.RetryBudget" => &[
+            "budget_percent",
+            "min_retry_concurrency",
         ],
         // S6 active health checking (WP-18). `initial_jitter`,
         // `interval_jitter_percent`, `alt_port`, `reuse_connection`,
@@ -3762,6 +3766,27 @@ fn convert_circuit_breakers(
 
     for (i, t) in cb.thresholds.iter().enumerate() {
         let t_path = format!("{path}.circuit_breakers.thresholds[{i}]");
+        let retry_budget = t
+            .retry_budget
+            .as_ref()
+            .map(|budget| {
+                let budget_percent = budget
+                    .budget_percent
+                    .as_ref()
+                    .map(|percent| percent.value)
+                    .unwrap_or(20.0);
+                if !budget_percent.is_finite() || !(0.0..=100.0).contains(&budget_percent) {
+                    return Err(invalid(
+                        format!("{t_path}.retry_budget.budget_percent.value"),
+                        "must be a finite percentage in the range 0 through 100",
+                    ));
+                }
+                Ok(RetryBudget {
+                    budget_percent,
+                    min_retry_concurrency: budget.min_retry_concurrency.unwrap_or(3),
+                })
+            })
+            .transpose()?;
         let thresholds = CircuitBreakerThresholds {
             max_connections: t
                 .max_connections
@@ -3775,6 +3800,7 @@ fn convert_circuit_breakers(
             max_retries: t
                 .max_retries
                 .unwrap_or(CircuitBreakerThresholds::ENVOY_DEFAULT.max_retries),
+            retry_budget,
         };
 
         use core_v3::RoutingPriority;

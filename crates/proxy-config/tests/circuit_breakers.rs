@@ -76,6 +76,61 @@ static_resources:
     assert_eq!(cb.high, CircuitBreakerThresholds::ENVOY_DEFAULT);
 }
 
+/// A configured retry budget replaces `max_retries`; omitted sub-fields use
+/// Envoy's 20% / 3-concurrency defaults rather than becoming zeroes.
+#[test]
+fn retry_budget_lowers_fractional_percent_and_defaults() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_retries: 99
+            retry_budget:
+              budget_percent: { value: 12.5 }
+              min_retry_concurrency: 7
+          - priority: HIGH
+            retry_budget: {}
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    let cb = snapshot.clusters["c1"].circuit_breakers;
+    assert_eq!(
+        cb.default.retry_budget,
+        Some(RetryBudget {
+            budget_percent: 12.5,
+            min_retry_concurrency: 7,
+        })
+    );
+    assert_eq!(
+        cb.high.retry_budget,
+        Some(RetryBudget {
+            budget_percent: 20.0,
+            min_retry_concurrency: 3,
+        })
+    );
+    assert_eq!(
+        cb.default.max_retries, 99,
+        "IR retains source for display only"
+    );
+}
+
+#[test]
+fn retry_budget_rejects_out_of_range_percent() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      circuit_breakers:
+        thresholds:
+          - retry_budget:
+              budget_percent: { value: 100.1 }
+"#;
+    let err = snapshot_from(yaml).expect_err("over-100 percent must fail");
+    assert!(err.to_string().contains("budget_percent"), "got: {err}");
+}
+
 /// `track_remaining` is not on the supported surface: rejected with a path
 /// that names the offending field, not silently dropped (ground rule #1).
 #[test]
