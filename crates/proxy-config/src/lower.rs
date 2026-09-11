@@ -650,7 +650,9 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "retriable_status_codes",
             "retry_back_off",
             "host_selection_retry_max_attempts",
+            "retry_host_predicate",
         ],
+        "envoy.config.route.v3.RetryPolicy.RetryHostPredicate" => &["name", "typed_config"],
         "envoy.config.route.v3.RetryPolicy.RetryBackOff" => &["base_interval", "max_interval"],
         "envoy.config.route.v3.HedgePolicy" => &[
             "initial_requests",
@@ -4737,17 +4739,53 @@ fn convert_retry_policy(
         host_selection_retry_max_attempts
     };
 
-    // Ground rule #1. The router re-runs host selection once per retry, which
-    // *is* the Envoy default (1) -- but it has no notion of "avoid a host this
-    // request already tried", so any explicit value above 1 would parse,
-    // validate, and then do nothing. Refuse it instead of accepting a knob we
-    // silently drop.
-    if host_selection_retry_max_attempts > 1 {
+    // The only retry-host predicate implemented in this build is Envoy's
+    // built-in `previous_hosts`.  Do not accept a plugin by name alone: its
+    // typed config must name the exact empty message as well, otherwise a
+    // future plugin option could be silently discarded.
+    const PREVIOUS_HOSTS_NAME: &str = "envoy.retry_host_predicates.previous_hosts";
+    const PREVIOUS_HOSTS_TYPE: &str =
+        "envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate";
+    let mut avoid_previous_hosts = false;
+    for (i, predicate) in rp.retry_host_predicate.iter().enumerate() {
+        let predicate_path = format!("{path}.retry_host_predicate[{i}]");
+        if predicate.name != PREVIOUS_HOSTS_NAME {
+            return Err(unsupported(
+                format!("{predicate_path}.name"),
+                format!("only `{PREVIOUS_HOSTS_NAME}` is implemented"),
+            ));
+        }
+        let Some(route_v3::retry_policy::retry_host_predicate::ConfigType::TypedConfig(config)) =
+            &predicate.config_type
+        else {
+            return Err(invalid(
+                format!("{predicate_path}.typed_config"),
+                format!("`{PREVIOUS_HOSTS_NAME}` requires `{PREVIOUS_HOSTS_TYPE}` typed_config"),
+            ));
+        };
+        if type_name(config) != PREVIOUS_HOSTS_TYPE {
+            return Err(invalid(
+                format!("{predicate_path}.typed_config"),
+                format!(
+                    "expected `{PREVIOUS_HOSTS_TYPE}`, found `{}`",
+                    type_name(config)
+                ),
+            ));
+        }
+        // Decode even though the message is currently empty: malformed Any
+        // bytes are config errors, not a reason to quietly enable a default.
+        let _: proxy_api::envoy::extensions::retry::host::previous_hosts::v3::PreviousHostsPredicate =
+            decode_any(config, &format!("{predicate_path}.typed_config"))?;
+        avoid_previous_hosts = true;
+    }
+
+    // Without a host predicate Envoy has nothing to reattempt, so accepting
+    // a higher count would still be a dropped knob.  With `previous_hosts`,
+    // HostPicker consumes this exact count on every rejected pick.
+    if host_selection_retry_max_attempts > 1 && !avoid_previous_hosts {
         return Err(unsupported(
             format!("{path}.host_selection_retry_max_attempts"),
-            "values above 1 are not implemented yet (WP-14 follow-up: the router re-runs host \
-             selection per retry but cannot yet exclude already-tried hosts, so a higher \
-             attempt count would have no effect)",
+            "values above 1 require the supported `previous_hosts` retry_host_predicate",
         ));
     }
 
@@ -4780,6 +4818,7 @@ fn convert_retry_policy(
         retriable_status_codes: codes,
         retry_back_off,
         host_selection_retry_max_attempts,
+        avoid_previous_hosts,
     })
 }
 

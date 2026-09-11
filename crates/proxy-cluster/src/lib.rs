@@ -205,6 +205,17 @@ pub struct LoadBalancerContext {
     /// hashing, and there's no risk of the list growing large enough for
     /// that to matter.
     pub attempted_clusters: Vec<ClusterName>,
+    /// Socket addresses dispatched by earlier attempts of this request. The
+    /// list is only consulted when the route configured Envoy's
+    /// `previous_hosts` retry predicate; keeping it in the selection context
+    /// makes the predicate apply consistently to every LB policy.
+    pub attempted_hosts: Vec<SocketAddr>,
+    /// Whether [`Self::attempted_hosts`] must reject a selected host, and how
+    /// many times a picker may re-run selection after such a rejection.
+    /// These are route policy, not cluster policy, so they belong beside the
+    /// rest of the per-request selection input.
+    pub avoid_previous_hosts: bool,
+    pub host_selection_retry_max_attempts: u32,
 }
 
 /// Circuit-breaker accounting for one (cluster, priority) — S5's four

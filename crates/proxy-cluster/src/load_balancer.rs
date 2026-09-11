@@ -332,14 +332,20 @@ impl HostPicker {
 
     /// Full S7 host pick: `ctx.host_override` short-circuit, then priority
     /// spillover, then the healthy-panic-threshold widening, then the
-    /// configured policy's choice among the resulting pool.
+    /// configured policy's choice among the resulting pool. When the route
+    /// installs Envoy's `previous_hosts` retry predicate, a rejected pick is
+    /// re-run up to `host_selection_retry_max_attempts` times; the final pick
+    /// is used even if it repeats, exactly as Envoy specifies when no unused
+    /// host can be found.
     pub fn pick(&self, host_set: &HostSet, ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
         // WP-36 endpoint-picker hook: honor an explicit override when it's
         // actually present in the set; otherwise fall through to normal
         // selection rather than erroring (the override is a *hint*).
         if let Some(addr) = ctx.host_override {
             if let Some(host) = host_set.all_hosts().iter().find(|h| h.address == addr) {
-                return Some(Arc::clone(host));
+                if !ctx.avoid_previous_hosts || !ctx.attempted_hosts.contains(&addr) {
+                    return Some(Arc::clone(host));
+                }
             }
         }
 
@@ -364,7 +370,21 @@ impl HostPicker {
         if candidates.is_empty() {
             return None;
         }
-        self.policy.pick(&candidates, ctx)
+        let max_retries = if ctx.avoid_previous_hosts {
+            ctx.host_selection_retry_max_attempts
+        } else {
+            0
+        };
+        for selection_attempt in 0..=max_retries {
+            let picked = self.policy.pick(&candidates, ctx)?;
+            if !ctx.avoid_previous_hosts
+                || !ctx.attempted_hosts.contains(&picked.address)
+                || selection_attempt == max_retries
+            {
+                return Some(picked);
+            }
+        }
+        unreachable!("the inclusive selection loop always returns")
     }
 
     /// Picks which priority level this request routes to, per S7's
@@ -684,6 +704,7 @@ mod tests {
             hash: None,
             host_override: Some(addr(2)),
             attempted_clusters: Vec::new(),
+            ..LoadBalancerContext::default()
         };
         for _ in 0..5 {
             assert_eq!(picker.pick(&set, &ctx).unwrap().address, addr(2));
@@ -698,6 +719,7 @@ mod tests {
             hash: None,
             host_override: Some(addr(99)),
             attempted_clusters: Vec::new(),
+            ..LoadBalancerContext::default()
         };
         let picked = picker.pick(&set, &ctx).unwrap();
         assert!(picked.address == addr(1) || picked.address == addr(2));
@@ -716,6 +738,37 @@ mod tests {
         let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
         let set = host_set_from(vec![healthy_host(1, 1)]);
         let ctx = LoadBalancerContext::default();
+        assert_eq!(picker.pick(&set, &ctx).unwrap().address, addr(1));
+    }
+
+    #[test]
+    fn previous_hosts_predicate_reselects_a_new_host() {
+        // Round robin starts at host 1.  A retry that has already dispatched
+        // it must re-run host selection and land on host 2 instead.
+        let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
+        let set = host_set_from(vec![healthy_host(1, 1), healthy_host(2, 1)]);
+        let ctx = LoadBalancerContext {
+            attempted_hosts: vec![addr(1)],
+            avoid_previous_hosts: true,
+            host_selection_retry_max_attempts: 1,
+            ..LoadBalancerContext::default()
+        };
+        assert_eq!(picker.pick(&set, &ctx).unwrap().address, addr(2));
+    }
+
+    #[test]
+    fn previous_hosts_predicate_reuses_last_pick_when_all_hosts_were_tried() {
+        // Envoy does not turn a retriable request into UH merely because the
+        // predicate cannot find a new host: after its configured re-picks it
+        // uses the final selection, which can be a previous host.
+        let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
+        let set = host_set_from(vec![healthy_host(1, 1)]);
+        let ctx = LoadBalancerContext {
+            attempted_hosts: vec![addr(1)],
+            avoid_previous_hosts: true,
+            host_selection_retry_max_attempts: 3,
+            ..LoadBalancerContext::default()
+        };
         assert_eq!(picker.pick(&set, &ctx).unwrap().address, addr(1));
     }
 

@@ -290,6 +290,7 @@ mod tests {
             retriable_status_codes: vec![429],
             retry_back_off: RetryBackOff::ENVOY_DEFAULT,
             host_selection_retry_max_attempts: 1,
+            avoid_previous_hosts: false,
         }
     }
 

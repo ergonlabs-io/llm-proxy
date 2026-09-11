@@ -32,6 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `Cluster.cluster_type.typed_config` must resolve for the surface
         // walk to see inside it.
         "envoy/extensions/clusters/aggregate/v3/cluster.proto",
+        // WP-14 remainder: the built-in retry host predicate. Its empty
+        // typed config still has to be in the descriptor pool so strict
+        // bootstrap parsing can distinguish it from an unknown extension.
+        "envoy/extensions/retry/host/previous_hosts/v3/previous_hosts.proto",
         // Access logging (WP-24): common AccessLog/AccessLogFilter types plus
         // the two logger extensions we implement (file, stdout/stderr).
         "envoy/config/accesslog/v3/accesslog.proto",

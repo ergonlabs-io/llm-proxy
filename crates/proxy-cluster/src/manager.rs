@@ -1479,7 +1479,7 @@ mod tests {
 
         let ctx = LoadBalancerContext {
             attempted_clusters: vec!["a".to_string()],
-            ..Default::default()
+            ..LoadBalancerContext::default()
         };
         let sel = entry
             .select_host(&ctx)
@@ -1488,7 +1488,7 @@ mod tests {
 
         let ctx_exhausted = LoadBalancerContext {
             attempted_clusters: vec!["a".to_string(), "b".to_string()],
-            ..Default::default()
+            ..LoadBalancerContext::default()
         };
         assert!(
             entry.select_host(&ctx_exhausted).is_none(),

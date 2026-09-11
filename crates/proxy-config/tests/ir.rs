@@ -431,11 +431,42 @@ fn virtual_host_level_request_headers_to_add_is_rejected() {
     );
 }
 
-/// Ground rule #1: the router re-runs host selection once per retry (Envoy's
-/// default of 1) but cannot exclude an already-tried host, so a higher value
-/// is refused rather than accepted-and-dropped.
+/// WP-14 remainder: Envoy's built-in `previous_hosts` predicate is lowered
+/// with the exact host-selection reattempt count.  The runtime owns the
+/// history; config only carries this explicit policy through to it.
 #[test]
-fn host_selection_retry_max_attempts_above_one_is_rejected() {
+fn previous_hosts_predicate_and_selection_attempts_are_lowered() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "5xx"
+                              host_selection_retry_max_attempts: 5
+                              retry_host_predicate:
+                                - name: envoy.retry_host_predicates.previous_hosts
+                                  typed_config:
+                                    "@type": type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate
+"#,
+    );
+    let table = route_table(&snapshot);
+    let RouteActionIR::Forward(f) = &table.virtual_hosts[0].routes[0].action else {
+        panic!("expected forward");
+    };
+    let rp = f.retry_policy.as_ref().expect("retry policy");
+    assert!(rp.avoid_previous_hosts);
+    assert_eq!(rp.host_selection_retry_max_attempts, 5);
+}
+
+/// A high reattempt count without a predicate still does nothing, so it stays
+/// a strict config error instead of becoming a silently accepted knob.
+#[test]
+fn host_selection_retry_max_attempts_above_one_without_predicate_is_rejected() {
     let err = hcm_snapshot_err(
         r#"
                   virtual_hosts:
@@ -450,15 +481,7 @@ fn host_selection_retry_max_attempts_above_one_is_rejected() {
                               host_selection_retry_max_attempts: 5
 "#,
     );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("host_selection_retry_max_attempts"),
-        "error must name the field path, got: {msg}"
-    );
-    assert!(
-        msg.contains("exclude"),
-        "error must explain why it can't be honored, got: {msg}"
-    );
+    assert!(err.to_string().contains("previous_hosts"));
 }
 
 /// Ground rule #1: `envoy-ratelimited` fires on the `x-envoy-ratelimited`
