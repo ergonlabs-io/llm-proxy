@@ -10,6 +10,7 @@
 //! client body rather than the body a Lane-H filter rewrote.
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 
 use crate::filter::RequestHeaders;
 
@@ -20,11 +21,16 @@ use crate::filter::RequestHeaders;
 /// closed: a signer/minting failure must return an error instead of sending an
 /// unauthenticated request to a provider.
 pub(crate) trait CredentialProvider {
-    fn apply(
-        &self,
-        request: &mut RequestHeaders,
-        body: &Bytes,
-    ) -> Result<(), CredentialProviderError>;
+    /// Completion is asynchronous because minted credentials must be
+    /// refreshed before the request may be sent.  A future OAuth provider
+    /// must keep its token cache and refresh work off the request worker;
+    /// this method only awaits a published/ongoing refresh and fails closed
+    /// if no usable token is available.
+    fn apply<'a>(
+        &'a self,
+        request: &'a mut RequestHeaders,
+        body: &'a Bytes,
+    ) -> BoxFuture<'a, Result<(), CredentialProviderError>>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,18 +50,20 @@ impl<'a> StaticHeaderCredentials<'a> {
 }
 
 impl CredentialProvider for StaticHeaderCredentials<'_> {
-    fn apply(
-        &self,
-        request: &mut RequestHeaders,
-        _body: &Bytes,
-    ) -> Result<(), CredentialProviderError> {
-        // `apply_header_mutations` intentionally preserves the existing
-        // Envoy-compatible malformed-header behavior (warn and skip).  The
-        // dialect validates its own emitted values before they reach this
-        // point; a future signing/minting implementation instead returns a
-        // `CredentialProviderError`, which the router maps to a local 503.
-        crate::router::apply_header_mutations(self.headers, &mut request.headers);
-        Ok(())
+    fn apply<'a>(
+        &'a self,
+        request: &'a mut RequestHeaders,
+        _body: &'a Bytes,
+    ) -> BoxFuture<'a, Result<(), CredentialProviderError>> {
+        Box::pin(async move {
+            // `apply_header_mutations` intentionally preserves the existing
+            // Envoy-compatible malformed-header behavior (warn and skip). The
+            // dialect validates its own emitted values before they reach this
+            // point; a future signing/minting implementation instead returns
+            // a `CredentialProviderError`, which the router maps to a 503.
+            crate::router::apply_header_mutations(self.headers, &mut request.headers);
+            Ok(())
+        })
     }
 }
 
@@ -79,9 +87,11 @@ mod tests {
             headers: HeaderMap::new(),
         };
 
-        StaticHeaderCredentials::new(&headers)
-            .apply(&mut request, &bytes::Bytes::from_static(b"rewritten-body"))
-            .expect("static credentials are valid");
+        futures::executor::block_on(
+            StaticHeaderCredentials::new(&headers)
+                .apply(&mut request, &bytes::Bytes::from_static(b"rewritten-body")),
+        )
+        .expect("static credentials are valid");
 
         assert_eq!(
             request.headers.get("authorization"),
