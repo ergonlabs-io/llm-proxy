@@ -62,6 +62,10 @@ jsonwebtoken = { version = "9", default-features = false }
 # `control.rs::ControlPlane::start_policy_poller`, modeled on
 # `proxy-cluster::health_check`'s `next_delay`.
 rand = { workspace = true }
+# WP-31 CORS: Envoy StringMatcher supports safe_regex alongside the scalar
+# matchers, so accepting its config without compiling it would be a silent
+# partial implementation.
+regex = { workspace = true }
 
 [dev-dependencies]
 proxy-api = { workspace = true }

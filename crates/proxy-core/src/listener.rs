@@ -70,6 +70,10 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
     REGISTRY.get_or_init(|| {
         let mut registry = FilterRegistry::default();
         registry.register(Arc::new(HeaderMutationFactory));
+        // WP-31: CORS policies live on the route through
+        // `typed_per_filter_config`; registration only makes a configured
+        // policy buildable, never enables CORS on an unrelated route.
+        registry.register(Arc::new(proxy_filters::cors::CorsFilterFactory));
         // WP-33a (Lane H): the usage/token filter. Registered unconditionally
         // -- it only does anything on a route that configures it, and a filter
         // that isn't in the registry is a hard config error at load time.

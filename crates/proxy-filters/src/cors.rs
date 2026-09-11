@@ -12,7 +12,9 @@ use http::header::{
     ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use prost_reflect::{DynamicMessage, Value};
+use prost_reflect::DynamicMessage;
+#[cfg(test)]
+use prost_reflect::Value;
 use regex::Regex;
 
 use proxy_config::ConfigError;
@@ -156,8 +158,11 @@ fn bool_wrapper(config: &DynamicMessage, field: &str, default: bool) -> Result<b
     config
         .get_field_by_name(field)
         .and_then(|value| value.as_message().cloned())
-        .and_then(|message| message.get_field_by_name("value"))
-        .and_then(|value| value.as_bool())
+        .and_then(|message| {
+            message
+                .get_field_by_name("value")
+                .and_then(|value| value.as_bool())
+        })
         .ok_or_else(|| invalid(format!("typed_config.{field}.value"), "must be a BoolValue"))
 }
 
