@@ -10,18 +10,13 @@ use ring::digest::{digest, SHA256};
 
 use crate::usage::TokenUsage;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TierBasis {
+    #[default]
     InputTokens,
     CachedTokens,
     CacheCreationTokens,
     OutputTokens,
-}
-
-impl Default for TierBasis {
-    fn default() -> Self {
-        Self::InputTokens
-    }
 }
 
 /// Intentionally has no Default: choosing either option changes money.

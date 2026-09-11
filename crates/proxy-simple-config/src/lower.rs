@@ -323,18 +323,14 @@ fn lower_pricing(
             validate_price_list(list)?;
             Ok(Some(price_list_filter_config(config, list)))
         }
-        (None, None) => {
-            return Err(ConfigError::InvalidValue {
-                field_path: "pricing".into(),
-                reason: "set exactly one of price_list_file or price_list".into(),
-            })
-        }
-        (Some(_), Some(_)) => {
-            return Err(ConfigError::InvalidValue {
-                field_path: "pricing".into(),
-                reason: "set exactly one of price_list_file or price_list, not both".into(),
-            })
-        }
+        (None, None) => Err(ConfigError::InvalidValue {
+            field_path: "pricing".into(),
+            reason: "set exactly one of price_list_file or price_list".into(),
+        }),
+        (Some(_), Some(_)) => Err(ConfigError::InvalidValue {
+            field_path: "pricing".into(),
+            reason: "set exactly one of price_list_file or price_list, not both".into(),
+        }),
     }
 }
 

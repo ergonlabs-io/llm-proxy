@@ -33,7 +33,9 @@ use proxy_observability::stats::{
 use tokio::net::TcpStream;
 
 use crate::dump::{LiveCluster, LiveEndpoint};
-use crate::server::{serve, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe};
+use crate::server::{
+    serve, AdminRuntime, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe,
+};
 
 /// The HMAC secret every write-API test's `ControlPlane` and matching
 /// [`VirtualKeyAuthenticator`] are built with -- arbitrary, but shared
@@ -240,13 +242,15 @@ async fn start_full_with_readiness(
     let config = SnapshotHandles::new().register(snapshot);
     let server = serve(
         "127.0.0.1:0".parse().unwrap(),
-        config,
-        registry,
-        Instant::now(),
-        factory_state,
-        admin_token,
-        readiness,
-        None,
+        AdminRuntime {
+            config,
+            registry,
+            started_at: Instant::now(),
+            factory_state,
+            admin_token,
+            readiness,
+            cluster_state: None,
+        },
     )
     .await
     .expect("admin server bind");
@@ -264,13 +268,15 @@ async fn start_with_cluster_state(
     let config = SnapshotHandles::new().register(snapshot);
     let server = serve(
         "127.0.0.1:0".parse().unwrap(),
-        config,
-        None,
-        Instant::now(),
-        Arc::new(SharedFactoryState::default()),
-        None,
-        None,
-        Some(cluster_state),
+        AdminRuntime {
+            config,
+            registry: None,
+            started_at: Instant::now(),
+            factory_state: Arc::new(SharedFactoryState::default()),
+            admin_token: None,
+            readiness: None,
+            cluster_state: Some(cluster_state),
+        },
     )
     .await
     .expect("admin server bind");

@@ -430,11 +430,8 @@ impl HttpFilter for CorsFilterInstance {
         else {
             return FilterHeadersStatus::Continue;
         };
-        let origin_text = match origin.to_str() {
-            Ok(origin) => origin,
-            // An invalid byte sequence cannot equal a configured StringMatcher.
-            Err(_) => "",
-        };
+        // An invalid byte sequence cannot equal a configured StringMatcher.
+        let origin_text = origin.to_str().unwrap_or_default();
         let allowed = policy.origin_allowed(origin_text);
         self.is_cors_request = true;
         self.policy = Some(Arc::clone(&policy));

@@ -154,6 +154,21 @@ pub struct AdminServer {
     accept_task: JoinHandle<()>,
 }
 
+/// Dependencies shared by every connection accepted by one admin server.
+///
+/// This is one server-level capability bundle, not a request payload: cloning
+/// it only clones `Arc` handles and optional closures for the next task.
+#[derive(Clone)]
+pub struct AdminRuntime {
+    pub config: Arc<WorkerConfigHandle>,
+    pub registry: Option<Arc<Registry>>,
+    pub started_at: Instant,
+    pub factory_state: Arc<SharedFactoryState>,
+    pub admin_token: Option<String>,
+    pub readiness: Option<ReadinessProbe>,
+    pub cluster_state: Option<ClusterStateProvider>,
+}
+
 impl AdminServer {
     /// The address actually bound -- callers pass port 0 in tests and read
     /// the OS-assigned port back from here.
@@ -207,17 +222,8 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
 /// one `hyper::server::conn::http1` connection, the standard hyper-on-tokio
 /// shape. Nothing here needs `!Send`/`Rc` -- this is ordinary control-plane
 /// code, never the worker-local data plane (ADR-0003).
-pub async fn serve(
-    addr: SocketAddr,
-    config: Arc<WorkerConfigHandle>,
-    registry: Option<Arc<Registry>>,
-    started_at: Instant,
-    factory_state: Arc<SharedFactoryState>,
-    admin_token: Option<String>,
-    readiness: Option<ReadinessProbe>,
-    cluster_state: Option<ClusterStateProvider>,
-) -> Result<AdminServer, AdminError> {
-    let admin_token = normalize_admin_token(admin_token);
+pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServer, AdminError> {
+    let admin_token = normalize_admin_token(runtime.admin_token.clone());
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| AdminError::Bind { addr, source })?;
@@ -235,35 +241,13 @@ pub async fn serve(
                 }
             };
             let io = TokioIo::new(stream);
-            let config = config.clone();
-            let registry = registry.clone();
-            let factory_state = factory_state.clone();
+            let mut runtime = runtime.clone();
             let admin_token = admin_token.clone();
-            let readiness = readiness.clone();
-            let cluster_state = cluster_state.clone();
+            runtime.admin_token = admin_token;
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
-                    let config = config.clone();
-                    let registry = registry.clone();
-                    let factory_state = factory_state.clone();
-                    let admin_token = admin_token.clone();
-                    let readiness = readiness.clone();
-                    let cluster_state = cluster_state.clone();
-                    async move {
-                        Ok::<_, std::convert::Infallible>(
-                            handle(
-                                req,
-                                &config,
-                                registry.as_deref(),
-                                started_at,
-                                &factory_state,
-                                admin_token.as_deref(),
-                                readiness.as_ref(),
-                                cluster_state.as_ref(),
-                            )
-                            .await,
-                        )
-                    }
+                    let runtime = runtime.clone();
+                    async move { Ok::<_, std::convert::Infallible>(handle(req, &runtime).await) }
                 });
                 if let Err(err) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
@@ -281,16 +265,14 @@ pub async fn serve(
     })
 }
 
-async fn handle(
-    req: Request<Incoming>,
-    config: &WorkerConfigHandle,
-    registry: Option<&Registry>,
-    started_at: Instant,
-    factory_state: &SharedFactoryState,
-    admin_token: Option<&str>,
-    readiness: Option<&ReadinessProbe>,
-    cluster_state: Option<&ClusterStateProvider>,
-) -> Response<Full<Bytes>> {
+async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full<Bytes>> {
+    let config = &runtime.config;
+    let registry = runtime.registry.as_deref();
+    let started_at = runtime.started_at;
+    let factory_state = &runtime.factory_state;
+    let admin_token = runtime.admin_token.as_deref();
+    let readiness = runtime.readiness.as_ref();
+    let cluster_state = runtime.cluster_state.as_ref();
     // ---- Read endpoints: byte-for-byte the read-only increment's behavior,
     // no gate, matched on path alone (as before -- these never distinguished
     // method). ----

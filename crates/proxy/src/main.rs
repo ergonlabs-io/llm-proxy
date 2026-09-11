@@ -748,13 +748,15 @@ async fn run_serve(
     // accepting traffic.
     let admin_server = match start_admin(
         snapshot.admin,
-        snapshot.clone(),
-        registry.clone(),
-        Instant::now(),
-        &snapshot_handles,
-        factory_state.clone(),
-        Some(readiness),
-        Some(cluster_state),
+        AdminStartRuntime {
+            snapshot: snapshot.clone(),
+            registry: registry.clone(),
+            started_at: Instant::now(),
+            snapshot_handles: &snapshot_handles,
+            factory_state: factory_state.clone(),
+            readiness: Some(readiness),
+            cluster_state: Some(cluster_state),
+        },
     )
     .await
     {
@@ -1631,30 +1633,36 @@ fn build_readiness_probe(
 /// also reads [`ADMIN_TOKEN_ENV_VAR`] once and passes the result to
 /// `proxy_admin::serve` as a plain parameter, per that function's own doc on
 /// why it never reads the environment itself.
-async fn start_admin(
-    admin: Option<SocketAddr>,
+struct AdminStartRuntime<'a> {
     snapshot: Arc<ConfigSnapshot>,
     registry: Arc<proxy_observability::stats::Registry>,
     started_at: Instant,
-    snapshot_handles: &SnapshotHandles,
+    snapshot_handles: &'a SnapshotHandles,
     factory_state: Arc<proxy_http::filter::SharedFactoryState>,
     readiness: Option<proxy_admin::ReadinessProbe>,
     cluster_state: Option<proxy_admin::ClusterStateProvider>,
+}
+
+async fn start_admin(
+    admin: Option<SocketAddr>,
+    runtime: AdminStartRuntime<'_>,
 ) -> Result<Option<proxy_admin::AdminServer>, String> {
     let Some(addr) = admin else {
         return Ok(None);
     };
-    let config = snapshot_handles.register(snapshot);
+    let config = runtime.snapshot_handles.register(runtime.snapshot);
     let admin_token = std::env::var(ADMIN_TOKEN_ENV_VAR).ok();
     let server = proxy_admin::serve(
         addr,
-        config,
-        Some(registry),
-        started_at,
-        factory_state,
-        admin_token,
-        readiness,
-        cluster_state,
+        proxy_admin::AdminRuntime {
+            config,
+            registry: Some(runtime.registry),
+            started_at: runtime.started_at,
+            factory_state: runtime.factory_state,
+            admin_token,
+            readiness: runtime.readiness,
+            cluster_state: runtime.cluster_state,
+        },
     )
     .await
     .map_err(|err| err.to_string())?;
@@ -1883,13 +1891,15 @@ mod tests {
 
         let result = start_admin(
             None,
-            empty_snapshot(),
-            test_registry(),
-            Instant::now(),
-            &SnapshotHandles::new(),
-            Arc::new(proxy_http::filter::SharedFactoryState::default()),
-            None,
-            None,
+            AdminStartRuntime {
+                snapshot: empty_snapshot(),
+                registry: test_registry(),
+                started_at: Instant::now(),
+                snapshot_handles: &SnapshotHandles::new(),
+                factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
+                readiness: None,
+                cluster_state: None,
+            },
         )
         .await
         .expect("start_admin(None, ..) must not fail");
@@ -1910,13 +1920,15 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server = start_admin(
             Some(addr),
-            empty_snapshot(),
-            test_registry(),
-            Instant::now(),
-            &SnapshotHandles::new(),
-            Arc::new(proxy_http::filter::SharedFactoryState::default()),
-            None,
-            None,
+            AdminStartRuntime {
+                snapshot: empty_snapshot(),
+                registry: test_registry(),
+                started_at: Instant::now(),
+                snapshot_handles: &SnapshotHandles::new(),
+                factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
+                readiness: None,
+                cluster_state: None,
+            },
         )
         .await
         .expect("start_admin should succeed on an available port")
@@ -1942,13 +1954,15 @@ mod tests {
         let snapshot_handles = SnapshotHandles::new();
         let server = start_admin(
             Some(addr),
-            empty_snapshot(),
-            test_registry(),
-            Instant::now(),
-            &snapshot_handles,
-            Arc::new(proxy_http::filter::SharedFactoryState::default()),
-            None,
-            None,
+            AdminStartRuntime {
+                snapshot: empty_snapshot(),
+                registry: test_registry(),
+                started_at: Instant::now(),
+                snapshot_handles: &snapshot_handles,
+                factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
+                readiness: None,
+                cluster_state: None,
+            },
         )
         .await
         .expect("start_admin should succeed on an available port")

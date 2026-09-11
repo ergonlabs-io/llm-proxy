@@ -263,6 +263,18 @@ struct ListenerHcm {
     default_handler: Option<Rc<dyn StreamHandler>>,
 }
 
+/// Shared runtime dependencies for every HCM filter-chain in one listener.
+/// Keeping this bundle explicit prevents new instrumentation from quietly
+/// growing `build_hcm_handler`'s positional interface again.
+struct HcmRuntime<'a> {
+    cluster_manager: &'a Arc<ClusterManager>,
+    router_stats: &'a Arc<RouterStats>,
+    token_stats: &'a Arc<GenAiTokenStats>,
+    latency_stats: &'a Arc<GenAiLatencyStats>,
+    tracing_handles: Option<&'a TracingHandles>,
+    factory_state: &'a Arc<SharedFactoryState>,
+}
+
 impl ListenerHcm {
     /// Same "everything resets" placeholder as [`ListenerTls::empty_for`],
     /// used when a runtime rebuild fails.
@@ -288,21 +300,20 @@ fn build_listener_hcm(
     tracing_handles: Option<&TracingHandles>,
     factory_state: &Arc<SharedFactoryState>,
 ) -> Result<ListenerHcm, HttpFilterChainBuildError> {
+    let runtime = HcmRuntime {
+        cluster_manager,
+        router_stats,
+        token_stats,
+        latency_stats,
+        tracing_handles,
+        factory_state,
+    };
     let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
     for (i, chain) in listener.filter_chains.iter().enumerate() {
         let handler = match chain.filters.last() {
             Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
                 let context = format!("listener '{}' filter_chains[{i}]", listener.name);
-                Some(build_hcm_handler(
-                    hcm,
-                    &context,
-                    cluster_manager,
-                    router_stats,
-                    token_stats,
-                    latency_stats,
-                    tracing_handles,
-                    factory_state,
-                )?)
+                Some(build_hcm_handler(hcm, &context, &runtime)?)
             }
             _ => None,
         };
@@ -315,16 +326,7 @@ fn build_listener_hcm(
     {
         Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
             let context = format!("listener '{}' default_filter_chain", listener.name);
-            Some(build_hcm_handler(
-                hcm,
-                &context,
-                cluster_manager,
-                router_stats,
-                token_stats,
-                latency_stats,
-                tracing_handles,
-                factory_state,
-            )?)
+            Some(build_hcm_handler(hcm, &context, &runtime)?)
         }
         _ => None,
     };
@@ -1237,12 +1239,7 @@ fn terminal_filter(
 fn build_hcm_handler(
     hcm: &HttpConnectionManagerConfig,
     context: &str,
-    cluster_manager: &Arc<ClusterManager>,
-    router_stats: &Arc<RouterStats>,
-    token_stats: &Arc<GenAiTokenStats>,
-    latency_stats: &Arc<GenAiLatencyStats>,
-    tracing_handles: Option<&TracingHandles>,
-    factory_state: &Arc<SharedFactoryState>,
+    runtime: &HcmRuntime<'_>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
     // `context` is this chain's identity (the same string this function's own
@@ -1251,7 +1248,7 @@ fn build_hcm_handler(
     // sibling chain built through a later call gets a different one. See
     // `SharedFactoryState`'s doc for why this must not collide across chains.
     let factory_ctx = FactoryContext {
-        shared: factory_state.clone(),
+        shared: runtime.factory_state.clone(),
         scope: context.to_string(),
         // WP-50 3c-ii-a: the HCM's own operator-supplied `stat_prefix` (this
         // function already holds `hcm`) becomes the chain's external name --
@@ -1305,9 +1302,11 @@ fn build_hcm_handler(
     // CLIENT span sink to emit through (see `RouterFilterFactory::with_tracing`'s
     // doc). `None` costs nothing; see this function's own `.with_tracing`
     // call below for the FilterChainHandler half of the same wiring.
-    let mut router_factory =
-        RouterFilterFactory::new(cluster_manager.clone(), router_stats.clone());
-    if let Some(t) = tracing_handles {
+    let mut router_factory = RouterFilterFactory::new(
+        runtime.cluster_manager.clone(),
+        runtime.router_stats.clone(),
+    );
+    if let Some(t) = runtime.tracing_handles {
         router_factory = router_factory.with_tracing(t.sink.clone());
     }
     // S10 (WP-10 increment 2b/2c): thread this HCM's `upgrade_configs` into
@@ -1355,13 +1354,13 @@ fn build_hcm_handler(
         context: context.to_string(),
         reason: format!("failed to build filter chain: {e}"),
     })?
-    .with_token_stats(token_stats.clone());
-    handler = handler.with_gen_ai_latency_stats(latency_stats.clone());
+    .with_token_stats(runtime.token_stats.clone());
+    handler = handler.with_gen_ai_latency_stats(runtime.latency_stats.clone());
     // WP-51 increment 2: `.with_tracing` on the FilterChainHandler half of
     // this build -- see the `router_factory` one above for the other half
     // (the CLIENT-span-emitting router terminal); this half is what mints
     // the SERVER span and joins/propagates an inbound `traceparent`.
-    if let Some(t) = tracing_handles {
+    if let Some(t) = runtime.tracing_handles {
         handler = handler.with_tracing(t.sink.clone(), t.sample_ratio);
     }
     Ok(Rc::new(handler))

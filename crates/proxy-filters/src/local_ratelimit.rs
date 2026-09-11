@@ -1190,7 +1190,7 @@ mod tests {
         assert_eq!(headers.get("x-local-limit").unwrap(), "yes");
         assert_eq!(
             proxy_observability::flags::render_flags(
-                &second_cb.stream_info.borrow().response_flags().to_vec()
+                second_cb.stream_info.borrow().response_flags()
             ),
             "RL"
         );
