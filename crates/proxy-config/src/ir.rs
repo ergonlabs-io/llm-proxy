@@ -926,7 +926,7 @@ pub enum UpstreamProtocol {
 /// per routing priority (`DEFAULT` / `HIGH`). Envoy's proto carries a repeated
 /// `thresholds` list tagged by priority; the IR flattens it to the two buckets
 /// and fills missing ones with the Envoy defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CircuitBreakers {
     /// Budgets for priority 0 (`RoutingPriority::Default`).
     pub default: CircuitBreakerThresholds,
@@ -938,7 +938,7 @@ pub struct CircuitBreakers {
 /// the cluster shed load (503 + `UO` + `x-envoy-overloaded`) rather than pile
 /// work onto a struggling upstream. Envoy defaults are baked into
 /// [`CircuitBreakerThresholds::ENVOY_DEFAULT`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CircuitBreakerThresholds {
     /// Max open upstream connections (Envoy default 1024).
     pub max_connections: u32,
@@ -948,6 +948,22 @@ pub struct CircuitBreakerThresholds {
     pub max_requests: u32,
     /// Max concurrent retries in flight (Envoy default 3).
     pub max_retries: u32,
+    /// When present, replaces `max_retries` with Envoy's concurrency-relative
+    /// retry budget. Its percentage is deliberately a `f64`: Envoy's
+    /// `Percent` accepts fractional values, so narrowing it to an integer
+    /// would silently alter an operator's limit.
+    pub retry_budget: Option<RetryBudget>,
+}
+
+/// Envoy's `CircuitBreakers.Thresholds.RetryBudget`, lowered exactly rather
+/// than approximated by the fixed `max_retries` breaker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetryBudget {
+    /// Percentage of active + pending requests allowed to be active retries.
+    /// Validated finite and in `[0, 100]` while lowering.
+    pub budget_percent: f64,
+    /// Floor for small clusters. Envoy default 3.
+    pub min_retry_concurrency: u32,
 }
 
 impl CircuitBreakerThresholds {
@@ -960,6 +976,7 @@ impl CircuitBreakerThresholds {
         max_pending_requests: 1024,
         max_requests: 1024,
         max_retries: 3,
+        retry_budget: None,
     };
 }
 

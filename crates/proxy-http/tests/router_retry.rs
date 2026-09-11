@@ -48,6 +48,22 @@ fn fast_backoff() -> RetryBackOff {
     }
 }
 
+fn retry_budget_breakers(percent: f64, minimum: u32) -> proxy_config::ir::CircuitBreakers {
+    proxy_config::ir::CircuitBreakers {
+        default: proxy_config::ir::CircuitBreakerThresholds {
+            retry_budget: Some(proxy_config::ir::RetryBudget {
+                budget_percent: percent,
+                min_retry_concurrency: minimum,
+            }),
+            // A retry budget replaces this value; make that assertion
+            // meaningful by setting a permissive fixed breaker alongside it.
+            max_retries: 99,
+            ..proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT
+        },
+        high: proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT,
+    }
+}
+
 fn retry_policy(retry_on: &str, num_retries: u32) -> RetryPolicyIR {
     RetryPolicyIR {
         retry_on: RetryOn::parse(retry_on),
@@ -97,6 +113,16 @@ async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandle
     build_router_with_stats(addr, fwd).await.0
 }
 
+async fn build_router_with_breakers(
+    addr: SocketAddr,
+    fwd: ForwardAction,
+    circuit_breakers: proxy_config::ir::CircuitBreakers,
+) -> FilterChainHandler {
+    build_router_with_stats_and_breakers(addr, fwd, circuit_breakers)
+        .await
+        .0
+}
+
 /// Like [`build_router`], but also hands back the [`RouterStats`] (and,
 /// through it, the [`proxy_observability::stats::Registry`]) the router was
 /// built with -- for tests that need to assert on recorded traffic, not just
@@ -104,6 +130,15 @@ async fn build_router(addr: SocketAddr, fwd: ForwardAction) -> FilterChainHandle
 async fn build_router_with_stats(
     addr: SocketAddr,
     fwd: ForwardAction,
+) -> (FilterChainHandler, Arc<RouterStats>) {
+    build_router_with_stats_and_breakers(addr, fwd, proxy_config::ir::CircuitBreakers::default())
+        .await
+}
+
+async fn build_router_with_stats_and_breakers(
+    addr: SocketAddr,
+    fwd: ForwardAction,
+    circuit_breakers: proxy_config::ir::CircuitBreakers,
 ) -> (FilterChainHandler, Arc<RouterStats>) {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
@@ -126,7 +161,7 @@ async fn build_router_with_stats(
             kind: ClusterKind::Endpoints,
             transport_socket: None,
             per_connection_buffer_limit_bytes: 1 << 20,
-            circuit_breakers: proxy_config::ir::CircuitBreakers::default(),
+            circuit_breakers,
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
@@ -459,6 +494,32 @@ async fn retries_stop_at_num_retries_and_return_the_last_failure() {
                 count.load(Ordering::SeqCst),
                 3,
                 "expected num_retries + 1 == 3 attempts to reach the upstream"
+            );
+        })
+        .await;
+}
+
+/// A real socket must see no second request when the percentage retry budget
+/// admits none, even though the route policy and fixed `max_retries` would
+/// both otherwise permit one.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_budget_blocks_an_ordinary_retry_over_a_real_socket() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, count, _rx) = spawn_upstream_fails_then_succeeds(usize::MAX, 503).await;
+            let router = build_router_with_breakers(
+                addr,
+                forward_to_up(Some(retry_policy("5xx", 1))),
+                retry_budget_breakers(0.0, 0),
+            )
+            .await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "budget must override max_retries"
             );
         })
         .await;
@@ -921,6 +982,38 @@ async fn a_safe_request_hedges_without_cancelling_the_original_attempt() {
     })
     .await
     .expect("the hedge must complete well within this guard");
+}
+
+/// A hedge consumes the exact same concurrency-relative retry budget as an
+/// ordinary replay. A zero cap must prevent the second socket from opening.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_budget_blocks_a_hedge_over_a_real_socket() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, count) = spawn_upstream_original_wins_hedge().await;
+                let mut policy =
+                    retry_policy_with_per_try_timeout("5xx", 1, Duration::from_millis(50));
+                policy.hedge_on_per_try_timeout = true;
+                let router = build_router_with_breakers(
+                    addr,
+                    forward_to_up(Some(policy)),
+                    retry_budget_breakers(0.0, 0),
+                )
+                .await;
+
+                let response = router.handle(get_request("/v1/chat")).await;
+                assert_eq!(response.head.status, StatusCode::GATEWAY_TIMEOUT);
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    1,
+                    "budget must block the hedge"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("budget rejection must not leave the original hedge task running");
 }
 
 #[tokio::test(flavor = "current_thread")]

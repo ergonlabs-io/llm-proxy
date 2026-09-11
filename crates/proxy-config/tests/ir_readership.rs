@@ -217,17 +217,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   TcpProxyConfig's own field is ever touched.",
     },
     AllowlistEntry {
-        struct_name: "RetryPolicyIR",
-        field_name: "host_selection_retry_max_attempts",
-        kind: EntryKind::KnownInert,
-        reason: "WP-14: lowering rejects any config where this would exceed \
-                  1 (crates/proxy-config/src/lower.rs, `> 1` check) rather \
-                  than silently ignoring it, so the field can only ever carry \
-                  its default in the IR — but the router has no host-*repick* \
-                  predicate yet (IMPLEMENTATION_PLAN.md's WP-14 remainder), \
-                  so no runtime code reads even that default value.",
-    },
-    AllowlistEntry {
         struct_name: "RetryOn",
         field_name: "envoy_ratelimited",
         kind: EntryKind::KnownInert,
