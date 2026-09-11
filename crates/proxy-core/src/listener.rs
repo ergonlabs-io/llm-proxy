@@ -74,6 +74,12 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         // `typed_per_filter_config`; registration only makes a configured
         // policy buildable, never enables CORS on an unrelated route.
         registry.register(Arc::new(proxy_filters::cors::CorsFilterFactory));
+        // WP-31: local rate limits keep their process-wide buckets in the
+        // factory's shared state. Registration alone consumes no requests;
+        // a listener must configure this type URL to enforce a limit.
+        registry.register(Arc::new(
+            proxy_filters::local_ratelimit::LocalRateLimitFilterFactory,
+        ));
         // WP-33a (Lane H): the usage/token filter. Registered unconditionally
         // -- it only does anything on a route that configures it, and a filter
         // that isn't in the registry is a hard config error at load time.
