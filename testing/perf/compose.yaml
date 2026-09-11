@@ -1,0 +1,82 @@
+# WP-30 Docker capacity topology:
+#
+#   loadgen (manual profile, separate cgroup) -> proxy (2 CPU / 1 GiB)
+#                                                   -> mock (private network)
+#
+# `loadgen` joins the proxy PID namespace but not its cgroup. Its existing
+# `--sweep-pid 1` sampler therefore reads the proxy process while generator
+# CPU and memory do not consume the proxy's configured resource budget.
+services:
+  mock:
+    image: llm-proxy-perf:local
+    build:
+      context: ../..
+      dockerfile: testing/perf/Dockerfile
+    command:
+      - /usr/local/bin/mock-upstream
+      - --listen
+      - 0.0.0.0:8080
+      - --protocol
+      - auto
+      - --tokens
+      - "${TOKENS:-128}"
+      - --ttft-ms
+      - "${TTFT_MS:-250}"
+      - --inter-token-ms
+      - "${INTER_TOKEN_MS:-25}"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/health"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+    networks: [perf]
+
+  proxy:
+    image: llm-proxy-perf:local
+    build:
+      context: ../..
+      dockerfile: testing/perf/Dockerfile
+    environment:
+      UPSTREAM_PROTOCOL: "${UPSTREAM_PROTOCOL:-http2}"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        sed "s/^    protocol: .*/    protocol: $${UPSTREAM_PROTOCOL}/" \
+          /etc/llm-proxy/proxy.yaml > /tmp/proxy.yaml
+        exec /usr/local/bin/llm-proxy --config /tmp/proxy.yaml
+    cpus: "${PROXY_CPUS:-2.0}"
+    mem_limit: "${PROXY_MEMORY:-1g}"
+    memswap_limit: "${PROXY_MEMORY:-1g}"
+    pids_limit: 512
+    ports:
+      - "18080:8080"
+      - "18901:8901"
+    depends_on:
+      mock:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8901/ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+    networks: [perf]
+
+  loadgen:
+    image: llm-proxy-perf:local
+    build:
+      context: ../..
+      dockerfile: testing/perf/Dockerfile
+    profiles: [manual]
+    entrypoint: [/usr/local/bin/loadgen]
+    pid: "service:proxy"
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+      - "${PERF_OUT_DIR:-../../target/docker-capacity}:/reports"
+    networks: [perf]
+
+networks:
+  perf:
+    internal: true

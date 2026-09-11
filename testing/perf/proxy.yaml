@@ -1,0 +1,15 @@
+# WP-30 Docker capacity topology. Compose substitutes only the upstream
+# protocol line at startup; this default remains a valid standalone config.
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 0.0.0.0:8901
+
+providers:
+  mock:
+    base_url: http://mock:8080
+    protocol: http2
+
+routes:
+  - model: "*"
+    provider: mock
