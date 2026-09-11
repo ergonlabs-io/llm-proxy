@@ -122,7 +122,7 @@ printf 'project=%s\nproxy_cpus=%s\nproxy_memory=%s\ntokens=%s\nttft_ms=%s\ninter
 echo "=== build and start proxy (${PROXY_CPUS} CPUs, ${PROXY_MEMORY}, no swap) ==="
 PERF_OUT_DIR="$OUT_DIR" PROXY_CPUS="$PROXY_CPUS" PROXY_MEMORY="$PROXY_MEMORY" \
 TOKENS="$TOKENS" TTFT_MS="$TTFT_MS" INTER_TOKEN_MS="$INTER_TOKEN_MS" \
-"${COMPOSE[@]}" up --build --detach mock-upstream proxy
+"${COMPOSE[@]}" up --build --detach mock proxy
 
 PROXY_ID="$("${COMPOSE[@]}" ps -q proxy)"
 [[ -n "$PROXY_ID" ]] || { echo 'proxy container did not start' >&2; exit 1; }
