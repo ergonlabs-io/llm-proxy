@@ -134,6 +134,8 @@ pub enum FormatOp {
     /// WP-46: `%LLM_RESPONSE_CHUNKS%` -- number of response body chunks
     /// observed for this stream.
     LlmResponseChunks,
+    /// WP-53: `%LLM_LIST_COST%`, in integer nanodollars.
+    LlmListCost,
 }
 
 /// The argument to `%REQ%`/`%RESP%`/`%TRAILER%`: a primary header name, an
@@ -395,6 +397,10 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmResponseChunks
         }
+        "LLM_LIST_COST" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmListCost
+        }
         other => {
             return Err(err(format!(
                 "unknown access-log format operator `%{other}%` in format string `{input}`"
@@ -475,6 +481,8 @@ pub struct LogContext<'a> {
     pub llm_max_stall: Option<std::time::Duration>,
     /// WP-46: number of response body chunks observed for this stream.
     pub llm_response_chunks: u64,
+    /// WP-53's request-time list price. `None` is unpriced/unknown, not zero.
+    pub llm_list_cost_nanodollars: Option<u64>,
     /// Envoy request pseudo-header `:method` -- e.g. `GET`. These four fields
     /// exist because `:method`/`:path`/`:authority`/`:scheme` are not legal
     /// `http::HeaderName`s (a colon isn't a valid HTTP field-name character),
@@ -634,6 +642,12 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::LlmResponseChunks => {
             let _ = write!(out, "{}", ctx.llm_response_chunks);
         }
+        FormatOp::LlmListCost => match ctx.llm_list_cost_nanodollars {
+            Some(cost) => {
+                let _ = write!(out, "{cost}");
+            }
+            None => out.push('-'),
+        },
     }
 }
 
@@ -923,6 +937,7 @@ mod tests {
             llm_ttft: None,
             llm_max_stall: None,
             llm_response_chunks: 0,
+            llm_list_cost_nanodollars: None,
             request_method: Some("POST"),
             request_path: Some("/v1/chat/completions"),
             request_authority: Some("api.example.com"),
@@ -953,6 +968,16 @@ mod tests {
         c.downstream_remote_address = None;
         let fs = parse("%PROTOCOL% %RESPONSE_CODE% %DURATION% %UPSTREAM_HOST% %UPSTREAM_CLUSTER% %DOWNSTREAM_REMOTE_ADDRESS% %REQ(x)% %RESPONSE_FLAGS%");
         assert_eq!(render(&fs, &c), "- - - - - - - -");
+    }
+
+    #[test]
+    fn llm_list_cost_renders_nanodollars_or_dash_for_unpriced() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let format = parse("%LLM_LIST_COST%");
+        assert_eq!(render(&format, &c), "-", "unpriced is not a free zero");
+        c.llm_list_cost_nanodollars = Some(123_456);
+        assert_eq!(render(&format, &c), "123456");
     }
 
     #[test]

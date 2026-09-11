@@ -242,7 +242,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
 
     let auth_filter = lower_auth(config, &mut warnings)?;
     let token_limit_filter = lower_limits(config, &mut warnings)?;
-    lower_pricing(config, &mut warnings)?;
+    let pricing = lower_pricing(config, &mut warnings)?;
 
     let access_log = config
         .observability
@@ -255,6 +255,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         access_log,
         auth_filter,
         token_limit_filter,
+        pricing,
         &mut warnings,
     )?;
 
@@ -294,9 +295,9 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
 fn lower_pricing(
     config: &SimpleConfig,
     warnings: &mut Vec<ConfigWarning>,
-) -> Result<(), ConfigError> {
+) -> Result<Option<Value>, ConfigError> {
     let Some(pricing) = config.pricing.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     match (&pricing.price_list_file, &pricing.price_list) {
         (Some(file), None) => {
@@ -316,8 +317,12 @@ fn lower_pricing(
                 }
             })?;
             validate_price_list(&list)?;
+            Ok(Some(price_list_filter_config(config, &list)))
         }
-        (None, Some(list)) => validate_price_list(list)?,
+        (None, Some(list)) => {
+            validate_price_list(list)?;
+            Ok(Some(price_list_filter_config(config, list)))
+        }
         (None, None) => {
             return Err(ConfigError::InvalidValue {
                 field_path: "pricing".into(),
@@ -330,8 +335,53 @@ fn lower_pricing(
                 reason: "set exactly one of price_list_file or price_list, not both".into(),
             })
         }
-    };
-    Ok(())
+    }
+}
+
+/// Serialize the strict dialect card into the usage filter's temporary
+/// DataSource carrier.  This is listener-level (not route-level): the card
+/// must be captured once per stream, while the actual provider is resolved
+/// from the cluster the router really dialled at response end.
+fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value {
+    let entries: Vec<Value> = list
+        .entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "provider_type": entry.provider_type,
+                "model": entry.model,
+                "tier_mode": match entry.tier_mode.expect("validated") {
+                    TierModeDef::WholeRequest => "whole_request",
+                    TierModeDef::Graduated => "graduated",
+                },
+                "tiers": entry.tiers.iter().map(|tier| json!({
+                    "up_to": tier.up_to,
+                    "input_nanodollars_per_token": tier.input_nanodollars_per_token,
+                    "cached_input_nanodollars_per_token": tier.cached_input_nanodollars_per_token,
+                    "cache_write_nanodollars_per_token": tier.cache_write_nanodollars_per_token,
+                    "output_nanodollars_per_token": tier.output_nanodollars_per_token,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let providers: serde_json::Map<String, Value> = config
+        .providers
+        .iter()
+        .map(|(name, provider)| {
+            (
+                format!("provider:{name}"),
+                Value::String(provider.effective_type(name).as_str().to_string()),
+            )
+        })
+        .collect();
+    json!({
+        "price_list": {
+            "version": list.version,
+            "effective_from": list.effective_from,
+            "entries": entries,
+        },
+        "providers": providers,
+    })
 }
 
 fn pricing_file_path(path: &str) -> String {
@@ -1793,6 +1843,7 @@ fn lower_listener(
     access_log: Option<Value>,
     auth_filter: Option<Value>,
     token_limit_filter: Option<Value>,
+    pricing: Option<Value>,
     _warnings: &mut [ConfigWarning],
 ) -> Result<Value, ConfigError> {
     let (address, tls) = match &config.listen {
@@ -1849,6 +1900,12 @@ fn lower_listener(
         // `token_limit_filter`'s module doc, "Filter position" section.
         http_filters.push(token_limit_filter);
     }
+    let usage_config = pricing
+        .map(|mut pricing| {
+            pricing["dialect"] = Value::String(default_dialect.to_string());
+            pricing.to_string()
+        })
+        .unwrap_or_else(|| default_dialect.to_string());
     http_filters.push(json!({
         // Before the router, so it is in the encode chain (S2.1: encoder
         // callbacks run in REVERSE config order) and sees response bytes
@@ -1856,7 +1913,7 @@ fn lower_listener(
         "name": USAGE_FILTER_NAME,
         "typed_config": {
             "@type": USAGE_FILTER_TYPE_URL,
-            "inline_string": default_dialect,
+            "inline_string": usage_config,
         }
     }));
     http_filters.push(json!({

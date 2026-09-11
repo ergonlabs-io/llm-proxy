@@ -106,6 +106,7 @@ is a load error, never silently dropped or emitted as literal text.
 | `%UPSTREAM_HOST%` / `%UPSTREAM_CLUSTER%` | The dialed upstream host and the cluster it belongs to. |
 | `%DOWNSTREAM_REMOTE_ADDRESS%` | The client's socket address. |
 | `%LLM_INPUT_TOKENS%` / `%LLM_CACHED_TOKENS%` / `%LLM_CACHE_CREATION_TOKENS%` / `%LLM_OUTPUT_TOKENS%` / `%LLM_TOTAL_TOKENS%` | Token counts from the provider's own usage report. `-` when the provider reported none — never a confident-looking `0`. |
+| `%LLM_LIST_COST%` | Configured list cost in integer nanodollars, captured once when final response usage is available. `-` when usage, the requested model, actual provider, or a rate-card entry is unknown; this is distinct from a configured zero price. |
 | `%LLM_TTFT%` | Time to first token (response headers to first body byte), in milliseconds. |
 | `%LLM_TPOT%` | Mean time per output token: `(duration - ttft) / output_tokens`, in fractional milliseconds. `-` if usage, TTFT, or duration is missing, or output tokens is zero. |
 | `%LLM_MAX_STALL%` | The largest gap between two consecutive response chunks, in milliseconds — the tail of the per-token latency distribution, not the mean. |

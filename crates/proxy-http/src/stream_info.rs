@@ -34,6 +34,18 @@ pub struct LlmTokenUsage {
     pub output_tokens: u64,
 }
 
+/// The immutable list-price observation for one completed request (WP-53).
+///
+/// `LlmStats::list_cost` stays `None` when the provider reported no usage,
+/// the request had no extracted model, or that `(provider type, model)` is
+/// absent from the configured card.  This is intentionally distinct from
+/// `Some(0)`: a zero price is a configured price, while `None` is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmListCost {
+    pub nanodollars: u64,
+    pub rate_card_version: String,
+}
+
 impl LlmTokenUsage {
     /// Total across all four buckets. Sound to sum because they don't overlap.
     pub fn total(&self) -> u64 {
@@ -74,6 +86,8 @@ impl GenAiSystem {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LlmStats {
     pub usage: Option<LlmTokenUsage>,
+    /// Filled once, alongside final usage, after the response stream ends.
+    pub list_cost: Option<LlmListCost>,
     /// The response dialect selected from the route's usage-filter config.
     /// `None` means no usage filter ran, so GenAI latency metrics must not
     /// guess a system from a cluster name.

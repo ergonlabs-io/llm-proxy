@@ -28,6 +28,7 @@
 //! (per-dialect overrides, a token-rate-limit budget knob, etc.) it should
 //! get its own vendored proto instead of stretching `DataSource` further.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -43,8 +44,10 @@ use proxy_http::filter::{
     ResponseTrailers,
 };
 use proxy_http::stream_info::GenAiSystem;
-use proxy_http::LlmTokenUsage;
+use proxy_http::{LlmListCost, LlmTokenUsage};
+use serde::Deserialize;
 
+use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
 use crate::usage::{extract_json_usage, Dialect, SseUsageScanner, TokenUsage};
 
 /// Type URL this filter is registered under (see the module doc for the
@@ -96,8 +99,11 @@ impl HttpFilterFactory for UsageFilterFactory {
         config: &DynamicMessage,
         _ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let dialect = parse_config(config)?;
-        Ok(Box::new(UsageFilterInstanceFactory { dialect }))
+        let parsed = parse_factory_config(config)?;
+        Ok(Box::new(UsageFilterInstanceFactory {
+            dialect: parsed.dialect,
+            pricing: parsed.pricing,
+        }))
     }
 
     fn parse_per_route(
@@ -130,6 +136,153 @@ fn parse_config(config: &DynamicMessage) -> Result<Dialect, ConfigError> {
     }
 }
 
+/// The temporary DataSource carrier accepts its historic bare dialect and,
+/// when pricing is enabled, a strict JSON object.  Keeping the card on the
+/// listener config means a stream captures the exact card/version at creation
+/// time; a later reload creates a new factory rather than mutating in-flight
+/// requests.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FactoryWire {
+    dialect: String,
+    price_list: PriceListWire,
+    providers: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriceListWire {
+    #[serde(default)]
+    version: Option<String>,
+    effective_from: String,
+    entries: Vec<PriceEntryWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriceEntryWire {
+    provider_type: String,
+    model: String,
+    tier_mode: String,
+    tiers: Vec<TierWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TierWire {
+    #[serde(default)]
+    up_to: Option<u64>,
+    input_nanodollars_per_token: u64,
+    cached_input_nanodollars_per_token: u64,
+    cache_write_nanodollars_per_token: u64,
+    output_nanodollars_per_token: u64,
+}
+
+#[derive(Clone)]
+struct PricingContext {
+    list: PriceList,
+    /// Actual dialled cluster -> configured provider type.  A route can point
+    /// at an aggregate/fallback, so this must not be inferred from dialect.
+    providers: HashMap<String, String>,
+}
+
+struct ParsedFactoryConfig {
+    dialect: Dialect,
+    pricing: Option<PricingContext>,
+}
+
+fn invalid_config(reason: impl Into<String>) -> ConfigError {
+    ConfigError::InvalidValue {
+        field_path: "typed_config.inline_string".to_string(),
+        reason: reason.into(),
+    }
+}
+
+fn parse_factory_config(config: &DynamicMessage) -> Result<ParsedFactoryConfig, ConfigError> {
+    let raw = config
+        .get_field_by_name("inline_string")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if !raw.trim_start().starts_with('{') {
+        return Ok(ParsedFactoryConfig {
+            dialect: parse_config(config)?,
+            pricing: None,
+        });
+    }
+    let wire: FactoryWire = serde_json::from_str(&raw)
+        .map_err(|e| invalid_config(format!("invalid pricing configuration: {e}")))?;
+    let dialect = match wire.dialect.to_ascii_lowercase().as_str() {
+        "openai" => Dialect::OpenAi,
+        "anthropic" => Dialect::Anthropic,
+        other => {
+            return Err(invalid_config(format!(
+                "expected `openai` or `anthropic`, got `{other}`"
+            )))
+        }
+    };
+    let effective_from = chrono::DateTime::parse_from_rfc3339(&wire.price_list.effective_from)
+        .map_err(|e| invalid_config(format!("price_list.effective_from must be RFC3339: {e}")))?
+        .with_timezone(&chrono::Utc)
+        .into();
+    let mut entries = Vec::with_capacity(wire.price_list.entries.len());
+    for (entry_index, entry) in wire.price_list.entries.into_iter().enumerate() {
+        if entry.provider_type.is_empty() || entry.model.is_empty() || entry.tiers.is_empty() {
+            return Err(invalid_config(format!(
+                "price_list.entries[{entry_index}] requires provider_type, model, and tiers"
+            )));
+        }
+        let tier_mode = match entry.tier_mode.as_str() {
+            "whole_request" => TierMode::WholeRequest,
+            "graduated" => TierMode::Graduated,
+            other => return Err(invalid_config(format!("price_list.entries[{entry_index}].tier_mode must be whole_request or graduated, got `{other}`"))),
+        };
+        let mut previous = None;
+        for (tier_index, tier) in entry.tiers.iter().enumerate() {
+            if tier.up_to.is_none() && tier_index + 1 != entry.tiers.len() {
+                return Err(invalid_config(format!("price_list.entries[{entry_index}].tiers[{tier_index}] open-ended tier must be last")));
+            }
+            if tier
+                .up_to
+                .is_some_and(|up_to| previous.is_some_and(|p| up_to <= p))
+            {
+                return Err(invalid_config(format!("price_list.entries[{entry_index}].tiers[{tier_index}].up_to must strictly increase")));
+            }
+            if tier.up_to.is_some() {
+                previous = tier.up_to;
+            }
+        }
+        if entry.tiers.last().is_some_and(|tier| tier.up_to.is_some()) {
+            return Err(invalid_config(format!(
+                "price_list.entries[{entry_index}].tiers requires a final open-ended tier"
+            )));
+        }
+        entries.push(PriceEntry {
+            provider_type: entry.provider_type,
+            model: entry.model,
+            tier_basis: TierBasis::InputTokens,
+            tier_mode,
+            tiers: entry
+                .tiers
+                .into_iter()
+                .map(|tier| Tier {
+                    up_to: tier.up_to,
+                    input_nanodollars_per_token: tier.input_nanodollars_per_token,
+                    cached_input_nanodollars_per_token: tier.cached_input_nanodollars_per_token,
+                    cache_write_nanodollars_per_token: tier.cache_write_nanodollars_per_token,
+                    output_nanodollars_per_token: tier.output_nanodollars_per_token,
+                })
+                .collect(),
+        });
+    }
+    Ok(ParsedFactoryConfig {
+        dialect,
+        pricing: Some(PricingContext {
+            list: PriceList::new(wire.price_list.version.as_deref(), effective_from, entries),
+            providers: wire.providers,
+        }),
+    })
+}
+
 /// Created once per (filter config, listener); stateless beyond the parsed
 /// dialect, so building a fresh per-stream instance is cheap.
 struct UsagePerRouteConfig(Dialect);
@@ -142,12 +295,14 @@ impl PerRouteConfig for UsagePerRouteConfig {
 
 struct UsageFilterInstanceFactory {
     dialect: Dialect,
+    pricing: Option<PricingContext>,
 }
 
 impl FilterInstanceFactory for UsageFilterInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(UsageFilterInstance {
             dialect: self.dialect,
+            pricing: self.pricing.clone(),
             mode: BodyMode::Inert,
             headers_at: None,
             last_chunk_at: None,
@@ -179,6 +334,7 @@ enum BodyMode {
 /// leaves the worker thread that owns this stream.
 struct UsageFilterInstance {
     dialect: Dialect,
+    pricing: Option<PricingContext>,
     mode: BodyMode,
     /// When response headers were flushed — the TTFT baseline. `Instant`
     /// (not `SystemTime`) because we only ever compare it to another `Instant`
@@ -282,6 +438,22 @@ impl UsageFilterInstance {
         // response that reported no usage at all (WP-34's rule; this number
         // feeds billing, and a wrong zero is worse than an honest "unknown").
         stream_info.llm.usage = usage.map(LlmTokenUsage::from);
+        // The card is evaluated only after the terminal usage extractor has
+        // seen the complete response. In particular, an SSE stream's partial
+        // chunks cannot create a provisional price that later changes.
+        stream_info.llm.list_cost = usage.and_then(|usage| {
+            let pricing = self.pricing.as_ref()?;
+            let cluster = stream_info.upstream_cluster.as_deref()?;
+            let provider_type = pricing.providers.get(cluster)?;
+            let model = stream_info.requested_model.as_deref()?;
+            pricing
+                .list
+                .list_cost_nanodollars(provider_type, model, &usage)
+                .map(|nanodollars| LlmListCost {
+                    nanodollars,
+                    rate_card_version: pricing.list.version().as_str().to_string(),
+                })
+        });
         stream_info.llm.system = Some(match self.dialect {
             Dialect::OpenAi | Dialect::OpenAiResponses => GenAiSystem::OpenAi,
             Dialect::Anthropic => GenAiSystem::Anthropic,
@@ -489,6 +661,7 @@ mod tests {
     fn filter_for(dialect: Dialect) -> UsageFilterInstance {
         UsageFilterInstance {
             dialect,
+            pricing: None,
             mode: BodyMode::Inert,
             headers_at: None,
             last_chunk_at: None,
@@ -497,6 +670,33 @@ mod tests {
             max_inter_chunk: None,
             response_chunks: 0,
             finalized: false,
+        }
+    }
+
+    fn priced_filter() -> UsageFilterInstance {
+        let list = PriceList::new(
+            Some("2026-09"),
+            std::time::SystemTime::UNIX_EPOCH,
+            vec![PriceEntry {
+                provider_type: "openai".into(),
+                model: "gpt-5".into(),
+                tier_basis: TierBasis::InputTokens,
+                tier_mode: TierMode::WholeRequest,
+                tiers: vec![Tier {
+                    up_to: None,
+                    input_nanodollars_per_token: 10,
+                    cached_input_nanodollars_per_token: 1,
+                    cache_write_nanodollars_per_token: 20,
+                    output_nanodollars_per_token: 100,
+                }],
+            }],
+        );
+        UsageFilterInstance {
+            pricing: Some(PricingContext {
+                list,
+                providers: HashMap::from([("provider:openai".into(), "openai".into())]),
+            }),
+            ..filter_for(Dialect::OpenAi)
         }
     }
 
@@ -664,6 +864,46 @@ mod tests {
         filter.encode_data(&mut cb, &mut data, true);
 
         assert_eq!(cb.llm().usage, None);
+    }
+
+    #[test]
+    fn list_cost_is_recorded_once_at_terminal_usage_with_its_card_version() {
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-5".into());
+        }
+        let mut headers = response_headers("text/event-stream");
+        filter.encode_headers(&mut cb, &mut headers, false);
+        let mut first = Bytes::from_static(
+            b"data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n",
+        );
+        filter.encode_data(&mut cb, &mut first, false);
+        assert_eq!(cb.llm().list_cost, None, "partial stream must not price");
+        let mut end = Bytes::new();
+        filter.encode_data(&mut cb, &mut end, true);
+        let cost = cb.llm().list_cost.expect("terminal usage is priced");
+        assert_eq!(cost.nanodollars, 320);
+        assert!(cost.rate_card_version.starts_with("2026-09+"));
+    }
+
+    #[test]
+    fn unpriced_model_stays_none_not_zero() {
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("unpriced".into());
+        }
+        let mut headers = response_headers("application/json");
+        filter.encode_headers(&mut cb, &mut headers, false);
+        let mut data =
+            Bytes::from_static(br#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#);
+        filter.encode_data(&mut cb, &mut data, true);
+        assert_eq!(cb.llm().list_cost, None);
     }
 
     /// The four cost buckets are priced differently, so all four must survive

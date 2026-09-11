@@ -55,4 +55,4 @@ pub use route::{
     apply_prefix_rewrite, match_route, select_cluster, strip_port, strip_query, RouteMatch,
     RouteRequest,
 };
-pub use stream_info::{AuthInfo, LlmStats, LlmTokenUsage, StreamInfo};
+pub use stream_info::{AuthInfo, LlmListCost, LlmStats, LlmTokenUsage, StreamInfo};
