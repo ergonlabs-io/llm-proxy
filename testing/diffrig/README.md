@@ -28,14 +28,26 @@ docker and `make ci` (no docker daemon there) is unaffected. Run them
 explicitly with `cargo test -p diffrig -- --ignored` (with `DIFFRIG_DOCKER=1`
 and docker up).
 
-## Deferred: HTTP traffic-replay topology
+## Landed: hermetic reload-under-LLM-traffic topology
+
+`cargo test -p diffrig --test swap_under_load` drives the real proxy against
+two paced, in-process OpenAI-shaped upstreams over loopback. While concurrent
+SSE and non-streaming traffic is active, it rewrites the bootstrap and sends
+SIGHUP. The test proves that streams were in flight before the reload, the new
+upstream serves post-reload traffic, and every stream — especially the cohort
+that crossed the reload boundary — reaches `data: [DONE]`. A clean EOF is not
+treated as success. It is deterministic, hermetic, and needs neither Docker,
+xDS, nor provider credentials.
+
+## Deferred: side-by-side Envoy HTTP replay/capture topology
 
 The docker-compose topology, proxy drivers, and capture/compare engine that
 turn a `Scenario` (`scenario.rs`, already parsed) into a pass/fail — replaying
 requests against both proxies and diffing status/headers/body/access-log
-fields/stats — wait on WP-10 landing llm-proxy's HTTP data plane (today it's
-config-loading plus an L4 `tcp_proxy`/TLS data plane only) and a follow-up
-llm-proxy Docker image to run it in-topology alongside Envoy's.
+fields/stats — is still a separate follow-up. The proxy HTTP data plane now
+exists, but this needs an explicit capture schema and pinned Envoy topology;
+the reload-under-load test above deliberately does not pretend to be that
+broader differential comparison.
 
 Every scenario will run in BOTH config modes: static/file-watch and gRPC xDS
 (PLAN.md Part 9.6 anti-rot rule).

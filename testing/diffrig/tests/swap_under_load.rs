@@ -370,6 +370,18 @@ enum StreamOutcome {
     HttpError { status: u16 },
 }
 
+/// One result plus the two phase observations needed to prove the reload did
+/// not merely happen *near* some successful streams.  A stream overlaps the
+/// reload only when it began before the swap gate opened and completed after
+/// it opened; validating only the aggregate outcome list would let a broken
+/// reload that aborted every old stream hide behind streams started later.
+#[derive(Debug)]
+struct StreamObservation {
+    outcome: Result<StreamOutcome, String>,
+    started_before_reload: bool,
+    completed_after_reload: bool,
+}
+
 async fn try_send_streaming_chat(
     addr: SocketAddr,
     body: &serde_json::Value,
@@ -445,14 +457,24 @@ async fn stream_worker(
     addr: SocketAddr,
     body: serde_json::Value,
     stop: Arc<AtomicBool>,
+    reload_started: Arc<AtomicBool>,
     in_flight: Arc<AtomicUsize>,
-    tx: tokio::sync::mpsc::UnboundedSender<Result<StreamOutcome, String>>,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamObservation>,
 ) {
     while !stop.load(Ordering::Relaxed) {
+        let started_before_reload = !reload_started.load(Ordering::SeqCst);
         in_flight.fetch_add(1, Ordering::SeqCst);
         let outcome = try_send_streaming_chat(addr, &body).await;
         in_flight.fetch_sub(1, Ordering::SeqCst);
-        if tx.send(outcome).is_err() {
+        let completed_after_reload = reload_started.load(Ordering::SeqCst);
+        if tx
+            .send(StreamObservation {
+                outcome,
+                started_before_reload,
+                completed_after_reload,
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -487,8 +509,11 @@ async fn config_swap_under_live_traffic_drops_no_streams() {
     // ---- start sustained concurrent traffic --------------------------------
 
     let stop = Arc::new(AtomicBool::new(false));
+    // This is a deterministic phase marker, not a timing assertion: each
+    // stream snapshots it on entry and again only after its body completes.
+    let reload_started = Arc::new(AtomicBool::new(false));
     let in_flight = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<StreamOutcome, String>>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamObservation>();
 
     let stream_body = json!({
         "model": "swap-test-model",
@@ -501,6 +526,7 @@ async fn config_swap_under_live_traffic_drops_no_streams() {
             listener_addr,
             stream_body.clone(),
             stop.clone(),
+            reload_started.clone(),
             in_flight.clone(),
             tx.clone(),
         )));
@@ -552,6 +578,7 @@ async fn config_swap_under_live_traffic_drops_no_streams() {
 
     // ---- config B: same listener address, cluster repointed at upstream 2 --
 
+    reload_started.store(true, Ordering::SeqCst);
     proxy.rewrite_config(&envoy_config(listener_port, upstream_2.addr()));
     proxy.sighup();
     let reloaded = proxy.wait_for_log("SIGHUP: config reload succeeded", RELOAD_TIMEOUT);
@@ -608,9 +635,21 @@ async fn config_swap_under_live_traffic_drops_no_streams() {
     let mut stream_transport_errors = Vec::new();
     let mut stream_http_errors = Vec::new();
     let mut stream_truncated = Vec::new();
-    for result in &stream_results {
+    let mut streams_overlapping_reload = 0u64;
+    let mut overlapping_reload_failures = Vec::new();
+    for observation in &stream_results {
         stream_total += 1;
-        match result {
+        let clean = matches!(
+            &observation.outcome,
+            Ok(StreamOutcome::Completed { clean: true, .. })
+        );
+        if observation.started_before_reload && observation.completed_after_reload {
+            streams_overlapping_reload += 1;
+            if !clean {
+                overlapping_reload_failures.push(format!("{:#?}", observation.outcome));
+            }
+        }
+        match &observation.outcome {
             Ok(StreamOutcome::Completed { clean: true, .. }) => {}
             Ok(StreamOutcome::Completed {
                 clean: false,
@@ -645,6 +684,16 @@ async fn config_swap_under_live_traffic_drops_no_streams() {
          truncation -- the exact failure mode this test exists to catch): {:#?}",
         stream_truncated.len(),
         stream_truncated
+    );
+    assert!(
+        streams_overlapping_reload > 0,
+        "the reload had no observed in-flight stream cohort; in_flight_at_swap={in_flight_at_swap}"
+    );
+    assert!(
+        overlapping_reload_failures.is_empty(),
+        "{} of {streams_overlapping_reload} streams that crossed the reload boundary failed or \
+         missed the terminal frame: {overlapping_reload_failures:#?}",
+        overlapping_reload_failures.len(),
     );
 
     // 3. The swap actually took effect: upstream 2 must have served real

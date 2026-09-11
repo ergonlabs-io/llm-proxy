@@ -8,13 +8,15 @@
 //! `config_diff::ENVOY_IMAGE`) and llm-proxy's own `--mode validate`, and
 //! reports where they agree/diverge (`config_diff` module).
 //!
-//! **Deferred:** the full HTTP traffic-replay topology (docker-compose,
+//! **Landed:** `tests/swap_under_load.rs` is a hermetic real-proxy traffic
+//! topology for paced LLM SSE/non-streaming traffic across SIGHUP reload; it
+//! asserts terminal SSE frames rather than cosmetic request counters.
+//!
+//! **Deferred:** the full side-by-side HTTP traffic-replay topology (docker-compose,
 //! scriptable upstreams driving both proxies side by side, response/access-log
 //! diffing — the scenario format already parsed by `scenario.rs`) waits on
-//! WP-10 landing llm-proxy's HTTP data plane, plus an llm-proxy Docker image
-//! to run it in-topology. llm-proxy today only does config-loading plus an L4
-//! `tcp_proxy`/TLS data plane (no HTTP), so there is nothing yet to replay
-//! requests against.
+//! an explicit capture schema and an llm-proxy Docker image to run it
+//! alongside pinned Envoy.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
