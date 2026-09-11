@@ -53,7 +53,10 @@ use prost::Message;
 use proxy_api::envoy::config::cluster::v3 as cluster_v3;
 use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
+use proxy_api::envoy::config::listener::v3 as listener_v3;
 use proxy_api::envoy::config::route::v3 as route_v3;
+use proxy_api::envoy::extensions::filters::http::router::v3 as router_v3;
+use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use rcgen::{CertificateParams, DnType, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -68,6 +71,13 @@ const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster"
 /// Bare type name `Any::type_url` is built from -- matches
 /// `crates/proxy-xds/tests/apply.rs`'s own `CLUSTER_TYPE`.
 const CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
+/// Bare type name a dynamically delivered listener carries in `Any`.
+const LISTENER_TYPE: &str = "envoy.config.listener.v3.Listener";
+/// Bare type name of an HCM's typed configuration.
+const HCM_TYPE: &str =
+    "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
+/// Bare type name of the terminal router filter configuration.
+const ROUTER_TYPE: &str = "envoy.extensions.filters.http.router.v3.Router";
 /// Full `type_url` an EDS `DiscoveryResponse` carries -- matches
 /// `crates/proxy-xds/src/apply.rs`'s own private `EDS_TYPE_URL`.
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
@@ -80,6 +90,8 @@ const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_socke
 /// Full `type_url` an RDS `DiscoveryRequest` subscribes to -- matches
 /// `crates/proxy-xds/src/apply.rs`'s own private `RDS_TYPE_URL`.
 const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
+/// Full `type_url` an LDS `DiscoveryResponse` carries.
+const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
 
 /// How long to wait for the freshly spawned `llm-proxy` to become
 /// connectable -- a liveness backstop, not a speed assertion (matches every
@@ -1559,6 +1571,309 @@ async fn initial_fetch_timeout_marks_ready_live_without_warming_an_eds_cluster()
     assert!(
         response.contains("cluster not warmed"),
         "timeout must not call force_initialize; the request path must remain not warmed, got:\n{response}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}
+
+// --------------------------------------- dynamic listener make-before-break --
+
+/// A bootstrap with no data-plane resources of its own. CDS and LDS deliver
+/// the complete serving generation; only the ADS transport cluster is static.
+fn bootstrap_dynamic_listeners(ads_addr: SocketAddr) -> String {
+    format!(
+        r#"
+node:
+  id: proxy-1
+  cluster: proxy-fleet
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: {{ cluster_name: xds_cluster }}
+  cds_config: {{ ads: {{}}, resource_api_version: V3 }}
+  lds_config: {{ ads: {{}}, resource_api_version: V3 }}
+
+static_resources:
+  listeners: []
+  clusters:
+    - name: xds_cluster
+      type: STATIC
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {ads_ip}, port_value: {ads_port} }}
+"#,
+        ads_ip = ads_addr.ip(),
+        ads_port = ads_addr.port(),
+    )
+}
+
+/// One ADS-delivered HCM listener whose route remains unavailable until RDS
+/// supplies `route_name`. This is intentionally an HCM rather than a
+/// `tcp_proxy`: listener warming is a dependency on RDS, so a TCP listener
+/// would bind immediately and could not exercise the make-before-break path.
+fn dynamic_rds_listener(name: &str, route_name: &str, port: u32) -> listener_v3::Listener {
+    listener_v3::Listener {
+        name: name.to_string(),
+        address: Some(core_v3::Address {
+            address: Some(core_v3::address::Address::SocketAddress(
+                core_v3::SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_specifier: Some(core_v3::socket_address::PortSpecifier::PortValue(port)),
+                    ..Default::default()
+                },
+            )),
+        }),
+        filter_chains: vec![listener_v3::FilterChain {
+            filters: vec![listener_v3::Filter {
+                name: "envoy.filters.network.http_connection_manager".to_string(),
+                config_type: Some(listener_v3::filter::ConfigType::TypedConfig(any_of(
+                    &hcm_v3::HttpConnectionManager {
+                        stat_prefix: name.to_string(),
+                        route_specifier: Some(
+                            hcm_v3::http_connection_manager::RouteSpecifier::Rds(hcm_v3::Rds {
+                                config_source: Some(core_v3::ConfigSource {
+                                    config_source_specifier: Some(
+                                        core_v3::config_source::ConfigSourceSpecifier::Ads(
+                                            core_v3::AggregatedConfigSource {},
+                                        ),
+                                    ),
+                                    resource_api_version: core_v3::ApiVersion::V3 as i32,
+                                    ..Default::default()
+                                }),
+                                route_config_name: route_name.to_string(),
+                            }),
+                        ),
+                        http_filters: vec![hcm_v3::HttpFilter {
+                            name: "envoy.filters.http.router".to_string(),
+                            config_type: Some(hcm_v3::http_filter::ConfigType::TypedConfig(
+                                any_of(&router_v3::Router::default(), ROUTER_TYPE),
+                            )),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    HCM_TYPE,
+                ))),
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn route_to_cluster(name: &str, cluster: &str) -> route_v3::RouteConfiguration {
+    route_v3::RouteConfiguration {
+        name: name.to_string(),
+        virtual_hosts: vec![route_v3::VirtualHost {
+            name: "backend".to_string(),
+            domains: vec!["*".to_string()],
+            routes: vec![route_v3::Route {
+                r#match: Some(route_v3::RouteMatch {
+                    path_specifier: Some(route_v3::route_match::PathSpecifier::Prefix(
+                        "/".to_string(),
+                    )),
+                    ..Default::default()
+                }),
+                action: Some(route_v3::route::Action::Route(route_v3::RouteAction {
+                    cluster_specifier: Some(route_v3::route_action::ClusterSpecifier::Cluster(
+                        cluster.to_string(),
+                    )),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+async fn wait_for_ack(
+    harness: &Harness,
+    stderr: &mpsc::Receiver<String>,
+    type_url: &str,
+    version: &str,
+    nonce: &str,
+) {
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    loop {
+        if harness.log.snapshot().iter().any(|request| {
+            request.type_url == type_url
+                && request.kind() == RequestKind::Ack
+                && request.version_info == version
+                && request.response_nonce == nonce
+        }) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {ACK_TIMEOUT:?} waiting for {type_url} {version}/{nonce} ACK; \
+                 ADS requests so far: {:?}; stderr so far: {:?}",
+                harness.log.snapshot(),
+                drain_available_lines(stderr)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// WP-21's make-before-break negative path. A replacement generation gets a
+/// new cluster and listener name, but its listener waits on a not-yet-delivered
+/// RDS table. The old generation must keep serving when the control plane
+/// disappears in that window; dropping it because the listener name changed
+/// turns a control-plane delay into a data-plane outage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_plane_loss_mid_listener_warm_keeps_the_last_good_generation_serving() {
+    const CLUSTER_A: &str = "backend-a";
+    const CLUSTER_B: &str = "backend-b";
+    const LISTENER_A: &str = "ingress-a";
+    const LISTENER_B: &str = "ingress-b";
+    const ROUTE_A: &str = "route-a";
+    const ROUTE_B: &str = "route-b";
+
+    let upstream_a = spawn_mock_upstream();
+    let upstream_b = spawn_mock_upstream();
+    let listener_a_port = free_port();
+    let listener_b_port = free_port();
+    let listener_a: SocketAddr = format!("127.0.0.1:{listener_a_port}").parse().unwrap();
+
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "cds-v1".to_string(),
+            nonce: "cds-n1".to_string(),
+            resources: vec![any_of(
+                &minimal_cluster(CLUSTER_A, upstream_a.port() as u32),
+                CLUSTER_TYPE,
+            )],
+        },
+        Step::Send {
+            type_url: LDS_TYPE_URL.to_string(),
+            version_info: "lds-v1".to_string(),
+            nonce: "lds-n1".to_string(),
+            resources: vec![any_of(
+                &dynamic_rds_listener(LISTENER_A, ROUTE_A, listener_a_port as u32),
+                LISTENER_TYPE,
+            )],
+        },
+        Step::Send {
+            type_url: RDS_TYPE_URL.to_string(),
+            version_info: "rds-v1".to_string(),
+            nonce: "rds-n1".to_string(),
+            resources: vec![any_of(
+                &route_to_cluster(ROUTE_A, CLUSTER_A),
+                "envoy.config.route.v3.RouteConfiguration",
+            )],
+        },
+        Step::WaitForRequest {
+            type_url: RDS_TYPE_URL.to_string(),
+        },
+        Step::Wait {
+            duration: Duration::from_millis(100),
+        },
+        Step::Push {
+            // Adds B before the later LDS response retires A, per S8.4.
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "cds-v2".to_string(),
+            nonce: "cds-n2".to_string(),
+            resources: vec![
+                any_of(
+                    &minimal_cluster(CLUSTER_A, upstream_a.port() as u32),
+                    CLUSTER_TYPE,
+                ),
+                any_of(
+                    &minimal_cluster(CLUSTER_B, upstream_b.port() as u32),
+                    CLUSTER_TYPE,
+                ),
+            ],
+        },
+        Step::Wait {
+            duration: Duration::from_millis(50),
+        },
+        Step::Push {
+            type_url: LDS_TYPE_URL.to_string(),
+            version_info: "lds-v2".to_string(),
+            nonce: "lds-n2".to_string(),
+            resources: vec![any_of(
+                &dynamic_rds_listener(LISTENER_B, ROUTE_B, listener_b_port as u32),
+                LISTENER_TYPE,
+            )],
+        },
+        Step::WaitForRequest {
+            type_url: LDS_TYPE_URL.to_string(),
+        },
+        // No route-b response: this is the precise mid-warm interruption.
+        Step::Wait {
+            duration: Duration::from_millis(250),
+        },
+        Step::DropStream,
+    ])
+    .await
+    .expect("harness spawns");
+
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-make-before-break-{}-{listener_a_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&config_path, bootstrap_dynamic_listeners(harness.addr)).expect("write config");
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+
+    wait_for_ack(&harness, &stderr_rx, RDS_TYPE_URL, "rds-v1", "rds-n1").await;
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_a_port), STARTUP_TIMEOUT),
+        "first dynamic listener at {listener_a} did not warm; stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+    let before = get(listener_a, "/", "generation-a.test");
+    assert!(
+        before.starts_with("HTTP/1.1 200"),
+        "first dynamic generation must serve before replacement begins, got:\n{before}"
+    );
+
+    wait_for_ack(&harness, &stderr_rx, LDS_TYPE_URL, "lds-v2", "lds-n2").await;
+    // The second listener has no route table, so it must not bind; its absence
+    // is what makes this a genuine warming window rather than a slow swap.
+    assert!(
+        !wait_for_connectable(("127.0.0.1", listener_b_port), Duration::from_millis(100)),
+        "unwarmed replacement listener must not bind before its RDS table arrives"
+    );
+
+    // Simulate the control plane disappearing while the replacement is
+    // staged. `DropStream` closes the active ADS RPC; wait for the client's
+    // reconnect rather than mistaking the already-open old stream for proof.
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    loop {
+        if harness
+            .log
+            .snapshot()
+            .iter()
+            .any(|request| request.stream_id > 1)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {ACK_TIMEOUT:?} waiting for ADS reconnect after control-plane \
+                 loss; requests so far: {:?}; stderr so far: {:?}",
+                harness.log.snapshot(),
+                drain_available_lines(&stderr_rx)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after = get(listener_a, "/", "generation-a.test");
+    assert!(
+        after.starts_with("HTTP/1.1 200"),
+        "control-plane loss during replacement warm-up must keep generation A serving, got:\n{after}"
     );
 
     terminate(&mut child);

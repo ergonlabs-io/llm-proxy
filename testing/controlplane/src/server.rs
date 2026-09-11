@@ -123,6 +123,34 @@ impl AggregatedDiscoveryService for ScriptedAds {
                     Step::Wait { duration } => {
                         tokio::time::sleep(duration).await;
                     }
+                    Step::WaitForRequest { type_url } => loop {
+                        match incoming.next().await {
+                            Some(Ok(req)) => {
+                                log.record(stream_id, &req);
+                                if req.type_url == type_url {
+                                    break;
+                                }
+                            }
+                            _ => break 'steps,
+                        }
+                    },
+                    Step::Push {
+                        type_url,
+                        version_info,
+                        nonce,
+                        resources,
+                    } => {
+                        let response = DiscoveryResponse {
+                            version_info,
+                            resources,
+                            type_url,
+                            nonce,
+                            ..Default::default()
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
                     Step::Send {
                         type_url,
                         version_info,

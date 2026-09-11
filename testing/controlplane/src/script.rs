@@ -21,6 +21,20 @@ pub enum Step {
         nonce: String,
         resources: Vec<Any>,
     },
+    /// Send a `DiscoveryResponse` without waiting for another request. Real
+    /// control planes may push an update at any time after a subscription is
+    /// established; requiring an ACK to trigger every later update makes it
+    /// impossible to model ordinary SotW churn.
+    Push {
+        type_url: String,
+        version_info: String,
+        nonce: String,
+        resources: Vec<Any>,
+    },
+    /// Wait until the client sends a request for `type_url`, recording it,
+    /// without sending a response. This models control-plane ordering such as
+    /// "do not send the next generation until the previous one was ACKed".
+    WaitForRequest { type_url: String },
     /// End the current `StreamAggregatedResources` stream from the server
     /// side, the way a control plane going away does. The next stream the
     /// server accepts resumes the script at the step after this one — it

@@ -803,30 +803,28 @@ impl ResourceApplier {
         routes
     }
 
-    /// Promote only listeners whose complete RDS dependency set is present.
-    /// A same-name replacement that is still waiting leaves the last-good
-    /// active listener intact. LDS removal is deliberate, so it removes the
-    /// active entry even if an unrelated RDS table remains cached.
+    /// Promote a complete LDS generation only after every listener in it has
+    /// its RDS dependencies. Until then, retain the whole last-good listener
+    /// set. An LDS response is SotW, so retaining only a same-named listener
+    /// would still withdraw a renamed old listener before its replacement is
+    /// warm -- the precise outage make-before-break must avoid.
+    ///
+    /// An explicitly empty LDS generation remains a deliberate removal and
+    /// therefore promotes immediately.
     fn refresh_active_dynamic_listeners(&mut self) {
         let routes = self.staged_routes();
-        let wanted: std::collections::HashSet<String> = self
-            .listeners
-            .names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        self.active_dynamic_listeners
-            .retain(|name, _| wanted.contains(name));
+        let mut next = std::collections::HashMap::new();
         for name in self.listeners.names() {
             let listener = self
                 .listeners
                 .get(name)
                 .expect("a listener SotwSet name must resolve to an entry");
-            if listener.ir.routes_are_warmed(&routes) {
-                self.active_dynamic_listeners
-                    .insert(name.to_string(), Arc::clone(&listener.ir));
+            if !listener.ir.routes_are_warmed(&routes) {
+                return;
             }
+            next.insert(name.to_string(), Arc::clone(&listener.ir));
         }
+        self.active_dynamic_listeners = next;
     }
 
     /// Build a fresh snapshot: the dynamic sets' current entries merged over

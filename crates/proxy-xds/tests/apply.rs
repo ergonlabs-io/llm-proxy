@@ -734,6 +734,58 @@ async fn an_unwarmed_same_name_lds_replacement_keeps_the_last_good_listener_acti
 }
 
 #[tokio::test]
+async fn an_unwarmed_renamed_lds_replacement_keeps_the_last_good_listener_set_active() {
+    let (publish, _published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    applier
+        .on_response(&rds_response(
+            "rds-a",
+            &[route_v3::RouteConfiguration {
+                name: "route-a".to_string(),
+                ..Default::default()
+            }],
+        ))
+        .await;
+    applier
+        .on_response(&lds_response(
+            "lds-a",
+            &[minimal_rds_listener("ingress-a", "route-a", 10000)],
+        ))
+        .await;
+
+    applier
+        .on_response(&lds_response(
+            "lds-b",
+            &[minimal_rds_listener("ingress-b", "route-b", 10001)],
+        ))
+        .await;
+    assert!(
+        applier.current().listeners.contains_key("ingress-a"),
+        "a renamed listener must stay active until its replacement is warmed"
+    );
+    assert!(
+        !applier.current().listeners.contains_key("ingress-b"),
+        "an unwarmed replacement must not reach workers"
+    );
+
+    applier
+        .on_response(&rds_response(
+            "rds-b",
+            &[route_v3::RouteConfiguration {
+                name: "route-b".to_string(),
+                ..Default::default()
+            }],
+        ))
+        .await;
+    assert!(
+        !applier.current().listeners.contains_key("ingress-a"),
+        "the old listener must retire once the complete replacement generation is warm"
+    );
+    assert!(applier.current().listeners.contains_key("ingress-b"));
+}
+
+#[tokio::test]
 async fn a_completely_unknown_type_url_is_rejected_not_silently_ignored() {
     let (publish, _published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
