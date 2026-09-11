@@ -337,3 +337,7 @@ sweep: ## Capacity sweep against the mock upstream: make sweep [ARGS="--upstream
 sweep-compare: ## Run the sweep twice, h1 vs h2 upstream, to price connection reuse
 	./scripts/capacity-sweep.sh --upstream-protocol http1
 	./scripts/capacity-sweep.sh --upstream-protocol http2
+
+.PHONY: sweep-docker
+sweep-docker: ## Docker Desktop capacity baseline: proxy pinned to 2 CPUs and 1 GiB
+	./scripts/docker-capacity-sweep.sh $(ARGS)
