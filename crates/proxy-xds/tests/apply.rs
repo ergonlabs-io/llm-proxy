@@ -16,6 +16,9 @@ use proxy_api::envoy::config::cluster::v3 as cluster_v3;
 use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
 use proxy_api::envoy::config::listener::v3 as listener_v3;
+use proxy_api::envoy::config::route::v3 as route_v3;
+use proxy_api::envoy::extensions::filters::http::router::v3 as router_v3;
+use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
@@ -27,11 +30,15 @@ use proxy_xds::{
 };
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
+const HCM_TYPE: &str =
+    "envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
+const ROUTER_TYPE: &str = "envoy.extensions.filters.http.router.v3.Router";
 const CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
 const LISTENER_TYPE: &str = "envoy.config.listener.v3.Listener";
 const ENDPOINT_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
 const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
+const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
 const DOWNSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
@@ -121,6 +128,59 @@ fn minimal_listener(name: &str, cluster: &str, port: u32) -> listener_v3::Listen
     }
 }
 
+/// A minimal HCM listener whose route table is delivered separately by RDS.
+/// This is deliberately a proto fixture, not a pre-built IR value: it proves
+/// the LDS path lowers the real `HttpConnectionManager.rds` surface.
+fn minimal_rds_listener(name: &str, route_name: &str, port: u32) -> listener_v3::Listener {
+    listener_v3::Listener {
+        name: name.to_string(),
+        address: Some(core_v3::Address {
+            address: Some(core_v3::address::Address::SocketAddress(
+                core_v3::SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_specifier: Some(core_v3::socket_address::PortSpecifier::PortValue(port)),
+                    ..Default::default()
+                },
+            )),
+        }),
+        filter_chains: vec![listener_v3::FilterChain {
+            filters: vec![listener_v3::Filter {
+                name: "envoy.filters.network.http_connection_manager".to_string(),
+                config_type: Some(listener_v3::filter::ConfigType::TypedConfig(any_of(
+                    &hcm_v3::HttpConnectionManager {
+                        stat_prefix: "ingress".to_string(),
+                        route_specifier: Some(
+                            hcm_v3::http_connection_manager::RouteSpecifier::Rds(hcm_v3::Rds {
+                                config_source: Some(core_v3::ConfigSource {
+                                    config_source_specifier: Some(
+                                        core_v3::config_source::ConfigSourceSpecifier::Ads(
+                                            core_v3::AggregatedConfigSource {},
+                                        ),
+                                    ),
+                                    resource_api_version: core_v3::ApiVersion::V3 as i32,
+                                    ..Default::default()
+                                }),
+                                route_config_name: route_name.to_string(),
+                            }),
+                        ),
+                        http_filters: vec![hcm_v3::HttpFilter {
+                            name: "envoy.filters.http.router".to_string(),
+                            config_type: Some(hcm_v3::http_filter::ConfigType::TypedConfig(
+                                any_of(&router_v3::Router::default(), ROUTER_TYPE),
+                            )),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    HCM_TYPE,
+                ))),
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
 fn cds_response(version: &str, clusters: &[cluster_v3::Cluster]) -> DiscoveryResponse {
     DiscoveryResponse {
         version_info: version.to_string(),
@@ -137,6 +197,19 @@ fn lds_response(version: &str, listeners: &[listener_v3::Listener]) -> Discovery
         type_url: LDS_TYPE_URL.to_string(),
         nonce: format!("n-{version}"),
         resources: listeners.iter().map(|l| any_of(l, LISTENER_TYPE)).collect(),
+        ..Default::default()
+    }
+}
+
+fn rds_response(version: &str, routes: &[route_v3::RouteConfiguration]) -> DiscoveryResponse {
+    DiscoveryResponse {
+        version_info: version.to_string(),
+        type_url: RDS_TYPE_URL.to_string(),
+        nonce: format!("n-{version}"),
+        resources: routes
+            .iter()
+            .map(|route| any_of(route, "envoy.config.route.v3.RouteConfiguration"))
+            .collect(),
         ..Default::default()
     }
 }
@@ -518,22 +591,146 @@ async fn a_dynamic_name_colliding_with_a_static_one_is_refused_and_the_static_de
 // ------------------------------------------------------------- type routing --
 
 #[tokio::test]
-async fn an_rds_response_is_rejected_naming_the_work_package_that_owns_it() {
+async fn an_rds_response_publishes_its_named_route_table() {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let resp = rds_response(
+        "v1",
+        &[route_v3::RouteConfiguration {
+            name: "ingress-routes".to_string(),
+            ..Default::default()
+        }],
+    );
+    let verdict = applier.on_response(&resp).await;
+    assert_eq!(verdict, Verdict::Accept);
+    assert!(applier.current().routes.contains_key("ingress-routes"));
+    assert_eq!(published.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn omitting_a_route_from_a_later_rds_response_keeps_its_last_good_table() {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    applier
+        .on_response(&rds_response(
+            "rds-1",
+            &[route_v3::RouteConfiguration {
+                name: "ingress-routes".to_string(),
+                ..Default::default()
+            }],
+        ))
+        .await;
+    let verdict = applier.on_response(&rds_response("rds-2", &[])).await;
+
+    assert_eq!(verdict, Verdict::Accept);
+    assert!(
+        applier.current().routes.contains_key("ingress-routes"),
+        "RDS is PerName, so omission cannot remove an unrelated route table"
+    );
+    assert_eq!(
+        published.lock().unwrap().len(),
+        1,
+        "an omitted PerName resource is not a worker-visible change"
+    );
+}
+
+#[tokio::test]
+async fn an_lds_listener_waits_for_its_named_rds_route_before_it_is_published() {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let verdict = applier
+        .on_response(&lds_response(
+            "lds-1",
+            &[minimal_rds_listener("ingress", "ingress-routes", 10000)],
+        ))
+        .await;
+    assert_eq!(verdict, Verdict::Accept);
+    assert!(
+        !applier.current().listeners.contains_key("ingress"),
+        "a listener without its named RDS table must stay out of the worker snapshot"
+    );
+    assert!(applier.rds_resource_names().contains("ingress-routes"));
+    assert!(
+        published.lock().unwrap().is_empty(),
+        "staging an unready listener must not wake workers or replace last-good state"
+    );
+
+    let verdict = applier
+        .on_response(&rds_response(
+            "rds-1",
+            &[route_v3::RouteConfiguration {
+                name: "ingress-routes".to_string(),
+                ..Default::default()
+            }],
+        ))
+        .await;
+    assert_eq!(verdict, Verdict::Accept);
+    assert!(applier.current().listeners.contains_key("ingress"));
+    assert_eq!(published.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_unwarmed_same_name_lds_replacement_keeps_the_last_good_listener_active() {
     let (publish, _published) = recording_publisher();
     let mut applier = ResourceApplier::new(empty_base(), publish);
 
-    let resp = DiscoveryResponse {
-        type_url: "type.googleapis.com/envoy.config.route.v3.RouteConfiguration".to_string(),
-        ..Default::default()
+    applier
+        .on_response(&rds_response(
+            "rds-a",
+            &[route_v3::RouteConfiguration {
+                name: "route-a".to_string(),
+                ..Default::default()
+            }],
+        ))
+        .await;
+    applier
+        .on_response(&lds_response(
+            "lds-a",
+            &[minimal_rds_listener("ingress", "route-a", 10000)],
+        ))
+        .await;
+
+    applier
+        .on_response(&lds_response(
+            "lds-b",
+            &[minimal_rds_listener("ingress", "route-b", 10000)],
+        ))
+        .await;
+    let listener = applier
+        .current()
+        .listeners
+        .get("ingress")
+        .expect("last good listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM");
     };
-    let verdict = applier.on_response(&resp).await;
-    let Verdict::Reject(message) = verdict else {
-        panic!("expected Reject");
+    assert_eq!(hcm.rds_route_config_name.as_deref(), Some("route-a"));
+
+    applier
+        .on_response(&rds_response(
+            "rds-b",
+            &[route_v3::RouteConfiguration {
+                name: "route-b".to_string(),
+                ..Default::default()
+            }],
+        ))
+        .await;
+    let listener = applier
+        .current()
+        .listeners
+        .get("ingress")
+        .expect("promoted listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM");
     };
-    assert!(
-        message.contains("RDS") || message.contains("RouteConfiguration"),
-        "message should name what was rejected, got: {message}"
-    );
+    assert_eq!(hcm.rds_route_config_name.as_deref(), Some("route-b"));
 }
 
 #[tokio::test]

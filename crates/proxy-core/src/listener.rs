@@ -267,6 +267,7 @@ struct ListenerHcm {
 /// Keeping this bundle explicit prevents new instrumentation from quietly
 /// growing `build_hcm_handler`'s positional interface again.
 struct HcmRuntime<'a> {
+    routes: &'a HashMap<String, Arc<proxy_config::ir::RouteTable>>,
     cluster_manager: &'a Arc<ClusterManager>,
     router_stats: &'a Arc<RouterStats>,
     token_stats: &'a Arc<GenAiTokenStats>,
@@ -293,27 +294,14 @@ impl ListenerHcm {
 /// `build_listener_tls`'s shape exactly.
 fn build_listener_hcm(
     listener: &ListenerConfig,
-    cluster_manager: &Arc<ClusterManager>,
-    router_stats: &Arc<RouterStats>,
-    token_stats: &Arc<GenAiTokenStats>,
-    latency_stats: &Arc<GenAiLatencyStats>,
-    tracing_handles: Option<&TracingHandles>,
-    factory_state: &Arc<SharedFactoryState>,
+    runtime: &HcmRuntime<'_>,
 ) -> Result<ListenerHcm, HttpFilterChainBuildError> {
-    let runtime = HcmRuntime {
-        cluster_manager,
-        router_stats,
-        token_stats,
-        latency_stats,
-        tracing_handles,
-        factory_state,
-    };
     let mut chain_handlers = Vec::with_capacity(listener.filter_chains.len());
     for (i, chain) in listener.filter_chains.iter().enumerate() {
         let handler = match chain.filters.last() {
             Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
                 let context = format!("listener '{}' filter_chains[{i}]", listener.name);
-                Some(build_hcm_handler(hcm, &context, &runtime)?)
+                Some(build_hcm_handler(hcm, runtime.routes, &context, runtime)?)
             }
             _ => None,
         };
@@ -326,7 +314,7 @@ fn build_listener_hcm(
     {
         Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
             let context = format!("listener '{}' default_filter_chain", listener.name);
-            Some(build_hcm_handler(hcm, &context, &runtime)?)
+            Some(build_hcm_handler(hcm, runtime.routes, &context, runtime)?)
         }
         _ => None,
     };
@@ -506,6 +494,7 @@ struct WorkerShared<'a> {
 fn spawn_bound(
     name: &ListenerName,
     listener_ir: &Arc<ListenerConfig>,
+    routes: &HashMap<String, Arc<proxy_config::ir::RouteTable>>,
     version: SnapshotVersion,
     shared: &WorkerShared<'_>,
 ) -> Result<BoundListener, InitialBindError> {
@@ -513,15 +502,16 @@ fn spawn_bound(
     // filter chain whose certs won't load, or whose HTTP filter chain
     // references an unregistered filter.
     let tls = build_listener_tls(listener_ir, shared.secret_registry)?;
-    let hcm = build_listener_hcm(
-        listener_ir,
-        shared.cluster_manager,
-        shared.router_stats,
-        shared.token_stats,
-        shared.latency_stats,
-        shared.tracing.as_ref(),
-        shared.factory_state,
-    )?;
+    let hcm_runtime = HcmRuntime {
+        routes,
+        cluster_manager: shared.cluster_manager,
+        router_stats: shared.router_stats,
+        token_stats: shared.token_stats,
+        latency_stats: shared.latency_stats,
+        tracing_handles: shared.tracing.as_ref(),
+        factory_state: shared.factory_state,
+    };
+    let hcm = build_listener_hcm(listener_ir, &hcm_runtime)?;
     let tcp_listener = bind_listener(listener_ir).map_err(|source| InitialBindError::Bind {
         name: name.clone(),
         addr: listener_ir.address,
@@ -560,11 +550,12 @@ fn spawn_bound(
 fn bind_and_spawn(
     name: ListenerName,
     listener_ir: &Arc<ListenerConfig>,
+    routes: &HashMap<String, Arc<proxy_config::ir::RouteTable>>,
     version: SnapshotVersion,
     bound: &mut HashMap<ListenerName, BoundListener>,
     shared: &WorkerShared<'_>,
 ) {
-    match spawn_bound(&name, listener_ir, version, shared) {
+    match spawn_bound(&name, listener_ir, routes, version, shared) {
         Ok(b) => {
             bound.insert(name, b);
         }
@@ -620,7 +611,17 @@ pub fn initial_bind(
             tracing::debug!(listener = %name, "bind_to_port=false; not binding");
             continue;
         }
-        match spawn_bound(name, listener_ir, snapshot.version, &shared) {
+        if !listener_ir.routes_are_warmed(&snapshot.routes) {
+            tracing::info!(listener = %name, "listener waits for RDS route configuration before binding");
+            continue;
+        }
+        match spawn_bound(
+            name,
+            listener_ir,
+            &snapshot.routes,
+            snapshot.version,
+            &shared,
+        ) {
             Ok(b) => {
                 bound.insert(name.clone(), b);
             }
@@ -776,15 +777,16 @@ fn spawn_accept_loop(
                     // Same rebuild cadence and same "whole-listener fallback"
                     // tradeoff as the TLS cache just above, for the HTTP
                     // filter-chain handlers.
-                    match build_listener_hcm(
-                        l,
-                        &cluster_manager,
-                        &router_stats,
-                        &token_stats,
-                        &latency_stats,
-                        tracing_handles.as_ref(),
-                        &factory_state,
-                    ) {
+                    let hcm_runtime = HcmRuntime {
+                        routes: &snapshot.routes,
+                        cluster_manager: &cluster_manager,
+                        router_stats: &router_stats,
+                        token_stats: &token_stats,
+                        latency_stats: &latency_stats,
+                        tracing_handles: tracing_handles.as_ref(),
+                        factory_state: &factory_state,
+                    };
+                    match build_listener_hcm(l, &hcm_runtime) {
                         Ok(rebuilt) => hcm_cache = Rc::new(rebuilt),
                         Err(err) => {
                             tracing::warn!(listener = %name, error = %err, "failed to rebuild HTTP filter chain after config change; HCM chains on this listener will reset connections until fixed");
@@ -1238,6 +1240,7 @@ fn terminal_filter(
 /// (WP-13).
 fn build_hcm_handler(
     hcm: &HttpConnectionManagerConfig,
+    routes: &HashMap<String, Arc<proxy_config::ir::RouteTable>>,
     context: &str,
     runtime: &HcmRuntime<'_>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
@@ -1341,10 +1344,20 @@ fn build_hcm_handler(
     // was wired end to end everywhere except here, so `token_stats` was
     // always `None` and `llm.client.token.usage` was never recorded no
     // matter what a route configured.
+    let route_table = match &hcm.rds_route_config_name {
+        Some(name) => routes
+            .get(name)
+            .cloned()
+            .ok_or_else(|| HttpFilterChainBuildError {
+                context: context.to_string(),
+                reason: format!("RDS route configuration `{name}` is not warmed"),
+            })?,
+        None => hcm.route_table.clone(),
+    };
     let mut handler = FilterChainHandler::new_with_filters_and_access_logs(
         filters,
         terminal_factory,
-        hcm.route_table.clone(),
+        route_table,
         hcm.generate_request_id,
         hcm.use_remote_address,
         hcm.xff_num_trusted_hops,
@@ -1531,6 +1544,10 @@ fn reconcile(
             tracing::debug!(listener = %name, "bind_to_port=false; not binding");
             continue;
         }
+        if !listener_ir.routes_are_warmed(&snapshot.routes) {
+            tracing::info!(listener = %name, "listener waits for RDS route configuration before binding");
+            continue;
+        }
 
         match bound.get(name) {
             Some(existing) if existing.addr == listener_ir.address => {
@@ -1542,10 +1559,24 @@ fn reconcile(
             Some(existing) => {
                 tracing::info!(listener = %name, old_addr = %existing.addr, new_addr = %listener_ir.address, "listener address changed; rebinding");
                 existing.task.abort();
-                bind_and_spawn(name.clone(), listener_ir, snapshot.version, bound, &shared);
+                bind_and_spawn(
+                    name.clone(),
+                    listener_ir,
+                    &snapshot.routes,
+                    snapshot.version,
+                    bound,
+                    &shared,
+                );
             }
             None => {
-                bind_and_spawn(name.clone(), listener_ir, snapshot.version, bound, &shared);
+                bind_and_spawn(
+                    name.clone(),
+                    listener_ir,
+                    &snapshot.routes,
+                    snapshot.version,
+                    bound,
+                    &shared,
+                );
             }
         }
     }
@@ -1795,6 +1826,7 @@ mod tests {
                 )
                 .expect("empty route table can't have duplicate domains"),
             ),
+            rds_route_config_name: None,
             http_filters: vec![],
             codec_type: proxy_config::ir::CodecType::Auto,
             generate_request_id: true,
@@ -1859,6 +1891,7 @@ mod tests {
         NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
             stat_prefix: "test".to_string(),
             route_table: direct_response_route_table(200),
+            rds_route_config_name: None,
             http_filters: vec![
                 proxy_config::ir::HttpFilterSpec {
                     name: "llmproxy.header_mutation".to_string(),
@@ -2701,6 +2734,7 @@ mod tests {
         NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
             stat_prefix: "test".to_string(),
             route_table: direct_response_route_table(status),
+            rds_route_config_name: None,
             http_filters: vec![],
             codec_type,
             generate_request_id: true,
@@ -3709,6 +3743,7 @@ mod tests {
         NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
             stat_prefix: "test".to_string(),
             route_table: forward_route_table(cluster),
+            rds_route_config_name: None,
             http_filters: vec![
                 proxy_config::ir::HttpFilterSpec {
                     name: "llmproxy.header_mutation".to_string(),
@@ -4191,15 +4226,16 @@ static_resources:
         let latency_stats = latency_stats_for(&stats_control);
         let factory_state = Arc::new(SharedFactoryState::default());
 
-        let err = match build_listener_hcm(
-            listener_ir,
-            &cluster_manager,
-            &router_stats,
-            &token_stats,
-            &latency_stats,
-            None,
-            &factory_state,
-        ) {
+        let hcm_runtime = HcmRuntime {
+            routes: &snapshot.routes,
+            cluster_manager: &cluster_manager,
+            router_stats: &router_stats,
+            token_stats: &token_stats,
+            latency_stats: &latency_stats,
+            tracing_handles: None,
+            factory_state: &factory_state,
+        };
+        let err = match build_listener_hcm(listener_ir, &hcm_runtime) {
             Ok(_) => {
                 panic!("an invalid per-route dialect must fail the build, is_optional or not")
             }
@@ -4322,26 +4358,17 @@ static_resources:
         let latency_stats = latency_stats_for(&stats_control);
         let factory_state = Arc::new(SharedFactoryState::default());
 
-        build_listener_hcm(
-            l1,
-            &cluster_manager,
-            &router_stats,
-            &token_stats,
-            &latency_stats,
-            None,
-            &factory_state,
-        )
-        .expect("listener l1's filter chain must build");
-        build_listener_hcm(
-            l2,
-            &cluster_manager,
-            &router_stats,
-            &token_stats,
-            &latency_stats,
-            None,
-            &factory_state,
-        )
-        .expect("listener l2's filter chain must build");
+        let hcm_runtime = HcmRuntime {
+            routes: &snapshot.routes,
+            cluster_manager: &cluster_manager,
+            router_stats: &router_stats,
+            token_stats: &token_stats,
+            latency_stats: &latency_stats,
+            tracing_handles: None,
+            factory_state: &factory_state,
+        };
+        build_listener_hcm(l1, &hcm_runtime).expect("listener l1's filter chain must build");
+        build_listener_hcm(l2, &hcm_runtime).expect("listener l2's filter chain must build");
 
         let scopes = factory_state
             .get_across_scopes(proxy_filters::auth_filter::TYPE_URL)

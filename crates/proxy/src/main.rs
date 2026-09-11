@@ -1193,6 +1193,8 @@ async fn reload(
 const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 /// Full `type_url` an LDS `DiscoveryRequest` subscribes to.
 const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
+/// Full `type_url` an RDS `DiscoveryRequest` subscribes to.
+const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
 /// Full `type_url` an EDS `DiscoveryRequest` subscribes to. Same duplication
 /// as [`CDS_TYPE_URL`]/[`LDS_TYPE_URL`], and the same reason.
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
@@ -1274,7 +1276,11 @@ fn start_ads(
     let ads = snapshot.ads.as_ref()?;
 
     let has_static_eds_cluster = snapshot.clusters.values().any(|c| c.eds.is_some());
-    if !ads.lds && !ads.cds && !has_static_eds_cluster {
+    let has_static_rds_listener = snapshot
+        .listeners
+        .values()
+        .any(|listener| listener.rds_route_config_names().next().is_some());
+    if !ads.lds && !ads.cds && !has_static_eds_cluster && !has_static_rds_listener {
         tracing::info!(
             cluster = %ads.cluster,
             "ADS configured but none of `lds`, `cds`, or a statically-declared EDS cluster asks \
@@ -1342,8 +1348,12 @@ fn start_ads(
             // `run_serve`'s control loop is the authoritative stamper (see
             // its own comment on `current_version`) and overwrites it before
             // this ever reaches `apply_snapshot`.
-            let owned =
-                snapshot.with_dynamic_resources(HashMap::new(), HashMap::new(), snapshot.version);
+            let owned = snapshot.with_dynamic_resources(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                snapshot.version,
+            );
             let (reply_tx, reply_rx) = oneshot::channel();
             if apply_tx.send((owned, reply_tx)).await.is_err() {
                 // The control loop only ever drops its receiver by falling
@@ -1444,6 +1454,12 @@ fn start_ads(
     if ads.lds {
         states.push(SubscriptionState::new(LDS_TYPE_URL, Subscription::Wildcard));
     }
+    // RDS is by-name like EDS. Register it even when empty so an LDS response
+    // can widen this subscription after it introduces an RDS listener.
+    states.push(SubscriptionState::new(
+        RDS_TYPE_URL,
+        Subscription::Names(applier.rds_resource_names()),
+    ));
     // Seeded from the applier's OWN view of the boot snapshot, not left to
     // populate itself after the first response arrives. `ResponseHandler::
     // desired_names` (which `client.rs`'s pump calls) is only consulted

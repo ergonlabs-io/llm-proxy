@@ -73,8 +73,9 @@ pub struct ConfigSnapshot {
 impl ConfigSnapshot {
     /// Build the snapshot that succeeds this one when xDS delivers a new set
     /// of dynamic resources (WP-20 increment 4b-ii): everything that is not a
-    /// listener or a cluster is carried forward from `self` unchanged, and the
-    /// two resource maps become `self`'s static entries plus the dynamic ones.
+    /// listener, cluster, or RDS route is carried forward from `self`
+    /// unchanged, and those resource maps become `self`'s static entries plus
+    /// the dynamic ones.
     ///
     /// **This lives here, rather than in `proxy-xds` where its only caller
     /// is, for one specific reason** -- and it is the reason
@@ -104,6 +105,7 @@ impl ConfigSnapshot {
         &self,
         dynamic_listeners: HashMap<ListenerName, Arc<ListenerConfig>>,
         dynamic_clusters: HashMap<ClusterName, Arc<ClusterConfig>>,
+        dynamic_routes: HashMap<RouteConfigName, Arc<RouteTable>>,
         version: SnapshotVersion,
     ) -> ConfigSnapshot {
         let mut listeners = self.listeners.clone();
@@ -126,10 +128,20 @@ impl ConfigSnapshot {
             clusters.insert(name, cfg);
         }
 
+        let mut routes = self.routes.clone();
+        for (name, table) in dynamic_routes {
+            debug_assert!(
+                !self.routes.contains_key(&name),
+                "dynamic route `{name}` collides with a static route; static names are immune \
+                 to xDS and should have been refused before reaching here"
+            );
+            routes.insert(name, table);
+        }
+
         ConfigSnapshot {
             listeners,
             clusters,
-            routes: self.routes.clone(),
+            routes,
             secrets: self.secrets.clone(),
             admin: self.admin,
             tracing: self.tracing.clone(),
@@ -397,8 +409,15 @@ pub enum CodecType {
 #[derive(Debug)]
 pub struct HttpConnectionManagerConfig {
     pub stat_prefix: String,
-    /// The inlined route table (RDS arrives with WP-21).
+    /// The inlined route table. When [`Self::rds_route_config_name`] is set,
+    /// this is an empty placeholder and workers resolve the named table from
+    /// [`ConfigSnapshot::routes`] before accepting traffic.
     pub route_table: Arc<RouteTable>,
+    /// RDS name when this HCM's route specifier is `rds`. Keeping the name
+    /// beside the HCM rather than replacing `route_table` with an enum keeps
+    /// the hot-path filter manager concrete: a listener is published only
+    /// after this name resolves to a real table.
+    pub rds_route_config_name: Option<RouteConfigName>,
     /// Ordered HTTP filters; the last must be the router.
     pub http_filters: Vec<HttpFilterSpec>,
     /// WP-10: which codec serves a downstream connection on this HCM. Envoy
@@ -427,6 +446,29 @@ pub struct HttpConnectionManagerConfig {
     /// chains (`UpgradeConfig.filters`) are rejected at lowering as
     /// unimplemented — the current tunnel is transparent (S10.2 deferred).
     pub upgrade_configs: Vec<UpgradeConfig>,
+}
+
+impl ListenerConfig {
+    /// Every ADS RDS resource this listener needs before it can accept traffic.
+    /// This walks both ordinary and default chains because either can carry an
+    /// HTTP connection manager.
+    pub fn rds_route_config_names(&self) -> impl Iterator<Item = &RouteConfigName> {
+        self.filter_chains
+            .iter()
+            .chain(self.default_filter_chain.iter())
+            .flat_map(|chain| chain.filters.iter())
+            .filter_map(|filter| match filter {
+                NetworkFilterSpec::HttpConnectionManager(hcm) => hcm.rds_route_config_name.as_ref(),
+                NetworkFilterSpec::TcpProxy(_) => None,
+            })
+    }
+
+    /// An inline-route listener is ready immediately; an RDS listener is
+    /// ready only after every named table appears in this snapshot.
+    pub fn routes_are_warmed(&self, routes: &HashMap<RouteConfigName, Arc<RouteTable>>) -> bool {
+        self.rds_route_config_names()
+            .all(|name| routes.contains_key(name))
+    }
 }
 
 /// S10 (WP-10): one entry of an HCM's `upgrade_configs`. `upgrade_type` is

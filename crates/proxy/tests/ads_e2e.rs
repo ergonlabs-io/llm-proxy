@@ -53,6 +53,7 @@ use prost::Message;
 use proxy_api::envoy::config::cluster::v3 as cluster_v3;
 use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
+use proxy_api::envoy::config::route::v3 as route_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use rcgen::{CertificateParams, DnType, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -76,6 +77,9 @@ const ENDPOINT_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
 /// Full `type_url` an SDS `DiscoveryRequest` subscribes to -- matches
 /// `crates/proxy-xds/src/apply.rs`'s own private `SDS_TYPE_URL`.
 const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
+/// Full `type_url` an RDS `DiscoveryRequest` subscribes to -- matches
+/// `crates/proxy-xds/src/apply.rs`'s own private `RDS_TYPE_URL`.
+const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
 
 /// How long to wait for the freshly spawned `llm-proxy` to become
 /// connectable -- a liveness backstop, not a speed assertion (matches every
@@ -1230,6 +1234,181 @@ async fn an_sds_delivered_certificate_serves_a_tls_request_in_the_running_binary
         response.starts_with(b"HTTP/1.1 200 OK\r\n"),
         "expected the TLS request to reach the static upstream, got: {}",
         String::from_utf8_lossy(&response)
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}
+
+// ------------------------------------------------------------------ test F --
+
+/// Static RDS listener's requested route configuration name.
+const TEST_F_RDS_ROUTE: &str = "ingress-routes";
+const TEST_F_RDS_BACKEND: &str = "rds_backend";
+
+/// A static listener whose HCM has no inline routes: it must not bind until
+/// ADS supplies `TEST_F_RDS_ROUTE`.
+fn bootstrap_static_rds_listener(
+    listener_port: u16,
+    ads_addr: SocketAddr,
+    backend_addr: SocketAddr,
+) -> String {
+    format!(
+        r#"
+node:
+  id: proxy-1
+  cluster: proxy-fleet
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: {{ cluster_name: xds_cluster }}
+  cds_config: {{ ads: {{}}, resource_api_version: V3 }}
+
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {listener_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                rds:
+                  config_source: {{ ads: {{}}, resource_api_version: V3 }}
+                  route_config_name: {route_name}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: xds_cluster
+      type: STATIC
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {ads_ip}, port_value: {ads_port} }}
+    - name: {backend_name}
+      type: STATIC
+      load_assignment:
+        cluster_name: {backend_name}
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {backend_ip}, port_value: {backend_port} }}
+"#,
+        route_name = TEST_F_RDS_ROUTE,
+        backend_name = TEST_F_RDS_BACKEND,
+        ads_ip = ads_addr.ip(),
+        ads_port = ads_addr.port(),
+        backend_ip = backend_addr.ip(),
+        backend_port = backend_addr.port(),
+    )
+}
+
+fn rds_route_to_backend() -> route_v3::RouteConfiguration {
+    route_v3::RouteConfiguration {
+        name: TEST_F_RDS_ROUTE.to_string(),
+        virtual_hosts: vec![route_v3::VirtualHost {
+            name: "backend".to_string(),
+            domains: vec!["*".to_string()],
+            routes: vec![route_v3::Route {
+                r#match: Some(route_v3::RouteMatch {
+                    path_specifier: Some(route_v3::route_match::PathSpecifier::Prefix(
+                        "/".to_string(),
+                    )),
+                    ..Default::default()
+                }),
+                action: Some(route_v3::route::Action::Route(route_v3::RouteAction {
+                    cluster_specifier: Some(route_v3::route_action::ClusterSpecifier::Cluster(
+                        TEST_F_RDS_BACKEND.to_string(),
+                    )),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// RDS has two boot-time contracts: `start_ads` must issue its named
+/// subscription from a static HCM, and a listener missing that table must
+/// wait rather than fail startup or serve the empty placeholder. Delivery of
+/// one valid table must then bind it and route real traffic through that table.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_rds_delivered_route_binds_and_serves_a_static_listener() {
+    let harness = Harness::spawn(vec![Step::Send {
+        type_url: RDS_TYPE_URL.to_string(),
+        version_info: "rds-v1".to_string(),
+        nonce: "rds-n1".to_string(),
+        resources: vec![any_of(
+            &rds_route_to_backend(),
+            "envoy.config.route.v3.RouteConfiguration",
+        )],
+    }])
+    .await
+    .expect("harness spawns");
+    let upstream_addr = spawn_mock_upstream();
+    let listener_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-rds-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        bootstrap_static_rds_listener(listener_port, harness.addr, upstream_addr),
+    )
+    .expect("write config");
+
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    loop {
+        if harness.log.snapshot().iter().any(|request| {
+            request.type_url == RDS_TYPE_URL
+                && request.kind() == RequestKind::Ack
+                && request.version_info == "rds-v1"
+                && request.response_nonce == "rds-n1"
+        }) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {ACK_TIMEOUT:?} waiting for the RDS delivery ACK; ADS requests so far: {:?}; stderr so far: {:?}",
+                harness.log.snapshot(),
+                drain_available_lines(&stderr_rx)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let initial_rds = harness
+        .log
+        .snapshot()
+        .into_iter()
+        .find(|request| request.type_url == RDS_TYPE_URL && request.kind() == RequestKind::Initial)
+        .expect("static RDS listener must send an initial named subscription");
+    assert_eq!(initial_rds.resource_names, vec![TEST_F_RDS_ROUTE]);
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "RDS-warmed listener at {listener_addr} did not bind in time; stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+    let response = get(listener_addr, "/", "rds.test");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "RDS-delivered route must reach the static backend, got:\n{response}"
     );
 
     terminate(&mut child);

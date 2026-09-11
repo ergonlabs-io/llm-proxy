@@ -38,21 +38,14 @@
 //!    `tracing::warn!` names the resource and says the static definition
 //!    keeps serving -- `internal-docs/envoy-divergences.md` already records
 //!    this as a deliberate divergence from Envoy's own silence here.
-//! 6. **RDS is refused by name**, not silently ignored (ground rule #1's
-//!    shape); **EDS is applied, as of WP-21 increment 2b-ii, and SDS is
-//!    applied, as of WP-22 increment 1.** RDS still belongs to WP-21's
-//!    warming logic, uncorrected since 2026-09-06: a
-//!    `HttpConnectionManagerConfig` carries its route table inline as an
-//!    `Arc<RouteTable>` with no by-name variant, so applying an RDS response
-//!    would mean inventing an IR shape whose warming rules are not this
-//!    increment's to own. EDS and SDS had no such obstacle -- `EndpointIR` is
-//!    already a plain `Vec`, and [`DynamicSecret`] (in `secret.rs`, a
-//!    WP-22-increment-1-only home -- see its own doc) is not a
-//!    listener-shaped dependency either -- so `on_eds_response`/
-//!    `on_sds_response` lower their resource and hand the result to an
-//!    injected [`PublishEndpoints`]/[`PublishSecrets`] sink, the same
-//!    seam-not-dependency shape [`Publish`] already uses for listeners and
-//!    clusters. **SDS names its subscription as of WP-22 increment 2a**:
+//! 6. **RDS is applied per name, with listener warming.** An LDS listener
+//!    that names RDS is staged until every named route arrives; a same-name
+//!    replacement waiting on a new table retains its last-good listener.
+//!    **EDS is applied, as of WP-21 increment 2b-ii, and SDS is applied, as
+//!    of WP-22 increment 1.** EDS and SDS have dedicated sinks because their
+//!    data is not a listener dependency: `EndpointIR` is already a plain
+//!    `Vec`, and [`DynamicSecret`] (in `secret.rs`) is resolved by the SDS
+//!    registry. **SDS names its subscription as of WP-22 increment 2a**:
 //!    [`ResourceApplier::sds_resource_names`] reads every listener's
 //!    `DownstreamTlsSpec::certificate_sds_names`, so `desired_names` answers
 //!    a real set for SDS the same way it does for EDS. **What increment 2a
@@ -81,12 +74,16 @@ use prost::Message;
 use proxy_api::envoy::config::cluster::v3::Cluster as ClusterProto;
 use proxy_api::envoy::config::endpoint::v3::ClusterLoadAssignment as ClusterLoadAssignmentProto;
 use proxy_api::envoy::config::listener::v3::Listener as ListenerProto;
+use proxy_api::envoy::config::route::v3::RouteConfiguration as RouteConfigurationProto;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3::Secret as SecretProto;
 use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
 use proxy_config::ir::{
-    ClusterConfig, ConfigSnapshot, DynamicSecret, EndpointIR, ListenerConfig, SnapshotVersion,
+    ClusterConfig, ConfigSnapshot, DynamicSecret, EndpointIR, ListenerConfig, RouteTable,
+    SnapshotVersion,
 };
-use proxy_config::{lower_dynamic_cluster, lower_dynamic_endpoints, lower_dynamic_listener};
+use proxy_config::{
+    lower_dynamic_cluster, lower_dynamic_endpoints, lower_dynamic_listener, lower_dynamic_route,
+};
 
 use crate::client::ResponseHandler;
 use crate::secret::decode_secret;
@@ -98,8 +95,7 @@ use crate::subscription::Verdict;
 const CDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 /// Full `type_url` an LDS `DiscoveryResponse` carries.
 const LDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
-/// RDS's `type_url` -- named so an incoming response is refused by name
-/// (ground rule #1) rather than falling into the generic "unknown" branch.
+/// Full `type_url` an RDS `DiscoveryResponse` carries.
 const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
 /// EDS's `type_url` -- same reasoning as [`RDS_TYPE_URL`].
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
@@ -204,6 +200,27 @@ struct Entry<T> {
     ir: Arc<T>,
 }
 
+/// Snapshot version is publication bookkeeping, not configuration. Compare
+/// only worker-visible resource identities so staging an LDS listener that is
+/// still missing RDS does not wake workers or replace last-good handlers.
+fn same_published_resources(left: &ConfigSnapshot, right: &ConfigSnapshot) -> bool {
+    fn same_map<T>(
+        left: &std::collections::HashMap<String, Arc<T>>,
+        right: &std::collections::HashMap<String, Arc<T>>,
+    ) -> bool {
+        left.len() == right.len()
+            && left.iter().all(|(name, value)| {
+                right
+                    .get(name)
+                    .is_some_and(|other| Arc::ptr_eq(value, other))
+            })
+    }
+
+    same_map(&left.listeners, &right.listeners)
+        && same_map(&left.clusters, &right.clusters)
+        && same_map(&left.routes, &right.routes)
+}
+
 impl<T> PartialEq for Entry<T> {
     fn eq(&self, other: &Self) -> bool {
         self.raw == other.raw
@@ -227,6 +244,14 @@ fn lds_path(any: &prost_types::Any, index: usize) -> String {
     match ListenerProto::decode(any.value.as_slice()) {
         Ok(l) if !l.name.is_empty() => format!("lds.listeners[{}]", l.name),
         _ => format!("lds.listeners[{index}]"),
+    }
+}
+
+/// Same error-root convention as CDS/LDS, for RDS resources.
+fn rds_path(any: &prost_types::Any, index: usize) -> String {
+    match RouteConfigurationProto::decode(any.value.as_slice()) {
+        Ok(route) if !route.name.is_empty() => format!("rds.routes[{}]", route.name),
+        _ => format!("rds.routes[{index}]"),
     }
 }
 
@@ -263,6 +288,13 @@ pub struct ResourceApplier {
     base: Arc<ConfigSnapshot>,
     clusters: SotwSet<Entry<ClusterConfig>>,
     listeners: SotwSet<Entry<ListenerConfig>>,
+    /// RDS resources are per-name: a response omitting an unrelated route
+    /// must not un-warm its listener (S8).
+    routes: SotwSet<Entry<RouteTable>>,
+    /// Last-good dynamic listeners exposed to workers. This differs from
+    /// `listeners`, which holds the latest LDS desired set: a replacement
+    /// waiting on RDS must not replace a live listener with an unrouteable one.
+    active_dynamic_listeners: std::collections::HashMap<String, Arc<ListenerConfig>>,
     /// EDS's own set -- `PerName`, not `FullState`. S8 draws this line for a
     /// reason store.rs's own doc states directly: "SotW: LDS/CDS full-set
     /// semantics (absence = removal); EDS/RDS absence != removal." A
@@ -321,9 +353,12 @@ impl ResourceApplier {
     pub fn new(base: Arc<ConfigSnapshot>, publish: Publish) -> Self {
         let static_clusters = base.clusters.keys().cloned().collect();
         let static_listeners = base.listeners.keys().cloned().collect();
+        let static_routes = base.routes.keys().cloned().collect();
         Self {
             clusters: SotwSet::new(SetSemantics::FullState, static_clusters),
             listeners: SotwSet::new(SetSemantics::FullState, static_listeners),
+            routes: SotwSet::new(SetSemantics::PerName, static_routes),
+            active_dynamic_listeners: std::collections::HashMap::new(),
             // Empty static-name set on purpose -- see the field's own doc.
             endpoints: SotwSet::new(SetSemantics::PerName, BTreeSet::new()),
             // Empty static-name set on purpose -- see the field's own doc.
@@ -407,13 +442,30 @@ impl ResourceApplier {
             .collect()
     }
 
+    /// RDS names come from the latest LDS set, not `current`: a listener
+    /// waiting for its first route table is intentionally absent from the
+    /// worker snapshot, but it must still cause the ADS subscription to be
+    /// sent. Bootstrap listeners participate too.
+    pub fn rds_resource_names(&self) -> BTreeSet<String> {
+        self.base
+            .listeners
+            .values()
+            .chain(self.listeners.names().into_iter().map(|name| {
+                &self
+                    .listeners
+                    .get(name)
+                    .expect("a listener SotwSet name must resolve to an entry")
+                    .ir
+            }))
+            .flat_map(|listener| listener.rds_route_config_names().cloned())
+            .collect()
+    }
+
     /// Decode, validate, apply and publish one response. `Accept` iff every
     /// resource in it lowered cleanly.
     ///
-    /// Routing is by the response's own `type_url` (rule 6 above): CDS, LDS
-    /// and EDS are applied; RDS -- a real xDS type, just not this
-    /// increment's job -- and anything else are refused by name rather than
-    /// silently ignored (ground rule #1).
+    /// Routing is by the response's own `type_url`. CDS/LDS and RDS publish
+    /// only warmed listeners; EDS/SDS use their dedicated sinks.
     ///
     /// `async` since increment 4d-i: publishing (below, via [`Publish`]) can
     /// now await, and this is the method that awaits it, so
@@ -425,11 +477,7 @@ impl ResourceApplier {
             LDS_TYPE_URL => self.on_lds_response(resp).await,
             EDS_TYPE_URL => self.on_eds_response(resp).await,
             SDS_TYPE_URL => self.on_sds_response(resp).await,
-            RDS_TYPE_URL => Verdict::Reject(format!(
-                "RDS (`{RDS_TYPE_URL}`) is not applied: a listener references its route table \
-                 inline, and the by-name variant plus the warming rules that go with it are \
-                 WP-21's"
-            )),
+            RDS_TYPE_URL => self.on_rds_response(resp).await,
             other => Verdict::Reject(format!("unknown ADS type_url `{other}`")),
         }
     }
@@ -490,6 +538,38 @@ impl ResourceApplier {
             }
         };
         self.finish(outcome, "listener").await
+    }
+
+    /// RDS is `PerName`: an omitted route is not a deletion. A changed route
+    /// can promote a listener LDS staged earlier, or rebuild a live listener
+    /// against a new immutable table, but an RDS update never tears down an
+    /// unrelated listener.
+    async fn on_rds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
+        let mut pairs = Vec::with_capacity(resp.resources.len());
+        for (index, any) in resp.resources.iter().enumerate() {
+            let path = rds_path(any, index);
+            let ir = match lower_dynamic_route(any, &path) {
+                Ok(ir) => ir,
+                Err(err) => return Verdict::Reject(err.to_string()),
+            };
+            let name = ir.name.clone();
+            pairs.push((
+                name,
+                Entry {
+                    raw: any.value.clone(),
+                    ir: Arc::new(ir),
+                },
+            ));
+        }
+        let outcome = match self.routes.apply(pairs) {
+            Ok(outcome) => outcome,
+            Err(ApplyError::DuplicateName(name)) => {
+                return Verdict::Reject(format!(
+                    "RDS response named route configuration `{name}` more than once"
+                ));
+            }
+        };
+        self.finish(outcome, "route configuration").await
     }
 
     /// EDS has no `finish` call -- unlike CDS/LDS, an accepted endpoint
@@ -699,14 +779,54 @@ impl ResourceApplier {
             );
         }
 
-        let changed =
-            !outcome.added.is_empty() || !outcome.updated.is_empty() || !outcome.removed.is_empty();
-        if changed {
-            let snapshot = self.assemble_snapshot();
+        self.refresh_active_dynamic_listeners();
+        let snapshot = self.assemble_snapshot();
+        if !same_published_resources(&self.current, &snapshot) {
             (self.publish)(Arc::clone(&snapshot)).await;
             self.current = snapshot;
         }
         Verdict::Accept
+    }
+
+    /// Return all routes known to the staged resource sets. RDS resources are
+    /// exposed in the snapshot as well as used for the warm-up check so an
+    /// accept loop rebuild sees the exact immutable table that admitted it.
+    fn staged_routes(&self) -> std::collections::HashMap<String, Arc<RouteTable>> {
+        let mut routes = self.base.routes.clone();
+        for name in self.routes.names() {
+            let entry = self
+                .routes
+                .get(name)
+                .expect("a route SotwSet name must resolve to an entry");
+            routes.insert(name.to_string(), Arc::clone(&entry.ir));
+        }
+        routes
+    }
+
+    /// Promote only listeners whose complete RDS dependency set is present.
+    /// A same-name replacement that is still waiting leaves the last-good
+    /// active listener intact. LDS removal is deliberate, so it removes the
+    /// active entry even if an unrelated RDS table remains cached.
+    fn refresh_active_dynamic_listeners(&mut self) {
+        let routes = self.staged_routes();
+        let wanted: std::collections::HashSet<String> = self
+            .listeners
+            .names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        self.active_dynamic_listeners
+            .retain(|name, _| wanted.contains(name));
+        for name in self.listeners.names() {
+            let listener = self
+                .listeners
+                .get(name)
+                .expect("a listener SotwSet name must resolve to an entry");
+            if listener.ir.routes_are_warmed(&routes) {
+                self.active_dynamic_listeners
+                    .insert(name.to_string(), Arc::clone(&listener.ir));
+            }
+        }
     }
 
     /// Build a fresh snapshot: the dynamic sets' current entries merged over
@@ -721,18 +841,7 @@ impl ResourceApplier {
     /// anything acts on them. That test's own module doc names this as the
     /// failure mode it exists to prevent. See the method's doc.
     fn assemble_snapshot(&self) -> Arc<ConfigSnapshot> {
-        let listeners = self
-            .listeners
-            .names()
-            .into_iter()
-            .map(|name| {
-                let entry = self
-                    .listeners
-                    .get(name)
-                    .expect("a name SotwSet::names() just returned must be present in the set");
-                (name.to_string(), Arc::clone(&entry.ir))
-            })
-            .collect();
+        let listeners = self.active_dynamic_listeners.clone();
         let clusters = self
             .clusters
             .names()
@@ -745,10 +854,23 @@ impl ResourceApplier {
                 (name.to_string(), Arc::clone(&entry.ir))
             })
             .collect();
+        let routes = self
+            .routes
+            .names()
+            .into_iter()
+            .map(|name| {
+                let entry = self
+                    .routes
+                    .get(name)
+                    .expect("a route SotwSet name must resolve to an entry");
+                (name.to_string(), Arc::clone(&entry.ir))
+            })
+            .collect();
 
         Arc::new(self.base.with_dynamic_resources(
             listeners,
             clusters,
+            routes,
             SnapshotVersion(self.current.version.0 + 1),
         ))
     }
@@ -764,12 +886,11 @@ impl ResponseHandler for ResourceApplier {
         self.on_response(resp)
     }
 
-    /// EDS and SDS are the two types this applier derives a name set for --
+    /// EDS, RDS and SDS are the types this applier derives a name set for --
     /// CDS/LDS are wildcard subscriptions (see `subscription.rs`'s own doc on
-    /// why `set_names` panics for those) and RDS is not applied here at all,
-    /// so both answer `None`. `client.rs`'s pump calls this after every
-    /// response, for every state it holds; returning `None` is what makes
-    /// those calls no-ops.
+    /// why `set_names` panics for those). `client.rs`'s pump calls this after
+    /// every response, for every state it holds; returning `None` is what
+    /// makes those calls no-ops.
     ///
     /// SDS joined EDS in WP-22 increment 2a, once
     /// `DownstreamTlsSpec::certificate_sds_names` gave the snapshot somewhere
@@ -777,6 +898,7 @@ impl ResponseHandler for ResourceApplier {
     fn desired_names(&self, type_url: &str) -> Option<BTreeSet<String>> {
         match type_url {
             EDS_TYPE_URL => Some(self.eds_resource_names()),
+            RDS_TYPE_URL => Some(self.rds_resource_names()),
             SDS_TYPE_URL => Some(self.sds_resource_names()),
             _ => None,
         }

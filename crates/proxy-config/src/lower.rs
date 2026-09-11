@@ -11,6 +11,7 @@
 //!    protos, pre-computing matchers (S1 domain index, compiled regexes,
 //!    weighted-cluster cumulative arrays) so the hot path never does it.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -153,6 +154,8 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
 const DYNAMIC_CLUSTER_TYPE: &str = "envoy.config.cluster.v3.Cluster";
 /// Full proto type name a dynamic `Listener` resource must carry.
 const DYNAMIC_LISTENER_TYPE: &str = "envoy.config.listener.v3.Listener";
+/// Full proto type name a dynamic RDS resource must carry.
+const DYNAMIC_ROUTE_TYPE: &str = "envoy.config.route.v3.RouteConfiguration";
 /// Full proto type name a dynamic `ClusterLoadAssignment` (EDS) resource must
 /// carry.
 const DYNAMIC_ENDPOINTS_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssignment";
@@ -234,6 +237,13 @@ pub fn lower_dynamic_listener(
 ) -> Result<ListenerConfig, ConfigError> {
     let l: listener_v3::Listener = lower_dynamic_any(any, path, DYNAMIC_LISTENER_TYPE)?;
     convert_listener(&l, path)
+}
+
+/// Lower one ADS-delivered RDS resource. Like CDS/LDS lowering, this uses the
+/// same surface walk as file configuration so RDS is never a strict-mode hole.
+pub fn lower_dynamic_route(any: &prost_types::Any, path: &str) -> Result<RouteTable, ConfigError> {
+    let route: route_v3::RouteConfiguration = lower_dynamic_any(any, path, DYNAMIC_ROUTE_TYPE)?;
+    convert_route_table(&route, path)
 }
 
 /// Lower one xDS-delivered `ClusterLoadAssignment` (an EDS resource) into its
@@ -534,6 +544,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "codec_type",
             "stat_prefix",
             "route_config",
+            "rds",
             "http_filters",
             "generate_request_id",
             "use_remote_address",
@@ -549,6 +560,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             // `convert_hcm` into `HttpConnectionManagerConfig::upgrade_configs`.
             "upgrade_configs",
         ],
+        // RDS has the same ADS-only ConfigSource rule as EDS/SDS. The typed
+        // converter performs its per-specifier refusal so all members pass
+        // through this surface layer first.
+        "envoy.extensions.filters.network.http_connection_manager.v3.Rds" => {
+            &["config_source", "route_config_name"]
+        }
         // WP-10 S10: `filters` is deliberately NOT listed -- per-upgrade
         // filter chains are unimplemented (the tunnel is transparent, S10.2
         // deferred), so a config setting them is rejected right here by the
@@ -1448,15 +1465,35 @@ fn convert_hcm(
     use hcm_v3::http_connection_manager::RouteSpecifier;
     // (see `check_lane_h_filter_order` below for the ordering rules these
     // three type URLs participate in)
-    let route_table = match &hcm.route_specifier {
-        Some(RouteSpecifier::RouteConfig(rc)) => {
-            convert_route_table(rc, &format!("{path}.route_config"))?
-        }
-        Some(RouteSpecifier::Rds(_)) => {
-            return Err(unsupported(
-                format!("{path}.rds"),
-                "RDS is not implemented yet (WP-21)",
-            ))
+    let (route_table, rds_route_config_name) = match &hcm.route_specifier {
+        Some(RouteSpecifier::RouteConfig(rc)) => (
+            convert_route_table(rc, &format!("{path}.route_config"))?,
+            None,
+        ),
+        Some(RouteSpecifier::Rds(rds)) => {
+            let rds_path = format!("{path}.rds");
+            if !check_ads_source(
+                rds.config_source.as_ref(),
+                &format!("{rds_path}.config_source"),
+            )? {
+                return Err(invalid(
+                    format!("{rds_path}.config_source"),
+                    "RDS requires an ADS config_source",
+                ));
+            }
+            if rds.route_config_name.is_empty() {
+                return Err(invalid(
+                    format!("{rds_path}.route_config_name"),
+                    "RDS requires a non-empty route_config_name",
+                ));
+            }
+            // Workers never use this table: ResourceApplier stages the
+            // listener until the named RDS resource is present.
+            (
+                RouteTable::new(rds.route_config_name.clone(), Vec::new(), BTreeMap::new())
+                    .expect("an empty RDS placeholder route table is valid"),
+                Some(rds.route_config_name.clone()),
+            )
         }
         Some(RouteSpecifier::ScopedRoutes(_)) => {
             return Err(unsupported(
@@ -1599,6 +1636,7 @@ fn convert_hcm(
     Ok(HttpConnectionManagerConfig {
         stat_prefix: hcm.stat_prefix.clone(),
         route_table: Arc::new(route_table),
+        rds_route_config_name,
         http_filters,
         codec_type,
         generate_request_id,

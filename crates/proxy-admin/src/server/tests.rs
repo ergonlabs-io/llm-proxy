@@ -96,6 +96,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
     let hcm = HttpConnectionManagerConfig {
         stat_prefix: "ingress".to_string(),
         route_table,
+        rds_route_config_name: None,
         http_filters: vec![HttpFilterSpec {
             name: "envoy.filters.http.router".to_string(),
             type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"

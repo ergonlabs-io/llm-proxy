@@ -102,6 +102,39 @@ fn route_table(snapshot: &ConfigSnapshot) -> &RouteTable {
     &hcm.route_table
 }
 
+#[test]
+fn hcm_rds_over_ads_lowers_to_a_named_route_dependency() {
+    let yaml = r#"
+static_resources:
+  listeners:
+    - name: http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http
+                rds:
+                  route_config_name: ingress-routes
+                  config_source:
+                    ads: {}
+                    resource_api_version: V3
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#;
+    let snapshot = snapshot_from(yaml).expect("ADS-backed RDS must lower");
+    let listener = snapshot.listeners.get("http").expect("listener");
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM filter");
+    };
+    assert_eq!(hcm.rds_route_config_name.as_deref(), Some("ingress-routes"));
+}
+
 /// The Phase-1 example config lowers end to end.
 #[test]
 fn example_tcp_proxy_config_lowers() {
