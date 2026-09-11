@@ -53,6 +53,11 @@ use prost::Message;
 use proxy_api::envoy::config::cluster::v3 as cluster_v3;
 use proxy_api::envoy::config::core::v3 as core_v3;
 use proxy_api::envoy::config::endpoint::v3 as endpoint_v3;
+use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
+use rcgen::{CertificateParams, DnType, KeyPair};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream as TokioTcpStream;
+use tokio_rustls::TlsConnector;
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 
@@ -953,7 +958,11 @@ const TEST_E_SDS_SECRET: &str = "ingress-cert";
 /// `TEST_E_SDS_SECRET`. The test intentionally needs no scripted response:
 /// the load-bearing claim is the initial request emitted by the real binary,
 /// before a control plane has sent anything that could update subscriptions.
-fn bootstrap_sds_only_listener(listener_port: u16, ads_addr: SocketAddr) -> String {
+fn bootstrap_sds_only_listener(
+    listener_port: u16,
+    ads_addr: SocketAddr,
+    backend_addr: SocketAddr,
+) -> String {
     format!(
         r#"
 node:
@@ -979,7 +988,7 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
                 stat_prefix: ingress_tls
-                cluster: xds_cluster
+                cluster: sds_backend
           transport_socket:
             name: envoy.transport_sockets.tls
             typed_config:
@@ -999,10 +1008,61 @@ static_resources:
               - endpoint:
                   address:
                     socket_address: {{ address: {ads_ip}, port_value: {ads_port} }}
+    - name: sds_backend
+      type: STATIC
+      load_assignment:
+        cluster_name: sds_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {backend_ip}, port_value: {backend_port} }}
 "#,
         secret = TEST_E_SDS_SECRET,
         ads_ip = ads_addr.ip(),
         ads_port = ads_addr.port(),
+        backend_ip = backend_addr.ip(),
+        backend_port = backend_addr.port(),
+    )
+}
+
+/// A TLS-certificate SDS resource with inline PEM, the only secret shape
+/// WP-22 accepts at this boundary. The returned DER is also installed in the
+/// test client's trust store, so its successful handshake proves the proxy
+/// installed this exact delivered certificate rather than merely accepting an
+/// arbitrary TLS connection.
+fn minted_sds_certificate() -> (tls_v3::Secret, rustls::pki_types::CertificateDer<'static>) {
+    let key = KeyPair::generate().expect("generate SDS leaf key");
+    let mut params = CertificateParams::new(vec!["sds.test".to_string()]).expect("leaf params");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "sds.test");
+    let certificate = params.self_signed(&key).expect("self-sign SDS leaf");
+    let certificate_pem = certificate.pem();
+    let certificate_der = certificate.der().clone();
+
+    (
+        tls_v3::Secret {
+            name: TEST_E_SDS_SECRET.to_string(),
+            r#type: Some(tls_v3::secret::Type::TlsCertificate(
+                tls_v3::TlsCertificate {
+                    certificate_chain: Some(core_v3::DataSource {
+                        specifier: Some(core_v3::data_source::Specifier::InlineBytes(
+                            certificate_pem.into_bytes(),
+                        )),
+                        ..Default::default()
+                    }),
+                    private_key: Some(core_v3::DataSource {
+                        specifier: Some(core_v3::data_source::Specifier::InlineBytes(
+                            key.serialize_pem().into_bytes(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        },
+        certificate_der,
     )
 }
 
@@ -1021,7 +1081,7 @@ async fn an_sds_only_listener_subscribes_to_its_certificate_at_boot() {
     ));
     std::fs::write(
         &config_path,
-        bootstrap_sds_only_listener(listener_port, harness.addr),
+        bootstrap_sds_only_listener(listener_port, harness.addr, harness.addr),
     )
     .expect("write config");
 
@@ -1063,6 +1123,113 @@ async fn an_sds_only_listener_subscribes_to_its_certificate_at_boot() {
         request.resource_names,
         vec![TEST_E_SDS_SECRET],
         "got {request:?}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}
+
+/// WP-22's crate-level tests prove subscriptions, secret decoding, and the
+/// registry separately. This proves the real binary connects those seams:
+/// its SDS-only listener requests the named secret, the scripted control
+/// plane delivers it, and a client trusting only that secret completes TLS
+/// and receives a proxied HTTP response.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_sds_delivered_certificate_serves_a_tls_request_in_the_running_binary() {
+    let (secret, certificate_der) = minted_sds_certificate();
+    let harness = Harness::spawn(vec![Step::Send {
+        type_url: SDS_TYPE_URL.to_string(),
+        version_info: "sds-v1".to_string(),
+        nonce: "sds-n1".to_string(),
+        resources: vec![any_of(
+            &secret,
+            "envoy.extensions.transport_sockets.tls.v3.Secret",
+        )],
+    }])
+    .await
+    .expect("harness spawns");
+    let upstream_addr = spawn_mock_upstream();
+    let listener_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-sds-delivery-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        bootstrap_sds_only_listener(listener_port, harness.addr, upstream_addr),
+    )
+    .expect("write config");
+
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "SDS-only listener at {listener_addr} did not bind in time; stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+
+    // Wait for the SDS ACK, not merely the initial subscription: the ACK is
+    // emitted only after the delivery sink has updated the live TLS factory.
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    loop {
+        if harness.log.snapshot().iter().any(|request| {
+            request.type_url == SDS_TYPE_URL
+                && request.kind() == RequestKind::Ack
+                && request.version_info == "sds-v1"
+                && request.response_nonce == "sds-n1"
+        }) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {ACK_TIMEOUT:?} waiting for the SDS delivery ACK; ADS requests so far: {:?}; stderr so far: {:?}",
+                harness.log.snapshot(),
+                drain_available_lines(&stderr_rx)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(certificate_der)
+        .expect("add delivered leaf as trust root");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports default TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name: rustls::pki_types::ServerName<'static> = "sds.test"
+        .try_into()
+        .expect("test name is a valid DNS name");
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        TokioTcpStream::connect(listener_addr),
+    )
+    .await
+    .expect("TCP connection must not hang")
+    .expect("connect TLS listener");
+    let mut tls = tokio::time::timeout(
+        Duration::from_secs(5),
+        TlsConnector::from(Arc::new(client_config)).connect(server_name, tcp),
+    )
+    .await
+    .expect("TLS handshake must not hang")
+    .expect("SDS-delivered certificate must complete TLS handshake");
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: sds.test\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write TLS request");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
+        .await
+        .expect("TLS response must not hang")
+        .expect("read proxied TLS response");
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "expected the TLS request to reach the static upstream, got: {}",
+        String::from_utf8_lossy(&response)
     );
 
     terminate(&mut child);

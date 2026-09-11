@@ -54,6 +54,11 @@ serde_json = { workspace = true }
 # `crates/proxy-xds`'s own tests, not a `workspace.dependencies` entry since
 # nothing outside test code needs it (see that crate's Cargo.toml comment).
 controlplane = { path = "../../testing/controlplane" }
+# tests/ads_e2e.rs's SDS delivery acceptance mints the certificate the
+# scripted control plane sends, then makes a real downstream TLS request.
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 # tests/ads_e2e.rs: hand-builds a `Cluster` proto and wraps it as a
 # `google.protobuf.Any` to script a CDS response directly -- there is no
 # bootstrap file on this path, only a resource the ADS client decodes off
