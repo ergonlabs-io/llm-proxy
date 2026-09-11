@@ -1256,6 +1256,7 @@ impl RouterHandler {
                 if let Err(err) =
                     StaticHeaderCredentials::new(attempt_entry.request_headers_to_add())
                         .apply(&mut attempt_head, &body_bytes)
+                        .await
                 {
                     tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
                     dcb.stream_info()
