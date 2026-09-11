@@ -1,0 +1,5 @@
+.git
+target
+target-*
+docs/site/node_modules
+**/.DS_Store

@@ -12,13 +12,13 @@ WORKDIR /src
 
 # `proxy-api` generates its descriptor pool during the build.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends protobuf-compiler pkg-config \
+    && apt-get install --yes --no-install-recommends libprotobuf-dev protobuf-compiler pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY examples ./examples
 COPY testing ./testing
-COPY vendor ./vendor
 COPY schema ./schema
 
 RUN cargo build --release -p proxy -p mockupstream -p loadgen
@@ -35,4 +35,3 @@ COPY --from=build /src/target/release/llm-proxy /usr/local/bin/llm-proxy
 COPY --from=build /src/target/release/mock-upstream /usr/local/bin/mock-upstream
 COPY --from=build /src/target/release/loadgen /usr/local/bin/loadgen
 COPY testing/perf/proxy.yaml /etc/llm-proxy/proxy.yaml
-

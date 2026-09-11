@@ -9,9 +9,6 @@
 services:
   mock:
     image: llm-proxy-perf:local
-    build:
-      context: ../..
-      dockerfile: testing/perf/Dockerfile
     command:
       - /usr/local/bin/mock-upstream
       - --listen
@@ -64,9 +61,6 @@ services:
 
   loadgen:
     image: llm-proxy-perf:local
-    build:
-      context: ../..
-      dockerfile: testing/perf/Dockerfile
     profiles: [manual]
     entrypoint: [/usr/local/bin/loadgen]
     pid: "service:proxy"

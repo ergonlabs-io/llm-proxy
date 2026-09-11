@@ -98,11 +98,11 @@ sample_resources() {
                 printf ";"
             done
             for key in usage_usec user_usec system_usec nr_periods nr_throttled throttled_usec; do
-                value=$(awk -v key="$key" "$1 == key { print $2 }" "$root/cpu.stat" 2>/dev/null)
+                value=$(grep "^$key " "$root/cpu.stat" 2>/dev/null | cut -d " " -f 2)
                 printf "cpu.%s=%s;" "$key" "${value:-unavailable}"
             done
             for key in oom oom_kill high max; do
-                value=$(awk -v key="$key" "$1 == key { print $2 }" "$root/memory.events" 2>/dev/null)
+                value=$(grep "^$key " "$root/memory.events" 2>/dev/null | cut -d " " -f 2)
                 printf "memory.%s=%s;" "$key" "${value:-unavailable}"
             done
         ' 2>/dev/null || true)"
