@@ -341,3 +341,7 @@ sweep-compare: ## Run the sweep twice, h1 vs h2 upstream, to price connection re
 .PHONY: sweep-docker
 sweep-docker: ## Docker Desktop capacity baseline: proxy pinned to 2 CPUs and 1 GiB
 	./scripts/docker-capacity-sweep.sh $(ARGS)
+
+.PHONY: overhead-docker
+overhead-docker: ## Docker proxy-vs-direct latency overhead baseline
+	./scripts/docker-proxy-overhead.sh $(ARGS)
