@@ -57,6 +57,7 @@ fn retry_policy(retry_on: &str, num_retries: u32) -> RetryPolicyIR {
         retriable_status_codes: Vec::new(),
         retry_back_off: fast_backoff(),
         host_selection_retry_max_attempts: 1,
+        avoid_previous_hosts: false,
     }
 }
 
@@ -826,6 +827,7 @@ fn retry_policy_with_per_try_timeout(
         retriable_status_codes: Vec::new(),
         retry_back_off: fast_backoff(),
         host_selection_retry_max_attempts: 1,
+        avoid_previous_hosts: false,
     }
 }
 

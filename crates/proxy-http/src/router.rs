@@ -947,6 +947,10 @@ impl RouterHandler {
         // needs to see the first attempt's pick to skip it. `mut` because
         // the loop pushes onto it after every pick.
         let mut ctx = LoadBalancerContext::default();
+        if let Some(policy) = fwd.retry_policy.as_ref() {
+            ctx.avoid_previous_hosts = policy.avoid_previous_hosts;
+            ctx.host_selection_retry_max_attempts = policy.host_selection_retry_max_attempts;
+        }
 
         // WP-13: this attempt loop's own 1-based attempt counter, for
         // `x-envoy-attempt-count` (S9) -- incremented at the same point as
@@ -1039,6 +1043,7 @@ impl RouterHandler {
                 // `String` clone, not a borrow, so it doesn't conflict with
                 // `attempt_cluster` still being read below.
                 ctx.attempted_clusters.push(attempt_cluster.to_string());
+                ctx.attempted_hosts.push(host.address);
 
                 // WP-23 increment 6a: this is "the attempt is actually
                 // dispatched" -- past the S5 circuit breaker and host
@@ -3576,6 +3581,7 @@ mod tests {
                 max_interval: Duration::from_millis(2),
             },
             host_selection_retry_max_attempts: 1,
+            avoid_previous_hosts: false,
         }
     }
 

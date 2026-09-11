@@ -1385,6 +1385,10 @@ pub struct RetryPolicyIR {
     /// S3.1: how many times a retry may re-run host selection to avoid a
     /// previously-tried host before giving up and reusing one. Envoy default 1.
     pub host_selection_retry_max_attempts: u32,
+    /// Whether the supported Envoy `previous_hosts` retry predicate is
+    /// configured.  The router records every dispatched host on the request
+    /// context; the load balancer re-picks when this predicate rejects one.
+    pub avoid_previous_hosts: bool,
 }
 
 /// S3.3 backoff: attempt *n* (1-based) waits a delay drawn uniformly from

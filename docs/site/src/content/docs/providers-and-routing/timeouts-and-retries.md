@@ -115,14 +115,15 @@ non-obvious case where `attempts: 0` does *not* disable failover.
 The same engine exposes `per_try_timeout`, a configurable `retry_on` token
 set, `retriable_status_codes`, and a configurable backoff — all reachable
 directly on a raw bootstrap configuration's route `retry_policy`, none of
-them exposed by this configuration format's `routes[].retries`. Two
-`retry_policy` values are rejected outright rather than silently ignored:
-`host_selection_retry_max_attempts` above `1` (the router re-runs host
-selection once per retry but cannot yet exclude an already-tried host, so a
-higher value would parse and do nothing) and the `envoy-ratelimited`
-`retry_on` token (nothing sets the `x-envoy-ratelimited` response header it
-watches for). Both fail at config load naming the field, not at request time
-(`crates/proxy-config/src/lower.rs`).
+them exposed by this configuration format's `routes[].retries`. Raw bootstrap
+routes can also use Envoy's `previous_hosts` retry-host predicate with its
+empty typed config. The router records each dispatched socket address and
+re-runs load balancing up to `host_selection_retry_max_attempts`; if no new
+host is found, the final selection is used, matching Envoy's fallback rather
+than turning a retriable request into `no healthy upstream`. Other retry-host
+predicates are rejected at config load. The `envoy-ratelimited` `retry_on`
+token is also rejected because nothing yet sets the
+`x-envoy-ratelimited` response header it watches for.
 
 ### `x-envoy-attempt-count`
 
