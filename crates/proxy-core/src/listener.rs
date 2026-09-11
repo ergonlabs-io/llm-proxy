@@ -1483,9 +1483,9 @@ fn reset(stream: &TcpStream, listener: &str) {
     // just set is what turns that drop into an RST.
 }
 
-/// Reconcile `bound` against `snapshot`: bind new listeners, rebind ones
-/// whose address changed, leave unchanged ones alone, and stop accepting on
-/// ones that were removed.
+/// Reconcile `bound` against `snapshot`: bind new listeners, warm a replacement
+/// before stopping an address-changed listener, leave unchanged ones alone, and
+/// stop accepting on ones that were removed.
 // WP-50 3b-ii part B: `factory_state` is the 8th argument, tipping this over
 // clippy's 7-arg ceiling -- it can't fold into `stats` (a `&StatsRecorders`,
 // already a bundle of the actual per-worker *stats recorders*; `factory_state`
@@ -1557,16 +1557,33 @@ fn reconcile(
                 // listener take effect for new connections without a rebind.
             }
             Some(existing) => {
-                tracing::info!(listener = %name, old_addr = %existing.addr, new_addr = %listener_ir.address, "listener address changed; rebinding");
-                existing.task.abort();
-                bind_and_spawn(
-                    name.clone(),
+                let old_addr = existing.addr;
+                tracing::info!(listener = %name, %old_addr, new_addr = %listener_ir.address, "listener address changed; warming replacement before drain");
+                match spawn_bound(
+                    name,
                     listener_ir,
                     &snapshot.routes,
                     snapshot.version,
-                    bound,
                     &shared,
-                );
+                ) {
+                    Ok(replacement) => {
+                        // The replacement has completed every bind-time warm-up
+                        // (TLS and HTTP filter construction plus socket bind) before
+                        // this point. Only now stop the old accept loop. Its already
+                        // accepted connection tasks own their snapshots and drain
+                        // independently.
+                        let old = bound
+                            .insert(name.clone(), replacement)
+                            .expect("address-changed listener must still be bound");
+                        old.task.abort();
+                    }
+                    Err(err) => {
+                        // Keep the old map entry and accept loop intact. A failed
+                        // replacement must never turn a live listener update into an
+                        // outage; later snapshots can retry this warm-up.
+                        tracing::error!(listener = %name, address = %listener_ir.address, error = %err, "failed to warm replacement listener; keeping previous listener active");
+                    }
+                }
             }
             None => {
                 bind_and_spawn(
@@ -2505,6 +2522,98 @@ mod tests {
                 }
             }
 
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn address_replacement_serves_new_listener_and_drains_existing_connection() {
+        run_local(async {
+            let old_port = free_port().await;
+            let old_addr: SocketAddr = format!("127.0.0.1:{old_port}").parse().unwrap();
+            let new_port = free_port().await;
+            let new_addr: SocketAddr = format!("127.0.0.1:{new_port}").parse().unwrap();
+            let upstream_addr = spawn_echo_upstream().await;
+            let harness = spawn_manager(snapshot_with_cluster(
+                match_all_listener("l1", old_addr, "up"),
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut held = TcpStream::connect(old_addr)
+                .await
+                .expect("old listener should accept before replacement");
+            held.write_all(b"before").await.unwrap();
+            let mut before = [0_u8; 6];
+            held.read_exact(&mut before).await.unwrap();
+            assert_eq!(&before, b"before");
+
+            harness.publish(snapshot_with_cluster(
+                match_all_listener("l1", new_addr, "up"),
+                static_cluster("up", upstream_addr),
+                2,
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut fresh = TcpStream::connect(new_addr)
+                .await
+                .expect("warmed replacement listener should accept");
+            fresh.write_all(b"new").await.unwrap();
+            let mut new_response = [0_u8; 3];
+            fresh.read_exact(&mut new_response).await.unwrap();
+            assert_eq!(&new_response, b"new");
+
+            // Replacing the accept loop must not abort a connection it handed
+            // off before the swap.
+            held.write_all(b"drained").await.unwrap();
+            let mut drained = [0_u8; 7];
+            held.read_exact(&mut drained).await.unwrap();
+            assert_eq!(&drained, b"drained");
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn failed_address_replacement_keeps_previous_listener_accepting() {
+        run_local(async {
+            let old_port = free_port().await;
+            let old_addr: SocketAddr = format!("127.0.0.1:{old_port}").parse().unwrap();
+            // A plain Tokio listener does not opt into SO_REUSEPORT, so it
+            // makes the replacement address unavailable to proxy-core's
+            // SO_REUSEPORT listener socket.
+            let occupied = TokioTcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("occupy replacement address");
+            let occupied_addr = occupied.local_addr().unwrap();
+            let upstream_addr = spawn_echo_upstream().await;
+            let harness = spawn_manager(snapshot_with_cluster(
+                match_all_listener("l1", old_addr, "up"),
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            harness.publish(snapshot_with_cluster(
+                match_all_listener("l1", occupied_addr, "up"),
+                static_cluster("up", upstream_addr),
+                2,
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut old = TcpStream::connect(old_addr)
+                .await
+                .expect("old listener must remain after replacement warm-up failure");
+            old.write_all(b"still-live").await.unwrap();
+            let mut echoed = [0_u8; 10];
+            old.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"still-live");
+
+            drop(occupied);
             harness.shutdown().await;
         });
     }
