@@ -475,6 +475,7 @@ impl LoggingBody {
             llm_ttft,
             llm_max_stall,
             llm_response_chunks,
+            llm_list_cost_nanodollars,
             llm_system,
             llm_time_to_first_body_byte,
             requested_model,
@@ -506,6 +507,7 @@ impl LoggingBody {
                 info.llm.time_to_first_byte,
                 info.llm.max_inter_chunk,
                 info.llm.response_chunks,
+                info.llm.list_cost.as_ref().map(|cost| cost.nanodollars),
                 info.llm.system,
                 info.llm.time_to_first_body_byte,
                 info.requested_model.clone(),
@@ -641,6 +643,7 @@ impl LoggingBody {
             llm_ttft,
             llm_max_stall,
             llm_response_chunks,
+            llm_list_cost_nanodollars,
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
             request_authority: ctx.request.authority.as_deref(),
@@ -847,6 +850,7 @@ mod tests {
                 cache_creation_tokens: 33,
                 output_tokens: 44,
             }),
+            list_cost: None,
             system: None,
             time_to_first_byte: Some(std::time::Duration::from_millis(250)),
             time_to_first_body_byte: None,
@@ -865,6 +869,18 @@ mod tests {
             render_one(crate::stream_info::LlmStats::default()).await,
             "- - - - - -"
         );
+    }
+
+    #[tokio::test]
+    async fn immutable_list_cost_reaches_the_real_access_log_line() {
+        let llm = crate::stream_info::LlmStats {
+            list_cost: Some(crate::stream_info::LlmListCost {
+                nanodollars: 987_654,
+                rate_card_version: "v1+abcdef".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(render_one_fmt("%LLM_LIST_COST%", llm).await, "987654");
     }
 
     // --- WP-23 increment 6b: llm token-usage recording plumbing -----------
@@ -1129,6 +1145,7 @@ mod tests {
     async fn llm_max_stall_and_response_chunks_reach_the_rendered_line() {
         let llm = crate::stream_info::LlmStats {
             usage: None,
+            list_cost: None,
             system: None,
             time_to_first_byte: None,
             time_to_first_body_byte: None,
@@ -1165,6 +1182,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 output_tokens: 10,
             }),
+            list_cost: None,
             system: None,
             time_to_first_byte: Some(std::time::Duration::from_millis(0)),
             time_to_first_body_byte: None,

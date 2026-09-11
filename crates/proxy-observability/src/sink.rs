@@ -483,6 +483,7 @@ mod tests {
             llm_ttft: None,
             llm_max_stall: None,
             llm_response_chunks: 0,
+            llm_list_cost_nanodollars: None,
             request_method: None,
             request_path: None,
             request_authority: None,

@@ -37,6 +37,23 @@ fn valid_inline_price_list_lowers() {
 }
 
 #[test]
+fn rate_card_reaches_the_listener_usage_filter_with_actual_provider_map() {
+    let lowered = lower(&parse(BASE)).expect("rate card validates");
+    let inline = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["http_filters"]
+        .as_array()
+        .expect("filters")
+        .iter()
+        .find(|filter| filter["name"] == "llmproxy.usage")
+        .expect("usage filter")["typed_config"]["inline_string"]
+        .as_str()
+        .expect("rate card carrier");
+    let carrier: serde_json::Value = serde_json::from_str(inline).expect("strict JSON carrier");
+    assert_eq!(carrier["price_list"]["version"], "2026-09");
+    assert_eq!(carrier["providers"]["provider:openai"], "openai");
+}
+
+#[test]
 fn tier_mode_is_required_with_a_precise_path() {
     let config = BASE.replace("        tier_mode: whole_request\n", "");
     let error = lower(&parse(&config)).expect_err("must not guess money semantics");
