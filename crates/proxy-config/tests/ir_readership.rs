@@ -150,12 +150,11 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "AdsConfig",
         field_name: "initial_fetch_timeout",
-        kind: EntryKind::KnownInert,
-        reason: "WP-20 carries this so the config surface is complete, but its \
-                  consumer is WP-21's warming logic (a listener with an RDS \
-                  dependency waits for its route config, bounded by this), not \
-                  WP-20's client. It therefore outlives the other four entries \
-                  here -- expect to delete it with WP-21, not with WP-20.",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-21: crates/proxy/src/main.rs::run_serve reads this field \
+                 when building its readiness probe, so an ADS-backed \
+                 ConfigSource timeout releases /ready without force-initializing \
+                 a cluster. `proxy` is control-side and outside RUNTIME_CRATES.",
     },
     AllowlistEntry {
         struct_name: "ClusterConfig",

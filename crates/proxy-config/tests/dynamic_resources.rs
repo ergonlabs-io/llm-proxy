@@ -94,6 +94,34 @@ fn cds_only_is_legal_and_leaves_lds_false() {
     assert!(!ads.lds);
 }
 
+/// `initial_fetch_timeout` belongs to each ADS-backed `ConfigSource`, not
+/// `ads_config`. The shared ADS runtime currently has one startup deadline,
+/// so a sole CDS source carries its exact configured value into `AdsConfig`.
+#[test]
+fn cds_initial_fetch_timeout_lowers_to_ads_config() {
+    let yaml = with_ads(
+        r#"dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: { cluster_name: xds_cluster }
+  cds_config:
+    ads: {}
+    resource_api_version: V3
+    initial_fetch_timeout: 0.200s
+"#,
+    );
+    let ads = snapshot_from(&yaml)
+        .expect("CDS initial_fetch_timeout must load")
+        .ads
+        .unwrap();
+    assert_eq!(
+        ads.initial_fetch_timeout,
+        Some(std::time::Duration::from_millis(200))
+    );
+}
+
 /// The back-compat case, and the one that matters most: every config shipped
 /// through v0.2.0 has no `dynamic_resources` and must be completely unaffected.
 #[test]

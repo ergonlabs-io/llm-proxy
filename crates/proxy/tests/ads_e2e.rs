@@ -1415,3 +1415,153 @@ async fn an_rds_delivered_route_binds_and_serves_a_static_listener() {
     let _ = std::fs::remove_file(&config_path);
     harness.shutdown().await;
 }
+
+// -------------------------------------------------- initial fetch timeout --
+
+/// One static EDS cluster whose control-plane connection stays open but never
+/// delivers endpoints. The configured timeout belongs to `cds_config`'s
+/// `ConfigSource`: WP-21's bootstrap lowering carries that ADS-wide deadline
+/// into the readiness probe.
+fn bootstrap_never_warmed_eds_cluster(
+    listener_port: u16,
+    admin_port: u16,
+    ads_addr: SocketAddr,
+) -> String {
+    format!(
+        r#"
+node:
+  id: proxy-1
+  cluster: proxy-fleet
+
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: {admin_port} }}
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: {{ cluster_name: xds_cluster }}
+  cds_config:
+    ads: {{}}
+    resource_api_version: V3
+    initial_fetch_timeout: 0.200s
+
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {listener_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: {eds_cluster}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: xds_cluster
+      type: STATIC
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {ads_ip}, port_value: {ads_port} }}
+    - name: {eds_cluster}
+      type: EDS
+      eds_cluster_config:
+        eds_config:
+          ads: {{}}
+          resource_api_version: V3
+"#,
+        eds_cluster = TEST_D_EDS_CLUSTER,
+        ads_ip = ads_addr.ip(),
+        ads_port = ads_addr.port(),
+    )
+}
+
+/// A timeout unblocks readiness only. It must not force an EDS cluster that
+/// never received endpoints into the initialized state, or let its route send
+/// traffic to an empty host set.
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_fetch_timeout_marks_ready_live_without_warming_an_eds_cluster() {
+    let harness = Harness::spawn(vec![]).await.expect("harness spawns");
+    let listener_port = free_port();
+    let admin_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-initial-fetch-timeout-{}-{admin_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        bootstrap_never_warmed_eds_cluster(listener_port, admin_port, harness.addr),
+    )
+    .expect("write config");
+
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "listener at {listener_addr} did not bind in time; stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+    assert!(
+        wait_for_connectable(("127.0.0.1", admin_port), STARTUP_TIMEOUT),
+        "admin at {admin_addr} did not bind in time; stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+
+    let before_timeout = get(admin_addr, "/ready", "admin.local");
+    assert!(
+        before_timeout.starts_with("HTTP/1.1 503"),
+        "a never-fed EDS cluster must keep /ready INITIALIZING before its configured timeout, got:\n{before_timeout}"
+    );
+    assert!(
+        before_timeout.ends_with("INITIALIZING"),
+        "expected Envoy-compatible initializing body before timeout, got:\n{before_timeout}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let after_timeout = get(admin_addr, "/ready", "admin.local");
+    assert!(
+        after_timeout.starts_with("HTTP/1.1 200"),
+        "initial_fetch_timeout must release readiness after 200ms, got:\n{after_timeout}"
+    );
+    assert!(
+        after_timeout.ends_with("LIVE"),
+        "expected Envoy-compatible live body after timeout, got:\n{after_timeout}"
+    );
+
+    let response = get(listener_addr, "/", "warming.test");
+    assert!(
+        response.starts_with("HTTP/1.1 503"),
+        "timeout must not make the never-fed EDS route serve traffic, got:\n{response}"
+    );
+    assert!(
+        response.contains("cluster not warmed"),
+        "timeout must not call force_initialize; the request path must remain not warmed, got:\n{response}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}

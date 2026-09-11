@@ -1472,13 +1472,23 @@ fn convert_hcm(
         ),
         Some(RouteSpecifier::Rds(rds)) => {
             let rds_path = format!("{path}.rds");
-            if !check_ads_source(
+            let source = check_ads_source(
                 rds.config_source.as_ref(),
                 &format!("{rds_path}.config_source"),
-            )? {
+            )?;
+            if source.is_none() {
                 return Err(invalid(
                     format!("{rds_path}.config_source"),
                     "RDS requires an ADS config_source",
+                ));
+            }
+            if source
+                .as_ref()
+                .is_some_and(|source| source.initial_fetch_timeout.is_some())
+            {
+                return Err(unsupported(
+                    format!("{rds_path}.config_source.initial_fetch_timeout"),
+                    "per-route initial_fetch_timeout is not implemented; use the bootstrap LDS/CDS timeout",
                 ));
             }
             if rds.route_config_name.is_empty() {
@@ -2501,12 +2511,22 @@ fn convert_certificate_sds_configs(
             ));
         }
         let sds_config_path = format!("{entry_path}.sds_config");
-        if !check_ads_source(cfg.sds_config.as_ref(), &sds_config_path)? {
+        let source = check_ads_source(cfg.sds_config.as_ref(), &sds_config_path)?;
+        if source.is_none() {
             return Err(unsupported(
                 sds_config_path,
                 "a name-only SdsSecretConfig resolves against static_resources.secrets, \
                  whose TlsSecret is still a stub carrying only a name, so there is nothing \
                  to resolve to yet (WP-22, a later increment)",
+            ));
+        }
+        if source
+            .as_ref()
+            .is_some_and(|source| source.initial_fetch_timeout.is_some())
+        {
+            return Err(unsupported(
+                format!("{entry_path}.sds_config.initial_fetch_timeout"),
+                "SDS initial_fetch_timeout is not implemented",
             ));
         }
         names.push(cfg.name.clone());
@@ -2582,8 +2602,10 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
     // Per-type sources must be ADS-backed: the proto says "only ConfigSources
     // that have the ads field set will be streamed on the ADS channel", so a
     // source without it would silently never be subscribed.
-    let lds = check_ads_source(dr.lds_config.as_ref(), &format!("{path}.lds_config"))?;
-    let cds = check_ads_source(dr.cds_config.as_ref(), &format!("{path}.cds_config"))?;
+    let lds_source = check_ads_source(dr.lds_config.as_ref(), &format!("{path}.lds_config"))?;
+    let cds_source = check_ads_source(dr.cds_config.as_ref(), &format!("{path}.cds_config"))?;
+    let lds = lds_source.is_some();
+    let cds = cds_source.is_some();
 
     // EDS is WP-21's: the IR has no `Eds` discovery variant to lower into, and
     // inventing one here would put the warming semantics in the wrong package.
@@ -2595,18 +2617,37 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
         ));
     }
 
-    convert_api_config_source(api, &api_path, lds, cds, b)
+    let initial_fetch_timeout = match (
+        lds_source.and_then(|source| source.initial_fetch_timeout),
+        cds_source.and_then(|source| source.initial_fetch_timeout),
+    ) {
+        (Some(lds_timeout), Some(cds_timeout)) if lds_timeout != cds_timeout => {
+            return Err(unsupported(
+                format!("{path}.cds_config.initial_fetch_timeout"),
+                "independent LDS and CDS initial_fetch_timeout values are not implemented; configure the same value for both sources",
+            ));
+        }
+        (Some(timeout), _) | (_, Some(timeout)) => Some(timeout),
+        (None, None) => None,
+    };
+
+    convert_api_config_source(api, &api_path, lds, cds, initial_fetch_timeout, b)
 }
 
-/// A per-type `ConfigSource` is honoured only in its ADS form. Returns whether
-/// this type is subscribed at all (`None` => not subscribed).
+/// ADS-specific settings extracted from one per-type [`ConfigSource`].
+/// `None` from [`check_ads_source`] means this resource type is not subscribed.
+struct AdsSource {
+    initial_fetch_timeout: Option<StdDuration>,
+}
+
+/// A per-type `ConfigSource` is honoured only in its ADS form.
 fn check_ads_source(
     source: Option<&core_v3::ConfigSource>,
     path: &str,
-) -> Result<bool, ConfigError> {
+) -> Result<Option<AdsSource>, ConfigError> {
     use core_v3::config_source::ConfigSourceSpecifier;
     let Some(source) = source else {
-        return Ok(false);
+        return Ok(None);
     };
     if !source.resource_api_version().eq(&core_v3::ApiVersion::V3) {
         return Err(unsupported(
@@ -2615,7 +2656,13 @@ fn check_ads_source(
         ));
     }
     match &source.config_source_specifier {
-        Some(ConfigSourceSpecifier::Ads(_)) => Ok(true),
+        Some(ConfigSourceSpecifier::Ads(_)) => Ok(Some(AdsSource {
+            initial_fetch_timeout: source
+                .initial_fetch_timeout
+                .as_ref()
+                .map(|timeout| to_std_duration(timeout, &format!("{path}.initial_fetch_timeout")))
+                .transpose()?,
+        })),
         Some(ConfigSourceSpecifier::ApiConfigSource(_)) => Err(unsupported(
             format!("{path}.api_config_source"),
             "a per-type api_config_source is a separate xDS transport; only ADS-delivered \
@@ -2644,6 +2691,7 @@ fn convert_api_config_source(
     path: &str,
     lds: bool,
     cds: bool,
+    initial_fetch_timeout: Option<StdDuration>,
     b: &Bootstrap,
 ) -> Result<Option<AdsConfig>, ConfigError> {
     use core_v3::api_config_source::ApiType;
@@ -2737,7 +2785,7 @@ fn convert_api_config_source(
         cluster,
         lds,
         cds,
-        initial_fetch_timeout: None,
+        initial_fetch_timeout,
         node: NodeIdentity {
             id: b.node.as_ref().map(|n| n.id.clone()).unwrap_or_default(),
             cluster: b
@@ -2826,12 +2874,22 @@ fn convert_validation_context_sds_config(
         ));
     }
     let sds_config_path = format!("{path}.sds_config");
-    if !check_ads_source(cfg.sds_config.as_ref(), &sds_config_path)? {
+    let source = check_ads_source(cfg.sds_config.as_ref(), &sds_config_path)?;
+    if source.is_none() {
         return Err(unsupported(
             sds_config_path,
             "a name-only SdsSecretConfig resolves against static_resources.secrets, \
              whose TlsSecret is still a stub carrying only a name, so there is nothing \
              to resolve to yet (WP-22, a later increment)",
+        ));
+    }
+    if source
+        .as_ref()
+        .is_some_and(|source| source.initial_fetch_timeout.is_some())
+    {
+        return Err(unsupported(
+            format!("{path}.sds_config.initial_fetch_timeout"),
+            "SDS initial_fetch_timeout is not implemented",
         ));
     }
     Ok(cfg.name.clone())
@@ -3283,15 +3341,24 @@ fn convert_eds_cluster_config(
     let eds_config_path = format!("{cfg_path}.eds_config");
     // `check_ads_source` (defined above, for `dynamic_resources`'s per-type
     // ConfigSources) says exactly what we mean here too: only the ADS form
-    // of a ConfigSource is implemented. It returns `Ok(false)` for an unset
-    // source, which for a *required* field is itself the error -- the `!` arm
+    // of a ConfigSource is implemented. It returns `Ok(None)` for an unset
+    // source, which for a *required* field is itself the error -- the arm
     // below is what turns that into one, since `check_ads_source` alone has
     // no way to know whether its caller's field was optional.
-    let over_ads = check_ads_source(eds_cfg.eds_config.as_ref(), &eds_config_path)?;
-    if !over_ads {
+    let source = check_ads_source(eds_cfg.eds_config.as_ref(), &eds_config_path)?;
+    if source.is_none() {
         return Err(invalid(
             &eds_config_path,
             "eds_cluster_config.eds_config is required for an EDS cluster",
+        ));
+    }
+    if source
+        .as_ref()
+        .is_some_and(|source| source.initial_fetch_timeout.is_some())
+    {
+        return Err(unsupported(
+            format!("{eds_config_path}.initial_fetch_timeout"),
+            "EDS initial_fetch_timeout is not implemented; use the bootstrap CDS timeout",
         ));
     }
 
