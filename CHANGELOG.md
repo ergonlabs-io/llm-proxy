@@ -11,19 +11,29 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Work toward **v0.3.0** (ADS/xDS) has started. The test harness gained the ability to drop and
-resume an xDS stream, without which a control-plane reconnect could not be tested at all; and
-the configuration loader now accepts a `dynamic_resources` block naming an ADS control plane,
-validating it fully and rejecting every option that is not implemented with the exact path of
-the offending field. **No xDS behavior exists yet** — nothing connects to a control plane, and
-the proxy still takes its configuration from a file. Only the ADS forms of `lds_config` and
-`cds_config` are accepted; EDS, delta xDS, REST, filesystem sources and the `google_grpc`
-client are each refused by name.
+Work toward **v0.3.0** (ADS/xDS) is in progress. The proxy now connects to an ADS control plane,
+ACKs/NACKs strict LDS/CDS/RDS/SDS/EDS resources, applies accepted snapshots, reconnects with
+resync, and gates readiness/request admission on cluster warming. Named RDS delivery warms
+dependent listeners; replacement listeners retain last-good generations until warm, and ADS
+initial-fetch timeout is honored. Delta xDS, init-manager sequencing, and full differential churn
+verification remain open. Configuration loading rejects unsupported sources with full dotted paths.
 Everything else below is WP-50 increment 3 (operator control plane: tenants, budgets, spend),
 which shipped between the v0.2.0 tag and this point and gates neither release — see
 `internal-docs/MILESTONES.md`'s v0.2.0 section for why it's recorded there.
 
 ### Added
+
+- **Vertex bearer-token and Bedrock signing support.** Vertex applies configured access
+  tokens and provider paths; Bedrock signs final request bodies with SigV4. Strict validation, IR
+  lowering, dialect handling, and focused tests landed in `9c939b9`; Vertex token mint/refresh and
+  live-provider E2E remain deferred.
+- **Owned Lane-H filter protos.** TokenLimit, Usage, and BodyRewrite now use versioned
+  `llmproxy.filters.v0` typed config with legacy borrowed decoders retained for one release.
+- **Direct-response file bodies load during config lowering.** Request workers perform no file I/O
+  for this path (`24b42fb`).
+- **Local rate-limit request header mutations.** `request_headers_to_add_when_not_enforced`
+  parses strictly and applies on disabled, no-bucket, not-enforced, and shadow-denied paths
+  (`f979f38`).
 
 - **Admin write API, gated by `LLMPROXY_ADMIN_TOKEN`.** `POST /keys` (mints a virtual key,
   returns the plaintext exactly once), `DELETE /keys/{id}`, tenant CRUD, and

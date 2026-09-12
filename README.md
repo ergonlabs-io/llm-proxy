@@ -284,13 +284,12 @@ Stated plainly, because a feature list without this is not much use:
   HTTP/2 provider is offered `h2` and nothing else, so a backend that cannot
   speak it fails the TLS handshake rather than downgrading, which rules out most
   local plaintext servers. Upgrade requests bypass the cache by design.
-- **Dynamic configuration is partial.** CDS, LDS, and EDS are wired; **RDS is a
-  hard NACK**, delta xDS is not implemented, and the full make-before-break
-  warming story is still open (`v0.3.0`). SDS ingest and the swap into the
-  serving TLS chain have landed, but the ADS subscription that feeds them has
-  not; when it does, it carries downstream `tls_certificate` secrets only — a
-  `validation_context` is refused, and only inline data sources are accepted.
-  Static config plus SIGHUP is the supported deployment today.
+- **Dynamic configuration is partial.** CDS, LDS, RDS, SDS, and EDS are wired.
+  RDS-dependent and replacement listeners warm while last-good generations keep
+  serving, and ADS initial-fetch timeout is honored. Delta xDS, file transport,
+  init-manager sequencing, and full 5k-rps differential rename-churn verification
+  remain open (`v0.3.0`). SDS supports downstream certificate and validation-context
+  delivery with inline data sources. Static config plus SIGHUP remains supported.
 - **File-sourced credentials and certificates are read once.** `api_key_file`,
   `hmac_secret_file`, `cert_file`/`key_file` take effect on restart or SIGHUP —
   nothing watches them. Changing the control-plane store spec or its poll

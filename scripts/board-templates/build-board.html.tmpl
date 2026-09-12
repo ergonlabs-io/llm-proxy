@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 62 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-09 · 1868 tests passed, 26 skipped as of 2026-09-09 (<code>make tq-count</code>, cargo nextest, workspace only — fmt/clippy/doctests/QA not re-run this refresh) · + black-box QA suite (Go, 10 cases, last run 2026-09-08)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 62 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-12 · 1961 tests passed, 26 skipped as of 2026-09-12 (<code>make tq</code> + <code>make tq-doc</code>, format check and selected-crate clippy green) · + black-box QA suite (Go, 10 cases, last run 2026-09-08)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -198,9 +198,8 @@
     stream headers, and grpc-go withholds those until it has a request to answer — our own puppet
     harness structurally cannot catch this, since tonic sends headers eagerly. The client is also
     now reachable from the shipped binary (increment 4d-iii) — until that landed, every piece of
-    WP-20 was built, tested, and unreachable. RDS and EDS are both refused by name, not silently
-    dropped, and both are now WP-21's — a doc correction moved RDS off WP-20 mid-flight, since the
-    IR has no by-name route-table variant for an HCM to warm against. One ordering gap stays open,
+    WP-20 was built, tested, and unreachable. RDS and EDS moved to WP-21, which now subscribes,
+    applies, and warms their dependent resources. One ordering gap stays open,
     deliberately and in writing: ACK-before-apply in <code>main.rs</code>, which two independent
     test attempts could not observe from outside (the ACK's own network round trip dwarfs the
     race window) — publish-ordering is closed instead by the type system.
@@ -213,11 +212,11 @@
     down in one increment that the next increment did not honour. Increment 2a accepted a
     hostname in an EDS endpoint (nothing resolves one — refused at lowering now), and 2b-ii
     called the sink with the EDS <i>resource</i> name where <code>accept_eds_update</code> is
-    keyed by <code>Cluster.name</code>, which Envoy lets differ. <b>Do not read this as the gate
-    moving.</b> Cluster warming, listener warming on an RDS dependency (RDS is still refused by
-    name), the init manager, <code>/ready</code> gating and the make-before-break churn test are
-    all still ahead of WP-21 — and <code>is_initialized</code> STILL has no production caller, so
-    warming is inert for every discovery type, not only EDS.
+    keyed by <code>Cluster.name</code>, which Envoy lets differ. <code>/ready</code> now gates on
+    cluster warming, and WP-58 request admission distinguishes <code>cluster_not_warmed</code>
+    from <code>no_healthy_upstream</code>. RDS delivery, replacement-listener warming, last-good
+    retention, and ADS initial-fetch timeout landed 2026-09-11. Init-manager sequencing and full
+    5k-rps, Envoy-baselined rename churn remain ahead of WP-21.
     <b>WP-54 (tenant self-service usage API) is DONE, 2026-09-06, both increments</b> — not
     gate-moving, it never was part of the ADS gate. <b>WP-55 (usage history) was decided
     2026-09-06 — export-only, stay stateless — and DONE 2026-09-07</b>: a <code>tenant</code>
@@ -252,32 +251,24 @@
     <b>WP-59 is now DONE, both increments (2026-09-08)</b> — increment 2 is the carry-forward
     itself: an unrelated cluster's config change no longer wipes health-check state, outlier
     ejections, or EDS membership for clusters whose own config didn't change (6 more tests,
-    103 → 109). <b>WP-22 increment 1 landed 2026-09-08</b> — SDS ingest only: the proxy
-    subscribes to, decodes, and ACK/NACKs <code>...tls.v3.Secret</code>. Nothing yet serves a
-    rotated certificate; that's increment 2. Neither WP-59 nor WP-22 moves the v0.3.0 gate.
+    103 → 109). <b>WP-22 increments 1, 2a, 2b and 2c landed by 2026-09-12</b> — SDS ingest,
+    listener binding, certificate and validation-context delivery, shared IR types, and the
+    running binary's SDS subscription. Delta ADS remains open. Neither WP-59 nor WP-22 moves
+    the v0.3.0 gate.
     <b>2026-09-08, later the same day: WP-58 shipped</b> (<code>b71ec42</code>/<code>6226ee7</code>,
     3 new tests) — <code>router.rs</code> now checks <code>is_initialized</code> at both
     cluster-lookup sites before routing, so a not-yet-warm cluster renders
     <code>cluster_not_warmed</code> distinctly from an all-hosts-ejected
     <code>no_healthy_upstream</code>, closing the request-admission half of what WP-21 increment
-    3 left open. <b>WP-22 increments 2a and 2b also landed the same day</b>
+    3 left open. <b>WP-22 increments 2a, 2b and 2c landed by 2026-09-12</b>
     (<code>6e0c6ef</code>/<code>bdff97f</code>, <code>f500946</code>/<code>136064e</code>): a
     listener can now name an SDS secret and binds with an empty cert set instead of being
     refused, and a new <code>SdsSecretRegistry</code> (name → <code>Weak</code> factory map)
     makes a delivered secret actually reach <code>DownstreamTlsFactory::update_certificates</code>.
-    A <code>validation_context</code> secret is NACKed by name, naming increment 2c, rather than
-    silently accepted. <b>Real gap found on this refresh (2026-09-09), not by any of the tests
-    that shipped alongside these three increments:</b> the running binary's
-    <code>start_ads</code> (<code>crates/proxy/src/main.rs</code>) never adds an SDS subscription
-    to the ADS request list at <code>HEAD</code> — no <code>SDS_TYPE_URL</code> constant, no
-    matching <code>states.push</code> — so an SDS-only listener in production binds empty and
-    fails every handshake, silently, forever, because no SDS request is ever sent to explain why.
-    Every test that proved 2a/2b exercises the client/applier or registry layer directly; none of
-    them drives <code>main.rs</code>'s own subscription list, which is exactly the shape rule 16
-    warns about. A fix exists uncommitted in the working tree as of this refresh — not counted as
-    landed. Test total this refresh: <b>1868 passed, 26 skipped</b> (<code>make tq-count</code>,
-    up from 1844 — the +24 reconciles against WP-22 2a/2b's and WP-58's own new-test counts
-    above). None of WP-58 or WP-22 moves the v0.3.0 gate.
+    A <code>validation_context</code> secret now hot-swaps downstream trust anchors through its
+    own registry path. The running binary drives the SDS subscription as well as the
+    client/applier and registry layers. Test total this refresh: <b>1961 passed, 26 skipped</b>
+    (<code>make tq</code> + <code>make tq-doc</code>). None of WP-58 or WP-22 moves the gate.
     <b>Four new work packages, scoped 2026-09-07, three of them driven by an external consumer:</b>
     a sibling project (<code>remote-llm</code>) is building a sidecar that registers GPU inference
     nodes, and asked for per-endpoint metadata (WP-56), a <code>/clusters</code> view that shows
@@ -346,8 +337,7 @@
     <code>make xds-conformance</code> found and fixed a real deadlock against a pinned
     go-control-plane on its first run — evidence for why that opt-in target exists, since our own
     puppet harness structurally cannot reproduce it. <b>Read that as the ADS client working, not
-    as the gate moving</b>: RDS and EDS are both still refused by name, not silently dropped, and
-    both are now WP-21's. <b>WP-21 started 2026-09-06, three increments landed:</b> increment 1
+    as the gate moving</b>: RDS and EDS belong to WP-21. <b>WP-21 started 2026-09-06:</b> increment 1
     added the EDS cluster IR surface; increment 2 (2026-09-07) wired EDS ingest end to end,
     proven over a real socket; increment 3 (2026-09-07) wired <code>/ready</code> to gate on
     cluster warming, giving <code>is_initialized</code> its first production caller — though the
@@ -355,25 +345,19 @@
     <b>WP-58 (2026-09-08) gave it a second caller</b>: <code>router.rs</code> now checks
     <code>is_initialized</code> before routing, so a not-yet-warm cluster fails distinctly
     (<code>cluster_not_warmed</code>) instead of through the generic ejected-hosts path — this is
-    admission, not make-before-break; nothing warms in the background or swaps a listener
-    atomically. Listener warming on an RDS dependency (RDS is still refused by name),
-    active/warming/draining listener sets, the init manager and the make-before-break churn test
-    (zero 5xx under a renaming control plane) are all still ahead of WP-21, and that is what this
-    gate is actually waiting on now. <b>WP-22 landed increments 1, 2a and 2b by 2026-09-08</b> —
-    SDS ingest, a listener naming an SDS secret binding empty instead of being refused, and a
-    delivered secret actually reaching the serving TLS chain via a new <code>SdsSecretRegistry</code>.
-    <b>Real gap found this refresh (2026-09-09), not by a test:</b> the shipped binary's
-    <code>start_ads</code> never adds SDS to the ADS subscription list — no <code>SDS_TYPE_URL</code>,
-    no matching <code>states.push</code>, at <code>HEAD</code> — so in production no SDS request
-    is ever sent over the wire and an SDS-only listener fails every handshake silently, forever. A
-    fix sits uncommitted in the working tree; not counted as landed here. Neither WP-58 nor WP-22
-    touches this gate's own text (ACK/NACK/warming/reconnect) either way. WP-28 (the control-plane
+    admission, not make-before-break by itself. RDS delivery, replacement-listener warming,
+    last-good retention, and ADS initial-fetch timeout landed 2026-09-11. Init-manager sequencing
+    and full 5k-rps, Envoy-baselined rename churn remain. <b>WP-22 landed increments 1, 2a, 2b and
+    2c by 2026-09-12</b> — SDS ingest, a listener naming an SDS secret binding empty instead of
+    being refused, and certificate plus validation-context delivery reaching the serving TLS chain
+    via <code>SdsSecretRegistry</code>.
+    The running binary now includes the SDS subscription; delta ADS remains open. Neither WP-58
+    nor WP-22 touches this gate's own text (ACK/NACK/warming/reconnect) either way. WP-28 (the control-plane
     test harness) has landed the DropStream/Wait chunk WP-20's own reconnect-resync scenario
     needed and is otherwise still scaffolding. <b>WP-59 (incremental cluster application) shipped
     complete 2026-09-08</b> — a direct safety consequence of this gate's own subject (a fast CDS
     heartbeat would otherwise clear ejection state proxy-wide on a timer) but not itself a gate
-    requirement. One of the four in-scope WPs (WP-20) is done; WP-21 and WP-22 are started, WP-28
-    is scaffolding only.</span>
+    requirement. WP-20 is done; WP-21 and WP-22 remain started, WP-28 is scaffolding only.</span>
     <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
     mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
     budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
@@ -397,9 +381,8 @@
     construction. Proxy-issued virtual keys, keyed HMAC-SHA-256 verified in constant time, fail
     closed, an <code>Authenticator</code> trait chain so OIDC lands later without reshaping
     anything above it. Increments 2b (persistent key store), 2c (OIDC), and 3
-    (tenants/budgets/admin CRUD) remain, as does WP-47's migration of the three pre-existing
-    borrowed-message filters — only increment 1, the vendored <code>auth.proto</code> itself,
-    landed alongside 2a.
+    (tenants/budgets/admin CRUD) remain. WP-47's three pre-existing borrowed-message filters
+    now use owned <code>llmproxy.filters.v0</code> protos (completed 2026-09-12).
     <b>Test-suite note, re-measured 2026-08-08:</b> full workspace run is <b>18.3s</b>, 1045 tests
     green, 24 skipped, zero slow — a real re-run, not carried forward from the 968/21 count at the
     last refresh (this batch's volume of landed work explains the jump). The <code>cli.rs</code>
