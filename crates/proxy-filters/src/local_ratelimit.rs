@@ -130,8 +130,9 @@ impl DescriptorAction {
     }
 }
 
-/// Header mutation used on a locally rate-limited reply. The config parser
-/// accepts Envoy's overwrite-or-add and append actions only.
+/// Header mutation used on a locally rate-limited reply or admitted request
+/// when enforcement is disabled. The config parser accepts Envoy's
+/// overwrite-or-add and append actions only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderMutation {
     pub name: HeaderName,
@@ -152,6 +153,7 @@ pub struct LocalRateLimitConfig {
     pub enabled: bool,
     pub enforced: bool,
     pub status: StatusCode,
+    pub request_headers_to_add_when_not_enforced: Vec<HeaderMutation>,
     pub response_headers_to_add: Vec<HeaderMutation>,
     pub enable_x_ratelimit_headers: bool,
 }
@@ -168,6 +170,7 @@ impl LocalRateLimitConfig {
             enabled: true,
             enforced: true,
             status: StatusCode::TOO_MANY_REQUESTS,
+            request_headers_to_add_when_not_enforced: Vec::new(),
             response_headers_to_add: Vec::new(),
             enable_x_ratelimit_headers: false,
         }
@@ -533,18 +536,36 @@ impl HttpFilter for LocalRateLimitFilter {
         _end_stream: bool,
     ) -> FilterHeadersStatus {
         let limiter = self.effective_limiter(cb);
+        let config = limiter.config();
         let Some(decision) = limiter.check(&headers.headers, Instant::now()) else {
+            apply_header_mutations(
+                &config.request_headers_to_add_when_not_enforced,
+                &mut headers.headers,
+            );
             return FilterHeadersStatus::Continue;
         };
         self.decision = Some(decision);
-        self.emit_x_ratelimit_headers = limiter.config().enable_x_ratelimit_headers;
-        if decision.allowed || decision.shadow || !limiter.config().enforced {
+        self.emit_x_ratelimit_headers = config.enable_x_ratelimit_headers;
+        if decision.allowed {
+            if !config.enforced {
+                apply_header_mutations(
+                    &config.request_headers_to_add_when_not_enforced,
+                    &mut headers.headers,
+                );
+            }
+            return FilterHeadersStatus::Continue;
+        }
+        if decision.shadow || !config.enforced {
+            apply_header_mutations(
+                &config.request_headers_to_add_when_not_enforced,
+                &mut headers.headers,
+            );
             return FilterHeadersStatus::Continue;
         }
 
-        let status = limiter.config().status;
-        let mutations = limiter.config().response_headers_to_add.clone();
-        let include_x_rate_limit = limiter.config().enable_x_ratelimit_headers;
+        let status = config.status;
+        let mutations = config.response_headers_to_add.clone();
+        let include_x_rate_limit = config.enable_x_ratelimit_headers;
         cb.stream_info()
             .set_response_flag(ResponseFlag::RateLimited);
         cb.send_local_reply(
@@ -614,7 +635,6 @@ fn parse_config(
     per_route: bool,
 ) -> Result<LocalRateLimitConfig, ConfigError> {
     for field in [
-        "request_headers_to_add_when_not_enforced",
         "local_rate_limit_per_downstream_connection",
         "local_cluster_rate_limit",
         "vh_rate_limits",
@@ -691,8 +711,16 @@ fn parse_config(
     let response_headers_to_add = list(message, "response_headers_to_add")
         .iter()
         .enumerate()
-        .map(|(index, value)| parse_header_mutation(value, index))
+        .map(|(index, value)| parse_header_mutation(value, index, "response_headers_to_add"))
         .collect::<Result<Vec<_>, _>>()?;
+    let request_headers_to_add_when_not_enforced =
+        list(message, "request_headers_to_add_when_not_enforced")
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_header_mutation(value, index, "request_headers_to_add_when_not_enforced")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
     let enable_x_ratelimit_headers = message
         .get_field_by_name("enable_x_ratelimit_headers")
         .and_then(|value| value.as_i32())
@@ -707,6 +735,7 @@ fn parse_config(
         enabled,
         enforced,
         status,
+        request_headers_to_add_when_not_enforced,
         response_headers_to_add,
         enable_x_ratelimit_headers,
     };
@@ -923,16 +952,17 @@ fn parse_actions(
         .collect()
 }
 
-fn parse_header_mutation(value: &Value, index: usize) -> Result<HeaderMutation, ConfigError> {
-    let option = value.as_message().ok_or_else(|| {
-        invalid(
-            "typed_config.response_headers_to_add",
-            "must contain messages",
-        )
-    })?;
+fn parse_header_mutation(
+    value: &Value,
+    index: usize,
+    field: &str,
+) -> Result<HeaderMutation, ConfigError> {
+    let option = value
+        .as_message()
+        .ok_or_else(|| invalid(&format!("typed_config.{field}"), "must contain messages"))?;
     let header = child_message(option, "header").ok_or_else(|| {
         invalid(
-            &format!("typed_config.response_headers_to_add[{index}].header"),
+            &format!("typed_config.{field}[{index}].header"),
             "field is required",
         )
     })?;
@@ -942,7 +972,7 @@ fn parse_header_mutation(value: &Value, index: usize) -> Result<HeaderMutation, 
         .and_then(|name| HeaderName::from_bytes(name.as_bytes()).ok())
         .ok_or_else(|| {
             invalid(
-                &format!("typed_config.response_headers_to_add[{index}].header.key"),
+                &format!("typed_config.{field}[{index}].header.key"),
                 "must be a valid header name",
             )
         })?;
@@ -952,7 +982,7 @@ fn parse_header_mutation(value: &Value, index: usize) -> Result<HeaderMutation, 
         .and_then(|value| HeaderValue::from_str(&value).ok())
         .ok_or_else(|| {
             invalid(
-                &format!("typed_config.response_headers_to_add[{index}].header.value"),
+                &format!("typed_config.{field}[{index}].header.value"),
                 "must be a valid header value",
             )
         })?;
@@ -972,9 +1002,19 @@ fn parse_header_mutation(value: &Value, index: usize) -> Result<HeaderMutation, 
             append: true,
         }),
         _ => Err(invalid(
-            &format!("typed_config.response_headers_to_add[{index}].append_action"),
+            &format!("typed_config.{field}[{index}].append_action"),
             "only APPEND_IF_EXISTS_OR_ADD and OVERWRITE_IF_EXISTS_OR_ADD are implemented",
         )),
+    }
+}
+
+fn apply_header_mutations(mutations: &[HeaderMutation], headers: &mut HeaderMap) {
+    for mutation in mutations {
+        if mutation.append {
+            headers.append(mutation.name.clone(), mutation.value.clone());
+        } else {
+            headers.insert(mutation.name.clone(), mutation.value.clone());
+        }
     }
 }
 
@@ -1125,6 +1165,41 @@ mod tests {
         let denied = limiter.check(&headers, now).unwrap();
         assert!(!denied.allowed);
         assert!(denied.shadow);
+    }
+
+    #[test]
+    fn request_headers_are_added_when_enforcement_is_disabled() {
+        let now = Instant::now();
+        let mut config = LocalRateLimitConfig::enabled(bucket(1));
+        config.enforced = false;
+        config
+            .request_headers_to_add_when_not_enforced
+            .push(HeaderMutation {
+                name: HeaderName::from_static("x-local-rate-limit-shadow"),
+                value: HeaderValue::from_static("true"),
+                append: false,
+            });
+        let limiter = Arc::new(LocalRateLimiter::new(Arc::new(config), now).unwrap());
+        let mut filter = LocalRateLimitFilter {
+            default: limiter,
+            decision: None,
+            emit_x_ratelimit_headers: false,
+        };
+        let mut callbacks = TestCallbacks::default();
+        let mut request = RequestHeaders {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+        };
+
+        assert_eq!(
+            filter.decode_headers(&mut callbacks, &mut request, true),
+            FilterHeadersStatus::Continue
+        );
+        assert_eq!(
+            request.headers.get("x-local-rate-limit-shadow"),
+            Some(&HeaderValue::from_static("true"))
+        );
     }
 
     #[test]
