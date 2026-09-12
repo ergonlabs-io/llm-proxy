@@ -625,6 +625,9 @@ pub trait ClusterEntry: Send + Sync {
     /// dialect -- see `ClusterConfig::request_headers_to_add`.
     fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation];
 
+    /// Provider-owned path/query rewrite to apply after route transforms.
+    fn request_path_rewrite(&self) -> Option<&proxy_config::ir::RequestPathRewrite>;
+
     /// Feed one upstream attempt's outcome to this cluster's S6 outlier
     /// detector (WP-19). `addr` is the host the attempt actually dialed. A
     /// no-op when the cluster configures no outlier detection, so the router

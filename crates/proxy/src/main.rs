@@ -2044,6 +2044,7 @@ mod tests {
                 circuit_breakers: Default::default(),
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
                 request_headers_to_add: Vec::new(),
+                request_path_rewrite: None,
                 usage_dialect: None,
                 health_check: None,
                 outlier_detection: None,

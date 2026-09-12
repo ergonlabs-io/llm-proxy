@@ -118,6 +118,7 @@ async fn build_router(
             circuit_breakers: CircuitBreakers::default(),
             upstream_protocol: proto,
             request_headers_to_add: Vec::new(),
+            request_path_rewrite: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,

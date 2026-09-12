@@ -506,24 +506,15 @@ fn provider_upstream(name: &str, provider: &Provider) -> Result<ProviderUpstream
     Ok(ProviderUpstream { host, port, tls })
 }
 
-/// `azure-openai`/`vertex`/`bedrock` are named in the taxonomy (WP-49) but
-/// have no working way to reach the upstream yet: Vertex needs minted OAuth2
-/// with a refresh loop, Bedrock needs per-request SigV4 signing over the
-/// canonical request (which must run after body rewriting and so cannot be
-/// `request_headers_to_add`), and Azure needs a deployment-name +
-/// `api-version` URL template neither `host_rewrite_literal` nor
-/// `prefix_rewrite` can express. `None` for the three implemented types.
+/// Vertex and Bedrock still need provider-specific credential schemes.
 fn unsupported_credential_scheme(provider_type: ProviderType) -> Option<String> {
     let (gap, detail) = match provider_type {
         ProviderType::Vertex => ("credential scheme", "minted OAuth2 with refresh"),
         ProviderType::Bedrock => ("credential scheme", "per-request SigV4 signing"),
-        ProviderType::AzureOpenai => (
-            "URL path templating",
-            "deployment name + api-version query parameter",
-        ),
         ProviderType::Openai | ProviderType::Anthropic | ProviderType::OpenaiCompatible => {
             return None
         }
+        ProviderType::AzureOpenai => return None,
     };
     Some(format!(
         "provider type `{}` is not yet supported: its {gap} ({detail}) is not implemented \
@@ -699,6 +690,22 @@ fn lower_provider(
         }
     });
 
+    if provider.effective_type(name) == ProviderType::AzureOpenai {
+        let deployment = provider
+            .deployment
+            .as_deref()
+            .expect("validated: Azure deployment is present");
+        let api_version = provider
+            .api_version
+            .as_deref()
+            .expect("validated: Azure api_version is present");
+        cluster["metadata"]["filter_metadata"][PATH_REWRITE_METADATA_KEY] = json!({
+            "match_prefix": "/v1",
+            "replacement_prefix": format!("/openai/deployments/{deployment}"),
+            "query": format!("api-version={api_version}"),
+        });
+    }
+
     Ok(cluster)
 }
 
@@ -711,6 +718,9 @@ fn lower_provider(
 /// same reason `USAGE_FILTER_TYPE_URL` above is pinned by a dev-dependency
 /// test rather than trusted to stay in sync.
 const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
+
+/// Namespace key for provider-owned path/query rewrites.
+const PATH_REWRITE_METADATA_KEY: &str = "io.llmproxy.path_rewrite";
 
 /// Namespace key under `Cluster.metadata.filter_metadata` this dialect uses
 /// to carry the usage-filter dialect -- must match
@@ -747,6 +757,7 @@ fn auth_header(
     };
     Ok(Some(match provider.effective_type(name) {
         ProviderType::Anthropic => ("x-api-key".to_string(), key),
+        ProviderType::AzureOpenai => ("api-key".to_string(), key),
         _ => ("authorization".to_string(), format!("Bearer {key}")),
     }))
 }

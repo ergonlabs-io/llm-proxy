@@ -3296,6 +3296,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // is per-provider, so it rides the same `Cluster.metadata.filter_metadata`
     // smuggling channel as credentials above, under its own namespace.
     let usage_dialect = convert_usage_dialect_metadata(c.metadata.as_ref(), path)?;
+    let request_path_rewrite = convert_request_path_rewrite_metadata(c.metadata.as_ref(), path)?;
     // S6 active health checking (WP-18): meaningful on an aggregate too, in
     // principle, but Envoy runs health checks against a cluster's own hosts
     // -- an aggregate has none -- so `c.health_checks` on one is inert the
@@ -3335,6 +3336,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         circuit_breakers,
         upstream_protocol,
         request_headers_to_add,
+        request_path_rewrite,
         usage_dialect,
         health_check,
         outlier_detection,
@@ -3478,6 +3480,10 @@ fn validate_cluster_graph(
 /// have to live on the cluster rather than the route.
 const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
 
+/// Namespace key the `llmproxy` dialect uses to carry provider-owned
+/// upstream path/query rewriting through `Cluster.metadata.filter_metadata`.
+const PATH_REWRITE_METADATA_KEY: &str = "io.llmproxy.path_rewrite";
+
 /// Lower `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
 /// into `ClusterConfig::request_headers_to_add`. The expected shape is
 /// `{ headers: [ { key: "...", value: "..." }, ... ] }`; every entry lowers
@@ -3566,6 +3572,80 @@ fn provider_auth_string_field(
         Some(_) => Err(invalid(format!("{path}.{name}"), "must be a string")),
         None => Err(invalid(format!("{path}.{name}"), "is required")),
     }
+}
+
+/// Lower `Cluster.metadata.filter_metadata["io.llmproxy.path_rewrite"]` into
+/// provider-owned request path IR. The namespace accepts exactly
+/// `match_prefix`, `replacement_prefix`, and optional `query` string fields.
+fn convert_request_path_rewrite_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<Option<RequestPathRewrite>, ConfigError> {
+    let Some(rewrite) = metadata.and_then(|m| m.filter_metadata.get(PATH_REWRITE_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let rewrite_path = format!("{path}.metadata.filter_metadata[\"{PATH_REWRITE_METADATA_KEY}\"]");
+    let fields = rewrite;
+    let mut unknown: Vec<&String> = fields
+        .fields
+        .keys()
+        .filter(|key| {
+            !matches!(
+                key.as_str(),
+                "match_prefix" | "replacement_prefix" | "query"
+            )
+        })
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{rewrite_path}.{key}"),
+            format!(
+                "`{PATH_REWRITE_METADATA_KEY}` only supports `match_prefix`, \
+                 `replacement_prefix`, and `query`"
+            ),
+        ));
+    }
+
+    let string_field = |name: &str| -> Result<String, ConfigError> {
+        let field_path = format!("{rewrite_path}.{name}");
+        match fields
+            .fields
+            .get(name)
+            .and_then(|value| value.kind.as_ref())
+        {
+            Some(prost_types::value::Kind::StringValue(value)) if !value.is_empty() => {
+                Ok(value.clone())
+            }
+            Some(prost_types::value::Kind::StringValue(_)) => {
+                Err(invalid(field_path, "must not be empty"))
+            }
+            Some(_) => Err(invalid(field_path, "must be a string")),
+            None => Err(invalid(field_path, "is required")),
+        }
+    };
+    let query = match fields.fields.get("query") {
+        None => None,
+        Some(value) => match value.kind.as_ref() {
+            Some(prost_types::value::Kind::StringValue(query)) if !query.is_empty() => {
+                Some(query.clone())
+            }
+            Some(prost_types::value::Kind::StringValue(_)) => {
+                return Err(invalid(
+                    format!("{rewrite_path}.query"),
+                    "must not be empty",
+                ))
+            }
+            Some(_) => return Err(invalid(format!("{rewrite_path}.query"), "must be a string")),
+            None => return Err(invalid(format!("{rewrite_path}.query"), "must be a string")),
+        },
+    };
+    Ok(Some(RequestPathRewrite {
+        match_prefix: string_field("match_prefix")?,
+        replacement_prefix: string_field("replacement_prefix")?,
+        query,
+    }))
 }
 
 /// Namespace key the `llmproxy` dialect uses to carry the usage-filter

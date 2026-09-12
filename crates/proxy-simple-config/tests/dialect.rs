@@ -4,7 +4,7 @@
 
 use proxy_config::{ConfigError, ConfigFrontEnd, UNKNOWN_FIELD_DIALECT_HINT};
 use proxy_simple_config::{
-    lower_to_loaded, parse_simple_config_with_env, to_envoy_yaml, MODEL_HEADER,
+    lower, lower_to_loaded, parse_simple_config_with_env, to_envoy_yaml, MODEL_HEADER,
 };
 
 /// Env lookup for tests: FOO_KEY-style names resolve, everything else is unset.
@@ -1848,9 +1848,9 @@ models:
     assert!(reason.contains("at least one provider"), "got: {reason}");
 }
 
-/// `vertex`, `bedrock`, and `azure-openai` are named in the taxonomy but
-/// have no working credential/addressing scheme yet -- loading a provider of
-/// one of those types is a hard error naming the gap, caught at LOWERING
+/// `vertex` and `bedrock` are named in taxonomy but have no working
+/// credential/addressing scheme yet -- loading a provider of one of those
+/// types is a hard error naming the gap, caught at LOWERING
 /// (not parse) time, since it's a "can we produce a working Envoy resource"
 /// question, not a shape question.
 ///
@@ -1864,17 +1864,10 @@ models:
 /// fully-specified config.
 #[test]
 fn unbuilt_provider_types_are_hard_load_errors() {
-    for (type_name, must_contain) in [
-        ("vertex", "OAuth2"),
-        ("bedrock", "SigV4"),
-        ("azure-openai", "URL path templating"),
-    ] {
-        let models = if type_name == "azure-openai" {
-            String::new()
-        } else {
+    for (type_name, must_contain) in [("vertex", "OAuth2"), ("bedrock", "SigV4")] {
+        let models =
             "\nmodels:\n  m1:\n    providers:\n      - { provider: p1, model: m, dialect: anthropic }\n"
-                .to_string()
-        };
+                .to_string();
         let config = parse(&format!(
             r#"
 version: 0
@@ -1892,6 +1885,121 @@ routes:
         };
         assert_eq!(field_path, "providers.p1.type", "{type_name}");
         assert!(reason.contains(must_contain), "{type_name}: got {reason}");
+    }
+}
+
+#[test]
+fn azure_openai_lowers_auth_and_provider_path_rewrite() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  azure:
+    type: azure-openai
+    base_url: "https://example.openai.azure.com"
+    deployment: gpt-4o-prod
+    api_version: 2024-10-21
+    api_key: azure-key
+routes:
+  - { model: "*", provider: azure }
+"#,
+    )
+    .expect("Azure config must parse");
+    let lowered = lower(&config).expect("Azure config must lower");
+    let cluster = lowered.bootstrap["static_resources"]["clusters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|cluster| cluster["name"] == "provider:azure")
+        .expect("Azure provider cluster must exist");
+    let headers = cluster["metadata"]["filter_metadata"]["io.llmproxy.provider_auth"]["headers"]
+        .as_array()
+        .unwrap();
+    assert!(headers
+        .iter()
+        .any(|header| header["key"] == "api-key" && header["value"] == "azure-key"));
+    assert_eq!(
+        cluster["metadata"]["filter_metadata"]["io.llmproxy.path_rewrite"],
+        serde_json::json!({
+            "match_prefix": "/v1",
+            "replacement_prefix": "/openai/deployments/gpt-4o-prod",
+            "query": "api-version=2024-10-21",
+        })
+    );
+    let loaded = lower_to_loaded(&config).expect("Azure config must load through Envoy IR");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("Azure config must build IR");
+    assert_eq!(
+        snapshot.clusters["provider:azure"].request_path_rewrite,
+        Some(proxy_config::ir::RequestPathRewrite {
+            match_prefix: "/v1".to_string(),
+            replacement_prefix: "/openai/deployments/gpt-4o-prod".to_string(),
+            query: Some("api-version=2024-10-21".to_string()),
+        })
+    );
+}
+
+#[test]
+fn azure_openai_requires_deployment_and_api_version() {
+    for (field, config) in [
+        (
+            "deployment",
+            r#"
+version: 0
+providers:
+  azure:
+    type: azure-openai
+    base_url: "https://example.openai.azure.com"
+    api_version: 2024-10-21
+routes:
+  - { model: "*", provider: azure }
+"#,
+        ),
+        (
+            "api_version",
+            r#"
+version: 0
+providers:
+  azure:
+    type: azure-openai
+    base_url: "https://example.openai.azure.com"
+    deployment: gpt-4o-prod
+routes:
+  - { model: "*", provider: azure }
+"#,
+        ),
+    ] {
+        let err = parse(config).expect_err("missing Azure field must fail");
+        let ConfigError::InvalidValue { field_path, .. } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(field_path, format!("providers.azure.{field}"));
+    }
+}
+
+#[test]
+fn azure_openai_rejects_unsafe_path_and_query_values() {
+    for (field, deployment, api_version) in [
+        ("deployment", "gpt/4o", "2024-10-21"),
+        ("api_version", "gpt-4o-prod", "2024-10-21&x=y"),
+    ] {
+        let config = format!(
+            r#"
+version: 0
+providers:
+  azure:
+    type: azure-openai
+    base_url: "https://example.openai.azure.com"
+    deployment: {deployment}
+    api_version: {api_version}
+routes:
+  - {{ model: "*", provider: azure }}
+"#
+        );
+        let err = parse(&config).expect_err("unsafe Azure value must fail");
+        let ConfigError::InvalidValue { field_path, .. } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(field_path, format!("providers.azure.{field}"));
     }
 }
 

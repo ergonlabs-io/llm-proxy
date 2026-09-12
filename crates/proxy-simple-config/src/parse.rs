@@ -9,7 +9,8 @@ use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
 use crate::lower::{classify_model_key, dialect_from_models, resolved_dialect};
 use crate::model::{
-    is_valid_provider_name, Listen, ModelProviderRef, ProviderModelRef, SimpleConfig, RESERVED_KEYS,
+    is_valid_provider_name, Listen, ModelProviderRef, Provider, ProviderModelRef, ProviderType,
+    SimpleConfig, RESERVED_KEYS,
 };
 
 /// Parse dialect YAML from a file.
@@ -154,6 +155,23 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                 field_path: path,
                 reason: "set either api_key or api_key_file, not both".to_string(),
             });
+        }
+        match provider.effective_type(name) {
+            ProviderType::AzureOpenai => validate_azure_provider(name, provider)?,
+            _ => {
+                if provider.deployment.is_some() {
+                    return Err(ConfigError::InvalidValue {
+                        field_path: format!("{path}.deployment"),
+                        reason: "deployment is only valid for azure-openai providers".into(),
+                    });
+                }
+                if provider.api_version.is_some() {
+                    return Err(ConfigError::InvalidValue {
+                        field_path: format!("{path}.api_version"),
+                        reason: "api_version is only valid for azure-openai providers".into(),
+                    });
+                }
+            }
         }
         if provider.effective_base_url(name).is_none() {
             return Err(ConfigError::InvalidValue {
@@ -313,6 +331,47 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
         parse_host_port(admin, "admin")?;
     }
     Ok(())
+}
+
+fn validate_azure_provider(name: &str, provider: &Provider) -> Result<(), ConfigError> {
+    let path = format!("providers.{name}");
+    let deployment = provider
+        .deployment
+        .as_deref()
+        .ok_or_else(|| ConfigError::InvalidValue {
+            field_path: format!("{path}.deployment"),
+            reason: "deployment is required for azure-openai providers".into(),
+        })?;
+    if !is_safe_url_component(deployment) {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.deployment"),
+            reason: "must contain only ASCII letters, digits, hyphen, dot, underscore, or tilde"
+                .into(),
+        });
+    }
+
+    let api_version = provider
+        .api_version
+        .as_deref()
+        .ok_or_else(|| ConfigError::InvalidValue {
+            field_path: format!("{path}.api_version"),
+            reason: "api_version is required for azure-openai providers".into(),
+        })?;
+    if !is_safe_url_component(api_version) {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.api_version"),
+            reason: "must contain only ASCII letters, digits, hyphen, dot, underscore, or tilde"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn is_safe_url_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
 fn check_provider_ref(

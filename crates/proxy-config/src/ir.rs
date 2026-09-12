@@ -603,6 +603,19 @@ pub struct HttpFilterSpec {
 
 // ----------------------------------------------------------------- clusters --
 
+/// Provider-owned rewrite for an upstream request path.
+///
+/// Route rewrites run before this transform. `match_prefix` is replaced by
+/// `replacement_prefix`, while any unmatched path suffix is preserved. An
+/// optional query replaces request query parameters. Keeping this on cluster
+/// IR makes provider-specific URL details follow selected aggregate member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestPathRewrite {
+    pub match_prefix: String,
+    pub replacement_prefix: String,
+    pub query: Option<String>,
+}
+
 /// IR for `envoy.config.cluster.v3.Cluster` (supported surface).
 ///
 /// `PartialEq` (WP-59 increment 2) is a derive over every field, not a
@@ -683,6 +696,9 @@ pub struct ClusterConfig {
     /// credentials here keeps them out of the access log — the same guarantee
     /// route-level injection had, and for the same reason.
     pub request_headers_to_add: Vec<HeaderMutation>,
+    /// Provider-owned path/query rewrite applied after route transforms and
+    /// before credentials. This follows actual cluster selected on failover.
+    pub request_path_rewrite: Option<RequestPathRewrite>,
     /// Which wire dialect this cluster's upstream speaks, for the usage
     /// filter's token accounting -- ground rule #6's third instance (see
     /// `CLAUDE.md`), following credentials (`request_headers_to_add`) and

@@ -133,6 +133,12 @@ pub struct Provider {
     pub provider_type: Option<ProviderType>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Azure OpenAI deployment name used in the provider-owned request path.
+    #[serde(default)]
+    pub deployment: Option<String>,
+    /// Azure OpenAI api-version query value.
+    #[serde(default)]
+    pub api_version: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
@@ -207,10 +213,8 @@ pub enum ProviderType {
     Openai,
     Anthropic,
     OpenaiCompatible,
-    /// OpenAI-shaped API hosted on Azure -- an unambiguous dialect (always
-    /// OpenAI's), but the endpoint needs a deployment-name + `api-version`
-    /// URL template that isn't built yet. Loading one is a hard error; see
-    /// `lower::lower_provider`.
+    /// OpenAI-shaped API hosted on Azure. The provider requires deployment
+    /// and api-version fields to build its provider-owned URL template.
     AzureOpenai,
     /// Serves Anthropic-shaped Claude, Google-shaped Gemini, and
     /// OpenAI-shaped Kimi under one provider type, and needs minted OAuth2
@@ -693,10 +697,9 @@ impl Provider {
         self.base_url.clone().or(match self.effective_type(name) {
             ProviderType::Openai => Some("https://api.openai.com".to_string()),
             ProviderType::Anthropic => Some("https://api.anthropic.com".to_string()),
-            // No implied URL built yet for these three -- their credential
-            // scheme isn't implemented either (see
-            // `lower::lower_provider`), so an explicit `base_url` here
-            // wouldn't get a config past lowering anyway.
+            // These provider types require an explicit base URL. Vertex and
+            // Bedrock also remain unavailable until their credential schemes
+            // land; Azure is handled by `lower::lower_provider`.
             ProviderType::OpenaiCompatible
             | ProviderType::AzureOpenai
             | ProviderType::Vertex

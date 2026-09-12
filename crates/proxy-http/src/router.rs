@@ -669,6 +669,7 @@ impl RouterHandler {
             headers: head.headers.clone(),
         };
         apply_request_transforms(fwd, matcher, request_headers_to_add, &mut attempt_head);
+        apply_cluster_request_path_rewrite(attempt_entry.request_path_rewrite(), &mut attempt_head);
         apply_header_mutations(
             attempt_entry.request_headers_to_add(),
             &mut attempt_head.headers,
@@ -1257,6 +1258,10 @@ impl RouterHandler {
                         .headers
                         .insert("x-envoy-attempt-count", HeaderValue::from(attempt_number));
                 }
+                apply_cluster_request_path_rewrite(
+                    attempt_entry.request_path_rewrite(),
+                    &mut attempt_head,
+                );
                 // WP-49: apply credentials only after every decode filter
                 // has produced the final body and the router has completed
                 // its own per-attempt header changes. `attempt_entry` is the
@@ -1926,6 +1931,57 @@ fn apply_request_transforms(
     }
 
     apply_header_mutations(request_headers_to_add, &mut head.headers);
+}
+
+/// Apply provider-owned path/query rewriting after route transforms. The
+/// selected aggregate member supplies this value, so fallback requests use
+/// fallback provider URL details rather than primary provider details.
+fn apply_cluster_request_path_rewrite(
+    rewrite: Option<&proxy_config::ir::RequestPathRewrite>,
+    head: &mut crate::filter::RequestHeaders,
+) {
+    let Some(rewrite) = rewrite else {
+        return;
+    };
+    let path = head.uri.path();
+    let Some(suffix) = path.strip_prefix(&rewrite.match_prefix) else {
+        tracing::debug!(
+            path,
+            match_prefix = %rewrite.match_prefix,
+            "cluster request path rewrite did not match request path"
+        );
+        return;
+    };
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        tracing::debug!(
+            path,
+            match_prefix = %rewrite.match_prefix,
+            "cluster request path rewrite matched only a path prefix segment"
+        );
+        return;
+    }
+
+    let mut new_path = rewrite.replacement_prefix.clone();
+    if !suffix.is_empty() {
+        if !new_path.ends_with('/') && !suffix.starts_with('/') {
+            new_path.push('/');
+        }
+        new_path.push_str(suffix);
+    }
+    if let Some(query) = &rewrite.query {
+        new_path.push('?');
+        new_path.push_str(query);
+    } else if let Some(query) = head.uri.query() {
+        new_path.push('?');
+        new_path.push_str(query);
+    }
+
+    match http::Uri::builder().path_and_query(new_path).build() {
+        Ok(uri) => head.uri = uri,
+        Err(err) => {
+            tracing::warn!(error = %err, "cluster request path rewrite produced an invalid URI, leaving path unchanged")
+        }
+    }
 }
 
 /// Apply a route's `request_headers_to_add` mutations, in config order, to
@@ -2634,6 +2690,7 @@ mod tests {
                 circuit_breakers,
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
                 request_headers_to_add: Vec::new(),
+                request_path_rewrite: None,
                 usage_dialect: None,
                 health_check: None,
                 outlier_detection: None,
@@ -2708,6 +2765,7 @@ mod tests {
                 circuit_breakers: CircuitBreakers::default(),
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http2,
                 request_headers_to_add: Vec::new(),
+                request_path_rewrite: None,
                 usage_dialect: None,
                 health_check: None,
                 outlier_detection: None,
@@ -2807,6 +2865,27 @@ mod tests {
     // `tokio::task::spawn_local` -- so every test that reaches it needs a
     // `LocalSet` running on a `current_thread` runtime, exactly like
     // `tests/http1_upstream_codec.rs`.
+
+    #[test]
+    fn cluster_path_rewrite_replaces_v1_and_query() {
+        let mut head = RequestHeaders {
+            method: Method::POST,
+            uri: Uri::from_static("/v1/chat/completions?client=ignored"),
+            headers: HeaderMap::new(),
+        };
+        let rewrite = proxy_config::ir::RequestPathRewrite {
+            match_prefix: "/v1".to_string(),
+            replacement_prefix: "/openai/deployments/deployment-a".to_string(),
+            query: Some("api-version=2024-10-21".to_string()),
+        };
+
+        apply_cluster_request_path_rewrite(Some(&rewrite), &mut head);
+
+        assert_eq!(
+            head.uri,
+            "/openai/deployments/deployment-a/chat/completions?api-version=2024-10-21"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn prefix_rewrite_is_applied_to_the_upstream_request_line() {

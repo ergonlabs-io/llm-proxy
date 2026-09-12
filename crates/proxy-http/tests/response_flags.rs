@@ -190,6 +190,7 @@ async fn build_router(scenario: Scenario, access_logs: &[AccessLogIR]) -> Filter
             circuit_breakers: scenario.circuit_breakers,
             upstream_protocol: scenario.protocol,
             request_headers_to_add: Vec::new(),
+            request_path_rewrite: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,

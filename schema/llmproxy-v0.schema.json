@@ -187,11 +187,11 @@
     },
     "Provider": {
       "type": "object",
-      "description": "One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit both for unauthenticated local backends).",
+      "description": "One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit both for unauthenticated local backends). Azure OpenAI requires `deployment` and `api_version`.",
       "additionalProperties": false,
       "properties": {
         "type": {
-          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise. `azure-openai`, `vertex`, and `bedrock` are named for the model catalogue (`models`) but not yet loadable as a `providers` entry -- their credential scheme isn't implemented yet (Azure: deployment-name + api-version URL templating; Vertex: minted OAuth2 with refresh; Bedrock: per-request SigV4 signing), and configuring one is a load error naming the gap (WP-49 increment 2).",
+          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise. `azure-openai` uses Azure's deployment URL and `api-version` query parameter. `vertex` and `bedrock` remain reserved for the model catalogue and are not loadable provider types yet.",
           "enum": ["openai", "anthropic", "openai-compatible", "azure-openai", "vertex", "bedrock"]
         },
         "base_url": {
@@ -200,9 +200,19 @@
           "description": "API base URL. Required unless the provider name/type implies one (`openai` -> https://api.openai.com, `anthropic` -> https://api.anthropic.com).",
           "examples": ["http://vllm.internal:8000", "https://api.together.xyz"]
         },
+        "deployment": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._~-]+$",
+          "description": "Azure OpenAI deployment name. Required for `azure-openai`; used as a path segment."
+        },
+        "api_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._~-]+$",
+          "description": "Azure OpenAI API version query value. Required for `azure-openai`; sent as `api-version`."
+        },
         "api_key": {
           "type": "string",
-          "description": "API key, sent using the provider type's native auth header (`Authorization: Bearer` for OpenAI-shaped APIs, `x-api-key` for Anthropic). Use `${ENV_VAR}` interpolation rather than inlining secrets.",
+          "description": "API key, sent using provider type's native auth header (`api-key` for Azure OpenAI, `Authorization: Bearer` for other OpenAI-shaped APIs, `x-api-key` for Anthropic). Use `${ENV_VAR}` interpolation rather than inlining secrets.",
           "examples": ["${OPENAI_API_KEY}"]
         },
         "api_key_file": {
@@ -231,7 +241,38 @@
       },
       "not": {
         "required": ["api_key", "api_key_file"]
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "azure-openai" }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["base_url", "deployment", "api_version"]
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "type": { "const": "azure-openai" }
+              },
+              "required": ["type"]
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["deployment"] },
+                { "required": ["api_version"] }
+              ]
+            }
+          }
+        }
+      ]
     },
     "ModelDef": {
       "type": "object",
