@@ -1,0 +1,20 @@
+// Request-body rewrite configuration for the llm-proxy data plane (WP-45 / WP-47).
+//
+// This message owns fields used by `llmproxy.body_rewrite`. The old
+// RuntimeFeatureFlag carrier remains accepted by a compatibility decoder for
+// one release.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+// Configures `llmproxy.body_rewrite`.
+message BodyRewrite {
+  // Required. Enables OpenAI stream usage injection. Body-based model
+  // extraction remains active whenever this filter is present.
+  optional bool enabled = 1;
+
+  // Required. Provider response dialect used to decide whether OpenAI-only
+  // stream usage fields may be injected.
+  optional string dialect = 2;
+}

@@ -57,25 +57,12 @@
 //! "no injection" facts, never an error — this filter forwards them
 //! untouched, exactly per that module's "pass through, never fail" rule.
 //!
-//! # Config identity: reusing `RuntimeFeatureFlag`
+//! # Config identity: owned `llmproxy.filters.v0.BodyRewrite`
 //!
-//! Same rationale as `usage_filter`'s module doc (reusing `DataSource`) and
-//! `header_mutation_filter`'s (reusing `HeaderValueOption`): an Any's type
-//! URL is just an opaque `prefix/full.type.name` string, and only the suffix
-//! has to resolve against the descriptor pool, so pointing our
-//! `type.llmproxy.dev` prefix at an existing compiled message is legal, if a
-//! little unusual. This filter needs exactly two config facts — an on/off
-//! switch and the dialect — and `envoy.config.core.v3.RuntimeFeatureFlag`
-//! happens to have exactly that shape: `default_value` (a `BoolValue`) maps
-//! onto the on/off switch (WP-45's `observability.force_usage_reporting`,
-//! default `true`), and `runtime_key` (a plain string) carries the dialect
-//! name. `DataSource` (already used by `usage_filter`) was ruled out only
-//! because `FilterRegistry::register` asserts on a duplicate `type_url`, and
-//! this filter is a distinct extension from the usage filter even though
-//! both currently borrow a stand-in proto. A vendored Lane-H proto is the
-//! real answer once this filter grows a third config knob (e.g. the prefix
-//! cap) — see `tests::runtime_feature_flag_resolves_in_the_descriptor_pool`
-//! for the check that pins this message actually being compiled in.
+//! The filter owns its enable switch and dialect. The old
+//! `RuntimeFeatureFlag` carrier remains accepted for one release through
+//! [`LegacyBodyRewriteFilterFactory`], so existing bootstraps keep loading
+//! while new configs use the versioned Lane-H message.
 
 use bytes::{Bytes, BytesMut};
 use http::header::CONTENT_LENGTH;
@@ -94,9 +81,11 @@ use crate::body_rewrite::{
 };
 use crate::usage::Dialect;
 
-/// Type URL this filter is registered under (see the module doc for the
-/// `RuntimeFeatureFlag`-reuse rationale).
-pub const TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
+/// Canonical type URL for the owned body-rewrite configuration.
+pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite";
+
+/// Borrowed type URL accepted for one release after the WP-47 migration.
+pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 
 /// The request header consumer B publishes the scanned `model` onto. Must
 /// equal `proxy_simple_config::lower::MODEL_HEADER`, which the dialect's
@@ -148,49 +137,90 @@ struct BodyRewriteConfig {
     dialect: Dialect,
 }
 
-/// Read a `RuntimeFeatureFlag`-shaped `typed_config`: `default_value.value`
-/// (a `BoolValue`, required) is `enabled`; `runtime_key` is the dialect name.
-fn parse_config(config: &DynamicMessage) -> Result<BodyRewriteConfig, ConfigError> {
+fn parse_dialect(raw: String, field_path: &str) -> Result<Dialect, ConfigError> {
+    match raw.to_ascii_lowercase().as_str() {
+        "openai" => Ok(Dialect::OpenAi),
+        "anthropic" => Ok(Dialect::Anthropic),
+        _ => Err(ConfigError::InvalidValue {
+            field_path: field_path.to_string(),
+            reason: format!("expected `openai` or `anthropic`, got `{raw}`"),
+        }),
+    }
+}
+
+/// Read an owned `BodyRewrite` typed config.
+fn parse_owned_config(config: &DynamicMessage) -> Result<BodyRewriteConfig, ConfigError> {
     let invalid = |field_path: &str, reason: String| ConfigError::InvalidValue {
         field_path: field_path.to_string(),
         reason,
     };
 
-    // Rust note: `get_field_by_name` returns the *default* value for an
-    // unset message field, not `None` (that's `has_field_by_name`'s job) --
-    // so presence has to be checked explicitly, or a caller that omits
-    // `default_value` entirely would silently parse as `enabled: false`
-    // instead of the required-field error the PGV `validate.rules` on this
-    // proto field calls for.
-    if !config.has_field_by_name("default_value") {
+    if !config.has_field_by_name("enabled") {
         return Err(invalid(
-            "typed_config.default_value",
-            "the `default_value` field is required".to_string(),
+            "typed_config.enabled",
+            "the `enabled` field is required".to_string(),
         ));
+    }
+    let enabled = config
+        .get_field_by_name("enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            invalid(
+                "typed_config.enabled",
+                "the `enabled` field is invalid".into(),
+            )
+        })?;
+
+    if !config.has_field_by_name("dialect") {
+        return Err(invalid(
+            "typed_config.dialect",
+            "the `dialect` field is required".to_string(),
+        ));
+    }
+    let dialect = config
+        .get_field_by_name("dialect")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .ok_or_else(|| {
+            invalid(
+                "typed_config.dialect",
+                "the `dialect` field is invalid".into(),
+            )
+        })?;
+    let dialect = parse_dialect(dialect, "typed_config.dialect")?;
+
+    Ok(BodyRewriteConfig { enabled, dialect })
+}
+
+/// Read the borrowed `RuntimeFeatureFlag` compatibility config.
+fn parse_legacy_config(config: &DynamicMessage) -> Result<BodyRewriteConfig, ConfigError> {
+    if !config.has_field_by_name("default_value") {
+        return Err(ConfigError::InvalidValue {
+            field_path: "typed_config.default_value".to_string(),
+            reason: "the `default_value` field is required".to_string(),
+        });
     }
     let enabled = config
         .get_field_by_name("default_value")
         .and_then(|v| v.as_message().cloned())
         .and_then(|m| m.get_field_by_name("value").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-
+        .ok_or_else(|| ConfigError::InvalidValue {
+            field_path: "typed_config.default_value".to_string(),
+            reason: "the `default_value` field is invalid".to_string(),
+        })?;
     let runtime_key = config
         .get_field_by_name("runtime_key")
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default();
-
-    let dialect = match runtime_key.to_ascii_lowercase().as_str() {
-        "openai" => Dialect::OpenAi,
-        "anthropic" => Dialect::Anthropic,
-        _ => {
-            return Err(invalid(
-                "typed_config.runtime_key",
-                format!("expected `openai` or `anthropic`, got `{runtime_key}`"),
-            ))
-        }
-    };
-
+    let dialect = parse_dialect(runtime_key, "typed_config.runtime_key")?;
     Ok(BodyRewriteConfig { enabled, dialect })
+}
+
+fn warn_legacy_config() {
+    tracing::warn!(
+        legacy_type_url = LEGACY_TYPE_URL,
+        replacement_type_url = TYPE_URL,
+        "llmproxy.body_rewrite uses a deprecated borrowed typed_config; migrate to llmproxy.filters.v0.BodyRewrite before the next release"
+    );
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`].
@@ -211,7 +241,7 @@ impl HttpFilterFactory for BodyRewriteFilterFactory {
         config: &DynamicMessage,
         _ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let config = parse_config(config)?;
+        let config = parse_owned_config(config)?;
         Ok(Box::new(BodyRewriteInstanceFactory { config }))
     }
 
@@ -219,8 +249,43 @@ impl HttpFilterFactory for BodyRewriteFilterFactory {
         &self,
         config: &DynamicMessage,
     ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
-        let config = parse_config(config)?;
+        let config = parse_owned_config(config)?;
         Ok(Arc::new(BodyRewritePerRouteConfig(config)))
+    }
+}
+
+/// Decoder for [`LEGACY_TYPE_URL`].
+#[derive(Default)]
+pub struct LegacyBodyRewriteFilterFactory;
+
+impl HttpFilterFactory for LegacyBodyRewriteFilterFactory {
+    fn type_url(&self) -> &'static str {
+        LEGACY_TYPE_URL
+    }
+
+    fn may_buffer_response(&self) -> bool {
+        false
+    }
+
+    fn create(
+        &self,
+        config: &DynamicMessage,
+        _ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        warn_legacy_config();
+        Ok(Box::new(BodyRewriteInstanceFactory {
+            config: parse_legacy_config(config)?,
+        }))
+    }
+
+    fn parse_per_route(
+        &self,
+        config: &DynamicMessage,
+    ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
+        warn_legacy_config();
+        Ok(Arc::new(BodyRewritePerRouteConfig(parse_legacy_config(
+            config,
+        )?)))
     }
 }
 
@@ -624,6 +689,16 @@ mod tests {
         );
     }
 
+    fn body_rewrite(enabled: bool, dialect: &str) -> DynamicMessage {
+        let desc = proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.BodyRewrite")
+            .expect("BodyRewrite is compiled into proxy-api");
+        let mut msg = DynamicMessage::new(desc);
+        msg.set_field_by_name("enabled", prost_reflect::Value::Bool(enabled));
+        msg.set_field_by_name("dialect", prost_reflect::Value::String(dialect.to_string()));
+        msg
+    }
+
     fn runtime_feature_flag(default_value: bool, runtime_key: &str) -> DynamicMessage {
         let bool_value_desc = proxy_api::descriptor_pool()
             .get_message_by_name("google.protobuf.BoolValue")
@@ -670,53 +745,56 @@ mod tests {
     // --- config parsing -------------------------------------------------------
 
     #[test]
-    fn runtime_feature_flag_resolves_in_the_descriptor_pool() {
-        // Pins the type-URL choice: if this message ever stopped resolving
-        // (e.g. a vendored-proto pruning pass dropped it), every bootstrap
-        // using this filter would fail at load time with an opaque
-        // `UnknownTypeUrl`, not here where the reason is obvious.
-        let resolved = proxy_api::descriptor_pool()
-            .get_message_by_name("envoy.config.core.v3.RuntimeFeatureFlag");
+    fn body_rewrite_resolves_in_the_descriptor_pool() {
+        let resolved =
+            proxy_api::descriptor_pool().get_message_by_name("llmproxy.filters.v0.BodyRewrite");
         assert!(resolved.is_some(), "{TYPE_URL} must resolve");
     }
 
     #[test]
     fn config_parses_enabled_and_dialect() {
-        let cfg = parse_config(&runtime_feature_flag(true, "openai")).expect("valid config");
+        let cfg = parse_owned_config(&body_rewrite(true, "openai")).expect("valid config");
         assert!(cfg.enabled);
         assert_eq!(cfg.dialect, Dialect::OpenAi);
 
-        let cfg = parse_config(&runtime_feature_flag(false, "anthropic")).expect("valid config");
+        let cfg = parse_owned_config(&body_rewrite(false, "anthropic")).expect("valid config");
         assert!(!cfg.enabled);
         assert_eq!(cfg.dialect, Dialect::Anthropic);
     }
 
     #[test]
     fn config_rejects_unknown_dialect() {
-        let err =
-            parse_config(&runtime_feature_flag(true, "gemini")).expect_err("must be rejected");
+        let err = parse_owned_config(&body_rewrite(true, "gemini")).expect_err("must be rejected");
         match err {
             ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(field_path, "typed_config.runtime_key");
+                assert_eq!(field_path, "typed_config.dialect");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 
     #[test]
-    fn config_rejects_missing_default_value() {
+    fn config_rejects_missing_enabled_with_exact_field_path() {
         let desc = proxy_api::descriptor_pool()
-            .get_message_by_name("envoy.config.core.v3.RuntimeFeatureFlag")
+            .get_message_by_name("llmproxy.filters.v0.BodyRewrite")
             .unwrap();
         let mut msg = DynamicMessage::new(desc);
-        msg.set_field_by_name("runtime_key", prost_reflect::Value::String("openai".into()));
-        let err = parse_config(&msg).expect_err("missing default_value must be rejected");
+        msg.set_field_by_name("dialect", prost_reflect::Value::String("openai".into()));
+        let err = parse_owned_config(&msg).expect_err("missing enabled must be rejected");
         match err {
             ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(field_path, "typed_config.default_value");
+                assert_eq!(field_path, "typed_config.enabled");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_runtime_feature_flag_still_parses_through_compatibility_decoder() {
+        let cfg = parse_legacy_config(&runtime_feature_flag(false, "anthropic"))
+            .expect("legacy RuntimeFeatureFlag remains accepted for one release");
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.dialect, Dialect::Anthropic);
     }
 
     // --- acceptance 1: injection into a streaming OpenAI body ----------------

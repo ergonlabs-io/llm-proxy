@@ -427,6 +427,10 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // payload is intentionally opaque JSON; usage_filter validates its
         // schema before building the listener factory.
         "llmproxy.filters.v0.Usage" => &["dialect", "pricing_json"],
+        // WP-47 increment 4: owned body-rewrite configuration.
+        "llmproxy.filters.v0.BodyRewrite" => &["enabled", "dialect"],
+        // One-release compatibility for the old borrowed body-rewrite type.
+        "envoy.config.core.v3.RuntimeFeatureFlag" => &["default_value", "runtime_key"],
         // WP-62 increment 3: the Redis-backed shared store. `url` is an
         // `envoy.config.core.v3.DataSource`, already listed above under its
         // own entry -- same reasoning as `hmac_secret`.
@@ -1722,7 +1726,9 @@ pub const LEGACY_TOKEN_LIMIT_FILTER_TYPE: &str =
 pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
 /// One-release compatibility alias for the WP-47 usage-filter migration.
 pub const LEGACY_USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
-pub const BODY_REWRITE_FILTER_TYPE: &str =
+pub const BODY_REWRITE_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite";
+/// One-release compatibility alias for the WP-47 body-rewrite migration.
+pub const LEGACY_BODY_REWRITE_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
 pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
@@ -1891,6 +1897,8 @@ fn check_lane_h_filter_order(
             &[TOKEN_LIMIT_FILTER_TYPE, LEGACY_TOKEN_LIMIT_FILTER_TYPE][..]
         } else if first_type == USAGE_FILTER_TYPE {
             &[USAGE_FILTER_TYPE, LEGACY_USAGE_FILTER_TYPE][..]
+        } else if first_type == BODY_REWRITE_FILTER_TYPE {
+            &[BODY_REWRITE_FILTER_TYPE, LEGACY_BODY_REWRITE_FILTER_TYPE][..]
         } else {
             &[first_type][..]
         };
@@ -1898,6 +1906,8 @@ fn check_lane_h_filter_order(
             &[TOKEN_LIMIT_FILTER_TYPE, LEGACY_TOKEN_LIMIT_FILTER_TYPE][..]
         } else if second_type == USAGE_FILTER_TYPE {
             &[USAGE_FILTER_TYPE, LEGACY_USAGE_FILTER_TYPE][..]
+        } else if second_type == BODY_REWRITE_FILTER_TYPE {
+            &[BODY_REWRITE_FILTER_TYPE, LEGACY_BODY_REWRITE_FILTER_TYPE][..]
         } else {
             &[second_type][..]
         };

@@ -58,6 +58,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // WP-47 increment 3: owned usage dialect and pricing carrier. The
         // legacy DataSource decoder remains registered for one release.
         "llmproxy/filters/v0/usage.proto",
+        // WP-47 increment 4: owned body-rewrite configuration. The legacy
+        // RuntimeFeatureFlag decoder remains registered for one release.
+        "llmproxy/filters/v0/body_rewrite.proto",
         // WP-50 increment 3a: per-tenant model allow-lists.
         "llmproxy/filters/v0/model_authz.proto",
         // WP-50 increment 3c-i: the spend-budget filter's (cluster, model)

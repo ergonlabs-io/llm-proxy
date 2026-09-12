@@ -79,8 +79,7 @@ const BODY_REWRITE_FILTER_NAME: &str = "llmproxy.body_rewrite";
 /// Must equal `proxy_filters::body_rewrite_filter::TYPE_URL`. Duplicated for
 /// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
 /// `dialect.rs`'s `body_rewrite_filter_type_url_matches_the_filter` pins it.
-const BODY_REWRITE_FILTER_TYPE_URL: &str =
-    "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
+const BODY_REWRITE_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite";
 /// The token-limit filter's name in `http_filters`, emitted only when a
 /// `limits` entry actually lowers (see [`lower_limits`]). No per-route
 /// override exists for this filter (its module doc: "no per-route config in
@@ -917,25 +916,24 @@ fn force_usage_reporting(config: &SimpleConfig) -> bool {
 /// it's the only thing that ever reads the request body. Both reasons are
 /// independent, so this is an OR, not a replacement for
 /// [`force_usage_reporting`]: a config with routes but usage reporting
-/// turned off still needs the filter present (with `default_value: false`,
+/// turned off still needs the filter present (with `enabled: false`,
 /// so consumer A stays off), just for consumer B.
 fn needs_body_rewrite_filter(config: &SimpleConfig) -> bool {
     force_usage_reporting(config) || !config.routes.is_empty() || !config.models.is_empty()
 }
 
-/// `envoy.config.core.v3.RuntimeFeatureFlag` shaped `typed_config` for the
-/// body-rewrite filter: `default_value` is the on/off switch (proto3-JSON
-/// maps a `BoolValue` field to a bare JSON bool) for consumer A (the
+/// Owned `llmproxy.filters.v0.BodyRewrite` `typed_config` for the body-rewrite
+/// filter: `enabled` is the on/off switch for consumer A (the
 /// `include_usage` splice) ONLY -- consumer B (body-based model routing)
 /// reads the filter's presence in the chain, never this field (WP-45
-/// decision 3). `runtime_key` carries the dialect. Shared by the
+/// decision 3). `dialect` carries the dialect. Shared by the
 /// listener-level entry and every per-route override so the two can never
 /// drift in shape.
 fn body_rewrite_typed_config(enabled: bool, dialect: &str) -> Value {
     json!({
         "@type": BODY_REWRITE_FILTER_TYPE_URL,
-        "default_value": enabled,
-        "runtime_key": dialect,
+        "enabled": enabled,
+        "dialect": dialect,
     })
 }
 

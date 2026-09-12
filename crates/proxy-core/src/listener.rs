@@ -98,6 +98,13 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::body_rewrite_filter::BodyRewriteFilterFactory,
         ));
+        // WP-47 migration compatibility: hand-written bootstraps using the
+        // borrowed RuntimeFeatureFlag carrier continue to load for one
+        // release. Its factory emits a deprecation warning and preserves old
+        // field semantics while new configs use BodyRewrite.
+        registry.register(Arc::new(
+            proxy_filters::body_rewrite_filter::LegacyBodyRewriteFilterFactory,
+        ));
         // WP-34 increment 2 (Lane H): the token-budget limiter. Must be
         // configured BEFORE `llmproxy.usage` in any listener's `http_filters`
         // list for its encode-side `record` to observe usage the usage
@@ -4601,7 +4608,7 @@ static_resources:
     }
 
     /// The WP-45 increment 2 acceptance test: a bootstrap YAML wires the
-    /// `type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag`
+    /// `type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite`
     /// body-rewrite filter ahead of the router, a streaming OpenAI request
     /// WITHOUT `stream_options` is sent over a real socket, and the request
     /// the upstream actually received on the wire is asserted to (a) equal
@@ -4652,9 +4659,9 @@ static_resources:
                 http_filters:
                   - name: llmproxy.body_rewrite
                     typed_config:
-                      "@type": type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag
-                      default_value: true
-                      runtime_key: openai
+                      "@type": type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite
+                      enabled: true
+                      dialect: openai
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

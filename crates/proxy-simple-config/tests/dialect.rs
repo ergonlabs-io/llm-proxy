@@ -1320,7 +1320,7 @@ fn observability_without_the_flag_still_emits_body_rewrite_by_default() {
 /// non-empty (a config with no routes fails semantic validation), so
 /// consumer B (body-based model routing, WP-45 decision 3) still needs it
 /// present. Pins the specific shape that must survive the flag being off:
-/// the listener-level entry stays, `default_value` flips to `false`, and no
+/// the listener-level entry stays, `enabled` flips to `false`, and no
 /// route gets a `typed_per_filter_config` override for it (that override
 /// only ever exists to carry consumer A's per-route dialect, so it has
 /// nothing to say when consumer A is off).
@@ -1340,8 +1340,8 @@ fn force_usage_reporting_false_disables_the_splice_but_keeps_the_filter_for_rout
         .find(|f| f["name"] == "llmproxy.body_rewrite")
         .expect("the body-rewrite filter must still be in the chain (consumer B needs it)");
     assert_eq!(
-        body_rewrite_entry["typed_config"]["default_value"], false,
-        "the operator's `force_usage_reporting: false` must reach `default_value`"
+        body_rewrite_entry["typed_config"]["enabled"], false,
+        "the operator's `force_usage_reporting: false` must reach `enabled`"
     );
 
     let routes = &hcm["route_config"]["virtual_hosts"][0]["routes"];
@@ -1373,9 +1373,8 @@ routes:
     let routes =
         &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
 
-    let dialect = |i: usize| {
-        routes[i]["typed_per_filter_config"]["llmproxy.body_rewrite"]["runtime_key"].clone()
-    };
+    let dialect =
+        |i: usize| routes[i]["typed_per_filter_config"]["llmproxy.body_rewrite"]["dialect"].clone();
     assert_eq!(dialect(0), "openai");
     assert_eq!(dialect(1), "anthropic");
 }
@@ -1480,16 +1479,16 @@ routes:
 
         // Ground rule #2: the IR leaves the config undecoded, so read the
         // dialect back the way the filter's own `parse_per_route` does --
-        // `RuntimeFeatureFlag.runtime_key` carries it.
+        // `BodyRewrite.dialect` carries it.
         let msg = per_filter
             .config
             .as_ref()
             .unwrap_or_else(|| panic!("route {i} override must carry a config"));
         let got = msg
-            .get_field_by_name("runtime_key")
-            .expect("RuntimeFeatureFlag.runtime_key")
+            .get_field_by_name("dialect")
+            .expect("BodyRewrite.dialect")
             .as_str()
-            .expect("runtime_key must be a string")
+            .expect("dialect must be a string")
             .to_string();
         assert_eq!(got, want, "route {i}");
     }
