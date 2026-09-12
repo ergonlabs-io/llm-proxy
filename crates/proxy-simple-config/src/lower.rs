@@ -506,42 +506,12 @@ fn provider_upstream(name: &str, provider: &Provider) -> Result<ProviderUpstream
     Ok(ProviderUpstream { host, port, tls })
 }
 
-/// Vertex and Bedrock still need provider-specific credential schemes.
-fn unsupported_credential_scheme(provider_type: ProviderType) -> Option<String> {
-    let (gap, detail) = match provider_type {
-        ProviderType::Vertex => ("credential scheme", "minted OAuth2 with refresh"),
-        ProviderType::Bedrock => ("credential scheme", "per-request SigV4 signing"),
-        ProviderType::Openai | ProviderType::Anthropic | ProviderType::OpenaiCompatible => {
-            return None
-        }
-        ProviderType::AzureOpenai => return None,
-    };
-    Some(format!(
-        "provider type `{}` is not yet supported: its {gap} ({detail}) is not implemented \
-         (WP-49 increment 2)",
-        provider_type.as_str()
-    ))
-}
-
 fn lower_provider(
     config: &SimpleConfig,
     name: &str,
     provider: &Provider,
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<Value, ConfigError> {
-    // This is a hard load error, not a warning, and that is a deliberate
-    // departure from the `limits`/`fallbacks` pattern elsewhere in this
-    // file: an unenforced *limit* still serves real traffic, but a provider
-    // with no working credential scheme would produce a cluster that 401s
-    // on every single request. Failing at load is strictly kinder than
-    // failing per-request in production.
-    if let Some(reason) = unsupported_credential_scheme(provider.effective_type(name)) {
-        return Err(ConfigError::Unimplemented {
-            field_path: format!("providers.{name}.type"),
-            reason,
-        });
-    }
-
     let up = provider_upstream(name, provider)?;
     let cluster_name = format!("provider:{name}");
 
@@ -683,12 +653,82 @@ fn lower_provider(
     // credential/Host headers above, so a provider used by five routes still
     // gets exactly one copy.
     let dialect = cluster_usage_dialect(config, name, provider)?;
+    let provider_type = provider.effective_type(name);
+    let mut provider_auth = json!({ "headers": headers_to_add });
+    let mut path_template = None;
+    match provider_type {
+        ProviderType::Vertex => {
+            let access_token = provider_secret(
+                name,
+                "access_token",
+                provider.access_token.as_ref(),
+                provider.access_token_file.as_ref(),
+                warnings,
+            )?;
+            provider_auth["scheme"] = json!("vertex-oauth2");
+            provider_auth["access_token"] = json!(access_token);
+            path_template = Some(json!({
+                "scheme": "vertex",
+                "project": provider.project.as_deref().expect("validated: Vertex project"),
+                "location": provider.location.as_deref().expect("validated: Vertex location"),
+                "publisher": provider.publisher.as_deref().expect("validated: Vertex publisher"),
+                "models": provider_model_rewrites(config, name),
+            }));
+        }
+        ProviderType::Bedrock => {
+            let access_key_id = provider_secret(
+                name,
+                "access_key_id",
+                provider.access_key_id.as_ref(),
+                provider.access_key_id_file.as_ref(),
+                warnings,
+            )?;
+            let secret_access_key = provider_secret(
+                name,
+                "secret_access_key",
+                provider.secret_access_key.as_ref(),
+                provider.secret_access_key_file.as_ref(),
+                warnings,
+            )?;
+            let session_token = match (
+                provider.session_token.as_ref(),
+                provider.session_token_file.as_ref(),
+            ) {
+                (None, None) => None,
+                (inline, file) => Some(provider_secret(
+                    name,
+                    "session_token",
+                    inline,
+                    file,
+                    warnings,
+                )?),
+            };
+            provider_auth["scheme"] = json!("bedrock-sigv4");
+            provider_auth["region"] = json!(provider
+                .region
+                .as_deref()
+                .expect("validated: Bedrock region"));
+            provider_auth["access_key_id"] = json!(access_key_id);
+            provider_auth["secret_access_key"] = json!(secret_access_key);
+            if let Some(token) = session_token {
+                provider_auth["session_token"] = json!(token);
+            }
+            path_template = Some(json!({
+                "scheme": "bedrock",
+                "models": provider_model_rewrites(config, name),
+            }));
+        }
+        _ => {}
+    }
     cluster["metadata"] = json!({
         "filter_metadata": {
-            PROVIDER_AUTH_METADATA_KEY: { "headers": headers_to_add },
+            PROVIDER_AUTH_METADATA_KEY: provider_auth,
             USAGE_DIALECT_METADATA_KEY: { "dialect": dialect },
         }
     });
+    if let Some(template) = path_template {
+        cluster["metadata"]["filter_metadata"][PATH_TEMPLATE_METADATA_KEY] = template;
+    }
 
     if provider.effective_type(name) == ProviderType::AzureOpenai {
         let deployment = provider
@@ -709,6 +749,66 @@ fn lower_provider(
     Ok(cluster)
 }
 
+/// Read one provider secret during config compilation. Runtime requests only
+/// see the immutable value carried by the published cluster snapshot.
+fn provider_secret(
+    provider_name: &str,
+    field: &str,
+    inline: Option<&String>,
+    file: Option<&String>,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<String, ConfigError> {
+    let value = match (inline, file) {
+        (Some(value), None) => value.clone(),
+        (None, Some(file)) => {
+            warnings.push(warning(
+                format!("providers.{provider_name}.{field}_file"),
+                "the credential file is read once at startup; hot reload is required for rotation",
+            ));
+            std::fs::read_to_string(file)
+                .map_err(|e| ConfigError::Io {
+                    path: file.clone(),
+                    reason: e.to_string(),
+                })?
+                .trim_end()
+                .to_string()
+        }
+        (None, None) => {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("providers.{provider_name}.{field}"),
+                reason: "is required".to_string(),
+            })
+        }
+        (Some(_), Some(_)) => unreachable!("validated: provider secret sources are exclusive"),
+    };
+    if value.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("providers.{provider_name}.{field}"),
+            reason: "must not be empty".to_string(),
+        });
+    }
+    Ok(value)
+}
+
+fn provider_model_rewrites(config: &SimpleConfig, provider_name: &str) -> Vec<Value> {
+    model_catalog_order(config)
+        .into_iter()
+        .filter_map(|(pattern, model)| {
+            model.providers.iter().find_map(|entry| {
+                if entry.provider() != provider_name {
+                    return None;
+                }
+                entry.model().map(|upstream_model| {
+                    json!({
+                        "pattern": pattern,
+                        "upstream_model": upstream_model,
+                    })
+                })
+            })
+        })
+        .collect()
+}
+
 /// Namespace key under `Cluster.metadata.filter_metadata` this dialect uses
 /// to carry provider credentials -- must match
 /// `proxy_config::lower::PROVIDER_AUTH_METADATA_KEY` exactly, since the two
@@ -721,6 +821,9 @@ const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
 
 /// Namespace key for provider-owned path/query rewrites.
 const PATH_REWRITE_METADATA_KEY: &str = "io.llmproxy.path_rewrite";
+
+/// Namespace key for provider-specific model URL templates.
+const PATH_TEMPLATE_METADATA_KEY: &str = "io.llmproxy.path_template";
 
 /// Namespace key under `Cluster.metadata.filter_metadata` this dialect uses
 /// to carry the usage-filter dialect -- must match

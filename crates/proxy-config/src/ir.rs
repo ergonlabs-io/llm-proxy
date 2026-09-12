@@ -699,6 +699,10 @@ pub struct ClusterConfig {
     /// Provider-owned path/query rewrite applied after route transforms and
     /// before credentials. This follows actual cluster selected on failover.
     pub request_path_rewrite: Option<RequestPathRewrite>,
+    /// Provider-specific authentication and model URL templating. Both are
+    /// cluster-owned so fallback cannot send primary-provider material to a
+    /// different upstream.
+    pub provider_runtime: Option<ProviderRuntimeConfig>,
     /// Which wire dialect this cluster's upstream speaks, for the usage
     /// filter's token accounting -- ground rule #6's third instance (see
     /// `CLAUDE.md`), following credentials (`request_headers_to_add`) and
@@ -1932,6 +1936,52 @@ fn ends_with_ignore_case(haystack: &str, suffix: &str) -> bool {
 pub enum DataSourceIR {
     File(PathBuf),
     Inline(String),
+}
+
+/// Provider credential material and request shaping that must follow the
+/// cluster selected for an upstream attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCredential {
+    /// OAuth2 bearer token published by control-side credential work. The
+    /// request worker never mints or refreshes this value.
+    VertexOAuth2 { access_token: String },
+    /// AWS Signature Version 4 credentials. Signing happens after body and
+    /// route transforms, on the final per-attempt request.
+    BedrockSigV4 {
+        region: String,
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+    },
+}
+
+/// One provider-owned logical-to-upstream model mapping. Kept on the cluster
+/// because it affects the endpoint actually selected during fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModelRewrite {
+    pub pattern: String,
+    pub upstream_model: String,
+}
+
+/// Provider URL path template and its model map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderPathTemplate {
+    Vertex {
+        project: String,
+        location: String,
+        publisher: String,
+        models: Vec<ProviderModelRewrite>,
+    },
+    Bedrock {
+        models: Vec<ProviderModelRewrite>,
+    },
+}
+
+/// Runtime-only provider behavior carried by a cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRuntimeConfig {
+    pub credential: Option<ProviderCredential>,
+    pub path_template: Option<ProviderPathTemplate>,
 }
 
 /// A validated TLS certificate/validation-context secret (static or

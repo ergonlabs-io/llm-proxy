@@ -156,22 +156,13 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                 reason: "set either api_key or api_key_file, not both".to_string(),
             });
         }
-        match provider.effective_type(name) {
+        let provider_type = provider.effective_type(name);
+        validate_provider_specific_fields(name, provider, provider_type)?;
+        match provider_type {
             ProviderType::AzureOpenai => validate_azure_provider(name, provider)?,
-            _ => {
-                if provider.deployment.is_some() {
-                    return Err(ConfigError::InvalidValue {
-                        field_path: format!("{path}.deployment"),
-                        reason: "deployment is only valid for azure-openai providers".into(),
-                    });
-                }
-                if provider.api_version.is_some() {
-                    return Err(ConfigError::InvalidValue {
-                        field_path: format!("{path}.api_version"),
-                        reason: "api_version is only valid for azure-openai providers".into(),
-                    });
-                }
-            }
+            ProviderType::Vertex => validate_vertex_provider(name, provider)?,
+            ProviderType::Bedrock => validate_bedrock_provider(name, provider)?,
+            _ => validate_non_azure_provider(name, provider)?,
         }
         if provider.effective_base_url(name).is_none() {
             return Err(ConfigError::InvalidValue {
@@ -329,6 +320,210 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
     }
     if let Some(admin) = &config.admin {
         parse_host_port(admin, "admin")?;
+    }
+    Ok(())
+}
+
+fn validate_provider_specific_fields(
+    name: &str,
+    provider: &Provider,
+    provider_type: ProviderType,
+) -> Result<(), ConfigError> {
+    let path = format!("providers.{name}");
+    let vertex_fields = [
+        ("project", provider.project.is_some()),
+        ("location", provider.location.is_some()),
+        ("publisher", provider.publisher.is_some()),
+        ("access_token", provider.access_token.is_some()),
+        ("access_token_file", provider.access_token_file.is_some()),
+    ];
+    let bedrock_fields = [
+        ("region", provider.region.is_some()),
+        ("access_key_id", provider.access_key_id.is_some()),
+        ("access_key_id_file", provider.access_key_id_file.is_some()),
+        ("secret_access_key", provider.secret_access_key.is_some()),
+        (
+            "secret_access_key_file",
+            provider.secret_access_key_file.is_some(),
+        ),
+        ("session_token", provider.session_token.is_some()),
+        ("session_token_file", provider.session_token_file.is_some()),
+    ];
+
+    if provider_type != ProviderType::Vertex {
+        if let Some((field, true)) = vertex_fields.iter().find(|(_, present)| *present) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.{field}"),
+                reason: "is only valid for vertex providers".into(),
+            });
+        }
+    }
+    if provider_type != ProviderType::Bedrock {
+        if let Some((field, true)) = bedrock_fields.iter().find(|(_, present)| *present) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.{field}"),
+                reason: "is only valid for bedrock providers".into(),
+            });
+        }
+    }
+    if provider_type != ProviderType::AzureOpenai {
+        if provider.deployment.is_some() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.deployment"),
+                reason: "deployment is only valid for azure-openai providers".into(),
+            });
+        }
+        if provider.api_version.is_some() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.api_version"),
+                reason: "api_version is only valid for azure-openai providers".into(),
+            });
+        }
+    }
+    if matches!(provider_type, ProviderType::Vertex | ProviderType::Bedrock)
+        && (provider.api_key.is_some() || provider.api_key_file.is_some())
+    {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.api_key"),
+            reason: format!(
+                "api_key/api_key_file are not valid for `{}` providers; use its native credential fields",
+                provider_type.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_vertex_provider(name: &str, provider: &Provider) -> Result<(), ConfigError> {
+    let path = format!("providers.{name}");
+    for (field, value) in [
+        ("project", provider.project.as_deref()),
+        ("location", provider.location.as_deref()),
+        ("publisher", provider.publisher.as_deref()),
+    ] {
+        if value.is_none() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.{field}"),
+                reason: format!("{field} is required for vertex providers"),
+            });
+        }
+        if value == Some("") {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.{field}"),
+                reason: "must not be empty".into(),
+            });
+        }
+    }
+    validate_exactly_one_source(
+        &path,
+        "access_token",
+        provider.access_token.as_deref(),
+        "access_token_file",
+        provider.access_token_file.as_deref(),
+        "vertex OAuth access token",
+    )
+}
+
+fn validate_bedrock_provider(name: &str, provider: &Provider) -> Result<(), ConfigError> {
+    let path = format!("providers.{name}");
+    if provider.region.is_none() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.region"),
+            reason: "region is required for bedrock providers".into(),
+        });
+    }
+    if provider.region.as_deref() == Some("") {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.region"),
+            reason: "must not be empty".into(),
+        });
+    }
+    validate_exactly_one_source(
+        &path,
+        "access_key_id",
+        provider.access_key_id.as_deref(),
+        "access_key_id_file",
+        provider.access_key_id_file.as_deref(),
+        "Bedrock access key ID",
+    )?;
+    validate_exactly_one_source(
+        &path,
+        "secret_access_key",
+        provider.secret_access_key.as_deref(),
+        "secret_access_key_file",
+        provider.secret_access_key_file.as_deref(),
+        "Bedrock secret access key",
+    )?;
+    if provider.session_token.is_some() && provider.session_token_file.is_some() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.session_token"),
+            reason: "set either session_token or session_token_file, not both".into(),
+        });
+    }
+    for (field, value) in [
+        ("session_token", provider.session_token.as_deref()),
+        ("session_token_file", provider.session_token_file.as_deref()),
+    ] {
+        if value == Some("") {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.{field}"),
+                reason: "must not be empty".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_exactly_one_source(
+    path: &str,
+    inline_field: &str,
+    inline_value: Option<&str>,
+    file_field: &str,
+    file_value: Option<&str>,
+    credential_name: &str,
+) -> Result<(), ConfigError> {
+    match (inline_value, file_value) {
+        (Some(_), None) | (None, Some(_)) => {
+            let (field, value) = if let Some(value) = inline_value {
+                (inline_field, value)
+            } else {
+                (file_field, file_value.expect("matched Some"))
+            };
+            if value.is_empty() {
+                Err(ConfigError::InvalidValue {
+                    field_path: format!("{path}.{field}"),
+                    reason: "must not be empty".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        (Some(_), Some(_)) => Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.{inline_field}"),
+            reason: format!("set either {inline_field} or {file_field}, not both"),
+        }),
+        (None, None) => Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.{inline_field}"),
+            reason: format!(
+                "one {credential_name} source is required: {inline_field} or {file_field}"
+            ),
+        }),
+    }
+}
+
+fn validate_non_azure_provider(name: &str, provider: &Provider) -> Result<(), ConfigError> {
+    let path = format!("providers.{name}");
+    if provider.deployment.is_some() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.deployment"),
+            reason: "deployment is only valid for azure-openai providers".into(),
+        });
+    }
+    if provider.api_version.is_some() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.api_version"),
+            reason: "api_version is only valid for azure-openai providers".into(),
+        });
     }
     Ok(())
 }

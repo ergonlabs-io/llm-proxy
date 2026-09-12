@@ -1848,23 +1848,16 @@ models:
     assert!(reason.contains("at least one provider"), "got: {reason}");
 }
 
-/// `vertex` and `bedrock` are named in taxonomy but have no working
-/// credential/addressing scheme yet -- loading a provider of one of those
-/// types is a hard error naming the gap, caught at LOWERING
-/// (not parse) time, since it's a "can we produce a working Envoy resource"
-/// question, not a shape question.
-///
-/// The vertex/bedrock configs here carry a `models:` entry pinning `dialect`
-/// only so they get PAST `validate_semantics`, which rejects a
-/// dialect-ambiguous type reached from `routes:` with nothing to state its
-/// wire format (`check_route_ref_dialect`). Without it the parse-time error
-/// fires first and this lowering-time error becomes unreachable -- so the
-/// entry is what makes this test still test what it says it does, and it
-/// strengthens the claim: the unbuilt-type error survives an otherwise
-/// fully-specified config.
+/// Vertex and Bedrock configs lower through the same strict loader as static
+/// providers, carrying provider-owned credential and path behavior.
 #[test]
-fn unbuilt_provider_types_are_hard_load_errors() {
-    for (type_name, must_contain) in [("vertex", "OAuth2"), ("bedrock", "SigV4")] {
+fn provider_types_lower_to_runtime_config() {
+    for type_name in ["vertex", "bedrock"] {
+        let credentials = match type_name {
+            "vertex" => "project: test-project\n    location: us-central1\n    publisher: google\n    access_token: token",
+            "bedrock" => "region: us-east-1\n    access_key_id: access\n    secret_access_key: secret",
+            _ => unreachable!(),
+        };
         let models =
             "\nmodels:\n  m1:\n    providers:\n      - { provider: p1, model: m, dialect: anthropic }\n"
                 .to_string();
@@ -1872,20 +1865,99 @@ fn unbuilt_provider_types_are_hard_load_errors() {
             r#"
 version: 0
 providers:
-  p1: {{ type: {type_name}, base_url: "https://example.com", api_key: k }}
+  p1:
+    type: {type_name}
+    base_url: "https://example.com"
+    {credentials}
 routes:
   - {{ model: "*", provider: p1 }}
 {models}"#
         ))
         .unwrap_or_else(|e| panic!("{type_name}: must parse, got {e}"));
-        let err =
-            proxy_simple_config::lower(&config).expect_err(&format!("{type_name}: must fail"));
-        let ConfigError::Unimplemented { field_path, reason } = &err else {
-            panic!("{type_name}: expected Unimplemented, got: {err}");
-        };
-        assert_eq!(field_path, "providers.p1.type", "{type_name}");
-        assert!(reason.contains(must_contain), "{type_name}: got {reason}");
+        let lowered = proxy_simple_config::lower(&config)
+            .unwrap_or_else(|err| panic!("{type_name}: must lower, got {err}"));
+        let cluster = lowered.bootstrap["static_resources"]["clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cluster| cluster["name"] == "provider:p1")
+            .expect("provider cluster must exist");
+        assert!(
+            cluster["metadata"]["filter_metadata"]["io.llmproxy.provider_auth"]["scheme"]
+                .is_string()
+        );
+        assert!(
+            cluster["metadata"]["filter_metadata"]["io.llmproxy.path_template"]["scheme"]
+                .is_string()
+        );
     }
+}
+
+#[test]
+fn vertex_and_bedrock_runtime_settings_survive_ir_lowering() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  vertex:
+    type: vertex
+    base_url: "https://vertex.example.com"
+    project: project-a
+    location: us-central1
+    publisher: anthropic
+    access_token: vertex-token
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    access_key_id: access-key
+    secret_access_key: secret-key
+routes:
+  - { model: "*", provider: vertex }
+models:
+  claude-*:
+    providers:
+      - { provider: vertex, model: claude-upstream, dialect: anthropic }
+  bedrock-model:
+    providers:
+      - { provider: bedrock, model: anthropic.model, dialect: anthropic }
+"#,
+    )
+    .expect("provider config must parse");
+    let loaded = lower_to_loaded(&config).expect("provider config must lower");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("provider config must build IR");
+
+    let vertex = snapshot
+        .clusters
+        .get("provider:vertex")
+        .unwrap()
+        .provider_runtime
+        .as_ref()
+        .unwrap();
+    assert!(matches!(
+        vertex.credential,
+        Some(proxy_config::ir::ProviderCredential::VertexOAuth2 { .. })
+    ));
+    assert!(matches!(
+        vertex.path_template,
+        Some(proxy_config::ir::ProviderPathTemplate::Vertex { .. })
+    ));
+
+    let bedrock = snapshot
+        .clusters
+        .get("provider:bedrock")
+        .unwrap()
+        .provider_runtime
+        .as_ref()
+        .unwrap();
+    assert!(matches!(
+        bedrock.credential,
+        Some(proxy_config::ir::ProviderCredential::BedrockSigV4 { .. })
+    ));
+    assert!(matches!(
+        bedrock.path_template,
+        Some(proxy_config::ir::ProviderPathTemplate::Bedrock { .. })
+    ));
 }
 
 #[test]
@@ -2003,6 +2075,281 @@ routes:
     }
 }
 
+#[test]
+fn vertex_and_bedrock_provider_fields_parse() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  vertex-us:
+    type: vertex
+    base_url: "https://vertex.example.com"
+    project: test-project
+    location: us-central1
+    publisher: anthropic
+    access_token_file: /run/secrets/vertex-token
+  bedrock-us:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    access_key_id_file: /run/secrets/aws-access-key
+    secret_access_key_file: /run/secrets/aws-secret-key
+    session_token: session-token
+routes:
+  - { model: vertex-model, provider: vertex-us }
+  - { model: bedrock-model, provider: bedrock-us }
+models:
+  vertex-model:
+    providers:
+      - { provider: vertex-us, dialect: anthropic }
+  bedrock-model:
+    providers:
+      - { provider: bedrock-us, dialect: anthropic }
+"#,
+    )
+    .expect("Vertex and Bedrock provider fields must parse");
+
+    let vertex = &config.providers["vertex-us"];
+    assert_eq!(vertex.project.as_deref(), Some("test-project"));
+    assert_eq!(vertex.location.as_deref(), Some("us-central1"));
+    assert_eq!(vertex.publisher.as_deref(), Some("anthropic"));
+    assert_eq!(
+        vertex.access_token_file.as_deref(),
+        Some("/run/secrets/vertex-token")
+    );
+
+    let bedrock = &config.providers["bedrock-us"];
+    assert_eq!(bedrock.region.as_deref(), Some("us-east-1"));
+    assert_eq!(
+        bedrock.access_key_id_file.as_deref(),
+        Some("/run/secrets/aws-access-key")
+    );
+    assert_eq!(
+        bedrock.secret_access_key_file.as_deref(),
+        Some("/run/secrets/aws-secret-key")
+    );
+    assert_eq!(bedrock.session_token.as_deref(), Some("session-token"));
+}
+
+#[test]
+fn vertex_and_bedrock_credentials_require_valid_sources() {
+    let assert_field = |config: &str, expected: &str| {
+        let err = parse(config).expect_err("invalid provider credential config must fail");
+        let ConfigError::InvalidValue { field_path, .. } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(field_path, expected);
+    };
+
+    assert_field(
+        r#"
+version: 0
+providers:
+  vertex:
+    type: vertex
+    base_url: "https://vertex.example.com"
+    location: us-central1
+    publisher: google
+    access_token: token
+routes:
+  - { model: "*", provider: vertex }
+"#,
+        "providers.vertex.project",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  vertex:
+    type: vertex
+    base_url: "https://vertex.example.com"
+    project: project
+    location: us-central1
+    publisher: google
+    access_token: token
+    access_token_file: /run/secrets/token
+routes:
+  - { model: "*", provider: vertex }
+"#,
+        "providers.vertex.access_token",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  vertex:
+    type: vertex
+    base_url: "https://vertex.example.com"
+    project: project
+    location: us-central1
+    publisher: google
+routes:
+  - { model: "*", provider: vertex }
+"#,
+        "providers.vertex.access_token",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    access_key_id: access
+    secret_access_key: secret
+routes:
+  - { model: "*", provider: bedrock }
+"#,
+        "providers.bedrock.region",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    secret_access_key: secret
+routes:
+  - { model: "*", provider: bedrock }
+"#,
+        "providers.bedrock.access_key_id",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    access_key_id: access
+    access_key_id_file: /run/secrets/access
+    secret_access_key: secret
+routes:
+  - { model: "*", provider: bedrock }
+"#,
+        "providers.bedrock.access_key_id",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    access_key_id: access
+routes:
+  - { model: "*", provider: bedrock }
+"#,
+        "providers.bedrock.secret_access_key",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    access_key_id: access
+    secret_access_key: secret
+    secret_access_key_file: /run/secrets/secret
+routes:
+  - { model: "*", provider: bedrock }
+"#,
+        "providers.bedrock.secret_access_key",
+    );
+    assert_field(
+        r#"
+version: 0
+providers:
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    access_key_id: access
+    secret_access_key: secret
+    session_token: one
+    session_token_file: /run/secrets/session
+routes:
+  - { model: "*", provider: bedrock }
+"#,
+        "providers.bedrock.session_token",
+    );
+}
+
+#[test]
+fn vertex_and_bedrock_fields_are_rejected_on_other_provider_types() {
+    let cases = [
+        (
+            r#"
+version: 0
+providers:
+  openai:
+    project: project
+routes:
+  - { model: "*", provider: openai }
+"#,
+            "providers.openai.project",
+        ),
+        (
+            r#"
+version: 0
+providers:
+  openai:
+    region: us-east-1
+routes:
+  - { model: "*", provider: openai }
+"#,
+            "providers.openai.region",
+        ),
+        (
+            r#"
+version: 0
+providers:
+  vertex:
+    type: vertex
+    base_url: "https://vertex.example.com"
+    project: project
+    location: us-central1
+    publisher: google
+    access_token: token
+    region: us-east-1
+routes:
+  - { model: "*", provider: vertex }
+"#,
+            "providers.vertex.region",
+        ),
+        (
+            r#"
+version: 0
+providers:
+  bedrock:
+    type: bedrock
+    base_url: "https://bedrock.example.com"
+    region: us-east-1
+    access_key_id: access
+    secret_access_key: secret
+    access_token: token
+routes:
+  - { model: "*", provider: bedrock }
+"#,
+            "providers.bedrock.access_token",
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let err = parse(config).expect_err("provider-specific field must be rejected");
+        let ConfigError::InvalidValue { field_path, .. } = err else {
+            panic!("expected InvalidValue");
+        };
+        assert_eq!(field_path, expected);
+    }
+}
+
 /// Vertex/Bedrock serve more than one wire format under one provider type,
 /// so a `models:` entry using one MUST set `dialect` explicitly -- and the
 /// shorthand string form has nowhere to put it, so it must be rejected
@@ -2015,7 +2362,13 @@ fn model_provider_shorthand_on_ambiguous_provider_type_fails() {
         r#"
 version: 0
 providers:
-  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+  vertex-us:
+    type: vertex
+    base_url: "https://vertex-us.example.com"
+    project: test-project
+    location: us-central1
+    publisher: anthropic
+    access_token: token
 routes:
   - { model: "*", provider: vertex-us }
 models:
@@ -2045,7 +2398,13 @@ fn model_provider_object_form_missing_dialect_on_ambiguous_provider_fails() {
         r#"
 version: 0
 providers:
-  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+  vertex-us:
+    type: vertex
+    base_url: "https://vertex-us.example.com"
+    project: test-project
+    location: us-central1
+    publisher: anthropic
+    access_token: token
 routes:
   - { model: "*", provider: vertex-us }
 models:
@@ -3089,7 +3448,13 @@ fn a_routes_only_ambiguous_provider_is_rejected_with_its_path() {
         r#"
 version: 0
 providers:
-  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+  vertex-us:
+    type: vertex
+    base_url: "https://vertex-us.example.com"
+    project: test-project
+    location: us-central1
+    publisher: anthropic
+    access_token: token
 routes:
   - { model: "*", provider: vertex-us }
 "#,
@@ -3116,7 +3481,12 @@ fn a_routes_fallback_to_an_ambiguous_provider_is_rejected_at_its_own_path() {
 version: 0
 providers:
   main: { type: anthropic, base_url: "https://a.example.com", api_key: k }
-  bedrock-w: { type: bedrock, base_url: "https://b.example.com", api_key: k }
+  bedrock-w:
+    type: bedrock
+    base_url: "https://b.example.com"
+    region: us-east-1
+    access_key_id: access
+    secret_access_key: secret
 routes:
   - model: "*"
     provider: main
@@ -3142,7 +3512,13 @@ fn a_models_entry_makes_an_ambiguous_routes_provider_resolvable() {
         r#"
 version: 0
 providers:
-  vertex-us: { type: vertex, base_url: "https://vertex-us.example.com", api_key: k }
+  vertex-us:
+    type: vertex
+    base_url: "https://vertex-us.example.com"
+    project: test-project
+    location: us-central1
+    publisher: anthropic
+    access_token: token
 routes:
   - { model: "*", provider: vertex-us }
 models:
@@ -3152,15 +3528,17 @@ models:
 "#,
     )
     .expect("a models entry pinning dialect must make this parse");
-    // Lowering still refuses the type itself (no OAuth2 yet), which is the
-    // *other* fatal error and proves parse got past the dialect check rather
-    // than the config being wrong in some third way.
-    let err =
-        proxy_simple_config::lower(&config).expect_err("vertex is still unbuilt at lowering time");
-    let ConfigError::Unimplemented { field_path, .. } = &err else {
-        panic!("expected the unbuilt-type Unimplemented, got: {err}");
-    };
-    assert_eq!(field_path, "providers.vertex-us.type");
+    let lowered = proxy_simple_config::lower(&config).expect("Vertex must lower");
+    let cluster = lowered.bootstrap["static_resources"]["clusters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|cluster| cluster["name"] == "provider:vertex-us")
+        .expect("Vertex provider cluster must exist");
+    assert_eq!(
+        cluster["metadata"]["filter_metadata"]["io.llmproxy.usage"]["dialect"],
+        "anthropic"
+    );
 }
 
 /// An unambiguous type in `routes:` is untouched by any of this -- the type

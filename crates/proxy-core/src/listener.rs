@@ -1996,6 +1996,7 @@ mod tests {
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
             request_path_rewrite: None,
+            provider_runtime: None,
             health_check: None,
             outlier_detection: None,
         }

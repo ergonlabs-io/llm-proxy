@@ -24,6 +24,8 @@ thiserror = { workspace = true }
 # S9: per-worker seeding for `x-request-id` generation (headers.rs).
 rand = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
+ring = { workspace = true }
 # S3.2 `refused-stream`: the retry engine has to tell an h2 REFUSED_STREAM
 # apart from any other send failure, and the only way to do that is to
 # downcast the `hyper::Error`'s source chain to the `h2::Error` underneath

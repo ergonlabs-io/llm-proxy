@@ -628,6 +628,9 @@ pub trait ClusterEntry: Send + Sync {
     /// Provider-owned path/query rewrite to apply after route transforms.
     fn request_path_rewrite(&self) -> Option<&proxy_config::ir::RequestPathRewrite>;
 
+    /// Provider-specific credential and model path behavior for this cluster.
+    fn provider_runtime(&self) -> Option<&proxy_config::ir::ProviderRuntimeConfig>;
+
     /// Feed one upstream attempt's outcome to this cluster's S6 outlier
     /// detector (WP-19). `addr` is the host the attempt actually dialed. A
     /// no-op when the cluster configures no outlier detection, so the router

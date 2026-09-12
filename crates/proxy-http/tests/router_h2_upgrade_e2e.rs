@@ -119,6 +119,7 @@ async fn build_router(
             upstream_protocol: proto,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,

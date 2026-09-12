@@ -3292,6 +3292,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // instead; a hand-written Envoy config that never sets this namespace
     // gets an empty list here, unchanged from before.
     let request_headers_to_add = convert_provider_auth_metadata(c.metadata.as_ref(), path)?;
+    let provider_runtime = convert_provider_runtime_metadata(c.metadata.as_ref(), path)?;
     // Ground rule #6's third instance (CLAUDE.md): the usage-filter dialect
     // is per-provider, so it rides the same `Cluster.metadata.filter_metadata`
     // smuggling channel as credentials above, under its own namespace.
@@ -3337,6 +3338,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         upstream_protocol,
         request_headers_to_add,
         request_path_rewrite,
+        provider_runtime,
         usage_dialect,
         health_check,
         outlier_detection,
@@ -3484,6 +3486,9 @@ const PROVIDER_AUTH_METADATA_KEY: &str = "io.llmproxy.provider_auth";
 /// upstream path/query rewriting through `Cluster.metadata.filter_metadata`.
 const PATH_REWRITE_METADATA_KEY: &str = "io.llmproxy.path_rewrite";
 
+/// Namespace key for provider-specific model URL templates.
+const PATH_TEMPLATE_METADATA_KEY: &str = "io.llmproxy.path_template";
+
 /// Lower `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
 /// into `ClusterConfig::request_headers_to_add`. The expected shape is
 /// `{ headers: [ { key: "...", value: "..." }, ... ] }`; every entry lowers
@@ -3513,13 +3518,26 @@ fn convert_provider_auth_metadata(
     let mut unknown: Vec<&String> = auth
         .fields
         .keys()
-        .filter(|k| k.as_str() != "headers")
+        .filter(|k| {
+            !matches!(
+                k.as_str(),
+                "headers"
+                    | "scheme"
+                    | "access_token"
+                    | "region"
+                    | "access_key_id"
+                    | "secret_access_key"
+                    | "session_token"
+            )
+        })
         .collect();
     unknown.sort();
     if let Some(key) = unknown.first() {
         return Err(unsupported(
             format!("{auth_path}.{key}"),
-            format!("`{PROVIDER_AUTH_METADATA_KEY}` only supports a `headers` list"),
+            format!(
+                "`{PROVIDER_AUTH_METADATA_KEY}` contains an unsupported field; supported fields are `headers` and provider credential fields"
+            ),
         ));
     }
 
@@ -3572,6 +3590,185 @@ fn provider_auth_string_field(
         Some(_) => Err(invalid(format!("{path}.{name}"), "must be a string")),
         None => Err(invalid(format!("{path}.{name}"), "is required")),
     }
+}
+
+/// Lower the llmproxy-only provider credential and URL-template metadata.
+/// These values have no Envoy proto equivalent, so this parser is the strict
+/// boundary that keeps them from disappearing inside `google.protobuf.Struct`.
+fn convert_provider_runtime_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<Option<ProviderRuntimeConfig>, ConfigError> {
+    let credential = metadata
+        .and_then(|m| m.filter_metadata.get(PROVIDER_AUTH_METADATA_KEY))
+        .map(|auth| {
+            let auth_path =
+                format!("{path}.metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"]");
+            let scheme = match auth.fields.get("scheme") {
+                None => None,
+                Some(value) => match value.kind.as_ref() {
+                    Some(prost_types::value::Kind::StringValue(value)) => Some(value.as_str()),
+                    Some(_) => {
+                        return Err(invalid(format!("{auth_path}.scheme"), "must be a string"))
+                    }
+                    None => return Err(invalid(format!("{auth_path}.scheme"), "must be a string")),
+                },
+            };
+            let allowed = match scheme {
+                None => &["headers"][..],
+                Some("vertex-oauth2") => &["headers", "scheme", "access_token"][..],
+                Some("bedrock-sigv4") => &[
+                    "headers",
+                    "scheme",
+                    "region",
+                    "access_key_id",
+                    "secret_access_key",
+                    "session_token",
+                ][..],
+                Some(_) => &[][..],
+            };
+            let mut unexpected: Vec<&String> = auth
+                .fields
+                .keys()
+                .filter(|key| !allowed.contains(&key.as_str()))
+                .collect();
+            unexpected.sort();
+            if let Some(key) = unexpected.first() {
+                return Err(unsupported(
+                    format!("{auth_path}.{key}"),
+                    "provider credential field does not belong to selected scheme",
+                ));
+            }
+            match scheme {
+                None => Ok(None),
+                Some("vertex-oauth2") => Ok(Some(ProviderCredential::VertexOAuth2 {
+                    access_token: provider_auth_string_field(auth, "access_token", &auth_path)?,
+                })),
+                Some("bedrock-sigv4") => Ok(Some(ProviderCredential::BedrockSigV4 {
+                    region: provider_auth_string_field(auth, "region", &auth_path)?,
+                    access_key_id: provider_auth_string_field(auth, "access_key_id", &auth_path)?,
+                    secret_access_key: provider_auth_string_field(
+                        auth,
+                        "secret_access_key",
+                        &auth_path,
+                    )?,
+                    session_token: match auth.fields.get("session_token") {
+                        None => None,
+                        Some(_) => Some(provider_auth_string_field(
+                            auth,
+                            "session_token",
+                            &auth_path,
+                        )?),
+                    },
+                })),
+                Some(other) => Err(unsupported(
+                    format!("{auth_path}.scheme"),
+                    format!("unsupported provider credential scheme `{other}`"),
+                )),
+            }
+        })
+        .transpose()?
+        .flatten();
+
+    let path_template = metadata
+        .and_then(|m| m.filter_metadata.get(PATH_TEMPLATE_METADATA_KEY))
+        .map(|template| {
+            let template_path =
+                format!("{path}.metadata.filter_metadata[\"{PATH_TEMPLATE_METADATA_KEY}\"]");
+            let allowed = |key: &str| {
+                matches!(
+                    key,
+                    "scheme" | "project" | "location" | "publisher" | "models"
+                )
+            };
+            let mut unknown: Vec<&String> =
+                template.fields.keys().filter(|key| !allowed(key)).collect();
+            unknown.sort();
+            if let Some(key) = unknown.first() {
+                return Err(unsupported(
+                    format!("{template_path}.{key}"),
+                    format!("`{PATH_TEMPLATE_METADATA_KEY}` contains an unsupported field"),
+                ));
+            }
+            let scheme = provider_auth_string_field(template, "scheme", &template_path)?;
+            let allowed = match scheme.as_str() {
+                "vertex" => ["scheme", "project", "location", "publisher", "models"].as_slice(),
+                "bedrock" => ["scheme", "models"].as_slice(),
+                _ => ["scheme"].as_slice(),
+            };
+            let mut unexpected: Vec<&String> = template
+                .fields
+                .keys()
+                .filter(|key| !allowed.contains(&key.as_str()))
+                .collect();
+            unexpected.sort();
+            if let Some(key) = unexpected.first() {
+                return Err(unsupported(
+                    format!("{template_path}.{key}"),
+                    "provider path field does not belong to selected scheme",
+                ));
+            }
+            let models = provider_model_rewrites(template, &template_path)?;
+            match scheme.as_str() {
+                "vertex" => Ok(ProviderPathTemplate::Vertex {
+                    project: provider_auth_string_field(template, "project", &template_path)?,
+                    location: provider_auth_string_field(template, "location", &template_path)?,
+                    publisher: provider_auth_string_field(template, "publisher", &template_path)?,
+                    models,
+                }),
+                "bedrock" => Ok(ProviderPathTemplate::Bedrock { models }),
+                _ => Err(unsupported(
+                    format!("{template_path}.scheme"),
+                    format!("unsupported provider path template `{scheme}`"),
+                )),
+            }
+        })
+        .transpose()?;
+
+    if credential.is_none() && path_template.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(ProviderRuntimeConfig {
+            credential,
+            path_template,
+        }))
+    }
+}
+
+fn provider_model_rewrites(
+    template: &prost_types::Struct,
+    path: &str,
+) -> Result<Vec<ProviderModelRewrite>, ConfigError> {
+    let Some(value) = template.fields.get("models") else {
+        return Ok(Vec::new());
+    };
+    let Some(prost_types::value::Kind::ListValue(list)) = value.kind.as_ref() else {
+        return Err(invalid(format!("{path}.models"), "must be a list"));
+    };
+    let mut out = Vec::with_capacity(list.values.len());
+    for (i, value) in list.values.iter().enumerate() {
+        let item_path = format!("{path}.models[{i}]");
+        let Some(prost_types::value::Kind::StructValue(item)) = value.kind.as_ref() else {
+            return Err(invalid(&item_path, "must be an object"));
+        };
+        let mut unknown: Vec<&String> = item
+            .fields
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "pattern" | "upstream_model"))
+            .collect();
+        unknown.sort();
+        if let Some(key) = unknown.first() {
+            return Err(unsupported(
+                format!("{item_path}.{key}"),
+                "only `pattern` and `upstream_model` are supported",
+            ));
+        }
+        out.push(ProviderModelRewrite {
+            pattern: provider_auth_string_field(item, "pattern", &item_path)?,
+            upstream_model: provider_auth_string_field(item, "upstream_model", &item_path)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Lower `Cluster.metadata.filter_metadata["io.llmproxy.path_rewrite"]` into

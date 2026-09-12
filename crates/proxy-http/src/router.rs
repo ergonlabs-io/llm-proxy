@@ -85,7 +85,7 @@ use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, T
 use proxy_observability::ResponseFlag;
 
 use crate::codec::UpstreamCodecError;
-use crate::credential_provider::{CredentialProvider, StaticHeaderCredentials};
+use crate::credential_provider::{CredentialProvider, ProviderCredentials};
 use crate::filter::{
     DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
     RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
@@ -670,10 +670,29 @@ impl RouterHandler {
         };
         apply_request_transforms(fwd, matcher, request_headers_to_add, &mut attempt_head);
         apply_cluster_request_path_rewrite(attempt_entry.request_path_rewrite(), &mut attempt_head);
-        apply_header_mutations(
-            attempt_entry.request_headers_to_add(),
-            &mut attempt_head.headers,
+        let requested_model = dcb.stream_info().requested_model.clone();
+        apply_cluster_provider_path_template(
+            attempt_entry
+                .provider_runtime()
+                .and_then(|runtime| runtime.path_template.as_ref()),
+            requested_model.as_deref(),
+            &mut attempt_head,
         );
+        if let Err(err) = ProviderCredentials::new(
+            attempt_entry.provider_runtime(),
+            attempt_entry.request_headers_to_add(),
+        )
+        .apply(&mut attempt_head, &self.captured_body)
+        .await
+        {
+            tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
+            dcb.stream_info()
+                .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
+            return local_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider credential failure",
+            );
+        }
 
         // Bypass BOTH connection caches: `pool.new_stream()` dials a
         // connection this tunnel will own exclusively (see this method's
@@ -1262,17 +1281,23 @@ impl RouterHandler {
                     attempt_entry.request_path_rewrite(),
                     &mut attempt_head,
                 );
-                // WP-49: apply credentials only after every decode filter
-                // has produced the final body and the router has completed
-                // its own per-attempt header changes. `attempt_entry` is the
-                // member actually dialed, so failover cannot leak another
-                // provider's credential. Static headers are the sole current
-                // implementation; Bedrock's future SigV4 signer belongs at
-                // this exact point because it signs these final bytes.
-                if let Err(err) =
-                    StaticHeaderCredentials::new(attempt_entry.request_headers_to_add())
-                        .apply(&mut attempt_head, &body_bytes)
-                        .await
+                let requested_model = dcb.stream_info().requested_model.clone();
+                apply_cluster_provider_path_template(
+                    attempt_entry
+                        .provider_runtime()
+                        .and_then(|runtime| runtime.path_template.as_ref()),
+                    requested_model.as_deref(),
+                    &mut attempt_head,
+                );
+                // Credentials run after every decode filter and per-attempt
+                // transform. The selected member owns its credential, so a
+                // fallback cannot sign or authorize against the primary.
+                if let Err(err) = ProviderCredentials::new(
+                    attempt_entry.provider_runtime(),
+                    attempt_entry.request_headers_to_add(),
+                )
+                .apply(&mut attempt_head, &body_bytes)
+                .await
                 {
                     tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
                     dcb.stream_info()
@@ -1984,6 +2009,75 @@ fn apply_cluster_request_path_rewrite(
     }
 }
 
+/// Render provider-owned URL templates after final cluster selection. Model
+/// mappings live on the cluster, so a fallback uses its own upstream model
+/// identifier rather than the primary's.
+fn apply_cluster_provider_path_template(
+    template: Option<&proxy_config::ir::ProviderPathTemplate>,
+    requested_model: Option<&str>,
+    head: &mut crate::filter::RequestHeaders,
+) {
+    let Some(template) = template else {
+        return;
+    };
+    let Some(requested_model) = requested_model else {
+        tracing::warn!("provider path template requires a request model");
+        return;
+    };
+    let upstream_model = |models: &[proxy_config::ir::ProviderModelRewrite]| {
+        models
+            .iter()
+            .find(|mapping| provider_model_pattern_matches(&mapping.pattern, requested_model))
+            .map(|mapping| mapping.upstream_model.clone())
+            .unwrap_or_else(|| requested_model.to_string())
+    };
+    let path = match template {
+        proxy_config::ir::ProviderPathTemplate::Vertex {
+            project,
+            location,
+            publisher,
+            models,
+        } => format!(
+            "/v1/projects/{}/locations/{}/publishers/{}/models/{}:streamRawPredict",
+            path_segment(project),
+            path_segment(location),
+            path_segment(publisher),
+            path_segment(&upstream_model(models)),
+        ),
+        proxy_config::ir::ProviderPathTemplate::Bedrock { models } => {
+            format!("/model/{}/invoke", path_segment(&upstream_model(models)))
+        }
+    };
+    let path_and_query = match head.uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    match http::Uri::builder().path_and_query(path_and_query).build() {
+        Ok(uri) => head.uri = uri,
+        Err(err) => tracing::warn!(error = %err, "provider path template produced an invalid URI"),
+    }
+}
+
+fn provider_model_pattern_matches(pattern: &str, model: &str) -> bool {
+    pattern == "*"
+        || pattern
+            .strip_suffix('*')
+            .map_or(pattern == model, |prefix| model.starts_with(prefix))
+}
+
+fn path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 /// Apply a route's `request_headers_to_add` mutations, in config order, to
 /// the outgoing request headers -- this is what actually gets a
 /// dialect-injected provider credential (`Authorization`/`x-api-key`/
@@ -2691,6 +2785,7 @@ mod tests {
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
                 request_headers_to_add: Vec::new(),
                 request_path_rewrite: None,
+                provider_runtime: None,
                 usage_dialect: None,
                 health_check: None,
                 outlier_detection: None,
@@ -2766,6 +2861,7 @@ mod tests {
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http2,
                 request_headers_to_add: Vec::new(),
                 request_path_rewrite: None,
+                provider_runtime: None,
                 usage_dialect: None,
                 health_check: None,
                 outlier_detection: None,
@@ -2884,6 +2980,31 @@ mod tests {
         assert_eq!(
             head.uri,
             "/openai/deployments/deployment-a/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn provider_path_template_uses_cluster_model_mapping() {
+        let mut head = RequestHeaders {
+            method: Method::POST,
+            uri: Uri::from_static("/v1/messages?trace=1"),
+            headers: HeaderMap::new(),
+        };
+        let template = proxy_config::ir::ProviderPathTemplate::Vertex {
+            project: "project-a".to_string(),
+            location: "us-central1".to_string(),
+            publisher: "anthropic".to_string(),
+            models: vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "claude-*".to_string(),
+                upstream_model: "claude-sonnet@20250929".to_string(),
+            }],
+        };
+
+        apply_cluster_provider_path_template(Some(&template), Some("claude-sonnet"), &mut head);
+
+        assert_eq!(
+            head.uri,
+            "/v1/projects/project-a/locations/us-central1/publishers/anthropic/models/claude-sonnet%4020250929:streamRawPredict?trace=1"
         );
     }
 

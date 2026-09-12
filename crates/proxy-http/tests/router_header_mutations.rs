@@ -121,6 +121,7 @@ async fn build_router_with_cluster_mutations(
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: cluster_mutations,
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,

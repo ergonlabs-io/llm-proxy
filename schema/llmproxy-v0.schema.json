@@ -187,11 +187,11 @@
     },
     "Provider": {
       "type": "object",
-      "description": "One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit both for unauthenticated local backends). Azure OpenAI requires `deployment` and `api_version`.",
+      "description": "One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit both for unauthenticated local backends). Azure OpenAI requires `deployment` and `api_version`; Vertex requires project, location, publisher, and one OAuth access-token source; Bedrock requires region and AWS access-key and secret-key sources.",
       "additionalProperties": false,
       "properties": {
         "type": {
-          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise. `azure-openai` uses Azure's deployment URL and `api-version` query parameter. `vertex` and `bedrock` remain reserved for the model catalogue and are not loadable provider types yet.",
+          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise. `azure-openai` uses Azure's deployment URL and `api-version` query parameter. `vertex` uses Google Cloud project/location/publisher settings and an OAuth access token. `bedrock` uses an AWS region and SigV4 credential sources.",
           "enum": ["openai", "anthropic", "openai-compatible", "azure-openai", "vertex", "bedrock"]
         },
         "base_url": {
@@ -218,6 +218,66 @@
         "api_key_file": {
           "type": "string",
           "description": "Read the API key from this file (trailing whitespace trimmed; read once at startup -- hot reload lands with WP-35). Preferred over `api_key` for secret managers that mount files."
+        },
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Google Cloud project ID for Vertex AI. Required for `vertex`; rejected for other provider types."
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Google Cloud location for Vertex AI. Required for `vertex`; rejected for other provider types."
+        },
+        "publisher": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Vertex AI publisher, such as `google` or `anthropic`. Required for `vertex`; rejected for other provider types."
+        },
+        "access_token": {
+          "type": "string",
+          "minLength": 1,
+          "description": "OAuth access token for Vertex AI. Exactly one of `access_token` / `access_token_file` is required for `vertex`."
+        },
+        "access_token_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Read the Vertex OAuth access token from this file. Exactly one of `access_token` / `access_token_file` is required for `vertex`."
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1,
+          "description": "AWS region for Amazon Bedrock. Required for `bedrock`; rejected for other provider types."
+        },
+        "access_key_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "AWS access key ID for Bedrock SigV4. Exactly one of `access_key_id` / `access_key_id_file` is required for `bedrock`."
+        },
+        "access_key_id_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Read the AWS access key ID from this file. Exactly one of `access_key_id` / `access_key_id_file` is required for `bedrock`."
+        },
+        "secret_access_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "AWS secret access key for Bedrock SigV4. Exactly one of `secret_access_key` / `secret_access_key_file` is required for `bedrock`."
+        },
+        "secret_access_key_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Read the AWS secret access key from this file. Exactly one of `secret_access_key` / `secret_access_key_file` is required for `bedrock`."
+        },
+        "session_token": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional AWS session token for Bedrock SigV4. If set, do not set `session_token_file`."
+        },
+        "session_token_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Read an optional AWS session token from this file. If set, do not set `session_token`."
         },
         "extra_headers": {
           "type": "object",
@@ -268,6 +328,111 @@
               "anyOf": [
                 { "required": ["deployment"] },
                 { "required": ["api_version"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "vertex" }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["base_url", "project", "location", "publisher"],
+            "oneOf": [
+              { "required": ["access_token"], "not": { "required": ["access_token_file"] } },
+              { "required": ["access_token_file"], "not": { "required": ["access_token"] } }
+            ],
+            "not": {
+              "anyOf": [
+                { "required": ["region"] },
+                { "required": ["access_key_id"] },
+                { "required": ["access_key_id_file"] },
+                { "required": ["secret_access_key"] },
+                { "required": ["secret_access_key_file"] },
+                { "required": ["session_token"] },
+                { "required": ["session_token_file"] },
+                { "required": ["api_key"] },
+                { "required": ["api_key_file"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": { "type": { "const": "vertex" } },
+              "required": ["type"]
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["project"] },
+                { "required": ["location"] },
+                { "required": ["publisher"] },
+                { "required": ["access_token"] },
+                { "required": ["access_token_file"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "bedrock" }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["base_url", "region"],
+            "allOf": [
+              {
+                "oneOf": [
+                  { "required": ["access_key_id"], "not": { "required": ["access_key_id_file"] } },
+                  { "required": ["access_key_id_file"], "not": { "required": ["access_key_id"] } }
+                ]
+              },
+              {
+                "oneOf": [
+                  { "required": ["secret_access_key"], "not": { "required": ["secret_access_key_file"] } },
+                  { "required": ["secret_access_key_file"], "not": { "required": ["secret_access_key"] } }
+                ]
+              }
+            ],
+            "not": {
+              "anyOf": [
+                { "required": ["project"] },
+                { "required": ["location"] },
+                { "required": ["publisher"] },
+                { "required": ["access_token"] },
+                { "required": ["access_token_file"] },
+                { "required": ["session_token", "session_token_file"] },
+                { "required": ["api_key"] },
+                { "required": ["api_key_file"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": { "type": { "const": "bedrock" } },
+              "required": ["type"]
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["region"] },
+                { "required": ["access_key_id"] },
+                { "required": ["access_key_id_file"] },
+                { "required": ["secret_access_key"] },
+                { "required": ["secret_access_key_file"] },
+                { "required": ["session_token"] },
+                { "required": ["session_token_file"] }
               ]
             }
           }

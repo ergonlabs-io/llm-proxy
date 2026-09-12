@@ -1772,6 +1772,7 @@ version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "chrono",
  "futures",
  "h2",
  "http",
@@ -1783,6 +1784,7 @@ dependencies = [
  "proxy-config",
  "proxy-observability",
  "rand",
+ "ring",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

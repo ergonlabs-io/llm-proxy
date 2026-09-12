@@ -133,6 +133,49 @@ pub struct Provider {
     pub provider_type: Option<ProviderType>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Google Cloud project used by Vertex AI.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Google Cloud location used by Vertex AI.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Vertex publisher, such as `google` or `anthropic`.
+    #[serde(default)]
+    pub publisher: Option<String>,
+    /// OAuth access token used by Vertex AI. Exactly one token source is
+    /// required for a Vertex provider.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// File containing a Vertex OAuth access token. Exactly one token source
+    /// is required for a Vertex provider.
+    #[serde(default)]
+    pub access_token_file: Option<String>,
+    /// AWS region used by Amazon Bedrock.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// AWS access key ID. Exactly one access-key source is required for a
+    /// Bedrock provider.
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    /// File containing an AWS access key ID. Exactly one access-key source is
+    /// required for a Bedrock provider.
+    #[serde(default)]
+    pub access_key_id_file: Option<String>,
+    /// AWS secret access key. Exactly one secret-key source is required for a
+    /// Bedrock provider.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    /// File containing an AWS secret access key. Exactly one secret-key source
+    /// is required for a Bedrock provider.
+    #[serde(default)]
+    pub secret_access_key_file: Option<String>,
+    /// Optional AWS session token. If configured, exactly one token source is
+    /// required.
+    #[serde(default)]
+    pub session_token: Option<String>,
+    /// File containing an optional AWS session token.
+    #[serde(default)]
+    pub session_token_file: Option<String>,
     /// Azure OpenAI deployment name used in the provider-owned request path.
     #[serde(default)]
     pub deployment: Option<String>,
@@ -217,16 +260,12 @@ pub enum ProviderType {
     /// and api-version fields to build its provider-owned URL template.
     AzureOpenai,
     /// Serves Anthropic-shaped Claude, Google-shaped Gemini, and
-    /// OpenAI-shaped Kimi under one provider type, and needs minted OAuth2
-    /// with a refresh loop -- not built yet. Loading one is a hard error;
-    /// see `lower::lower_provider`. Its dialect cannot be derived from the
-    /// type alone -- see [`Self::dialect_is_ambiguous`].
+    /// OpenAI-shaped Kimi under one provider type. Its dialect cannot be
+    /// derived from the type alone -- see [`Self::dialect_is_ambiguous`].
     Vertex,
-    /// Serves multiple wire formats like Vertex, and needs per-request
-    /// SigV4 signing over the canonical request (which must run after body
-    /// rewriting, so it cannot be header injection) -- not built yet.
-    /// Loading one is a hard error; see `lower::lower_provider`. Also
-    /// dialect-ambiguous -- see [`Self::dialect_is_ambiguous`].
+    /// Serves multiple wire formats like Vertex. Per-request authentication
+    /// uses AWS SigV4. Also dialect-ambiguous -- see
+    /// [`Self::dialect_is_ambiguous`].
     Bedrock,
 }
 
@@ -697,9 +736,8 @@ impl Provider {
         self.base_url.clone().or(match self.effective_type(name) {
             ProviderType::Openai => Some("https://api.openai.com".to_string()),
             ProviderType::Anthropic => Some("https://api.anthropic.com".to_string()),
-            // These provider types require an explicit base URL. Vertex and
-            // Bedrock also remain unavailable until their credential schemes
-            // land; Azure is handled by `lower::lower_provider`.
+            // These provider types require an explicit base URL. Azure,
+            // Vertex, and Bedrock use provider-specific request handling.
             ProviderType::OpenaiCompatible
             | ProviderType::AzureOpenai
             | ProviderType::Vertex

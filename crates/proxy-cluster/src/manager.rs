@@ -903,6 +903,10 @@ impl ClusterEntry for ClusterHandle {
         self.managed.config.request_path_rewrite.as_ref()
     }
 
+    fn provider_runtime(&self) -> Option<&proxy_config::ir::ProviderRuntimeConfig> {
+        self.managed.config.provider_runtime.as_ref()
+    }
+
     fn report_outlier_result(&self, addr: SocketAddr, result: RequestResult) {
         // No-op unless this cluster configures outlier detection. For an
         // aggregate the router calls this on the *member's* entry (the one
@@ -946,6 +950,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,
@@ -977,6 +982,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,
@@ -1004,6 +1010,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,
@@ -1040,6 +1047,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: Some(od),
@@ -1068,6 +1076,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: None,
             outlier_detection: None,
@@ -1111,6 +1120,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: Some(health_check),
             outlier_detection: None,
@@ -1175,6 +1185,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             request_path_rewrite: None,
+            provider_runtime: None,
             usage_dialect: None,
             health_check: Some(health_check),
             outlier_detection: Some(od),
@@ -2191,6 +2202,7 @@ mod tests {
                 upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
                 request_headers_to_add: Vec::new(),
                 request_path_rewrite: None,
+                provider_runtime: None,
                 usage_dialect: None,
                 health_check: None,
                 outlier_detection: None,
