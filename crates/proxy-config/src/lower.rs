@@ -3048,6 +3048,24 @@ fn convert_data_source(
     }
 }
 
+/// Direct-response bodies are immutable request-independent data. Resolve
+/// file sources while compiling the snapshot so request workers never touch
+/// the filesystem.
+fn convert_direct_response_body(
+    ds: &core_v3::DataSource,
+    path: &str,
+) -> Result<DataSourceIR, ConfigError> {
+    match convert_data_source(Some(ds), path)? {
+        DataSourceIR::Inline(body) => Ok(DataSourceIR::Inline(body)),
+        DataSourceIR::File(file) => std::fs::read_to_string(&file)
+            .map(DataSourceIR::Inline)
+            .map_err(|error| ConfigError::Io {
+                path: file.display().to_string(),
+                reason: error.to_string(),
+            }),
+    }
+}
+
 // ----------------------------------------------------------------- clusters --
 
 /// `CustomClusterType.name` for the one custom cluster type implemented.
@@ -4857,7 +4875,7 @@ fn convert_route(
             body: dr
                 .body
                 .as_ref()
-                .map(|ds| convert_data_source(Some(ds), &format!("{path}.direct_response.body")))
+                .map(|ds| convert_direct_response_body(ds, &format!("{path}.direct_response.body")))
                 .transpose()?,
         },
         Some(_) => {
@@ -5295,4 +5313,34 @@ fn convert_header_mutation(
         value: header.value.clone(),
         action,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_response_file_body_is_loaded_during_lowering() {
+        let path = std::env::temp_dir().join(format!(
+            "llmproxy-direct-response-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after UNIX_EPOCH")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "file response").expect("test body must be writable");
+
+        let source = core_v3::DataSource {
+            specifier: Some(core_v3::data_source::Specifier::Filename(
+                path.to_string_lossy().into_owned(),
+            )),
+            ..Default::default()
+        };
+        let body = convert_direct_response_body(&source, "routes[0].direct_response.body")
+            .expect("file body must load during lowering");
+
+        assert_eq!(body, DataSourceIR::Inline("file response".to_string()));
+        std::fs::remove_file(path).expect("test body must be removable");
+    }
 }

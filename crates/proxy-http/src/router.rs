@@ -2155,10 +2155,9 @@ fn requested_upgrade_type(headers: &http::HeaderMap) -> Option<String> {
     Some(first.to_ascii_lowercase())
 }
 
-/// Synthesize a `DirectResponse` action's reply. `DataSourceIR::Inline` is
-/// the only body variant handled for v1; a `File` body is non-trivial
-/// (loading + caching file contents isn't wired anywhere in this WP) so it
-/// gets a logged 500 rather than a silent empty body (ground rule #1).
+/// Synthesize a `DirectResponse` action's reply. File bodies are resolved
+/// during config compilation; a file variant reaching this worker indicates
+/// manually constructed IR outside the supported lowering path.
 fn direct_response(status: u16, body: Option<&DataSourceIR>) -> HttpResponseParts {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     match body {
@@ -2169,11 +2168,11 @@ fn direct_response(status: u16, body: Option<&DataSourceIR>) -> HttpResponsePart
         Some(DataSourceIR::File(path)) => {
             tracing::warn!(
                 path = %path.display(),
-                "TODO(WP-13 follow-up): direct_response file-sourced body not yet implemented"
+                "direct_response received an unresolved file-sourced body"
             );
             local_reply(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "direct_response file body not yet implemented",
+                "direct_response file body was not loaded",
             )
         }
     }
