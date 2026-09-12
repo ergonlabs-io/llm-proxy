@@ -1140,7 +1140,7 @@ observability:
     // Criterion 5: the dialect follows the route, not the listener.
     let routes = &hcm["route_config"]["virtual_hosts"][0]["routes"];
     let dialect =
-        |i: usize| routes[i]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"].clone();
+        |i: usize| routes[i]["typed_per_filter_config"]["llmproxy.usage"]["dialect"].clone();
     assert_eq!(dialect(0), "openai");
     assert_eq!(dialect(1), "anthropic");
 }
@@ -1167,11 +1167,11 @@ routes:
         ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"];
 
     assert_eq!(
-        routes[0]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        routes[0]["typed_per_filter_config"]["llmproxy.usage"]["dialect"],
         "openai"
     );
     assert_eq!(
-        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["dialect"],
         "anthropic"
     );
 }
@@ -1235,10 +1235,10 @@ observability:
             .as_ref()
             .unwrap_or_else(|| panic!("route {i} override must carry a config"));
         let got = msg
-            .get_field_by_name("inline_string")
-            .expect("DataSource.inline_string")
+            .get_field_by_name("dialect")
+            .expect("Usage.dialect")
             .as_str()
-            .expect("inline_string must be a string")
+            .expect("dialect must be a string")
             .to_string();
         assert_eq!(got, want, "route {i}");
     }
@@ -1977,7 +1977,7 @@ models:
     let routes =
         &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
     assert_eq!(
-        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["dialect"],
         "anthropic"
     );
 }
@@ -2005,7 +2005,7 @@ models:
     let routes =
         &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
     assert_eq!(
-        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["inline_string"],
+        routes[1]["typed_per_filter_config"]["llmproxy.usage"]["dialect"],
         "anthropic"
     );
 }
@@ -2141,10 +2141,10 @@ observability:
         .as_ref()
         .expect("override must carry a config");
     let got = msg
-        .get_field_by_name("inline_string")
-        .expect("DataSource.inline_string")
+        .get_field_by_name("dialect")
+        .expect("Usage.dialect")
         .as_str()
-        .expect("inline_string must be a string")
+        .expect("dialect must be a string")
         .to_string();
     assert_eq!(got, "anthropic");
 }
@@ -2916,7 +2916,7 @@ fn both_dialect_carriers_agree_on_the_example_config() {
         let cluster = route["route"]["cluster"]
             .as_str()
             .expect("every example route targets a named cluster");
-        let route_dialect = route["typed_per_filter_config"]["llmproxy.usage"]["inline_string"]
+        let route_dialect = route["typed_per_filter_config"]["llmproxy.usage"]["dialect"]
             .as_str()
             .expect("every route carries a usage dialect");
 

@@ -14,19 +14,13 @@
 //! `// Rust note:` on [`UsageFilterInstance::encode_data`] for the mechanical
 //! guarantee.
 //!
-//! # Config: reusing `DataSource` (INTERIM)
+//! # Config: owned `llmproxy.filters.v0.Usage`
 //!
-//! Same rationale as `proxy-core`'s `header_mutation_filter` (see that
-//! module's doc comment): rather than vendoring a brand-new Lane-H proto for
-//! a filter that today has exactly one config field, `typed_config` reuses
-//! the already-compiled `envoy.config.core.v3.DataSource` message and reads
-//! its `inline_string` field as the dialect name (`"openai"` /
-//! `"anthropic"`, case-insensitive). An Any's type URL is just an opaque
-//! `prefix/full.type.name` string — only the suffix needs to resolve against
-//! the descriptor pool — so pointing `type.llmproxy.dev` at `DataSource` is
-//! legal, if a little unusual. Once this filter grows a second config field
-//! (per-dialect overrides, a token-rate-limit budget knob, etc.) it should
-//! get its own vendored proto instead of stretching `DataSource` further.
+//! The filter owns its dialect field and its opaque pricing JSON carrier.
+//! Pricing remains JSON because its strict schema is shared with the dialect
+//! price-list surface and is validated by this filter at listener creation.
+//! The old `DataSource` shape remains accepted for one release through
+//! [`LegacyUsageFilterFactory`].
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -50,9 +44,11 @@ use serde::Deserialize;
 use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
 use crate::usage::{extract_json_usage, Dialect, SseUsageScanner, TokenUsage};
 
-/// Type URL this filter is registered under (see the module doc for the
-/// `DataSource`-reuse rationale).
-pub const TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+/// Canonical type URL for the owned usage configuration.
+pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
+
+/// Borrowed type URL accepted for one release after the WP-47 migration.
+pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
 
 /// Upper bound on the response body this filter will accumulate to parse as a
 /// single non-streaming JSON document. A response over this size still
@@ -99,7 +95,7 @@ impl HttpFilterFactory for UsageFilterFactory {
         config: &DynamicMessage,
         _ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let parsed = parse_factory_config(config)?;
+        let parsed = parse_owned_factory_config(config)?;
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
             pricing: parsed.pricing,
@@ -110,37 +106,43 @@ impl HttpFilterFactory for UsageFilterFactory {
         &self,
         config: &DynamicMessage,
     ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
-        let dialect = parse_config(config)?;
+        let dialect = parse_owned_config(config)?;
         Ok(Arc::new(UsagePerRouteConfig(dialect)))
     }
 }
 
-/// Read the configured dialect out of a `DataSource`-shaped `typed_config`.
-fn parse_config(config: &DynamicMessage) -> Result<Dialect, ConfigError> {
-    let invalid = |reason: String| ConfigError::InvalidValue {
-        field_path: "typed_config.inline_string".to_string(),
-        reason,
-    };
+/// Parse one dialect value with a caller-supplied wire field path.
+fn parse_dialect(raw: String, field_path: &str) -> Result<Dialect, ConfigError> {
+    let raw = raw.to_ascii_lowercase();
+    match raw.as_str() {
+        "openai" => Ok(Dialect::OpenAi),
+        "anthropic" => Ok(Dialect::Anthropic),
+        _ => Err(ConfigError::InvalidValue {
+            field_path: field_path.to_string(),
+            reason: format!("expected `openai` or `anthropic`, got `{raw}`"),
+        }),
+    }
+}
 
+/// Read the dialect out of an owned `Usage` typed config.
+fn parse_owned_config(config: &DynamicMessage) -> Result<Dialect, ConfigError> {
+    let raw = config
+        .get_field_by_name("dialect")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    parse_dialect(raw, "typed_config.dialect")
+}
+
+/// Read the dialect out of the borrowed `DataSource` compatibility config.
+fn parse_legacy_config(config: &DynamicMessage) -> Result<Dialect, ConfigError> {
     let raw = config
         .get_field_by_name("inline_string")
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default();
-
-    match raw.to_ascii_lowercase().as_str() {
-        "openai" => Ok(Dialect::OpenAi),
-        "anthropic" => Ok(Dialect::Anthropic),
-        _ => Err(invalid(format!(
-            "expected `openai` or `anthropic`, got `{raw}`"
-        ))),
-    }
+    parse_dialect(raw, "typed_config.inline_string")
 }
 
-/// The temporary DataSource carrier accepts its historic bare dialect and,
-/// when pricing is enabled, a strict JSON object.  Keeping the card on the
-/// listener config means a stream captures the exact card/version at creation
-/// time; a later reload creates a new factory rather than mutating in-flight
-/// requests.
+/// The old DataSource carrier accepted a bare dialect or a strict JSON object.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FactoryWire {
@@ -178,6 +180,13 @@ struct TierWire {
     output_nanodollars_per_token: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PricingWire {
+    price_list: PriceListWire,
+    providers: HashMap<String, String>,
+}
+
 #[derive(Clone)]
 struct PricingContext {
     list: PriceList,
@@ -198,28 +207,7 @@ fn invalid_config(reason: impl Into<String>) -> ConfigError {
     }
 }
 
-fn parse_factory_config(config: &DynamicMessage) -> Result<ParsedFactoryConfig, ConfigError> {
-    let raw = config
-        .get_field_by_name("inline_string")
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default();
-    if !raw.trim_start().starts_with('{') {
-        return Ok(ParsedFactoryConfig {
-            dialect: parse_config(config)?,
-            pricing: None,
-        });
-    }
-    let wire: FactoryWire = serde_json::from_str(&raw)
-        .map_err(|e| invalid_config(format!("invalid pricing configuration: {e}")))?;
-    let dialect = match wire.dialect.to_ascii_lowercase().as_str() {
-        "openai" => Dialect::OpenAi,
-        "anthropic" => Dialect::Anthropic,
-        other => {
-            return Err(invalid_config(format!(
-                "expected `openai` or `anthropic`, got `{other}`"
-            )))
-        }
-    };
+fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
     let effective_from = chrono::DateTime::parse_from_rfc3339(&wire.price_list.effective_from)
         .map_err(|e| invalid_config(format!("price_list.effective_from must be RFC3339: {e}")))?
         .with_timezone(&chrono::Utc)
@@ -274,13 +262,105 @@ fn parse_factory_config(config: &DynamicMessage) -> Result<ParsedFactoryConfig, 
                 .collect(),
         });
     }
+    Ok(PricingContext {
+        list: PriceList::new(wire.price_list.version.as_deref(), effective_from, entries),
+        providers: wire.providers,
+    })
+}
+
+fn parse_owned_factory_config(config: &DynamicMessage) -> Result<ParsedFactoryConfig, ConfigError> {
+    let dialect = parse_owned_config(config)?;
+    let pricing_json = config
+        .get_field_by_name("pricing_json")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let pricing = if pricing_json.trim().is_empty() {
+        None
+    } else {
+        let wire: PricingWire =
+            serde_json::from_str(&pricing_json).map_err(|e| ConfigError::InvalidValue {
+                field_path: "typed_config.pricing_json".to_string(),
+                reason: format!("invalid pricing configuration: {e}"),
+            })?;
+        Some(parse_pricing(wire).map_err(|error| match error {
+            ConfigError::InvalidValue { reason, .. } => ConfigError::InvalidValue {
+                field_path: "typed_config.pricing_json".to_string(),
+                reason,
+            },
+            other => other,
+        })?)
+    };
+    Ok(ParsedFactoryConfig { dialect, pricing })
+}
+
+fn parse_legacy_factory_config(
+    config: &DynamicMessage,
+) -> Result<ParsedFactoryConfig, ConfigError> {
+    let raw = config
+        .get_field_by_name("inline_string")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if !raw.trim_start().starts_with('{') {
+        return Ok(ParsedFactoryConfig {
+            dialect: parse_legacy_config(config)?,
+            pricing: None,
+        });
+    }
+    let wire: FactoryWire = serde_json::from_str(&raw)
+        .map_err(|e| invalid_config(format!("invalid pricing configuration: {e}")))?;
+    let dialect = parse_dialect(wire.dialect, "typed_config.inline_string")?;
+    let pricing = parse_pricing(PricingWire {
+        price_list: wire.price_list,
+        providers: wire.providers,
+    })?;
     Ok(ParsedFactoryConfig {
         dialect,
-        pricing: Some(PricingContext {
-            list: PriceList::new(wire.price_list.version.as_deref(), effective_from, entries),
-            providers: wire.providers,
-        }),
+        pricing: Some(pricing),
     })
+}
+
+/// Decoder for [`LEGACY_TYPE_URL`]. It retains old `DataSource` field paths
+/// while making the compatibility path visible during migration.
+#[derive(Default)]
+pub struct LegacyUsageFilterFactory;
+
+fn warn_legacy_config() {
+    tracing::warn!(
+        legacy_type_url = LEGACY_TYPE_URL,
+        replacement_type_url = TYPE_URL,
+        "llmproxy.usage uses a deprecated borrowed typed_config; migrate to llmproxy.filters.v0.Usage before the next release"
+    );
+}
+
+impl HttpFilterFactory for LegacyUsageFilterFactory {
+    fn type_url(&self) -> &'static str {
+        LEGACY_TYPE_URL
+    }
+
+    fn may_buffer_response(&self) -> bool {
+        false
+    }
+
+    fn create(
+        &self,
+        config: &DynamicMessage,
+        _ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        warn_legacy_config();
+        let parsed = parse_legacy_factory_config(config)?;
+        Ok(Box::new(UsageFilterInstanceFactory {
+            dialect: parsed.dialect,
+            pricing: parsed.pricing,
+        }))
+    }
+
+    fn parse_per_route(
+        &self,
+        config: &DynamicMessage,
+    ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
+        warn_legacy_config();
+        Ok(Arc::new(UsagePerRouteConfig(parse_legacy_config(config)?)))
+    }
 }
 
 /// Created once per (filter config, listener); stateless beyond the parsed
@@ -712,6 +792,15 @@ mod tests {
         msg
     }
 
+    fn usage_config(dialect: &str) -> DynamicMessage {
+        let desc = proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.Usage")
+            .expect("Usage is compiled into proxy-api");
+        let mut msg = DynamicMessage::new(desc);
+        msg.set_field_by_name("dialect", prost_reflect::Value::String(dialect.to_string()));
+        msg
+    }
+
     // --- behavior tests -------------------------------------------------------
 
     #[test]
@@ -1006,9 +1095,35 @@ mod tests {
     // --- config parsing ---------------------------------------------------
 
     #[test]
+    fn owned_config_resolves_and_parses_dialect() {
+        let config = usage_config("OpenAI");
+        assert_eq!(
+            parse_owned_config(&config).expect("valid dialect"),
+            Dialect::OpenAi
+        );
+        assert!(proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.Usage")
+            .is_some());
+    }
+
+    #[test]
+    fn owned_config_parses_the_current_pricing_json_payload() {
+        let mut config = usage_config("anthropic");
+        config.set_field_by_name(
+            "pricing_json",
+            prost_reflect::Value::String(
+                r#"{"price_list":{"effective_from":"2026-09-01T00:00:00Z","entries":[{"provider_type":"anthropic","model":"claude-sonnet","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":1,"cached_input_nanodollars_per_token":1,"cache_write_nanodollars_per_token":1,"output_nanodollars_per_token":1}]}]},"providers":{"provider:anthropic":"anthropic"}}"#.to_string(),
+            ),
+        );
+        let parsed = parse_owned_factory_config(&config).expect("owned pricing config");
+        assert_eq!(parsed.dialect, Dialect::Anthropic);
+        assert!(parsed.pricing.is_some());
+    }
+
+    #[test]
     fn config_accepts_openai_case_insensitively() {
         for value in ["openai", "OpenAI", "OPENAI"] {
-            let dialect = parse_config(&data_source(value)).expect("valid dialect");
+            let dialect = parse_owned_config(&usage_config(value)).expect("valid dialect");
             assert_eq!(dialect, Dialect::OpenAi);
         }
     }
@@ -1016,17 +1131,18 @@ mod tests {
     #[test]
     fn config_accepts_anthropic_case_insensitively() {
         for value in ["anthropic", "Anthropic", "ANTHROPIC"] {
-            let dialect = parse_config(&data_source(value)).expect("valid dialect");
+            let dialect = parse_owned_config(&usage_config(value)).expect("valid dialect");
             assert_eq!(dialect, Dialect::Anthropic);
         }
     }
 
     #[test]
     fn config_rejects_unknown_dialect() {
-        let err = parse_config(&data_source("gemini")).expect_err("unknown dialect must fail");
+        let err =
+            parse_owned_config(&usage_config("gemini")).expect_err("unknown dialect must fail");
         match err {
             ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(field_path, "typed_config.inline_string");
+                assert_eq!(field_path, "typed_config.dialect");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
@@ -1034,10 +1150,10 @@ mod tests {
 
     #[test]
     fn config_rejects_empty_dialect() {
-        let err = parse_config(&data_source("")).expect_err("empty dialect must fail");
+        let err = parse_owned_config(&usage_config("")).expect_err("empty dialect must fail");
         match err {
             ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(field_path, "typed_config.inline_string");
+                assert_eq!(field_path, "typed_config.dialect");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
@@ -1047,7 +1163,7 @@ mod tests {
     fn factory_creates_a_working_filter() {
         let factory = UsageFilterFactory;
         let instance_factory = factory
-            .create(&data_source("openai"), &FactoryContext::default())
+            .create(&usage_config("openai"), &FactoryContext::default())
             .expect("valid config builds a factory");
         let mut filter = instance_factory.create_filter();
         let mut cb = TestCallbacks::new();
@@ -1101,13 +1217,13 @@ mod tests {
     fn parse_per_route_rejects_an_invalid_dialect_as_invalid_value() {
         let factory = UsageFilterFactory;
         for invalid in ["gemini", ""] {
-            let err = match factory.parse_per_route(&data_source(invalid)) {
+            let err = match factory.parse_per_route(&usage_config(invalid)) {
                 Ok(_) => panic!("invalid dialect must fail to parse"),
                 Err(err) => err,
             };
             match err {
                 ConfigError::InvalidValue { field_path, .. } => {
-                    assert_eq!(field_path, "typed_config.inline_string");
+                    assert_eq!(field_path, "typed_config.dialect");
                 }
                 ConfigError::Unimplemented { .. } => panic!(
                     "must not be Unimplemented -- that variant is swallowed by \
@@ -1124,7 +1240,7 @@ mod tests {
     fn parse_per_route_accepts_route_level_dialect() {
         let factory = UsageFilterFactory;
         let per_route = factory
-            .parse_per_route(&data_source("anthropic"))
+            .parse_per_route(&usage_config("anthropic"))
             .expect("valid per-route config");
         let dialect = per_route
             .as_any()
@@ -1132,5 +1248,20 @@ mod tests {
             .expect("UsagePerRouteConfig")
             .0;
         assert_eq!(dialect, Dialect::Anthropic);
+    }
+
+    #[test]
+    fn legacy_config_still_parses_through_compatibility_factory() {
+        let factory = LegacyUsageFilterFactory;
+        let instance_factory = factory
+            .create(&data_source("anthropic"), &FactoryContext::default())
+            .expect("legacy DataSource config remains accepted for one release");
+        let mut filter = instance_factory.create_filter();
+        let mut cb = TestCallbacks::new();
+        let mut headers = response_headers("application/json");
+        filter.encode_headers(&mut cb, &mut headers, false);
+        let mut data = Bytes::from_static(br#"{"usage":{"input_tokens":2,"output_tokens":3}}"#);
+        filter.encode_data(&mut cb, &mut data, true);
+        assert_eq!(cb.llm().usage.expect("legacy filter runs").input_tokens, 2);
     }
 }

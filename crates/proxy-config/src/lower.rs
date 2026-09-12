@@ -423,6 +423,10 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // RateLimitSettings has unrelated xDS fields; accepting any of them
         // would claim the limiter honors a knob it never reads.
         "envoy.config.core.v3.RateLimitSettings" => &["max_tokens", "fill_rate"],
+        // WP-47 increment 3: owned usage-filter configuration. The pricing
+        // payload is intentionally opaque JSON; usage_filter validates its
+        // schema before building the listener factory.
+        "llmproxy.filters.v0.Usage" => &["dialect", "pricing_json"],
         // WP-62 increment 3: the Redis-backed shared store. `url` is an
         // `envoy.config.core.v3.DataSource`, already listed above under its
         // own entry -- same reasoning as `hmac_secret`.
@@ -1715,7 +1719,9 @@ pub const TOKEN_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0
 /// factory just as they pin the canonical type URL.
 pub const LEGACY_TOKEN_LIMIT_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
-pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
+/// One-release compatibility alias for the WP-47 usage-filter migration.
+pub const LEGACY_USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
 pub const BODY_REWRITE_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
@@ -1883,11 +1889,15 @@ fn check_lane_h_filter_order(
         // alone is a perfectly ordinary chain.
         let first_types = if first_type == TOKEN_LIMIT_FILTER_TYPE {
             &[TOKEN_LIMIT_FILTER_TYPE, LEGACY_TOKEN_LIMIT_FILTER_TYPE][..]
+        } else if first_type == USAGE_FILTER_TYPE {
+            &[USAGE_FILTER_TYPE, LEGACY_USAGE_FILTER_TYPE][..]
         } else {
             &[first_type][..]
         };
         let second_types = if second_type == TOKEN_LIMIT_FILTER_TYPE {
             &[TOKEN_LIMIT_FILTER_TYPE, LEGACY_TOKEN_LIMIT_FILTER_TYPE][..]
+        } else if second_type == USAGE_FILTER_TYPE {
+            &[USAGE_FILTER_TYPE, LEGACY_USAGE_FILTER_TYPE][..]
         } else {
             &[second_type][..]
         };

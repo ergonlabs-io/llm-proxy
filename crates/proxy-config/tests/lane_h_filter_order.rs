@@ -20,9 +20,9 @@ use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, S
 // leave `lower.rs` free to drift from both.
 use proxy_config::lower::{
     AUTH_FILTER_TYPE as AUTH, BODY_REWRITE_FILTER_TYPE as BODY_REWRITE,
-    LEGACY_TOKEN_LIMIT_FILTER_TYPE as LEGACY_TOKEN_LIMIT, MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ,
-    SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT,
-    USAGE_FILTER_TYPE as USAGE,
+    LEGACY_TOKEN_LIMIT_FILTER_TYPE as LEGACY_TOKEN_LIMIT, LEGACY_USAGE_FILTER_TYPE as LEGACY_USAGE,
+    MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT,
+    TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT, USAGE_FILTER_TYPE as USAGE,
 };
 
 /// `lower.rs` cannot import the filters' constants — `proxy-filters` depends
@@ -67,6 +67,13 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
          silently stops firing"
     );
     assert_eq!(
+        LEGACY_USAGE,
+        proxy_filters::usage_filter::LEGACY_TYPE_URL,
+        "the legacy usage-filter type URL changed; update LEGACY_USAGE_FILTER_TYPE in \
+         proxy-config/src/lower.rs or old configs will lose ordering protection during \
+         the one-release compatibility window"
+    );
+    assert_eq!(
         BODY_REWRITE,
         proxy_filters::body_rewrite_filter::TYPE_URL,
         "the body_rewrite filter's type URL changed; update `BODY_REWRITE_FILTER_TYPE` in \
@@ -98,7 +105,8 @@ fn filter_entry(name: &str, type_url: &str) -> String {
         }
         TOKEN_LIMIT => "\n                      max_tokens: 10\n                      fill_rate: 1.0",
         LEGACY_TOKEN_LIMIT => "\n                      max_tokens: 10\n                      fill_rate: 1.0",
-        USAGE => "\n                      inline_string: \"\"",
+        USAGE => "\n                      dialect: openai",
+        LEGACY_USAGE => "\n                      inline_string: \"\"",
         BODY_REWRITE => "\n                      default_value: true\n                      runtime_key: openai",
         MODEL_AUTHZ => "\n                      policies: []",
         SPEND_LIMIT => "\n                      pricing: []",

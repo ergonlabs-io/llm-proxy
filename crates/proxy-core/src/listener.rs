@@ -84,6 +84,13 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         // -- it only does anything on a route that configures it, and a filter
         // that isn't in the registry is a hard config error at load time.
         registry.register(Arc::new(proxy_filters::usage_filter::UsageFilterFactory));
+        // WP-47 migration compatibility: hand-written bootstraps using the
+        // borrowed DataSource carrier continue to load for one release.
+        // Its factory emits a deprecation warning and preserves old field
+        // semantics while new configs use the owned Usage message.
+        registry.register(Arc::new(
+            proxy_filters::usage_filter::LegacyUsageFilterFactory,
+        ));
         // WP-45 increment 2b (Lane H): the request-body rewrite filter
         // (forced `stream_options.include_usage` for OpenAI-dialect
         // streaming requests). Also registered unconditionally, same

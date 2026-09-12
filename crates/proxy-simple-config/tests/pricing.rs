@@ -39,16 +39,22 @@ fn valid_inline_price_list_lowers() {
 #[test]
 fn rate_card_reaches_the_listener_usage_filter_with_actual_provider_map() {
     let lowered = lower(&parse(BASE)).expect("rate card validates");
-    let inline = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+    let typed_config = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
         ["filters"][0]["typed_config"]["http_filters"]
         .as_array()
         .expect("filters")
         .iter()
         .find(|filter| filter["name"] == "llmproxy.usage")
-        .expect("usage filter")["typed_config"]["inline_string"]
-        .as_str()
-        .expect("rate card carrier");
-    let carrier: serde_json::Value = serde_json::from_str(inline).expect("strict JSON carrier");
+        .expect("usage filter")["typed_config"]
+        .clone();
+    assert_eq!(typed_config["@type"], proxy_filters::usage_filter::TYPE_URL);
+    assert_eq!(typed_config["dialect"], "openai");
+    let carrier: serde_json::Value = serde_json::from_str(
+        typed_config["pricing_json"]
+            .as_str()
+            .expect("rate card carrier"),
+    )
+    .expect("strict JSON carrier");
     assert_eq!(carrier["price_list"]["version"], "2026-09");
     assert_eq!(carrier["providers"]["provider:openai"], "openai");
 }

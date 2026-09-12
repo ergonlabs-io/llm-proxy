@@ -69,7 +69,7 @@ const USAGE_FILTER_NAME: &str = "llmproxy.usage";
 /// pins the two together via a dev-dependency, and a drift that slipped past
 /// it would still be a loud bind-time error ("no registered factory for
 /// type_url"), never a silent skip.
-const USAGE_FILTER_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
+const USAGE_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
 
 /// The body-rewrite filter's name in `http_filters`, gated by
 /// `observability.force_usage_reporting` (default `true`). Same
@@ -334,8 +334,8 @@ fn lower_pricing(
     }
 }
 
-/// Serialize the strict dialect card into the usage filter's temporary
-/// DataSource carrier.  This is listener-level (not route-level): the card
+/// Serialize the strict dialect card into the usage filter's pricing JSON
+/// carrier. This is listener-level (not route-level): the card
 /// must be captured once per stream, while the actual provider is resolved
 /// from the cluster the router really dialled at response end.
 fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value {
@@ -1131,7 +1131,7 @@ fn lower_route(
     let mut typed_per_filter_config = json!({
         USAGE_FILTER_NAME: {
             "@type": USAGE_FILTER_TYPE_URL,
-            "inline_string": primary_dialect,
+            "dialect": primary_dialect,
         }
     });
     // Token accounting follows the ROUTE's provider here too, for the exact
@@ -1361,7 +1361,7 @@ fn lower_model(
     let mut typed_per_filter_config = json!({
         USAGE_FILTER_NAME: {
             "@type": USAGE_FILTER_TYPE_URL,
-            "inline_string": dialect,
+            "dialect": dialect,
         }
     });
     if force_usage_reporting(config) {
@@ -1896,21 +1896,19 @@ fn lower_listener(
         // `token_limit_filter`'s module doc, "Filter position" section.
         http_filters.push(token_limit_filter);
     }
-    let usage_config = pricing
-        .map(|mut pricing| {
-            pricing["dialect"] = Value::String(default_dialect.to_string());
-            pricing.to_string()
-        })
-        .unwrap_or_else(|| default_dialect.to_string());
+    let mut usage_config = json!({
+        "@type": USAGE_FILTER_TYPE_URL,
+        "dialect": default_dialect,
+    });
+    if let Some(pricing) = pricing {
+        usage_config["pricing_json"] = Value::String(pricing.to_string());
+    }
     http_filters.push(json!({
         // Before the router, so it is in the encode chain (S2.1: encoder
         // callbacks run in REVERSE config order) and sees response bytes
         // on their way back out.
         "name": USAGE_FILTER_NAME,
-        "typed_config": {
-            "@type": USAGE_FILTER_TYPE_URL,
-            "inline_string": usage_config,
-        }
+        "typed_config": usage_config,
     }));
     http_filters.push(json!({
         "name": "envoy.filters.http.router",

@@ -1,0 +1,21 @@
+// Configuration for the llm-proxy usage filter (WP-34 / WP-47).
+//
+// This owns the filter's vocabulary instead of borrowing Envoy's DataSource,
+// whose inline_string field used to carry either a dialect or a JSON pricing
+// carrier. The JSON remains intentionally opaque here: its strict schema and
+// pricing semantics belong to the usage filter, while this message owns the
+// wire-level fields and their presence.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+// Configures `llmproxy.usage`.
+message Usage {
+  // Required. Provider response dialect used for usage extraction.
+  optional string dialect = 1;
+
+  // Optional strict JSON object containing `price_list` and `providers`.
+  // Empty means pricing is disabled for this filter instance.
+  string pricing_json = 2;
+}

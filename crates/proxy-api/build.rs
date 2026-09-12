@@ -55,6 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Envoy RateLimitSettings decoder remains registered for one release,
         // but new configs lower to this message.
         "llmproxy/filters/v0/token_limit.proto",
+        // WP-47 increment 3: owned usage dialect and pricing carrier. The
+        // legacy DataSource decoder remains registered for one release.
+        "llmproxy/filters/v0/usage.proto",
         // WP-50 increment 3a: per-tenant model allow-lists.
         "llmproxy/filters/v0/model_authz.proto",
         // WP-50 increment 3c-i: the spend-budget filter's (cluster, model)
