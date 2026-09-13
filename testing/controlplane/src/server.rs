@@ -134,6 +134,43 @@ impl AggregatedDiscoveryService for ScriptedAds {
                             _ => break 'steps,
                         }
                     },
+                    Step::WaitForAck {
+                        type_url,
+                        version_info,
+                        response_nonce,
+                    } => loop {
+                        match incoming.next().await {
+                            Some(Ok(req)) => {
+                                log.record(stream_id, &req);
+                                let is_ack = req.error_detail.is_none()
+                                    && !req.response_nonce.is_empty()
+                                    && req.type_url == type_url
+                                    && req.version_info == version_info
+                                    && req.response_nonce == response_nonce;
+                                if is_ack {
+                                    break;
+                                }
+                            }
+                            _ => break 'steps,
+                        }
+                    },
+                    Step::WaitForNack {
+                        type_url,
+                        response_nonce,
+                    } => loop {
+                        match incoming.next().await {
+                            Some(Ok(req)) => {
+                                log.record(stream_id, &req);
+                                if req.error_detail.is_some()
+                                    && req.type_url == type_url
+                                    && req.response_nonce == response_nonce
+                                {
+                                    break;
+                                }
+                            }
+                            _ => break 'steps,
+                        }
+                    },
                     Step::Push {
                         type_url,
                         version_info,

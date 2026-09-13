@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const CLUSTER_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
+const LISTENER_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
 
 /// Generous bound on any single wire round-trip in these tests (rule 14:
 /// bound every request). Not a performance assertion -- just turns "the
@@ -188,6 +189,197 @@ async fn records_nack() {
     assert_eq!(log[1].kind(), RequestKind::Nack);
     assert_eq!(log[1].error_detail.as_deref(), Some("bad cluster config"));
 
+    drop(req_tx);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn wait_for_ack_ignores_initial_requests_and_advances_on_the_exact_ack() {
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+        Step::WaitForAck {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: "v1".to_string(),
+            response_nonce: "n1".to_string(),
+        },
+        Step::Push {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: "v2".to_string(),
+            nonce: "n2".to_string(),
+            resources: vec![],
+        },
+    ])
+    .await
+    .expect("harness spawns");
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+    let (req_tx, req_rx) = mpsc::channel(4);
+    let mut inbound = client
+        .stream_aggregated_resources(OutboundStream(req_rx))
+        .await
+        .expect("stream opens")
+        .into_inner();
+
+    req_tx
+        .send(DiscoveryRequest {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let first = timeout(STEP_TIMEOUT, inbound.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    req_tx
+        .send(DiscoveryRequest {
+            type_url: LISTENER_TYPE_URL.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), inbound.message())
+            .await
+            .is_err(),
+        "an unrelated initial subscription must not release an ACK wait"
+    );
+
+    req_tx
+        .send(DiscoveryRequest {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: first.version_info.clone(),
+            response_nonce: "wrong-nonce".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), inbound.message())
+            .await
+            .is_err(),
+        "an ACK for another response must not release this wait"
+    );
+
+    req_tx
+        .send(DiscoveryRequest {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: first.version_info,
+            response_nonce: first.nonce,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let second = timeout(STEP_TIMEOUT, inbound.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.version_info, "v2");
+
+    let log = harness.log.snapshot();
+    assert_eq!(log.len(), 4);
+    assert_eq!(log[0].kind(), RequestKind::Initial);
+    assert_eq!(log[1].kind(), RequestKind::Initial);
+    assert_eq!(log[2].kind(), RequestKind::Ack);
+    assert_eq!(log[2].response_nonce, "wrong-nonce");
+    assert_eq!(log[3].kind(), RequestKind::Ack);
+    drop(req_tx);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn wait_for_nack_does_not_accept_an_ack_for_the_same_nonce() {
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+        Step::WaitForNack {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            response_nonce: "n1".to_string(),
+        },
+        Step::Push {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: "recovery".to_string(),
+            nonce: "n2".to_string(),
+            resources: vec![],
+        },
+    ])
+    .await
+    .expect("harness spawns");
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+    let (req_tx, req_rx) = mpsc::channel(4);
+    let mut inbound = client
+        .stream_aggregated_resources(OutboundStream(req_rx))
+        .await
+        .expect("stream opens")
+        .into_inner();
+
+    req_tx
+        .send(DiscoveryRequest {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let first = timeout(STEP_TIMEOUT, inbound.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    req_tx
+        .send(DiscoveryRequest {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            version_info: first.version_info.clone(),
+            response_nonce: first.nonce.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(100), inbound.message())
+            .await
+            .is_err(),
+        "an ACK must not release a NACK wait"
+    );
+
+    req_tx
+        .send(DiscoveryRequest {
+            type_url: CLUSTER_TYPE_URL.to_string(),
+            response_nonce: first.nonce,
+            error_detail: Some(RpcStatus {
+                code: 3,
+                message: "reject v1".to_string(),
+                details: vec![],
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let recovery = timeout(STEP_TIMEOUT, inbound.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovery.version_info, "recovery");
+
+    let log = harness.log.snapshot();
+    assert_eq!(log.len(), 3);
+    assert_eq!(log[1].kind(), RequestKind::Ack);
+    assert_eq!(log[2].kind(), RequestKind::Nack);
     drop(req_tx);
     harness.shutdown().await;
 }

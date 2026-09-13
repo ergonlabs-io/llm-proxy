@@ -35,6 +35,21 @@ pub enum Step {
     /// without sending a response. This models control-plane ordering such as
     /// "do not send the next generation until the previous one was ACKed".
     WaitForRequest { type_url: String },
+    /// Wait for an ACK of one exact response. Requests for other resource
+    /// types, initial subscriptions, and ACKs carrying another nonce remain
+    /// recorded but do not advance the script.
+    WaitForAck {
+        type_url: String,
+        version_info: String,
+        response_nonce: String,
+    },
+    /// Wait for a NACK of one exact response. `version_info` is deliberately
+    /// not matched: SotW NACKs carry the last accepted version, not the
+    /// rejected response's version.
+    WaitForNack {
+        type_url: String,
+        response_nonce: String,
+    },
     /// End the current `StreamAggregatedResources` stream from the server
     /// side, the way a control plane going away does. The next stream the
     /// server accepts resumes the script at the step after this one — it
