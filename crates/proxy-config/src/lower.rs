@@ -2721,12 +2721,13 @@ fn convert_api_config_source(
     // accessor keeps every named variant explicit (no `_ =>` fallthrough), so
     // adding a variant upstream is a compile error rather than a silent
     // acceptance -- ground rule #1 applied to enums.
-    match api.api_type() {
-        ApiType::Grpc => {}
-        ApiType::DeltaGrpc | ApiType::AggregatedDeltaGrpc => {
+    let protocol = match api.api_type() {
+        ApiType::Grpc => crate::ir::AdsProtocol::Sotw,
+        ApiType::DeltaGrpc => crate::ir::AdsProtocol::Delta,
+        ApiType::AggregatedDeltaGrpc => {
             return Err(unsupported(
                 format!("{path}.api_type"),
-                "delta xDS is not implemented yet (WP-22); use GRPC",
+                "AGGREGATED_DELTA_GRPC is set implicitly by dynamic_resources.ads_config; use DELTA_GRPC",
             ));
         }
         ApiType::Rest | ApiType::DeprecatedAndUnavailableDoNotUse => {
@@ -2741,7 +2742,7 @@ fn convert_api_config_source(
                 "AGGREGATED_GRPC is set implicitly by dynamic_resources.ads_config; use GRPC",
             ));
         }
-    }
+    };
 
     if !api.transport_api_version().eq(&core_v3::ApiVersion::V3) {
         return Err(unsupported(
@@ -2803,6 +2804,7 @@ fn convert_api_config_source(
 
     Ok(Some(AdsConfig {
         cluster,
+        protocol,
         lds,
         cds,
         initial_fetch_timeout,

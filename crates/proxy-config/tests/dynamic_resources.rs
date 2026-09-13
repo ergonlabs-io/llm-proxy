@@ -66,6 +66,7 @@ fn a_full_ads_bootstrap_lowers_to_ads_config() {
     let snap = snapshot_from(&yaml).expect("a well-formed ADS bootstrap must load");
     let ads = snap.ads.expect("dynamic_resources must lower to Some");
     assert_eq!(ads.cluster, "xds_cluster");
+    assert_eq!(ads.protocol, proxy_config::ir::AdsProtocol::Sotw);
     assert!(ads.lds, "lds_config sets ads, so LDS is subscribed");
     assert!(ads.cds, "cds_config sets ads, so CDS is subscribed");
     assert_eq!(ads.node.id, "proxy-1");
@@ -153,7 +154,7 @@ fn rest_api_type_is_refused_naming_api_type() {
 }
 
 #[test]
-fn delta_grpc_api_type_is_refused_naming_wp22() {
+fn delta_grpc_api_type_selects_delta_transport() {
     let yaml = with_ads(
         r#"dynamic_resources:
   ads_config:
@@ -164,12 +165,11 @@ fn delta_grpc_api_type_is_refused_naming_wp22() {
   cds_config: { ads: {}, resource_api_version: V3 }
 "#,
     );
-    let err = snapshot_from(&yaml).expect_err("delta xDS must be refused");
-    assert_eq!(err_path(&err), "dynamic_resources.ads_config.api_type");
-    assert!(
-        format!("{err}").contains("WP-22"),
-        "the message must say which work package owns delta: {err}"
-    );
+    let ads = snapshot_from(&yaml)
+        .expect("delta xDS must lower")
+        .ads
+        .unwrap();
+    assert_eq!(ads.protocol, proxy_config::ir::AdsProtocol::Delta);
 }
 
 #[test]

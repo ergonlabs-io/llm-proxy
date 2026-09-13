@@ -15,7 +15,8 @@ Work toward **v0.3.0** (ADS/xDS) is in progress. The proxy now connects to an AD
 ACKs/NACKs strict LDS/CDS/RDS/SDS/EDS resources, applies accepted snapshots, reconnects with
 resync, and gates readiness/request admission on cluster warming. Named RDS delivery warms
 dependent listeners; replacement listeners retain last-good generations until warm, and ADS
-initial-fetch timeout is honored. Delta xDS, init-manager sequencing, and full differential churn
+initial-fetch timeout is honored. Delta ADS now runs end to end for strict incremental resource
+updates; filesystem xDS, init-manager sequencing, SDS removal, and full differential churn
 verification remain open. Configuration loading rejects unsupported sources with full dotted paths.
 Everything else below is WP-50 increment 3 (operator control plane: tenants, budgets, spend),
 which shipped between the v0.2.0 tag and this point and gates neither release â€” see
@@ -23,9 +24,10 @@ which shipped between the v0.2.0 tag and this point and gates neither release â€
 
 ### Added
 
-- **Delta xDS subscription state.** Per-resource accepted versions, removals, named
-  subscribe/unsubscribe differences, ACK/NACK nonce handling, and reconnect persistence now have
-  transport-independent state and tests (`61e70a4`). gRPC delta transport remains open.
+- **Delta ADS transport and application.** `DELTA_GRPC` opens `DeltaAggregatedResources` in the
+  running binary, carries per-resource reconnect versions and named subscription differences,
+  applies before ACK, and incrementally applies CDS/LDS/RDS/EDS updates and removals plus SDS
+  updates. Unsupported delta wrapper variants and SDS removals NACK instead of being ignored.
 - **xDS warming-race script predicates.** Control-plane scenarios can wait for an exact ACK or
   NACK without unrelated subscriptions advancing the script (`376d8d0`).
 - **`x-envoy-upstream-service-time`.** Successful upstream responses report final-attempt elapsed

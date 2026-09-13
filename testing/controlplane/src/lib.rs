@@ -10,10 +10,12 @@
 //! and a go-control-plane docker fixture; this chunk is only the core
 //! scriptable server plus its own self-tests.
 
+pub mod delta;
 pub mod log;
 pub mod script;
 pub mod server;
 
+pub use delta::{DeltaHarness, RecordedDeltaRequest};
 pub use log::{RecordedRequest, RequestKind, RequestLog};
 pub use script::Step;
 pub use server::{Harness, ScriptedAds};

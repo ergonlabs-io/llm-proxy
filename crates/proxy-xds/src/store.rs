@@ -106,6 +106,16 @@ pub enum ApplyError {
     DuplicateName(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaApplyError {
+    /// Delta response supplied same resource more than once.
+    DuplicateName(String),
+    /// Delta response listed same explicit removal more than once.
+    DuplicateRemoval(String),
+    /// Delta response both supplied and removed same name.
+    ConflictingName(String),
+}
+
 impl<T> SotwSet<T> {
     /// A fresh set with no dynamic resources held yet. `static_names` is
     /// fixed for the set's lifetime -- these are the config-file resources
@@ -245,6 +255,74 @@ impl<T: PartialEq> SotwSet<T> {
             shadowed_by_static,
         })
     }
+
+    /// Apply one delta response. Missing names always remain untouched;
+    /// only `removed_names` delete entries, regardless of SotW semantics.
+    pub fn apply_delta(
+        &mut self,
+        resources: Vec<(String, T)>,
+        removed_names: &[String],
+    ) -> Result<ApplyOutcome, DeltaApplyError> {
+        let mut supplied = BTreeSet::new();
+        for (name, _) in &resources {
+            if !supplied.insert(name.clone()) {
+                return Err(DeltaApplyError::DuplicateName(name.clone()));
+            }
+        }
+        let mut removals = BTreeSet::new();
+        for name in removed_names {
+            if !removals.insert(name.clone()) {
+                return Err(DeltaApplyError::DuplicateRemoval(name.clone()));
+            }
+            if supplied.contains(name) {
+                return Err(DeltaApplyError::ConflictingName(name.clone()));
+            }
+        }
+
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        let mut unchanged = Vec::new();
+        let mut shadowed_by_static = Vec::new();
+        for (name, value) in resources {
+            if self.static_names.contains(&name) {
+                shadowed_by_static.push(name);
+                continue;
+            }
+            match self.dynamic.get(&name) {
+                Some(existing) if *existing == value => unchanged.push(name),
+                Some(_) => {
+                    self.dynamic.insert(name.clone(), value);
+                    updated.push(name);
+                }
+                None => {
+                    self.dynamic.insert(name.clone(), value);
+                    added.push(name);
+                }
+            }
+        }
+
+        let mut removed = Vec::new();
+        for name in removals {
+            if self.static_names.contains(&name) {
+                shadowed_by_static.push(name);
+            } else if self.dynamic.remove(&name).is_some() {
+                removed.push(name);
+            }
+        }
+        added.sort();
+        updated.sort();
+        unchanged.sort();
+        shadowed_by_static.sort();
+        shadowed_by_static.dedup();
+
+        Ok(ApplyOutcome {
+            added,
+            updated,
+            unchanged,
+            removed,
+            shadowed_by_static,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +374,35 @@ mod tests {
         assert!(outcome.removed.is_empty());
         assert_eq!(s.names(), vec!["a", "b"]);
         assert_eq!(*s.get("b").unwrap(), 2);
+    }
+
+    #[test]
+    fn delta_changes_only_supplied_and_explicitly_removed_names() {
+        let mut set = SotwSet::new(SetSemantics::FullState, no_statics());
+        set.apply(res(&[("a", 1), ("b", 2)])).unwrap();
+
+        let outcome = set
+            .apply_delta(res(&[("a", 3), ("c", 4)]), &["b".to_string()])
+            .unwrap();
+
+        assert_eq!(outcome.updated, vec!["a"]);
+        assert_eq!(outcome.added, vec!["c"]);
+        assert_eq!(outcome.removed, vec!["b"]);
+        assert_eq!(set.names(), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn rejected_delta_is_atomic() {
+        let mut set = SotwSet::new(SetSemantics::PerName, no_statics());
+        set.apply(res(&[("held", 1)])).unwrap();
+        let before = set.clone();
+
+        assert_eq!(
+            set.apply_delta(res(&[("same", 2)]), &["same".to_string()]),
+            Err(DeltaApplyError::ConflictingName("same".to_string()))
+        );
+        assert_eq!(set.names(), before.names());
+        assert_eq!(set.get("held"), before.get("held"));
     }
 
     #[test]

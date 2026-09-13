@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
-use proxy_config::ir::{NodeIdentity, SnapshotVersion};
+use proxy_config::ir::{AdsProtocol, NodeIdentity, SnapshotVersion};
 use proxy_config::{
     build_snapshot, load_bootstrap_file, ConfigSnapshot, LoadedBootstrap, StrictMode,
 };
@@ -30,8 +30,8 @@ use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
 use proxy_core::tls::SdsSecretRegistry;
 use proxy_xds::{
-    AdsClient, DynamicSecret, Publish, PublishEndpoints, PublishSecrets, Reconnect,
-    ResourceApplier, Subscription, SubscriptionState,
+    AdsClient, DeltaAdsClient, DeltaSubscriptionState, DynamicSecret, Publish, PublishEndpoints,
+    PublishSecrets, Reconnect, ResourceApplier, ResponseHandler, Subscription, SubscriptionState,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Channel;
@@ -1491,19 +1491,39 @@ fn start_ads(
         Subscription::Names(applier.sds_resource_names()),
     ));
 
-    let mut client = AdsClient::new(states).with_node(node.clone());
-    let reconnect = Reconnect::real();
-
-    // Rust note: spawned and the `JoinHandle` dropped -- `AdsClient::run`
-    // never returns (`-> !`), so there is nothing to join, only to abandon at
-    // shutdown. This lands on the control runtime `run_serve` is already
-    // `block_on`'d on (see the OTLP exporter's own `tokio::spawn` above for
-    // the same reasoning): a plain `tokio::spawn`, not `spawn_local`, since
-    // neither the client nor the applier holds any `!Send` worker-local state
-    // (ADR-0003 governs workers, not this control-runtime-only task).
-    tokio::spawn(async move {
-        client.run(&mut grpc_client, applier, reconnect).await;
-    });
+    match ads.protocol {
+        AdsProtocol::Sotw => {
+            let mut client = AdsClient::new(states).with_node(node.clone());
+            tokio::spawn(async move {
+                client
+                    .run(&mut grpc_client, applier, Reconnect::real())
+                    .await;
+            });
+        }
+        AdsProtocol::Delta => {
+            let delta_states = states
+                .into_iter()
+                .map(|state| {
+                    DeltaSubscriptionState::new(
+                        state.type_url(),
+                        if state.has_nothing_to_request() {
+                            Subscription::Names(Default::default())
+                        } else if let Some(names) = applier.desired_names(state.type_url()) {
+                            Subscription::Names(names)
+                        } else {
+                            Subscription::Wildcard
+                        },
+                    )
+                })
+                .collect();
+            let mut client = DeltaAdsClient::new(delta_states).with_node(node.clone());
+            tokio::spawn(async move {
+                client
+                    .run(&mut grpc_client, applier, Reconnect::real())
+                    .await;
+            });
+        }
+    }
 
     Some(apply_rx)
 }

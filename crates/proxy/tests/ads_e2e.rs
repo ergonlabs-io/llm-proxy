@@ -48,7 +48,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use controlplane::{Harness, RequestKind, Step};
+use controlplane::{DeltaHarness, Harness, RequestKind, Step};
 use prost::Message;
 use proxy_api::envoy::config::cluster::v3 as cluster_v3;
 use proxy_api::envoy::config::core::v3 as core_v3;
@@ -58,6 +58,7 @@ use proxy_api::envoy::config::route::v3 as route_v3;
 use proxy_api::envoy::extensions::filters::http::router::v3 as router_v3;
 use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
+use proxy_api::envoy::service::discovery::v3::{DeltaDiscoveryResponse, Resource};
 use rcgen::{CertificateParams, DnType, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream as TokioTcpStream;
@@ -360,7 +361,7 @@ const TEST_A_NEW_CLUSTER: &str = "ads_added_cluster";
 
 /// No listeners at all -- test A only needs `admin` (to read `/config_dump`)
 /// and `dynamic_resources` naming the harness as the ADS cluster.
-fn bootstrap_no_listeners(admin_port: u16, ads_addr: SocketAddr) -> String {
+fn bootstrap_no_listeners(admin_port: u16, ads_addr: SocketAddr, api_type: &str) -> String {
     format!(
         r#"
 node:
@@ -373,7 +374,7 @@ admin:
 
 dynamic_resources:
   ads_config:
-    api_type: GRPC
+    api_type: {api_type}
     transport_api_version: V3
     grpc_services:
       - envoy_grpc: {{ cluster_name: xds_cluster }}
@@ -431,7 +432,7 @@ async fn a_cds_delivered_cluster_reaches_config_dump_in_the_running_binary() {
     ));
     std::fs::write(
         &config_path,
-        bootstrap_no_listeners(admin_port, harness.addr),
+        bootstrap_no_listeners(admin_port, harness.addr, "GRPC"),
     )
     .expect("write config");
 
@@ -467,6 +468,57 @@ async fn a_cds_delivered_cluster_reaches_config_dump_in_the_running_binary() {
          the instant its ACK was observed on the wire (proving `apply_snapshot` published before \
          `main.rs` let the ACK go out) -- got:\n{dump}"
     );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delta_cds_transport_reaches_config_dump_in_running_binary() {
+    let cluster = minimal_cluster("delta_added_cluster", 19998);
+    let harness = DeltaHarness::spawn(DeltaDiscoveryResponse {
+        type_url: CDS_TYPE_URL.to_string(),
+        nonce: "delta-n1".to_string(),
+        resources: vec![Resource {
+            name: cluster.name.clone(),
+            version: "resource-v1".to_string(),
+            resource: Some(any_of(&cluster, CLUSTER_TYPE)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .await
+    .expect("delta harness spawns");
+    let admin_port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-delta-ads-e2e-{}-{admin_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        bootstrap_no_listeners(admin_port, harness.addr, "DELTA_GRPC"),
+    )
+    .expect("write config");
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+    assert!(
+        wait_for_connectable(("127.0.0.1", admin_port), STARTUP_TIMEOUT),
+        "admin did not become connectable; stderr: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    while harness.requests().len() < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let requests = harness.requests();
+    assert!(requests.len() >= 2, "delta request and ACK must reach wire");
+    assert_eq!(requests[1].response_nonce, "delta-n1");
+    assert!(requests[1].error_detail.is_none());
+
+    let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    let dump = get(admin_addr, "/config_dump", "admin.local");
+    assert!(dump.contains("delta_added_cluster"), "got:\n{dump}");
 
     terminate(&mut child);
     let _ = std::fs::remove_file(&config_path);

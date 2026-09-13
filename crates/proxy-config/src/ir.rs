@@ -157,7 +157,7 @@ impl ConfigSnapshot {
 /// `dynamic_resources` (WP-20). Config surface only: nothing in this snapshot
 /// dials anything, and the client that will is `proxy-xds`.
 ///
-/// v1 is deliberately narrow -- `api_type: GRPC`, `transport_api_version: V3`,
+/// v1 is deliberately narrow -- `api_type: GRPC|DELTA_GRPC`, `transport_api_version: V3`,
 /// and exactly one `envoy_grpc` service naming a statically-defined cluster.
 /// Every other member of `ApiConfigSource` is refused at load with its full
 /// dotted path rather than silently ignored (ground rule #1); see
@@ -168,6 +168,8 @@ pub struct AdsConfig {
     /// explicit that this cluster "must be statically defined", so lowering
     /// validates it exists in this same bootstrap.
     pub cluster: ClusterName,
+    /// ADS wire protocol selected by `ApiConfigSource.api_type`.
+    pub protocol: AdsProtocol,
     /// Whether listeners arrive over the ADS channel (bootstrap `lds_config`
     /// with its `ads` field set).
     pub lds: bool,
@@ -179,6 +181,12 @@ pub struct AdsConfig {
     pub initial_fetch_timeout: Option<Duration>,
     /// The xDS `Node` identity echoed on every `DiscoveryRequest` (S8).
     pub node: NodeIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdsProtocol {
+    Sotw,
+    Delta,
 }
 
 /// The bootstrap `node` fields the xDS protocol itself needs. Distinct from

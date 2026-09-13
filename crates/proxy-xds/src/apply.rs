@@ -76,7 +76,9 @@ use proxy_api::envoy::config::endpoint::v3::ClusterLoadAssignment as ClusterLoad
 use proxy_api::envoy::config::listener::v3::Listener as ListenerProto;
 use proxy_api::envoy::config::route::v3::RouteConfiguration as RouteConfigurationProto;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3::Secret as SecretProto;
-use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
+use proxy_api::envoy::service::discovery::v3::{
+    DeltaDiscoveryResponse, DiscoveryResponse, Resource as DeltaResource,
+};
 use proxy_config::ir::{
     ClusterConfig, ConfigSnapshot, DynamicSecret, EndpointIR, ListenerConfig, RouteTable,
     SnapshotVersion,
@@ -86,8 +88,9 @@ use proxy_config::{
 };
 
 use crate::client::ResponseHandler;
+use crate::delta_client::DeltaResponseHandler;
 use crate::secret::decode_secret;
-use crate::store::{ApplyError, ApplyOutcome, SetSemantics, SotwSet};
+use crate::store::{ApplyError, ApplyOutcome, DeltaApplyError, SetSemantics, SotwSet};
 use crate::subscription::Verdict;
 
 /// Full `type_url` a CDS `DiscoveryResponse` carries -- matches the constant
@@ -103,6 +106,62 @@ const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.Cluster
 /// `secret.proto`'s own `package envoy.extensions.transport_sockets.tls.v3;`
 /// plus its `message Secret`, not just copied from memory.
 const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
+
+fn validate_delta_resource(
+    resource: &DeltaResource,
+    index: usize,
+    response_type_url: &str,
+) -> Result<(), String> {
+    let path = format!("delta_response.resources[{index}]");
+    if resource.name.is_empty() {
+        return Err(format!("{path}.name must not be empty"));
+    }
+    if resource.resource_name.is_some() {
+        return Err(format!("{path}.resource_name is not implemented"));
+    }
+    if !resource.aliases.is_empty() {
+        return Err(format!("{path}.aliases is not implemented"));
+    }
+    if resource.ttl.is_some() {
+        return Err(format!("{path}.ttl is not implemented"));
+    }
+    if resource.cache_control.is_some() {
+        return Err(format!("{path}.cache_control is not implemented"));
+    }
+    let Some(any) = resource.resource.as_ref() else {
+        return Err(format!(
+            "{path}.resource must be set; delta heartbeat resources are not implemented"
+        ));
+    };
+    if any.type_url != response_type_url {
+        return Err(format!(
+            "{path}.resource.type_url `{}` does not match delta_response.type_url `{response_type_url}`",
+            any.type_url
+        ));
+    }
+    Ok(())
+}
+
+fn delta_any(resource: &DeltaResource) -> &prost_types::Any {
+    resource
+        .resource
+        .as_ref()
+        .expect("validate_delta_resource checked resource presence")
+}
+
+fn delta_apply_error(type_name: &str, error: DeltaApplyError) -> String {
+    match error {
+        DeltaApplyError::DuplicateName(name) => {
+            format!("{type_name} delta response supplied resource `{name}` more than once")
+        }
+        DeltaApplyError::DuplicateRemoval(name) => {
+            format!("{type_name} delta response removed resource `{name}` more than once")
+        }
+        DeltaApplyError::ConflictingName(name) => {
+            format!("{type_name} delta response both supplied and removed resource `{name}`")
+        }
+    }
+}
 
 /// Where a newly assembled snapshot goes once every resource in a response
 /// has lowered cleanly.
@@ -480,6 +539,300 @@ impl ResourceApplier {
             RDS_TYPE_URL => self.on_rds_response(resp).await,
             other => Verdict::Reject(format!("unknown ADS type_url `{other}`")),
         }
+    }
+
+    /// Validate, apply, then ACK/NACK one delta response. Wrapper fields not
+    /// represented by current IR are refused by dotted path rather than
+    /// silently ignored.
+    pub async fn on_delta_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
+        if !response.removed_resource_names.is_empty() {
+            return Verdict::Reject(
+                "delta_response.removed_resource_names is not implemented; use removed_resources"
+                    .to_string(),
+            );
+        }
+        if !response.resource_errors.is_empty() {
+            return Verdict::Reject(
+                "delta_response.resource_errors is not implemented".to_string(),
+            );
+        }
+        for (index, resource) in response.resources.iter().enumerate() {
+            if let Err(error) = validate_delta_resource(resource, index, &response.type_url) {
+                return Verdict::Reject(error);
+            }
+        }
+
+        match response.type_url.as_str() {
+            CDS_TYPE_URL => self.on_delta_cds_response(response).await,
+            LDS_TYPE_URL => self.on_delta_lds_response(response).await,
+            RDS_TYPE_URL => self.on_delta_rds_response(response).await,
+            EDS_TYPE_URL => self.on_delta_eds_response(response).await,
+            SDS_TYPE_URL => self.on_delta_sds_response(response).await,
+            other => Verdict::Reject(format!("unknown delta ADS type_url `{other}`")),
+        }
+    }
+
+    async fn on_delta_cds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
+        let mut pairs = Vec::with_capacity(response.resources.len());
+        for (index, resource) in response.resources.iter().enumerate() {
+            let any = delta_any(resource);
+            let path = format!("delta_response.resources[{index}].resource");
+            let ir = match lower_dynamic_cluster(any, &path) {
+                Ok(ir) => ir,
+                Err(error) => return Verdict::Reject(error.to_string()),
+            };
+            if ir.name != resource.name {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].name `{}` does not match resource name `{}`",
+                    resource.name, ir.name
+                ));
+            }
+            pairs.push((
+                resource.name.clone(),
+                Entry {
+                    raw: any.value.clone(),
+                    ir: Arc::new(ir),
+                },
+            ));
+        }
+        let outcome = match self
+            .clusters
+            .apply_delta(pairs, &response.removed_resources)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Verdict::Reject(delta_apply_error("CDS", error)),
+        };
+        self.finish(outcome, "cluster").await
+    }
+
+    async fn on_delta_lds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
+        let mut pairs = Vec::with_capacity(response.resources.len());
+        for (index, resource) in response.resources.iter().enumerate() {
+            let any = delta_any(resource);
+            let path = format!("delta_response.resources[{index}].resource");
+            let ir = match lower_dynamic_listener(any, &path) {
+                Ok(ir) => ir,
+                Err(error) => return Verdict::Reject(error.to_string()),
+            };
+            if ir.name != resource.name {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].name `{}` does not match resource name `{}`",
+                    resource.name, ir.name
+                ));
+            }
+            pairs.push((
+                resource.name.clone(),
+                Entry {
+                    raw: any.value.clone(),
+                    ir: Arc::new(ir),
+                },
+            ));
+        }
+        let outcome = match self
+            .listeners
+            .apply_delta(pairs, &response.removed_resources)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Verdict::Reject(delta_apply_error("LDS", error)),
+        };
+        self.finish(outcome, "listener").await
+    }
+
+    async fn on_delta_rds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
+        let mut pairs = Vec::with_capacity(response.resources.len());
+        for (index, resource) in response.resources.iter().enumerate() {
+            let any = delta_any(resource);
+            let path = format!("delta_response.resources[{index}].resource");
+            let ir = match lower_dynamic_route(any, &path) {
+                Ok(ir) => ir,
+                Err(error) => return Verdict::Reject(error.to_string()),
+            };
+            if ir.name != resource.name {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].name `{}` does not match resource name `{}`",
+                    resource.name, ir.name
+                ));
+            }
+            pairs.push((
+                resource.name.clone(),
+                Entry {
+                    raw: any.value.clone(),
+                    ir: Arc::new(ir),
+                },
+            ));
+        }
+        let outcome = match self.routes.apply_delta(pairs, &response.removed_resources) {
+            Ok(outcome) => outcome,
+            Err(error) => return Verdict::Reject(delta_apply_error("RDS", error)),
+        };
+        self.finish(outcome, "route configuration").await
+    }
+
+    async fn on_delta_eds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
+        if self.endpoint_sink.is_none() {
+            return Verdict::Reject(format!(
+                "EDS (`{EDS_TYPE_URL}`) is not applied: this ResourceApplier has no endpoint sink wired"
+            ));
+        }
+        let mut pairs = Vec::with_capacity(response.resources.len());
+        for (index, resource) in response.resources.iter().enumerate() {
+            let any = delta_any(resource);
+            let path = format!("delta_response.resources[{index}].resource");
+            let (name, endpoints) = match lower_dynamic_endpoints(any, &path) {
+                Ok(value) => value,
+                Err(error) => return Verdict::Reject(error.to_string()),
+            };
+            if name != resource.name {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].name `{}` does not match resource name `{name}`",
+                    resource.name
+                ));
+            }
+            pairs.push((
+                name,
+                Entry {
+                    raw: any.value.clone(),
+                    ir: Arc::new(endpoints),
+                },
+            ));
+        }
+
+        let previous = self.endpoints.clone();
+        let outcome = match self
+            .endpoints
+            .apply_delta(pairs, &response.removed_resources)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Verdict::Reject(delta_apply_error("EDS", error)),
+        };
+        let updates: Vec<_> = outcome
+            .added
+            .iter()
+            .chain(outcome.updated.iter())
+            .map(|resource_name| {
+                let endpoints = self
+                    .endpoints
+                    .get(resource_name)
+                    .expect("delta EDS update must be present")
+                    .ir
+                    .as_ref()
+                    .clone();
+                (
+                    resource_name.clone(),
+                    endpoints,
+                    self.eds_clusters_for(resource_name),
+                )
+            })
+            .collect();
+        let removals: Vec<_> = outcome
+            .removed
+            .iter()
+            .map(|resource_name| (resource_name.clone(), self.eds_clusters_for(resource_name)))
+            .collect();
+
+        let sink = self
+            .endpoint_sink
+            .as_mut()
+            .expect("endpoint sink presence checked above");
+        let mut failures = Vec::new();
+        for (resource_name, endpoints, cluster_names) in updates {
+            for cluster_name in cluster_names {
+                if let Err(error) = sink(cluster_name.clone(), endpoints.clone()).await {
+                    failures.push(format!(
+                        "{cluster_name} (resource `{resource_name}`): {error}"
+                    ));
+                }
+            }
+        }
+        for (resource_name, cluster_names) in removals {
+            for cluster_name in cluster_names {
+                if let Err(error) = sink(cluster_name.clone(), Vec::new()).await {
+                    failures.push(format!(
+                        "{cluster_name} (removed resource `{resource_name}`): {error}"
+                    ));
+                }
+            }
+        }
+        if failures.is_empty() {
+            Verdict::Accept
+        } else {
+            self.endpoints = previous;
+            Verdict::Reject(format!(
+                "EDS endpoint sink rejected: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    async fn on_delta_sds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
+        if !response.removed_resources.is_empty() {
+            return Verdict::Reject(
+                "delta SDS removed_resources is not implemented; prior secret remains active"
+                    .to_string(),
+            );
+        }
+        let Some(sink) = self.secret_sink.as_mut() else {
+            return Verdict::Reject(format!(
+                "SDS (`{SDS_TYPE_URL}`) is not applied: this ResourceApplier has no secret sink wired"
+            ));
+        };
+        let mut pairs = Vec::with_capacity(response.resources.len());
+        for (index, resource) in response.resources.iter().enumerate() {
+            let any = delta_any(resource);
+            let path = format!("delta_response.resources[{index}].resource");
+            let secret = match decode_secret(any, &path) {
+                Ok(secret) => secret,
+                Err(error) => return Verdict::Reject(error.to_string()),
+            };
+            if secret.name != resource.name {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].name `{}` does not match resource name `{}`",
+                    resource.name, secret.name
+                ));
+            }
+            pairs.push((
+                resource.name.clone(),
+                Entry {
+                    raw: any.value.clone(),
+                    ir: Arc::new(secret),
+                },
+            ));
+        }
+        let previous = self.secrets.clone();
+        let outcome = match self.secrets.apply_delta(pairs, &[]) {
+            Ok(outcome) => outcome,
+            Err(error) => return Verdict::Reject(delta_apply_error("SDS", error)),
+        };
+        let mut failures = Vec::new();
+        for name in outcome.added.iter().chain(outcome.updated.iter()) {
+            let secret = Arc::clone(
+                &self
+                    .secrets
+                    .get(name)
+                    .expect("delta SDS update must be present")
+                    .ir,
+            );
+            if let Err(error) = sink(name.clone(), secret).await {
+                failures.push(format!("{name}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Verdict::Accept
+        } else {
+            self.secrets = previous;
+            Verdict::Reject(format!("SDS secret sink rejected: {}", failures.join("; ")))
+        }
+    }
+
+    fn eds_clusters_for(&self, resource_name: &str) -> Vec<String> {
+        self.current
+            .clusters
+            .iter()
+            .filter(|(_, cluster)| {
+                cluster.eds.as_ref().map(|eds| eds.service_name.as_str()) == Some(resource_name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     async fn on_cds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
@@ -900,6 +1253,19 @@ impl ResponseHandler for ResourceApplier {
             SDS_TYPE_URL => Some(self.sds_resource_names()),
             _ => None,
         }
+    }
+}
+
+impl DeltaResponseHandler for ResourceApplier {
+    fn handle(
+        &mut self,
+        response: &DeltaDiscoveryResponse,
+    ) -> impl Future<Output = Verdict> + Send {
+        self.on_delta_response(response)
+    }
+
+    fn desired_names(&self, type_url: &str) -> Option<BTreeSet<String>> {
+        <Self as ResponseHandler>::desired_names(self, type_url)
     }
 }
 

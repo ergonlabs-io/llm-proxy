@@ -21,7 +21,9 @@ use proxy_api::envoy::extensions::filters::http::router::v3 as router_v3;
 use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
-use proxy_api::envoy::service::discovery::v3::DiscoveryResponse;
+use proxy_api::envoy::service::discovery::v3::{
+    DeltaDiscoveryResponse, DiscoveryResponse, Resource as DeltaResource,
+};
 use proxy_config::ir::{ConfigSnapshot, EndpointIR};
 use proxy_config::lower_dynamic_cluster;
 use proxy_xds::{
@@ -1356,4 +1358,67 @@ async fn a_tls_certificate_secret_is_accepted_by_the_same_increment_2c_sink() {
     let verdict = applier.on_response(&resp).await;
 
     assert!(matches!(verdict, Verdict::Accept), "got {verdict:?}");
+}
+
+fn delta_cds_response(
+    nonce: &str,
+    clusters: &[(&str, cluster_v3::Cluster)],
+    removed: &[&str],
+) -> DeltaDiscoveryResponse {
+    DeltaDiscoveryResponse {
+        type_url: CDS_TYPE_URL.to_string(),
+        nonce: nonce.to_string(),
+        resources: clusters
+            .iter()
+            .map(|(version, cluster)| DeltaResource {
+                name: cluster.name.clone(),
+                version: (*version).to_string(),
+                resource: Some(any_of(cluster, CLUSTER_TYPE)),
+                ..Default::default()
+            })
+            .collect(),
+        removed_resources: removed.iter().map(|name| (*name).to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn delta_cds_updates_and_explicit_removals_publish_incrementally() {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let first = delta_cds_response(
+        "n1",
+        &[
+            ("a1", minimal_cluster("a", 8001)),
+            ("b1", minimal_cluster("b", 8002)),
+        ],
+        &[],
+    );
+    assert_eq!(applier.on_delta_response(&first).await, Verdict::Accept);
+
+    let second = delta_cds_response("n2", &[("a2", minimal_cluster("a", 9001))], &["b"]);
+    assert_eq!(applier.on_delta_response(&second).await, Verdict::Accept);
+
+    let snapshots = published.lock().unwrap();
+    let latest = snapshots.last().expect("second delta response publishes");
+    assert!(latest.clusters.contains_key("a"));
+    assert!(!latest.clusters.contains_key("b"));
+    assert_eq!(snapshots.len(), 2);
+}
+
+#[tokio::test]
+async fn delta_wrapper_name_mismatch_nacks_without_publishing() {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+    let mut response = delta_cds_response("n1", &[("v1", minimal_cluster("inside", 8001))], &[]);
+    response.resources[0].name = "outside".to_string();
+
+    let verdict = applier.on_delta_response(&response).await;
+
+    assert!(
+        matches!(verdict, Verdict::Reject(ref message) if message.contains("does not match resource name `inside`")),
+        "got {verdict:?}"
+    );
+    assert!(published.lock().unwrap().is_empty());
 }
