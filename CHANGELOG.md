@@ -23,6 +23,14 @@ which shipped between the v0.2.0 tag and this point and gates neither release â€
 
 ### Added
 
+- **Delta xDS subscription state.** Per-resource accepted versions, removals, named
+  subscribe/unsubscribe differences, ACK/NACK nonce handling, and reconnect persistence now have
+  transport-independent state and tests (`61e70a4`). gRPC delta transport remains open.
+- **xDS warming-race script predicates.** Control-plane scenarios can wait for an exact ACK or
+  NACK without unrelated subscriptions advancing the script (`376d8d0`).
+- **`x-envoy-upstream-service-time`.** Successful upstream responses report final-attempt elapsed
+  milliseconds, replace spoofed upstream values, and omit the header on local failures
+  (`498adba`).
 - **Vertex bearer-token and Bedrock signing support.** Vertex applies configured access
   tokens and provider paths; Bedrock signs final request bodies with SigV4. Strict validation, IR
   lowering, dialect handling, and focused tests landed in `9c939b9`; Vertex token mint/refresh and
