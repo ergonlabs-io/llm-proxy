@@ -13,6 +13,7 @@
 pub mod apply;
 pub mod backoff;
 pub mod client;
+pub mod delta_subscription;
 pub mod secret;
 pub mod store;
 pub mod subscription;
@@ -20,6 +21,7 @@ pub mod subscription;
 pub use apply::{Publish, PublishEndpoints, PublishSecrets, ResourceApplier};
 pub use backoff::BackoffPolicy;
 pub use client::{AdsClient, AdsError, FnHandler, Reconnect, ResponseHandler, Sleep, Validator};
+pub use delta_subscription::{DeltaRequest, DeltaSubscriptionState, ResourceVersion};
 pub use proxy_config::ir::{DynamicSecret, SecretKind};
 pub use store::{ApplyError, ApplyOutcome, SetSemantics, SotwSet};
 pub use subscription::{Request, Subscription, SubscriptionState, Verdict};
