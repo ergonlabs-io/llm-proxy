@@ -1205,6 +1205,51 @@ async fn spawn_upstream_answers_after_delay_then_fails_first(
     (addr, count)
 }
 
+async fn spawn_slow_failure_then_fast_success(
+    failure_delay: Duration,
+    success_delay: Duration,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for (delay, status) in [(failure_delay, 503), (success_delay, 200)] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_one_request(&mut stream).await;
+            tokio::time::sleep(delay).await;
+            let response =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn upstream_service_time_reports_only_the_winning_retry() {
+    LocalSet::new()
+        .run_until(async {
+            let addr = spawn_slow_failure_then_fast_success(
+                Duration::from_millis(300),
+                Duration::from_millis(10),
+            )
+            .await;
+            let router = build_router(addr, forward_to_up(Some(retry_policy("5xx", 1)))).await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            let measured: u64 = resp.head.headers["x-envoy-upstream-service-time"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                measured < 200,
+                "discarded 300ms attempt leaked into final service time: {measured}ms"
+            );
+        })
+        .await;
+}
+
 /// An upstream that answers a single connection with `200 OK` after `delay`
 /// -- used to prove a `per_try_timeout: None` route doesn't spuriously time
 /// out an upstream that's merely slow, not stalled.
@@ -1225,6 +1270,67 @@ async fn spawn_slow_but_ok_upstream(
         let _ = tx.send(());
     });
     (addr, rx)
+}
+
+/// One delayed success carrying a bogus service-time header. The router must
+/// replace that value with its own measurement.
+async fn spawn_slow_upstream_with_spoofed_service_time(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        tokio::time::sleep(delay).await;
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nx-envoy-upstream-service-time: 9999\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+    });
+    addr
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn upstream_service_time_measures_and_replaces_the_upstream_value() {
+    LocalSet::new()
+        .run_until(async {
+            let addr =
+                spawn_slow_upstream_with_spoofed_service_time(Duration::from_millis(60)).await;
+            let router = build_router(addr, forward_to_up(None)).await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            let measured: u64 = resp.head.headers["x-envoy-upstream-service-time"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                (50..1000).contains(&measured),
+                "expected this proxy's roughly 60ms measurement, got {measured}ms"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_upstream_failure_has_no_upstream_service_time() {
+    LocalSet::new()
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let router = build_router(addr, forward_to_up(None)).await;
+
+            let resp = router.handle(request("/v1/chat")).await;
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!resp
+                .head
+                .headers
+                .contains_key("x-envoy-upstream-service-time"));
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

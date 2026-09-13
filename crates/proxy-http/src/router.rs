@@ -134,6 +134,7 @@ enum Connected {
 struct HedgedResponse {
     receiver: tokio::sync::oneshot::Receiver<Result<HttpResponseParts, UpstreamCodecError>>,
     task: tokio::task::JoinHandle<()>,
+    dispatched_at: std::time::Instant,
 }
 
 impl Drop for HedgedResponse {
@@ -1396,6 +1397,11 @@ impl RouterHandler {
                 // release the hedge budget immediately rather than pinning it
                 // to an unrelated response body.
                 let mut response_from_hedge = false;
+                // Usually the current loop iteration wins. A hedge can
+                // instead return the prior, timed-out attempt's response;
+                // retain that attempt's own start so service time never
+                // measures from the wrong dispatch.
+                let mut winning_attempt_dispatched_at = attempt_dispatched_at;
                 let attempt_result = if let Some(hedge) = hedged_response.as_mut() {
                     // The original request was still alive when the previous
                     // iteration dispatched this replay.  Both sends are now
@@ -1408,7 +1414,10 @@ impl RouterHandler {
                         first = &mut hedge.receiver => {
                             response_already_guarded = true;
                             match first.expect("hedged attempt task must outlive its receiver") {
-                                Ok(response) => Ok(response),
+                                Ok(response) => {
+                                    winning_attempt_dispatched_at = hedge.dispatched_at;
+                                    Ok(response)
+                                }
                                 // Envoy discards an error from the timed-out
                                 // attempt while the hedge is live.  Let the
                                 // newly-issued attempt decide this race
@@ -1437,7 +1446,10 @@ impl RouterHandler {
                                     .await
                                     .expect("hedged attempt task must outlive its receiver")
                                 {
-                                    Ok(response) => Ok(response),
+                                    Ok(response) => {
+                                        winning_attempt_dispatched_at = hedge.dispatched_at;
+                                        Ok(response)
+                                    }
                                     Err(_) => Err(second_error),
                                 }
                             }
@@ -1510,7 +1522,11 @@ impl RouterHandler {
                                     if let Some(guard) = cb.try_acquire_retry() {
                                         retry_guard = Some(guard);
                                         state.record_attempt();
-                                        hedged_response = Some(HedgedResponse { receiver, task });
+                                        hedged_response = Some(HedgedResponse {
+                                            receiver,
+                                            task,
+                                            dispatched_at: attempt_dispatched_at,
+                                        });
                                         continue;
                                     }
                                 }
@@ -1635,6 +1651,19 @@ impl RouterHandler {
                         // through unmodified; the only flag it can carry at
                         // all is this one.
                         record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
+                        // WP-13: report this proxy's final upstream attempt,
+                        // including connection acquisition and the wait for
+                        // response headers. `insert` deliberately replaces a
+                        // value supplied by an upstream proxy. Retriable
+                        // responses continue above, so discarded attempts
+                        // never leak their duration downstream.
+                        let service_time_ms =
+                            u64::try_from(winning_attempt_dispatched_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                        resp.head.headers.insert(
+                            "x-envoy-upstream-service-time",
+                            HeaderValue::from(service_time_ms),
+                        );
                         // Rust note: the route `timeout` bounds the whole
                         // attempt loop, not just this last attempt's
                         // `send` -- once headers arrive here the timeout is
