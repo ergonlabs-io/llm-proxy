@@ -29,9 +29,10 @@ use proxy_core::drain::{
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
 use proxy_core::tls::SdsSecretRegistry;
+use proxy_xds::apply::SecretUpdate;
 use proxy_xds::{
-    AdsClient, DeltaAdsClient, DeltaSubscriptionState, DynamicSecret, Publish, PublishEndpoints,
-    PublishSecrets, Reconnect, ResourceApplier, ResponseHandler, Subscription, SubscriptionState,
+    AdsClient, DeltaAdsClient, DeltaSubscriptionState, Publish, PublishEndpoints, PublishSecrets,
+    Reconnect, ResourceApplier, ResponseHandler, Subscription, SubscriptionState,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Channel;
@@ -1426,19 +1427,24 @@ fn start_ads(
     // rustls bakes the client verifier (trust anchors) into it; an invalid CA
     // is returned here as an SDS NACK while the prior config keeps serving.
     let secret_registry = Arc::clone(secret_registry);
-    let secret_sink: PublishSecrets = Box::new(move |name, secret: Arc<DynamicSecret>| {
+    let secret_sink: PublishSecrets = Box::new(move |update| {
         let secret_registry = Arc::clone(&secret_registry);
         Box::pin(async move {
-            match secret.tls_certificate_ir() {
-                Ok(Some(ir)) => secret_registry.publish(&name, vec![ir]),
-                Ok(None) => match secret.validation_context_ir() {
-                    Ok(Some(validation)) => {
-                        secret_registry.publish_validation_context(&name, validation)
-                    }
-                    Ok(None) => Err(format!("secret `{name}` has no supported SDS TLS payload")),
+            match update {
+                SecretUpdate::Upsert { name, secret } => match secret.tls_certificate_ir() {
+                    Ok(Some(ir)) => secret_registry.publish(&name, vec![ir]),
+                    Ok(None) => match secret.validation_context_ir() {
+                        Ok(Some(validation)) => {
+                            secret_registry.publish_validation_context(&name, validation)
+                        }
+                        Ok(None) => {
+                            Err(format!("secret `{name}` has no supported SDS TLS payload"))
+                        }
+                        Err(err) => Err(err.to_string()),
+                    },
                     Err(err) => Err(err.to_string()),
                 },
-                Err(err) => Err(err.to_string()),
+                SecretUpdate::Remove { name } => secret_registry.remove(&name),
             }
         })
     });

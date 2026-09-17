@@ -26,9 +26,9 @@ use proxy_api::envoy::service::discovery::v3::{
 };
 use proxy_config::ir::{ConfigSnapshot, EndpointIR};
 use proxy_config::lower_dynamic_cluster;
+use proxy_xds::apply::SecretUpdate;
 use proxy_xds::{
-    DynamicSecret, Publish, PublishEndpoints, PublishSecrets, ResourceApplier, ResponseHandler,
-    Verdict,
+    Publish, PublishEndpoints, PublishSecrets, ResourceApplier, ResponseHandler, Verdict,
 };
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
@@ -1319,16 +1319,21 @@ fn sds_response(version: &str, secrets: &[tls_v3::Secret]) -> DiscoveryResponse 
 /// in `proxy-core`; this proves neither supported secret kind is discarded at
 /// the transport/apply boundary.
 fn main_rs_shaped_secret_sink() -> PublishSecrets {
-    Box::new(move |name, secret: Arc<DynamicSecret>| {
+    Box::new(move |update| {
         Box::pin(async move {
-            match secret.tls_certificate_ir() {
-                Ok(Some(_ir)) => Ok(()),
-                Ok(None) => match secret.validation_context_ir() {
-                    Ok(Some(_)) => Ok(()),
-                    Ok(None) => Err(format!("secret `{name}` has no supported SDS TLS payload")),
+            match update {
+                SecretUpdate::Upsert { name, secret } => match secret.tls_certificate_ir() {
+                    Ok(Some(_ir)) => Ok(()),
+                    Ok(None) => match secret.validation_context_ir() {
+                        Ok(Some(_)) => Ok(()),
+                        Ok(None) => {
+                            Err(format!("secret `{name}` has no supported SDS TLS payload"))
+                        }
+                        Err(err) => Err(err.to_string()),
+                    },
                     Err(err) => Err(err.to_string()),
                 },
-                Err(err) => Err(err.to_string()),
+                SecretUpdate::Remove { .. } => Ok(()),
             }
         })
     })
@@ -1380,6 +1385,82 @@ fn delta_cds_response(
         removed_resources: removed.iter().map(|name| (*name).to_string()).collect(),
         ..Default::default()
     }
+}
+
+fn delta_sds_response(
+    nonce: &str,
+    secrets: &[(&str, tls_v3::Secret)],
+    removed: &[&str],
+) -> DeltaDiscoveryResponse {
+    DeltaDiscoveryResponse {
+        type_url: SDS_TYPE_URL.to_string(),
+        nonce: nonce.to_string(),
+        resources: secrets
+            .iter()
+            .map(|(version, secret)| DeltaResource {
+                name: secret.name.clone(),
+                version: (*version).to_string(),
+                resource: Some(any_of(secret, SECRET_TYPE)),
+                ..Default::default()
+            })
+            .collect(),
+        removed_resources: removed.iter().map(|name| (*name).to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn delta_sds_removal_reaches_sink_and_sink_failure_rolls_back_store() {
+    let (publish, _published) = recording_publisher();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let mut fail_first_removal = true;
+    let sink: PublishSecrets = Box::new(move |update| {
+        let result = match update {
+            SecretUpdate::Upsert { name, .. } => {
+                recorded.lock().unwrap().push(format!("upsert:{name}"));
+                Ok(())
+            }
+            SecretUpdate::Remove { name } if fail_first_removal => {
+                fail_first_removal = false;
+                Err(format!("deliberately failed removal of `{name}`"))
+            }
+            SecretUpdate::Remove { name } => {
+                recorded.lock().unwrap().push(format!("remove:{name}"));
+                Ok(())
+            }
+        };
+        Box::pin(std::future::ready(result))
+    });
+    let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
+    let secret = tls_cert_secret("cert-1", b"chain", b"key");
+    let update = delta_sds_response("n1", &[("v1", secret.clone())], &[]);
+
+    assert_eq!(applier.on_delta_response(&update).await, Verdict::Accept);
+    let failed_remove = delta_sds_response("n2", &[], &["cert-1"]);
+    assert!(matches!(
+        applier.on_delta_response(&failed_remove).await,
+        Verdict::Reject(message) if message.contains("deliberately failed removal")
+    ));
+
+    // Failed removal restored the prior store entry. Identical bytes remain
+    // unchanged and do not replay through the sink.
+    assert_eq!(applier.on_delta_response(&update).await, Verdict::Accept);
+    assert_eq!(&*events.lock().unwrap(), &["upsert:cert-1"]);
+
+    assert_eq!(
+        applier.on_delta_response(&failed_remove).await,
+        Verdict::Accept
+    );
+    let unknown_remove = delta_sds_response("n3", &[], &["unknown"]);
+    assert_eq!(
+        applier.on_delta_response(&unknown_remove).await,
+        Verdict::Accept
+    );
+    assert_eq!(
+        &*events.lock().unwrap(),
+        &["upsert:cert-1", "remove:cert-1", "remove:unknown"]
+    );
 }
 
 #[tokio::test]

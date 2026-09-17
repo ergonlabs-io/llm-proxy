@@ -301,6 +301,60 @@ impl SdsSecretRegistry {
         Ok(())
     }
 
+    /// Evict a delivered SDS secret and return every live consumer of that
+    /// name to its fail-closed pending state. Unknown and unregistered names
+    /// are successful no-ops, matching delta xDS removal semantics.
+    pub fn remove(&self, name: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
+
+        let validation_factories = inner
+            .validation_factories
+            .entry(name.to_string())
+            .or_default();
+        validation_factories.retain(|weak| weak.strong_count() > 0);
+        let validation_factories = validation_factories.clone();
+
+        let context = format!("removed SDS secret `{name}`");
+        let mut failures = Vec::new();
+        for weak in &validation_factories {
+            let Some(factory) = weak.upgrade() else {
+                continue;
+            };
+            if let Err(error) = factory.remove_validation_context(&context) {
+                failures.push(error.to_string());
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "secret `{name}` removal rejected by {} registered TLS chain(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ));
+        }
+
+        let certificate_factories = inner
+            .certificate_factories
+            .entry(name.to_string())
+            .or_default();
+        certificate_factories.retain(|weak| weak.strong_count() > 0);
+        let certificate_factories = certificate_factories.clone();
+        for weak in &certificate_factories {
+            if let Some(factory) = weak.upgrade() {
+                factory.remove_certificates();
+            }
+        }
+
+        inner.delivered_certificates.remove(name);
+        inner.delivered_validation_contexts.remove(name);
+        tracing::info!(
+            secret = name,
+            certificate_factories = certificate_factories.len(),
+            validation_factories = validation_factories.len(),
+            "SDS secret removed: registered TLS chain(s) returned to pending state"
+        );
+        Ok(())
+    }
+
     /// The number of currently-live factories registered under `name` --
     /// i.e. after pruning dead `Weak`s. Not used by production code; exists
     /// so `crates/proxy-core/tests/tls.rs` can assert the pruning behavior

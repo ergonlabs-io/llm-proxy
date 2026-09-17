@@ -365,6 +365,12 @@ impl DownstreamTlsFactory {
         Ok(())
     }
 
+    /// Remove every serving certificate from this factory. New handshakes
+    /// fail closed until a later SDS delivery installs another certificate.
+    pub fn remove_certificates(&self) {
+        self.cert_resolver.store(resolver::CertSet::default());
+    }
+
     /// Atomically replace downstream client-auth trust anchors after an SDS
     /// validation-context delivery. Construction happens before the swap, so
     /// invalid PEM or an unusable CA bundle leaves the prior config serving.
@@ -382,6 +388,25 @@ impl DownstreamTlsFactory {
             &self.cert_resolver,
             Some(validation),
             false,
+            context,
+        )?;
+        self.server_config.store(Arc::new(config));
+        Ok(())
+    }
+
+    /// Return this factory to its pre-delivery SDS validation state. The
+    /// pending verifier rejects every client certificate until a later SDS
+    /// delivery installs fresh trust anchors.
+    pub fn remove_validation_context(&self, context: &str) -> Result<(), TlsBuildError> {
+        let config = Self::build_server_config(
+            &self.provider,
+            &self.params,
+            &self.alpn_protocols,
+            self.require_client_certificate,
+            self.disable_stateless_session_resumption,
+            &self.cert_resolver,
+            None,
+            true,
             context,
         )?;
         self.server_config.store(Arc::new(config));

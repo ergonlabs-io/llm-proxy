@@ -1117,6 +1117,57 @@ async fn publish_to_an_unregistered_name_is_ok_and_delivered_on_a_later_register
     assert_eq!(peer, cert.der().as_ref());
 }
 
+/// Explicit removal clears every live certificate resolver and the replay
+/// cache. Existing factories fail closed again, and a later registration
+/// cannot resurrect the removed certificate without a new delivery.
+#[tokio::test]
+async fn removal_fails_closed_all_certificate_consumers_and_clears_replay() {
+    let ca = mint_ca("test CA");
+    let key = KeyPair::generate().unwrap();
+    let cert = mint_leaf(&ca, &["server.example.com"], &key);
+    let upstream = upstream_for(&ca);
+    let registry = SdsSecretRegistry::new();
+
+    let first = Arc::new(DownstreamTlsFactory::build(&sds_only_spec("shared"), "test").unwrap());
+    let second = Arc::new(DownstreamTlsFactory::build(&sds_only_spec("shared"), "test").unwrap());
+    registry
+        .register(&["shared".to_string()], &first, "test")
+        .unwrap();
+    registry
+        .register(&["shared".to_string()], &second, "test")
+        .unwrap();
+    registry
+        .publish("shared", vec![tls_cert_ir(&cert, &key)])
+        .unwrap();
+    let _ = handshake(&first, &upstream, "server.example.com").await;
+    let _ = handshake(&second, &upstream, "server.example.com").await;
+
+    registry.remove("shared").unwrap();
+    for downstream in [&first, &second] {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::try_join!(
+            downstream.wrap(server_io),
+            upstream.wrap(client_io, "server.example.com")
+        )
+        .expect_err("every registered certificate consumer must fail after removal");
+    }
+
+    let late = Arc::new(DownstreamTlsFactory::build(&sds_only_spec("shared"), "test").unwrap());
+    registry
+        .register(&["shared".to_string()], &late, "test")
+        .unwrap();
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::try_join!(
+        late.wrap(server_io),
+        upstream.wrap(client_io, "server.example.com")
+    )
+    .expect_err("removed certificate must not replay to a later registration");
+
+    registry
+        .remove("unknown")
+        .expect("removing an unknown, unregistered secret must succeed");
+}
+
 /// A dynamic validation context is fail-closed before SDS delivers the CA,
 /// then updates the same serving factory without rebuilding its certificates.
 /// This pins the distinct trust-anchor seam (an atomic ServerConfig swap), not
@@ -1171,6 +1222,21 @@ async fn validation_context_sds_delivery_unblocks_mtls_on_the_same_factory() {
     registry
         .publish_validation_context("client-ca", trusted_ca_validation(&ca))
         .expect("a usable dynamic trust anchor must update the registered factory");
+    let _ = handshake(&downstream, &upstream, "server.example.com").await;
+
+    registry
+        .remove("client-ca")
+        .expect("removing a validation context must restore pending verification");
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::try_join!(
+        downstream.wrap(server_io),
+        upstream.wrap(client_io, "server.example.com")
+    )
+    .expect_err("removed validation context must fail closed again");
+
+    registry
+        .publish_validation_context("client-ca", trusted_ca_validation(&ca))
+        .expect("a later delivery must unblock verification again");
     let _ = handshake(&downstream, &upstream, "server.example.com").await;
 
     let bad_update = registry.publish_validation_context(

@@ -218,24 +218,21 @@ pub type PublishEndpoints = Box<
 /// real sink; the real one is the WP-08 `ArcSwap` cert resolver, wired in
 /// increment 2, and this crate must stay free of that edge).
 ///
-/// The second parameter is `Arc<DynamicSecret>` rather than an owned value --
-/// unlike [`PublishEndpoints`]'s `Vec<EndpointIR>`, a secret's bytes are the
-/// kind of payload worth sharing rather than cloning per call, and
-/// `SotwSet<Entry<DynamicSecret>>` already holds its own `Arc<DynamicSecret>`
-/// per entry (see `Entry`'s own doc), so handing the sink a clone of that
-/// `Arc` costs nothing.
-///
-/// This increment wires the sink from `on_sds_response` only -- it is not
-/// yet reachable from any listener's `tls_certificate_sds_secret_configs`,
-/// because naming which secrets to subscribe to needs `ir.rs` (increment 2,
-/// owned by another lane this batch; see this module's SDS scope note below).
-pub type PublishSecrets = Box<
-    dyn FnMut(
-            String,
-            Arc<DynamicSecret>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
-        + Send,
->;
+/// One accepted SDS change for the live TLS sink. Delta removals are explicit
+/// events so sinks can evict cached payloads and return consumers to their
+/// fail-closed pending state.
+pub enum SecretUpdate {
+    Upsert {
+        name: String,
+        secret: Arc<DynamicSecret>,
+    },
+    Remove {
+        name: String,
+    },
+}
+
+pub type PublishSecrets =
+    Box<dyn FnMut(SecretUpdate) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send>;
 
 /// One dynamically-held resource: the raw bytes it arrived as, plus the IR
 /// [`lower_dynamic_cluster`] / [`lower_dynamic_listener`] produced from them.
@@ -765,12 +762,6 @@ impl ResourceApplier {
     }
 
     async fn on_delta_sds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
-        if !response.removed_resources.is_empty() {
-            return Verdict::Reject(
-                "delta SDS removed_resources is not implemented; prior secret remains active"
-                    .to_string(),
-            );
-        }
         let Some(sink) = self.secret_sink.as_mut() else {
             return Verdict::Reject(format!(
                 "SDS (`{SDS_TYPE_URL}`) is not applied: this ResourceApplier has no secret sink wired"
@@ -799,7 +790,7 @@ impl ResourceApplier {
             ));
         }
         let previous = self.secrets.clone();
-        let outcome = match self.secrets.apply_delta(pairs, &[]) {
+        let outcome = match self.secrets.apply_delta(pairs, &response.removed_resources) {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("SDS", error)),
         };
@@ -812,8 +803,18 @@ impl ResourceApplier {
                     .expect("delta SDS update must be present")
                     .ir,
             );
-            if let Err(error) = sink(name.clone(), secret).await {
+            if let Err(error) = sink(SecretUpdate::Upsert {
+                name: name.clone(),
+                secret,
+            })
+            .await
+            {
                 failures.push(format!("{name}: {error}"));
+            }
+        }
+        for name in &response.removed_resources {
+            if let Err(error) = sink(SecretUpdate::Remove { name: name.clone() }).await {
+                failures.push(format!("{name} (removed): {error}"));
             }
         }
         if failures.is_empty() {
@@ -1101,7 +1102,12 @@ impl ResourceApplier {
                 .secrets
                 .get(name)
                 .expect("a name SotwSet::apply just reported added/updated must be present");
-            if let Err(err) = sink(name.clone(), Arc::clone(&entry.ir)).await {
+            if let Err(err) = sink(SecretUpdate::Upsert {
+                name: name.clone(),
+                secret: Arc::clone(&entry.ir),
+            })
+            .await
+            {
                 failed.insert(name.clone());
                 failure_detail.push(format!("{name}: {err}"));
             }
@@ -1357,31 +1363,46 @@ mod tests {
     /// What [`recording_secret_sink`] hands back: every successful sink call,
     /// in order, as `(name, secret)`.
     type RecordedSecretCalls = Arc<Mutex<Vec<(String, Arc<DynamicSecret>)>>>;
+    type RecordedSecretRemovals = Arc<Mutex<Vec<String>>>;
 
     /// A recording [`PublishSecrets`]: same shape as `tests/apply.rs`'s own
     /// `recording_endpoint_sink` -- `fail_names` lists secret names whose
     /// FIRST call must return `Err`, consumed on that first failure so a
     /// later retry for the same name succeeds.
-    fn recording_secret_sink(fail_names: &[&str]) -> (PublishSecrets, RecordedSecretCalls) {
+    fn recording_secret_sink(
+        fail_names: &[&str],
+    ) -> (PublishSecrets, RecordedSecretCalls, RecordedSecretRemovals) {
         let recorded: RecordedSecretCalls = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::clone(&recorded);
+        let removals: RecordedSecretRemovals = Arc::new(Mutex::new(Vec::new()));
+        let recorded_removals = Arc::clone(&removals);
         let mut still_failing: HashSet<String> = fail_names.iter().map(|s| s.to_string()).collect();
-        let sink: PublishSecrets = Box::new(move |name, secret| {
-            if still_failing.remove(&name) {
+        let sink: PublishSecrets = Box::new(move |update| {
+            let name = match &update {
+                SecretUpdate::Upsert { name, .. } | SecretUpdate::Remove { name } => name,
+            };
+            if still_failing.remove(name) {
                 return Box::pin(std::future::ready(Err(format!(
                     "sink deliberately failed for `{name}`"
                 ))));
             }
-            calls.lock().unwrap().push((name, secret));
+            match update {
+                SecretUpdate::Upsert { name, secret } => {
+                    calls.lock().unwrap().push((name, secret));
+                }
+                SecretUpdate::Remove { name } => {
+                    recorded_removals.lock().unwrap().push(name);
+                }
+            }
             Box::pin(std::future::ready(Ok(())))
         });
-        (sink, recorded)
+        (sink, recorded, removals)
     }
 
     #[tokio::test]
     async fn a_well_formed_inline_tls_certificate_secret_reaches_the_sink() {
         let (publish, _published) = recording_publisher();
-        let (sink, recorded) = recording_secret_sink(&[]);
+        let (sink, recorded, _removals) = recording_secret_sink(&[]);
         let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
 
         let resp = sds_response("v1", &[tls_cert_secret("cert-1", b"chain", b"key")]);
@@ -1406,7 +1427,7 @@ mod tests {
     #[tokio::test]
     async fn a_well_formed_validation_context_secret_lowers_and_reaches_the_sink() {
         let (publish, _published) = recording_publisher();
-        let (sink, recorded) = recording_secret_sink(&[]);
+        let (sink, recorded, _removals) = recording_secret_sink(&[]);
         let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
 
         let resp = sds_response("v1", &[validation_context_secret("ca-1", b"ca-bytes")]);
@@ -1434,7 +1455,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_response_omitting_a_previously_seen_secret_does_not_remove_it() {
         let (publish, _published) = recording_publisher();
-        let (sink, recorded) = recording_secret_sink(&[]);
+        let (sink, recorded, _removals) = recording_secret_sink(&[]);
         let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
 
         let resp_a = sds_response("v1", &[tls_cert_secret("cert-a", b"chain-a", b"key-a")]);
@@ -1472,7 +1493,7 @@ mod tests {
     #[tokio::test]
     async fn a_sink_failure_leaves_the_set_as_if_the_secret_never_arrived() {
         let (publish, _published) = recording_publisher();
-        let (sink, recorded) = recording_secret_sink(&["cert-1"]);
+        let (sink, recorded, _removals) = recording_secret_sink(&["cert-1"]);
         let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
 
         let resp = sds_response("v1", &[tls_cert_secret("cert-1", b"chain", b"key")]);
@@ -1517,7 +1538,7 @@ mod tests {
     #[tokio::test]
     async fn an_sds_response_naming_a_secret_twice_is_rejected() {
         let (publish, _published) = recording_publisher();
-        let (sink, recorded) = recording_secret_sink(&[]);
+        let (sink, recorded, _removals) = recording_secret_sink(&[]);
         let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
 
         let resp = sds_response(
@@ -1541,7 +1562,7 @@ mod tests {
     #[tokio::test]
     async fn an_sds_response_with_a_filename_data_source_is_rejected_with_its_full_dotted_path() {
         let (publish, _published) = recording_publisher();
-        let (sink, recorded) = recording_secret_sink(&[]);
+        let (sink, recorded, _removals) = recording_secret_sink(&[]);
         let mut applier = ResourceApplier::new(empty_base(), publish).with_secret_sink(sink);
 
         let bad = SecretProto {
