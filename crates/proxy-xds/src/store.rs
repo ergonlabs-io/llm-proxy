@@ -75,6 +75,10 @@ pub struct SotwSet<T> {
     // `ApplyOutcome` vector are deterministically sorted -- the same
     // reasoning `subscription.rs` gives for its own `BTreeSet`.
     dynamic: BTreeMap<String, T>,
+    /// Alternate xDS resource names, resolved to canonical names. Aliases
+    /// never appear in `names()` or apply outcomes, so downstream sinks see
+    /// one update per delivered resource.
+    aliases: BTreeMap<String, String>,
 }
 
 /// The result of applying one response's resource list to a [`SotwSet`].
@@ -104,6 +108,7 @@ pub struct ApplyOutcome {
 pub enum ApplyError {
     /// The response named the same resource twice. Nothing was applied.
     DuplicateName(String),
+    AliasConflict(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +119,7 @@ pub enum DeltaApplyError {
     DuplicateRemoval(String),
     /// Delta response both supplied and removed same name.
     ConflictingName(String),
+    AliasConflict(String),
 }
 
 impl<T> SotwSet<T> {
@@ -125,6 +131,7 @@ impl<T> SotwSet<T> {
             semantics,
             static_names,
             dynamic: BTreeMap::new(),
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -133,7 +140,11 @@ impl<T> SotwSet<T> {
     /// as a name reservation -- `static_names` names an exclusion, not a
     /// value, since static resources live in `proxy-config`'s IR, not here.
     pub fn get(&self, name: &str) -> Option<&T> {
-        self.dynamic.get(name)
+        self.dynamic.get(name).or_else(|| {
+            self.aliases
+                .get(name)
+                .and_then(|canonical| self.dynamic.get(canonical))
+        })
     }
 
     /// Names currently held dynamically, sorted.
@@ -166,6 +177,7 @@ impl<T> SotwSet<T> {
     pub fn forget(&mut self, names: &BTreeSet<String>) {
         for name in names {
             self.dynamic.remove(name);
+            self.aliases.retain(|_, canonical| canonical != name);
         }
     }
 }
@@ -181,12 +193,56 @@ impl<T: PartialEq> SotwSet<T> {
     /// dynamic name the response did not mention (rule 1) -- `PerName` skips
     /// this step entirely (rule 2).
     pub fn apply(&mut self, resources: Vec<(String, T)>) -> Result<ApplyOutcome, ApplyError> {
+        self.apply_named(
+            resources
+                .into_iter()
+                .map(|(name, value)| (name, value, Vec::new()))
+                .collect(),
+        )
+    }
+
+    /// Apply resources with alternate names. Aliases resolve to the
+    /// canonical resource and therefore never create a second outcome entry.
+    pub fn apply_named(
+        &mut self,
+        resources: Vec<(String, T, Vec<String>)>,
+    ) -> Result<ApplyOutcome, ApplyError> {
         // Rule 5: validate before mutating anything, so a rejected response
         // leaves the set byte-for-byte as it was.
         let mut seen = BTreeSet::new();
-        for (name, _) in &resources {
+        for (name, _, aliases) in &resources {
             if !seen.insert(name.clone()) {
                 return Err(ApplyError::DuplicateName(name.clone()));
+            }
+            for alias in aliases {
+                if alias == name || !seen.insert(alias.clone()) {
+                    return Err(ApplyError::DuplicateName(alias.clone()));
+                }
+            }
+        }
+
+        let incoming_names: BTreeSet<String> =
+            resources.iter().map(|(name, _, _)| name.clone()).collect();
+        if resources.iter().any(|(_, _, aliases)| {
+            aliases
+                .iter()
+                .any(|alias| self.static_names.contains(alias))
+        }) {
+            return Err(ApplyError::DuplicateName(
+                "resource name or alias is statically owned".to_string(),
+            ));
+        }
+        for alias in seen.iter().filter(|name| !incoming_names.contains(*name)) {
+            if let Some(existing) = self.aliases.get(alias) {
+                if !incoming_names.contains(existing)
+                    && !(self.semantics == SetSemantics::FullState
+                        && !self.dynamic.contains_key(existing))
+                {
+                    return Err(ApplyError::AliasConflict(alias.clone()));
+                }
+            }
+            if self.dynamic.contains_key(alias) && !incoming_names.contains(alias) {
+                return Err(ApplyError::DuplicateName(alias.clone()));
             }
         }
 
@@ -202,22 +258,26 @@ impl<T: PartialEq> SotwSet<T> {
         // dynamic to begin with.
         let mut declared = BTreeSet::new();
 
-        for (name, value) in resources {
+        for (name, value, aliases) in resources {
             if self.static_names.contains(&name) {
                 shadowed_by_static.push(name);
                 continue;
             }
             declared.insert(name.clone());
+            self.aliases.retain(|_, canonical| canonical != &name);
             match self.dynamic.get(&name) {
-                Some(existing) if *existing == value => unchanged.push(name),
+                Some(existing) if *existing == value => unchanged.push(name.clone()),
                 Some(_) => {
                     self.dynamic.insert(name.clone(), value);
-                    updated.push(name);
+                    updated.push(name.clone());
                 }
                 None => {
                     self.dynamic.insert(name.clone(), value);
-                    added.push(name);
+                    added.push(name.clone());
                 }
+            }
+            for alias in aliases {
+                self.aliases.insert(alias, name.clone());
             }
         }
 
@@ -234,6 +294,7 @@ impl<T: PartialEq> SotwSet<T> {
                 .collect();
             for name in stale {
                 self.dynamic.remove(&name);
+                self.aliases.retain(|_, canonical| canonical != &name);
                 removed.push(name);
             }
         }
@@ -263,10 +324,31 @@ impl<T: PartialEq> SotwSet<T> {
         resources: Vec<(String, T)>,
         removed_names: &[String],
     ) -> Result<ApplyOutcome, DeltaApplyError> {
+        self.apply_delta_named(
+            resources
+                .into_iter()
+                .map(|(name, value)| (name, value, Vec::new()))
+                .collect(),
+            removed_names,
+        )
+    }
+
+    /// Delta variant of [`Self::apply_named`]. Removals may name either the
+    /// canonical resource or one of its aliases.
+    pub fn apply_delta_named(
+        &mut self,
+        resources: Vec<(String, T, Vec<String>)>,
+        removed_names: &[String],
+    ) -> Result<ApplyOutcome, DeltaApplyError> {
         let mut supplied = BTreeSet::new();
-        for (name, _) in &resources {
+        for (name, _, aliases) in &resources {
             if !supplied.insert(name.clone()) {
                 return Err(DeltaApplyError::DuplicateName(name.clone()));
+            }
+            for alias in aliases {
+                if alias == name || !supplied.insert(alias.clone()) {
+                    return Err(DeltaApplyError::DuplicateName(alias.clone()));
+                }
             }
         }
         let mut removals = BTreeSet::new();
@@ -278,26 +360,54 @@ impl<T: PartialEq> SotwSet<T> {
                 return Err(DeltaApplyError::ConflictingName(name.clone()));
             }
         }
+        let canonical_names: BTreeSet<String> =
+            resources.iter().map(|(name, _, _)| name.clone()).collect();
+        if resources.iter().any(|(_, _, aliases)| {
+            aliases
+                .iter()
+                .any(|alias| self.static_names.contains(alias))
+        }) {
+            return Err(DeltaApplyError::DuplicateName(
+                "resource name or alias is statically owned".to_string(),
+            ));
+        }
+        for alias in supplied
+            .iter()
+            .filter(|name| !canonical_names.contains(*name))
+        {
+            if self.dynamic.contains_key(alias) && !self.aliases.contains_key(alias) {
+                return Err(DeltaApplyError::DuplicateName(alias.clone()));
+            }
+            if let Some(existing) = self.aliases.get(alias) {
+                if !canonical_names.contains(existing) {
+                    return Err(DeltaApplyError::AliasConflict(alias.clone()));
+                }
+            }
+        }
 
         let mut added = Vec::new();
         let mut updated = Vec::new();
         let mut unchanged = Vec::new();
         let mut shadowed_by_static = Vec::new();
-        for (name, value) in resources {
+        for (name, value, aliases) in resources {
             if self.static_names.contains(&name) {
                 shadowed_by_static.push(name);
                 continue;
             }
+            self.aliases.retain(|_, canonical| canonical != &name);
             match self.dynamic.get(&name) {
-                Some(existing) if *existing == value => unchanged.push(name),
+                Some(existing) if *existing == value => unchanged.push(name.clone()),
                 Some(_) => {
                     self.dynamic.insert(name.clone(), value);
-                    updated.push(name);
+                    updated.push(name.clone());
                 }
                 None => {
                     self.dynamic.insert(name.clone(), value);
-                    added.push(name);
+                    added.push(name.clone());
                 }
+            }
+            for alias in aliases {
+                self.aliases.insert(alias, name.clone());
             }
         }
 
@@ -305,8 +415,12 @@ impl<T: PartialEq> SotwSet<T> {
         for name in removals {
             if self.static_names.contains(&name) {
                 shadowed_by_static.push(name);
-            } else if self.dynamic.remove(&name).is_some() {
-                removed.push(name);
+            } else {
+                let canonical = self.aliases.get(&name).cloned().unwrap_or(name.clone());
+                if self.dynamic.remove(&canonical).is_some() {
+                    self.aliases.retain(|_, value| value != &canonical);
+                    removed.push(canonical);
+                }
             }
         }
         added.sort();
@@ -571,5 +685,37 @@ mod tests {
     fn get_on_an_unknown_name_is_none() {
         let s: SotwSet<i32> = SotwSet::new(SetSemantics::PerName, no_statics());
         assert!(s.get("nope").is_none());
+    }
+
+    #[test]
+    fn aliases_resolve_to_one_canonical_resource_and_remove_by_alias() {
+        let mut s = SotwSet::new(SetSemantics::PerName, no_statics());
+        s.apply_named(vec![(
+            "canonical".to_string(),
+            7,
+            vec!["alias-a".to_string(), "alias-b".to_string()],
+        )])
+        .unwrap();
+
+        assert_eq!(s.names(), vec!["canonical"]);
+        assert_eq!(s.get("alias-a"), Some(&7));
+        let outcome = s
+            .apply_delta_named(Vec::new(), &["alias-b".to_string()])
+            .unwrap();
+        assert_eq!(outcome.removed, vec!["canonical"]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn aliases_cannot_collide_with_another_resource() {
+        let mut s = SotwSet::new(SetSemantics::PerName, no_statics());
+        let error = s
+            .apply_named(vec![
+                ("one".to_string(), 1, vec!["shared".to_string()]),
+                ("two".to_string(), 2, vec!["shared".to_string()]),
+            ])
+            .unwrap_err();
+        assert_eq!(error, ApplyError::DuplicateName("shared".to_string()));
+        assert!(s.is_empty());
     }
 }

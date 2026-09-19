@@ -119,8 +119,8 @@ fn validate_delta_resource(
     if resource.resource_name.is_some() {
         return Err(format!("{path}.resource_name is not implemented"));
     }
-    if !resource.aliases.is_empty() {
-        return Err(format!("{path}.aliases is not implemented"));
+    if resource.aliases.iter().any(String::is_empty) {
+        return Err(format!("{path}.aliases must not contain empty names"));
     }
     if resource.ttl.is_some() {
         return Err(format!("{path}.ttl is not implemented"));
@@ -159,6 +159,9 @@ fn delta_apply_error(type_name: &str, error: DeltaApplyError) -> String {
         }
         DeltaApplyError::ConflictingName(name) => {
             format!("{type_name} delta response both supplied and removed resource `{name}`")
+        }
+        DeltaApplyError::AliasConflict(name) => {
+            format!("{type_name} delta response has conflicting alias `{name}`")
         }
     }
 }
@@ -690,11 +693,12 @@ impl ResourceApplier {
                     raw: any.value.clone(),
                     ir: Arc::new(ir),
                 },
+                resource.aliases.clone(),
             ));
         }
         let outcome = match self
             .clusters
-            .apply_delta(pairs, &response.removed_resources)
+            .apply_delta_named(pairs, &response.removed_resources)
         {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("CDS", error)),
@@ -723,11 +727,12 @@ impl ResourceApplier {
                     raw: any.value.clone(),
                     ir: Arc::new(ir),
                 },
+                resource.aliases.clone(),
             ));
         }
         let outcome = match self
             .listeners
-            .apply_delta(pairs, &response.removed_resources)
+            .apply_delta_named(pairs, &response.removed_resources)
         {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("LDS", error)),
@@ -756,9 +761,13 @@ impl ResourceApplier {
                     raw: any.value.clone(),
                     ir: Arc::new(ir),
                 },
+                resource.aliases.clone(),
             ));
         }
-        let outcome = match self.routes.apply_delta(pairs, &response.removed_resources) {
+        let outcome = match self
+            .routes
+            .apply_delta_named(pairs, &response.removed_resources)
+        {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("RDS", error)),
         };
@@ -791,13 +800,14 @@ impl ResourceApplier {
                     raw: any.value.clone(),
                     ir: Arc::new(endpoints),
                 },
+                resource.aliases.clone(),
             ));
         }
 
         let previous = self.endpoints.clone();
         let outcome = match self
             .endpoints
-            .apply_delta(pairs, &response.removed_resources)
+            .apply_delta_named(pairs, &response.removed_resources)
         {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("EDS", error)),
@@ -887,10 +897,14 @@ impl ResourceApplier {
                     raw: any.value.clone(),
                     ir: Arc::new(secret),
                 },
+                resource.aliases.clone(),
             ));
         }
         let previous = self.secrets.clone();
-        let outcome = match self.secrets.apply_delta(pairs, &response.removed_resources) {
+        let outcome = match self
+            .secrets
+            .apply_delta_named(pairs, &response.removed_resources)
+        {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("SDS", error)),
         };
@@ -962,6 +976,9 @@ impl ResourceApplier {
                     "CDS response named cluster `{name}` more than once"
                 ));
             }
+            Err(ApplyError::AliasConflict(name)) => {
+                return Verdict::Reject(format!("CDS response has conflicting alias: {name}"));
+            }
         };
         self.finish(outcome, "cluster").await
     }
@@ -989,6 +1006,9 @@ impl ResourceApplier {
                 return Verdict::Reject(format!(
                     "LDS response named listener `{name}` more than once"
                 ));
+            }
+            Err(ApplyError::AliasConflict(name)) => {
+                return Verdict::Reject(format!("LDS response has conflicting alias: {name}"));
             }
         };
         self.finish(outcome, "listener").await
@@ -1021,6 +1041,9 @@ impl ResourceApplier {
                 return Verdict::Reject(format!(
                     "RDS response named route configuration `{name}` more than once"
                 ));
+            }
+            Err(ApplyError::AliasConflict(name)) => {
+                return Verdict::Reject(format!("RDS response has conflicting alias: {name}"));
             }
         };
         self.finish(outcome, "route configuration").await
@@ -1073,6 +1096,9 @@ impl ResourceApplier {
                 return Verdict::Reject(format!(
                     "EDS response named cluster load assignment `{name}` more than once"
                 ));
+            }
+            Err(ApplyError::AliasConflict(name)) => {
+                return Verdict::Reject(format!("EDS response has conflicting alias: {name}"));
             }
         };
 
@@ -1186,6 +1212,9 @@ impl ResourceApplier {
                 return Verdict::Reject(format!(
                     "SDS response named secret `{name}` more than once"
                 ));
+            }
+            Err(ApplyError::AliasConflict(name)) => {
+                return Verdict::Reject(format!("SDS response has conflicting alias: {name}"));
             }
         };
 
