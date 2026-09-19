@@ -1,5 +1,6 @@
 //! Minimal delta ADS wire harness used by WP-22 transport tests.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -45,7 +46,7 @@ impl From<DeltaDiscoveryRequest> for RecordedDeltaRequest {
 
 #[derive(Clone)]
 struct DeltaServer {
-    response: DeltaDiscoveryResponse,
+    responses: Arc<Mutex<VecDeque<DeltaDiscoveryResponse>>>,
     requests: Arc<Mutex<Vec<RecordedDeltaRequest>>>,
 }
 
@@ -66,7 +67,11 @@ impl AggregatedDiscoveryService for DeltaServer {
         request: Request<tonic::Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
         let mut incoming = request.into_inner();
-        let response = self.response.clone();
+        let response = self
+            .responses
+            .lock()
+            .expect("delta response queue mutex poisoned")
+            .pop_front();
         let requests = Arc::clone(&self.requests);
         let (sender, receiver) = mpsc::channel(2);
         tokio::spawn(async move {
@@ -77,8 +82,10 @@ impl AggregatedDiscoveryService for DeltaServer {
                 .lock()
                 .expect("delta request log mutex poisoned")
                 .push(initial.into());
-            if sender.send(Ok(response)).await.is_err() {
-                return;
+            if let Some(response) = response {
+                if sender.send(Ok(response)).await.is_err() {
+                    return;
+                }
             }
             if let Some(Ok(ack)) = incoming.next().await {
                 requests
@@ -124,11 +131,22 @@ pub struct DeltaHarness {
 
 impl DeltaHarness {
     pub async fn spawn(response: DeltaDiscoveryResponse) -> anyhow::Result<Self> {
+        Self::spawn_sequence([response]).await
+    }
+
+    /// Spawn a server whose successive streams receive successive responses.
+    ///
+    /// Each stream sends one response, waits for its ACK, then closes. This
+    /// models a control-plane stream reset and makes reconnect/resync tests
+    /// assert the first request on the new stream.
+    pub async fn spawn_sequence(
+        responses: impl IntoIterator<Item = DeltaDiscoveryResponse>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = DeltaServer {
-            response,
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
             requests: Arc::clone(&requests),
         };
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
