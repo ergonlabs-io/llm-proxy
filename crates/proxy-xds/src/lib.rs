@@ -15,6 +15,7 @@ pub mod backoff;
 pub mod client;
 pub mod delta_client;
 pub mod delta_subscription;
+pub mod filesystem;
 pub mod secret;
 pub mod store;
 pub mod subscription;
@@ -29,6 +30,7 @@ pub use delta_client::{
     DeltaAdsClient, DeltaAdsError, DeltaResponseHandler, DeltaValidator, FnDeltaHandler,
 };
 pub use delta_subscription::{DeltaRequest, DeltaSubscriptionState, ResourceVersion};
+pub use filesystem::{FileSource, FileSourceError, FileWatcher};
 pub use proxy_config::ir::{DynamicSecret, SecretKind};
 pub use store::{ApplyError, ApplyOutcome, DeltaApplyError, SetSemantics, SotwSet};
 pub use subscription::{Request, Subscription, SubscriptionState, Verdict};

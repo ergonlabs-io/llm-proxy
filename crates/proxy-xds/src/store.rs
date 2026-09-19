@@ -79,6 +79,9 @@ pub struct SotwSet<T> {
     /// never appear in `names()` or apply outcomes, so downstream sinks see
     /// one update per delivered resource.
     aliases: BTreeMap<String, String>,
+    /// Per-resource expiry deadlines. Kept in store so TTL state follows the
+    /// same atomic resource mutation as payload state.
+    expirations: BTreeMap<String, std::time::Instant>,
 }
 
 /// The result of applying one response's resource list to a [`SotwSet`].
@@ -132,6 +135,7 @@ impl<T> SotwSet<T> {
             static_names,
             dynamic: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            expirations: BTreeMap::new(),
         }
     }
 
@@ -178,7 +182,27 @@ impl<T> SotwSet<T> {
         for name in names {
             self.dynamic.remove(name);
             self.aliases.retain(|_, canonical| canonical != name);
+            self.expirations.remove(name);
         }
+    }
+
+    pub fn set_expiration(&mut self, name: String, deadline: std::time::Instant) {
+        if self.dynamic.contains_key(&name) {
+            self.expirations.insert(name, deadline);
+        }
+    }
+
+    pub fn clear_expiration(&mut self, name: &str) {
+        let canonical = self.aliases.get(name).map(String::as_str).unwrap_or(name);
+        self.expirations.remove(canonical);
+    }
+
+    pub fn expired(&self, now: std::time::Instant) -> Vec<String> {
+        self.expirations
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 }
 
@@ -295,6 +319,7 @@ impl<T: PartialEq> SotwSet<T> {
             for name in stale {
                 self.dynamic.remove(&name);
                 self.aliases.retain(|_, canonical| canonical != &name);
+                self.expirations.remove(&name);
                 removed.push(name);
             }
         }
@@ -419,6 +444,7 @@ impl<T: PartialEq> SotwSet<T> {
                 let canonical = self.aliases.get(&name).cloned().unwrap_or(name.clone());
                 if self.dynamic.remove(&canonical).is_some() {
                     self.aliases.retain(|_, value| value != &canonical);
+                    self.expirations.remove(&canonical);
                     removed.push(canonical);
                 }
             }
@@ -442,6 +468,7 @@ impl<T: PartialEq> SotwSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -717,5 +744,23 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, ApplyError::DuplicateName("shared".to_string()));
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn expiration_tracks_canonical_name_and_clears_on_removal() {
+        let mut s = SotwSet::new(SetSemantics::PerName, no_statics());
+        s.apply_named(vec![(
+            "canonical".to_string(),
+            7,
+            vec!["alias".to_string()],
+        )])
+        .unwrap();
+        let now = std::time::Instant::now();
+        s.set_expiration("canonical".to_string(), now + Duration::from_secs(1));
+        assert!(s.expired(now).is_empty());
+        assert_eq!(s.expired(now + Duration::from_secs(1)), vec!["canonical"]);
+        s.apply_delta_named(Vec::new(), &["alias".to_string()])
+            .unwrap();
+        assert!(s.expired(now + Duration::from_secs(2)).is_empty());
     }
 }

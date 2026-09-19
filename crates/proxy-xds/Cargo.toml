@@ -26,6 +26,9 @@ tracing = { workspace = true }
 # before handing them to `proxy-config`'s `lower_dynamic_*`.
 prost = { workspace = true }
 prost-types = { workspace = true }
+prost-reflect = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 [dev-dependencies]
 # The WP-28 puppet ADS server this increment's tests run the pump against

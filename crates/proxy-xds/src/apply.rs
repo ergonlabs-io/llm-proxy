@@ -69,6 +69,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use proxy_api::envoy::config::cluster::v3::Cluster as ClusterProto;
@@ -122,22 +123,24 @@ fn validate_delta_resource(
     if resource.aliases.iter().any(String::is_empty) {
         return Err(format!("{path}.aliases must not contain empty names"));
     }
-    if resource.ttl.is_some() {
-        return Err(format!("{path}.ttl is not implemented"));
-    }
     if resource.cache_control.is_some() {
         return Err(format!("{path}.cache_control is not implemented"));
     }
-    let Some(any) = resource.resource.as_ref() else {
-        return Err(format!(
-            "{path}.resource must be set; delta heartbeat resources are not implemented"
-        ));
-    };
-    if any.type_url != response_type_url {
-        return Err(format!(
-            "{path}.resource.type_url `{}` does not match delta_response.type_url `{response_type_url}`",
-            any.type_url
-        ));
+    if let Some(ttl) = resource.ttl.as_ref() {
+        if ttl.seconds < 0 || ttl.nanos < 0 || ttl.nanos >= 1_000_000_000 {
+            return Err(format!("{path}.ttl must be a positive finite duration"));
+        }
+        if ttl.seconds == 0 && ttl.nanos == 0 {
+            return Err(format!("{path}.ttl must be a positive finite duration"));
+        }
+    }
+    if let Some(any) = resource.resource.as_ref() {
+        if any.type_url != response_type_url {
+            return Err(format!(
+                "{path}.resource.type_url `{}` does not match delta_response.type_url `{response_type_url}`",
+                any.type_url
+            ));
+        }
     }
     Ok(())
 }
@@ -147,6 +150,22 @@ fn delta_any(resource: &DeltaResource) -> &prost_types::Any {
         .resource
         .as_ref()
         .expect("validate_delta_resource checked resource presence")
+}
+
+fn ttl_duration(resource: &DeltaResource) -> Result<Option<Duration>, String> {
+    resource
+        .ttl
+        .as_ref()
+        .map(|ttl| {
+            u64::try_from(ttl.seconds)
+                .ok()
+                .and_then(|seconds| {
+                    Duration::new(seconds, ttl.nanos as u32).checked_add(Duration::ZERO)
+                })
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| "ttl must be a positive finite duration".to_string())
+        })
+        .transpose()
 }
 
 fn delta_apply_error(type_name: &str, error: DeltaApplyError) -> String {
@@ -432,6 +451,9 @@ pub struct ResourceApplier {
     /// Optional startup initialization observer. Existing callers need no
     /// observer and retain identical behavior.
     initialization_sink: Option<InitializationSink>,
+    /// Last resource versions, used to validate payload-free TTL heartbeats.
+    delta_versions: BTreeSet<(String, String, String)>,
+    ttl_clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl ResourceApplier {
@@ -456,6 +478,8 @@ impl ResourceApplier {
             endpoint_sink: None,
             secret_sink: None,
             initialization_sink: None,
+            delta_versions: BTreeSet::new(),
+            ttl_clock: Arc::new(Instant::now),
         }
     }
 
@@ -482,6 +506,12 @@ impl ResourceApplier {
     /// response has completed its apply work.
     pub fn with_initialization_sink(mut self, sink: InitializationSink) -> Self {
         self.initialization_sink = Some(sink);
+        self
+    }
+
+    /// Inject a monotonic clock for deterministic TTL tests.
+    pub fn with_ttl_clock(mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        self.ttl_clock = clock;
         self
     }
 
@@ -637,6 +667,204 @@ impl ResourceApplier {
         verdict
     }
 
+    /// Remove resources whose delta TTL deadline has passed and notify same
+    /// downstream sinks used by explicit delta removals. Caller owns polling
+    /// cadence; no timer task is created inside the applier.
+    pub async fn expire_ttl(&mut self, now: Instant) -> Verdict {
+        let mut verdict = Verdict::Accept;
+
+        for (type_url, kind) in [
+            (CDS_TYPE_URL, "cluster"),
+            (LDS_TYPE_URL, "listener"),
+            (RDS_TYPE_URL, "route configuration"),
+        ] {
+            let names = match type_url {
+                CDS_TYPE_URL => self.clusters.expired(now),
+                LDS_TYPE_URL => self.listeners.expired(now),
+                _ => self.routes.expired(now),
+            };
+            if names.is_empty() {
+                continue;
+            }
+            let outcome = match type_url {
+                CDS_TYPE_URL => self.clusters.apply_delta_named(Vec::new(), &names),
+                LDS_TYPE_URL => self.listeners.apply_delta_named(Vec::new(), &names),
+                _ => self.routes.apply_delta_named(Vec::new(), &names),
+            };
+            let Ok(outcome) = outcome else {
+                return Verdict::Reject(format!("{kind} TTL expiration could not be applied"));
+            };
+            self.delta_versions
+                .retain(|(ty, name, _)| ty != type_url || !names.iter().any(|n| n == name));
+            if self.finish(outcome, kind).await != Verdict::Accept {
+                verdict = Verdict::Reject(format!("{kind} TTL expiration publish failed"));
+            }
+        }
+
+        let endpoint_names = self.endpoints.expired(now);
+        if !endpoint_names.is_empty() {
+            let previous = self.endpoints.clone();
+            let outcome = self
+                .endpoints
+                .apply_delta_named(Vec::new(), &endpoint_names)
+                .expect("empty delta with known names cannot fail");
+            let mut failures = Vec::new();
+            let removals: Vec<_> = outcome
+                .removed
+                .iter()
+                .map(|name| (name.clone(), self.eds_clusters_for(name)))
+                .collect();
+            if let Some(sink) = self.endpoint_sink.as_mut() {
+                for (name, clusters) in removals {
+                    for cluster in clusters {
+                        if let Err(error) = sink(cluster.clone(), Vec::new()).await {
+                            failures.push(format!("{cluster} (resource `{name}`): {error}"));
+                        }
+                    }
+                }
+            } else {
+                failures.push("EDS endpoint sink is not wired".to_string());
+            }
+            if failures.is_empty() {
+                self.delta_versions.retain(|(ty, name, _)| {
+                    ty != EDS_TYPE_URL || !endpoint_names.iter().any(|n| n == name)
+                });
+            } else {
+                self.endpoints = previous;
+                verdict = Verdict::Reject(format!(
+                    "EDS TTL expiration failed: {}",
+                    failures.join("; ")
+                ));
+            }
+        }
+
+        let secret_names = self.secrets.expired(now);
+        if !secret_names.is_empty() {
+            let previous = self.secrets.clone();
+            let outcome = self
+                .secrets
+                .apply_delta_named(Vec::new(), &secret_names)
+                .expect("empty delta with known names cannot fail");
+            let mut failures = Vec::new();
+            if let Some(sink) = self.secret_sink.as_mut() {
+                for name in &outcome.removed {
+                    if let Err(error) = sink(SecretUpdate::Remove { name: name.clone() }).await {
+                        failures.push(format!("{name}: {error}"));
+                    }
+                }
+            } else {
+                failures.push("SDS secret sink is not wired".to_string());
+            }
+            if failures.is_empty() {
+                self.delta_versions.retain(|(ty, name, _)| {
+                    ty != SDS_TYPE_URL || !secret_names.iter().any(|n| n == name)
+                });
+            } else {
+                self.secrets = previous;
+                verdict = Verdict::Reject(format!(
+                    "SDS TTL expiration failed: {}",
+                    failures.join("; ")
+                ));
+            }
+        }
+
+        verdict
+    }
+
+    fn heartbeat_or_payload(
+        &mut self,
+        type_url: &str,
+        resource: &DeltaResource,
+    ) -> Result<bool, String> {
+        if resource.resource.is_some() {
+            return Ok(false);
+        }
+        if !self.delta_versions.contains(&(
+            type_url.to_string(),
+            resource.name.clone(),
+            resource.version.clone(),
+        )) {
+            return Err(format!(
+                "delta_response.resources heartbeat for `{}` has no matching resource version",
+                resource.name
+            ));
+        }
+        ttl_duration(resource)?;
+        if !matches!(
+            type_url,
+            CDS_TYPE_URL | LDS_TYPE_URL | RDS_TYPE_URL | EDS_TYPE_URL | SDS_TYPE_URL
+        ) {
+            return Err(format!("unknown delta ADS type_url `{type_url}`"));
+        }
+        Ok(true)
+    }
+
+    fn record_ttls(&mut self, type_url: &str, resources: &[DeltaResource]) {
+        let now = (self.ttl_clock)();
+        for resource in resources {
+            self.delta_versions.remove(&(
+                type_url.to_string(),
+                resource.name.clone(),
+                String::new(),
+            ));
+            self.delta_versions
+                .retain(|(ty, name, _)| ty != type_url || name != &resource.name);
+            self.delta_versions.insert((
+                type_url.to_string(),
+                resource.name.clone(),
+                resource.version.clone(),
+            ));
+            let deadline = if let Some(ttl) = resource
+                .ttl
+                .as_ref()
+                .and_then(|_| ttl_duration(resource).ok())
+                .flatten()
+            {
+                Some(now + ttl)
+            } else {
+                None
+            };
+            match type_url {
+                CDS_TYPE_URL => {
+                    if let Some(d) = deadline {
+                        self.clusters.set_expiration(resource.name.clone(), d)
+                    } else {
+                        self.clusters.clear_expiration(&resource.name)
+                    }
+                }
+                LDS_TYPE_URL => {
+                    if let Some(d) = deadline {
+                        self.listeners.set_expiration(resource.name.clone(), d)
+                    } else {
+                        self.listeners.clear_expiration(&resource.name)
+                    }
+                }
+                RDS_TYPE_URL => {
+                    if let Some(d) = deadline {
+                        self.routes.set_expiration(resource.name.clone(), d)
+                    } else {
+                        self.routes.clear_expiration(&resource.name)
+                    }
+                }
+                EDS_TYPE_URL => {
+                    if let Some(d) = deadline {
+                        self.endpoints.set_expiration(resource.name.clone(), d)
+                    } else {
+                        self.endpoints.clear_expiration(&resource.name)
+                    }
+                }
+                SDS_TYPE_URL => {
+                    if let Some(d) = deadline {
+                        self.secrets.set_expiration(resource.name.clone(), d)
+                    } else {
+                        self.secrets.clear_expiration(&resource.name)
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     async fn emit_initialization_event(&mut self, accepted_type_url: &str) {
         if self.initialization_sink.is_none() {
             return;
@@ -673,8 +901,17 @@ impl ResourceApplier {
     }
 
     async fn on_delta_cds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
-        let mut pairs = Vec::with_capacity(response.resources.len());
-        for (index, resource) in response.resources.iter().enumerate() {
+        let resources = response.resources.clone();
+        let mut pairs = Vec::with_capacity(resources.len());
+        for (index, resource) in resources.iter().enumerate() {
+            if self.heartbeat_or_payload(CDS_TYPE_URL, resource).is_err() {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].resource heartbeat has no matching resource version"
+                ));
+            }
+            if resource.resource.is_none() {
+                continue;
+            }
             let any = delta_any(resource);
             let path = format!("delta_response.resources[{index}].resource");
             let ir = match lower_dynamic_cluster(any, &path) {
@@ -703,12 +940,22 @@ impl ResourceApplier {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("CDS", error)),
         };
+        self.record_ttls(CDS_TYPE_URL, &response.resources);
         self.finish(outcome, "cluster").await
     }
 
     async fn on_delta_lds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
-        let mut pairs = Vec::with_capacity(response.resources.len());
-        for (index, resource) in response.resources.iter().enumerate() {
+        let resources = response.resources.clone();
+        let mut pairs = Vec::with_capacity(resources.len());
+        for (index, resource) in resources.iter().enumerate() {
+            if self.heartbeat_or_payload(LDS_TYPE_URL, resource).is_err() {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].resource heartbeat has no matching resource version"
+                ));
+            }
+            if resource.resource.is_none() {
+                continue;
+            }
             let any = delta_any(resource);
             let path = format!("delta_response.resources[{index}].resource");
             let ir = match lower_dynamic_listener(any, &path) {
@@ -737,12 +984,22 @@ impl ResourceApplier {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("LDS", error)),
         };
+        self.record_ttls(LDS_TYPE_URL, &response.resources);
         self.finish(outcome, "listener").await
     }
 
     async fn on_delta_rds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
-        let mut pairs = Vec::with_capacity(response.resources.len());
-        for (index, resource) in response.resources.iter().enumerate() {
+        let resources = response.resources.clone();
+        let mut pairs = Vec::with_capacity(resources.len());
+        for (index, resource) in resources.iter().enumerate() {
+            if self.heartbeat_or_payload(RDS_TYPE_URL, resource).is_err() {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].resource heartbeat has no matching resource version"
+                ));
+            }
+            if resource.resource.is_none() {
+                continue;
+            }
             let any = delta_any(resource);
             let path = format!("delta_response.resources[{index}].resource");
             let ir = match lower_dynamic_route(any, &path) {
@@ -771,6 +1028,7 @@ impl ResourceApplier {
             Ok(outcome) => outcome,
             Err(error) => return Verdict::Reject(delta_apply_error("RDS", error)),
         };
+        self.record_ttls(RDS_TYPE_URL, &response.resources);
         self.finish(outcome, "route configuration").await
     }
 
@@ -780,8 +1038,17 @@ impl ResourceApplier {
                 "EDS (`{EDS_TYPE_URL}`) is not applied: this ResourceApplier has no endpoint sink wired"
             ));
         }
-        let mut pairs = Vec::with_capacity(response.resources.len());
-        for (index, resource) in response.resources.iter().enumerate() {
+        let resources = response.resources.clone();
+        let mut pairs = Vec::with_capacity(resources.len());
+        for (index, resource) in resources.iter().enumerate() {
+            if self.heartbeat_or_payload(EDS_TYPE_URL, resource).is_err() {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].resource heartbeat has no matching resource version"
+                ));
+            }
+            if resource.resource.is_none() {
+                continue;
+            }
             let any = delta_any(resource);
             let path = format!("delta_response.resources[{index}].resource");
             let (name, endpoints) = match lower_dynamic_endpoints(any, &path) {
@@ -861,6 +1128,7 @@ impl ResourceApplier {
             }
         }
         if failures.is_empty() {
+            self.record_ttls(EDS_TYPE_URL, &response.resources);
             Verdict::Accept
         } else {
             self.endpoints = previous;
@@ -872,13 +1140,17 @@ impl ResourceApplier {
     }
 
     async fn on_delta_sds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {
-        let Some(sink) = self.secret_sink.as_mut() else {
-            return Verdict::Reject(format!(
-                "SDS (`{SDS_TYPE_URL}`) is not applied: this ResourceApplier has no secret sink wired"
-            ));
-        };
-        let mut pairs = Vec::with_capacity(response.resources.len());
-        for (index, resource) in response.resources.iter().enumerate() {
+        let resources = response.resources.clone();
+        let mut pairs = Vec::with_capacity(resources.len());
+        for (index, resource) in resources.iter().enumerate() {
+            if self.heartbeat_or_payload(SDS_TYPE_URL, resource).is_err() {
+                return Verdict::Reject(format!(
+                    "delta_response.resources[{index}].resource heartbeat has no matching resource version"
+                ));
+            }
+            if resource.resource.is_none() {
+                continue;
+            }
             let any = delta_any(resource);
             let path = format!("delta_response.resources[{index}].resource");
             let secret = match decode_secret(any, &path) {
@@ -900,6 +1172,11 @@ impl ResourceApplier {
                 resource.aliases.clone(),
             ));
         }
+        let Some(sink) = self.secret_sink.as_mut() else {
+            return Verdict::Reject(format!(
+                "SDS (`{SDS_TYPE_URL}`) is not applied: this ResourceApplier has no secret sink wired"
+            ));
+        };
         let previous = self.secrets.clone();
         let outcome = match self
             .secrets
@@ -932,6 +1209,7 @@ impl ResourceApplier {
             }
         }
         if failures.is_empty() {
+            self.record_ttls(SDS_TYPE_URL, &response.resources);
             Verdict::Accept
         } else {
             self.secrets = previous;
