@@ -39,6 +39,14 @@ that crossed the reload boundary — reaches `data: [DONE]`. A clean EOF is not
 treated as success. It is deterministic, hermetic, and needs neither Docker,
 xDS, nor provider credentials.
 
+## Landed: rename-churn acceptance drill
+
+`cargo test -p diffrig --test rename_churn -- --ignored` runs eight listener/cluster
+renames while an explicit 5,000-request/second open-loop load is active, then sends
+a malformed generation and proves last-good serving remains live. It is an
+acceptance drill, not a passing CI test: dedicated capacity-host execution is
+required, and broader Envoy side-by-side comparison remains open.
+
 ## Deferred: side-by-side Envoy HTTP replay/capture topology
 
 The docker-compose topology, proxy drivers, and capture/compare engine that
