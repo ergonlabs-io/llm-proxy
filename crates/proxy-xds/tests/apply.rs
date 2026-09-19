@@ -9,6 +9,7 @@
 //! YAML -- there is no bootstrap file on this path, only resources the ADS
 //! client already decoded off the wire.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use prost::Message;
@@ -24,11 +25,12 @@ use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use proxy_api::envoy::service::discovery::v3::{
     DeltaDiscoveryResponse, DiscoveryResponse, Resource as DeltaResource,
 };
-use proxy_config::ir::{ConfigSnapshot, EndpointIR};
+use proxy_config::ir::{AdsConfig, AdsProtocol, ConfigSnapshot, EndpointIR, NodeIdentity};
 use proxy_config::lower_dynamic_cluster;
 use proxy_xds::apply::SecretUpdate;
 use proxy_xds::{
-    Publish, PublishEndpoints, PublishSecrets, ResourceApplier, ResponseHandler, Verdict,
+    InitializationEvent, InitializationSink, Publish, PublishEndpoints, PublishSecrets,
+    ResourceApplier, ResponseHandler, Verdict,
 };
 
 const TCP_PROXY_TYPE: &str = "envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
@@ -323,6 +325,23 @@ fn base_with_static_eds_cluster(name: &str, service_name: &str) -> Arc<ConfigSna
     Arc::new(snapshot)
 }
 
+fn with_ads_requirements(
+    mut base: Arc<ConfigSnapshot>,
+    cds: bool,
+    lds: bool,
+) -> Arc<ConfigSnapshot> {
+    let snapshot = Arc::get_mut(&mut base).expect("fixture base must have one owner");
+    snapshot.ads = Some(AdsConfig {
+        cluster: "ads-control-plane".to_string(),
+        protocol: AdsProtocol::Sotw,
+        lds,
+        cds,
+        initial_fetch_timeout: None,
+        node: NodeIdentity::default(),
+    });
+    base
+}
+
 /// What [`recording_endpoint_sink`] hands back: every successful sink call,
 /// in order, as `(cluster_name, endpoints)`.
 type RecordedEndpointCalls = Arc<Mutex<Vec<(String, Vec<EndpointIR>)>>>;
@@ -367,7 +386,140 @@ fn recording_publisher() -> (Publish, Arc<Mutex<Vec<Arc<ConfigSnapshot>>>>) {
     (publish, published)
 }
 
+type RecordedInitializationEvents = Arc<Mutex<Vec<InitializationEvent>>>;
+
+fn recording_initialization_sink() -> (InitializationSink, RecordedInitializationEvents) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let sink: InitializationSink = Box::new(move |event| {
+        recorded.lock().unwrap().push(event);
+        Box::pin(std::future::ready(()))
+    });
+    (sink, events)
+}
+
 // ------------------------------------------------------------- acceptance --
+
+#[tokio::test]
+async fn accepted_event_reports_received_eds_and_rds_after_sink_and_publish_work() {
+    let base = with_ads_requirements(
+        base_with_static_eds_cluster("payments", "payments-eds"),
+        true,
+        true,
+    );
+    let (publish, _published) = recording_publisher();
+    let (endpoint_sink, endpoint_calls) = recording_endpoint_sink(&[]);
+    let (initialization_sink, events) = recording_initialization_sink();
+    let mut applier = ResourceApplier::new(base, publish)
+        .with_endpoint_sink(endpoint_sink)
+        .with_initialization_sink(initialization_sink);
+
+    assert_eq!(
+        applier
+            .on_response(&lds_response(
+                "lds-1",
+                &[minimal_rds_listener("ingress", "ingress-routes", 10000)],
+            ))
+            .await,
+        Verdict::Accept
+    );
+    assert_eq!(
+        applier
+            .on_response(&rds_response(
+                "rds-1",
+                &[route_v3::RouteConfiguration {
+                    name: "ingress-routes".to_string(),
+                    ..Default::default()
+                }],
+            ))
+            .await,
+        Verdict::Accept
+    );
+    assert_eq!(
+        applier
+            .on_response(&eds_response(
+                "eds-1",
+                &[minimal_assignment("payments-eds", &[("10.0.0.1", 8080)])],
+            ))
+            .await,
+        Verdict::Accept
+    );
+
+    assert_eq!(endpoint_calls.lock().unwrap().len(), 1);
+    let events = events.lock().unwrap();
+    let event = events.last().expect("accepted EDS emits an event");
+    assert_eq!(event.accepted_type_url, EDS_TYPE_URL);
+    assert!(event.cds_required);
+    assert!(event.lds_required);
+    assert_eq!(
+        event.required_eds,
+        BTreeSet::from(["payments-eds".to_string()])
+    );
+    assert_eq!(event.received_eds, event.required_eds);
+    assert_eq!(
+        event.required_rds,
+        BTreeSet::from(["ingress-routes".to_string()])
+    );
+    assert_eq!(event.received_rds, event.required_rds);
+}
+
+#[tokio::test]
+async fn accepted_cds_and_lds_events_expose_new_dynamic_requirements() {
+    let base = with_ads_requirements(empty_base(), true, true);
+    let (publish, _published) = recording_publisher();
+    let (sink, events) = recording_initialization_sink();
+    let mut applier = ResourceApplier::new(base, publish).with_initialization_sink(sink);
+
+    assert_eq!(
+        applier
+            .on_response(&cds_response(
+                "cds-1",
+                &[eds_cluster("payments", "payments-eds")],
+            ))
+            .await,
+        Verdict::Accept
+    );
+    assert_eq!(
+        applier
+            .on_response(&lds_response(
+                "lds-1",
+                &[minimal_rds_listener("ingress", "ingress-routes", 10000)],
+            ))
+            .await,
+        Verdict::Accept
+    );
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].accepted_type_url, CDS_TYPE_URL);
+    assert_eq!(
+        events[0].required_eds,
+        BTreeSet::from(["payments-eds".to_string()])
+    );
+    assert!(events[0].received_eds.is_empty());
+    assert_eq!(events[1].accepted_type_url, LDS_TYPE_URL);
+    assert_eq!(
+        events[1].required_rds,
+        BTreeSet::from(["ingress-routes".to_string()])
+    );
+    assert!(events[1].received_rds.is_empty());
+}
+
+#[tokio::test]
+async fn rejected_response_emits_no_initialization_event() {
+    let (publish, _published) = recording_publisher();
+    let (sink, events) = recording_initialization_sink();
+    let mut applier = ResourceApplier::new(empty_base(), publish).with_initialization_sink(sink);
+    let duplicate = minimal_cluster("duplicate", 8000);
+
+    assert!(matches!(
+        applier
+            .on_response(&cds_response("bad", &[duplicate.clone(), duplicate]))
+            .await,
+        Verdict::Reject(_)
+    ));
+    assert!(events.lock().unwrap().is_empty());
+}
 
 #[tokio::test]
 async fn a_cds_response_with_one_valid_cluster_publishes_a_snapshot_with_the_version_bumped() {
@@ -1407,6 +1559,30 @@ fn delta_sds_response(
         removed_resources: removed.iter().map(|name| (*name).to_string()).collect(),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn accepted_delta_response_emits_initialization_event() {
+    let base = with_ads_requirements(empty_base(), true, false);
+    let (publish, _published) = recording_publisher();
+    let (sink, events) = recording_initialization_sink();
+    let mut applier = ResourceApplier::new(base, publish).with_initialization_sink(sink);
+    let response = delta_cds_response(
+        "n1",
+        &[("v1", eds_cluster("payments", "payments-eds"))],
+        &[],
+    );
+
+    assert_eq!(applier.on_delta_response(&response).await, Verdict::Accept);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].accepted_type_url, CDS_TYPE_URL);
+    assert!(events[0].cds_required);
+    assert!(!events[0].lds_required);
+    assert_eq!(
+        events[0].required_eds,
+        BTreeSet::from(["payments-eds".to_string()])
+    );
 }
 
 #[tokio::test]

@@ -486,6 +486,16 @@ impl UsageFilterInstance {
         self.last_chunk_at = Some(now);
     }
 
+    /// Convert the IR's cluster-level usage dialect to the filter's parsed
+    /// dialect enum, preserving the one-source-of-truth mapping for the selected
+    /// upstream member.
+    fn resolve_cluster_dialect(cluster_dialect: proxy_config::ir::UsageDialect) -> Dialect {
+        match cluster_dialect {
+            proxy_config::ir::UsageDialect::OpenAi => Dialect::OpenAi,
+            proxy_config::ir::UsageDialect::Anthropic => Dialect::Anthropic,
+        }
+    }
+
     /// Compute the final usage (if any) for the current body mode, without
     /// consuming `self.mode` — cheap enough (an `Option<TokenUsage>` and a
     /// JSON parse of an already-bounded buffer) that borrowing is simplest.
@@ -553,14 +563,16 @@ impl HttpFilter for UsageFilterInstance {
         end_stream: bool,
     ) -> FilterHeadersStatus {
         self.headers_at = Some(Instant::now());
-        let dialect = cb
-            .per_route_config()
-            .and_then(|cfg| {
-                cfg.as_any()
-                    .downcast_ref::<UsagePerRouteConfig>()
-                    .map(|c| c.0)
-            })
-            .unwrap_or(self.dialect);
+        let route_dialect = cb.per_route_config().and_then(|cfg| {
+            cfg.as_any()
+                .downcast_ref::<UsagePerRouteConfig>()
+                .map(|c| c.0)
+        });
+        let cluster_dialect = cb
+            .stream_info()
+            .upstream_usage_dialect
+            .map(Self::resolve_cluster_dialect);
+        let dialect = cluster_dialect.or(route_dialect).unwrap_or(self.dialect);
         self.dialect = dialect;
         self.mode = classify_body(&headers.headers, dialect);
 
@@ -1180,6 +1192,31 @@ mod tests {
         let usage = cb.llm().usage.expect("usage should be found");
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 4);
+    }
+
+    #[test]
+    fn selected_cluster_dialect_is_used_when_no_route_override_exists() {
+        let mut filter = filter_for(Dialect::Anthropic);
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.upstream_usage_dialect = Some(proxy_config::ir::UsageDialect::OpenAi);
+        }
+
+        let mut headers = response_headers("application/json");
+        assert_eq!(
+            filter.encode_headers(&mut cb, &mut headers, false),
+            FilterHeadersStatus::Continue
+        );
+
+        let mut data =
+            Bytes::from_static(br#"{"usage":{"prompt_tokens":7,"completion_tokens":9}}"#);
+        filter.encode_data(&mut cb, &mut data, true);
+
+        let usage = cb.llm().usage.expect("usage should be found");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 9);
     }
 
     #[test]

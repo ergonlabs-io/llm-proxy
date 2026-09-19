@@ -907,6 +907,10 @@ impl ClusterEntry for ClusterHandle {
         self.managed.config.provider_runtime.as_ref()
     }
 
+    fn usage_dialect(&self) -> Option<proxy_config::ir::UsageDialect> {
+        self.managed.config.usage_dialect
+    }
+
     fn report_outlier_result(&self, addr: SocketAddr, result: RequestResult) {
         // No-op unless this cluster configures outlier detection. For an
         // aggregate the router calls this on the *member's* entry (the one

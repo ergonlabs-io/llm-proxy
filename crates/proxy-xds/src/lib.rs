@@ -19,7 +19,10 @@ pub mod secret;
 pub mod store;
 pub mod subscription;
 
-pub use apply::{Publish, PublishEndpoints, PublishSecrets, ResourceApplier};
+pub use apply::{
+    InitializationEvent, InitializationSink, Publish, PublishEndpoints, PublishSecrets,
+    ResourceApplier, SecretUpdate,
+};
 pub use backoff::BackoffPolicy;
 pub use client::{AdsClient, AdsError, FnHandler, Reconnect, ResponseHandler, Sleep, Validator};
 pub use delta_client::{

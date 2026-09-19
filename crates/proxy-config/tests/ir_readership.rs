@@ -157,20 +157,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                  a cluster. `proxy` is control-side and outside RUNTIME_CRATES.",
     },
     AllowlistEntry {
-        struct_name: "ClusterConfig",
-        field_name: "usage_dialect",
-        kind: EntryKind::KnownInert,
-        reason: "WP-35 increment 1 lands the per-provider carrier (ground rule \
-                  #6's third instance) additively: the usage filter still reads \
-                  the route-level typed_per_filter_config copy, so nothing in a \
-                  runtime crate reads this field yet. Increment 2 switches the \
-                  filter over to it and deletes this entry -- and the \
-                  cross-dialect fallback prohibition in \
-                  proxy-simple-config/src/lower.rs must stay until it does, \
-                  since that rejection is what currently prevents the route \
-                  copy from reaching the wrong provider on failover.",
-    },
-    AllowlistEntry {
         struct_name: "VirtualHostIR",
         field_name: "domains",
         kind: EntryKind::ConsumedInternally,

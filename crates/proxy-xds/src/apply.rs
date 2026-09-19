@@ -234,6 +234,31 @@ pub enum SecretUpdate {
 pub type PublishSecrets =
     Box<dyn FnMut(SecretUpdate) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send>;
 
+/// Initialization state after one accepted xDS response has finished all
+/// apply, publish, and resource-sink work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitializationEvent {
+    /// Type URL of response whose successful application produced this event.
+    pub accepted_type_url: String,
+    /// Bootstrap configured CDS as a required wildcard ADS source.
+    pub cds_required: bool,
+    /// Bootstrap configured LDS as a required wildcard ADS source.
+    pub lds_required: bool,
+    /// EDS resource names required by current cluster configuration.
+    pub required_eds: BTreeSet<String>,
+    /// EDS resource names currently retained under per-name semantics.
+    pub received_eds: BTreeSet<String>,
+    /// RDS resource names required by current staged listener configuration.
+    pub required_rds: BTreeSet<String>,
+    /// RDS resource names currently retained under per-name semantics.
+    pub received_rds: BTreeSet<String>,
+}
+
+/// Observer for accepted-response initialization state. Output is infallible:
+/// initialization bookkeeping must not turn an applied response into a NACK.
+pub type InitializationSink =
+    Box<dyn FnMut(InitializationEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
 /// One dynamically-held resource: the raw bytes it arrived as, plus the IR
 /// [`lower_dynamic_cluster`] / [`lower_dynamic_listener`] produced from them.
 ///
@@ -401,6 +426,9 @@ pub struct ResourceApplier {
     /// [`ResourceApplier::with_secret_sink`] wires one -- until then, an SDS
     /// response is refused (see `on_sds_response`).
     secret_sink: Option<PublishSecrets>,
+    /// Optional startup initialization observer. Existing callers need no
+    /// observer and retain identical behavior.
+    initialization_sink: Option<InitializationSink>,
 }
 
 impl ResourceApplier {
@@ -424,6 +452,7 @@ impl ResourceApplier {
             publish,
             endpoint_sink: None,
             secret_sink: None,
+            initialization_sink: None,
         }
     }
 
@@ -443,6 +472,13 @@ impl ResourceApplier {
     /// reason: without this, `on_sds_response` keeps refusing SDS by name.
     pub fn with_secret_sink(mut self, sink: PublishSecrets) -> Self {
         self.secret_sink = Some(sink);
+        self
+    }
+
+    /// Observe initialization state after each accepted SotW or delta
+    /// response has completed its apply work.
+    pub fn with_initialization_sink(mut self, sink: InitializationSink) -> Self {
+        self.initialization_sink = Some(sink);
         self
     }
 
@@ -528,14 +564,18 @@ impl ResourceApplier {
     /// [`AdsClient::run_once`](crate::client::AdsClient::run_once) can finish
     /// applying a response before it sends that response's ACK.
     pub async fn on_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
-        match resp.type_url.as_str() {
+        let verdict = match resp.type_url.as_str() {
             CDS_TYPE_URL => self.on_cds_response(resp).await,
             LDS_TYPE_URL => self.on_lds_response(resp).await,
             EDS_TYPE_URL => self.on_eds_response(resp).await,
             SDS_TYPE_URL => self.on_sds_response(resp).await,
             RDS_TYPE_URL => self.on_rds_response(resp).await,
             other => Verdict::Reject(format!("unknown ADS type_url `{other}`")),
+        };
+        if verdict == Verdict::Accept {
+            self.emit_initialization_event(&resp.type_url).await;
         }
+        verdict
     }
 
     /// Validate, apply, then ACK/NACK one delta response. Wrapper fields not
@@ -559,14 +599,53 @@ impl ResourceApplier {
             }
         }
 
-        match response.type_url.as_str() {
+        let verdict = match response.type_url.as_str() {
             CDS_TYPE_URL => self.on_delta_cds_response(response).await,
             LDS_TYPE_URL => self.on_delta_lds_response(response).await,
             RDS_TYPE_URL => self.on_delta_rds_response(response).await,
             EDS_TYPE_URL => self.on_delta_eds_response(response).await,
             SDS_TYPE_URL => self.on_delta_sds_response(response).await,
             other => Verdict::Reject(format!("unknown delta ADS type_url `{other}`")),
+        };
+        if verdict == Verdict::Accept {
+            self.emit_initialization_event(&response.type_url).await;
         }
+        verdict
+    }
+
+    async fn emit_initialization_event(&mut self, accepted_type_url: &str) {
+        if self.initialization_sink.is_none() {
+            return;
+        }
+        let (cds_required, lds_required) = self
+            .base
+            .ads
+            .as_ref()
+            .map(|ads| (ads.cds, ads.lds))
+            .unwrap_or((false, false));
+        let event = InitializationEvent {
+            accepted_type_url: accepted_type_url.to_string(),
+            cds_required,
+            lds_required,
+            required_eds: self.eds_resource_names(),
+            received_eds: self
+                .endpoints
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            required_rds: self.rds_resource_names(),
+            received_rds: self
+                .routes
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        self.initialization_sink
+            .as_mut()
+            .expect("initialization sink presence checked above")(event)
+        .await;
     }
 
     async fn on_delta_cds_response(&mut self, response: &DeltaDiscoveryResponse) -> Verdict {

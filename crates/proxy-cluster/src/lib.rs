@@ -631,6 +631,10 @@ pub trait ClusterEntry: Send + Sync {
     /// Provider-specific credential and model path behavior for this cluster.
     fn provider_runtime(&self) -> Option<&proxy_config::ir::ProviderRuntimeConfig>;
 
+    /// Which usage dialect the provider behind this cluster speaks. Returns
+    /// `None` for ordinary clusters that never set the llmproxy usage metadata.
+    fn usage_dialect(&self) -> Option<proxy_config::ir::UsageDialect>;
+
     /// Feed one upstream attempt's outcome to this cluster's S6 outlier
     /// detector (WP-19). `addr` is the host the attempt actually dialed. A
     /// no-op when the cluster configures no outlier detection, so the router

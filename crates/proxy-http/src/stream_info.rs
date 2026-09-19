@@ -171,6 +171,11 @@ pub struct StreamInfo {
     pub upstream_host: Option<String>,
     /// WP-24: the cluster the request was forwarded to -- `%UPSTREAM_CLUSTER%`.
     pub upstream_cluster: Option<String>,
+    /// The usage dialect spoken by the selected upstream member. This is the
+    /// provider actually dialled after any aggregate/fallback choice, so the
+    /// usage filter can parse the response with the correct schema even when
+    /// the route still carries a legacy compatibility override.
+    pub upstream_usage_dialect: Option<proxy_config::ir::UsageDialect>,
     /// WP-24: the HTTP version spoken to the upstream -- `%PROTOCOL%`.
     /// `None` for a local reply, which never dials one.
     pub protocol: Option<String>,
@@ -238,6 +243,7 @@ impl Default for StreamInfo {
             is_local_reply: false,
             upstream_host: None,
             upstream_cluster: None,
+            upstream_usage_dialect: None,
             protocol: None,
             bytes_received: 0,
             bytes_sent: 0,

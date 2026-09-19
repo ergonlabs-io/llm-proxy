@@ -629,6 +629,7 @@ impl RouterHandler {
         {
             let mut info = dcb.stream_info();
             info.upstream_cluster = Some(attempt_cluster.to_string());
+            info.upstream_usage_dialect = attempt_entry.usage_dialect();
             info.upstream_host = Some(host.address.to_string());
             info.protocol = Some(
                 match proto {

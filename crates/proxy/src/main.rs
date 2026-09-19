@@ -31,10 +31,11 @@ use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, 
 use proxy_core::tls::SdsSecretRegistry;
 use proxy_xds::apply::SecretUpdate;
 use proxy_xds::{
-    AdsClient, DeltaAdsClient, DeltaSubscriptionState, Publish, PublishEndpoints, PublishSecrets,
-    Reconnect, ResourceApplier, ResponseHandler, Subscription, SubscriptionState,
+    AdsClient, DeltaAdsClient, DeltaSubscriptionState, InitializationEvent, InitializationSink,
+    Publish, PublishEndpoints, PublishSecrets, Reconnect, ResourceApplier, ResponseHandler,
+    Subscription, SubscriptionState,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tonic::transport::Channel;
 
 mod keygen;
@@ -813,8 +814,22 @@ async fn run_serve(
     // means nothing was started; see `start_ads`'s own doc for the three
     // (non-fatal) ways that happens. The receiver is read from inside the
     // `select!` in this function's own signal loop, further down.
-    let mut ads_apply_rx = start_ads(&snapshot, &node, &cluster_manager, &secret_registry);
+    let mut init_manager = InitManager::new(&snapshot);
+    let startup_gate = Arc::new(StartupGate::new());
+    let ads_channels = start_ads(&snapshot, &node, &cluster_manager, &secret_registry);
+    let (mut ads_apply_rx, mut init_rx) = ads_channels
+        .map(|(apply, init)| (Some(apply), Some(init)))
+        .unwrap_or((None, None));
+    let initial_fetch_timeout = snapshot
+        .ads
+        .as_ref()
+        .and_then(|ads| ads.initial_fetch_timeout)
+        .unwrap_or(proxy_cluster::discovery::DEFAULT_INITIAL_FETCH_TIMEOUT);
+    if init_manager.ready() {
+        startup_gate.release();
+    }
 
+    let startup_gate_for_workers = startup_gate.clone();
     let publisher = WorkerPool::spawn(
         WorkerPoolConfig {
             concurrency,
@@ -824,9 +839,11 @@ async fn run_serve(
         snapshot_handles,
         move |ctx: WorkerContext| {
             let bind_tx = bind_tx.clone();
+            let startup_gate = startup_gate_for_workers.clone();
             worker_main(
                 ctx,
                 bind_tx,
+                startup_gate,
                 cluster_manager.clone(),
                 registry.clone(),
                 stat_handles.clone(),
@@ -848,6 +865,53 @@ async fn run_serve(
         listeners = %listener_summary.join(", "),
         "llm-proxy started, waiting for SIGTERM/SIGINT/SIGHUP"
     );
+
+    // Startup gate: consume initial xDS responses before allowing workers to
+    // bind. A timeout releases this gate without marking unresolved resources
+    // initialized; request admission continues to distinguish warming.
+    let init_deadline = Instant::now() + initial_fetch_timeout;
+    while !init_manager.ready() {
+        let remaining = init_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(
+                "initial xDS fetch timeout expired; starting workers with last-good configuration"
+            );
+            startup_gate.release();
+            break;
+        }
+        tokio::select! {
+            event = recv_init_event(&mut init_rx) => {
+                if let Some(event) = event {
+                    init_manager.accept(event);
+                    if init_manager.ready() {
+                        startup_gate.release();
+                    }
+                } else {
+                    init_rx = None;
+                }
+            }
+            ads_msg = recv_ads_apply(&mut ads_apply_rx) => {
+                if let Some((mut ads_snapshot, reply)) = ads_msg {
+                    ads_snapshot.version = SnapshotVersion(current_version.0 + 1);
+                    let (version, rejected) = apply_snapshot(
+                        ads_snapshot,
+                        &publisher,
+                        &cluster_manager_for_reload,
+                        &stats_control,
+                        &stat_handle_tables_for_reload,
+                    ).await;
+                    current_version = version;
+                    for (name, err) in rejected {
+                        tracing::error!(cluster = %name, error = %err, "ADS: cluster rejected during startup");
+                    }
+                    let _ = reply.send(());
+                } else {
+                    ads_apply_rx = None;
+                }
+            }
+            _ = tokio::time::sleep(remaining) => {}
+        }
+    }
 
     // Startup gate: every worker must report a successful initial bind
     // before we consider ourselves "up". A single failed listener is fatal
@@ -1209,6 +1273,96 @@ const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_socke
 /// `start_ads`'s doc for why the callback awaits the reply before resolving).
 type AdsApplyMsg = (ConfigSnapshot, oneshot::Sender<()>);
 
+/// Tracks Envoy's initial dependency chain. A deadline releases workers from
+/// startup gating, but never changes any cluster's initialization state.
+#[derive(Debug)]
+struct InitManager {
+    cds_required: bool,
+    lds_required: bool,
+    cds_received: bool,
+    lds_received: bool,
+    required_eds: std::collections::BTreeSet<String>,
+    received_eds: std::collections::BTreeSet<String>,
+    required_rds: std::collections::BTreeSet<String>,
+    received_rds: std::collections::BTreeSet<String>,
+}
+
+struct StartupGate {
+    released: AtomicBool,
+    notify: Notify,
+}
+
+impl StartupGate {
+    fn new() -> Self {
+        Self {
+            released: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        while !self.released.load(Ordering::Acquire) {
+            self.notify.notified().await;
+        }
+    }
+}
+
+impl InitManager {
+    fn new(snapshot: &ConfigSnapshot) -> Self {
+        let (cds_required, lds_required) = snapshot
+            .ads
+            .as_ref()
+            .map(|ads| (ads.cds, ads.lds))
+            .unwrap_or((false, false));
+        let required_eds = snapshot
+            .clusters
+            .values()
+            .filter_map(|cluster| cluster.eds.as_ref().map(|eds| eds.service_name.clone()))
+            .collect();
+        let required_rds = snapshot
+            .listeners
+            .values()
+            .flat_map(|listener| listener.rds_route_config_names().cloned())
+            .collect();
+        Self {
+            cds_required,
+            lds_required,
+            cds_received: false,
+            lds_received: false,
+            required_eds,
+            received_eds: Default::default(),
+            required_rds,
+            received_rds: Default::default(),
+        }
+    }
+
+    fn accept(&mut self, event: InitializationEvent) {
+        self.cds_required = event.cds_required;
+        self.lds_required = event.lds_required;
+        self.required_eds = event.required_eds;
+        self.received_eds = event.received_eds;
+        self.required_rds = event.required_rds;
+        self.received_rds = event.received_rds;
+        match event.accepted_type_url.as_str() {
+            CDS_TYPE_URL => self.cds_received = true,
+            LDS_TYPE_URL => self.lds_received = true,
+            _ => {}
+        }
+    }
+
+    fn ready(&self) -> bool {
+        (!self.cds_required || self.cds_received)
+            && (!self.lds_required || self.lds_received)
+            && self.required_eds.is_subset(&self.received_eds)
+            && self.required_rds.is_subset(&self.received_rds)
+    }
+}
+
 /// `--service-node`/`--service-cluster` override the corresponding field of
 /// bootstrap `node` when present -- Envoy gives its own flags of the same
 /// name the identical relationship to its bootstrap `node`. A pure function,
@@ -1273,7 +1427,10 @@ fn start_ads(
     node: &NodeIdentity,
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
     secret_registry: &Arc<SdsSecretRegistry>,
-) -> Option<mpsc::Receiver<AdsApplyMsg>> {
+) -> Option<(
+    mpsc::Receiver<AdsApplyMsg>,
+    mpsc::Receiver<InitializationEvent>,
+)> {
     let ads = snapshot.ads.as_ref()?;
 
     let has_static_eds_cluster = snapshot.clusters.values().any(|c| c.eds.is_some());
@@ -1332,6 +1489,7 @@ fn start_ads(
     // oneshot reply below before resolving, so at most one message is ever in
     // flight on this channel.
     let (apply_tx, apply_rx) = mpsc::channel::<AdsApplyMsg>(1);
+    let (init_tx, init_rx) = mpsc::channel::<InitializationEvent>(16);
     let publish: Publish = Box::new(move |snapshot: Arc<ConfigSnapshot>| {
         let apply_tx = apply_tx.clone();
         Box::pin(async move {
@@ -1449,9 +1607,16 @@ fn start_ads(
         })
     });
 
+    let initialization_sink: InitializationSink = Box::new(move |event| {
+        let init_tx = init_tx.clone();
+        Box::pin(async move {
+            let _ = init_tx.send(event).await;
+        })
+    });
     let applier = ResourceApplier::new(Arc::clone(snapshot), publish)
         .with_endpoint_sink(endpoint_sink)
-        .with_secret_sink(secret_sink);
+        .with_secret_sink(secret_sink)
+        .with_initialization_sink(initialization_sink);
 
     let mut states = Vec::new();
     if ads.cds {
@@ -1531,7 +1696,7 @@ fn start_ads(
         }
     }
 
-    Some(apply_rx)
+    Some((apply_rx, init_rx))
 }
 
 /// Polls `rx` if `Some`, otherwise never resolves. This is what lets
@@ -1541,6 +1706,15 @@ fn start_ads(
 /// receiver whose sender was simply never created still resolves `recv()` to
 /// `None` immediately, same as one whose sender was dropped.
 async fn recv_ads_apply(rx: &mut Option<mpsc::Receiver<AdsApplyMsg>>) -> Option<AdsApplyMsg> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_init_event(
+    rx: &mut Option<mpsc::Receiver<InitializationEvent>>,
+) -> Option<InitializationEvent> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -1736,6 +1910,7 @@ async fn start_admin(
 async fn worker_main(
     ctx: WorkerContext,
     bind_tx: mpsc::UnboundedSender<(WorkerId, Result<(), String>)>,
+    startup_gate: Arc<StartupGate>,
     cluster_manager: Arc<proxy_cluster::manager::ClusterManager>,
     stats_registry: Arc<proxy_observability::stats::Registry>,
     stat_handles: Arc<proxy_http::stat_handles::StatHandles>,
@@ -1751,6 +1926,7 @@ async fn worker_main(
     // cloned from.
     secret_registry: Arc<SdsSecretRegistry>,
 ) {
+    startup_gate.wait().await;
     let registry = ConnectionRegistry::new();
     // WP-23 increment 6a: built fresh per worker -- `stats_registry`/
     // `stat_handles` are the SAME shared, config-scoped state every worker
@@ -1919,6 +2095,48 @@ mod tests {
 
     fn test_registry() -> Arc<proxy_observability::stats::Registry> {
         proxy_observability::stats::StatsControl::new(1).registry()
+    }
+
+    #[test]
+    fn init_manager_waits_for_required_resources() {
+        let mut manager = InitManager {
+            cds_required: true,
+            lds_required: true,
+            cds_received: false,
+            lds_received: false,
+            required_eds: ["cluster-endpoints".to_string()].into_iter().collect(),
+            received_eds: Default::default(),
+            required_rds: ["routes".to_string()].into_iter().collect(),
+            received_rds: Default::default(),
+        };
+
+        assert!(!manager.ready());
+        manager.accept(InitializationEvent {
+            accepted_type_url: CDS_TYPE_URL.to_string(),
+            cds_required: true,
+            lds_required: true,
+            required_eds: ["cluster-endpoints".to_string()].into_iter().collect(),
+            received_eds: ["cluster-endpoints".to_string()].into_iter().collect(),
+            required_rds: ["routes".to_string()].into_iter().collect(),
+            received_rds: Default::default(),
+        });
+        assert!(!manager.ready(), "LDS and RDS still have to arrive");
+
+        manager.accept(InitializationEvent {
+            accepted_type_url: LDS_TYPE_URL.to_string(),
+            cds_required: true,
+            lds_required: true,
+            required_eds: ["cluster-endpoints".to_string()].into_iter().collect(),
+            received_eds: ["cluster-endpoints".to_string()].into_iter().collect(),
+            required_rds: ["routes".to_string()].into_iter().collect(),
+            received_rds: ["routes".to_string()].into_iter().collect(),
+        });
+        assert!(manager.ready());
+    }
+
+    #[test]
+    fn init_manager_empty_bootstrap_is_ready() {
+        assert!(InitManager::new(&ConfigSnapshot::default()).ready());
     }
 
     #[tokio::test]

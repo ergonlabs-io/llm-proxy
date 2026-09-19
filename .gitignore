@@ -21,6 +21,7 @@ testing/diffrig/captures/
 *.md
 !README.md
 !CLAUDE.md
+!AGENTS.md
 # The release record. Cited by internal-docs/MILESTONES.md and by the v0.0.1 tag.
 !CHANGELOG.md
 # The security policy. Needs an entry here for the same reason everything else
