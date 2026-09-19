@@ -23,8 +23,10 @@ use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use proxy_api::envoy::service::discovery::v3::{
-    DeltaDiscoveryResponse, DiscoveryResponse, Resource as DeltaResource,
+    DeltaDiscoveryResponse, DiscoveryResponse, Resource as DeltaResource, ResourceError,
+    ResourceName,
 };
+use proxy_api::google::rpc::Status as RpcStatus;
 use proxy_config::ir::{AdsConfig, AdsProtocol, ConfigSnapshot, EndpointIR, NodeIdentity};
 use proxy_config::lower_dynamic_cluster;
 use proxy_xds::apply::SecretUpdate;
@@ -1561,6 +1563,20 @@ fn delta_sds_response(
     }
 }
 
+fn delta_resource_error(name: &str, code: i32, message: &str) -> ResourceError {
+    ResourceError {
+        resource_name: Some(ResourceName {
+            name: name.to_string(),
+            ..Default::default()
+        }),
+        error_detail: Some(RpcStatus {
+            code,
+            message: message.to_string(),
+            ..Default::default()
+        }),
+    }
+}
+
 #[tokio::test]
 async fn accepted_delta_response_emits_initialization_event() {
     let base = with_ads_requirements(empty_base(), true, false);
@@ -1662,6 +1678,52 @@ async fn delta_cds_updates_and_explicit_removals_publish_incrementally() {
     assert!(latest.clusters.contains_key("a"));
     assert!(!latest.clusters.contains_key("b"));
     assert_eq!(snapshots.len(), 2);
+}
+
+#[tokio::test]
+async fn delta_not_found_resource_error_removes_existing_resource() {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let first = delta_cds_response("n1", &[("v1", minimal_cluster("a", 8001))], &[]);
+    assert_eq!(applier.on_delta_response(&first).await, Verdict::Accept);
+
+    let removal = DeltaDiscoveryResponse {
+        type_url: CDS_TYPE_URL.to_string(),
+        nonce: "n2".to_string(),
+        resource_errors: vec![delta_resource_error("a", 5, "cluster no longer exists")],
+        ..Default::default()
+    };
+    assert_eq!(applier.on_delta_response(&removal).await, Verdict::Accept);
+    assert!(!published
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clusters
+        .contains_key("a"));
+}
+
+#[tokio::test]
+async fn delta_non_not_found_resource_error_nacks_without_mutating_state() {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let first = delta_cds_response("n1", &[("v1", minimal_cluster("a", 8001))], &[]);
+    assert_eq!(applier.on_delta_response(&first).await, Verdict::Accept);
+    let before = published.lock().unwrap().len();
+
+    let failure = DeltaDiscoveryResponse {
+        type_url: CDS_TYPE_URL.to_string(),
+        nonce: "n2".to_string(),
+        resource_errors: vec![delta_resource_error("a", 7, "permission denied")],
+        ..Default::default()
+    };
+    let verdict = applier.on_delta_response(&failure).await;
+    assert!(matches!(verdict, Verdict::Reject(message)
+        if message.contains("delta_response.resource_errors[0].error_detail.code")
+            && message.contains("permission denied")));
+    assert_eq!(published.lock().unwrap().len(), before);
 }
 
 #[tokio::test]

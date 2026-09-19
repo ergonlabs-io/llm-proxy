@@ -588,10 +588,31 @@ impl ResourceApplier {
                     .to_string(),
             );
         }
-        if !response.resource_errors.is_empty() {
-            return Verdict::Reject(
-                "delta_response.resource_errors is not implemented".to_string(),
-            );
+
+        // Envoy defines NOT_FOUND resource errors as equivalent to explicit
+        // removals. Normalize them before applying anything so the existing
+        // duplicate/conflict checks and sink rollback paths remain shared.
+        let mut normalized = response.clone();
+        for (index, resource_error) in response.resource_errors.iter().enumerate() {
+            let path = format!("delta_response.resource_errors[{index}]");
+            let Some(resource_name) = resource_error.resource_name.as_ref() else {
+                return Verdict::Reject(format!("{path}.resource_name must be set"));
+            };
+            if resource_name.name.is_empty() {
+                return Verdict::Reject(format!("{path}.resource_name.name must not be empty"));
+            }
+            let Some(error_detail) = resource_error.error_detail.as_ref() else {
+                return Verdict::Reject(format!("{path}.error_detail must be set"));
+            };
+            if error_detail.code != 5 {
+                return Verdict::Reject(format!(
+                    "{path}.error_detail.code `{}` is not NOT_FOUND: {}",
+                    error_detail.code, error_detail.message
+                ));
+            }
+            normalized
+                .removed_resources
+                .push(resource_name.name.clone());
         }
         for (index, resource) in response.resources.iter().enumerate() {
             if let Err(error) = validate_delta_resource(resource, index, &response.type_url) {
@@ -599,12 +620,12 @@ impl ResourceApplier {
             }
         }
 
-        let verdict = match response.type_url.as_str() {
-            CDS_TYPE_URL => self.on_delta_cds_response(response).await,
-            LDS_TYPE_URL => self.on_delta_lds_response(response).await,
-            RDS_TYPE_URL => self.on_delta_rds_response(response).await,
-            EDS_TYPE_URL => self.on_delta_eds_response(response).await,
-            SDS_TYPE_URL => self.on_delta_sds_response(response).await,
+        let verdict = match normalized.type_url.as_str() {
+            CDS_TYPE_URL => self.on_delta_cds_response(&normalized).await,
+            LDS_TYPE_URL => self.on_delta_lds_response(&normalized).await,
+            RDS_TYPE_URL => self.on_delta_rds_response(&normalized).await,
+            EDS_TYPE_URL => self.on_delta_eds_response(&normalized).await,
+            SDS_TYPE_URL => self.on_delta_sds_response(&normalized).await,
             other => Verdict::Reject(format!("unknown delta ADS type_url `{other}`")),
         };
         if verdict == Verdict::Accept {
