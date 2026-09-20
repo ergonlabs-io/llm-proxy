@@ -7,6 +7,7 @@
 //! and every terminal frame is asserted. The broader Envoy side-by-side
 //! request replay/capture topology remains deferred (see `main.rs`).
 
+pub mod access_log_diff;
 pub mod config_diff;
 pub mod harness;
 pub mod scenario;
