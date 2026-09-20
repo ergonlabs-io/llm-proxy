@@ -18,11 +18,14 @@
 //! an explicit capture schema and an llm-proxy Docker image to run it
 //! alongside pinned Envoy.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use diffrig::config_diff::{render_config_diff_report, run_config_diff, Verdict, ENVOY_IMAGE};
+use diffrig::replay::replay_scenario;
+use diffrig::scenario::load_scenario_file;
 
 #[derive(Parser)]
 #[command(name = "diffrig", about = "WP-26 differential test rig")]
@@ -56,9 +59,23 @@ enum DiffrigCommand {
         #[arg(long = "report-path", value_name = "PATH")]
         report_path: Option<PathBuf>,
     },
+    /// Replay one strict scenario against two already-running targets.
+    Replay {
+        #[arg(long)]
+        scenario: PathBuf,
+        #[arg(long)]
+        left: SocketAddr,
+        #[arg(long)]
+        right: SocketAddr,
+        #[arg(long)]
+        left_log: Option<PathBuf>,
+        #[arg(long)]
+        right_log: Option<PathBuf>,
+    },
 }
 
-fn main() -> anyhow::Result<ExitCode> {
+#[tokio::main]
+async fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
     match args.command {
         DiffrigCommand::ConfigValidateDiff {
@@ -67,6 +84,25 @@ fn main() -> anyhow::Result<ExitCode> {
             llm_proxy_bin,
             report_path,
         } => run_config_validate_diff(configs_dir, envoy_image, llm_proxy_bin, report_path),
+        DiffrigCommand::Replay {
+            scenario,
+            left,
+            right,
+            left_log,
+            right_log,
+        } => {
+            let scenario = load_scenario_file(&scenario)?;
+            replay_scenario(
+                &scenario,
+                left,
+                right,
+                left_log.as_deref(),
+                right_log.as_deref(),
+            )
+            .await?;
+            println!("replay: {} requests matched", scenario.requests.len());
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

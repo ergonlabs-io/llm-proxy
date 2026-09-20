@@ -47,15 +47,20 @@ a malformed generation and proves last-good serving remains live. It is an
 acceptance drill, not a passing CI test: dedicated capacity-host execution is
 required, and broader Envoy side-by-side comparison remains open.
 
-## Deferred: side-by-side Envoy HTTP replay/capture topology
+## Side-by-side Envoy HTTP replay/capture topology (increment 1)
 
-The docker-compose topology, proxy drivers, and capture/compare engine that
-turn a `Scenario` (`scenario.rs`, already parsed) into a pass/fail — replaying
-requests against both proxies and diffing status/headers/body/access-log
-fields/stats — is still a separate follow-up. The proxy HTTP data plane now
-exists, but this needs an explicit capture schema and pinned Envoy topology;
-the reload-under-load test above deliberately does not pretend to be that
-broader differential comparison.
+`access_log_diff` defines normalized HTTP captures and field-level comparison.
+`replay` replays a parsed `Scenario` against two already-running targets:
+
+```text
+cargo run -p diffrig -- replay --scenario testing/diffrig/scenarios/echo-basic.yaml \
+  --left 127.0.0.1:10000 --right 127.0.0.1:10001
+```
+
+Optional `--left-log` and `--right-log` paths include normalized JSON access-log
+fields in the comparison. Process orchestration and the Docker Envoy target
+remain the next increment; this command deliberately keeps target lifecycle
+outside the replay loop so cleanup is owned by the topology runner.
 
 Every scenario will run in BOTH config modes: static/file-watch and gRPC xDS
 (PLAN.md Part 9.6 anti-rot rule).

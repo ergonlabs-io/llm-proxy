@@ -10,5 +10,6 @@
 pub mod access_log_diff;
 pub mod config_diff;
 pub mod harness;
+pub mod replay;
 pub mod scenario;
 pub mod upstreams;
