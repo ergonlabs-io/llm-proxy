@@ -12,6 +12,51 @@ use serde_json::Value;
 /// A normalized JSON access-log object suitable for comparison.
 pub type NormalizedAccessLog = BTreeMap<String, Value>;
 
+/// Stable HTTP result captured from one side of a replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpCapture {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+    pub access_log: Option<NormalizedAccessLog>,
+}
+
+/// Compare the semantic HTTP and access-log portions of two replay captures.
+pub fn compare_captures(expected: &HttpCapture, actual: &HttpCapture) -> Result<(), CaptureDiff> {
+    let mut differences = Vec::new();
+    if expected.status != actual.status {
+        differences.push(format!("status: {} != {}", expected.status, actual.status));
+    }
+    if expected.headers != actual.headers {
+        differences.push("headers differ".to_string());
+    }
+    if expected.body != actual.body {
+        differences.push("body differs".to_string());
+    }
+    if expected.access_log != actual.access_log {
+        differences.push("access-log fields differ".to_string());
+    }
+    if differences.is_empty() {
+        Ok(())
+    } else {
+        Err(CaptureDiff { differences })
+    }
+}
+
+/// Field-level differences between two replay captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureDiff {
+    pub differences: Vec<String>,
+}
+
+impl std::fmt::Display for CaptureDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "capture differences: {}", self.differences.join(", "))
+    }
+}
+
+impl std::error::Error for CaptureDiff {}
+
 /// Fields whose values are inherently run-specific and must not make a
 /// deterministic lifecycle comparison fail.
 pub const DEFAULT_VOLATILE_FIELDS: &[&str] = &[
@@ -113,5 +158,32 @@ mod tests {
     fn rejects_non_object_json() {
         let err = normalize_json_line("[]", &[]).expect_err("array is not an access-log object");
         assert!(matches!(err, AccessLogDiffError::NotAnObject));
+    }
+
+    #[test]
+    fn capture_self_check_accepts_identical_results() {
+        let capture = HttpCapture {
+            status: 200,
+            headers: BTreeMap::from([(String::from("content-type"), String::from("text/plain"))]),
+            body: String::from("ok"),
+            access_log: None,
+        };
+        compare_captures(&capture, &capture).expect("identical captures should compare equal");
+    }
+
+    #[test]
+    fn capture_mutation_reports_the_changed_surface() {
+        let expected = HttpCapture {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: String::from("ok"),
+            access_log: None,
+        };
+        let actual = HttpCapture {
+            status: 503,
+            ..expected.clone()
+        };
+        let diff = compare_captures(&expected, &actual).expect_err("mutated status must fail");
+        assert_eq!(diff.differences, vec!["status: 200 != 503"]);
     }
 }
