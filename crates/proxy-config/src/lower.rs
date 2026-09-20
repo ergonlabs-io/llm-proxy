@@ -81,7 +81,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
                 "dynamic_resources.ads_config.grpc_services[0].envoy_grpc.cluster_name",
                 format!(
                     "ADS cluster `{}` must be statically defined, but this bootstrap has no static_resources",
-                    ads.cluster.as_str()
+                    ads.cluster.as_deref().unwrap_or("<filesystem>")
                 ),
             ));
         }
@@ -134,14 +134,16 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     // must be statically defined". Checked here, once the cluster map is
     // complete, for the same reason `validate_cluster_graph` is.
     if let Some(ads) = &ads_pending {
-        if !snapshot.clusters.contains_key(&ads.cluster) {
-            return Err(invalid(
-                "dynamic_resources.ads_config.grpc_services[0].envoy_grpc.cluster_name",
-                format!(
-                    "ADS cluster `{}` is not defined in static_resources.clusters",
-                    ads.cluster.as_str()
-                ),
-            ));
+        if let Some(cluster) = &ads.cluster {
+            if !snapshot.clusters.contains_key(cluster) {
+                return Err(invalid(
+                    "dynamic_resources.ads_config.grpc_services[0].envoy_grpc.cluster_name",
+                    format!(
+                        "ADS cluster `{}` is not defined in static_resources.clusters",
+                        cluster.as_str()
+                    ),
+                ));
+            }
         }
     }
     snapshot.ads = ads_pending;
@@ -2583,9 +2585,9 @@ fn convert_upstream_certificate(
 ///
 /// v1 accepts a narrow surface and refuses everything else with its full
 /// dotted path: `api_type: GRPC`, `transport_api_version: V3`, and exactly one
-/// `grpc_services` entry using `envoy_grpc`. Per-type non-ADS sources are a
-/// different transport we do not implement, and `eds_config` needs an IR
-/// discovery variant that WP-21 owns.
+/// `grpc_services` entry using `envoy_grpc` when an ADS source is selected.
+/// Per-type LDS/CDS filesystem sources are also supported; `eds_config` needs
+/// an IR discovery variant that WP-21 owns.
 fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConfig>, ConfigError> {
     let Some(dr) = &b.dynamic_resources else {
         return Ok(None);
@@ -2608,24 +2610,67 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
     let Some(api) = &dr.ads_config else {
         // A per-type ConfigSource without an ads_config is a separate
         // transport (its own gRPC stream, or REST polling), not ADS.
-        if dr.lds_config.is_some() || dr.cds_config.is_some() {
+        let lds_source = check_source(dr.lds_config.as_ref(), &format!("{path}.lds_config"))?;
+        let cds_source = check_source(dr.cds_config.as_ref(), &format!("{path}.cds_config"))?;
+        if lds_source
+            .as_ref()
+            .is_some_and(|source| matches!(source, crate::ir::DiscoverySource::Ads))
+            || cds_source
+                .as_ref()
+                .is_some_and(|source| matches!(source, crate::ir::DiscoverySource::Ads))
+        {
+            return Err(unsupported(
+                format!("{path}.ads_config"),
+                "ADS-backed sources require dynamic_resources.ads_config",
+            ));
+        }
+        if lds_source.is_none() && cds_source.is_none() {
             return Err(unsupported(
                 format!("{path}.ads_config"),
                 "lds_config/cds_config are only implemented when delivered over ADS, so \
                  dynamic_resources.ads_config must be set",
             ));
         }
-        return Ok(None);
+        return Ok(Some(AdsConfig {
+            cluster: None,
+            protocol: crate::ir::AdsProtocol::Sotw,
+            lds: lds_source.is_some(),
+            cds: cds_source.is_some(),
+            initial_fetch_timeout: None,
+            node: NodeIdentity::default(),
+            lds_source,
+            cds_source,
+        }));
     };
     let api_path = format!("{path}.ads_config");
 
-    // Per-type sources must be ADS-backed: the proto says "only ConfigSources
-    // that have the ads field set will be streamed on the ADS channel", so a
-    // source without it would silently never be subscribed.
+    // Per-type sources may be ADS-backed or filesystem-backed. The transport
+    // is retained in the IR so runtime startup can subscribe or watch each
+    // resource type independently.
     let lds_source = check_ads_source(dr.lds_config.as_ref(), &format!("{path}.lds_config"))?;
     let cds_source = check_ads_source(dr.cds_config.as_ref(), &format!("{path}.cds_config"))?;
     let lds = lds_source.is_some();
     let cds = cds_source.is_some();
+
+    if (lds || cds)
+        && !lds_source
+            .as_ref()
+            .is_some_and(|source| matches!(source.transport, crate::ir::DiscoverySource::Ads))
+        && !cds_source
+            .as_ref()
+            .is_some_and(|source| matches!(source.transport, crate::ir::DiscoverySource::Ads))
+    {
+        return Ok(Some(AdsConfig {
+            cluster: None,
+            protocol: crate::ir::AdsProtocol::Sotw,
+            lds,
+            cds,
+            initial_fetch_timeout: None,
+            node: NodeIdentity::default(),
+            lds_source: lds_source.map(|source| source.transport),
+            cds_source: cds_source.map(|source| source.transport),
+        }));
+    }
 
     // EDS is WP-21's: the IR has no `Eds` discovery variant to lower into, and
     // inventing one here would put the warming semantics in the wrong package.
@@ -2638,8 +2683,12 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
     }
 
     let initial_fetch_timeout = match (
-        lds_source.and_then(|source| source.initial_fetch_timeout),
-        cds_source.and_then(|source| source.initial_fetch_timeout),
+        lds_source
+            .as_ref()
+            .and_then(|source| source.initial_fetch_timeout),
+        cds_source
+            .as_ref()
+            .and_then(|source| source.initial_fetch_timeout),
     ) {
         (Some(lds_timeout), Some(cds_timeout)) if lds_timeout != cds_timeout => {
             return Err(unsupported(
@@ -2651,16 +2700,91 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
         (None, None) => None,
     };
 
-    convert_api_config_source(api, &api_path, lds, cds, initial_fetch_timeout, b)
+    convert_api_config_source(
+        api,
+        &api_path,
+        AdsSourceSelection {
+            lds,
+            cds,
+            initial_fetch_timeout,
+            lds_source: lds_source.as_ref().map(|source| source.transport.clone()),
+            cds_source: cds_source.as_ref().map(|source| source.transport.clone()),
+        },
+        b,
+    )
 }
 
 /// ADS-specific settings extracted from one per-type [`ConfigSource`].
 /// `None` from [`check_ads_source`] means this resource type is not subscribed.
 struct AdsSource {
     initial_fetch_timeout: Option<StdDuration>,
+    transport: crate::ir::DiscoverySource,
 }
 
-/// A per-type `ConfigSource` is honoured only in its ADS form.
+struct AdsSourceSelection {
+    lds: bool,
+    cds: bool,
+    initial_fetch_timeout: Option<StdDuration>,
+    lds_source: Option<crate::ir::DiscoverySource>,
+    cds_source: Option<crate::ir::DiscoverySource>,
+}
+
+fn check_source(
+    source: Option<&core_v3::ConfigSource>,
+    path: &str,
+) -> Result<Option<crate::ir::DiscoverySource>, ConfigError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    use core_v3::config_source::ConfigSourceSpecifier;
+    match &source.config_source_specifier {
+        Some(ConfigSourceSpecifier::Path(path_value)) => {
+            if path_value.is_empty() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must not be empty",
+                ));
+            }
+            if !std::path::Path::new(path_value).exists() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must exist at config load time",
+                ));
+            }
+            Ok(Some(crate::ir::DiscoverySource::Filesystem(
+                path_value.clone().into(),
+            )))
+        }
+        Some(ConfigSourceSpecifier::PathConfigSource(config)) => {
+            if config.path.is_empty() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must not be empty",
+                ));
+            }
+            if !std::path::Path::new(&config.path).exists() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must exist at config load time",
+                ));
+            }
+            Ok(Some(crate::ir::DiscoverySource::Filesystem(
+                config.path.clone().into(),
+            )))
+        }
+        Some(ConfigSourceSpecifier::Ads(_)) => Ok(Some(crate::ir::DiscoverySource::Ads)),
+        Some(_) => Err(unsupported(
+            format!("{path}.path_config_source"),
+            "unsupported config source",
+        )),
+        None => Err(invalid(
+            path,
+            "a config source must set one of its specifier members",
+        )),
+    }
+}
+
+/// A per-type `ConfigSource` supports ADS and filesystem transports.
 fn check_ads_source(
     source: Option<&core_v3::ConfigSource>,
     path: &str,
@@ -2682,17 +2806,47 @@ fn check_ads_source(
                 .as_ref()
                 .map(|timeout| to_std_duration(timeout, &format!("{path}.initial_fetch_timeout")))
                 .transpose()?,
+            transport: crate::ir::DiscoverySource::Ads,
         })),
         Some(ConfigSourceSpecifier::ApiConfigSource(_)) => Err(unsupported(
             format!("{path}.api_config_source"),
-            "a per-type api_config_source is a separate xDS transport; only ADS-delivered \
-             resources are implemented (set the `ads` field instead)",
+            "a per-type api_config_source is not implemented; use `ads` or a filesystem source",
         )),
-        Some(ConfigSourceSpecifier::Path(_)) | Some(ConfigSourceSpecifier::PathConfigSource(_)) => {
-            Err(unsupported(
-                format!("{path}.path_config_source"),
-                "filesystem xDS is not implemented yet (WP-22)",
-            ))
+        Some(ConfigSourceSpecifier::Path(value)) => {
+            if value.is_empty() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must not be empty",
+                ));
+            }
+            if !std::path::Path::new(value).exists() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must exist at config load time",
+                ));
+            }
+            Ok(Some(AdsSource {
+                initial_fetch_timeout: None,
+                transport: crate::ir::DiscoverySource::Filesystem(value.clone().into()),
+            }))
+        }
+        Some(ConfigSourceSpecifier::PathConfigSource(value)) => {
+            if value.path.is_empty() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must not be empty",
+                ));
+            }
+            if !std::path::Path::new(&value.path).exists() {
+                return Err(invalid(
+                    format!("{path}.path_config_source.path"),
+                    "path must exist at config load time",
+                ));
+            }
+            Ok(Some(AdsSource {
+                initial_fetch_timeout: None,
+                transport: crate::ir::DiscoverySource::Filesystem(value.path.clone().into()),
+            }))
         }
         Some(ConfigSourceSpecifier::Self_(_)) => Err(unsupported(
             format!("{path}.self"),
@@ -2709,9 +2863,7 @@ fn check_ads_source(
 fn convert_api_config_source(
     api: &core_v3::ApiConfigSource,
     path: &str,
-    lds: bool,
-    cds: bool,
-    initial_fetch_timeout: Option<StdDuration>,
+    selection: AdsSourceSelection,
     b: &Bootstrap,
 ) -> Result<Option<AdsConfig>, ConfigError> {
     use core_v3::api_config_source::ApiType;
@@ -2803,11 +2955,11 @@ fn convert_api_config_source(
     let cluster = convert_ads_grpc_service(&api.grpc_services[0], &svc_path)?;
 
     Ok(Some(AdsConfig {
-        cluster,
+        cluster: Some(cluster),
         protocol,
-        lds,
-        cds,
-        initial_fetch_timeout,
+        lds: selection.lds,
+        cds: selection.cds,
+        initial_fetch_timeout: selection.initial_fetch_timeout,
         node: NodeIdentity {
             id: b.node.as_ref().map(|n| n.id.clone()).unwrap_or_default(),
             cluster: b
@@ -2816,6 +2968,8 @@ fn convert_api_config_source(
                 .map(|n| n.cluster.clone())
                 .unwrap_or_default(),
         },
+        lds_source: selection.lds_source,
+        cds_source: selection.cds_source,
     }))
 }
 
@@ -3384,8 +3538,8 @@ fn convert_eds_cluster_config(
 
     let eds_config_path = format!("{cfg_path}.eds_config");
     // `check_ads_source` (defined above, for `dynamic_resources`'s per-type
-    // ConfigSources) says exactly what we mean here too: only the ADS form
-    // of a ConfigSource is implemented. It returns `Ok(None)` for an unset
+    // ConfigSources) says exactly what we mean here too: ADS and filesystem
+    // forms are implemented. It returns `Ok(None)` for an unset
     // source, which for a *required* field is itself the error -- the arm
     // below is what turns that into one, since `check_ads_source` alone has
     // no way to know whether its caller's field was optional.

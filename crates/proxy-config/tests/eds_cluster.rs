@@ -152,7 +152,7 @@ fn eds_config_set_to_a_filesystem_source_instead_of_ads_is_rejected() {
     let err = snapshot_from(&yaml).expect_err("only ADS-delivered EDS is implemented");
     assert_eq!(
         err_path(&err),
-        "static_resources.clusters[0].eds_cluster_config.eds_config.path_config_source"
+        "static_resources.clusters[0].eds_cluster_config.eds_config.path_config_source.path"
     );
 }
 

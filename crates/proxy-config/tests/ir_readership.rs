@@ -115,39 +115,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     //     still inert; each says what will read it, corrected 2026-09-05 to
     //     name the increment that actually will.
     AllowlistEntry {
-        struct_name: "ConfigSnapshot",
-        field_name: "ads",
-        kind: EntryKind::KnownInert,
-        reason: "WP-20 increment 1 lowers bootstrap dynamic_resources into the \
-                  IR so the config surface can be validated and refused \
-                  precisely (ground rule #1) before any client exists. Nothing \
-                  dials a control plane yet: proxy-xds is a doc comment. \
-                  Increment 3 (the gRPC transport) is the first reader; \
-                  increment 4 publishes resources through \
-                  ConfigPublisher::publish. Delete this entry then.",
-    },
-    AllowlistEntry {
-        struct_name: "AdsConfig",
-        field_name: "lds",
-        kind: EntryKind::KnownInert,
-        reason: "WP-20: which resource types are subscribed over ADS. The \
-                  original reason said the subscription state machine \
-                  (increment 2/3) would read this. It does not: increments \
-                  2-4 build their SubscriptionStates from arguments the \
-                  caller passes, so the first real reader is the wiring in \
-                  crates/proxy/src/main.rs that constructs an AdsClient FROM \
-                  this config. Delete this entry with that, not with \
-                  increment 3.",
-    },
-    AllowlistEntry {
-        struct_name: "AdsConfig",
-        field_name: "cds",
-        kind: EntryKind::KnownInert,
-        reason: "WP-20: as AdsConfig.lds -- the CDS half of the same \
-                  subscription set, and the same correction applies. See \
-                  AdsConfig.lds's entry.",
-    },
-    AllowlistEntry {
         struct_name: "AdsConfig",
         field_name: "initial_fetch_timeout",
         kind: EntryKind::ReadOutsideRuntimeCrates,
@@ -155,6 +122,18 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                  when building its readiness probe, so an ADS-backed \
                  ConfigSource timeout releases /ready without force-initializing \
                  a cluster. `proxy` is control-side and outside RUNTIME_CRATES.",
+    },
+    AllowlistEntry {
+        struct_name: "AdsConfig",
+        field_name: "lds_source",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-22: crates/proxy/src/main.rs owns mixed ADS/filesystem source startup; this control-plane reader is outside RUNTIME_CRATES.",
+    },
+    AllowlistEntry {
+        struct_name: "AdsConfig",
+        field_name: "cds_source",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-22: crates/proxy/src/main.rs owns mixed ADS/filesystem source startup; this control-plane reader is outside RUNTIME_CRATES.",
     },
     AllowlistEntry {
         struct_name: "VirtualHostIR",

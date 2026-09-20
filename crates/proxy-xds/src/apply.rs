@@ -814,16 +814,12 @@ impl ResourceApplier {
                 resource.name.clone(),
                 resource.version.clone(),
             ));
-            let deadline = if let Some(ttl) = resource
+            let deadline = resource
                 .ttl
                 .as_ref()
                 .and_then(|_| ttl_duration(resource).ok())
                 .flatten()
-            {
-                Some(now + ttl)
-            } else {
-                None
-            };
+                .map(|ttl| now + ttl);
             match type_url {
                 CDS_TYPE_URL => {
                     if let Some(d) = deadline {

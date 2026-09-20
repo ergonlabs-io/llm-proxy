@@ -9,7 +9,7 @@
 //! network filter chain (`tcp_proxy` etc.) is still a stub -- see
 //! `proxy_core::listener`'s `TODO(WP-09)`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
-use proxy_config::ir::{AdsProtocol, NodeIdentity, SnapshotVersion};
+use proxy_api::envoy::service::discovery::v3::{DeltaDiscoveryResponse, DiscoveryResponse};
+use proxy_config::ir::{AdsProtocol, DiscoverySource, NodeIdentity, SnapshotVersion};
 use proxy_config::{
     build_snapshot, load_bootstrap_file, ConfigSnapshot, LoadedBootstrap, StrictMode,
 };
@@ -30,10 +31,11 @@ use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
 use proxy_core::tls::SdsSecretRegistry;
 use proxy_xds::apply::SecretUpdate;
+use proxy_xds::subscription::Verdict;
 use proxy_xds::{
-    AdsClient, DeltaAdsClient, DeltaSubscriptionState, InitializationEvent, InitializationSink,
-    Publish, PublishEndpoints, PublishSecrets, Reconnect, ResourceApplier, ResponseHandler,
-    Subscription, SubscriptionState,
+    AdsClient, DeltaAdsClient, DeltaResponseHandler, DeltaSubscriptionState, FileSource,
+    InitializationEvent, InitializationSink, Publish, PublishEndpoints, PublishSecrets, Reconnect,
+    ResourceApplier, ResponseHandler, Subscription, SubscriptionState,
 };
 use tokio::sync::{mpsc, oneshot, Notify};
 use tonic::transport::Channel;
@@ -1393,7 +1395,8 @@ fn effective_node(
     }
 }
 
-/// Builds and spawns the ADS client task when `snapshot.ads` asks for one.
+/// Builds and spawns the dynamic-resource client tasks when `snapshot.ads`
+/// asks for one. Sources may be ADS, filesystem, or a mixture of both.
 ///
 /// Returns `None` -- and starts nothing -- in three cases, none of them
 /// fatal to `run_serve` (PLAN.md 8.5: keep serving last-good/static config):
@@ -1406,10 +1409,9 @@ fn effective_node(
 ///   `ClusterConfig.eds` -- so this gate also starts an ADS client for a
 ///   bootstrap that enables neither `lds` nor `cds` but declares a `Cluster`
 ///   whose membership comes over EDS.
-/// - the named ADS cluster has no endpoints: a config error, logged at
-///   `error!` with the cluster name -- config lowering already guarantees the
-///   cluster itself exists in `static_resources` (`AdsConfig`'s own doc), so
-///   this is the one thing left for this function to check.
+/// - an ADS-backed source has no usable cluster endpoint: a config error,
+///   logged at `error!` with the cluster name. Filesystem-only sources do not
+///   need an ADS cluster and are handled by the local watcher above.
 ///
 /// The `Channel` is built with `connect_lazy`, not an eager `connect().await`:
 /// a control plane that is not up yet at boot must not stop the proxy from
@@ -1422,6 +1424,168 @@ fn effective_node(
 /// `SharedFactoryState::for_node`; this function no longer calls
 /// `effective_node` itself, to keep that a single call site (see `run_serve`'s
 /// own comment on `node`).
+fn start_filesystem_ads(
+    snapshot: &Arc<ConfigSnapshot>,
+    _cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
+    _secret_registry: &Arc<SdsSecretRegistry>,
+) -> Option<(
+    mpsc::Receiver<AdsApplyMsg>,
+    mpsc::Receiver<InitializationEvent>,
+)> {
+    let ads = snapshot.ads.as_ref()?;
+    let mut sources = Vec::new();
+    if let Some(DiscoverySource::Filesystem(path)) = &ads.lds_source {
+        sources.push(FileSource::new(
+            path.clone(),
+            "type.googleapis.com/envoy.config.listener.v3.Listener",
+        ));
+    }
+    if let Some(DiscoverySource::Filesystem(path)) = &ads.cds_source {
+        sources.push(FileSource::new(
+            path.clone(),
+            "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+        ));
+    }
+    if sources.is_empty() {
+        return None;
+    }
+    let (apply_tx, apply_rx) = mpsc::channel::<AdsApplyMsg>(1);
+    let (init_tx, init_rx) = mpsc::channel::<InitializationEvent>(16);
+    let publish: Publish = Box::new(move |snapshot: Arc<ConfigSnapshot>| {
+        let apply_tx = apply_tx.clone();
+        Box::pin(async move {
+            let owned = snapshot.with_dynamic_resources(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                snapshot.version,
+            );
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if apply_tx.send((owned, reply_tx)).await.is_ok() {
+                let _ = reply_rx.await;
+            }
+        })
+    });
+    let initialization_sink: InitializationSink = Box::new(move |event| {
+        let init_tx = init_tx.clone();
+        Box::pin(async move {
+            let _ = init_tx.send(event).await;
+        })
+    });
+    let mut applier = ResourceApplier::new(Arc::clone(snapshot), publish)
+        .with_initialization_sink(initialization_sink);
+    tokio::spawn(async move {
+        let mut watchers: Vec<_> = sources.iter().map(FileSource::watcher).collect();
+        loop {
+            for (source, watcher) in sources.iter().zip(watchers.iter_mut()) {
+                match watcher.changed() {
+                    Ok(true) => match source.load() {
+                        Ok(response) => {
+                            let verdict = applier.on_response(&response).await;
+                            tracing::info!(type_url = %response.type_url, ?verdict, "filesystem xDS response applied");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "filesystem xDS response rejected; retaining last-good state")
+                        }
+                    },
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "filesystem xDS source unavailable; retaining last-good state")
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+    Some((apply_rx, init_rx))
+}
+
+#[derive(Clone)]
+struct SharedApplier {
+    inner: Arc<tokio::sync::Mutex<ResourceApplier>>,
+    desired: Arc<std::sync::RwLock<HashMap<String, BTreeSet<String>>>>,
+}
+
+impl SharedApplier {
+    fn new(applier: ResourceApplier) -> Self {
+        let mut desired_map = HashMap::new();
+        for type_url in [
+            "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+            "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+            "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+        ] {
+            if let Some(names) = ResponseHandler::desired_names(&applier, type_url) {
+                desired_map.insert(type_url.to_string(), names);
+            }
+        }
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(applier)),
+            desired: Arc::new(std::sync::RwLock::new(desired_map)),
+        }
+    }
+
+    async fn apply_sotw(&self, response: DiscoveryResponse) -> Verdict {
+        let mut applier = self.inner.lock().await;
+        let verdict = applier.on_response(&response).await;
+        self.refresh_desired(&applier);
+        verdict
+    }
+
+    async fn apply_delta(&self, response: DeltaDiscoveryResponse) -> Verdict {
+        let mut applier = self.inner.lock().await;
+        let verdict = applier.on_delta_response(&response).await;
+        self.refresh_desired(&applier);
+        verdict
+    }
+
+    fn refresh_desired(&self, applier: &ResourceApplier) {
+        let mut desired = self.desired.write().expect("desired names lock poisoned");
+        for type_url in [
+            "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+            "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+            "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+        ] {
+            if let Some(names) = ResponseHandler::desired_names(applier, type_url) {
+                desired.insert(type_url.to_string(), names);
+            }
+        }
+    }
+}
+
+impl ResponseHandler for SharedApplier {
+    fn handle(
+        &mut self,
+        response: &DiscoveryResponse,
+    ) -> impl std::future::Future<Output = Verdict> + Send {
+        let this = self.clone();
+        let response = response.clone();
+        async move { this.apply_sotw(response).await }
+    }
+
+    fn desired_names(&self, type_url: &str) -> Option<BTreeSet<String>> {
+        self.desired
+            .read()
+            .expect("desired names lock poisoned")
+            .get(type_url)
+            .cloned()
+    }
+}
+
+impl DeltaResponseHandler for SharedApplier {
+    fn handle(
+        &mut self,
+        response: &DeltaDiscoveryResponse,
+    ) -> impl std::future::Future<Output = Verdict> + Send {
+        let this = self.clone();
+        let response = response.clone();
+        async move { this.apply_delta(response).await }
+    }
+
+    fn desired_names(&self, type_url: &str) -> Option<BTreeSet<String>> {
+        <Self as ResponseHandler>::desired_names(self, type_url)
+    }
+}
+
 fn start_ads(
     snapshot: &Arc<ConfigSnapshot>,
     node: &NodeIdentity,
@@ -1432,6 +1596,10 @@ fn start_ads(
     mpsc::Receiver<InitializationEvent>,
 )> {
     let ads = snapshot.ads.as_ref()?;
+    if ads.cluster.is_none() {
+        return start_filesystem_ads(snapshot, cluster_manager, secret_registry);
+    }
+    let ads_cluster = ads.cluster.as_ref()?;
 
     let has_static_eds_cluster = snapshot.clusters.values().any(|c| c.eds.is_some());
     let has_static_rds_listener = snapshot
@@ -1440,7 +1608,7 @@ fn start_ads(
         .any(|listener| listener.rds_route_config_names().next().is_some());
     if !ads.lds && !ads.cds && !has_static_eds_cluster && !has_static_rds_listener {
         tracing::info!(
-            cluster = %ads.cluster,
+            cluster = %ads_cluster,
             "ADS configured but none of `lds`, `cds`, or a statically-declared EDS cluster asks \
              for anything; nothing to subscribe to, not starting an ADS client"
         );
@@ -1456,13 +1624,13 @@ fn start_ads(
     // 8.5).
     let endpoint = match snapshot
         .clusters
-        .get(&ads.cluster)
+        .get(ads_cluster)
         .and_then(|c| c.endpoints.first())
     {
         Some(endpoint) => endpoint,
         None => {
             tracing::error!(
-                cluster = %ads.cluster,
+                cluster = %ads_cluster,
                 "ADS cluster has no endpoints (or does not exist); not starting an ADS client"
             );
             return None;
@@ -1474,7 +1642,7 @@ fn start_ads(
         Ok(endpoint) => endpoint.connect_lazy(),
         Err(err) => {
             tracing::error!(
-                cluster = %ads.cluster,
+                cluster = %ads_cluster,
                 uri,
                 error = %err,
                 "ADS cluster address is not a valid URI; not starting an ADS client"
@@ -1619,10 +1787,10 @@ fn start_ads(
         .with_initialization_sink(initialization_sink);
 
     let mut states = Vec::new();
-    if ads.cds {
+    if matches!(ads.cds_source, Some(DiscoverySource::Ads)) {
         states.push(SubscriptionState::new(CDS_TYPE_URL, Subscription::Wildcard));
     }
-    if ads.lds {
+    if matches!(ads.lds_source, Some(DiscoverySource::Ads)) {
         states.push(SubscriptionState::new(LDS_TYPE_URL, Subscription::Wildcard));
     }
     // RDS is by-name like EDS. Register it even when empty so an LDS response
@@ -1662,12 +1830,57 @@ fn start_ads(
         Subscription::Names(applier.sds_resource_names()),
     ));
 
+    let file_sources: Vec<_> = [
+        (
+            ads.lds_source.as_ref(),
+            "type.googleapis.com/envoy.config.listener.v3.Listener",
+        ),
+        (
+            ads.cds_source.as_ref(),
+            "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(source, type_url)| match source {
+        Some(DiscoverySource::Filesystem(path)) => Some(FileSource::new(path.clone(), type_url)),
+        _ => None,
+    })
+    .collect();
+    let shared = SharedApplier::new(applier);
+    if !file_sources.is_empty() {
+        let file_handler = shared.clone();
+        tokio::spawn(async move {
+            let mut watchers: Vec<_> = file_sources.iter().map(FileSource::watcher).collect();
+            loop {
+                for (source, watcher) in file_sources.iter().zip(watchers.iter_mut()) {
+                    match watcher.changed() {
+                        Ok(true) => match source.load() {
+                            Ok(response) => {
+                                let verdict = file_handler.apply_sotw(response).await;
+                                tracing::info!(?verdict, "filesystem xDS response applied");
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "filesystem xDS response rejected; retaining last-good state")
+                            }
+                        },
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "filesystem xDS source unavailable; retaining last-good state")
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+    }
+
     match ads.protocol {
         AdsProtocol::Sotw => {
             let mut client = AdsClient::new(states).with_node(node.clone());
+            let handler = shared.clone();
             tokio::spawn(async move {
                 client
-                    .run(&mut grpc_client, applier, Reconnect::real())
+                    .run(&mut grpc_client, handler, Reconnect::real())
                     .await;
             });
         }
@@ -1679,7 +1892,9 @@ fn start_ads(
                         state.type_url(),
                         if state.has_nothing_to_request() {
                             Subscription::Names(Default::default())
-                        } else if let Some(names) = applier.desired_names(state.type_url()) {
+                        } else if let Some(names) =
+                            DeltaResponseHandler::desired_names(&shared, state.type_url())
+                        {
                             Subscription::Names(names)
                         } else {
                             Subscription::Wildcard
@@ -1688,9 +1903,10 @@ fn start_ads(
                 })
                 .collect();
             let mut client = DeltaAdsClient::new(delta_states).with_node(node.clone());
+            let handler = shared.clone();
             tokio::spawn(async move {
                 client
-                    .run(&mut grpc_client, applier, Reconnect::real())
+                    .run(&mut grpc_client, handler, Reconnect::real())
                     .await;
             });
         }

@@ -65,12 +65,57 @@ fn a_full_ads_bootstrap_lowers_to_ads_config() {
     );
     let snap = snapshot_from(&yaml).expect("a well-formed ADS bootstrap must load");
     let ads = snap.ads.expect("dynamic_resources must lower to Some");
-    assert_eq!(ads.cluster, "xds_cluster");
+    assert_eq!(ads.cluster.as_deref(), Some("xds_cluster"));
     assert_eq!(ads.protocol, proxy_config::ir::AdsProtocol::Sotw);
     assert!(ads.lds, "lds_config sets ads, so LDS is subscribed");
     assert!(ads.cds, "cds_config sets ads, so CDS is subscribed");
     assert_eq!(ads.node.id, "proxy-1");
     assert_eq!(ads.node.cluster, "proxy-fleet");
+}
+
+#[test]
+fn a_filesystem_lds_source_lowers_without_an_ads_cluster() {
+    let yaml = r#"dynamic_resources:
+  lds_config:
+    path: Cargo.toml
+    resource_api_version: V3
+static_resources:
+  listeners: []
+"#;
+    let ads = snapshot_from(yaml)
+        .expect("filesystem source must lower")
+        .ads
+        .expect("filesystem dynamic resources must produce AdsConfig");
+    assert_eq!(ads.cluster, None);
+    assert_eq!(ads.cds_source, None);
+    assert!(matches!(
+        ads.lds_source,
+        Some(DiscoverySource::Filesystem(_))
+    ));
+}
+
+#[test]
+fn lds_filesystem_and_cds_ads_sources_can_be_mixed() {
+    let yaml = with_ads(
+        r#"dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: { cluster_name: xds_cluster }
+  lds_config: { path: Cargo.toml, resource_api_version: V3 }
+  cds_config: { ads: {}, resource_api_version: V3 }
+"#,
+    );
+    let ads = snapshot_from(&yaml)
+        .expect("mixed filesystem and ADS sources must lower")
+        .ads
+        .expect("dynamic resources must be present");
+    assert!(matches!(
+        ads.lds_source,
+        Some(DiscoverySource::Filesystem(_))
+    ));
+    assert_eq!(ads.cds_source, Some(DiscoverySource::Ads));
 }
 
 /// Subscribing to only one type is legal -- a control plane may serve clusters
@@ -297,7 +342,7 @@ fn a_non_ads_per_type_source_is_refused() {
 
 /// EDS needs an IR discovery variant that does not exist; WP-21 owns adding it.
 #[test]
-fn a_filesystem_source_is_refused_naming_wp22() {
+fn a_missing_filesystem_source_is_refused_by_full_path() {
     let yaml = with_ads(
         r#"dynamic_resources:
   ads_config:
@@ -309,9 +354,9 @@ fn a_filesystem_source_is_refused_naming_wp22() {
 "#,
     );
     let err = snapshot_from(&yaml).expect_err("filesystem xDS must be refused");
-    assert!(
-        format!("{err}").contains("WP-22"),
-        "must name the owning work package: {err}"
+    assert_eq!(
+        err_path(&err),
+        "dynamic_resources.cds_config.path_config_source.path"
     );
 }
 

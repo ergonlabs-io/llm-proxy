@@ -334,12 +334,14 @@ fn with_ads_requirements(
 ) -> Arc<ConfigSnapshot> {
     let snapshot = Arc::get_mut(&mut base).expect("fixture base must have one owner");
     snapshot.ads = Some(AdsConfig {
-        cluster: "ads-control-plane".to_string(),
+        cluster: Some("ads-control-plane".to_string()),
         protocol: AdsProtocol::Sotw,
         lds,
         cds,
         initial_fetch_timeout: None,
         node: NodeIdentity::default(),
+        lds_source: Some(proxy_config::ir::DiscoverySource::Ads),
+        cds_source: Some(proxy_config::ir::DiscoverySource::Ads),
     });
     base
 }
