@@ -58,9 +58,19 @@ cargo run -p diffrig -- replay --scenario testing/diffrig/scenarios/echo-basic.y
 ```
 
 Optional `--left-log` and `--right-log` paths include normalized JSON access-log
-fields in the comparison. Process orchestration and the Docker Envoy target
-remain the next increment; this command deliberately keeps target lifecycle
-outside the replay loop so cleanup is owned by the topology runner.
+fields in the comparison. `replay-managed` now owns target lifecycle for one
+llm-proxy process and one Docker Envoy process:
+
+```text
+cargo run -p diffrig -- replay-managed --scenario testing/diffrig/scenarios/echo-basic.yaml \
+  --proxy-bin target/debug/llm-proxy \
+  --proxy-config proxy.yaml --envoy-config envoy.yaml \
+  --left 127.0.0.1:10000 --right 127.0.0.1:10001 \
+  --proxy-log proxy.log --envoy-log envoy.log
+```
+
+The configs are separate intentionally: each target must bind a distinct
+listener port while receiving the same request script.
 
 Every scenario will run in BOTH config modes: static/file-watch and gRPC xDS
 (PLAN.md Part 9.6 anti-rot rule).

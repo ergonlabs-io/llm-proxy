@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use diffrig::config_diff::{render_config_diff_report, run_config_diff, Verdict, ENVOY_IMAGE};
-use diffrig::replay::replay_scenario;
+use diffrig::replay::{replay_managed, replay_scenario, ManagedReplayConfig};
 use diffrig::scenario::load_scenario_file;
 
 #[derive(Parser)]
@@ -72,6 +72,27 @@ enum DiffrigCommand {
         #[arg(long)]
         right_log: Option<PathBuf>,
     },
+    /// Launch llm-proxy and Docker Envoy, then replay one scenario against both.
+    ReplayManaged {
+        #[arg(long)]
+        scenario: PathBuf,
+        #[arg(long)]
+        proxy_config: PathBuf,
+        #[arg(long)]
+        envoy_config: PathBuf,
+        #[arg(long)]
+        proxy_bin: PathBuf,
+        #[arg(long, default_value = "envoyproxy/envoy:v1.38.0")]
+        envoy_image: String,
+        #[arg(long)]
+        left: SocketAddr,
+        #[arg(long)]
+        right: SocketAddr,
+        #[arg(long)]
+        proxy_log: PathBuf,
+        #[arg(long)]
+        envoy_log: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -101,6 +122,38 @@ async fn main() -> anyhow::Result<ExitCode> {
             )
             .await?;
             println!("replay: {} requests matched", scenario.requests.len());
+            Ok(ExitCode::SUCCESS)
+        }
+        DiffrigCommand::ReplayManaged {
+            scenario,
+            proxy_config,
+            envoy_config,
+            proxy_bin,
+            envoy_image,
+            left,
+            right,
+            proxy_log,
+            envoy_log,
+        } => {
+            let scenario = load_scenario_file(&scenario)?;
+            replay_managed(
+                &scenario,
+                &ManagedReplayConfig {
+                    proxy_bin,
+                    proxy_config,
+                    envoy_image,
+                    envoy_config,
+                    left,
+                    right,
+                    proxy_log,
+                    envoy_log,
+                },
+            )
+            .await?;
+            println!(
+                "replay-managed: {} requests matched",
+                scenario.requests.len()
+            );
             Ok(ExitCode::SUCCESS)
         }
     }
