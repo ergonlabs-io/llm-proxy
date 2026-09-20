@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::access_log_diff::{compare_captures, normalize_json_line, HttpCapture};
-use crate::harness::send_json;
+use crate::harness::send_json_optional;
 use crate::scenario::{Scenario, ScriptedRequest};
 
 /// Replay every request in a scenario against two already-running targets.
@@ -37,16 +37,24 @@ pub async fn replay_scenario(
 }
 
 /// Run a scenario while owning both target processes. The Envoy container uses
-/// host networking so the caller's scenario can name its listener directly.
+/// published-port networking so the caller's scenario can name each listener.
 pub async fn replay_managed(
     scenario: &Scenario,
     config: &ManagedReplayConfig,
 ) -> Result<(), ReplayError> {
     let _proxy = ManagedTarget::proxy(&config.proxy_bin, &config.proxy_config, &config.proxy_log)?;
-    let _envoy =
-        ManagedTarget::envoy(&config.envoy_image, &config.envoy_config, &config.envoy_log)?;
+    let _envoy = ManagedTarget::envoy(
+        &config.envoy_image,
+        &config.envoy_config,
+        &config.envoy_log,
+        config.right.port(),
+    )?;
     wait_until_ready(config.left, &config.proxy_log)?;
     wait_until_ready(config.right, &config.envoy_log)?;
+    // The readiness probe only proves one listener socket accepted a connect;
+    // give all worker threads and Envoy's listener workers a short settling
+    // window before the first replay request.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     replay_scenario(
         scenario,
         config.left,
@@ -95,7 +103,12 @@ impl ManagedTarget {
         Ok(Self { child })
     }
 
-    fn envoy(image: &str, config: &Path, log: &Path) -> Result<Self, ReplayError> {
+    fn envoy(
+        image: &str,
+        config: &Path,
+        log: &Path,
+        listener_port: u16,
+    ) -> Result<Self, ReplayError> {
         let out = std::fs::File::create(log).map_err(|source| ReplayError::Io {
             action: "create Envoy log",
             source,
@@ -104,13 +117,19 @@ impl ManagedTarget {
             action: "clone Envoy log",
             source,
         })?;
+        let config = std::fs::canonicalize(config).map_err(|source| ReplayError::Io {
+            action: "resolve Envoy bootstrap path",
+            source,
+        })?;
         let mount = format!("{}:/etc/envoy/bootstrap.yaml:ro", config.display());
         let child = Command::new("docker")
             .args([
                 "run",
                 "--rm",
-                "--network",
-                "host",
+                "-p",
+                &format!("{listener_port}:{listener_port}"),
+                "--add-host",
+                "host.docker.internal:host-gateway",
                 "-v",
                 &mount,
                 image,
@@ -158,14 +177,30 @@ async fn capture_request(
     let body = request
         .body
         .as_deref()
-        .and_then(|body| serde_json::from_str(body).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let headers: Vec<(&str, &str)> = request
+        .and_then(|body| serde_json::from_str(body).ok());
+    let mut owned_headers: Vec<(String, String)> = request
         .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if !owned_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        owned_headers.push((String::from("host"), String::from("replay.local")));
+    }
+    let headers: Vec<(&str, &str)> = owned_headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let response = send_json(address, &request.method, &request.path, &headers, &body).await;
+    let response = send_json_optional(
+        address,
+        &request.method,
+        &request.path,
+        &headers,
+        body.as_ref(),
+    )
+    .await;
     let response_headers = response
         .headers
         .into_iter()

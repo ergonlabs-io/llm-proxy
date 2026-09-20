@@ -1,0 +1,8 @@
+name: replay-http-basic
+bootstrap:
+  path: ../fixtures/replay-proxy.yaml
+requests:
+  - method: GET
+    path: /
+upstream:
+  type: echo

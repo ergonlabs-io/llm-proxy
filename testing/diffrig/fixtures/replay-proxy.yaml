@@ -1,0 +1,33 @@
+static_resources:
+  listeners:
+    - name: replay_proxy
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 18080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: replay
+                route_config:
+                  name: replay_routes
+                  virtual_hosts:
+                    - name: replay
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: replay_upstream }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: replay_upstream
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: replay_upstream
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 18082 } }

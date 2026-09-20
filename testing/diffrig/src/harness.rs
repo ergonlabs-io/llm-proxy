@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Either, Empty, Full};
 use hyper::client::conn::http1;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
@@ -295,6 +295,19 @@ pub async fn send_json(
     headers: &[(&str, &str)],
     json_body: &serde_json::Value,
 ) -> RawResponse {
+    send_json_optional(addr, method, path, headers, Some(json_body)).await
+}
+
+/// Send a JSON request while preserving whether the caller supplied a body.
+/// Envoy rejects a bodyless-method request carrying an unsolicited JSON body,
+/// so replay clients must not synthesize `{}` for GET/HEAD scenarios.
+pub async fn send_json_optional(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    json_body: Option<&serde_json::Value>,
+) -> RawResponse {
     let stream = TcpStream::connect(addr).await.expect("connect to proxy");
     let io = TokioIo::new(stream);
     let (mut sender, conn) = http1::handshake(io).await.expect("http1 handshake");
@@ -302,16 +315,18 @@ pub async fn send_json(
         let _ = conn.await;
     });
 
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("content-type", "application/json");
+    let mut builder = Request::builder().method(method).uri(path);
+    if json_body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
-    let req = builder
-        .body(Full::new(Bytes::from(json_body.to_string())))
-        .expect("build request");
+    let body = match json_body {
+        Some(body) => Either::Left(Full::new(Bytes::from(body.to_string()))),
+        None => Either::Right(Empty::new()),
+    };
+    let req = builder.body(body).expect("build request");
 
     let res = sender.send_request(req).await.expect("send request");
     let status = res.status().as_u16();
