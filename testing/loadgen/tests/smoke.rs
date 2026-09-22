@@ -86,3 +86,31 @@ async fn closed_loop_end_to_end_smoke() {
     assert!(summary.ttft_from_scheduled_us.is_some());
     assert!(summary.total_from_scheduled_us.is_some());
 }
+
+#[tokio::test]
+async fn open_loop_paces_without_counting_response_drain_as_dispatch_time() {
+    let addr = spawn_server().await;
+    let targets = driver::parse_targets(&[format!("http://{addr}")]).expect("parse target");
+    let cfg = Arc::new(RunConfig {
+        targets,
+        endpoint: Endpoint::Chat,
+        model: "test-model".to_string(),
+        prompt: "hi".to_string(),
+        max_tokens: 16,
+        api_key: None,
+        stream: true,
+        timeout: Duration::from_secs(5),
+    });
+
+    let (summary, stats) =
+        driver::run_open_loop(cfg, 100.0, Duration::from_millis(500), Duration::ZERO).await;
+
+    assert_eq!(stats.requested_count, 50);
+    assert_eq!(summary.streams_started, stats.requested_count);
+    assert_eq!(summary.error_rate, 0.0, "expected no errors: {summary:?}");
+    assert!(!stats.driver_saturated, "driver saturated: {stats:?}");
+    assert!(
+        stats.achieved_rate >= 90.0,
+        "response drain was counted as dispatch time: {stats:?}"
+    );
+}

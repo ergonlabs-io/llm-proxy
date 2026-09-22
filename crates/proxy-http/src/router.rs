@@ -73,7 +73,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
-use proxy_cluster::manager::ClusterManager;
+use proxy_cluster::manager::{ClusterManager, ClusterRegistrySnapshot};
 use proxy_cluster::outlier::RequestResult;
 use proxy_cluster::{
     CbGuard, ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
@@ -173,7 +173,7 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 /// wiring builds once per (worker, config version), not through anything
 /// resolved per request.
 pub struct RouterFilterFactory {
-    clusters: Arc<ClusterManager>,
+    clusters: ClusterRegistrySnapshot,
     stats: Arc<RouterStats>,
     /// WP-51 increment 2: this HCM's span sink, if boot/reload wired one --
     /// see [`RouterHandler::span_sink`]'s doc for where it's read.
@@ -197,7 +197,7 @@ pub struct RouterFilterFactory {
 impl RouterFilterFactory {
     pub fn new(clusters: Arc<ClusterManager>, stats: Arc<RouterStats>) -> Self {
         Self {
-            clusters,
+            clusters: clusters.routing_snapshot(),
             stats,
             span_sink: None,
             upgrade_configs: Arc::new(HashMap::new()),
@@ -256,7 +256,7 @@ impl TerminalFilterInstanceFactory for RouterFilterFactory {
 /// callbacks -- there is no more bespoke `HttpRequestParts` field carrying it
 /// across a seam.
 pub struct RouterHandler {
-    clusters: Arc<ClusterManager>,
+    clusters: ClusterRegistrySnapshot,
     /// WP-23 increment 6a: this worker's `upstream_rq`/`upstream_rq_time`
     /// recorder -- see `apply_forward`'s attempt loop for where it's called
     /// and why.
@@ -302,7 +302,7 @@ pub struct RouterHandler {
 
 impl RouterHandler {
     pub fn new(
-        clusters: Arc<ClusterManager>,
+        clusters: ClusterRegistrySnapshot,
         stats: Arc<RouterStats>,
         span_sink: Option<SpanSink>,
         upgrade_configs: Arc<HashMap<String, bool>>,

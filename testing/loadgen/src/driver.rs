@@ -20,6 +20,7 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::dialect::{Endpoint, FrameKind};
 use crate::metrics::{Aggregator, Outcome, RunSummary, StreamResult};
@@ -359,13 +360,18 @@ pub struct OpenLoopStats {
     pub requested_rate: f64,
     pub achieved_rate: f64,
     pub requested_count: u64,
+    /// 99th-percentile delay between a request's schedule slot and its
+    /// actual dispatch. Unlike the maximum, this distinguishes sustained
+    /// scheduler pressure from one OS wake-up outlier.
+    pub p99_backlog_ms: f64,
     /// Longest observed gap between a stream's scheduled slot and when it
-    /// actually got sent. Large values mean the *loadgen* fell behind its
-    /// own schedule -- see `driver_saturated` for the derived verdict.
+    /// actually got sent. This stays visible for diagnosis but a single
+    /// outlier does not by itself declare the entire run saturated.
     pub max_backlog_ms: f64,
-    /// `true` once `max_backlog_ms` exceeds a few schedule intervals --
-    /// i.e. the driver, not the target, is the bottleneck, and the run's
-    /// latency numbers describe the loadgen, not the proxy.
+    /// `true` when the driver misses at least 1% of requested dispatch
+    /// throughput or its p99 backlog exceeds the larger of five schedule
+    /// intervals and 50ms. The fixed floor accommodates normal VM scheduler
+    /// jitter while the loadgen, mock upstreams, and target share a host.
     pub driver_saturated: bool,
 }
 
@@ -382,45 +388,67 @@ pub async fn run_open_loop(
     let target_idx = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::unbounded_channel::<StreamResult>();
 
-    let mut handles = Vec::with_capacity(total_requests as usize);
+    // Pace from one scheduler instead of registering one sleeping Tokio task
+    // per request up front. At 5k RPS the old shape created 15,000 timers
+    // before the three-second run had settled, and timer registration itself
+    // delayed the tasks whose deadlines had already arrived.
+    let mut requests = JoinSet::new();
     for i in 0..total_requests {
         let scheduled_start = run_start + Duration::from_secs_f64(i as f64 / rate);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_start)).await;
         let cfg = cfg.clone();
         let target_idx = target_idx.clone();
         let tx = tx.clone();
-        handles.push(tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_start)).await;
+        requests.spawn(async move {
             let target = pick_target(&cfg, &target_idx);
             let result = run_one_stream(&cfg, target, scheduled_start).await;
             let _ = tx.send(result);
-        }));
+        });
+
+        // Reap completed requests while scheduling so the join set contains
+        // roughly the in-flight population, not every request in the run.
+        while requests.try_join_next().is_some() {}
     }
     drop(tx);
 
     let collector = spawn_collector_with_backlog(rx, warmup_end);
-    for handle in handles {
-        let _ = handle.await;
-    }
-    let (summary, max_backlog) = collector.await.expect("collector task panicked");
+    while requests.join_next().await.is_some() {}
+    let (summary, p99_backlog, max_backlog, last_send_start) =
+        collector.await.expect("collector task panicked");
 
-    let elapsed = run_start.elapsed().as_secs_f64();
+    // Request completion tails are target latency, not load-driver
+    // throughput. Measure through the final actual dispatch and add one
+    // nominal interval so a perfectly paced N-request run reports its
+    // configured rate rather than N/(duration - one interval).
+    let elapsed = last_send_start
+        .map(|last| last.saturating_duration_since(run_start) + interval)
+        .unwrap_or_default()
+        .as_secs_f64();
     let achieved_rate = if elapsed > 0.0 {
         summary.streams_started as f64 / elapsed
     } else {
         0.0
     };
-    // A backlog of several full schedule intervals means requests are
-    // piling up faster than they can even be dispatched -- the driver
-    // itself, not the target under test, has become the bottleneck.
-    let driver_saturated = max_backlog > interval * 5;
+    let driver_saturated = is_driver_saturated(rate, achieved_rate, interval, p99_backlog);
     let stats = OpenLoopStats {
         requested_rate: rate,
         achieved_rate,
         requested_count: total_requests,
+        p99_backlog_ms: p99_backlog.as_secs_f64() * 1000.0,
         max_backlog_ms: max_backlog.as_secs_f64() * 1000.0,
         driver_saturated,
     };
     (summary, stats)
+}
+
+fn is_driver_saturated(
+    requested_rate: f64,
+    achieved_rate: f64,
+    interval: Duration,
+    p99_backlog: Duration,
+) -> bool {
+    let backlog_budget = (interval * 5).max(Duration::from_millis(50));
+    achieved_rate < requested_rate * 0.99 || p99_backlog > backlog_budget
 }
 
 fn spawn_collector(
@@ -439,18 +467,40 @@ fn spawn_collector(
 fn spawn_collector_with_backlog(
     mut rx: mpsc::UnboundedReceiver<StreamResult>,
     warmup_end: Instant,
-) -> tokio::task::JoinHandle<(RunSummary, Duration)> {
+) -> tokio::task::JoinHandle<(RunSummary, Duration, Duration, Option<Instant>)> {
     tokio::spawn(async move {
         let mut aggregator = Aggregator::new(warmup_end);
+        let mut backlogs = Vec::new();
         let mut max_backlog = Duration::ZERO;
+        let mut last_send_start = None;
         while let Some(result) = rx.recv().await {
             let backlog = result
                 .send_start
                 .saturating_duration_since(result.scheduled_start);
+            backlogs.push(backlog);
             max_backlog = max_backlog.max(backlog);
+            last_send_start = Some(last_send_start.map_or(result.send_start, |last: Instant| {
+                last.max(result.send_start)
+            }));
             aggregator.record(result);
         }
-        (aggregator.finish(), max_backlog)
+        backlogs.sort_unstable();
+        let p99_backlog = if backlogs.is_empty() {
+            Duration::ZERO
+        } else {
+            let index = backlogs
+                .len()
+                .saturating_mul(99)
+                .div_ceil(100)
+                .saturating_sub(1);
+            backlogs[index]
+        };
+        (
+            aggregator.finish(),
+            p99_backlog,
+            max_backlog,
+            last_send_start,
+        )
     })
 }
 
@@ -463,4 +513,33 @@ where
     let start = Instant::now();
     let out = fut.await;
     (out, start.elapsed())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_loop_saturation_requires_sustained_dispatch_pressure() {
+        let interval = Duration::from_micros(200);
+
+        assert!(!is_driver_saturated(
+            5_000.0,
+            4_999.0,
+            interval,
+            Duration::from_millis(19),
+        ));
+        assert!(is_driver_saturated(
+            5_000.0,
+            4_900.0,
+            interval,
+            Duration::from_millis(19),
+        ));
+        assert!(is_driver_saturated(
+            5_000.0,
+            5_000.0,
+            interval,
+            Duration::from_millis(51),
+        ));
+    }
 }

@@ -47,6 +47,24 @@ a malformed generation and proves last-good serving remains live. It is an
 acceptance drill, not a passing CI test: dedicated capacity-host execution is
 required, and broader Envoy side-by-side comparison remains open.
 
+### Capacity-host setup
+
+On a fresh Ubuntu host, run the repository setup script as root before either
+of the host-only drills:
+
+```text
+sudo scripts/setup-test-machine.sh --user "$USER"
+```
+
+It installs the Rust/native/protobuf build prerequisites, verifies Docker, and
+sets a `65535` login-session descriptor limit. Log out and back in before the
+rename-churn run so the new limit applies. Docker is intentionally only checked
+by default; use `--install-docker` when the host does not already provide it.
+
+The setup script does not make a 2-vCPU machine a valid 5k-rps host. The
+rename-churn test's `driver_saturated` assertion remains the authority: a
+saturated driver is an invalid capacity result, not a proxy failure.
+
 ## Side-by-side Envoy HTTP replay/capture topology (increment 1)
 
 `access_log_diff` defines normalized HTTP captures and field-level comparison.

@@ -3,7 +3,9 @@
 //! `tokio::io::duplex` pipes (no real sockets needed since both factories'
 //! `wrap` are generic over `AsyncRead + AsyncWrite`).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use proxy_config::ir::{
     CaSource, DataSourceIR, DownstreamTlsSpec, SanMatcherIR, SanType, StringMatcherIR,
@@ -1009,6 +1011,105 @@ async fn publish_then_serve() {
     let mut buf = [0u8; 4];
     server.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"ping");
+}
+
+/// WP-22 acceptance: rotating an SDS certificate while new TLS connections
+/// are continuously handshaking must not expose an empty or partially-built
+/// resolver. Every connection sees either the complete old certificate or the
+/// complete new certificate, and the new certificate becomes observable
+/// without rebuilding the serving factory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn certificate_rotation_under_tls_load_has_no_handshake_failures() {
+    const WORKERS: usize = 16;
+    const HANDSHAKES_PER_WORKER: usize = 32;
+    const ROTATE_AFTER: usize = 64;
+
+    let ca = mint_ca("test CA");
+    let key_a = KeyPair::generate().unwrap();
+    let cert_a = mint_leaf(&ca, &["server.example.com"], &key_a);
+    let key_b = KeyPair::generate().unwrap();
+    let cert_b = mint_leaf(&ca, &["server.example.com"], &key_b);
+    let cert_a_der = cert_a.der().as_ref().to_vec();
+    let cert_b_der = cert_b.der().as_ref().to_vec();
+
+    let downstream = Arc::new(
+        DownstreamTlsFactory::build(&sds_only_spec("rotating-cert"), "test")
+            .expect("an SDS-only chain must build with an empty cert set"),
+    );
+    let upstream = Arc::new(upstream_for(&ca));
+    let registry = SdsSecretRegistry::new();
+    registry
+        .register(&["rotating-cert".to_string()], &downstream, "test")
+        .unwrap();
+    registry
+        .publish("rotating-cert", vec![tls_cert_ir(&cert_a, &key_a)])
+        .unwrap();
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let saw_old = Arc::new(AtomicUsize::new(0));
+    let saw_new = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(tokio::sync::Barrier::new(WORKERS + 1));
+    let mut workers = Vec::with_capacity(WORKERS);
+
+    for _ in 0..WORKERS {
+        let downstream = Arc::clone(&downstream);
+        let upstream = Arc::clone(&upstream);
+        let completed = Arc::clone(&completed);
+        let saw_old = Arc::clone(&saw_old);
+        let saw_new = Arc::clone(&saw_new);
+        let start = Arc::clone(&start);
+        let cert_a_der = cert_a_der.clone();
+        let cert_b_der = cert_b_der.clone();
+        workers.push(tokio::spawn(async move {
+            start.wait().await;
+            for _ in 0..HANDSHAKES_PER_WORKER {
+                let (_server, client) =
+                    handshake(&downstream, &upstream, "server.example.com").await;
+                let peer = client.get_ref().1.peer_certificates().unwrap()[0]
+                    .as_ref()
+                    .to_vec();
+                if peer == cert_a_der {
+                    saw_old.fetch_add(1, Ordering::Relaxed);
+                } else if peer == cert_b_der {
+                    saw_new.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    panic!("handshake observed neither complete SDS certificate");
+                }
+                completed.fetch_add(1, Ordering::Release);
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    start.wait().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while completed.load(Ordering::Acquire) < ROTATE_AFTER {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TLS load did not begin before the rotation deadline");
+
+    registry
+        .publish("rotating-cert", vec![tls_cert_ir(&cert_b, &key_b)])
+        .expect("rotation must update the live serving factory");
+
+    for worker in workers {
+        worker.await.expect("TLS load worker must not fail");
+    }
+
+    assert_eq!(
+        completed.load(Ordering::Acquire),
+        WORKERS * HANDSHAKES_PER_WORKER
+    );
+    assert!(
+        saw_old.load(Ordering::Relaxed) > 0,
+        "load must observe the initially published certificate"
+    );
+    assert!(
+        saw_new.load(Ordering::Relaxed) > 0,
+        "load must observe the rotated certificate"
+    );
 }
 
 /// "Secret first, factory later" (the normal case, per the module doc): the

@@ -406,6 +406,19 @@ pub struct ClusterManager {
     transport_builder: TransportSocketBuilder,
 }
 
+/// Immutable view of the cluster registry captured for one listener/HCM
+/// configuration generation. Existing downstream connections retain their
+/// generation's view while a newly published configuration serves new
+/// connections from the replacement registry.
+#[derive(Clone)]
+pub struct ClusterRegistrySnapshot {
+    // This is intentionally a distinct, never-updated `ArcSwap`, seeded with
+    // one published registry. `ClusterHandle` still uses an `ArcSwap` for
+    // aggregate member resolution, but its members must resolve within this
+    // generation rather than against a later reload's registry.
+    clusters: Arc<ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>>,
+}
+
 impl ClusterManager {
     pub fn new(resolver: Arc<dyn HostResolver>, transport_builder: TransportSocketBuilder) -> Self {
         Self {
@@ -422,6 +435,17 @@ impl ClusterManager {
     /// own tests.
     pub fn with_default_transport(resolver: Arc<dyn HostResolver>) -> Self {
         Self::new(resolver, transport::reject_tls_builder())
+    }
+
+    /// Capture the registry currently published by this manager for a
+    /// connection-facing configuration generation. Unlike [`Self::cluster`],
+    /// handles obtained through this view never observe a later replacement
+    /// registry; this keeps in-flight requests routed by an older HCM from
+    /// losing their selected clusters during a listener rename/reload.
+    pub fn routing_snapshot(&self) -> ClusterRegistrySnapshot {
+        ClusterRegistrySnapshot {
+            clusters: Arc::new(ArcSwap::from(self.clusters.load_full())),
+        }
     }
 
     /// Reconcile against a config snapshot's cluster map and kick off each
@@ -749,6 +773,28 @@ impl ClusterManager {
         }
         clusters.sort_by(|a, b| a.name.cmp(&b.name));
         clusters
+    }
+}
+
+impl ClusterRegistrySnapshot {
+    /// The router-facing handle for a cluster in this generation, or `None`
+    /// when that generation did not contain the name.
+    pub fn cluster(&self, name: &str) -> Option<Arc<dyn ClusterEntry>> {
+        self.clusters.load().get(name).cloned().map(|managed| {
+            Arc::new(ClusterHandle {
+                managed,
+                registry: Arc::clone(&self.clusters),
+            }) as Arc<dyn ClusterEntry>
+        })
+    }
+
+    /// Whether a cluster in this generation completed its initial discovery.
+    pub fn is_initialized(&self, name: &str) -> bool {
+        self.clusters
+            .load()
+            .get(name)
+            .map(|managed| managed.initialized.load(Ordering::Acquire))
+            .unwrap_or(false)
     }
 }
 
@@ -1261,6 +1307,26 @@ mod tests {
         snapshot.clear();
         manager.update_from_snapshot(&snapshot).await;
         assert!(manager.cluster("svc").is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_snapshot_keeps_removed_cluster_for_its_generation() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "svc".to_string(),
+            cluster_config("svc", DiscoveryType::Static, vec![endpoint("10.0.0.1", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let routing = manager.routing_snapshot();
+
+        snapshot.clear();
+        manager.update_from_snapshot(&snapshot).await;
+
+        assert!(manager.cluster("svc").is_none());
+        assert!(routing.cluster("svc").is_some());
+        assert!(routing.is_initialized("svc"));
     }
 
     #[tokio::test]

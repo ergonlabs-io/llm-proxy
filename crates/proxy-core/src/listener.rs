@@ -17,7 +17,7 @@
 //! fine for local development and tests, not representative of production
 //! (Linux) accept distribution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -536,6 +536,7 @@ fn spawn_bound(
     let task = spawn_accept_loop(
         name.clone(),
         tcp_listener,
+        addr,
         version,
         ListenerCaches { tls, hcm },
         AcceptLoopShared {
@@ -704,6 +705,7 @@ struct AcceptLoopShared {
 fn spawn_accept_loop(
     name: ListenerName,
     tcp_listener: TcpListener,
+    addr: SocketAddr,
     initial_version: SnapshotVersion,
     initial: ListenerCaches,
     shared: AcceptLoopShared,
@@ -732,6 +734,7 @@ fn spawn_accept_loop(
         // `tls_cache`/`hcm_cache` are `Rc`s so each accepted connection's task
         // gets a cheap clone of the same compiled factories/handlers (pointer
         // bump, no rebuild).
+        let mut name = name;
         let mut tls_version = initial_version;
         let mut tls_cache = Rc::new(initial_tls);
         let mut hcm_cache = Rc::new(initial_hcm);
@@ -780,7 +783,22 @@ fn spawn_accept_loop(
             // per-connection work done *inline* in the accept loop; it's
             // synchronous (no `.await`), so it can't stall new accepts.
             if snapshot.version != tls_version {
-                if let Some(l) = snapshot.listeners.get(&name) {
+                let current_listener = snapshot
+                    .listeners
+                    .get(&name)
+                    .map(|listener| (name.clone(), listener))
+                    .or_else(|| {
+                        snapshot
+                            .listeners
+                            .iter()
+                            .find(|(_, listener)| listener.bind_to_port && listener.address == addr)
+                            .map(|(name, listener)| (name.clone(), listener))
+                    });
+                if let Some((current_name, l)) = current_listener {
+                    if name != current_name {
+                        tracing::info!(old_listener = %name, new_listener = %current_name, %addr, "accept loop adopted renamed listener");
+                        name = current_name;
+                    }
                     match build_listener_tls(l, &secret_registry) {
                         Ok(rebuilt) => tls_cache = Rc::new(rebuilt),
                         Err(err) => {
@@ -1533,23 +1551,36 @@ fn reconcile(
         factory_state,
         secret_registry,
     };
-    // Removed: present in `bound`, absent from the new snapshot. Stop
-    // accepting; established connections under the old listener keep their
-    // own `Arc<ConfigSnapshot>` clone and drain independently (v1 "full
-    // listener replace + drain" semantics -- no partial in-place chain
-    // surgery on live connections).
-    let removed: Vec<ListenerName> = bound
-        .keys()
-        .filter(|name| !snapshot.listeners.contains_key(*name))
-        .cloned()
+    // A listener rename at an unchanged address keeps the existing socket and
+    // accept loop. The loop resolves its logical name from the next snapshot
+    // before accepting again, so the rename cannot create a `SO_REUSEPORT`
+    // accept race or leave an old handler pointed at a removed cluster.
+    let renames: Vec<(ListenerName, ListenerName)> = snapshot
+        .listeners
+        .iter()
+        .filter(|(name, _)| !bound.contains_key(*name))
+        .filter_map(|(new_name, listener_ir)| {
+            bound
+                .iter()
+                .find(|(old_name, existing)| {
+                    !snapshot.listeners.contains_key(*old_name)
+                        && existing.addr == listener_ir.address
+                })
+                .map(|(old_name, _)| (old_name.clone(), new_name.clone()))
+        })
         .collect();
-    for name in removed {
-        if let Some(b) = bound.remove(&name) {
-            tracing::info!(listener = %name, "listener removed from config; no longer accepting (existing connections drain independently)");
-            b.task.abort();
-        }
+    for (old_name, new_name) in renames {
+        let existing = bound
+            .remove(&old_name)
+            .expect("rename source must remain bound until re-keyed");
+        tracing::info!(old_listener = %old_name, new_listener = %new_name, addr = %existing.addr, "listener renamed in place");
+        bound.insert(new_name, existing);
     }
 
+    // Warm every desired listener before retiring names absent from the new
+    // snapshot. A rename at the same address is a replacement, not a remove
+    // followed by a bind: aborting the old accept loop first leaves a socket
+    // gap and drops connections queued during that gap.
     for (name, listener_ir) in snapshot.listeners.iter() {
         if !listener_ir.bind_to_port {
             // Envoy only uses such listeners via internal redirection
@@ -1609,6 +1640,40 @@ fn reconcile(
                     &shared,
                 );
             }
+        }
+    }
+
+    let desired_addrs: HashSet<SocketAddr> = snapshot
+        .listeners
+        .values()
+        .filter(|listener| listener.bind_to_port && listener.routes_are_warmed(&snapshot.routes))
+        .map(|listener| listener.address)
+        .collect();
+    let active_addrs: HashSet<SocketAddr> = bound
+        .iter()
+        .filter(|(name, _)| snapshot.listeners.contains_key(*name))
+        .map(|(_, listener)| listener.addr)
+        .collect();
+    let removed: Vec<ListenerName> = bound
+        .keys()
+        .filter(|name| !snapshot.listeners.contains_key(*name))
+        .cloned()
+        .collect();
+    for name in removed {
+        let addr = bound
+            .get(&name)
+            .expect("removed listener must still be bound")
+            .addr;
+        if desired_addrs.contains(&addr) && !active_addrs.contains(&addr) {
+            // A same-address rename whose replacement failed to warm must
+            // leave the last-good listener accepting until a later snapshot
+            // can retry it.
+            tracing::error!(listener = %name, %addr, "replacement listener failed to bind; keeping previous listener active");
+            continue;
+        }
+        if let Some(b) = bound.remove(&name) {
+            tracing::info!(listener = %name, "listener removed from config after replacements warmed; existing connections drain independently");
+            b.task.abort();
         }
     }
 }
@@ -2588,6 +2653,39 @@ mod tests {
             let mut drained = [0_u8; 7];
             held.read_exact(&mut drained).await.unwrap();
             assert_eq!(&drained, b"drained");
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn same_address_listener_rename_warms_replacement_before_retiring_old_name() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_echo_upstream().await;
+            let harness = spawn_manager(snapshot_with_cluster(
+                match_all_listener("old-name", addr, "up"),
+                static_cluster("up", upstream_addr),
+                1,
+            ))
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            harness.publish(snapshot_with_cluster(
+                match_all_listener("new-name", addr, "up"),
+                static_cluster("up", upstream_addr),
+                2,
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let mut fresh = TcpStream::connect(addr)
+                .await
+                .expect("same-address renamed listener should accept");
+            fresh.write_all(b"renamed").await.unwrap();
+            let mut response = [0_u8; 7];
+            fresh.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"renamed");
 
             harness.shutdown().await;
         });

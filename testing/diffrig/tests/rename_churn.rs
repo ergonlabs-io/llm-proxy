@@ -205,7 +205,13 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
     assert_eq!(summary.truncated, 0, "truncated responses: {summary:?}");
     assert!(
         summary.http_errors.is_empty(),
-        "5xx/non-2xx responses: {summary:?}"
+        "5xx/non-2xx responses: {summary:?}\nproxy failure logs:\n{}",
+        std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("response_flag"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert!(summary.success > 0, "no successful requests: {summary:?}");
     assert!(
