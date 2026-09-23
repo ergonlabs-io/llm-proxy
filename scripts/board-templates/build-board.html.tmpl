@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 62 work packages · 9 lanes · 6 releases · P0–P2 priorities · updated 2026-09-12 · 1961 tests passed, 26 skipped as of 2026-09-12 (<code>make tq</code> + <code>make tq-doc</code>, format check and selected-crate clippy green) · + black-box QA suite (Go, 10 cases, last run 2026-09-08)</p>
+  <p class="eyebrow">internal-docs/IMPLEMENTATION_PLAN.md · internal-docs/MILESTONES.md · 65 work packages · 9 lanes · 6 releases · P0–P2 priorities · planning updated 2026-09-22 · 1961 tests passed, 26 skipped as of 2026-09-12 (<code>make tq</code> + <code>make tq-doc</code>, format check and selected-crate clippy green) · + black-box QA suite (Go, 10 cases, last run 2026-09-08)</p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -189,6 +189,10 @@
     <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
   </div>
   <p class="now">
+    <b>Planning 2026-09-22:</b> WP-64 tracks spend by stable <code>key_id</code>;
+    WP-65 tracks multiple selectable providers per model alias using the existing provider
+    catalogue. Both are planned, provisionally in v1.0.0; fallback versus traffic distribution
+    remains undecided. Neither changes the current ADS ship gate.
     <b>Now — v0.3.0 "dynamic configuration": be deployable the way Envoy is deployed.</b> Current
     by declaration since v0.2.0 shipped 2026-08-29. <b>WP-20 is DONE, 2026-09-05/06 — all six
     increments (0 through 5).</b> Increment 5 landed all five WP-28 acceptance scenarios {ACK,
