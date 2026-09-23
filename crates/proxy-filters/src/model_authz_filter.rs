@@ -924,6 +924,8 @@ mod tests {
         let snapshot = Arc::new(ArcSwap::new(Arc::new(ControlPlaneSnapshot {
             keys: KeySet::new(),
             policies,
+            key_budgets: Default::default(),
+            key_tenants: Default::default(),
         })));
         ModelAuthzFilterInstance {
             snapshot,

@@ -99,12 +99,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::auth::{KeyId, TenantId};
+
 // WP-50 increment 3c-ii-b: UTC calendar-aligned period keys. `chrono` is
 // already a workspace dependency (`proxy-cluster`, `proxy-observability`
 // use it); this crate had no prior need for wall-clock rendering.
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
-use crate::auth::TenantId;
 use crate::control::{ControlPlaneStore, FlushToken, StoreError};
 use crate::usage::TokenUsage;
 
@@ -1096,6 +1097,13 @@ pub struct SpendAccumulator {
     flusher: Mutex<Option<Flusher>>,
 }
 
+/// Converts a public key identity into the opaque row key used by the
+/// pre-existing spend store. This prefix is private to the store boundary;
+/// callers must use the `*_key` methods above rather than construct it.
+pub(crate) fn key_spend_subject(key_id: &KeyId) -> TenantId {
+    TenantId::new(format!("\u{1f}key:{0}", key_id.as_str()))
+}
+
 impl SpendAccumulator {
     /// Construction and starting the flusher thread are SEPARATE calls
     /// (see [`Self::start_flusher`]) so a test can exercise `record`/
@@ -1240,6 +1248,50 @@ impl SpendAccumulator {
         model: Option<&str>,
     ) {
         self.record(tenant, Utc::now(), period, charge, cluster, model);
+    }
+
+    /// Records spend for one stable API key. The durable store predates
+    /// key-scoped budgets and addresses spend rows with `TenantId`; the
+    /// reserved internal subject keeps the representation compatible while
+    /// making key and tenant ledgers disjoint.
+    pub fn record_key(
+        &self,
+        key_id: &KeyId,
+        now: DateTime<Utc>,
+        period: Period,
+        charge: Charge,
+        cluster: Option<&str>,
+        model: Option<&str>,
+    ) {
+        self.record(
+            &key_spend_subject(key_id),
+            now,
+            period,
+            charge,
+            cluster,
+            model,
+        );
+    }
+
+    /// [`Self::record_key`] against the real wall clock. This lets callers
+    /// that only need key-scoped accounting avoid constructing a timestamp.
+    pub fn record_key_now(
+        &self,
+        key_id: &KeyId,
+        period: Period,
+        charge: Charge,
+        cluster: Option<&str>,
+        model: Option<&str>,
+    ) {
+        self.record_key(key_id, Utc::now(), period, charge, cluster, model);
+    }
+
+    pub fn current_total_key(&self, key_id: &KeyId, period: &PeriodKey) -> u64 {
+        self.current_total(&key_spend_subject(key_id), period)
+    }
+
+    pub fn report_key(&self, key_id: &KeyId, period: &PeriodKey) -> SpendReport {
+        self.report(&key_spend_subject(key_id), period)
     }
 
     /// The period a tenant with NO configured [`TenantBudget`] is metered

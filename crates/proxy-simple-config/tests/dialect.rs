@@ -1748,25 +1748,24 @@ fn token_limit_filter_survives_into_the_ir() {
 // form needed whenever `dialect` must be explicit. There is no third noun
 // ("backend") anywhere in the config.
 
-/// A `models:` block with two provider entries: `providers[0]` produces the
-/// route (pointed at its provider's cluster), `providers[1]` is recorded but
-/// not yet reachable and gets an explicit warning naming its exact path
-/// (ground rule #1) -- selection among them is WP-35.
+/// A `models:` block with two same-dialect providers lowers to an ordered
+/// aggregate cluster. The alias is the only client-selectable name; retrying
+/// the aggregate reaches the next provider.
 #[test]
-fn models_first_provider_produces_the_route_later_ones_warn() {
+fn models_multiple_providers_lower_to_ordered_fallback() {
     let config = parse(
         r#"
 version: 0
 providers:
-  anthropic: { api_key: ${ANTHROPIC_API_KEY} }
-  nebius: { base_url: "https://api.studio.nebius.ai", api_key: k }
+  primary: { base_url: "https://primary.example", api_key: k }
+  secondary: { base_url: "https://secondary.example", api_key: k }
 routes:
-  - { model: "gpt-*", provider: anthropic }
+  - { model: "gpt-*", provider: primary }
 models:
   claude-sonnet-4-5:
     providers:
-      - anthropic/claude-sonnet-4-5-20250929
-      - nebius/some-other-model
+      - primary
+      - secondary
 "#,
     )
     .expect("must parse");
@@ -1774,25 +1773,33 @@ models:
 
     let routes =
         &hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"];
-    // routes[0] is the explicit `routes:` rule; routes[1] is the implicit
-    // model route built from `providers[0]`.
+    // routes[0] is the explicit rule; routes[1] is the catalogue alias.
     let model_route = &routes[1];
-    assert_eq!(model_route["route"]["cluster"], "provider:anthropic");
+    assert_eq!(
+        model_route["route"]["cluster"],
+        "fallback:model-claude-sonnet-4-5"
+    );
+    assert_eq!(model_route["route"]["retry_policy"]["num_retries"], 1);
     assert_eq!(
         model_route["match"]["headers"][0]["string_match"]["exact"],
         "claude-sonnet-4-5"
     );
 
-    let paths = warning_paths(&lowered.warnings);
-    assert!(
-        paths.contains(&"models.claude-sonnet-4-5.providers[1]"),
-        "warnings: {paths:?}"
+    let clusters = &lowered.bootstrap["static_resources"]["clusters"];
+    let aggregate = clusters
+        .as_array()
+        .expect("clusters must be an array")
+        .iter()
+        .find(|cluster| cluster["name"] == "fallback:model-claude-sonnet-4-5")
+        .expect("model aggregate cluster must exist");
+    assert_eq!(
+        aggregate["cluster_type"]["typed_config"]["clusters"],
+        serde_json::json!(["provider:primary", "provider:secondary"])
     );
-    // `providers[0]`'s `/model` suffix (an upstream ID different from the
-    // catalogue name) is recorded but not substituted into the body yet.
     assert!(
-        paths.contains(&"models.claude-sonnet-4-5.providers[0]"),
-        "warnings: {paths:?}"
+        lowered.warnings.is_empty(),
+        "warnings: {:?}",
+        lowered.warnings
     );
 }
 
@@ -2560,14 +2567,12 @@ fn model_provider_survives_into_the_ir() {
 version: 0
 providers:
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
-  nebius: { base_url: "https://api.studio.nebius.ai", api_key: k }
 routes:
   - { model: "gpt-*", provider: anthropic }
 models:
   claude-sonnet-4-5:
     providers:
       - anthropic/claude-sonnet-4-5-20250929
-      - nebius
 observability:
   force_usage_reporting: false
 "#,

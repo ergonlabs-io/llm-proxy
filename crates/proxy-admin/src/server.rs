@@ -67,6 +67,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/server_info",
     "/keys",
     "/keys/{id}",
+    "/keys/{id}/budget",
+    "/keys/{id}/spend",
     "/tenants",
     "/tenants/{id}",
     "/tenants/{id}/policy",
@@ -76,6 +78,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}/spend",
     "/chains/{stat_prefix}/keys",
     "/chains/{stat_prefix}/keys/{id}",
+    "/chains/{stat_prefix}/keys/{id}/budget",
+    "/chains/{stat_prefix}/keys/{id}/spend",
     "/chains/{stat_prefix}/tenants",
     "/chains/{stat_prefix}/tenants/{id}",
     "/chains/{stat_prefix}/tenants/{id}/policy",
@@ -490,6 +494,12 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         WriteRoute::KeyById(id) | WriteRoute::ScopedKeyById(_, id) => {
             handle_revoke_key(&control_plane, id)
         }
+        WriteRoute::KeyBudget(id) | WriteRoute::ScopedKeyBudget(_, id) => {
+            handle_set_key_budget(&control_plane, id, &body)
+        }
+        WriteRoute::KeySpend(id) | WriteRoute::ScopedKeySpend(_, id) => {
+            handle_get_key_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
+        }
         WriteRoute::Tenants | WriteRoute::ScopedTenants(_) => {
             handle_create_tenant(&control_plane, &body)
         }
@@ -528,6 +538,8 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
 enum WriteRoute<'a> {
     Keys,
     KeyById(&'a str),
+    KeyBudget(&'a str),
+    KeySpend(&'a str),
     Tenants,
     TenantById(&'a str),
     TenantPolicy(&'a str),
@@ -537,6 +549,8 @@ enum WriteRoute<'a> {
     TenantSpend(&'a str),
     ScopedKeys(&'a str),
     ScopedKeyById(&'a str, &'a str),
+    ScopedKeyBudget(&'a str, &'a str),
+    ScopedKeySpend(&'a str, &'a str),
     ScopedTenants(&'a str),
     ScopedTenantById(&'a str, &'a str),
     ScopedTenantPolicy(&'a str, &'a str),
@@ -549,11 +563,15 @@ impl<'a> WriteRoute<'a> {
         match self {
             WriteRoute::Keys | WriteRoute::Tenants => Method::POST,
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
+            WriteRoute::KeyBudget(_) => Method::PUT,
+            WriteRoute::KeySpend(_) => Method::GET,
             WriteRoute::TenantPolicy(_) => Method::PUT,
             WriteRoute::TenantBudget(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
             WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
+            WriteRoute::ScopedKeyBudget(..) => Method::PUT,
+            WriteRoute::ScopedKeySpend(..) => Method::GET,
             WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
             WriteRoute::ScopedTenantBudget(..) => Method::PUT,
         }
@@ -567,6 +585,8 @@ impl<'a> WriteRoute<'a> {
         match self {
             WriteRoute::Keys
             | WriteRoute::KeyById(_)
+            | WriteRoute::KeyBudget(_)
+            | WriteRoute::KeySpend(_)
             | WriteRoute::Tenants
             | WriteRoute::TenantById(_)
             | WriteRoute::TenantPolicy(_)
@@ -575,6 +595,8 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::ScopedKeys(s)
             | WriteRoute::ScopedTenants(s)
             | WriteRoute::ScopedKeyById(s, _)
+            | WriteRoute::ScopedKeyBudget(s, _)
+            | WriteRoute::ScopedKeySpend(s, _)
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
             | WriteRoute::ScopedTenantBudget(s, _)
@@ -603,6 +625,8 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
     match segments {
         ["keys"] => Some(WriteRoute::Keys),
         ["keys", id] => Some(WriteRoute::KeyById(id)),
+        ["keys", id, "budget"] => Some(WriteRoute::KeyBudget(id)),
+        ["keys", id, "spend"] => Some(WriteRoute::KeySpend(id)),
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
@@ -614,6 +638,12 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         // operator-chosen `stat_prefix` -- see `WriteRoute`'s doc.
         ["chains", stat_prefix, "keys"] => Some(WriteRoute::ScopedKeys(stat_prefix)),
         ["chains", stat_prefix, "keys", id] => Some(WriteRoute::ScopedKeyById(stat_prefix, id)),
+        ["chains", stat_prefix, "keys", id, "budget"] => {
+            Some(WriteRoute::ScopedKeyBudget(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "keys", id, "spend"] => {
+            Some(WriteRoute::ScopedKeySpend(stat_prefix, id))
+        }
         ["chains", stat_prefix, "tenants"] => Some(WriteRoute::ScopedTenants(stat_prefix)),
         ["chains", stat_prefix, "tenants", id] => {
             Some(WriteRoute::ScopedTenantById(stat_prefix, id))
@@ -1149,6 +1179,37 @@ fn handle_set_budget(
     }
 }
 
+/// `PUT /keys/{id}/budget`. A budget belongs to the logical key identity,
+/// never its secret, so rotating a secret leaves this row and its spend
+/// ledger in place.
+fn handle_set_key_budget(
+    control_plane: &ControlPlane,
+    key_id: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if key_id.is_empty() {
+        return bad_request("key_id must not be empty");
+    }
+    let request: SetBudgetRequest = match parse_json_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let budget = match request.budget {
+        None => None,
+        Some(spec) => match parse_micro_usd(&spec.max_usd) {
+            Ok(max_micros) => Some(TenantBudget {
+                max_micros,
+                period: spec.period.into(),
+            }),
+            Err(err) => return bad_request(&format!("invalid `max_usd`: {err}")),
+        },
+    };
+    match control_plane.set_key_budget(&KeyId::new(key_id), budget.as_ref()) {
+        Ok(()) => no_content(),
+        Err(err) => store_error_response("/keys/{id}/budget", err),
+    }
+}
+
 /// Resolves the spend accumulator (scoped or unscoped, matching
 /// `stat_prefix`'s presence exactly the way [`handle`]'s own `ControlPlane`
 /// gate already did just above this call) and dispatches to
@@ -1194,6 +1255,35 @@ fn handle_get_spend_route(
         },
     };
     handle_get_spend(control_plane, accumulator, tenant)
+}
+
+fn handle_get_key_spend_route(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+    control_plane: &ControlPlane,
+    key_id: &str,
+    path: &str,
+) -> Response<Full<Bytes>> {
+    let accumulator = match stat_prefix {
+        Some(stat_prefix) => resolve_spend_state_by_name(factory_state, stat_prefix),
+        None => match resolve_spend_state(factory_state) {
+            Ok(accumulator) => accumulator,
+            Err(scopes) => {
+                return text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!(
+                        "the unscoped admin spend read cannot resolve a single spend accumulator: \
+                         {} filter chains each configure llmproxy.spend_limit ({}) -- use \
+                         /chains/{{stat_prefix}}/... to address one explicitly",
+                        scopes.len(),
+                        scopes.join(", "),
+                    ),
+                );
+            }
+        },
+    };
+    let _ = path;
+    handle_get_key_spend(control_plane, accumulator, key_id)
 }
 
 /// `GET /tenants/{id}/spend` (and its scoped form) -- WP-50 increment 3c-iv.
@@ -1291,6 +1381,62 @@ fn handle_get_spend(
             // age since start here rather than `null`, so "never reached the
             // store" cannot be misread as "fine" -- see
             // `SpendAccumulator::reconciliation_age`.
+            "reconciliation_age_seconds": report.reconciliation_age_seconds,
+            "reconciliation_expired": report.reconciliation_expired,
+            "unreconciled_admissions": report.unreconciled_admissions,
+            "unpriced_requests": report.unpriced_requests,
+            "unpriced_pairs": report.unpriced_pairs,
+            "unpriced_pairs_truncated": report.unpriced_pairs_truncated,
+        }),
+    )
+}
+
+fn handle_get_key_spend(
+    control_plane: &ControlPlane,
+    accumulator: Option<Arc<SpendAccumulator>>,
+    key_id: &str,
+) -> Response<Full<Bytes>> {
+    if key_id.is_empty() {
+        return bad_request("key_id must not be empty");
+    }
+    let Some(accumulator) = accumulator else {
+        return text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "llmproxy.spend_limit is not configured on this chain, so there is no spend accumulator to report from",
+        );
+    };
+    let key_id = KeyId::new(key_id);
+    let snapshot = control_plane.handle().load();
+    let Some(tenant) = snapshot.key_tenants.get(&key_id) else {
+        return store_error_response("/keys/{id}/spend", StoreError::NotFound);
+    };
+    let budget = snapshot.key_budgets.get(&key_id).copied();
+    let period = budget
+        .map(|budget| budget.period)
+        .unwrap_or_else(|| accumulator.default_period());
+    let period_key = period.key_for_now();
+    let (period_start, period_end) = period.window_now();
+    let report = accumulator.report_key(&key_id, &period_key);
+    let (budget_micros, remaining_micros) = match budget {
+        Some(budget) => {
+            let limit = budget.max_micros.as_micros();
+            (Some(limit), Some(limit.saturating_sub(report.total_micros)))
+        }
+        None => (None, None),
+    };
+    json(
+        StatusCode::OK,
+        &serde_json::json!({
+            "key_id": key_id.as_str(),
+            "tenant": tenant.as_str(),
+            "period": period_key.as_str(),
+            "period_started_at": period_start.to_rfc3339(),
+            "period_ends_at": period_end.to_rfc3339(),
+            "spend_micro_usd": report.total_micros,
+            "spend_usd": render_micro_usd(report.total_micros),
+            "budget_micro_usd": budget_micros,
+            "remaining_micro_usd": remaining_micros,
+            "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
             "reconciliation_age_seconds": report.reconciliation_age_seconds,
             "reconciliation_expired": report.reconciliation_expired,
             "unreconciled_admissions": report.unreconciled_admissions,

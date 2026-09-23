@@ -1,5 +1,5 @@
-//! WP-50 increment 3c-iii-b — wires [`crate::spend`]'s price table, per-tenant
-//! spend accumulator, and per-tenant budget into a real decode/encode
+//! WP-50 increment 3c-iii-b / WP-64 — wires [`crate::spend`]'s price table,
+//! per-key spend accumulator, and per-key budget into a real decode/encode
 //! `HttpFilter`: `llmproxy.spend_limit`. See
 //! `internal-docs/wp-50-3c-spend-budgets.md`'s "3c-iii" section, normative
 //! here.
@@ -10,10 +10,10 @@
 //! A request's cost is unknown until its response finishes (usage arrives at
 //! the END of the stream, never before), so this filter -- exactly like
 //! [`crate::token_limit_filter`] -- checks on the **decode** path (before a
-//! request is sent upstream, against whatever the tenant's live spend
+//! request is sent upstream, against whatever the key's live spend
 //! already is) and records on the **encode** path, at response end. The
 //! consequence is the same shape as `token_limit`'s: the ONE request whose
-//! cost pushes a tenant over its ceiling is necessarily ADMITTED (its own
+//! cost pushes a key over its ceiling is necessarily ADMITTED (its own
 //! cost cannot be known yet at the moment it is checked), and it is the
 //! **next** request that gets refused. Overspend past a configured ceiling
 //! is therefore bounded by at most one request's cost, never unbounded --
@@ -21,10 +21,10 @@
 //! price", not a bug to fix by delaying the response.
 //!
 //! # Filter position: mirrors `token_limit_filter`'s two ordering rules
-//! exactly, restated for tenant + usage instead of tenant + usage
+//! exactly, restated for key + usage instead of tenant + usage
 //!
 //! - **`llmproxy.auth` BEFORE `llmproxy.spend_limit`** (decode-side): this
-//!   filter's decode check reads `StreamInfo::auth.tenant`, which the auth
+//!   filter's decode check reads `StreamInfo::auth.key_id`, which the auth
 //!   filter writes. Decoder callbacks run in config order (S2.1), so this
 //!   is the same direction as `token_limit`'s own auth-ordering rule.
 //! - **`llmproxy.spend_limit` BEFORE `llmproxy.usage`** (encode-side): this
@@ -39,24 +39,24 @@
 //! `proxy_config::lower::check_lane_h_filter_order` enforces both at config
 //! load; this comment states the reasoning, not the guard.
 //!
-//! # No tenant -> admit; no budget -> admit (unlimited)
+//! # No key -> admit; no budget -> admit (unlimited)
 //!
 //! Two DIFFERENT "nothing to enforce" cases, both admitting, for different
 //! reasons:
 //!
-//! - **`StreamInfo::auth.tenant` is `None`.** This filter is not an
+//! - **`StreamInfo::auth.key_id` is `None`.** This filter is not an
 //!   authenticator, and duplicating `llmproxy.auth`'s own fail-closed 401
 //!   here would only produce a second, confusingly different refusal reason
 //!   for the same underlying fact ("this request was never authenticated").
-//!   Nothing is recorded either -- there is no tenant to attribute spend to.
-//! - **The authenticated tenant has no configured [`crate::spend::TenantBudget`]**
-//!   (absent from the snapshot's `policies` entirely, or present with
-//!   `budget: None`). Mirrors [`crate::model_authz_filter`]'s and
+//!   Nothing is recorded either -- there is no key to attribute spend to.
+//! - **The authenticated key has no configured [`crate::spend::TenantBudget`]**
+//!   (absent from the snapshot's `key_budgets`). Mirrors
+//!   [`crate::model_authz_filter`]'s and
 //!   [`crate::spend::TenantBudget`]'s own "`None` means unlimited, and that
 //!   is the deliberate default" reasoning: a budget is an opt-in ceiling, not
 //!   a default-deny, so enabling this filter must not silently deny every
-//!   tenant's very first request the moment an operator adds it to a chain.
-//!   Spend IS still recorded for this tenant (under
+//!   key's very first request the moment an operator adds it to a chain.
+//!   Spend IS still recorded for this key (under
 //!   [`crate::spend::SpendAccumulator::default_period`]) so its history
 //!   accrues somewhere reportable even with no ceiling to check it against.
 //!
@@ -66,7 +66,7 @@
 //! real, deliberate policy -- deny every priced request this period -- not a
 //! degenerate case to special-case away. The comparison below is
 //! `current_micros >= limit_micros`, which is `0 >= 0` on a fresh period:
-//! true, so the very first request a zero-budget tenant makes is refused.
+//! true, so the very first request a zero-budget key makes is refused.
 //! See [`crate::spend::TenantBudget`]'s doc for why `None` and `Some(0)` are
 //! kept distinguishable end to end rather than collapsed.
 //!
@@ -84,7 +84,7 @@
 //! gets the SAME one the `llmproxy.auth`-resolved
 //! [`crate::control::ControlPlane`] persists budgets and policies into, via
 //! [`crate::control::ControlPlane::store`]. That matters concretely: with
-//! `store: persistent` configured on `llmproxy.auth`, a tenant's accrued
+//! `store: persistent` configured on `llmproxy.auth`, a key's accrued
 //! spend survives a restart along with its budget, and only the unflushed
 //! window (bounded by the flush interval) is lost -- the crash-refund the
 //! design brief documents.
@@ -98,19 +98,17 @@
 //! # Loud on unreadable usage, but never fail-closed -- restated from
 //! `token_limit_filter`, per CLAUDE.md rule 17
 //!
-//! A request a budget actually applies to (this stream had a tenant AND that
-//! tenant had a configured budget) whose usage reads `None` at encode time is
+//! A request a budget actually applies to (this stream had a key AND that
+//! key had a configured budget) whose usage reads `None` at encode time is
 //! metered as zero spend and never shown anywhere an operator would look --
 //! unless something says so. [`UsageMissingWarner::warn_if_due`] closes
 //! exactly that gap, `warn!`, never a denial (the request itself succeeded
 //! and behaved as designed): see [`crate::token_limit_filter`]'s identical
 //! section for the full reasoning, including why this must warn ONLY when a
-//! budget actually applies (an unbudgeted tenant's missing usage is not a
-//! bypass of anything) and why the suppression is once-per-tenant-per-minute
-//! rather than once-per-process. Tenant ids need no hashing before they
-//! reach this warning -- unlike `token_limit`'s credential-derived key, a
-//! tenant id is an identifier the OPERATOR chose, not a secret (see
-//! `crate::auth::TenantPolicy`'s `Debug` impl, which reasons identically).
+//! budget actually applies (an unbudgeted key's missing usage is not a
+//! bypass of anything) and why the suppression is once-per-key-per-minute
+//! rather than once-per-process. Key ids identify a logical credential and
+//! are never rendered in metrics labels or response bodies.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -129,7 +127,7 @@ use proxy_http::filter::{
 };
 use proxy_observability::ResponseFlag;
 
-use crate::auth::TenantId;
+use crate::auth::KeyId;
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::spend::{
@@ -486,7 +484,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
             accumulator: Arc::clone(&self.accumulator),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             snapshot: Arc::clone(&self.snapshot),
-            tenant: None,
+            key_id: None,
             period: None,
             budget_applies: false,
             recorded: false,
@@ -494,14 +492,14 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
     }
 }
 
-/// Warns, at most once per tenant per [`Self::REPEAT_INTERVAL`], when a
+/// Warns, at most once per key per [`Self::REPEAT_INTERVAL`], when a
 /// budget actually applied to a request but its usage could not be read at
 /// encode time -- see the module doc's "Loud on unreadable usage" section.
 /// Mirrors `token_limit_filter::UsageMissingWarner` structurally; kept as a
-/// separate type because it dedups on [`TenantId`], not `token_limit`'s
+/// separate type because it dedups on [`KeyId`], not `token_limit`'s
 /// `LimitKey`, and needs no credential hashing (see the module doc for why).
 struct UsageMissingWarner {
-    last_warned: Mutex<HashMap<TenantId, Instant>>,
+    last_warned: Mutex<HashMap<KeyId, Instant>>,
 }
 
 impl UsageMissingWarner {
@@ -515,7 +513,7 @@ impl UsageMissingWarner {
         }
     }
 
-    fn warn_if_due(&self, tenant: &TenantId, now: Instant) {
+    fn warn_if_due(&self, key_id: &KeyId, now: Instant) {
         // Rust note: `unwrap_or_else(PoisonError::into_inner)` recovers from
         // a poisoned lock rather than panicking -- same convention as
         // `token_limit_filter::UsageMissingWarner::warn_if_due`.
@@ -523,19 +521,19 @@ impl UsageMissingWarner {
             .last_warned
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let due = match last_warned.get(tenant) {
+        let due = match last_warned.get(key_id) {
             Some(&last) => now.saturating_duration_since(last) >= Self::REPEAT_INTERVAL,
             None => true,
         };
         if !due {
             return;
         }
-        last_warned.insert(tenant.clone(), now);
+        last_warned.insert(key_id.clone(), now);
         drop(last_warned);
 
         tracing::warn!(
-            tenant = tenant.as_str(),
-            "spend_limit: this tenant's spend budget was NOT enforced for this request and \
+            key_id = key_id.as_str(),
+            "spend_limit: this key's spend budget was NOT enforced for this request and \
              nothing was charged against it -- usage could not be extracted from the response \
              (StreamInfo::llm.usage was None). The most likely cause is that the llmproxy.usage \
              filter's configured `dialect` does not match this provider's actual response shape \
@@ -557,7 +555,7 @@ struct SpendLimitFilterInstance {
     /// tenant, regardless of whether that tenant has a budget -- `None`
     /// means "nothing to record" (see the module doc's "no tenant -> admit"
     /// case).
-    tenant: Option<TenantId>,
+    key_id: Option<KeyId>,
     /// The period this tenant's spend accrues into for THIS request -- the
     /// tenant's own `TenantBudget::period` if one is configured, else
     /// `self.accumulator.default_period()`. Set alongside `tenant`; `None`
@@ -587,7 +585,7 @@ impl SpendLimitFilterInstance {
         }
         self.recorded = true;
 
-        let Some(tenant) = self.tenant.clone() else {
+        let Some(key_id) = self.key_id.clone() else {
             return;
         };
         let period = self
@@ -610,7 +608,7 @@ impl SpendLimitFilterInstance {
         let Some(usage) = usage else {
             if self.budget_applies {
                 self.usage_missing_warner
-                    .warn_if_due(&tenant, Instant::now());
+                    .warn_if_due(&key_id, Instant::now());
             }
             return;
         };
@@ -625,8 +623,8 @@ impl SpendLimitFilterInstance {
             .price_table
             .cost_of(cluster.as_deref(), model.as_deref(), &usage);
 
-        self.accumulator.record(
-            &tenant,
+        self.accumulator.record_key(
+            &key_id,
             Utc::now(),
             period,
             charge,
@@ -648,26 +646,21 @@ impl HttpFilter for SpendLimitFilterInstance {
         // `Option<String>` out and letting the guard drop at the end of this
         // block keeps that rule visibly satisfied, same pattern as
         // `token_limit_filter`/`model_authz_filter`.
-        let tenant_name = cb.stream_info().auth.tenant.clone();
+        let key_id = cb.stream_info().auth.key_id.clone();
 
         // Case: no authenticated tenant -- see the module doc's "no tenant ->
         // admit" section. This filter is not an authenticator.
-        let Some(tenant_name) = tenant_name else {
-            self.tenant = None;
+        let Some(key_id) = key_id else {
+            self.key_id = None;
             self.period = None;
             self.budget_applies = false;
             return FilterHeadersStatus::Continue;
         };
 
-        let tenant = TenantId::new(tenant_name.clone());
-        let budget = self
-            .snapshot
-            .load()
-            .policies
-            .get(&tenant_name)
-            .and_then(|policy| policy.budget);
+        let key_id = KeyId::new(key_id);
+        let budget = self.snapshot.load().key_budgets.get(&key_id).copied();
 
-        self.tenant = Some(tenant.clone());
+        self.key_id = Some(key_id.clone());
         self.budget_applies = budget.is_some();
         let period = budget
             .map(|b| b.period)
@@ -683,7 +676,7 @@ impl HttpFilter for SpendLimitFilterInstance {
 
         let now = Utc::now();
         let period_key = period.key_for(now);
-        let current_micros = self.accumulator.current_total(&tenant, &period_key);
+        let current_micros = self.accumulator.current_total_key(&key_id, &period_key);
         let limit_micros = budget.max_micros.as_micros();
 
         // At or over the ceiling denies -- see the module doc's "A
@@ -869,6 +862,7 @@ fn resolve_node_id(configured: &str, stat_prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TenantId;
 
     // Rust note: test-only now -- `create` reaches its store through
     // `ControlPlane::store()`, so the lib half never names a concrete store
@@ -1167,7 +1161,9 @@ mod tests {
         }
 
         fn set_tenant(&self, tenant: &str) {
-            self.stream_info.borrow_mut().auth.tenant = Some(tenant.to_string());
+            let mut auth = self.stream_info.borrow_mut();
+            auth.auth.tenant = Some(tenant.to_string());
+            auth.auth.key_id = Some(test_key_id(tenant).as_str().to_string());
         }
 
         fn set_usage(&self, usage: LlmTokenUsage) {
@@ -1270,12 +1266,11 @@ mod tests {
         }
     }
 
-    /// A `ControlPlane` with `budgets` set for each named tenant via
-    /// `ControlPlane::set_budget` -- the SAME write path (and republish) an
-    /// admin `PUT /tenants/{id}/budget` call uses in production, deliberately
-    /// NOT `seed_bootstrap_policies` (which only ever writes `ModelAccess`,
-    /// never a `TenantBudget` -- see its own doc's "a bootstrap policy seed
-    /// can never observe, let alone clobber, a budget an admin set").
+    fn test_key_id(tenant: &str) -> KeyId {
+        KeyId::new(format!("key-{tenant}"))
+    }
+
+    /// A `ControlPlane` with a stable key and budget for every test tenant.
     fn control_plane_with(budgets: &[(&str, TenantBudget)]) -> Arc<ControlPlane> {
         let cp = ControlPlane::new(
             Box::new(InMemoryControlPlaneStore::default()),
@@ -1284,8 +1279,14 @@ mod tests {
         )
         .expect("control plane must build");
         for (tenant, budget) in budgets {
-            cp.set_budget(&TenantId::new(*tenant), Some(budget))
-                .expect("set_budget must succeed");
+            let tenant_id = TenantId::new(*tenant);
+            cp.create_tenant(&tenant_id)
+                .expect("tenant creation must succeed");
+            let key_id = test_key_id(tenant);
+            cp.mint_key(&tenant_id, &key_id)
+                .expect("key mint must succeed");
+            cp.set_key_budget(&key_id, Some(budget))
+                .expect("set key budget must succeed");
         }
         Arc::new(cp)
     }
@@ -1316,7 +1317,7 @@ mod tests {
                 accumulator: Arc::clone(&self.accumulator),
                 usage_missing_warner: Arc::clone(&self.usage_missing_warner),
                 snapshot: Arc::clone(&self.snapshot),
-                tenant: None,
+                key_id: None,
                 period: None,
                 budget_applies: false,
                 recorded: false,
@@ -1562,11 +1563,11 @@ mod tests {
             .downcast::<SharedSpendLimitState>()
             .expect("the spend singleton is always a SharedSpendLimitState");
 
-        let tenant = TenantId::new("tenant-a");
+        let key_id = KeyId::new("key-tenant-a");
         let now = chrono::Utc::now();
         let period = Period::Monthly;
-        accumulator.accumulator.record(
-            &tenant,
+        accumulator.accumulator.record_key(
+            &key_id,
             now,
             period,
             Charge::Priced(MicroUsd::from_micros(4_242)),
@@ -1582,7 +1583,11 @@ mod tests {
         // filter had built a private store, this one would still be empty.
         let stored = cp
             .store()
-            .load_spend(&ctx.stat_prefix, &tenant, &period.key_for(now))
+            .load_spend(
+                &ctx.stat_prefix,
+                &crate::spend::key_spend_subject(&key_id),
+                &period.key_for(now),
+            )
             .expect("load_spend must succeed");
         assert_eq!(
             stored, 4_242,
@@ -1773,12 +1778,12 @@ mod tests {
             );
         }
 
-        let tenant = TenantId::new("tenant-a");
+        let key_id = test_key_id("tenant-a");
         let now = Utc::now();
         assert_eq!(
             filter
                 .accumulator
-                .current_total(&tenant, &Period::Daily.key_for(now)),
+                .current_total_key(&key_id, &Period::Daily.key_for(now)),
             0,
             "an unpriced request must add nothing to the spend total"
         );
@@ -1789,6 +1794,12 @@ mod tests {
     #[test]
     fn set_budget_changes_enforcement_on_the_very_next_request_with_no_reload() {
         let cp = control_plane_with(&[]);
+        let tenant = TenantId::new("tenant-a");
+        let key_id = test_key_id("tenant-a");
+        cp.create_tenant(&tenant)
+            .expect("tenant creation must succeed");
+        cp.mint_key(&tenant, &key_id)
+            .expect("key mint must succeed");
         let mut table = PriceTable::new();
         table.insert(
             "cluster-a",
@@ -1818,8 +1829,8 @@ mod tests {
         // accrued under the accumulator's `default_period` before any budget
         // existed) spend history, so it isolates "did the write take effect"
         // from the unrelated question of period-key carryover.
-        cp.set_budget(
-            &TenantId::new("tenant-a"),
+        cp.set_key_budget(
+            &key_id,
             Some(&TenantBudget {
                 max_micros: MicroUsd::from_micros(0),
                 period: Period::Daily,
@@ -1877,11 +1888,11 @@ mod tests {
         // record a charge under TOMORROW's period key so `current_total` for
         // tomorrow starts fresh, then check tomorrow's key directly rather
         // than waiting on the real wall clock.
-        let tenant = TenantId::new("tenant-a");
+        let key_id = test_key_id("tenant-a");
         let tomorrow = Utc::now() + chrono::Duration::days(1);
         let tomorrow_key = Period::Daily.key_for(tomorrow);
         assert_eq!(
-            filter.accumulator.current_total(&tenant, &tomorrow_key),
+            filter.accumulator.current_total_key(&key_id, &tomorrow_key),
             0,
             "a new day's period key must start at zero even though today's is exhausted -- \
              this is what lets tomorrow's request be admitted with no operator action"

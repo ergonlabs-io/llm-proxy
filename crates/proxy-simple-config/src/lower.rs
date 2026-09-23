@@ -216,7 +216,11 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     // `model_catalog_order` puts them in exact > longest-prefix > `*`
     // precedence order rather than the catalogue's alphabetical key order.
     for (name, model) in model_catalog_order(config) {
-        routes.push(lower_model(config, name, model, &mut warnings)?);
+        let (route, aggregate_cluster) = lower_model(config, name, model, &mut warnings)?;
+        routes.push(route);
+        if let Some(aggregate_cluster) = aggregate_cluster {
+            clusters.push(aggregate_cluster);
+        }
     }
     // A bare `*` catalogue entry (increment 2's empty-prefix tier) is just
     // as much a catch-all as a `routes:` rule with `model: "*"` -- it also
@@ -1417,34 +1421,21 @@ pub(crate) fn model_catalog_order(config: &SimpleConfig) -> Vec<(&String, &Model
     exact
 }
 
-/// `models.<name>` -> one route (WP-49). `providers[0]` is the only entry
-/// this increment ever uses to serve traffic -- it produces the route,
-/// pointed at that entry's provider cluster with that entry's dialect.
-/// Every later entry is still fully validated (`validate_semantics` already
-/// rejected an unknown provider or an unresolvable dialect at any index, not
-/// just 0) but is not yet reachable, so it gets an explicit per-entry
-/// warning naming its exact path (ground rule #1) rather than being
-/// silently accepted -- selection among providers is WP-35.
+/// `models.<name>` -> one route and, for a multi-provider alias, one ordered
+/// aggregate cluster. Each retry against the aggregate advances to the next
+/// provider, so callers select an alias, never a provider.
 fn lower_model(
     config: &SimpleConfig,
     name: &str,
     model: &ModelDef,
     warnings: &mut Vec<ConfigWarning>,
-) -> Result<Value, ConfigError> {
+) -> Result<(Value, Option<Value>), ConfigError> {
     // `validate_semantics` already guarantees `providers` is non-empty and
     // `providers[0]` names a real provider.
     let entry = &model.providers[0];
     let provider_name = entry.provider();
     let provider = &config.providers[provider_name];
     let up = provider_upstream(provider_name, provider)?;
-
-    if entry.model().is_some() {
-        warnings.push(warning(
-            format!("models.{name}.providers[0]"),
-            "the upstream model ID needs the request-body rewriter (WP-35); \
-             the client's original model name is forwarded for now",
-        ));
-    }
 
     // `validate_semantics` already rejects an unresolvable dialect (an
     // ambiguous provider type with no explicit `dialect`) at every entry
@@ -1458,8 +1449,54 @@ fn lower_model(
         r#match["headers"] = json!([header_matcher]);
     }
 
-    let action = json!({
-        "cluster": format!("provider:{provider_name}"),
+    let mut members = vec![format!("provider:{provider_name}")];
+    for (index, candidate) in model.providers.iter().enumerate().skip(1) {
+        let candidate_name = candidate.provider();
+        let candidate_provider = &config.providers[candidate_name];
+        let candidate_dialect =
+            resolved_dialect(candidate_name, candidate_provider, candidate.dialect())
+                .expect("validated: models.<name>.providers[i]'s dialect is resolvable");
+        if candidate_dialect != dialect {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("models.{name}.providers[{index}]"),
+                reason: format!(
+                    "`{candidate_name}` speaks `{candidate_dialect}`, but the primary provider \
+                     `{provider_name}` speaks `{dialect}`; cross-dialect model fallback needs \
+                     request/response translation and is not supported"
+                ),
+            });
+        }
+        members.push(format!("provider:{candidate_name}"));
+    }
+    for (index, candidate) in model.providers.iter().enumerate() {
+        if candidate.model().is_some() {
+            warnings.push(warning(
+                format!("models.{name}.providers[{index}]"),
+                "the upstream model ID needs per-attempt body rewriting; the requested alias is forwarded for now",
+            ));
+        }
+    }
+    let member_count = members.len();
+    let (route_cluster, aggregate_cluster) = if member_count == 1 {
+        (format!("provider:{provider_name}"), None)
+    } else {
+        let aggregate_name = format!("fallback:model-{name}");
+        let aggregate = json!({
+            "name": aggregate_name,
+            "lb_policy": "CLUSTER_PROVIDED",
+            "cluster_type": {
+                "name": "envoy.clusters.aggregate",
+                "typed_config": {
+                    "@type": AGGREGATE_CLUSTER_CONFIG_TYPE_URL,
+                    "clusters": members,
+                }
+            }
+        });
+        (aggregate_name, Some(aggregate))
+    };
+
+    let mut action = json!({
+        "cluster": route_cluster,
         // Same LLM-safe S4 defaults as `lower_route`: no total timeout,
         // idle-based guard. `models:` entries don't (yet) carry their own
         // `idle_timeout` override, so this is always the 90s default.
@@ -1467,6 +1504,13 @@ fn lower_model(
         "idle_timeout": "90s",
         "host_rewrite_literal": up.host,
     });
+    if member_count > 1 {
+        action["retry_policy"] = json!({
+            "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",
+            "num_retries": member_count - 1,
+            "retriable_status_codes": [429, 500, 502, 503],
+        });
+    }
 
     let mut route = json!({ "match": r#match, "route": action });
 
@@ -1482,15 +1526,7 @@ fn lower_model(
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
 
-    for i in 1..model.providers.len() {
-        warnings.push(warning(
-            format!("models.{name}.providers[{i}]"),
-            "not yet selectable; only providers[0] is used to serve traffic until the \
-             model router (WP-35) can choose among them",
-        ));
-    }
-
-    Ok(route)
+    Ok((route, aggregate_cluster))
 }
 
 // -------------------------------------------------------------------- auth --

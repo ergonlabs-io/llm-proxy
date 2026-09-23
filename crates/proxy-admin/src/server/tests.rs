@@ -20,7 +20,8 @@ use proxy_config::ir::{
 };
 use proxy_core::runtime::SnapshotHandles;
 use proxy_filters::auth::{
-    AuthError, AuthOutcome, Authenticator, HmacSecret, KeySet, TenantId, VirtualKeyAuthenticator,
+    AuthError, AuthOutcome, Authenticator, HmacSecret, KeyId, KeySet, TenantId,
+    VirtualKeyAuthenticator,
 };
 use proxy_filters::auth_filter;
 use proxy_filters::control::{ControlPlane, InMemoryControlPlaneStore};
@@ -1413,6 +1414,126 @@ async fn put_budget_sets_reads_back_and_clears() {
             .and_then(|p| p.budget)
             .is_none(),
         "{{\"budget\": null}} must clear the tenant's budget"
+    );
+}
+
+/// Key budgets are attached to the stable public `key_id`, independent of
+/// its tenant's other keys. This covers the real admin route and published
+/// snapshot used by spend enforcement.
+#[tokio::test]
+async fn put_key_budget_sets_and_clears_the_stable_key_policy() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        addr,
+        "POST",
+        "/tenants",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, _, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, _, body) = request(
+        addr,
+        "PUT",
+        "/keys/key-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"3.00","period":"daily"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        handle.load().key_budgets[&KeyId::new("key-a")].max_micros,
+        MicroUsd::from_micros(3_000_000),
+    );
+
+    let (status, _, body) = request(
+        addr,
+        "PUT",
+        "/keys/key-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":null}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!handle.load().key_budgets.contains_key(&KeyId::new("key-a")));
+}
+
+/// Key spend reads use the same stable public `key_id` as key-budget writes,
+/// and do not expose another key belonging to the same tenant.
+#[tokio::test]
+async fn key_spend_read_reports_only_the_requested_key_ledger() {
+    let (factory_state, handle, accumulator) =
+        factory_state_with_control_plane_and_spend(Period::Monthly);
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        addr,
+        "POST",
+        "/tenants",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for key_id in ["key-a", "key-b"] {
+        let (status, _, body) = request(
+            addr,
+            "POST",
+            "/keys",
+            Some(ADMIN_TOKEN),
+            &format!(r#"{{"tenant":"tenant-a","key_id":"{key_id}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    accumulator.record_key_now(
+        &KeyId::new("key-a"),
+        Period::Monthly,
+        Charge::Priced(MicroUsd::from_micros(4_200)),
+        Some("cluster-a"),
+        Some("model-a"),
+    );
+    accumulator.record_key_now(
+        &KeyId::new("key-b"),
+        Period::Monthly,
+        Charge::Priced(MicroUsd::from_micros(9_900)),
+        Some("cluster-a"),
+        Some("model-a"),
+    );
+
+    let (status, _, body) = request(addr, "GET", "/keys/key-a/spend", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["key_id"], "key-a");
+    assert_eq!(value["tenant"], "tenant-a");
+    assert_eq!(value["spend_micro_usd"], 4_200);
+    assert_eq!(
+        handle.load().key_tenants[&KeyId::new("key-b")],
+        TenantId::new("tenant-a")
     );
 }
 

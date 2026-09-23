@@ -61,7 +61,15 @@ use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
 // `spend.rs` owns (it also owns the calendar-alignment logic that produces
 // one) -- `control.rs` only stores and retrieves values already computed
 // there. See `spend.rs`'s module doc for why the boundary is drawn there.
-use crate::spend::{PeriodKey, TenantBudget};
+use crate::spend::{key_spend_subject, PeriodKey, TenantBudget};
+
+fn key_budget_subject(key_id: &KeyId) -> TenantId {
+    key_spend_subject(key_id)
+}
+
+fn key_id_from_budget_subject(subject: &TenantId) -> Option<KeyId> {
+    subject.as_str().strip_prefix("\u{1f}key:").map(KeyId::new)
+}
 
 /// One key row exactly as a [`ControlPlaneStore`] persists it -- the
 /// admin-write shape, not the digest-keyed [`KeySet`] the data plane reads.
@@ -408,6 +416,13 @@ pub trait ControlPlaneStore: Send + Sync {
 pub struct ControlPlaneSnapshot {
     pub keys: KeySet,
     pub policies: TenantPolicyMap,
+    /// Spend ceilings by stable key identity. This is deliberately separate
+    /// from tenant authorization policy: keys authenticate to tenants, but a
+    /// key budget neither grants models nor shares spend with sibling keys.
+    pub key_budgets: HashMap<KeyId, TenantBudget>,
+    /// Ownership copied from the durable key rows so admin writes can reject
+    /// budgets for unknown keys without a hot-path store lookup.
+    pub key_tenants: HashMap<KeyId, TenantId>,
 }
 
 /// In-memory [`ControlPlaneStore`]. The whole of 3b-i's storage engine --
@@ -1774,6 +1789,22 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Sets or clears a budget for an existing stable key identity. The
+    /// special durable row is private to this module; tenant budgets remain
+    /// readable for migration but are no longer consumed by spend_limit.
+    pub fn set_key_budget(
+        &self,
+        key_id: &KeyId,
+        budget: Option<&TenantBudget>,
+    ) -> Result<(), StoreError> {
+        if !self.handle().load().key_tenants.contains_key(key_id) {
+            return Err(StoreError::NotFound);
+        }
+        self.store.set_budget(&key_budget_subject(key_id), budget)?;
+        self.rebuild();
+        Ok(())
+    }
+
     /// Seeds `bootstrap` (`llmproxy.model_authz`'s `typed_config.policies`,
     /// parsed by `model_authz_filter::parse_config`) into the store, then
     /// republishes -- store-wins on a tenant collision, the identical rule
@@ -1859,8 +1890,10 @@ impl ControlPlane {
         // consumed into a real (digest-keyed) `KeySet` before this function
         // returns.
         let mut by_key_id: HashMap<KeyId, (Vec<u8>, KeyRecord)> = HashMap::new();
+        let mut key_tenants = HashMap::new();
 
         for (digest, record) in bootstrap_keys.iter() {
+            key_tenants.insert(record.key_id.clone(), record.tenant.clone());
             by_key_id.insert(
                 record.key_id.clone(),
                 (
@@ -1875,6 +1908,7 @@ impl ControlPlane {
         }
 
         for stored in loaded.keys {
+            key_tenants.insert(stored.key_id.clone(), stored.tenant.clone());
             if by_key_id.contains_key(&stored.key_id) {
                 // Names ONLY the key_id -- never a digest or any key
                 // material. See `StoredKey`'s Debug and the design brief's
@@ -1928,6 +1962,15 @@ impl ControlPlane {
         // looks a tenant's budget up independently of where its policy row
         // came from.
         let mut budgets = loaded.budgets;
+        let mut key_budgets = HashMap::new();
+        budgets.retain(|subject, budget| {
+            if let Some(key_id) = key_id_from_budget_subject(subject) {
+                key_budgets.insert(key_id, *budget);
+                false
+            } else {
+                true
+            }
+        });
         let mut policies: TenantPolicyMap = HashMap::new();
         for (tenant, access) in loaded.policies {
             let budget = budgets.remove(&tenant);
@@ -1949,7 +1992,12 @@ impl ControlPlane {
             );
         }
 
-        ControlPlaneSnapshot { keys, policies }
+        ControlPlaneSnapshot {
+            keys,
+            policies,
+            key_budgets,
+            key_tenants,
+        }
     }
 }
 
@@ -2081,6 +2129,8 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
     Arc::new(ArcSwap::new(Arc::new(ControlPlaneSnapshot {
         keys,
         policies: TenantPolicyMap::new(),
+        key_budgets: HashMap::new(),
+        key_tenants: HashMap::new(),
     })))
 }
 

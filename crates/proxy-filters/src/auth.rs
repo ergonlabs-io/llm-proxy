@@ -699,6 +699,8 @@ impl VirtualKeyAuthenticator {
         let snapshot = Arc::new(ArcSwap::new(Arc::new(ControlPlaneSnapshot {
             keys,
             policies: crate::model_authz::TenantPolicyMap::new(),
+            key_budgets: Default::default(),
+            key_tenants: Default::default(),
         })));
         VirtualKeyAuthenticator { secret, snapshot }
     }
