@@ -116,6 +116,12 @@ impl Drop for RunningProxy {
 #[ignore = "5k-rps acceptance; run on a dedicated capacity host"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
+    // A lower diagnostic rate can reproduce reload failures on a workstation;
+    // the release gate always uses the 5k default.
+    let rate = std::env::var("RENAME_CHURN_DIAGNOSTIC_RPS")
+        .ok()
+        .map(|value| value.parse::<f64>().expect("valid diagnostic rps"))
+        .unwrap_or(RATE);
     let upstream_a = OpenAiUpstream::spawn(OpenAiConfig {
         model: "rename-churn".to_string(),
         response_text: "a".to_string(),
@@ -164,7 +170,7 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
     });
     let load = tokio::spawn(run_open_loop(
         load_config,
-        RATE,
+        rate,
         LOAD_DURATION,
         Duration::ZERO,
     ));
@@ -199,19 +205,25 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
     proxy.reload();
 
     let (summary, stats) = load.await.expect("load task panicked");
-    assert!(!stats.driver_saturated, "load driver saturated: {stats:?}");
+    let failure_logs = std::fs::read_to_string(&log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line.contains("local 503 response")
+                || line.contains("upstream connection attempt failed without retry")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !stats.driver_saturated,
+        "load driver saturated: {stats:?}; responses: {summary:?}\nlocal 503s:\n{failure_logs}"
+    );
     assert_eq!(summary.transport_errors, 0, "transport errors: {summary:?}");
     assert_eq!(summary.timeouts, 0, "timeouts: {summary:?}");
     assert_eq!(summary.truncated, 0, "truncated responses: {summary:?}");
     assert!(
         summary.http_errors.is_empty(),
-        "5xx/non-2xx responses: {summary:?}\nproxy failure logs:\n{}",
-        std::fs::read_to_string(&log_path)
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| line.contains("response_flag"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        "5xx/non-2xx responses: {summary:?}\nlocal 503s:\n{failure_logs}"
     );
     assert!(summary.success > 0, "no successful requests: {summary:?}");
     assert!(

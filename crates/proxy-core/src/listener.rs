@@ -281,6 +281,7 @@ struct ListenerHcm {
 /// Keeping this bundle explicit prevents new instrumentation from quietly
 /// growing `build_hcm_handler`'s positional interface again.
 struct HcmRuntime<'a> {
+    snapshot_version: SnapshotVersion,
     routes: &'a HashMap<String, Arc<proxy_config::ir::RouteTable>>,
     cluster_manager: &'a Arc<ClusterManager>,
     router_stats: &'a Arc<RouterStats>,
@@ -517,6 +518,7 @@ fn spawn_bound(
     // references an unregistered filter.
     let tls = build_listener_tls(listener_ir, shared.secret_registry)?;
     let hcm_runtime = HcmRuntime {
+        snapshot_version: version,
         routes,
         cluster_manager: shared.cluster_manager,
         router_stats: shared.router_stats,
@@ -810,6 +812,7 @@ fn spawn_accept_loop(
                     // tradeoff as the TLS cache just above, for the HTTP
                     // filter-chain handlers.
                     let hcm_runtime = HcmRuntime {
+                        snapshot_version: snapshot.version,
                         routes: &snapshot.routes,
                         cluster_manager: &cluster_manager,
                         router_stats: &router_stats,
@@ -1340,7 +1343,8 @@ fn build_hcm_handler(
     let mut router_factory = RouterFilterFactory::new(
         runtime.cluster_manager.clone(),
         runtime.router_stats.clone(),
-    );
+    )
+    .with_config_context(context.to_string(), runtime.snapshot_version.0);
     if let Some(t) = runtime.tracing_handles {
         router_factory = router_factory.with_tracing(t.sink.clone());
     }
@@ -4450,6 +4454,7 @@ static_resources:
         let factory_state = Arc::new(SharedFactoryState::default());
 
         let hcm_runtime = HcmRuntime {
+            snapshot_version: snapshot.version,
             routes: &snapshot.routes,
             cluster_manager: &cluster_manager,
             router_stats: &router_stats,
@@ -4582,6 +4587,7 @@ static_resources:
         let factory_state = Arc::new(SharedFactoryState::default());
 
         let hcm_runtime = HcmRuntime {
+            snapshot_version: snapshot.version,
             routes: &snapshot.routes,
             cluster_manager: &cluster_manager,
             router_stats: &router_stats,

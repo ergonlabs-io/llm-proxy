@@ -175,6 +175,7 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 pub struct RouterFilterFactory {
     clusters: ClusterRegistrySnapshot,
     stats: Arc<RouterStats>,
+    config_context: Option<(String, u64)>,
     /// WP-51 increment 2: this HCM's span sink, if boot/reload wired one --
     /// see [`RouterHandler::span_sink`]'s doc for where it's read.
     span_sink: Option<SpanSink>,
@@ -199,9 +200,17 @@ impl RouterFilterFactory {
         Self {
             clusters: clusters.routing_snapshot(),
             stats,
+            config_context: None,
             span_sink: None,
             upgrade_configs: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Bind failure diagnostics to the listener and snapshot that built this
+    /// router. The tuple is copied only when a local 503 is emitted.
+    pub fn with_config_context(mut self, listener: String, version: u64) -> Self {
+        self.config_context = Some((listener, version));
+        self
     }
 
     /// WP-51 increment 2: attaches this HCM's span sink -- a builder method,
@@ -234,12 +243,15 @@ impl RouterFilterFactory {
 
 impl TerminalFilterInstanceFactory for RouterFilterFactory {
     fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter> {
-        Box::new(RouterHandler::new(
-            self.clusters.clone(),
-            self.stats.clone(),
-            self.span_sink.clone(),
-            self.upgrade_configs.clone(),
-        ))
+        Box::new(
+            RouterHandler::new(
+                self.clusters.clone(),
+                self.stats.clone(),
+                self.span_sink.clone(),
+                self.upgrade_configs.clone(),
+            )
+            .with_config_context(self.config_context.clone()),
+        )
     }
 }
 
@@ -257,6 +269,7 @@ impl TerminalFilterInstanceFactory for RouterFilterFactory {
 /// across a seam.
 pub struct RouterHandler {
     clusters: ClusterRegistrySnapshot,
+    config_context: Option<(String, u64)>,
     /// WP-23 increment 6a: this worker's `upstream_rq`/`upstream_rq_time`
     /// recorder -- see `apply_forward`'s attempt loop for where it's called
     /// and why.
@@ -309,6 +322,7 @@ impl RouterHandler {
     ) -> Self {
         Self {
             clusters,
+            config_context: None,
             stats,
             conn_cache: crate::upstream_pool::worker_conn_cache(),
             h1_cache: crate::upstream_pool::worker_h1_conn_cache(),
@@ -318,6 +332,11 @@ impl RouterHandler {
             span_sink,
             upgrade_configs,
         }
+    }
+
+    fn with_config_context(mut self, context: Option<(String, u64)>) -> Self {
+        self.config_context = context;
+        self
     }
 
     /// S10.1: is `upgrade_type` (already lowercased by the caller -- see
@@ -376,7 +395,30 @@ impl TerminalHttpFilter for RouterHandler {
         &'a mut self,
         cb: &'a mut dyn DecoderCallbacks,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>> {
-        Box::pin(async move { self.route_and_forward(cb).await })
+        Box::pin(async move {
+            let response = self.route_and_forward(cb).await;
+            if response.head.status == StatusCode::SERVICE_UNAVAILABLE {
+                let route = cb.route();
+                let info = cb.stream_info();
+                let (listener, version) = self
+                    .config_context
+                    .as_ref()
+                    .map(|(name, version)| (name.as_str(), *version))
+                    .unwrap_or(("unknown", 0));
+                tracing::warn!(
+                    listener,
+                    snapshot_version = version,
+                    route_name = ?route.as_ref().and_then(|route| route.name.as_deref()),
+                    route_index = ?route.as_ref().map(|route| route.route_index),
+                    response_code_details = ?info.response_code_details,
+                    response_flags = ?info.response_flags(),
+                    upstream_cluster = ?info.upstream_cluster,
+                    upstream_host = ?info.upstream_host,
+                    "local 503 response"
+                );
+            }
+            response
+        })
     }
 }
 
@@ -1184,6 +1226,12 @@ impl RouterHandler {
                                 continue;
                             }
                         }
+                        tracing::warn!(
+                            cluster = %attempt_cluster,
+                            host = %host.address,
+                            error = %err,
+                            "upstream connection attempt failed without retry"
+                        );
                         // Rust note: bound to `resp` (rather than `return
                         // match err {...}` directly) so the WP-24 `URX` flag
                         // below can be recorded AFTER this arm's own flag --
