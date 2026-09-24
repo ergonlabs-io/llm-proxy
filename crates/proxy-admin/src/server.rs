@@ -943,6 +943,8 @@ struct CreateTenantRequest {
 #[serde(deny_unknown_fields)]
 struct SetPolicyRequest {
     access: AccessSpec,
+    #[serde(default)]
+    deny: Vec<String>,
 }
 
 /// `PUT /tenants/{id}/budget`'s body (WP-50 increment 3c-iii-a).
@@ -1108,7 +1110,7 @@ fn handle_set_policy(
         Ok(request) => request,
         Err(response) => return response,
     };
-    let access = match request.access {
+    let allow = match request.access {
         AccessSpec::All => ModelAccess::All,
         // An empty `only: []` is a legitimate, deliberate policy -- "deny
         // every model for this tenant" -- and MUST stay `Only(vec![])`
@@ -1121,6 +1123,14 @@ fn handle_set_policy(
             ModelAccess::Only(patterns.into_iter().map(ModelPattern::new).collect())
         }
     };
+    for (index, pattern) in request.deny.iter().enumerate() {
+        if !ModelPattern::is_valid(pattern) {
+            return bad_request(&format!(
+                "deny[{index}] must be an exact model name or a single trailing `*` glob"
+            ));
+        }
+    }
+    let access = allow.with_deny(request.deny.into_iter().map(ModelPattern::new).collect());
     match control_plane.set_policy(&TenantId::new(tenant), &access) {
         Ok(()) => {
             tracing::info!(

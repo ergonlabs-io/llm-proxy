@@ -60,6 +60,12 @@ impl ModelPattern {
         ModelPattern(pattern.into())
     }
 
+    pub fn is_valid(pattern: &str) -> bool {
+        !pattern.is_empty()
+            && (pattern.matches('*').count() == 0
+                || (pattern.matches('*').count() == 1 && pattern.ends_with('*')))
+    }
+
     /// Exact match, or -- if this pattern ends in `*` -- a prefix match
     /// against everything before that `*`. See the module doc's "Matching
     /// rule" section.
@@ -87,6 +93,11 @@ pub enum ModelAccess {
     /// EMPTY `Vec` here is not the same as `All` -- it denies every model for
     /// this tenant, which is a legitimate, deliberate policy.
     Only(Vec<ModelPattern>),
+    /// The effective grant is `allow - deny`. Deny patterns take precedence.
+    WithDeny {
+        allow: Box<ModelAccess>,
+        deny: Vec<ModelPattern>,
+    },
 }
 
 impl std::fmt::Debug for ModelAccess {
@@ -94,6 +105,11 @@ impl std::fmt::Debug for ModelAccess {
         match self {
             ModelAccess::All => write!(f, "All"),
             ModelAccess::Only(patterns) => f.debug_tuple("Only").field(patterns).finish(),
+            ModelAccess::WithDeny { allow, deny } => f
+                .debug_struct("WithDeny")
+                .field("allow", allow)
+                .field("deny", deny)
+                .finish(),
         }
     }
 }
@@ -109,11 +125,25 @@ impl Default for ModelAccess {
 }
 
 impl ModelAccess {
+    pub fn with_deny(self, deny: Vec<ModelPattern>) -> Self {
+        if deny.is_empty() {
+            self
+        } else {
+            Self::WithDeny {
+                allow: Box::new(self),
+                deny,
+            }
+        }
+    }
+
     /// Whether `model` is permitted under this policy.
     pub fn permits(&self, model: &str) -> bool {
         match self {
             ModelAccess::All => true,
             ModelAccess::Only(patterns) => patterns.iter().any(|p| p.matches(model)),
+            ModelAccess::WithDeny { allow, deny } => {
+                allow.permits(model) && !deny.iter().any(|p| p.matches(model))
+            }
         }
     }
 }
@@ -197,5 +227,18 @@ mod tests {
     #[test]
     fn default_model_access_is_all() {
         assert_eq!(ModelAccess::default(), ModelAccess::All);
+    }
+
+    #[test]
+    fn deny_overrides_an_exact_or_glob_allow() {
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-*")]).with_deny(vec![
+            ModelPattern::new("gpt-4o"),
+            ModelPattern::new("gpt-5*"),
+        ]);
+        assert!(access.permits("gpt-4o-mini"));
+        assert!(!access.permits("gpt-4o"));
+        assert!(!access.permits("gpt-5"));
+        assert!(!access.permits("claude-3"));
+        assert_eq!(ModelAccess::All.with_deny(vec![]), ModelAccess::All);
     }
 }

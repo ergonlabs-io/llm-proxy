@@ -287,7 +287,23 @@ pub fn parse_config(config: &DynamicMessage) -> Result<TenantPolicyMap, ConfigEr
             ));
         }
 
-        let model_access = parse_model_access(msg, i)?;
+        let allow = parse_model_access(msg, i)?;
+        let deny = msg
+            .get_field_by_name("deny_patterns")
+            .and_then(|v| v.as_list().map(<[_]>::to_vec))
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(j, value)| {
+                let path = format!("typed_config.policies[{i}].deny_patterns[{j}]");
+                let pattern = value
+                    .as_str()
+                    .ok_or_else(|| invalid(&path, "must be a string"))?;
+                validate_pattern(pattern, &path)?;
+                Ok(ModelPattern::new(pattern))
+            })
+            .collect::<Result<Vec<_>, ConfigError>>()?;
+        let model_access = allow.with_deny(deny);
 
         seen.insert(tenant.clone(), i);
         map.insert(
@@ -693,6 +709,32 @@ mod tests {
     }
 
     #[test]
+    fn deny_patterns_parse_and_override_allow() {
+        let mut policy = policy_only("tenant-a", &["gpt-*"]);
+        policy.set_field_by_name(
+            "deny_patterns",
+            prost_reflect::Value::List(vec![prost_reflect::Value::String("gpt-5*".into())]),
+        );
+        let map = parse_config(&model_authz(vec![policy])).unwrap();
+        let access = &map["tenant-a"].model_access;
+        assert!(access.permits("gpt-4o"));
+        assert!(!access.permits("gpt-5-mini"));
+    }
+
+    #[test]
+    fn malformed_deny_pattern_reports_its_path() {
+        let mut policy = policy_all("tenant-a");
+        policy.set_field_by_name(
+            "deny_patterns",
+            prost_reflect::Value::List(vec![prost_reflect::Value::String("gpt-*-mini".into())]),
+        );
+        let err = parse_config(&model_authz(vec![policy])).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field_path, .. } if field_path == "typed_config.policies[0].deny_patterns[0]")
+        );
+    }
+
+    #[test]
     fn absent_policies_parses_to_an_empty_map() {
         let config = DynamicMessage::new(model_authz_desc());
         let map = parse_config(&config).expect("absent policies is legal");
@@ -990,6 +1032,23 @@ mod tests {
         cb.set_requested_model("some-completely-unlisted-model");
         decode_request(&mut filter, &mut cb);
         assert!(cb.local_reply.is_none());
+    }
+
+    #[test]
+    fn deny_pattern_returns_403_even_when_allow_matches() {
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-*")])
+            .with_deny(vec![ModelPattern::new("gpt-5*")]);
+        let policies = policies_map(vec![("tenant-a", access)]);
+        let mut filter = filter_with(policies);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        cb.set_requested_model("gpt-5-mini");
+        decode_request(&mut filter, &mut cb);
+        let reply = cb
+            .local_reply
+            .expect("denied model must return a local reply");
+        assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+        assert_eq!(reply.details, "model_not_permitted");
     }
 
     // --- acceptance: unauthenticated request -> 403, never implicitly allowed --

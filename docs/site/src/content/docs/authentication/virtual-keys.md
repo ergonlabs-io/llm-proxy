@@ -244,6 +244,11 @@ the store first and republishes immediately, so the change is visible to
 every worker's very next request rather than waiting on a periodic refresh
 (`crates/proxy-filters/src/control.rs:1713-1775`, `ControlPlane::mint_key`,
 `revoke_key`, `set_policy`, `set_budget`, each documented "then republishes").
+For example, `PUT /tenants/acme/policy` with
+`{"access":{"only":["gpt-*"]},"deny":["gpt-5*"]}` permits the
+`gpt-*` models except those matching `gpt-5*`. Omit `deny` or send `[]` for
+no exclusions. Both lists accept exact names or one trailing `*`; a deny match
+always wins. `{"access":"all","deny":["gpt-5*"]}` grants every other model.
 The write API is fail-closed: with `LLMPROXY_ADMIN_TOKEN` unset, empty, or
 whitespace-only, every write returns `403` and a log line naming the endpoint,
 never a silent open door (`crates/proxy-admin/src/server.rs:387-395`,

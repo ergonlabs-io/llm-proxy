@@ -17,18 +17,12 @@ package llmproxy.filters.v0;
 // The filter is fail CLOSED on both axes that feed it -- an unauthenticated
 // stream (no `StreamInfo::auth.tenant`) and a request with no extractable
 // `model` (no `StreamInfo::requested_model`) are both refused, never admitted
-// -- but it defaults OPEN with respect to authorization itself: a tenant with
-// no entry in `policies` here is a config/consistency error (refused, NOT
-// implicitly granted every model), while simply not adding this filter to a
-// listener's `http_filters` at all is the actual "no restriction configured"
-// state, which never reaches this filter in the first place. See the design
-// brief for why those two are not the same axis and must not be confused.
+// -- but authorization defaults OPEN: a tenant with no configured policy
+// may use every model. Deny patterns, when present, subtract from the grant.
 message ModelAuthz {
   // The configured tenants' model access policies. A tenant authenticated by
-  // an earlier `llmproxy.auth` filter but absent from this list is refused --
-  // this is deliberately NOT the same as granting it every model. An empty
-  // list is legal and refuses every tenant, exactly as `Authentication` with
-  // no `virtual_keys` authenticates nobody (see that message's doc).
+  // an earlier `llmproxy.auth` filter but absent from this list is granted
+  // every model. An empty list is legal and imposes no model restrictions.
   repeated TenantModelPolicy policies = 1;
 }
 
@@ -59,6 +53,10 @@ message TenantModelPolicy {
     // Only a model matching one of `OnlyModels.patterns` is permitted.
     OnlyModels only = 3;
   }
+
+  // Optional deny patterns applied after `access`. Empty means no exclusions.
+  // Uses the same exact-name or single trailing `*` syntax as `only.patterns`.
+  repeated string deny_patterns = 4;
 }
 
 // Grants every model. An explicit (empty) message rather than a bare `bool`

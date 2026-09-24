@@ -1362,6 +1362,40 @@ async fn put_policy_all_and_only_are_reflected_and_empty_only_stays_only() {
     );
 }
 
+#[tokio::test]
+async fn put_policy_deny_overrides_allow_and_is_visible_in_snapshot() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    let (status, _, _) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":{"only":["gpt-*"]},"deny":["gpt-5*"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let access = &handle.load().policies["tenant-a"].model_access;
+    assert!(access.permits("gpt-4o"));
+    assert!(!access.permits("gpt-5-mini"));
+
+    let (status, _, _) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":"all","deny":["gpt-*-mini"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 // --- PUT /tenants/{id}/budget (WP-50 increment 3c-iii-a) --------------------
 
 /// Sets a budget, reads it back through the published snapshot, then clears

@@ -119,10 +119,10 @@ overspend is bounded by one request, never unbounded.
 time. Authentication fails closed: with an `auth` block configured, a request
 with no recognised credential is refused rather than admitted anonymously.
 
-**Authorizes models.** A tenant can be restricted to a named set of models,
-enforced before the request is routed. It fails closed on an unauthenticated
-request and open on an authenticated tenant with no policy, so the allow-list is
-opt-in per tenant.
+**Authorizes models.** A tenant can be restricted to named models and exclude
+specific models from that grant. The effective access is allow minus deny,
+enforced before routing. It fails closed on an unauthenticated request and
+defaults to all models for an authenticated tenant with no policy.
 
 **Mints and revokes keys at runtime.** A bearer-gated admin write API creates
 tenants, mints and revokes virtual keys, and sets per-tenant policies and

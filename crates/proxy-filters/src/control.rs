@@ -790,6 +790,10 @@ pub(crate) struct EncodedKeyRow {
 pub(crate) enum EncodedModelAccess {
     All,
     Only(Vec<String>),
+    WithDeny {
+        allow: Box<EncodedModelAccess>,
+        deny: Vec<String>,
+    },
 }
 
 impl From<&ModelAccess> for EncodedModelAccess {
@@ -799,6 +803,10 @@ impl From<&ModelAccess> for EncodedModelAccess {
             ModelAccess::Only(patterns) => {
                 EncodedModelAccess::Only(patterns.iter().map(|p| p.as_str().to_string()).collect())
             }
+            ModelAccess::WithDeny { allow, deny } => EncodedModelAccess::WithDeny {
+                allow: Box::new(EncodedModelAccess::from(allow.as_ref())),
+                deny: deny.iter().map(|p| p.as_str().to_string()).collect(),
+            },
         }
     }
 }
@@ -810,6 +818,10 @@ impl From<EncodedModelAccess> for ModelAccess {
             EncodedModelAccess::Only(patterns) => {
                 ModelAccess::Only(patterns.into_iter().map(ModelPattern::new).collect())
             }
+            EncodedModelAccess::WithDeny { allow, deny } => ModelAccess::WithDeny {
+                allow: Box::new(ModelAccess::from(*allow)),
+                deny: deny.into_iter().map(ModelPattern::new).collect(),
+            },
         }
     }
 }
@@ -3373,7 +3385,8 @@ mod tests {
     #[test]
     fn redb_set_policy_then_load_returns_it() {
         let store = RedbControlPlaneStore::in_memory();
-        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-*")])
+            .with_deny(vec![ModelPattern::new("gpt-5*")]);
         store
             .set_policy(&TenantId::new("tenant-a"), &access)
             .unwrap();
