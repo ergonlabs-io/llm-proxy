@@ -82,6 +82,11 @@ routes:
   - model: "gpt-*"
     provider: primary
     fallbacks: [standby]
+models:
+  gpt-4o-mini:
+    providers:
+      - {{ provider: primary, model: primary-upstream-model }}
+      - {{ provider: standby, model: standby-upstream-model }}
 "#
     )
 }
@@ -272,6 +277,17 @@ async fn failover_carries_the_standbys_credential_and_never_the_primarys() {
         !leaked,
         "the primary's key (`{PRIMARY_KEY}`) leaked into a header the standby received: {:?}",
         received.headers
+    );
+
+    let body = standby
+        .bodies
+        .bodies()
+        .last()
+        .cloned()
+        .expect("standby must have received a parsed chat body");
+    assert_eq!(
+        body["model"], "standby-upstream-model",
+        "fallback must rewrite the logical alias to the selected provider's model: {body}"
     );
 
     drop(proxy);
