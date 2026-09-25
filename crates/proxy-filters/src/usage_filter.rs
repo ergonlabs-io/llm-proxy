@@ -72,6 +72,10 @@ impl PricingRegistry {
             .clone()
     }
 
+    pub(crate) fn snapshot_context(&self) -> Option<PricingContext> {
+        self.snapshot()
+    }
+
     /// Seed a registry created by a preceding spend filter. Filter factories
     /// are built in chain order, while spend enforcement must precede usage
     /// extraction on the encode path.
@@ -95,6 +99,16 @@ impl PricingRegistry {
         usage: &TokenUsage,
     ) -> Option<u64> {
         let pricing = self.snapshot()?;
+        Self::cost_micro_usd_for(Some(&pricing), cluster, model, usage)
+    }
+
+    pub(crate) fn cost_micro_usd_for(
+        pricing: Option<&PricingContext>,
+        cluster: Option<&str>,
+        model: Option<&str>,
+        usage: &TokenUsage,
+    ) -> Option<u64> {
+        let pricing = pricing?;
         let cluster = cluster?;
         let model = model?;
         let provider = pricing.providers.get(cluster)?;

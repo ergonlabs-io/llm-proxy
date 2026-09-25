@@ -502,7 +502,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(SpendLimitFilterInstance {
             price_table: Arc::clone(&self.price_table),
-            pricing_registry: Arc::clone(&self.pricing_registry),
+            pricing_snapshot: self.pricing_registry.snapshot_context(),
             accumulator: Arc::clone(&self.accumulator),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             snapshot: Arc::clone(&self.snapshot),
@@ -570,7 +570,7 @@ impl UsageMissingWarner {
 /// an `Arc` clone, not shared interior state of this struct itself.
 struct SpendLimitFilterInstance {
     price_table: Arc<PriceTable>,
-    pricing_registry: Arc<PricingRegistry>,
+    pricing_snapshot: Option<crate::usage_filter::PricingContext>,
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
@@ -642,14 +642,17 @@ impl SpendLimitFilterInstance {
             cache_creation_tokens: usage.cache_creation_tokens,
             output_tokens: usage.output_tokens,
         };
-        let charge = self
-            .pricing_registry
-            .cost_micro_usd(cluster.as_deref(), model.as_deref(), &usage)
-            .map(|micros| Charge::Priced(MicroUsd::from_micros(micros)))
-            .unwrap_or_else(|| {
-                self.price_table
-                    .cost_of(cluster.as_deref(), model.as_deref(), &usage)
-            });
+        let charge = PricingRegistry::cost_micro_usd_for(
+            self.pricing_snapshot.as_ref(),
+            cluster.as_deref(),
+            model.as_deref(),
+            &usage,
+        )
+        .map(|micros| Charge::Priced(MicroUsd::from_micros(micros)))
+        .unwrap_or_else(|| {
+            self.price_table
+                .cost_of(cluster.as_deref(), model.as_deref(), &usage)
+        });
 
         self.accumulator.record_key(
             &key_id,
@@ -1345,7 +1348,7 @@ mod tests {
                 price_table: Arc::clone(&self.price_table),
                 accumulator: Arc::clone(&self.accumulator),
                 usage_missing_warner: Arc::clone(&self.usage_missing_warner),
-                pricing_registry: Arc::clone(&self.pricing_registry),
+                pricing_snapshot: self.pricing_registry.snapshot_context(),
                 snapshot: Arc::clone(&self.snapshot),
                 key_id: None,
                 period: None,
