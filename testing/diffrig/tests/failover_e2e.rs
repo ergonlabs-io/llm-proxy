@@ -17,7 +17,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use diffrig::harness::{
-    free_port, resolve_llm_proxy_bin, send_json, ProxyProcess, ScratchDir, READY_TIMEOUT,
+    free_port, resolve_llm_proxy_bin, send_json, send_json_collect_sse, ProxyProcess, ScratchDir,
+    READY_TIMEOUT,
 };
 use diffrig::upstreams::{OpenAiConfig, OpenAiUpstream};
 use serde_json::json;
@@ -184,6 +185,32 @@ async fn send_chat_request(listener_addr: SocketAddr) -> diffrig::harness::RawRe
     .expect("client request timed out -- failover hung instead of completing or failing")
 }
 
+/// Send a streaming chat completion through the fallback chain. The helper
+/// collects SSE events incrementally, so the acceptance test below proves the
+/// selected standby response remains streamable after the primary 429s.
+async fn send_streaming_chat_request(
+    listener_addr: SocketAddr,
+) -> (u16, Vec<diffrig::harness::TimedEvent>) {
+    let body = json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi there"}],
+        "stream": true,
+    });
+    let (status, _headers, events) = tokio::time::timeout(
+        CLIENT_TIMEOUT,
+        send_json_collect_sse(
+            listener_addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("x-llmproxy-model", "gpt-4o-mini")],
+            &body,
+        ),
+    )
+    .await
+    .expect("streaming client request timed out -- fallback hung");
+    (status, events)
+}
+
 // -------------------------------------------------------------------- tests --
 
 /// The primary 429s, the proxy fails over to the standby within policy, and
@@ -342,6 +369,39 @@ async fn failover_rewrites_host_to_the_member_that_served() {
         "the primary's host leaked into the request the standby received -- \
          host_rewrite_literal was never corrected per attempted member"
     );
+
+    drop(proxy);
+    primary.shutdown().await;
+    standby.shutdown().await;
+    drop(scratch);
+}
+
+/// WP-64/WP-65 acceptance seam: a primary 429 must fail over before any
+/// response bytes are emitted, and the selected standby must still deliver a
+/// genuine multi-frame SSE response. This guards the no-restart-after-stream
+/// boundary while the existing auth/spend E2E covers key attribution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failover_preserves_streaming_on_the_selected_standby() {
+    let (listener_addr, primary, standby, scratch, proxy) = spawn_suite("failover-streaming").await;
+
+    let (status, events) = send_streaming_chat_request(listener_addr).await;
+
+    assert_eq!(status, 200, "standby streaming response: {status}");
+    assert!(
+        events.len() >= 3,
+        "expected a role frame, content frame, and terminal frame from standby; got {}",
+        events.len()
+    );
+    assert!(
+        events.iter().any(|event| event
+            .data
+            .contains(STANDBY_RESPONSE_TEXT.split_whitespace().next().unwrap())),
+        "standby response text must appear in the streamed events: {:?}",
+        events.iter().map(|event| &event.data).collect::<Vec<_>>()
+    );
+    assert_eq!(primary.log.requests().len(), 1);
+    assert_eq!(standby.log.requests().len(), 1);
+    assert_eq!(standby.bodies.bodies()[0]["stream"], true);
 
     drop(proxy);
     primary.shutdown().await;
