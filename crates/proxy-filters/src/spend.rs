@@ -2077,6 +2077,59 @@ mod tests {
         );
     }
 
+    /// Key spend rows remain independent even when two stable API keys belong
+    /// to the same tenant. Recreate the accumulator between writes to cover
+    /// restart as well: neither key may inherit the other's total through the
+    /// legacy tenant-shaped store key.
+    #[test]
+    fn key_spend_isolated_across_keys_and_accumulator_restart() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let now = dt(2026, 9, 3, 12, 0, 0);
+        let period = Period::Daily;
+        let period_key = period.key_for(now);
+        let key_a = KeyId::new("key-a");
+        let key_b = KeyId::new("key-b");
+
+        {
+            let first = accumulator_on(&store, "node-a", period);
+            first.record_key(
+                &key_a,
+                now,
+                period,
+                Charge::Priced(MicroUsd::from_micros(1_250_000)),
+                Some("provider-a"),
+                Some("model-a"),
+            );
+            first.flush_now().unwrap();
+        }
+
+        let second = accumulator_on(&store, "node-a", period);
+        second.record_key(
+            &key_b,
+            now,
+            period,
+            Charge::Priced(MicroUsd::from_micros(2_500_000)),
+            Some("provider-b"),
+            Some("model-b"),
+        );
+        second.flush_now().unwrap();
+
+        assert_eq!(second.current_total_key(&key_a, &period_key), 1_250_000);
+        assert_eq!(second.current_total_key(&key_b, &period_key), 2_500_000);
+        assert_eq!(
+            store
+                .load_spend("test-chain", &key_spend_subject(&key_a), &period_key)
+                .unwrap(),
+            1_250_000
+        );
+        assert_eq!(
+            store
+                .load_spend("test-chain", &key_spend_subject(&key_b), &period_key)
+                .unwrap(),
+            2_500_000
+        );
+    }
+
     // --- record takes its period explicitly (WP-50 3c-iii-b fixup) -------
 
     /// The defect this fixup closes, as an executable assertion: ONE
