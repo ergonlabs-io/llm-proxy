@@ -61,11 +61,47 @@ impl PricingRegistry {
         }
     }
 
+    pub(crate) fn new_for_spend() -> Self {
+        Self::new(None)
+    }
+
     fn snapshot(&self) -> Option<PricingContext> {
         self.current
             .read()
             .expect("pricing registry lock poisoned")
             .clone()
+    }
+
+    /// Seed a registry created by a preceding spend filter. Filter factories
+    /// are built in chain order, while spend enforcement must precede usage
+    /// extraction on the encode path.
+    pub(crate) fn install_if_empty(&self, initial: Option<PricingContext>) {
+        let mut current = self
+            .current
+            .write()
+            .expect("pricing registry lock poisoned");
+        if current.is_none() {
+            *current = initial;
+        }
+    }
+
+    /// Compute a dollar-enforcement charge from the current list card. Round
+    /// nanodollars up to microdollars so enforcement never undercharges a
+    /// request because of unit conversion.
+    pub fn cost_micro_usd(
+        &self,
+        cluster: Option<&str>,
+        model: Option<&str>,
+        usage: &TokenUsage,
+    ) -> Option<u64> {
+        let pricing = self.snapshot()?;
+        let cluster = cluster?;
+        let model = model?;
+        let provider = pricing.providers.get(cluster)?;
+        pricing
+            .list
+            .list_cost_nanodollars(provider, model, usage)
+            .map(|nano| nano.saturating_add(999) / 1000)
     }
 
     /// Replace the card after validating the same wire shape used at startup.
@@ -135,12 +171,13 @@ impl HttpFilterFactory for UsageFilterFactory {
         let registry =
             ctx.shared
                 .get_or_try_init(&ctx.scope, &ctx.stat_prefix, TYPE_URL, || {
-                    Ok(Arc::new(PricingRegistry::new(initial))
+                    Ok(Arc::new(PricingRegistry::new(initial.clone()))
                         as Arc<dyn std::any::Any + Send + Sync>)
                 })?;
         let registry = registry
             .downcast::<PricingRegistry>()
             .map_err(|_| invalid_config("pricing registry type collision"))?;
+        registry.install_if_empty(initial);
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
             registry,
@@ -233,7 +270,7 @@ struct PricingWire {
 }
 
 #[derive(Clone)]
-struct PricingContext {
+pub(crate) struct PricingContext {
     list: PriceList,
     /// Actual dialled cluster -> configured provider type.  A route can point
     /// at an aggregate/fallback, so this must not be inferred from dialect.

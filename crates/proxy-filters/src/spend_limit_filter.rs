@@ -131,10 +131,11 @@ use crate::auth::KeyId;
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::spend::{
-    self, parse_micro_usd, ModelPrices, OnReconciliationExpired, Period, PriceTable,
-    ReconciliationPolicy, SpendAccumulator,
+    self, parse_micro_usd, Charge, MicroUsd, ModelPrices, OnReconciliationExpired, Period,
+    PriceTable, ReconciliationPolicy, SpendAccumulator,
 };
 use crate::usage::TokenUsage;
+use crate::usage_filter::PricingRegistry;
 
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
@@ -385,6 +386,24 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                  always a ControlPlane",
             );
 
+        // Seed or join the usage filter's live rate-card registry. The usage
+        // factory may be built later because spend must precede usage in the
+        // encode chain, so this creates an empty slot that usage fills once it
+        // parses the listener pricing config.
+        let pricing_registry = ctx
+            .shared
+            .get_or_try_init(
+                &ctx.scope,
+                &ctx.stat_prefix,
+                crate::usage_filter::TYPE_URL,
+                || {
+                    Ok(Arc::new(PricingRegistry::new_for_spend())
+                        as Arc<dyn std::any::Any + Send + Sync>)
+                },
+            )?
+            .downcast::<PricingRegistry>()
+            .expect("usage pricing singleton is always a PricingRegistry");
+
         // One `SpendAccumulator` (+ its usage-missing warner) per (filter
         // config, listener) -- same singleton lifetime/reasoning as
         // `token_limit_filter`'s `SharedTokenLimitState`: it must outlive any
@@ -422,6 +441,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
 
         Ok(Box::new(SpendLimitInstanceFactory {
             price_table,
+            pricing_registry,
             accumulator: Arc::clone(&shared.accumulator),
             usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
             snapshot: control_plane.handle(),
@@ -469,6 +489,7 @@ impl SharedSpendLimitState {
 
 struct SpendLimitInstanceFactory {
     price_table: Arc<PriceTable>,
+    pricing_registry: Arc<PricingRegistry>,
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     /// One handle per (filter config, listener), shared by every per-stream
@@ -481,6 +502,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(SpendLimitFilterInstance {
             price_table: Arc::clone(&self.price_table),
+            pricing_registry: Arc::clone(&self.pricing_registry),
             accumulator: Arc::clone(&self.accumulator),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             snapshot: Arc::clone(&self.snapshot),
@@ -548,6 +570,7 @@ impl UsageMissingWarner {
 /// an `Arc` clone, not shared interior state of this struct itself.
 struct SpendLimitFilterInstance {
     price_table: Arc<PriceTable>,
+    pricing_registry: Arc<PricingRegistry>,
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
@@ -620,8 +643,13 @@ impl SpendLimitFilterInstance {
             output_tokens: usage.output_tokens,
         };
         let charge = self
-            .price_table
-            .cost_of(cluster.as_deref(), model.as_deref(), &usage);
+            .pricing_registry
+            .cost_micro_usd(cluster.as_deref(), model.as_deref(), &usage)
+            .map(|micros| Charge::Priced(MicroUsd::from_micros(micros)))
+            .unwrap_or_else(|| {
+                self.price_table
+                    .cost_of(cluster.as_deref(), model.as_deref(), &usage)
+            });
 
         self.accumulator.record_key(
             &key_id,
@@ -1307,6 +1335,7 @@ mod tests {
         price_table: Arc<PriceTable>,
         accumulator: Arc<SpendAccumulator>,
         usage_missing_warner: Arc<UsageMissingWarner>,
+        pricing_registry: Arc<PricingRegistry>,
         snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
     }
 
@@ -1316,6 +1345,7 @@ mod tests {
                 price_table: Arc::clone(&self.price_table),
                 accumulator: Arc::clone(&self.accumulator),
                 usage_missing_warner: Arc::clone(&self.usage_missing_warner),
+                pricing_registry: Arc::clone(&self.pricing_registry),
                 snapshot: Arc::clone(&self.snapshot),
                 key_id: None,
                 period: None,
@@ -1346,6 +1376,7 @@ mod tests {
             price_table: Arc::new(price_table),
             accumulator,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+            pricing_registry: Arc::new(PricingRegistry::new_for_spend()),
             snapshot: control_plane.handle(),
         }
     }
@@ -1379,6 +1410,7 @@ mod tests {
             price_table: Arc::new(price_table),
             accumulator,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+            pricing_registry: Arc::new(PricingRegistry::new_for_spend()),
             snapshot: control_plane.handle(),
         }
     }
