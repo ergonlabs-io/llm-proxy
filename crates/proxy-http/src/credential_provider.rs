@@ -316,6 +316,7 @@ mod tests {
                 session_token: None,
             }),
             path_template: None,
+            model_rewrites: Vec::new(),
         };
         let mut request = RequestHeaders {
             method: Method::POST,
@@ -351,6 +352,7 @@ mod tests {
                 access_token: "published-token".to_string(),
             }),
             path_template: None,
+            model_rewrites: Vec::new(),
         };
         let mut request = RequestHeaders {
             method: Method::POST,

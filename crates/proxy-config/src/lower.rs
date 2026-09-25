@@ -3702,6 +3702,7 @@ fn convert_provider_auth_metadata(
                     | "access_key_id"
                     | "secret_access_key"
                     | "session_token"
+                    | "models"
             )
         })
         .collect();
@@ -3710,7 +3711,7 @@ fn convert_provider_auth_metadata(
         return Err(unsupported(
             format!("{auth_path}.{key}"),
             format!(
-                "`{PROVIDER_AUTH_METADATA_KEY}` contains an unsupported field; supported fields are `headers` and provider credential fields"
+                "`{PROVIDER_AUTH_METADATA_KEY}` contains an unsupported field; supported fields are `headers`, provider credential fields, and `models`"
             ),
         ));
     }
@@ -3789,8 +3790,8 @@ fn convert_provider_runtime_metadata(
                 },
             };
             let allowed = match scheme {
-                None => &["headers"][..],
-                Some("vertex-oauth2") => &["headers", "scheme", "access_token"][..],
+                None => &["headers", "models"][..],
+                Some("vertex-oauth2") => &["headers", "scheme", "access_token", "models"][..],
                 Some("bedrock-sigv4") => &[
                     "headers",
                     "scheme",
@@ -3798,6 +3799,7 @@ fn convert_provider_runtime_metadata(
                     "access_key_id",
                     "secret_access_key",
                     "session_token",
+                    "models",
                 ][..],
                 Some(_) => &[][..],
             };
@@ -3899,12 +3901,23 @@ fn convert_provider_runtime_metadata(
         })
         .transpose()?;
 
-    if credential.is_none() && path_template.is_none() {
+    let model_rewrites = metadata
+        .and_then(|m| m.filter_metadata.get(PROVIDER_AUTH_METADATA_KEY))
+        .map(|auth| {
+            let auth_path =
+                format!("{path}.metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"]");
+            provider_model_rewrites(auth, &auth_path)
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    if credential.is_none() && path_template.is_none() && model_rewrites.is_empty() {
         Ok(None)
     } else {
         Ok(Some(ProviderRuntimeConfig {
             credential,
             path_template,
+            model_rewrites,
         }))
     }
 }

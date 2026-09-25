@@ -2001,6 +2001,11 @@ pub enum ProviderPathTemplate {
 pub struct ProviderRuntimeConfig {
     pub credential: Option<ProviderCredential>,
     pub path_template: Option<ProviderPathTemplate>,
+    /// Provider-owned aliases to apply to the JSON request body after this
+    /// cluster has been selected. This cannot live on the route: an aggregate
+    /// fallback must send the selected member's upstream model, not the
+    /// primary member's model.
+    pub model_rewrites: Vec<ProviderModelRewrite>,
 }
 
 /// A validated TLS certificate/validation-context secret (static or

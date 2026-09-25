@@ -216,7 +216,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     // `model_catalog_order` puts them in exact > longest-prefix > `*`
     // precedence order rather than the catalogue's alphabetical key order.
     for (name, model) in model_catalog_order(config) {
-        let (route, aggregate_cluster) = lower_model(config, name, model, &mut warnings)?;
+        let (route, aggregate_cluster) = lower_model(config, name, model)?;
         routes.push(route);
         if let Some(aggregate_cluster) = aggregate_cluster {
             clusters.push(aggregate_cluster);
@@ -658,7 +658,10 @@ fn lower_provider(
     // gets exactly one copy.
     let dialect = cluster_usage_dialect(config, name, provider)?;
     let provider_type = provider.effective_type(name);
-    let mut provider_auth = json!({ "headers": headers_to_add });
+    let mut provider_auth = json!({
+        "headers": headers_to_add,
+        "models": provider_model_rewrites(config, name),
+    });
     let mut path_template = None;
     match provider_type {
         ProviderType::Vertex => {
@@ -1428,7 +1431,6 @@ fn lower_model(
     config: &SimpleConfig,
     name: &str,
     model: &ModelDef,
-    warnings: &mut Vec<ConfigWarning>,
 ) -> Result<(Value, Option<Value>), ConfigError> {
     // `validate_semantics` already guarantees `providers` is non-empty and
     // `providers[0]` names a real provider.
@@ -1467,14 +1469,6 @@ fn lower_model(
             });
         }
         members.push(format!("provider:{candidate_name}"));
-    }
-    for (index, candidate) in model.providers.iter().enumerate() {
-        if candidate.model().is_some() {
-            warnings.push(warning(
-                format!("models.{name}.providers[{index}]"),
-                "the upstream model ID needs per-attempt body rewriting; the requested alias is forwarded for now",
-            ));
-        }
     }
     let member_count = members.len();
     let (route_cluster, aggregate_cluster) = if member_count == 1 {

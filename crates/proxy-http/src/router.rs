@@ -1339,6 +1339,30 @@ impl RouterHandler {
                     requested_model.as_deref(),
                     &mut attempt_head,
                 );
+                let attempt_body_bytes = match rewrite_cluster_provider_model(
+                    attempt_entry
+                        .provider_runtime()
+                        .map(|runtime| runtime.model_rewrites.as_slice()),
+                    requested_model.as_deref(),
+                    &body_bytes,
+                ) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        tracing::warn!(cluster = %attempt_cluster, error = %err, "provider model rewrite failed");
+                        return local_reply(
+                            StatusCode::BAD_REQUEST,
+                            "provider model rewrite failed",
+                        );
+                    }
+                };
+                if attempt_body_bytes.len() != body_bytes.len() {
+                    if let Ok(length) = HeaderValue::from_str(&attempt_body_bytes.len().to_string())
+                    {
+                        attempt_head
+                            .headers
+                            .insert(http::header::CONTENT_LENGTH, length);
+                    }
+                }
                 // Credentials run after every decode filter and per-attempt
                 // transform. The selected member owns its credential, so a
                 // fallback cannot sign or authorize against the primary.
@@ -1346,7 +1370,7 @@ impl RouterHandler {
                     attempt_entry.provider_runtime(),
                     attempt_entry.request_headers_to_add(),
                 )
-                .apply(&mut attempt_head, &body_bytes)
+                .apply(&mut attempt_head, &attempt_body_bytes)
                 .await
                 {
                     tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
@@ -1362,7 +1386,7 @@ impl RouterHandler {
                 // there's no separate "streaming" body anymore (see this
                 // function's body-handling doc above).
                 let attempt_body: StreamBody =
-                    body_with_trailers(body_bytes.clone(), trailers.clone());
+                    body_with_trailers(attempt_body_bytes, trailers.clone());
 
                 let upstream_req = HttpRequestParts {
                     head: attempt_head,
@@ -2141,6 +2165,45 @@ fn provider_model_pattern_matches(pattern: &str, model: &str) -> bool {
         || pattern
             .strip_suffix('*')
             .map_or(pattern == model, |prefix| model.starts_with(prefix))
+}
+
+/// Replace the top-level JSON `model` only after the final upstream cluster
+/// is known. The model selected for routing remains in `StreamInfo`; this
+/// changes only the body sent to the selected provider.
+fn rewrite_cluster_provider_model(
+    mappings: Option<&[proxy_config::ir::ProviderModelRewrite]>,
+    requested_model: Option<&str>,
+    body: &Bytes,
+) -> Result<Bytes, String> {
+    let Some(requested_model) = requested_model else {
+        return Ok(body.clone());
+    };
+    let Some(upstream_model) = mappings.and_then(|mappings| {
+        mappings
+            .iter()
+            .find(|mapping| provider_model_pattern_matches(&mapping.pattern, requested_model))
+            .map(|mapping| mapping.upstream_model.as_str())
+    }) else {
+        return Ok(body.clone());
+    };
+
+    let mut value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|err| format!("request body is not valid JSON: {err}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "request body must be a JSON object".to_string())?;
+    match object.get("model").and_then(serde_json::Value::as_str) {
+        Some(model) if model == requested_model => {}
+        Some(_) => return Err("request model disagrees with routed model".to_string()),
+        None => return Err("request body has no model field".to_string()),
+    }
+    object.insert(
+        "model".to_string(),
+        serde_json::Value::String(upstream_model.to_string()),
+    );
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|err| format!("request body could not be serialized: {err}"))
 }
 
 fn path_segment(value: &str) -> String {
@@ -3083,6 +3146,47 @@ mod tests {
             head.uri,
             "/v1/projects/project-a/locations/us-central1/publishers/anthropic/models/claude-sonnet%4020250929:streamRawPredict?trace=1"
         );
+    }
+
+    #[test]
+    fn selected_provider_model_rewrite_changes_only_the_upstream_body() {
+        let mappings = [proxy_config::ir::ProviderModelRewrite {
+            pattern: "fast-*".to_string(),
+            upstream_model: "provider-fast-v2".to_string(),
+        }];
+        let body = Bytes::from_static(
+            br#"{"model":"fast-alias","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+
+        let rewritten = rewrite_cluster_provider_model(Some(&mappings), Some("fast-alias"), &body)
+            .expect("selected provider model rewrite must succeed");
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap()["model"],
+            "provider-fast-v2"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap()["messages"][0]
+                ["content"],
+            "hi"
+        );
+    }
+
+    #[test]
+    fn provider_model_rewrite_requires_the_body_to_match_the_routed_model() {
+        let mappings = [proxy_config::ir::ProviderModelRewrite {
+            pattern: "fast-*".to_string(),
+            upstream_model: "provider-fast-v2".to_string(),
+        }];
+
+        let err = rewrite_cluster_provider_model(
+            Some(&mappings),
+            Some("fast-alias"),
+            &Bytes::from_static(br#"{"model":"client-spoofed"}"#),
+        )
+        .expect_err("a rewrite cannot turn an unverified body into an upstream request");
+
+        assert!(err.contains("disagrees"), "unexpected error: {err}");
     }
 
     #[tokio::test(flavor = "current_thread")]

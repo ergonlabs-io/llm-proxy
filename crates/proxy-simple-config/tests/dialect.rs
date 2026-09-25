@@ -1764,8 +1764,8 @@ routes:
 models:
   claude-sonnet-4-5:
     providers:
-      - primary
-      - secondary
+      - { provider: primary, model: claude-sonnet-4-5-primary }
+      - { provider: secondary, model: claude-sonnet-4-5-secondary }
 "#,
     )
     .expect("must parse");
@@ -1801,6 +1801,31 @@ models:
         "warnings: {:?}",
         lowered.warnings
     );
+
+    let primary = clusters
+        .as_array()
+        .expect("clusters must be an array")
+        .iter()
+        .find(|cluster| cluster["name"] == "provider:primary")
+        .expect("primary cluster must exist");
+    let secondary = clusters
+        .as_array()
+        .expect("clusters must be an array")
+        .iter()
+        .find(|cluster| cluster["name"] == "provider:secondary")
+        .expect("secondary cluster must exist");
+    for (cluster, upstream_model) in [
+        (primary, "claude-sonnet-4-5-primary"),
+        (secondary, "claude-sonnet-4-5-secondary"),
+    ] {
+        assert_eq!(
+            cluster["metadata"]["filter_metadata"]["io.llmproxy.provider_auth"]["models"][0],
+            serde_json::json!({
+                "pattern": "claude-sonnet-4-5",
+                "upstream_model": upstream_model,
+            })
+        );
+    }
 }
 
 /// A provider entry naming a provider that doesn't exist is a load error
