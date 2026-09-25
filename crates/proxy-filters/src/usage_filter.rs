@@ -23,6 +23,7 @@
 //! [`LegacyUsageFilterFactory`].
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -30,7 +31,6 @@ use http::HeaderMap;
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
-use std::sync::Arc;
 
 use proxy_http::filter::{
     EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus, FilterInstanceFactory,
@@ -46,6 +46,41 @@ use crate::usage::{extract_json_usage, Dialect, SseUsageScanner, TokenUsage};
 
 /// Canonical type URL for the owned usage configuration.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
+
+/// Shared live rate-card state. A request clones the current pricing context
+/// when its filter instance is created, so an admin update can never re-price
+/// a response already in flight.
+pub struct PricingRegistry {
+    current: RwLock<Option<PricingContext>>,
+}
+
+impl PricingRegistry {
+    fn new(initial: Option<PricingContext>) -> Self {
+        Self {
+            current: RwLock::new(initial),
+        }
+    }
+
+    fn snapshot(&self) -> Option<PricingContext> {
+        self.current
+            .read()
+            .expect("pricing registry lock poisoned")
+            .clone()
+    }
+
+    /// Replace the card after validating the same wire shape used at startup.
+    pub fn replace_json(&self, json: &str) -> Result<String, ConfigError> {
+        let wire: PricingWire = serde_json::from_str(json)
+            .map_err(|e| invalid_config(format!("pricing update is invalid JSON: {e}")))?;
+        let parsed = parse_pricing(wire)?;
+        let version = parsed.list.version().as_str().to_string();
+        *self
+            .current
+            .write()
+            .expect("pricing registry lock poisoned") = Some(parsed);
+        Ok(version)
+    }
+}
 
 /// Borrowed type URL accepted for one release after the WP-47 migration.
 pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
@@ -93,12 +128,22 @@ impl HttpFilterFactory for UsageFilterFactory {
     fn create(
         &self,
         config: &DynamicMessage,
-        _ctx: &FactoryContext,
+        ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
         let parsed = parse_owned_factory_config(config)?;
+        let initial = parsed.pricing.clone();
+        let registry =
+            ctx.shared
+                .get_or_try_init(&ctx.scope, &ctx.stat_prefix, TYPE_URL, || {
+                    Ok(Arc::new(PricingRegistry::new(initial))
+                        as Arc<dyn std::any::Any + Send + Sync>)
+                })?;
+        let registry = registry
+            .downcast::<PricingRegistry>()
+            .map_err(|_| invalid_config("pricing registry type collision"))?;
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
-            pricing: parsed.pricing,
+            registry,
         }))
     }
 
@@ -350,7 +395,7 @@ impl HttpFilterFactory for LegacyUsageFilterFactory {
         let parsed = parse_legacy_factory_config(config)?;
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
-            pricing: parsed.pricing,
+            registry: Arc::new(PricingRegistry::new(parsed.pricing)),
         }))
     }
 
@@ -375,14 +420,14 @@ impl PerRouteConfig for UsagePerRouteConfig {
 
 struct UsageFilterInstanceFactory {
     dialect: Dialect,
-    pricing: Option<PricingContext>,
+    registry: Arc<PricingRegistry>,
 }
 
 impl FilterInstanceFactory for UsageFilterInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(UsageFilterInstance {
             dialect: self.dialect,
-            pricing: self.pricing.clone(),
+            pricing: self.registry.snapshot(),
             mode: BodyMode::Inert,
             headers_at: None,
             last_chunk_at: None,
@@ -1300,5 +1345,36 @@ mod tests {
         let mut data = Bytes::from_static(br#"{"usage":{"input_tokens":2,"output_tokens":3}}"#);
         filter.encode_data(&mut cb, &mut data, true);
         assert_eq!(cb.llm().usage.expect("legacy filter runs").input_tokens, 2);
+    }
+
+    #[test]
+    fn live_rate_card_update_does_not_reprice_an_existing_request_snapshot() {
+        let registry = PricingRegistry::new(None);
+        let first = registry
+            .replace_json(
+                r#"{
+                  "price_list": {"version":"v1","effective_from":"2026-09-25T00:00:00Z",
+                    "entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request",
+                      "tiers":[{"up_to":null,"input_nanodollars_per_token":10,"cached_input_nanodollars_per_token":0,
+                        "cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":20}]}]},
+                  "providers":{"provider:p1":"openai"}
+                }"#,
+            )
+            .expect("first card validates");
+        let in_flight = registry.snapshot().expect("first card snapshot");
+        let second = registry
+            .replace_json(
+                r#"{
+                  "price_list": {"version":"v2","effective_from":"2026-09-25T01:00:00Z",
+                    "entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request",
+                      "tiers":[{"up_to":null,"input_nanodollars_per_token":99,"cached_input_nanodollars_per_token":0,
+                        "cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":99}]}]},
+                  "providers":{"provider:p1":"openai"}
+                }"#,
+            )
+            .expect("second card validates");
+        assert_ne!(first, second);
+        assert_eq!(in_flight.list.version().as_str(), first);
+        assert_eq!(registry.snapshot().unwrap().list.version().as_str(), second);
     }
 }

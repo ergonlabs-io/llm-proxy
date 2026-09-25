@@ -48,6 +48,7 @@ use proxy_filters::control::{ControlPlane, StoreError};
 use proxy_filters::model_authz::{ModelAccess, ModelPattern};
 use proxy_filters::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
+use proxy_filters::usage_filter::PricingRegistry;
 use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
@@ -85,6 +86,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/tenants/{id}/policy",
     "/chains/{stat_prefix}/tenants/{id}/budget",
     "/chains/{stat_prefix}/tenants/{id}/spend",
+    "/pricing",
+    "/chains/{stat_prefix}/pricing",
 ];
 
 /// Hard cap on a write request's body. An admin write endpoint has no
@@ -515,6 +518,9 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
             handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
         }
+        WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => {
+            handle_set_pricing(factory_state, stat_prefix_opt, &body)
+        }
     }
 }
 
@@ -556,6 +562,8 @@ enum WriteRoute<'a> {
     ScopedTenantPolicy(&'a str, &'a str),
     ScopedTenantBudget(&'a str, &'a str),
     ScopedTenantSpend(&'a str, &'a str),
+    Pricing,
+    ScopedPricing(&'a str),
 }
 
 impl<'a> WriteRoute<'a> {
@@ -568,6 +576,7 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::TenantPolicy(_) => Method::PUT,
             WriteRoute::TenantBudget(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
+            WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => Method::PUT,
             WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
             WriteRoute::ScopedKeyBudget(..) => Method::PUT,
@@ -601,6 +610,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenantPolicy(s, _)
             | WriteRoute::ScopedTenantBudget(s, _)
             | WriteRoute::ScopedTenantSpend(s, _) => Some(s),
+            WriteRoute::Pricing => None,
+            WriteRoute::ScopedPricing(s) => Some(s),
         }
     }
 }
@@ -659,6 +670,8 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         ["chains", stat_prefix, "tenants", id, "spend"] => {
             Some(WriteRoute::ScopedTenantSpend(stat_prefix, id))
         }
+        ["pricing"] => Some(WriteRoute::Pricing),
+        ["chains", stat_prefix, "pricing"] => Some(WriteRoute::ScopedPricing(stat_prefix)),
         _ => None,
     }
 }
@@ -720,6 +733,49 @@ fn resolve_control_plane_by_name(
     factory_state
         .get_by_name(stat_prefix, proxy_filters::auth_filter::TYPE_URL)
         .and_then(|s| s.downcast::<ControlPlane>().ok())
+}
+
+fn resolve_pricing_registry(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+) -> Result<Option<Arc<PricingRegistry>>, Vec<String>> {
+    let singleton = match stat_prefix {
+        Some(name) => factory_state.get_by_name(name, proxy_filters::usage_filter::TYPE_URL),
+        None => factory_state
+            .get_across_scopes(proxy_filters::usage_filter::TYPE_URL)?
+            .as_ref()
+            .map(Arc::clone),
+    };
+    Ok(singleton.and_then(|s| s.downcast::<PricingRegistry>().ok()))
+}
+
+fn handle_set_pricing(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    let Ok(registry) = resolve_pricing_registry(factory_state, stat_prefix) else {
+        return text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the unscoped pricing API cannot resolve a single usage filter chain",
+        );
+    };
+    let Some(registry) = registry else {
+        return text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "llmproxy.usage is not initialized on this chain",
+        );
+    };
+    match std::str::from_utf8(body)
+        .map_err(|e| e.to_string())
+        .and_then(|json| registry.replace_json(json).map_err(|e| e.to_string()))
+    {
+        Ok(version) => json(
+            StatusCode::OK,
+            &serde_json::json!({ "rate_card_version": version }),
+        ),
+        Err(error) => text(StatusCode::BAD_REQUEST, &error),
+    }
 }
 
 /// Resolves the [`SpendAccumulator`] singleton `llmproxy.spend_limit`
