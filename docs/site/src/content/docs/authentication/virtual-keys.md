@@ -230,15 +230,17 @@ Minting a key, revoking one, creating or deleting a tenant, and setting a
 tenant's model allow-list or spend budget are all bearer-gated HTTP calls
 against the admin server, not config-file edits: `POST /keys`,
 `DELETE /keys/{id}`, `POST /tenants`, `DELETE /tenants/{id}`,
-`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`, and a read-only
-`GET /tenants/{id}/spend` (`crates/proxy-admin/src/server.rs:61-79`'s
-`AVAILABLE_ENDPOINTS`, and the method table at `:547-555`). Each of these
+`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`, a read-only
+`GET /keys` listing every key (id, tenant, revocation, budget -- no
+plaintext), and a read-only `GET /tenants/{id}/spend`
+(`crates/proxy-admin/src/server.rs`'s `AVAILABLE_ENDPOINTS`, and its
+`WriteRoute::expected_method` table). Each of these
 paths also has a scoped form, `/chains/{stat_prefix}/...`, that names the
 target HTTP connection manager by its own `stat_prefix`. Use the scoped
 form when more than one chain in this serve configures `llmproxy.auth`:
 the unscoped paths are an alias that works only when exactly one chain
 does, and refuse rather than guess when more than one does
-(`crates/proxy-admin/src/lib.rs:47-63`, and `resolve_control_plane` in
+(`crates/proxy-admin/src/lib.rs`'s module doc, and `resolve_control_plane` in
 `crates/proxy-admin/src/server.rs`). Each call writes
 the store first and republishes immediately, so the change is visible to
 every worker's very next request rather than waiting on a periodic refresh
@@ -249,11 +251,13 @@ For example, `PUT /tenants/acme/policy` with
 `gpt-*` models except those matching `gpt-5*`. Omit `deny` or send `[]` for
 no exclusions. Both lists accept exact names or one trailing `*`; a deny match
 always wins. `{"access":"all","deny":["gpt-5*"]}` grants every other model.
-The write API is fail-closed: with `LLMPROXY_ADMIN_TOKEN` unset, empty, or
-whitespace-only, every write returns `403` and a log line naming the endpoint,
-never a silent open door (`crates/proxy-admin/src/server.rs:387-395`,
-`normalize_admin_token` at `:163-174`). Read endpoints are unaffected by the
-token.
+The admin API is fail-closed: with `LLMPROXY_ADMIN_TOKEN` unset, empty, or
+whitespace-only, every bearer-gated call returns `403` and a log line naming
+the endpoint, never a silent open door (`normalize_admin_token` and the
+authorization check in `crates/proxy-admin/src/server.rs`). The gated set is
+every write plus the two financial/identity reads, `GET .../spend` and
+`GET /keys`; the config-shaped reads (`/ready`, `/config_dump`, `/clusters`,
+`/models`, `/server_info`, `/stats*`) ignore the token entirely.
 
 Keys and tenant policy live in one of two stores, selected by
 `typed_config.store` on the `llmproxy.auth` filter. The default,

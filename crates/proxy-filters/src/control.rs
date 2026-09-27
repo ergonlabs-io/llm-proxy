@@ -1396,6 +1396,46 @@ impl std::fmt::Debug for MintedKey {
     }
 }
 
+/// One key as a LISTING sees it: stable identity, owning tenant, revocation
+/// state, and the configured ceiling.
+///
+/// Deliberately the same "never key material" rule [`StoredKey`]'s `Debug`
+/// follows -- there is no digest field here (an admin listing has no use for
+/// it) and no plaintext field (the plaintext is not stored anywhere to
+/// return; see [`MintedKey`] for the one place it exists at all).
+///
+/// Produced by [`ControlPlane::list_keys`]; `proxy-admin`'s gated
+/// `GET /keys` renders it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyListing {
+    pub key_id: KeyId,
+    pub tenant: TenantId,
+    /// Whether this key is revoked. Revoked keys STAY in the snapshot (the
+    /// authenticator rejects them there -- see `crate::auth::KeyRecord`), so
+    /// a listing that dropped them would hide exactly the rows an operator
+    /// auditing "what was revoked" came to see.
+    pub revoked: bool,
+    /// The key's own spend ceiling, or `None` when none is configured
+    /// (unlimited) -- see [`crate::spend::TenantBudget`]'s doc for why an
+    /// absent budget and an explicit zero ceiling are not the same thing.
+    pub budget: Option<TenantBudget>,
+}
+
+// Rust note: hand-written, not derived, matching every other `Debug` in this
+// file and in `auth.rs`: derived would print the same fields, but the
+// convention across the key-handling types is that a reader can tell at a
+// glance nothing secret is ever printed by accident.
+impl std::fmt::Debug for KeyListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyListing")
+            .field("key_id", &self.key_id)
+            .field("tenant", &self.tenant)
+            .field("revoked", &self.revoked)
+            .field("budget", &self.budget)
+            .finish()
+    }
+}
+
 /// The policy poller thread's stop condition, plus the [`Condvar`] that wakes
 /// it immediately on shutdown rather than sleeping out up to one full
 /// interval.
@@ -1726,6 +1766,39 @@ impl ControlPlane {
     /// digest a minted key will actually authenticate against.
     pub fn secret(&self) -> &HmacSecret {
         &self.secret
+    }
+
+    /// Every key this control plane currently serves -- bootstrap keys from
+    /// config AND store keys, which [`ControlPlane::merge`] has already
+    /// de-duplicated by `key_id` (one row per key, store wins a collision),
+    /// so this cannot double-count a key that exists in both sources.
+    ///
+    /// Reads the PUBLISHED snapshot, never the store: a listing is a control
+    /// read over the same state the data plane authenticates against, it
+    /// costs no I/O, and it therefore cannot show a key that has not been
+    /// republished yet (or hide one that has) -- the same "what is actually
+    /// in effect" property every other snapshot reader here relies on.
+    ///
+    /// Sorted by `(tenant, key_id)` so the admin API answers the same bytes
+    /// for the same state: a `HashMap` iteration order would make the
+    /// response body flap between identical calls, which is exactly the kind
+    /// of noise that hides a real diff.
+    pub fn list_keys(&self) -> Vec<KeyListing> {
+        let snapshot = self.published.load();
+        let mut keys: Vec<KeyListing> = snapshot
+            .keys
+            .iter()
+            .map(|(_digest, record)| KeyListing {
+                key_id: record.key_id.clone(),
+                tenant: record.tenant.clone(),
+                revoked: record.revoked,
+                budget: snapshot.key_budgets.get(&record.key_id).copied(),
+            })
+            .collect();
+        keys.sort_by(|a, b| {
+            (a.tenant.as_str(), a.key_id.as_str()).cmp(&(b.tenant.as_str(), b.key_id.as_str()))
+        });
+        keys
     }
 
     /// Mints a fresh virtual key for `tenant`/`key_id`, writes its digest to

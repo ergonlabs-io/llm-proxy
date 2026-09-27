@@ -2,7 +2,10 @@
 //! increment 3b-ii W4 adds a bearer-gated write API for the control plane).
 //!
 //! Read endpoints, ungated: `/ready`, `/config_dump`, `/clusters`,
-//! `/server_info`, `/stats`, `/stats/prometheus`. `/stats`(`/prometheus`) is
+//! `/server_info`, `/stats`, `/stats/prometheus`, and `/models` (every route
+//! the loaded config matches on the `x-llmproxy-model` header -- the model
+//! inventory; see `dump::models_from_snapshot` for what counts). `/stats`
+//! (`/prometheus`) is
 //! a deliberate 404 when no WP-23 stats registry is wired rather than a fake
 //! empty `200` -- an operator who trusts an empty `/stats` believes there is
 //! no traffic. `/ready` (WP-21 increment 3) is `200 "LIVE"` unless a
@@ -11,14 +14,17 @@
 //! injected-closure seam and `crates/proxy/src/main.rs` for the production
 //! probe and its warming deadline.
 //!
-//! **The one exception: `GET /tenants/{id}/spend` (WP-50 increment 3c-iv) is
-//! a READ that is nonetheless gated exactly like a write.** Every other read
-//! above is deliberately non-sensitive -- config shape, cluster names,
-//! aggregate stats -- but per-tenant spend is financial data: how much a
-//! specific tenant has billed, against what ceiling, this period. Nothing
-//! about it should be answerable to an unauthenticated caller just because
-//! the HTTP verb is `GET`. See `server.rs`'s `handle` and `WriteRoute`'s doc
-//! for how a GET route shares the write API's gate/resolution machinery.
+//! **Two READS are nonetheless gated exactly like writes: `GET
+//! /tenants/{id}/spend` (WP-50 increment 3c-iv) and the key listing `GET
+//! /keys` / `GET /chains/{stat_prefix}/keys`.** Every other read above is
+//! deliberately non-sensitive -- config shape, cluster names, model
+//! patterns, aggregate stats -- but per-tenant spend is financial data (how
+//! much a specific tenant has billed, against what ceiling, this period) and
+//! a key listing is identity data (which key ids exist, who owns each,
+//! whether it was revoked, what it may spend). Nothing about either should
+//! be answerable to an unauthenticated caller just because the HTTP verb is
+//! `GET`. See `server.rs`'s `handle` and `WriteRoute`'s doc for how a GET
+//! route shares the write API's gate/resolution machinery.
 //!
 //! Write endpoints, gated by the `LLMPROXY_ADMIN_TOKEN` bearer token (see
 //! `server::serve`'s doc for why that env var is read in `crates/proxy`, not
@@ -27,8 +33,10 @@
 //! `PUT /tenants/{id}/policy` (set model-access policy),
 //! `PUT /tenants/{id}/budget` (set or clear a tenant's spend ceiling -- WP-50
 //! increment 3c-iii-a; storage and admin CRUD only, the enforcing filter is a
-//! later increment), and the read described above,
-//! `GET /tenants/{id}/spend` (WP-50 increment 3c-iv). Unset (or
+//! later increment), and the reads described above,
+//! `GET /tenants/{id}/spend` (WP-50 increment 3c-iv) and `GET /keys` (the
+//! key listing: `key_id`, `tenant`, `revoked`, `budget`, sorted by
+//! `(tenant, key_id)`). Unset (or
 //! empty/whitespace) token means every one of these -- write OR read -- is
 //! refused with 403 -- **unset never means open** (CLAUDE.md rule 17). See
 //! `server.rs`'s `handle` for the full gate and its per-endpoint doc
@@ -45,8 +53,8 @@
 //! distinct rather than collapsed.
 //!
 //! WP-50 3c-ii-a added a **scoped** form of every write endpoint (and, since
-//! 3c-iv, the gated spend read too),
-//! `/chains/{stat_prefix}/keys`, `/chains/{stat_prefix}/keys/{id}`,
+//! 3c-iv, the gated spend read too, plus the `GET /keys` listing),
+//! `/chains/{stat_prefix}/keys` (POST to mint, GET to list), `/chains/{stat_prefix}/keys/{id}`,
 //! `/chains/{stat_prefix}/tenants`, `/chains/{stat_prefix}/tenants/{id}`,
 //! `/chains/{stat_prefix}/tenants/{id}/policy`,
 //! `/chains/{stat_prefix}/tenants/{id}/budget`,

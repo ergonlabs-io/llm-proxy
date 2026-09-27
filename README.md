@@ -72,8 +72,9 @@ and did not is worse than no limit at all.
  side channels
  ─────────────
  admin :9901   read:  /ready /config_dump /clusters /server_info
-                      /stats /stats/prometheus
+                      /stats /stats/prometheus /models
                write: /keys /tenants /tenants/{id}/policy|budget
+                      GET /keys lists the keys, same gate as the writes
                       (bearer-gated; no token means 403, never open)
  logs          access logs with tokens, TTFT, TPOT, response flags
  traces        OTLP, W3C traceparent propagated
@@ -151,8 +152,9 @@ dialect.
 **Tells you what it is doing.** Access logs with token counts,
 time-to-first-token, time-per-output-token, and Envoy response flags. OTLP
 traces with W3C `traceparent` propagation. An admin endpoint serving `/ready`,
-`/config_dump`, `/clusters`, `/server_info`, `/stats` and `/stats/prometheus`
-unauthenticated, and the control-plane writes behind a bearer token — unset
+`/config_dump`, `/clusters`, `/server_info`, `/stats`, `/stats/prometheus`
+and the model inventory `/models` unauthenticated, and the control-plane
+writes plus the `GET /keys` key inventory behind a bearer token — unset
 means 403, never open.
 
 **Survives operations.** Configuration reloads on SIGHUP — and a configuration

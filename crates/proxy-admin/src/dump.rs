@@ -11,10 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use proxy_config::ir::{
-    ClusterConfig, ConfigSnapshot, DiscoveryType, ForwardTarget, HttpConnectionManagerConfig,
-    LbPolicy, ListenerConfig, NetworkFilterSpec, PathMatch, RouteActionIR, RouteEntry, RouteTable,
-    UpstreamProtocol,
+    ClusterConfig, ConfigSnapshot, DiscoveryType, ForwardTarget, HeaderMatch, HeaderMatchKind,
+    HttpConnectionManagerConfig, LbPolicy, ListenerConfig, NetworkFilterSpec, PathMatch,
+    RouteActionIR, RouteEntry, RouteTable, UpstreamProtocol,
 };
+use proxy_filters::body_rewrite_filter::MODEL_HEADER_NAME;
 use serde::Serialize;
 
 /// String rendered in place of every credential-shaped value this module
@@ -552,5 +553,141 @@ fn upstream_protocol_str(p: UpstreamProtocol) -> &'static str {
     match p {
         UpstreamProtocol::Http1 => "HTTP1",
         UpstreamProtocol::Http2 => "HTTP2",
+    }
+}
+
+// ------------------------------------------------------------------ models --
+
+/// The body `GET /models` answers with: the model patterns this snapshot
+/// routes on. See [`models_from_snapshot`] for what is and is not in here.
+#[derive(Debug, Serialize)]
+pub struct ModelInventory {
+    /// The request header every entry below is matched on -- the one
+    /// dimension model routing is expressed on (see [`models_from_snapshot`]).
+    pub header: &'static str,
+    pub models: Vec<ModelDump>,
+}
+
+/// One model pattern, as `GET /models` renders it. Same allowlist rule as
+/// every other type in this module: hand-picked fields, never a
+/// `#[derive(Serialize)]` on an IR type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ModelDump {
+    /// The pattern as an operator would write it -- an exact name, or a glob
+    /// reconstructed from the route's prefix/suffix matcher (see
+    /// [`Self::from_header_match`]).
+    pub model: String,
+    /// How the route matches that pattern: `exact`, `prefix`, `suffix`,
+    /// `regex`, `present`, or `absent`.
+    ///
+    /// Rust note: `r#match` is a RAW IDENTIFIER -- `match` is a Rust keyword
+    /// so it cannot be a plain field name, but `serde` still serializes the
+    /// field as plain `match`, which is the wire name a reader expects.
+    pub r#match: &'static str,
+    /// The route's configured `name`, when it has one -- provenance, so the
+    /// entry can be found again in `/config_dump`.
+    pub route: Option<String>,
+    /// The route table holding the route: an HCM-inlined table's name, or an
+    /// RDS-delivered table's (`ConfigSnapshot::routes` doc).
+    pub route_table: String,
+}
+
+impl ModelDump {
+    /// Renders one `x-llmproxy-model` header matcher as a model pattern.
+    ///
+    /// Prefix/suffix matchers are shown back as GLOBS (`gpt-4` -> `gpt-4*`,
+    /// `gpt-4o` suffix -> `*gpt-4o`) because that is exactly the string an
+    /// operator wrote and Envoy's prefix matcher means precisely that set of
+    /// models -- showing the bare prefix would read like a truncated name.
+    /// A regex cannot be reconstructed as a glob without guessing, so its
+    /// source is shown verbatim and labelled `regex` rather than flattened
+    /// into something that might not mean the same thing.
+    fn from_header_match(
+        header: &HeaderMatch,
+        route_name: &Option<String>,
+        route_table: &str,
+    ) -> Self {
+        let (model, kind) = match &header.kind {
+            HeaderMatchKind::Exact { value, .. } => (value.clone(), "exact"),
+            HeaderMatchKind::Prefix { value, .. } => (format!("{value}*"), "prefix"),
+            HeaderMatchKind::Suffix { value, .. } => (format!("*{value}"), "suffix"),
+            HeaderMatchKind::Regex(re) => (re.as_str().to_string(), "regex"),
+            // A presence matcher keys on the header EXISTING, not on any
+            // particular model. `*` is the honest rendering (it spans every
+            // model, or every model-less request); the kind is what tells the
+            // two directions apart.
+            HeaderMatchKind::Present(true) => ("*".to_string(), "present"),
+            HeaderMatchKind::Present(false) => ("*".to_string(), "absent"),
+        };
+        Self {
+            model,
+            r#match: kind,
+            route: route_name.clone(),
+            route_table: route_table.to_string(),
+        }
+    }
+}
+
+/// Builds `GET /models`'s body: every route in the snapshot that matches on
+/// [`MODEL_HEADER_NAME`].
+///
+/// That header IS the model dimension in this proxy:
+/// `proxy_filters::body_rewrite_filter` publishes the request's `model` onto
+/// it (removing any client-supplied value first), and `proxy_simple_config`
+/// lowers every `routes[].model` pattern and every `models.<name>` catalogue
+/// entry into a matcher on it.
+///
+/// **Routes that do not match on that header are deliberately absent.** A
+/// plain `/v1/chat/completions` prefix route serves every model and names
+/// none; inventing an entry for it would report a model the config never
+/// mentioned. This endpoint reports what routing actually keys on, not what
+/// a reader might wish it keyed on -- the same honesty rule as `/stats`
+/// answering 404 rather than a fake empty `200` when unwired.
+///
+/// Both route sources are walked: RDS-delivered tables
+/// (`ConfigSnapshot::routes`) and the tables inlined in an HCM (the
+/// simple-config lowering inlines; see `ConfigSnapshot::routes`'s doc).
+/// Identical entries from two tables are de-duplicated, and the result is
+/// sorted, so the response is stable across calls for the same config.
+pub fn models_from_snapshot(snapshot: &ConfigSnapshot) -> ModelInventory {
+    let mut models: Vec<ModelDump> = Vec::new();
+    for table in snapshot.routes.values() {
+        collect_models(table, &mut models);
+    }
+    for listener in snapshot.listeners.values() {
+        for chain in listener
+            .filter_chains
+            .iter()
+            .chain(listener.default_filter_chain.iter())
+        {
+            for filter in &chain.filters {
+                if let NetworkFilterSpec::HttpConnectionManager(hcm) = filter {
+                    collect_models(&hcm.route_table, &mut models);
+                }
+            }
+        }
+    }
+    models.sort();
+    models.dedup();
+    ModelInventory {
+        header: MODEL_HEADER_NAME,
+        models,
+    }
+}
+
+/// One route table's contribution to [`models_from_snapshot`].
+fn collect_models(table: &RouteTable, out: &mut Vec<ModelDump>) {
+    for vhost in &table.virtual_hosts {
+        for route in &vhost.routes {
+            for header in &route.matcher.headers {
+                if header.name.eq_ignore_ascii_case(MODEL_HEADER_NAME) {
+                    out.push(ModelDump::from_header_match(
+                        header,
+                        &route.name,
+                        table.name.as_str(),
+                    ));
+                }
+            }
+        }
     }
 }

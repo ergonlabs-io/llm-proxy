@@ -14,9 +14,9 @@ use hyper_util::rt::TokioIo;
 use proxy_config::ir::{
     ClusterConfig, ClusterKind, CodecType, ConfigSnapshot, DiscoveryType, EndpointIR,
     FilterChainMatch, FilterChainSpec, ForwardAction, ForwardTarget, HeaderAppendAction,
-    HeaderMutation, HttpConnectionManagerConfig, HttpFilterSpec, LbPolicy, ListenerConfig,
-    NetworkFilterSpec, PathMatch, RouteActionIR, RouteEntry, RouteMatcher, RouteTable,
-    SnapshotVersion, UpstreamProtocol, VirtualHostIR,
+    HeaderMatch, HeaderMatchKind, HeaderMutation, HttpConnectionManagerConfig, HttpFilterSpec,
+    LbPolicy, ListenerConfig, NetworkFilterSpec, PathMatch, RouteActionIR, RouteEntry,
+    RouteMatcher, RouteTable, SnapshotVersion, UpstreamProtocol, VirtualHostIR,
 };
 use proxy_core::runtime::SnapshotHandles;
 use proxy_filters::auth::{
@@ -24,6 +24,7 @@ use proxy_filters::auth::{
     VirtualKeyAuthenticator,
 };
 use proxy_filters::auth_filter;
+use proxy_filters::body_rewrite_filter::MODEL_HEADER_NAME;
 use proxy_filters::control::{ControlPlane, InMemoryControlPlaneStore};
 use proxy_filters::model_authz::ModelAccess;
 use proxy_filters::spend::{Charge, MicroUsd, Period};
@@ -165,6 +166,153 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         tracing: None,
         // WP-20 increment 1: this fixture is a static-config snapshot, which
         // is what `None` means -- no control plane is involved.
+        ads: None,
+        version: SnapshotVersion(1),
+    })
+}
+
+/// A snapshot built ONLY for `GET /models`: one listener whose HCM inlines a
+/// route table of [`MODEL_HEADER_NAME`] matchers, plus one RDS-delivered
+/// table -- the two route sources `dump::models_from_snapshot` walks -- and
+/// one path-only route that must NOT be reported (it serves every model and
+/// names none, so reporting an entry for it would invent a model the config
+/// never mentioned).
+///
+/// Deliberately cluster-free: nothing `/models` reads touches clusters, and a
+/// fixture carrying them would imply the endpoint reports on them when it
+/// does not.
+fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
+    fn model_route(
+        name: &str,
+        kind: Option<HeaderMatchKind>,
+        route_index: usize,
+    ) -> Arc<RouteEntry> {
+        Arc::new(RouteEntry {
+            name: Some(name.to_string()),
+            matcher: RouteMatcher {
+                path: PathMatch::Prefix("/".to_string()),
+                case_sensitive: true,
+                headers: kind
+                    .map(|kind| {
+                        vec![HeaderMatch {
+                            name: MODEL_HEADER_NAME.to_string(),
+                            kind,
+                        }]
+                    })
+                    .unwrap_or_default(),
+            },
+            action: RouteActionIR::Forward(ForwardAction {
+                target: ForwardTarget::Cluster("upstream".to_string()),
+                timeout: None,
+                idle_timeout: None,
+                retry_policy: None,
+                host_rewrite_literal: None,
+                prefix_rewrite: None,
+            }),
+            request_headers_to_add: vec![],
+            typed_per_filter_config: BTreeMap::new(),
+            route_index,
+            include_request_attempt_count: false,
+            include_attempt_count_in_response: false,
+            streaming_strict: false,
+        })
+    }
+
+    fn table(name: &str, routes: Vec<Arc<RouteEntry>>) -> Arc<RouteTable> {
+        Arc::new(
+            RouteTable::new(
+                name.to_string(),
+                vec![VirtualHostIR {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes,
+                    typed_per_filter_config: BTreeMap::new(),
+                }],
+                BTreeMap::new(),
+            )
+            .expect("one vhost with domain `*` cannot collide"),
+        )
+    }
+
+    // The HCM-inlined source: an exact model, a prefix model, and a route
+    // that matches on the path alone.
+    let inlined = table(
+        "local_route",
+        vec![
+            model_route(
+                "model-gpt-4o",
+                Some(HeaderMatchKind::Exact {
+                    value: "gpt-4o".to_string(),
+                    ignore_case: false,
+                }),
+                0,
+            ),
+            model_route(
+                "model-claude",
+                Some(HeaderMatchKind::Prefix {
+                    value: "claude-3".to_string(),
+                    ignore_case: false,
+                }),
+                1,
+            ),
+            model_route("chat-completions", None, 2),
+        ],
+    );
+    // The RDS source: one more exact model, so a pass here proves the walk
+    // covers `ConfigSnapshot::routes` and not only the HCM's own table.
+    let rds = table(
+        "rds_route",
+        vec![model_route(
+            "model-o3-mini",
+            Some(HeaderMatchKind::Exact {
+                value: "o3-mini".to_string(),
+                ignore_case: false,
+            }),
+            0,
+        )],
+    );
+
+    let hcm = HttpConnectionManagerConfig {
+        stat_prefix: "ingress".to_string(),
+        route_table: inlined,
+        rds_route_config_name: None,
+        http_filters: vec![HttpFilterSpec {
+            name: "envoy.filters.http.router".to_string(),
+            type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                .to_string(),
+            config: None,
+            is_router: true,
+        }],
+        codec_type: CodecType::Auto,
+        generate_request_id: true,
+        use_remote_address: false,
+        xff_num_trusted_hops: 0,
+        access_logs: vec![],
+        upgrade_configs: vec![],
+    };
+    let listener = ListenerConfig {
+        name: "listener_0".to_string(),
+        address: "127.0.0.1:0".parse().unwrap(),
+        filter_chains: vec![FilterChainSpec {
+            name: Some("default".to_string()),
+            match_criteria: FilterChainMatch::default(),
+            transport_socket: None,
+            filters: vec![NetworkFilterSpec::HttpConnectionManager(hcm)],
+        }],
+        default_filter_chain: None,
+        listener_filters: vec![],
+        per_connection_buffer_limit_bytes: 1024 * 1024,
+        tcp_backlog_size: None,
+        bind_to_port: true,
+    };
+
+    Arc::new(ConfigSnapshot {
+        listeners: HashMap::from([(listener.name.clone(), Arc::new(listener))]),
+        clusters: HashMap::new(),
+        routes: HashMap::from([("rds_route".to_string(), rds)]),
+        secrets: HashMap::new(),
+        admin: None,
+        tracing: None,
         ads: None,
         version: SnapshotVersion(1),
     })
@@ -2268,8 +2416,13 @@ async fn oversized_body_is_413() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-/// A wrong method on a recognized write path (`/keys` only accepts `POST`)
-/// answers 405, not the generic 404 an unknown path gets.
+/// A wrong method on a recognized write path answers 405, not the generic
+/// 404 an unknown path gets.
+///
+/// `GET /keys` used to be the assertion here; it is now the gated LIST
+/// endpoint, so the wrong-method probe is `DELETE /keys` (no id -- the mint
+/// shape only accepts POST) instead. The listing's own behavior is covered
+/// by the `get_keys_*` tests below.
 #[tokio::test]
 async fn wrong_method_on_write_path_is_405() {
     let (factory_state, _handle) = factory_state_with_control_plane();
@@ -2281,8 +2434,311 @@ async fn wrong_method_on_write_path_is_405() {
     )
     .await;
 
-    let (status, _body) = get(addr, "/keys").await;
+    let (status, _headers, _body) = request(addr, "DELETE", "/keys", None, "").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// `GET /keys` with no keys yet: a well-formed empty list, not a 404 and not
+/// an error -- this is the shape the admin UI's Overview renders before
+/// anyone has minted anything.
+#[tokio::test]
+async fn get_keys_with_no_keys_is_an_empty_list() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(addr, "GET", "/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["count"], 0);
+    assert_eq!(value["keys"], serde_json::json!([]));
+}
+
+/// The listing itself: two tenants, one revoked key, one budgeted key --
+/// sorted by `(tenant, key_id)`, with ownership/revocation/ceiling rendered
+/// -- and, above all, NO plaintext of a minted key anywhere in the body.
+#[tokio::test]
+async fn get_keys_lists_tenant_revocation_and_budget_without_a_plaintext() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let minted: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let plaintext = minted["key"].as_str().expect("key field").to_string();
+
+    let (status, _headers, _body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-b","key_id":"key-b"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // key-a revoked, key-b budgeted -- so both non-default columns are
+    // exercised, and neither state may be reported for the wrong row.
+    let (status, _headers, _body) =
+        request(addr, "DELETE", "/keys/key-a", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _headers, _body) = request(
+        addr,
+        "PUT",
+        "/keys/key-b/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"12.50","period":"daily"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _headers, body) = request(addr, "GET", "/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains(&plaintext),
+        "the minted plaintext leaked into the key listing: {body}"
+    );
+
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["count"], 2);
+    let keys = value["keys"].as_array().expect("keys array");
+    assert_eq!(keys.len(), 2);
+
+    assert_eq!(keys[0]["key_id"], "key-a");
+    assert_eq!(keys[0]["tenant"], "tenant-a");
+    assert_eq!(
+        keys[0]["revoked"], true,
+        "a revoked key stays listable -- \
+        hiding it would hide exactly what an operator came to audit"
+    );
+    assert!(
+        keys[0]["budget"].is_null(),
+        "no budget configured is `null` (unlimited), never a fabricated zero: {}",
+        keys[0]["budget"]
+    );
+
+    assert_eq!(keys[1]["key_id"], "key-b");
+    assert_eq!(keys[1]["tenant"], "tenant-b");
+    assert_eq!(keys[1]["revoked"], false);
+    assert_eq!(keys[1]["budget"]["max_usd"], "12.500000");
+    assert_eq!(keys[1]["budget"]["max_micro_usd"], 12_500_000u64);
+    assert_eq!(keys[1]["budget"]["period"], "daily");
+}
+
+/// Gate 1 on the listing: token not configured at all -> 403 naming the env
+/// var. Same fail-closed rule as the writes -- unset never means open.
+#[tokio::test]
+async fn get_keys_with_no_admin_token_configured_is_forbidden() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(snapshot_with_secret(), None, factory_state, None).await;
+
+    let (status, _headers, body) = request(addr, "GET", "/keys", None, "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body.contains("LLMPROXY_ADMIN_TOKEN"),
+        "the403 must name the env var that would enable the endpoint: {body}"
+    );
+}
+
+/// Gate 2 on the listing: token configured, wrong one presented -> 401 with
+/// the RFC 7235 challenge.
+#[tokio::test]
+async fn get_keys_with_wrong_token_is_401_with_challenge() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, headers, _body) = request(
+        addr,
+        "GET",
+        "/keys",
+        Some("definitely-not-the-configured-token"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(hyper::header::WWW_AUTHENTICATE),
+        Some(&hyper::header::HeaderValue::from_static("Bearer")),
+        "a 401 must carry the RFC 7235 challenge"
+    );
+}
+
+/// Gate 3 on the listing: two `llmproxy.auth`-configured chains mean the
+/// unscoped `GET /keys` cannot tell which one's inventory is meant. Loud,
+/// explicit error naming both scopes -- never a silent pick, exactly as the
+/// writes already behave.
+#[tokio::test]
+async fn get_keys_with_two_control_planes_is_an_explicit_error_not_a_guess() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        b"scope-a-secret",
+    );
+    register_control_plane(
+        &factory_state,
+        "listener 'b' filter_chains[0]",
+        "chain-b",
+        b"scope-b-secret",
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(addr, "GET", "/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "two llmproxy.auth-configured chains must be an explicit error, not a listing \
+         silently drawn from one of them: {body}"
+    );
+    assert!(
+        body.contains("listener 'a' filter_chains[0]")
+            && body.contains("listener 'b' filter_chains[0]"),
+        "the error must name every ambiguous scope: {body}"
+    );
+}
+
+/// The scoped listing answers for exactly the chain it names: key minted into
+/// chain-a is visible at `/chains/chain-a/keys` and absent from chain-b's.
+#[tokio::test]
+async fn scoped_get_keys_reads_only_the_named_chains_inventory() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    register_control_plane(
+        &factory_state,
+        "listener 'a' filter_chains[0]",
+        "chain-a",
+        TEST_HMAC_SECRET,
+    );
+    register_control_plane(
+        &factory_state,
+        "listener 'b' filter_chains[0]",
+        "chain-b",
+        TEST_HMAC_SECRET,
+    );
+
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, _body) = request(
+        addr,
+        "POST",
+        "/chains/chain-a/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _headers, body) =
+        request(addr, "GET", "/chains/chain-a/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["keys"][0]["key_id"], "key-a");
+
+    let (status, _headers, body) =
+        request(addr, "GET", "/chains/chain-b/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(
+        value["count"], 0,
+        "chain-b's inventory must not show chain-a's key: {body}"
+    );
+
+    // An unknown stat_prefix is a 404 naming it -- operator error, not a
+    // boot race, and never a fall-through to the ambiguous unscoped path.
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/chains/no-such-chain/keys",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("no-such-chain"), "404 must name it: {body}");
+}
+
+/// `GET /models`: the model patterns the loaded config routes on, from BOTH
+/// route sources (the HCM-inlined table and the RDS-delivered one), with the
+/// path-only route excluded -- and ungated, proven by the fixture standing up
+/// a server with no admin token configured at all.
+#[tokio::test]
+async fn get_models_lists_model_header_patterns_and_skips_path_only_routes() {
+    let (_server, addr) = start(snapshot_with_model_routes()).await;
+
+    let (status, body) = get(addr, "/models").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "config-shaped reads are ungated: {body}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(value["header"], MODEL_HEADER_NAME);
+
+    let models = value["models"].as_array().expect("models array");
+    let rendered: Vec<(&str, &str, &str, &str)> = models
+        .iter()
+        .map(|m| {
+            (
+                m["model"].as_str().expect("model"),
+                m["match"].as_str().expect("match"),
+                m["route"].as_str().expect("route"),
+                m["route_table"].as_str().expect("route_table"),
+            )
+        })
+        .collect();
+    // Sorted by pattern (the inventory is sorted, so a caller can diff it),
+    // with the prefix matcher reconstructed back into the glob an operator
+    // wrote (`claude-3` -> `claude-3*`).
+    assert_eq!(
+        rendered,
+        vec![
+            ("claude-3*", "prefix", "model-claude", "local_route"),
+            ("gpt-4o", "exact", "model-gpt-4o", "local_route"),
+            ("o3-mini", "exact", "model-o3-mini", "rds_route"),
+        ]
+    );
+    assert!(
+        !body.contains("chat-completions"),
+        "a path-only route names no model and must not be reported as one: {body}"
+    );
 }
 
 /// Starts the real HTTP admin socket with an in-`temp_dir` UI bundle: an

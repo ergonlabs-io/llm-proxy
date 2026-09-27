@@ -56,7 +56,9 @@ use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::dump::{clusters_from_snapshot_and_live, ClusterDump, ConfigDump, LiveCluster};
+use crate::dump::{
+    clusters_from_snapshot_and_live, models_from_snapshot, ClusterDump, ConfigDump, LiveCluster,
+};
 
 /// The endpoints this crate serves, used both to route requests and to list
 /// "available endpoints" in a 404 body. `{id}` segments are literal in this
@@ -69,6 +71,9 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/clusters",
     "/server_info",
     "/ui",
+    // Gated list reads live next to their write shapes below; `/models` is a
+    // plain read (config data, like `/config_dump`).
+    "/models",
     "/keys",
     "/keys/{id}",
     "/keys/{id}/budget",
@@ -458,6 +463,16 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
             };
             return json(StatusCode::OK, &clusters);
         }
+        // Model inventory: every route this snapshot matches on the model
+        // header (`x-llmproxy-model`), rendered as the patterns an operator
+        // configured. Ungated like every other read in this block -- it is
+        // config shape, exactly like `/config_dump` above, and carries no
+        // identity and no spend. See `dump::models_from_snapshot` for what
+        // counts as a model and what is deliberately left out.
+        "/models" => {
+            let snapshot = config.load();
+            return json(StatusCode::OK, &models_from_snapshot(&snapshot));
+        }
         "/server_info" => {
             let uptime_seconds = started_at.elapsed().as_secs();
             return json(
@@ -500,14 +515,15 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         _ => {}
     }
 
-    // ---- Write endpoints (WP-50 3b-ii W4), PLUS one gated read (WP-50
-    // 3c-iv's `.../spend`): all resolved per request through the SAME three
-    // gates. `.../spend` is a GET, not a write, but it renders per-tenant
-    // spend -- financial data, unlike every endpoint matched by literal path
-    // above (`/config_dump`, `/clusters`, `/stats`, ...), which is why it is
-    // routed here instead of there. See `lib.rs`'s module doc for the
-    // one-line rule and `WriteRoute`'s doc for how a GET fits a type named
-    // for writes. ----
+    // ---- Write endpoints (WP-50 3b-ii W4), PLUS two gated reads: WP-50
+    // 3c-iv's `.../spend`, and `GET .../keys` (the key listing). All are
+    // resolved per request through the SAME three gates. A GET on either
+    // renders data an unauthenticated caller has no business reading --
+    // per-tenant spend, or the tenant/key inventory -- unlike every endpoint
+    // matched by literal path above (`/config_dump`, `/clusters`, `/models`,
+    // `/stats`, ...), which is why they are routed here instead of there.
+    // See `lib.rs`'s module doc for the one-line rule and `WriteRoute`'s doc
+    // for how a GET fits a type named for writes. ----
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // Rust note: leading `/` stripped, then split on `/` WITHOUT filtering
@@ -519,7 +535,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
     let trimmed = path.strip_prefix('/').unwrap_or(path.as_str());
     let segments: Vec<&str> = trimmed.split('/').collect();
 
-    let Some(route) = match_write_route(&segments) else {
+    let Some(route) = match_write_route(&segments, &method) else {
         return unknown_endpoint(&path);
     };
 
@@ -634,6 +650,9 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
     };
 
     match route {
+        // `GET /keys` / `GET /chains/{p}/keys` -- the gated LIST read, same
+        // three gates as every write below (see `WriteRoute::KeyList`'s doc).
+        WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => handle_list_keys(&control_plane),
         WriteRoute::Keys | WriteRoute::ScopedKeys(_) => handle_mint_key(&control_plane, &body),
         WriteRoute::KeyById(id) | WriteRoute::ScopedKeyById(_, id) => {
             handle_revoke_key(&control_plane, id)
@@ -682,7 +701,18 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
 /// `ReadRoute` enum) precisely because it needs the exact same gate and the
 /// exact same scoped/unscoped `ControlPlane` resolution every other variant
 /// here already has; see [`handle`]'s doc for why it is gated at all.
+///
+/// `KeyList`/`ScopedKeyList` are the same story for a second reason worth
+/// stating separately: a key inventory is IDENTITY data -- which key ids
+/// exist, which tenant owns each, whether it was revoked, what ceiling it
+/// runs against. Nothing about it should be answerable to an unauthenticated
+/// caller just because the verb is `GET`, exactly as the spend read's doc
+/// says for money.
 enum WriteRoute<'a> {
+    /// `GET /keys` -- the gated list read. Distinct from [`Self::Keys`]
+    /// (POST, mint) so a GET is never answered with a 405 and a POST never
+    /// with a listing.
+    KeyList,
     Keys,
     KeyById(&'a str),
     KeyBudget(&'a str),
@@ -694,6 +724,8 @@ enum WriteRoute<'a> {
     TenantBudget(&'a str),
     // WP-50 increment 3c-iv.
     TenantSpend(&'a str),
+    /// `GET /chains/{stat_prefix}/keys` -- the scoped listing.
+    ScopedKeyList(&'a str),
     ScopedKeys(&'a str),
     ScopedKeyById(&'a str, &'a str),
     ScopedKeyBudget(&'a str, &'a str),
@@ -714,6 +746,8 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
             WriteRoute::KeyBudget(_) => Method::PUT,
             WriteRoute::KeySpend(_) => Method::GET,
+            // The gated list read: GET on the collection path.
+            WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => Method::GET,
             WriteRoute::TenantPolicy(_) => Method::PUT,
             WriteRoute::TenantBudget(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
@@ -733,7 +767,8 @@ impl<'a> WriteRoute<'a> {
     /// (unscoped, the W4 convenience alias).
     fn stat_prefix(&self) -> Option<&'a str> {
         match self {
-            WriteRoute::Keys
+            WriteRoute::KeyList
+            | WriteRoute::Keys
             | WriteRoute::KeyById(_)
             | WriteRoute::KeyBudget(_)
             | WriteRoute::KeySpend(_)
@@ -742,7 +777,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::TenantPolicy(_)
             | WriteRoute::TenantBudget(_)
             | WriteRoute::TenantSpend(_) => None,
-            WriteRoute::ScopedKeys(s)
+            WriteRoute::ScopedKeyList(s)
+            | WriteRoute::ScopedKeys(s)
             | WriteRoute::ScopedTenants(s)
             | WriteRoute::ScopedKeyById(s, _)
             | WriteRoute::ScopedKeyBudget(s, _)
@@ -773,8 +809,20 @@ impl<'a> WriteRoute<'a> {
 /// JSON body is rejected, rather than this function silently treating an
 /// empty-id path as "not a route" (404) for what is really a validation
 /// failure, not a routing one.
-fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
+///
+/// `method` participates for exactly TWO shapes: the key collection paths
+/// (`/keys` and `/chains/{stat_prefix}/keys`), where `GET` is the gated
+/// listing and every other verb is the mint (POST). Every other shape here
+/// is decided by the path alone, with [`WriteRoute::expected_method`]
+/// answering a wrong verb with 405 -- but on a collection path the path
+/// cannot decide, because two legitimate endpoints (mint and list) share it
+/// and are told apart only by the verb. Reading `method` here rather than
+/// after the gate keeps both from landing on 405: routing happens before
+/// authorization, as it must (a caller with the wrong verb on the right path
+/// should learn the path exists, not that it was forbidden).
+fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteRoute<'a>> {
     match segments {
+        ["keys"] if *method == Method::GET => Some(WriteRoute::KeyList),
         ["keys"] => Some(WriteRoute::Keys),
         ["keys", id] => Some(WriteRoute::KeyById(id)),
         ["keys", id, "budget"] => Some(WriteRoute::KeyBudget(id)),
@@ -788,6 +836,9 @@ fn match_write_route<'a>(segments: &[&'a str]) -> Option<WriteRoute<'a>> {
         ["tenants", id, "spend"] => Some(WriteRoute::TenantSpend(id)),
         // WP-50 3c-ii-a: the scoped forms, addressed by the chain's
         // operator-chosen `stat_prefix` -- see `WriteRoute`'s doc.
+        ["chains", stat_prefix, "keys"] if *method == Method::GET => {
+            Some(WriteRoute::ScopedKeyList(stat_prefix))
+        }
         ["chains", stat_prefix, "keys"] => Some(WriteRoute::ScopedKeys(stat_prefix)),
         ["chains", stat_prefix, "keys", id] => Some(WriteRoute::ScopedKeyById(stat_prefix, id)),
         ["chains", stat_prefix, "keys", id, "budget"] => {
@@ -1177,7 +1228,12 @@ struct BudgetSpec {
 /// External representation of [`Period`] over the wire -- `"daily"` or
 /// `"monthly"`, matching the proto/config convention this admin API already
 /// uses elsewhere (lowercase, snake_case wire names for a Rust enum).
-#[derive(serde::Deserialize)]
+///
+/// Serializable as well as deserializable, so the SAME wire spelling is used
+/// in both directions: a `PUT .../budget` accepts `"daily"` and
+/// `GET /keys` reports `"daily"`, rather than two spellings an operator has
+/// to remember belong together.
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PeriodSpec {
     Daily,
@@ -1193,6 +1249,15 @@ impl From<PeriodSpec> for Period {
     }
 }
 
+impl From<Period> for PeriodSpec {
+    fn from(period: Period) -> Self {
+        match period {
+            Period::Daily => PeriodSpec::Daily,
+            Period::Monthly => PeriodSpec::Monthly,
+        }
+    }
+}
+
 /// External representation of [`ModelAccess`] over the wire: `"all"` (a bare
 /// string) or `{"only": [...]}` -- the default externally-tagged shape
 /// `#[derive(Deserialize)]` produces for an enum, which is exactly the two
@@ -1202,6 +1267,51 @@ impl From<PeriodSpec> for Period {
 enum AccessSpec {
     All,
     Only(Vec<String>),
+}
+
+/// `GET /keys` and `GET /chains/{stat_prefix}/keys`: the key inventory --
+/// key id, owning tenant, revocation state, and configured ceiling, sorted
+/// by `(tenant, key_id)` (the sort is `ControlPlane::list_keys`'s, so the
+/// same state always answers the same bytes).
+///
+/// Routed through the write API's three gates despite being a GET, for the
+/// same reason `.../spend` is (see [`handle`]): this is IDENTITY data -- it
+/// answers which keys exist, which tenant owns each, and what each may spend
+/// -- and nothing about that should be enumerable by an unauthenticated
+/// caller just because the verb is `GET`.
+///
+/// It returns nothing a credential could be derived from: no digest, and no
+/// plaintext. The plaintext exists only in `POST /keys`'s own response body,
+/// exactly once (see `lib.rs`'s redaction section) -- `list_keys` reads the
+/// published snapshot, which never held it in the first place.
+fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
+    let keys = control_plane.list_keys();
+    let rendered: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|listing| {
+            serde_json::json!({
+                "key_id": listing.key_id.as_str(),
+                "tenant": listing.tenant.as_str(),
+                "revoked": listing.revoked,
+                // `null` means "no ceiling configured" (unlimited); an
+                // explicitly configured zero ceiling serializes as its own
+                // real number -- see `proxy_filters::spend::TenantBudget`'s
+                // doc for why those two must not collapse into one value.
+                // Both integer micro-dollars (exact) and a rendered decimal
+                // string (readable) are reported, mirroring the spend read.
+                "budget": listing.budget.map(|budget| serde_json::json!({
+                    "max_micro_usd": budget.max_micros.as_micros(),
+                    "max_usd": render_micro_usd(budget.max_micros.as_micros()),
+                    "period": PeriodSpec::from(budget.period),
+                })),
+            })
+        })
+        .collect();
+    let count = rendered.len();
+    json(
+        StatusCode::OK,
+        &serde_json::json!({ "keys": rendered, "count": count }),
+    )
 }
 
 fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<Bytes>> {

@@ -35,10 +35,13 @@ npm run build
 ## Notes
 
 - Auth: `Authorization: Bearer <token>` is sent on all write endpoints and on
-  `GET /tenants/{id}/spend` / `GET /keys/{id}/spend`.
-- Chain prefix: when set, write paths are prefixed as `/chains/{prefix}/…`.
-  Unscoped by default.
+  `GET /tenants/{id}/spend` / `GET /keys/{id}/spend` / `GET /keys` (the key
+  inventory). `GET /models` needs no token.
+- Chain prefix: when set, write paths are prefixed as `/chains/{prefix}/…`,
+  as is the Overview's `GET /keys` read. Unscoped by default.
 - Request bodies send exactly the documented fields (the server rejects unknown
   fields). The minted key plaintext is shown once in a dialog with a copy button.
-- There is no tenant/key list endpoint; Tenants and Keys tabs use lookup-by-id
-  forms plus create/mint forms.
+- The Overview tab lists every key (`GET /keys`, bearer-gated: id, tenant,
+  revocation, budget) and every model pattern the config routes on
+  (`GET /models`). Tenants still have no list endpoint: the Tenants tab is
+  lookup-by-id plus create forms, and the Keys tab is mint/revoke/budget forms.
