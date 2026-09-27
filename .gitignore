@@ -44,3 +44,6 @@ testing/diffrig/captures/
 # `operations/running-in-production.md` read as "never written" because the
 # only thing `git status` showed was the sidebar entry pointing at it.
 !docs/site/**/*.md
+
+admin-ui/node_modules/
+admin-ui/dist/

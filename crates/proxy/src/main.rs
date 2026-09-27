@@ -519,6 +519,16 @@ const SPAN_SINK_CAPACITY: usize = 4096;
 /// (`std::env::set_var` is process-global and racy across parallel tests).
 const ADMIN_TOKEN_ENV_VAR: &str = "LLMPROXY_ADMIN_TOKEN";
 
+/// Env var pointing at the `make ui-build` output directory
+/// (`admin-ui/dist/`). When set, the admin server loads the single-page admin
+/// UI into memory once at startup and serves it same-origin under `/ui` --
+/// no CORS, no extra port. Unset (or pointing at a dir without an
+/// `index.html`) keeps the API-only behavior: `/ui` 404s with a hint. A
+/// broken dir is a warning, not a startup error -- the API surface is the
+/// contract, the UI is convenience, and refusing to serve traffic over a
+/// missing bundle would invert that priority.
+const ADMIN_UI_DIR_ENV_VAR: &str = "LLMPROXY_ADMIN_UI_DIR";
+
 async fn run_serve(
     concurrency: usize,
     drain_time: Duration,
@@ -2084,6 +2094,25 @@ async fn start_admin(
     };
     let config = runtime.snapshot_handles.register(runtime.snapshot);
     let admin_token = std::env::var(ADMIN_TOKEN_ENV_VAR).ok();
+    let ui = std::env::var(ADMIN_UI_DIR_ENV_VAR)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .and_then(
+            |dir| match proxy_admin::UiAssets::load_from_dir(std::path::Path::new(&dir)) {
+                Ok(assets) => {
+                    tracing::info!(dir = %dir, "admin UI loaded, serving under /ui");
+                    Some(Arc::new(assets))
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        dir = %dir,
+                        error = %err,
+                        "admin UI not loaded, /ui will 404; API surface unaffected"
+                    );
+                    None
+                }
+            },
+        );
     let server = proxy_admin::serve(
         addr,
         proxy_admin::AdminRuntime {
@@ -2094,6 +2123,7 @@ async fn start_admin(
             admin_token,
             readiness: runtime.readiness,
             cluster_state: runtime.cluster_state,
+            ui,
         },
     )
     .await

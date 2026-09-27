@@ -35,7 +35,7 @@ use tokio::net::TcpStream;
 
 use crate::dump::{LiveCluster, LiveEndpoint};
 use crate::server::{
-    serve, AdminRuntime, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe,
+    serve, AdminRuntime, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe, UiAssets,
 };
 
 /// The HMAC secret every write-API test's `ControlPlane` and matching
@@ -254,6 +254,7 @@ async fn start_full_with_readiness(
             admin_token,
             readiness,
             cluster_state: None,
+            ui: None,
         },
     )
     .await
@@ -280,6 +281,7 @@ async fn start_with_cluster_state(
             admin_token: None,
             readiness: None,
             cluster_state: Some(cluster_state),
+            ui: None,
         },
     )
     .await
@@ -2281,4 +2283,112 @@ async fn wrong_method_on_write_path_is_405() {
 
     let (status, _body) = get(addr, "/keys").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// Starts the real HTTP admin socket with an in-`temp_dir` UI bundle: an
+/// `index.html` plus one hashed asset, exercising the same
+/// [`UiAssets::load_from_dir`] production (`start_admin`) uses rather than a
+/// hand-built map that could drift from the loader.
+async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::PathBuf) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static FIXTURE_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "llmproxy-admin-ui-test-{}-{}",
+        std::process::id(),
+        FIXTURE_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(dir.join("assets")).expect("fixture dir");
+    std::fs::write(dir.join("index.html"), "<html>ui-index-marker</html>").expect("index");
+    std::fs::write(dir.join("assets").join("app.js"), "console.log(1)").expect("asset");
+
+    let ui = UiAssets::load_from_dir(&dir).expect("fixture loads");
+    let config = SnapshotHandles::new().register(snapshot_with_secret());
+    let server = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        AdminRuntime {
+            config,
+            registry: None,
+            started_at: Instant::now(),
+            factory_state: Arc::new(SharedFactoryState::default()),
+            admin_token: None,
+            readiness: None,
+            cluster_state: None,
+            ui: Some(Arc::new(ui)),
+        },
+    )
+    .await
+    .expect("admin server bind");
+    let addr = server.local_addr();
+    (server, addr, dir)
+}
+
+#[tokio::test]
+async fn ui_serves_index_at_both_paths() {
+    let (_server, addr, _dir) = start_with_ui_from_fixture().await;
+    for path in ["/ui", "/ui/"] {
+        let (status, content_type, body) = get_with_content_type(addr, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(
+            content_type.starts_with("text/html"),
+            "{path}: {content_type}"
+        );
+        assert!(body.contains("ui-index-marker"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn ui_serves_hashed_asset_with_js_content_type() {
+    let (_server, addr, _dir) = start_with_ui_from_fixture().await;
+    let (status, content_type, body) = get_with_content_type(addr, "/ui/assets/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("text/javascript"),
+        "{content_type}"
+    );
+    assert!(body.contains("console.log(1)"));
+}
+
+#[tokio::test]
+async fn ui_falls_back_to_index_for_unknown_subpath() {
+    let (_server, addr, _dir) = start_with_ui_from_fixture().await;
+    let (status, _content_type, body) = get_with_content_type(addr, "/ui/tenants/acme").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("ui-index-marker"));
+}
+
+#[tokio::test]
+async fn ui_rejects_non_get_with_405() {
+    let (_server, addr, _dir) = start_with_ui_from_fixture().await;
+    let (status, _headers, _body) = request(addr, "POST", "/ui", None, "").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn ui_does_not_shadow_api_or_prefix_siblings() {
+    let (_server, addr, _dir) = start_with_ui_from_fixture().await;
+    let (status, _body) = get(addr, "/config_dump").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = get(addr, "/uix").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("available endpoints"), "{body}");
+}
+
+#[tokio::test]
+async fn ui_absent_is_a_hinted_404() {
+    let (_server, addr) = start(snapshot_with_secret()).await;
+    let (status, body) = get(addr, "/ui").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("LLMPROXY_ADMIN_UI_DIR"), "{body}");
+}
+
+#[tokio::test]
+async fn ui_load_requires_index_html() {
+    let dir = std::env::temp_dir().join(format!(
+        "llmproxy-admin-ui-test-empty-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let err = UiAssets::load_from_dir(&dir).expect_err("no index.html must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    std::fs::remove_dir(&dir).ok();
 }

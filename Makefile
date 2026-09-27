@@ -277,7 +277,6 @@ qa-vet: ## go vet the Go QA suite
 .PHONY: qa-tidy
 qa-tidy: ## go mod tidy for the Go QA suite
 	cd testing/qa && env -u GOROOT go mod tidy
-
 # `env -u GOROOT` on every Go invocation: the shell profile exports a stale
 # GOROOT=/usr/local/go that no longer exists, which makes the toolchain fail in
 # confusing ways. Unsetting it per-command fixes it without touching the
@@ -345,3 +344,20 @@ sweep-docker: ## Docker Desktop capacity baseline: proxy pinned to 2 CPUs and 1 
 .PHONY: overhead-docker
 overhead-docker: ## Docker proxy-vs-direct latency overhead baseline
 	./scripts/docker-proxy-overhead.sh $(ARGS)
+
+# --------------------------------------------------------------- admin UI --
+# Single-page admin UI (admin-ui/, Vite + React + shadcn-style components).
+# The Rust admin server hosts the built output same-origin under /ui when
+# LLMPROXY_ADMIN_UI_DIR points at admin-ui/dist/ -- no CORS, no extra port.
+
+.PHONY: ui-install
+ui-install: ## Install admin UI dependencies (admin-ui/node_modules)
+	cd admin-ui && npm install
+
+.PHONY: ui-build
+ui-build: ## Build the admin UI into admin-ui/dist/ for /ui serving
+	cd admin-ui && npm run build
+
+.PHONY: ui-dev
+ui-dev: ## Run the admin UI dev server on http://localhost:5173 (VITE_ADMIN_URL overrides the API origin)
+	cd admin-ui && npm run dev

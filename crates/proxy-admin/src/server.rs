@@ -32,7 +32,9 @@
 //! fail-closed behavior -- **unset never means open**, see the gate inside
 //! [`handle`] for the rest of the semantics.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -66,6 +68,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/config_dump",
     "/clusters",
     "/server_info",
+    "/ui",
     "/keys",
     "/keys/{id}",
     "/keys/{id}/budget",
@@ -174,6 +177,115 @@ pub struct AdminRuntime {
     pub admin_token: Option<String>,
     pub readiness: Option<ReadinessProbe>,
     pub cluster_state: Option<ClusterStateProvider>,
+    /// Static files for the single-page admin UI under `/ui/`, loaded once
+    /// at startup from the directory `make ui-build` produces
+    /// (`admin-ui/dist/`). `None` keeps the API-only behavior and `/ui`
+    /// answers 404 with a hint instead of an empty 200 -- the same honesty
+    /// rule as the unwired-`/stats` 404 above.
+    pub ui: Option<Arc<UiAssets>>,
+}
+
+/// One static file served under `/ui/`.
+#[derive(Clone, Debug)]
+struct UiFile {
+    bytes: Vec<u8>,
+    content_type: &'static str,
+}
+
+/// In-memory static assets for the admin UI, loaded once at startup -- never
+/// read from disk per request, so request workers never touch the filesystem
+/// (the same "control computes, workers read" split as the config snapshot).
+///
+/// Keys are paths relative to `/ui/` (`"index.html"`, `"assets/index-*.js"`);
+/// `""` is never a key -- the handler maps an empty remainder to
+/// `"index.html"` explicitly.
+#[derive(Clone, Debug, Default)]
+pub struct UiAssets {
+    files: HashMap<String, UiFile>,
+}
+
+impl UiAssets {
+    /// Loads every regular file under `dir` (recursively, so any vite output
+    /// shape works) into memory. `dir/index.html` is required -- without it
+    /// there is no SPA entry point and this returns an error naming the dir.
+    pub fn load_from_dir(dir: &Path) -> std::io::Result<Self> {
+        fn visit(
+            base: &Path,
+            dir: &Path,
+            out: &mut HashMap<String, UiFile>,
+        ) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(base, &path, out)?;
+                } else if path.is_file() {
+                    let rel = path
+                        .strip_prefix(base)
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("unrelatable path {}", path.display()),
+                            )
+                        })?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.insert(
+                        rel.clone(),
+                        UiFile {
+                            bytes: std::fs::read(&path)?,
+                            content_type: ui_content_type(&rel),
+                        },
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        let mut files = HashMap::new();
+        visit(dir, dir, &mut files)?;
+        if !files.contains_key("index.html") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{}/index.html not found -- run `make ui-build` first",
+                    dir.display()
+                ),
+            ));
+        }
+        Ok(Self { files })
+    }
+
+    /// Resolves a `/ui/` remainder to a file. Unknown remainders fall back
+    /// to `index.html` (a single-page app owns its own sub-routes; a 404
+    /// here would break a refresh on any client-side route).
+    fn lookup(&self, remainder: &str) -> Option<&UiFile> {
+        let key = remainder.trim_start_matches('/');
+        if key.is_empty() {
+            return self.files.get("index.html");
+        }
+        self.files.get(key).or_else(|| self.files.get("index.html"))
+    }
+}
+
+/// Content type by file extension for `/ui/` assets. Unknown extensions get
+/// `application/octet-stream` rather than a guessed text type -- serving an
+/// attacker-influenced byte stream as scriptable HTML/JS is exactly how a
+/// stored-XSS rides a static file server, and these bytes come from a build
+/// directory, not a vetted allowlist.
+fn ui_content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 impl AdminServer {
@@ -280,6 +392,35 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
     let admin_token = runtime.admin_token.as_deref();
     let readiness = runtime.readiness.as_ref();
     let cluster_state = runtime.cluster_state.as_ref();
+    // ---- Single-page admin UI (optional, in-memory, same-origin so no CORS
+    // is ever needed): `GET /ui`, `GET /ui/`, and `GET /ui/<asset>`. Unknown
+    // sub-paths fall back to index.html -- the SPA owns its own routes.
+    // Exact-prefix matching only (`/ui` + `/` or end): `/uix` must not match.
+    let path_str = req.uri().path();
+    let ui_remainder = if path_str == "/ui" {
+        Some("")
+    } else {
+        path_str.strip_prefix("/ui/")
+    };
+    if let Some(remainder) = ui_remainder {
+        if req.method() != Method::GET {
+            return text(StatusCode::METHOD_NOT_ALLOWED, "/ui only accepts GET");
+        }
+        return match runtime.ui.as_deref().and_then(|ui| ui.lookup(remainder)) {
+            Some(file) => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", file.content_type)
+                .header("cache-control", "no-store")
+                .body(Full::new(Bytes::copy_from_slice(&file.bytes)))
+                .expect("static response is always valid"),
+            None => text(
+                StatusCode::NOT_FOUND,
+                "the admin UI is not loaded for this server instance; set \
+                 LLMPROXY_ADMIN_UI_DIR to the `make ui-build` output directory \
+                 (admin-ui/dist/) and restart",
+            ),
+        };
+    }
     // ---- Read endpoints: byte-for-byte the read-only increment's behavior,
     // no gate, matched on path alone (as before -- these never distinguished
     // method). ----

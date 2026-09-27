@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-zinc-50 text-zinc-900 antialiased;
+}
+
+pre.result-panel {
+  @apply whitespace-pre-wrap break-words text-xs font-mono leading-relaxed;
+}

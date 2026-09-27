@@ -66,6 +66,13 @@
 //! `/drain_listeners`, and `/logging` (Envoy's own admin mutating
 //! endpoints) are not part of this API and stay 404.
 //!
+//! The single-page admin UI (`admin-ui/`, built by `make ui-build`) is served
+//! from memory under `GET /ui`, `GET /ui/`, and `GET /ui/<asset>` when the
+//! binary was started with `LLMPROXY_ADMIN_UI_DIR` pointing at the build
+//! output -- see [`server::UiAssets`]. Same-origin by construction, so the UI
+//! needs no CORS and the bearer token stays first-party. Without the env var
+//! `/ui` 404s with a hint rather than an empty 200.
+//!
 //! Runs on the control runtime with its own tiny `hyper` server -- **never**
 //! the data plane (ADR-0003 makes the data plane `!Send`/worker-local; this
 //! is an ordinary `Send` tokio task, same lane as stats aggregation and
@@ -118,4 +125,5 @@ pub mod server;
 pub use dump::{LiveCluster, LiveEndpoint};
 pub use server::{
     serve, AdminError, AdminRuntime, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe,
+    UiAssets,
 };
