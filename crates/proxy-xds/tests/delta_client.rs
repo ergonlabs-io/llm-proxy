@@ -187,6 +187,11 @@ async fn reconnect_resends_acked_versions_without_old_nonce() {
     tokio::time::timeout(Duration::from_secs(5), seen_second.notified())
         .await
         .expect("client reconnects and receives second response");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.requests().len() < 4 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     run.abort();
     let _ = run.await;
 

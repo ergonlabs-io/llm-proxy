@@ -965,8 +965,8 @@ async fn a_tenant_policy_write_changes_model_authorization_live() {
     drop(scratch);
 }
 
-/// 5. `PUT /tenants/{id}/budget` is enforced live against real priced
-/// traffic, and `GET /tenants/{id}/spend` (admin-gated despite being a GET
+/// 5. `PUT /keys/{id}/budget` is enforced live against real priced
+/// traffic, and `GET /keys/{id}/spend` (admin-gated despite being a GET
 /// -- financial data) reports spend consistent with what was actually sent.
 ///
 /// Per the module doc's token math, one admitted exchange against
@@ -1011,7 +1011,7 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
     let budget = admin_request_retrying(
         admin_addr,
         "PUT",
-        "/tenants/tenant-a/budget",
+        "/keys/budget-key/budget",
         Some(ADMIN_TOKEN),
         &json!({ "budget": { "max_usd": "1.50", "period": "daily" } }),
     )
@@ -1071,7 +1071,7 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
     let spend = admin_request_retrying(
         admin_addr,
         "GET",
-        "/tenants/tenant-a/spend",
+        "/keys/budget-key/spend",
         Some(ADMIN_TOKEN),
         &json!({}),
     )
@@ -1110,7 +1110,7 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
     let unauthenticated_spend_read = admin_request(
         admin_addr,
         "GET",
-        "/tenants/tenant-a/spend",
+        "/keys/budget-key/spend",
         None,
         &json!({}),
     )
