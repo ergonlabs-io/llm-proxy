@@ -345,6 +345,18 @@ pub enum AuthError {
     /// not a non-empty string. Never defaulted -- see the design brief's
     /// "missing tenant claim is Rejected, never a default tenant".
     JwtMissingTenantClaim,
+    /// The token verified and carried the configured tenant claim, but that
+    /// claim's value appears in no configured `tenant_values` map entry, so
+    /// there is no llm-proxy tenant to admit it as. Never passed through --
+    /// a non-empty map means "only these mappings", and an unmapped value is
+    /// refused rather than trusted as a tenant name (an Entra `tid` must not
+    /// become an implicitly trusted tenant).
+    JwtTenantNotMapped,
+    /// The provider's JWKS snapshot is older than its staleness bound
+    /// (background refreshes stopped landing, or never landed). Fail closed:
+    /// serving indefinitely old keys would trust a rotation that already
+    /// happened.
+    JwtJwksStale,
 }
 
 /// The result of asking one [`Authenticator`] to resolve a request.

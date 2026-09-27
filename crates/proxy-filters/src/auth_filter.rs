@@ -66,6 +66,10 @@ use crate::control::{
     ControlPlane, ControlPlaneStore, InMemoryControlPlaneStore, RedbControlPlaneStore,
 };
 use crate::control_redis::RedisControlPlaneStore;
+use crate::jwks_refresh::{
+    JwksSnapshot, RefreshSpec, DEFAULT_REFRESH_INTERVAL, STALE_AFTER_MISSED,
+};
+use crate::jwt_auth::{JwkRsaKey, JwtAuthenticator, JwtKeySet, JwtValidationConfig};
 
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
@@ -345,6 +349,286 @@ struct AuthConfig {
     /// WP-61: how often the policy poller re-checks the store's generation
     /// stamp -- see [`parse_poll_interval`].
     poll_interval: Duration,
+    /// WP-50 increment 2c-ii: one entry per `typed_config.jwt_providers[i]`,
+    /// in config order. Each becomes one `JwtAuthenticator` appended to the
+    /// chain after the virtual-key authenticator.
+    jwt_providers: Vec<JwtProviderConfig>,
+}
+
+/// One parsed `typed_config.jwt_providers[i]` -- the pieces
+/// [`JwtAuthenticator::new_shared`] takes, kept split here so `parse_config`
+/// (config parsing) stays separate from the constructor that consumes them.
+struct JwtProviderConfig {
+    keys: JwtKeySet,
+    validation: JwtValidationConfig,
+    /// `Some` when `discovery_url` is set: the background refresh spec.
+    /// `max_stale` for the authenticator is `interval * STALE_AFTER_MISSED`;
+    /// static providers (`None`) never go stale.
+    discovery: Option<DiscoveryConfig>,
+}
+
+/// The parsed shape of one provider's `discovery_url` /
+/// `refresh_interval_seconds` / `trusted_ca`.
+struct DiscoveryConfig {
+    url: String,
+    interval: Duration,
+    /// Raw PEM bytes of `trusted_ca` (`None` = system roots). Validated as
+    /// parseable PEM-with-certs at load; the refresher parses them again
+    /// into roots on its own thread.
+    ca_pem: Option<Vec<u8>>,
+}
+
+// Rust note: hand-written because `JwtValidationConfig`/`JwtKeySet` do not
+// derive `Debug` (key-adjacent types in this crate spell it out explicitly).
+// Prints identifiers only; `JwtKeySet`'s own `Debug` already prints kids.
+impl std::fmt::Debug for JwtProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtProviderConfig")
+            .field("keys", &self.keys)
+            .field("tenant_claim", &self.validation.tenant_claim)
+            .field("issuer", &self.validation.issuer)
+            .field("audience", &self.validation.audience)
+            .finish()
+    }
+}
+
+/// Decodes one base64url-no-pad component (`n` or `e`) of a
+/// `typed_config.jwt_providers[i].keys[j]` entry. Every error names its
+/// dotted path without echoing the value (key-adjacent material, same rule
+/// as [`parse_digest_hex`]).
+fn parse_jwk_component(raw: &str, field_path: &str) -> Result<Vec<u8>, ConfigError> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+
+    if raw.is_empty() {
+        return Err(invalid(field_path, "is required and must not be empty"));
+    }
+    URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| invalid(field_path, "must be valid base64url without padding"))
+        .and_then(|bytes| {
+            if bytes.is_empty() {
+                Err(invalid(field_path, "must not decode to empty"))
+            } else {
+                Ok(bytes)
+            }
+        })
+}
+
+/// Reads `typed_config.jwt_providers` into per-provider configs. Absent and
+/// empty are both legal and mean "no JWT accepted". Strict mode: every field
+/// either maps in or errors with its dotted path (ground rule #1).
+fn parse_jwt_providers(config: &DynamicMessage) -> Result<Vec<JwtProviderConfig>, ConfigError> {
+    let providers: Vec<prost_reflect::Value> = config
+        .get_field_by_name("jwt_providers")
+        .and_then(|v| v.as_list().map(<[_]>::to_vec))
+        .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(providers.len());
+    for (i, entry) in providers.iter().enumerate() {
+        let base = format!("typed_config.jwt_providers[{i}]");
+        let msg = entry
+            .as_message()
+            .ok_or_else(|| invalid(&base, "must be a message"))?;
+
+        let tenant_claim = msg
+            .get_field_by_name("tenant_claim")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        if tenant_claim.is_empty() {
+            return Err(invalid(format!("{base}.tenant_claim"), "must not be empty"));
+        }
+
+        // Optional: empty/unset means "no check". A present-but-empty string
+        // is the same as unset (proto3 cannot distinguish them); only a
+        // non-empty value enables the check.
+        let issuer = msg
+            .get_field_by_name("issuer")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+        let audience = msg
+            .get_field_by_name("audience")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+        let subject_claim = msg
+            .get_field_by_name("subject_claim")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+
+        let keys: Vec<prost_reflect::Value> = msg
+            .get_field_by_name("keys")
+            .and_then(|v| v.as_list().map(<[_]>::to_vec))
+            .unwrap_or_default();
+        // Empty is legal only with discovery (the first refresh populates
+        // the set); without it, a provider with no keys verifies nothing.
+        let discovery = parse_discovery(msg, &base)?;
+        if keys.is_empty() && discovery.is_none() {
+            return Err(invalid(
+                format!("{base}.keys"),
+                "must contain at least one key without `discovery_url` \
+                 (a provider with no keys verifies nothing)",
+            ));
+        }
+
+        let mut key_set = JwtKeySet::new();
+        let mut seen_kids: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (j, key_entry) in keys.iter().enumerate() {
+            let key_base = format!("{base}.keys[{j}]");
+            let key_msg = key_entry
+                .as_message()
+                .ok_or_else(|| invalid(&key_base, "must be a message"))?;
+
+            let kid = key_msg
+                .get_field_by_name("kid")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            if kid.is_empty() {
+                return Err(invalid(format!("{key_base}.kid"), "must not be empty"));
+            }
+            if let Some(&first) = seen_kids.get(&kid) {
+                return Err(invalid(
+                    format!("{key_base}.kid"),
+                    format!("duplicate `kid`; already used at index {first}"),
+                ));
+            }
+            seen_kids.insert(kid.clone(), j);
+
+            let n_raw = key_msg
+                .get_field_by_name("n")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let e_raw = key_msg
+                .get_field_by_name("e")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let n = parse_jwk_component(&n_raw, &format!("{key_base}.n"))?;
+            let e = parse_jwk_component(&e_raw, &format!("{key_base}.e"))?;
+            key_set.insert(JwkRsaKey { kid, n, e });
+        }
+
+        out.push(JwtProviderConfig {
+            keys: key_set,
+            validation: JwtValidationConfig {
+                tenant_claim,
+                issuer,
+                audience,
+                leeway_seconds: None,
+                tenant_map: parse_tenant_values(msg, &base)?,
+                subject_claim,
+            },
+            discovery,
+        });
+    }
+    Ok(out)
+}
+
+/// Reads one provider's `discovery_url` / `refresh_interval_seconds` /
+/// `trusted_ca`. Returns `None` when `discovery_url` is unset (static
+/// provider). Strict mode: `http` is rejected (JWKS over plaintext is an
+/// auth bypass -- see `jwks_refresh`'s module doc), and `trusted_ca` must
+/// parse as a PEM bundle with at least one certificate NOW, not on the
+/// first refresh tick months later.
+fn parse_discovery(
+    msg: &DynamicMessage,
+    base: &str,
+) -> Result<Option<DiscoveryConfig>, ConfigError> {
+    let url = msg
+        .get_field_by_name("discovery_url")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    let uri: http::Uri = url.parse().map_err(|_| {
+        invalid(
+            format!("{base}.discovery_url"),
+            "must be a valid absolute URL",
+        )
+    })?;
+    if uri.scheme_str() != Some("https") || uri.host().is_none() {
+        return Err(invalid(
+            format!("{base}.discovery_url"),
+            "must be an `https` URL with a host",
+        ));
+    }
+    let interval_secs = msg
+        .get_field_by_name("refresh_interval_seconds")
+        .and_then(|v| v.as_u32())
+        .unwrap_or(0);
+    let interval = if interval_secs == 0 {
+        DEFAULT_REFRESH_INTERVAL
+    } else {
+        Duration::from_secs(u64::from(interval_secs))
+    };
+    let ca_pem = if msg.has_field_by_name("trusted_ca") {
+        let ds = msg
+            .get_field_by_name("trusted_ca")
+            .and_then(|v| v.as_message().cloned())
+            .ok_or_else(|| invalid(format!("{base}.trusted_ca"), "must be a DataSource message"))?;
+        let bytes = read_data_source_bytes(&ds, &format!("{base}.trusted_ca"))?;
+        if bytes.is_empty() {
+            return Err(invalid(format!("{base}.trusted_ca"), "must not be empty"));
+        }
+        // Fail fast: a CA file that parses to zero certs must not pass
+        // config load only to break every refresh at runtime.
+        crate::jwks_refresh::tls_roots(Some(&bytes))
+            .map_err(|reason| invalid(format!("{base}.trusted_ca"), reason))?;
+        Some(bytes)
+    } else {
+        None
+    };
+    Ok(Some(DiscoveryConfig {
+        url,
+        interval,
+        ca_pem,
+    }))
+}
+
+/// Reads `typed_config.jwt_providers[i].tenant_values` (a
+/// `map<string, string>`) into the lookup [`JwtAuthenticator`] enforces.
+/// Absent and empty both mean "use the claim value directly". A mapped value
+/// must not be empty (it would admit a caller as a tenant named `""`);
+/// duplicates are impossible (proto maps have unique keys).
+fn parse_tenant_values(
+    msg: &DynamicMessage,
+    base: &str,
+) -> Result<HashMap<String, String>, ConfigError> {
+    let Some(map) = msg
+        .get_field_by_name("tenant_values")
+        .and_then(|v| v.as_map().cloned())
+    else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::with_capacity(map.len());
+    for (key, value) in map.iter() {
+        let key = match key {
+            prost_reflect::MapKey::String(s) => s.clone(),
+            _ => {
+                return Err(invalid(
+                    format!("{base}.tenant_values"),
+                    "map keys must be strings",
+                ));
+            }
+        };
+        let value = match value {
+            prost_reflect::Value::String(s) => s.clone(),
+            _ => {
+                return Err(invalid(
+                    format!("{base}.tenant_values"),
+                    "map values must be strings",
+                ));
+            }
+        };
+        if value.is_empty() {
+            return Err(invalid(
+                format!("{base}.tenant_values"),
+                "mapped tenant must not be empty",
+            ));
+        }
+        out.insert(key, value);
+    }
+    Ok(out)
 }
 
 /// Reads `typed_config` (an `llmproxy.filters.v0.Authentication`) into the
@@ -447,6 +731,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         bootstrap_keys: key_set,
         store_spec,
         poll_interval,
+        jwt_providers: parse_jwt_providers(config)?,
     })
 }
 
@@ -475,7 +760,50 @@ impl HttpFilterFactory for AuthFilterFactory {
             bootstrap_keys,
             store_spec,
             poll_interval,
+            jwt_providers,
         } = parse_config(config)?;
+
+        // WP-50 increment 2c-iv: one shared JWKS snapshot per JWT provider,
+        // built here (outside the singleton closure) so every worker's
+        // authenticator loads the same `Arc`. Static providers seed once and
+        // never change; discovery providers seed (possibly empty) and are
+        // republished by a background thread spawned exactly once inside the
+        // closure below -- per-serve, not per-worker, so N workers don't
+        // launch N refresh loops against the IdP.
+        let mut jwt_snapshots = Vec::with_capacity(jwt_providers.len());
+        let mut jwt_validations = Vec::with_capacity(jwt_providers.len());
+        let mut jwt_refreshes = Vec::new();
+        for (i, provider) in jwt_providers.into_iter().enumerate() {
+            let JwtProviderConfig {
+                keys,
+                validation,
+                discovery,
+            } = provider;
+            match discovery {
+                Some(d) => {
+                    let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                        JwksSnapshot::discovering(keys),
+                    )));
+                    jwt_refreshes.push((
+                        Arc::clone(&snapshot),
+                        RefreshSpec {
+                            discovery_url: d.url,
+                            expected_issuer: validation.issuer.clone(),
+                            interval: d.interval,
+                            ca_pem: d.ca_pem,
+                            label: format!("jwt_providers[{i}]"),
+                        },
+                    ));
+                    jwt_snapshots.push((snapshot, Some(d.interval * STALE_AFTER_MISSED)));
+                }
+                None => {
+                    let snapshot =
+                        Arc::new(arc_swap::ArcSwap::new(Arc::new(JwksSnapshot::seeded(keys))));
+                    jwt_snapshots.push((snapshot, None));
+                }
+            }
+            jwt_validations.push(validation);
+        }
 
         // WP-50 increment 3b-ii, part B: the `ControlPlane` is now the ONE
         // per-serve instance shared across every worker BUILDING THIS SAME
@@ -516,6 +844,15 @@ impl HttpFilterFactory for AuthFilterFactory {
         // afterward to build the authenticator's own `HmacSecret`.
         let control_plane = ctx
             .get_or_try_init(TYPE_URL, || {
+                // 2c-iv: discovery refreshers start here, inside the
+                // once-per-serve closure, for the same reason the store is
+                // built here: one loop per provider per serve, not one per
+                // worker. Each thread holds only a `Weak` to its snapshot
+                // (see `start_jwks_refresher`), so a reload retires the old
+                // threads when their snapshots drop.
+                for (snapshot, spec) in jwt_refreshes {
+                    crate::jwks_refresh::start_jwks_refresher(snapshot, spec);
+                }
                 let store: Box<dyn ControlPlaneStore> = match store_spec {
                     StoreSpec::InMemory => Box::new(InMemoryControlPlaneStore::default()),
                     StoreSpec::Persistent(path) => {
@@ -597,11 +934,18 @@ impl HttpFilterFactory for AuthFilterFactory {
         // One chain per (filter config, listener), shared by every per-stream
         // instance below via `Arc::clone` -- see `token_limit_filter`'s
         // `TokenLimitFilterFactory::create` for the same one-store-per-listener
-        // shape. Built with exactly one authenticator today; a future
-        // `JwtAuthenticator` (increment 2c) is meant to be pushed onto this
-        // same `Vec` without this factory changing shape -- see the design
-        // brief and `AuthenticatorChain`'s doc.
-        let chain = Arc::new(AuthenticatorChain::new(vec![authenticator]));
+        // shape. The virtual-key authenticator is always first
+        // (`Bearer llmp_...` is its territory); each configured JWT provider
+        // follows in config order and claims every other `Bearer` value as a
+        // JWT, so the first JWT provider in order decides every JWT outcome.
+        let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
+        authenticators.push(authenticator);
+        for ((snapshot, max_stale), validation) in jwt_snapshots.into_iter().zip(jwt_validations) {
+            authenticators.push(Box::new(JwtAuthenticator::new_shared(
+                snapshot, validation, max_stale,
+            )));
+        }
+        let chain = Arc::new(AuthenticatorChain::new(authenticators));
         Ok(Box::new(AuthFilterInstanceFactory { chain }))
     }
 }
@@ -718,6 +1062,14 @@ impl HttpFilter for AuthFilterInstance {
             }
             AuthOutcome::Rejected(AuthError::JwtMissingTenantClaim) => {
                 self.deny(cb, "auth_jwt_missing_tenant_claim");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtTenantNotMapped) => {
+                self.deny(cb, "auth_jwt_tenant_not_mapped");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::JwtJwksStale) => {
+                self.deny(cb, "auth_jwt_jwks_stale");
                 FilterHeadersStatus::Continue
             }
             AuthOutcome::NoCredential => {
@@ -2124,5 +2476,513 @@ mod tests {
             "the same scope across two independent FactoryContexts must resolve to the SAME \
              ControlPlane Arc -- this is the W1/W2 per-worker property and must not regress"
         );
+    }
+
+    // --- JWT wiring: WP-50 increment 2c-ii ------------------------------------
+    //
+    // These tests prove the `jwt_providers` config surface parses into live
+    // chain entries: a valid token authenticates end to end through the real
+    // filter, and failures stay terminal with their own access-log details.
+    // Full signature/expiry/issuer semantics already have their own suite in
+    // `jwt_auth.rs`; these tests pin the WIRING, not the crypto.
+
+    fn jwt_provider_desc() -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.JwtProvider")
+            .expect("JwtProvider is compiled into proxy-api")
+    }
+
+    fn jwt_key_desc() -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.JwtKey")
+            .expect("JwtKey is compiled into proxy-api")
+    }
+
+    fn jwt_key(kid: &str, n: &str, e: &str) -> DynamicMessage {
+        let mut msg = DynamicMessage::new(jwt_key_desc());
+        msg.set_field_by_name("kid", prost_reflect::Value::String(kid.to_string()));
+        msg.set_field_by_name("n", prost_reflect::Value::String(n.to_string()));
+        msg.set_field_by_name("e", prost_reflect::Value::String(e.to_string()));
+        msg
+    }
+
+    fn jwt_provider(
+        tenant_claim: &str,
+        issuer: Option<&str>,
+        audience: Option<&str>,
+        keys: Vec<DynamicMessage>,
+    ) -> DynamicMessage {
+        let mut msg = DynamicMessage::new(jwt_provider_desc());
+        msg.set_field_by_name(
+            "tenant_claim",
+            prost_reflect::Value::String(tenant_claim.to_string()),
+        );
+        if let Some(iss) = issuer {
+            msg.set_field_by_name("issuer", prost_reflect::Value::String(iss.to_string()));
+        }
+        if let Some(aud) = audience {
+            msg.set_field_by_name("audience", prost_reflect::Value::String(aud.to_string()));
+        }
+        msg.set_field_by_name(
+            "keys",
+            prost_reflect::Value::List(
+                keys.into_iter()
+                    .map(prost_reflect::Value::Message)
+                    .collect(),
+            ),
+        );
+        msg
+    }
+
+    fn authentication_with_jwt(
+        hmac_secret: DynamicMessage,
+        providers: Vec<DynamicMessage>,
+    ) -> DynamicMessage {
+        let mut msg = authentication(hmac_secret, vec![]);
+        msg.set_field_by_name(
+            "jwt_providers",
+            prost_reflect::Value::List(
+                providers
+                    .into_iter()
+                    .map(prost_reflect::Value::Message)
+                    .collect(),
+            ),
+        );
+        msg
+    }
+
+    /// Test RSA keypair, generated once per test process. `ring` can SIGN
+    /// with RSA but cannot GENERATE a keypair (see `jwt_auth.rs`'s own test
+    /// rationale), so generation uses the `rsa` dev-dependency; parsing and
+    /// signing are microseconds, generation (~1s for 2048 bits) happens once
+    /// behind this `OnceLock`, not once per assertion.
+    struct JwtTestKey {
+        der: Vec<u8>,
+        n_b64: String,
+        e_b64: String,
+    }
+
+    fn jwt_test_key() -> &'static JwtTestKey {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::traits::PublicKeyParts;
+
+        static KEY: std::sync::OnceLock<JwtTestKey> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            let mut rng = rand::thread_rng();
+            let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test RSA keygen");
+            let public_key = private_key.to_public_key();
+            JwtTestKey {
+                der: private_key
+                    .to_pkcs1_der()
+                    .expect("PKCS#1 DER encoding")
+                    .as_bytes()
+                    .to_vec(),
+                n_b64: URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+                e_b64: URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
+            }
+        })
+    }
+
+    fn sign_test_jwt(key: &JwtTestKey, kid: &str, payload_json: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"RS256","kid":"{kid}"}}"#));
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json);
+        let message = format!("{header_b64}.{payload_b64}");
+        let key_pair =
+            ring::signature::RsaKeyPair::from_der(&key.der).expect("parse test PKCS#1 DER");
+        let mut signature = vec![0u8; key_pair.public().modulus_len()];
+        key_pair
+            .sign(
+                &ring::signature::RSA_PKCS1_SHA256,
+                &ring::rand::SystemRandom::new(),
+                message.as_bytes(),
+                &mut signature,
+            )
+            .expect("RS256 sign");
+        format!("{message}.{}", URL_SAFE_NO_PAD.encode(&signature))
+    }
+
+    fn jwt_payload(fields: &str) -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        format!(r#"{{"exp":{exp}{fields}}}"#)
+    }
+
+    fn jwt_claims(tenant: &str, extra: &str) -> String {
+        jwt_payload(&format!(r#","tenant":"{tenant}"{extra}"#))
+    }
+
+    fn jwt_filter(tenant_claim: &str) -> (Box<dyn FilterInstanceFactory>, &'static JwtTestKey) {
+        let key = jwt_test_key();
+        let config = authentication_with_jwt(
+            inline_secret("operator-hmac-secret"),
+            vec![jwt_provider(
+                tenant_claim,
+                Some("https://issuer.example"),
+                Some("llm-proxy"),
+                vec![jwt_key("key-1", &key.n_b64, &key.e_b64)],
+            )],
+        );
+        let ctx = FactoryContext::default();
+        let factory = AuthFilterFactory
+            .create(&config, &ctx)
+            .expect("valid JWT provider config must build");
+        (factory, key)
+    }
+
+    fn jwt_bearer(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    fn jwt_provider_mapped(
+        tenant_claim: &str,
+        entries: Vec<(&str, &str)>,
+        key: &JwtTestKey,
+    ) -> DynamicMessage {
+        use prost_reflect::{MapKey, Value};
+
+        let mut msg = jwt_provider(
+            tenant_claim,
+            Some("https://issuer.example"),
+            Some("llm-proxy"),
+            vec![jwt_key("key-1", &key.n_b64, &key.e_b64)],
+        );
+        msg.set_field_by_name(
+            "tenant_values",
+            Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (MapKey::String(k.to_string()), Value::String(v.to_string())))
+                    .collect(),
+            ),
+        );
+        msg
+    }
+
+    // 2c-ii/1: a valid JWT authenticates end to end through the real filter,
+    // with the configured tenant claim and the JWKS kid as key_id.
+    #[test]
+    fn a_valid_jwt_authenticates_through_the_filter_chain() {
+        let (factory, key) = jwt_filter("tenant");
+        let mut filter = factory.create_filter();
+        let token = sign_test_jwt(
+            key,
+            "key-1",
+            &jwt_claims(
+                "tenant-a",
+                r#","iss":"https://issuer.example","aud":"llm-proxy""#,
+            ),
+        );
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some(&jwt_bearer(&token)));
+
+        let status = filter.decode_headers(&mut cb, &mut head, true);
+
+        assert_eq!(status, FilterHeadersStatus::Continue);
+        assert!(cb.local_reply.is_none());
+        let info = cb.stream_info.borrow();
+        assert_eq!(info.auth.tenant.as_deref(), Some("tenant-a"));
+        assert_eq!(info.auth.key_id.as_deref(), Some("key-1"));
+    }
+
+    // 2c-ii/2: a tampered JWT is 401ed with its own access-log detail -- the
+    // JWT outcome is terminal, exactly like the virtual-key outcomes above.
+    #[test]
+    fn a_tampered_jwt_is_401ed_with_jwt_details() {
+        let (factory, key) = jwt_filter("tenant");
+        let mut filter = factory.create_filter();
+        let mut token = sign_test_jwt(
+            key,
+            "key-1",
+            &jwt_claims(
+                "tenant-a",
+                r#","iss":"https://issuer.example","aud":"llm-proxy""#,
+            ),
+        );
+        // Flip one interior character of the signature segment: still
+        // decodable base64, no longer a valid signature.
+        let (message, signature) = token.rsplit_once('.').expect("three segments");
+        let mut chars: Vec<char> = signature.chars().collect();
+        let idx = chars.len() / 2;
+        chars[idx] = if chars[idx] == 'A' { 'B' } else { 'A' };
+        token = format!("{message}.{}", chars.into_iter().collect::<String>());
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some(&jwt_bearer(&token)));
+
+        filter.decode_headers(&mut cb, &mut head, true);
+
+        let reply = cb.local_reply.expect("a bad JWT must be denied");
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.details, "auth_jwt_invalid_signature");
+        assert_eq!(reply.body, "unauthorized");
+    }
+
+    // 2c-ii/3: chain order is preserved -- an invalid llmp_ key is still the
+    // virtual-key authenticator's terminal Rejected, never retried as a JWT.
+    #[test]
+    fn an_invalid_virtual_key_does_not_fall_through_to_jwt() {
+        let (factory, _key) = jwt_filter("tenant");
+        let mut filter = factory.create_filter();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_no-such-key"));
+
+        filter.decode_headers(&mut cb, &mut head, true);
+
+        let reply = cb.local_reply.expect("an unknown key must be denied");
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.details, "auth_unknown_key");
+    }
+
+    // 2c-ii/4: config validation -- every malformed jwt_providers entry fails
+    // with its dotted path, never silently ignored (ground rule #1).
+    #[test]
+    fn malformed_jwt_provider_entries_are_rejected_with_dotted_paths() {
+        let key = jwt_test_key();
+        let good_key = jwt_key("key-1", &key.n_b64, &key.e_b64);
+
+        // Missing tenant_claim.
+        let err = parse_config(&authentication_with_jwt(
+            inline_secret("secret"),
+            vec![jwt_provider("", None, None, vec![good_key.clone()])],
+        ))
+        .expect_err("empty tenant_claim must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.jwt_providers[0].tenant_claim");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        // No keys at all.
+        let err = parse_config(&authentication_with_jwt(
+            inline_secret("secret"),
+            vec![jwt_provider("tenant", None, None, vec![])],
+        ))
+        .expect_err("a provider with no keys must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.jwt_providers[0].keys");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        // Non-base64url modulus.
+        let err = parse_config(&authentication_with_jwt(
+            inline_secret("secret"),
+            vec![jwt_provider(
+                "tenant",
+                None,
+                None,
+                vec![jwt_key("key-1", "!!!not-base64!!!", &key.e_b64)],
+            )],
+        ))
+        .expect_err("non-base64url n must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.jwt_providers[0].keys[0].n");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        // Duplicate kid within one provider.
+        let err = parse_config(&authentication_with_jwt(
+            inline_secret("secret"),
+            vec![jwt_provider(
+                "tenant",
+                None,
+                None,
+                vec![good_key.clone(), good_key],
+            )],
+        ))
+        .expect_err("a duplicate kid must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.jwt_providers[0].keys[1].kid");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        // Empty mapped tenant.
+        let key = jwt_test_key();
+        let mut msg = jwt_provider(
+            "tenant",
+            None,
+            None,
+            vec![jwt_key("key-1", &key.n_b64, &key.e_b64)],
+        );
+        msg.set_field_by_name(
+            "tenant_values",
+            prost_reflect::Value::Map(HashMap::from([(
+                prost_reflect::MapKey::String("entra-tid-1".to_string()),
+                prost_reflect::Value::String(String::new()),
+            )])),
+        );
+        let err = parse_config(&authentication_with_jwt(inline_secret("secret"), vec![msg]))
+            .expect_err("an empty mapped tenant must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.jwt_providers[0].tenant_values");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // 2c-iii/1: a mapped claim value authenticates as the CONFIGURED tenant,
+    // end to end through the real filter.
+    #[test]
+    fn a_mapped_claim_value_authenticates_as_the_configured_tenant() {
+        let key = jwt_test_key();
+        let config = authentication_with_jwt(
+            inline_secret("operator-hmac-secret"),
+            vec![jwt_provider_mapped(
+                "tid",
+                vec![("entra-tid-1", "acme")],
+                key,
+            )],
+        );
+        let ctx = FactoryContext::default();
+        let factory = AuthFilterFactory
+            .create(&config, &ctx)
+            .expect("valid mapped provider must build");
+        let mut filter = factory.create_filter();
+        let token = sign_test_jwt(
+            key,
+            "key-1",
+            &jwt_payload(
+                r#","tid":"entra-tid-1","iss":"https://issuer.example","aud":"llm-proxy""#,
+            ),
+        );
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some(&jwt_bearer(&token)));
+
+        let status = filter.decode_headers(&mut cb, &mut head, true);
+
+        assert_eq!(status, FilterHeadersStatus::Continue);
+        assert!(cb.local_reply.is_none());
+        let info = cb.stream_info.borrow();
+        assert_eq!(info.auth.tenant.as_deref(), Some("acme"));
+    }
+
+    // 2c-iv/1: discovery parse -- http is rejected, empty keys are legal
+    // with discovery, bad trusted_ca fails fast with its dotted path.
+    #[test]
+    fn discovery_config_parses_strictly() {
+        let key = jwt_test_key();
+
+        // http discovery URL: rejected (plaintext JWKS is an auth bypass).
+        let mut http_provider = jwt_provider(
+            "tenant",
+            None,
+            None,
+            vec![jwt_key("key-1", &key.n_b64, &key.e_b64)],
+        );
+        http_provider.set_field_by_name(
+            "discovery_url",
+            prost_reflect::Value::String(
+                "http://issuer.example/.well-known/openid-configuration".to_string(),
+            ),
+        );
+        let err = parse_config(&authentication_with_jwt(
+            inline_secret("secret"),
+            vec![http_provider],
+        ))
+        .expect_err("http discovery_url must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.jwt_providers[0].discovery_url");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+
+        // Empty keys WITH discovery: legal (first refresh populates).
+        let mut seeded = DynamicMessage::new(jwt_provider_desc());
+        seeded.set_field_by_name(
+            "tenant_claim",
+            prost_reflect::Value::String("tenant".to_string()),
+        );
+        seeded.set_field_by_name(
+            "discovery_url",
+            prost_reflect::Value::String(
+                "https://issuer.example/.well-known/openid-configuration".to_string(),
+            ),
+        );
+        seeded.set_field_by_name("keys", prost_reflect::Value::List(vec![]));
+        let parsed = parse_config(&authentication_with_jwt(
+            inline_secret("secret"),
+            vec![seeded],
+        ))
+        .expect("empty keys with discovery must parse");
+        assert!(parsed.jwt_providers[0].discovery.is_some());
+
+        // Garbage trusted_ca: fails at load, not on the first tick.
+        let mut bad_ca = jwt_provider(
+            "tenant",
+            None,
+            None,
+            vec![jwt_key("key-1", &key.n_b64, &key.e_b64)],
+        );
+        bad_ca.set_field_by_name(
+            "discovery_url",
+            prost_reflect::Value::String(
+                "https://issuer.example/.well-known/openid-configuration".to_string(),
+            ),
+        );
+        bad_ca.set_field_by_name(
+            "trusted_ca",
+            prost_reflect::Value::Message(inline_secret("not pem at all")),
+        );
+        let err = parse_config(&authentication_with_jwt(
+            inline_secret("secret"),
+            vec![bad_ca],
+        ))
+        .expect_err("garbage trusted_ca must be rejected");
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "typed_config.jwt_providers[0].trusted_ca");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // 2c-iii/2: an unmapped claim value is 401ed with its own detail -- never
+    // admitted under the raw issuer-side value.
+    #[test]
+    fn an_unmapped_claim_value_is_401ed_never_passed_through() {
+        let key = jwt_test_key();
+        let config = authentication_with_jwt(
+            inline_secret("operator-hmac-secret"),
+            vec![jwt_provider_mapped(
+                "tid",
+                vec![("entra-tid-1", "acme")],
+                key,
+            )],
+        );
+        let ctx = FactoryContext::default();
+        let factory = AuthFilterFactory
+            .create(&config, &ctx)
+            .expect("valid mapped provider must build");
+        let mut filter = factory.create_filter();
+        let token = sign_test_jwt(
+            key,
+            "key-1",
+            &jwt_payload(
+                r#","tid":"some-other-tid","iss":"https://issuer.example","aud":"llm-proxy""#,
+            ),
+        );
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some(&jwt_bearer(&token)));
+
+        filter.decode_headers(&mut cb, &mut head, true);
+
+        let reply = cb.local_reply.expect("an unmapped value must be denied");
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.details, "auth_jwt_tenant_not_mapped");
     }
 }

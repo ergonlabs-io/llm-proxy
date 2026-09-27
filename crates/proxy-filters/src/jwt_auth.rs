@@ -73,28 +73,25 @@
 //! key ROTATION, which is exactly the granularity `kid` already exists to
 //! express).
 //!
-//! # What this increment does not build
+//! # What this module does not build
 //!
-//! No network JWKS fetch, no refresh timer, no `ArcSwap` snapshot -- the JWKS
-//! here is provided once, at construction, exactly like
-//! [`crate::auth::VirtualKeyAuthenticator::from_static_keys`]. Whether the
-//! *synchronous* [`crate::auth::Authenticator`] trait this module implements
-//! unchanged can still accommodate a later asynchronous-refresh JWKS without
-//! reshaping is a real open question, not a settled fact -- see this crate's
-//! task report for the finding.
-//!
-//! This module also does not wire a `JwtAuthenticator` into
-//! [`crate::auth_filter::AuthFilterFactory`]'s `AuthenticatorChain`, and does
-//! not add a config parser reading `typed_config` into this module's
-//! [`JwtValidationConfig`]/[`JwtKeySet`]. Both mirror how 2a-i (this module's sibling,
-//! [`crate::auth`]) landed before 2a-ii ([`crate::auth_filter`]) wired it into
-//! a real `HttpFilter` -- a later increment (2c-ii, by analogy) is the wiring
-//! step here too.
+//! No network JWKS fetch, no refresh timer, no `ArcSwap` snapshot *here* --
+//! but the open question this section used to pose is now settled: the
+//! synchronous [`crate::auth::Authenticator`] trait accommodates
+//! asynchronous refresh with no reshaping, because refresh publishes and
+//! verification only ever loads. [`crate::jwks_refresh`] owns the OIDC
+//! discovery document fetch, the JWKS fetch, the background thread, and the
+//! shared snapshot; this module only ever `load()`s it. Filter wiring
+//! (`auth_filter`'s `AuthenticatorChain`, `typed_config` parsing including
+//! `tenant_values` and discovery) lives in [`crate::auth_filter`].
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
+use arc_swap::ArcSwap;
+use base64::Engine as _;
 use http::header::AUTHORIZATION;
 use http::HeaderMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -103,6 +100,7 @@ use crate::auth::{
     AuthError, AuthOutcome, Authenticator, KeyId, Principal, TenantId, TenantPolicy, BEARER_PREFIX,
     KEY_PREFIX,
 };
+use crate::jwks_refresh::JwksSnapshot;
 
 /// Clock-skew leeway (seconds) applied to `exp`/`nbf` when
 /// [`JwtValidationConfig::leeway_seconds`] is left unset.
@@ -165,6 +163,17 @@ impl JwtKeySet {
     fn get(&self, kid: &str) -> Option<&DecodingKey> {
         self.keys.get(kid)
     }
+
+    /// Number of keys in the set. Used by the refresh path to refuse to
+    /// publish an empty set, and by refresh logging -- not a general
+    /// accessor, and it leaks nothing `Debug` doesn't already print.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
 }
 
 impl Default for JwtKeySet {
@@ -206,6 +215,13 @@ pub struct JwtValidationConfig {
     /// [`crate::auth::TenantPolicy::budget`] already documents for the same
     /// reason.
     pub leeway_seconds: Option<u64>,
+    /// Optional. Maps a verified token's tenant-claim VALUE to the
+    /// llm-proxy tenant to admit it as. Empty means the claim value is used
+    /// directly; non-empty means only mapped values are admitted and anything
+    /// else is [`crate::auth::AuthError::JwtTenantNotMapped`].
+    pub tenant_map: HashMap<String, String>,
+    /// Optional verified claim used to distinguish JWT callers for accounting.
+    pub subject_claim: Option<String>,
 }
 
 /// Builds the one [`Validation`] a [`JwtAuthenticator`] checks every token
@@ -252,22 +268,59 @@ fn build_validation(config: &JwtValidationConfig) -> Validation {
     validation
 }
 
-/// [`Authenticator`] for JWTs verified against a statically configured JWKS.
-/// See the module doc for scope, allow-listed algorithms, and what a caller
-/// must not conclude from a `Rejected` outcome.
+/// [`Authenticator`] for JWTs verified against a JWKS.
+///
+/// The key set is a lock-free [`ArcSwap`] snapshot, never fetched on the
+/// request path: static configs publish once at build
+/// ([`JwtAuthenticator::new`]); discovery-configured providers are
+/// republished by [`crate::jwks_refresh::start_jwks_refresher`]
+/// ([`JwtAuthenticator::new_shared`]). See that module's doc for the
+/// failure semantics. This answers the module doc's old open question in
+/// the affirmative: the synchronous [`Authenticator`] trait accommodates
+/// asynchronous refresh with no reshaping, because refresh publishes and
+/// verification only ever loads.
 pub struct JwtAuthenticator {
-    keys: JwtKeySet,
+    snapshot: Arc<ArcSwap<JwksSnapshot>>,
     validation: Validation,
     tenant_claim: String,
+    tenant_map: HashMap<String, String>,
+    subject_claim: Option<String>,
+    expected_issuer: Option<String>,
+    /// Fail-closed staleness bound for discovery snapshots (`None` for
+    /// static seeds, which never go stale). See
+    /// [`JwksSnapshot::is_stale`].
+    max_stale: Option<Duration>,
 }
 
 impl JwtAuthenticator {
     pub fn new(keys: JwtKeySet, config: JwtValidationConfig) -> Self {
-        let validation = build_validation(&config);
         JwtAuthenticator {
-            keys,
-            validation,
+            snapshot: Arc::new(ArcSwap::new(Arc::new(JwksSnapshot::seeded(keys)))),
+            validation: build_validation(&config),
             tenant_claim: config.tenant_claim,
+            tenant_map: config.tenant_map,
+            subject_claim: config.subject_claim,
+            expected_issuer: config.issuer,
+            max_stale: None,
+        }
+    }
+
+    /// Shares a refreshable snapshot (see [`JwksSnapshot`]). `max_stale`
+    /// must be `Some` for discovery snapshots so a snapshot whose refreshes
+    /// stopped landing is refused rather than served forever.
+    pub fn new_shared(
+        snapshot: Arc<ArcSwap<JwksSnapshot>>,
+        config: JwtValidationConfig,
+        max_stale: Option<Duration>,
+    ) -> Self {
+        JwtAuthenticator {
+            snapshot,
+            validation: build_validation(&config),
+            tenant_claim: config.tenant_claim,
+            tenant_map: config.tenant_map,
+            subject_claim: config.subject_claim,
+            expected_issuer: config.issuer,
+            max_stale,
         }
     }
 }
@@ -275,8 +328,10 @@ impl JwtAuthenticator {
 impl fmt::Debug for JwtAuthenticator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JwtAuthenticator")
-            .field("keys", &self.keys)
+            .field("snapshot", &self.snapshot.load())
             .field("tenant_claim", &self.tenant_claim)
+            .field("subject_claim", &self.subject_claim)
+            .field("max_stale", &self.max_stale)
             .finish()
     }
 }
@@ -330,8 +385,45 @@ impl Authenticator for JwtAuthenticator {
             return AuthOutcome::NoCredential;
         }
 
+        // An issuer is safe to read before verification only as a routing hint:
+        // it chooses the verifier, never grants access. This lets independent
+        // OIDC providers coexist without one provider claiming every JWT.
+        if let Some(expected) = &self.expected_issuer {
+            let issuer = presented
+                .split('.')
+                .nth(1)
+                .and_then(|segment| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(segment)
+                        .ok()
+                })
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|claims| {
+                    claims
+                        .get("iss")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                });
+            if issuer.as_deref().is_some_and(|issuer| issuer != expected) {
+                return AuthOutcome::NoCredential;
+            }
+        }
+
         // From here on every outcome is terminal: this authenticator has
         // claimed the credential as a JWT.
+        let snapshot = self.snapshot.load();
+        // Fail closed on staleness: a discovery snapshot whose refreshes
+        // stopped landing must not be served forever. Static seeds carry
+        // `max_stale: None` and skip this entirely; a discovery snapshot
+        // with no successful refresh yet reports an unbounded age and is
+        // refused, which is exactly the fail-closed birth state the
+        // snapshot constructor documents.
+        if let Some(max_stale) = self.max_stale {
+            let stale = snapshot.age().map(|age| age > max_stale).unwrap_or(true);
+            if stale {
+                return AuthOutcome::Rejected(AuthError::JwtJwksStale);
+            }
+        }
         let header = match jsonwebtoken::decode_header(presented) {
             Ok(header) => header,
             Err(_) => return AuthOutcome::Rejected(AuthError::JwtMalformed),
@@ -340,7 +432,7 @@ impl Authenticator for JwtAuthenticator {
         let Some(kid) = header.kid.as_deref() else {
             return AuthOutcome::Rejected(AuthError::JwtUnknownKid);
         };
-        let Some(key) = self.keys.get(kid) else {
+        let Some(key) = snapshot.keys().get(kid) else {
             return AuthOutcome::Rejected(AuthError::JwtUnknownKid);
         };
 
@@ -359,10 +451,38 @@ impl Authenticator for JwtAuthenticator {
             return AuthOutcome::Rejected(AuthError::JwtMissingTenantClaim);
         };
 
+        // A non-empty map means "only these mappings": the claim value is a
+        // lookup key, never a tenant name.
+        let tenant = if self.tenant_map.is_empty() {
+            tenant.to_string()
+        } else {
+            match self.tenant_map.get(tenant) {
+                Some(mapped) => mapped.clone(),
+                None => return AuthOutcome::Rejected(AuthError::JwtTenantNotMapped),
+            }
+        };
+
+        let key_id = match &self.subject_claim {
+            Some(claim) => match data
+                .claims
+                .get(claim)
+                .and_then(|value| value.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                Some(subject) => KeyId::new(format!(
+                    "jwt:{}:{}:{}",
+                    self.expected_issuer.as_deref().unwrap_or("issuerless"),
+                    tenant,
+                    subject
+                )),
+                None => return AuthOutcome::Rejected(AuthError::JwtMissingTenantClaim),
+            },
+            None => KeyId::new(kid.to_string()),
+        };
         AuthOutcome::Authenticated(Principal {
             tenant: TenantId::new(tenant),
             // See the module doc's "`Principal::key_id` for a JWT" section.
-            key_id: KeyId::new(kid.to_string()),
+            key_id,
             policy: Arc::new(TenantPolicy::default()),
         })
     }
@@ -385,7 +505,6 @@ mod tests {
     // verification path rather than a stand-in for it.
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine as _;
     use rsa::traits::PublicKeyParts;
 
     /// The test RSA keypair plus the pieces this module's tests need
@@ -576,6 +695,8 @@ GdGIML90cFtpXr13uutgIg==
             issuer: None,
             audience: None,
             leeway_seconds: None,
+            tenant_map: HashMap::new(),
+            subject_claim: None,
         }
     }
 
@@ -753,10 +874,10 @@ GdGIML90cFtpXr13uutgIg==
         }
     }
 
-    // --- 7: issuer mismatch -> Rejected, both when `iss` differs AND when
-    // `iss` is absent entirely (the fail-open gap `build_validation` closes).
+    // --- 7: a foreign issuer defers to a later configured provider; a missing
+    // issuer remains rejected (the fail-open gap `build_validation` closes).
     #[test]
-    fn issuer_mismatch_is_rejected_including_a_missing_iss_claim() {
+    fn foreign_issuer_defers_but_a_missing_issuer_is_rejected() {
         let key = shared_test_key();
         let config = JwtValidationConfig {
             issuer: Some("https://issuer.example".to_string()),
@@ -770,9 +891,9 @@ GdGIML90cFtpXr13uutgIg==
             claims(&[("iss", serde_json::json!("https://someone-else.example"))]).as_bytes(),
         );
         match auth.authenticate(&headers_with_bearer(&wrong_issuer)) {
-            AuthOutcome::Rejected(AuthError::JwtIssuerMismatch) => {}
+            AuthOutcome::NoCredential => {}
             other => panic!(
-                "expected Rejected(JwtIssuerMismatch) for a wrong iss; Authenticated={}",
+                "a foreign issuer must defer to a later provider; Authenticated={}",
                 matches!(other, AuthOutcome::Authenticated(_))
             ),
         }
@@ -1120,5 +1241,94 @@ GdGIML90cFtpXr13uutgIg==
             "a Rejected credential of a KNOWN kind must be terminal -- the later authenticator \
              must never have been consulted"
         );
+    }
+
+    // --- 21: a non-empty tenant map translates the claim value into the
+    // configured tenant.
+    #[test]
+    fn a_configured_tenant_map_translates_the_claim_value() {
+        let key = shared_test_key();
+        let config = JwtValidationConfig {
+            tenant_map: HashMap::from([("entra-tid-1".to_string(), "acme".to_string())]),
+            ..default_config()
+        };
+        let auth = authenticator_with_key(key, "key-1", config);
+        let token = build_jwt(
+            key,
+            &header_json("key-1"),
+            claims(&[("tenant", serde_json::json!("entra-tid-1"))]).as_bytes(),
+        );
+
+        match auth.authenticate(&headers_with_bearer(&token)) {
+            AuthOutcome::Authenticated(principal) => {
+                assert_eq!(principal.tenant.as_str(), "acme");
+            }
+            other => panic!(
+                "expected Authenticated as the mapped tenant; Rejected={}",
+                matches!(other, AuthOutcome::Rejected(_))
+            ),
+        }
+    }
+
+    // --- 23: a discovery snapshot past its staleness bound is Rejected,
+    // even with a signature that would otherwise verify.
+    #[test]
+    fn a_stale_discovery_snapshot_is_rejected() {
+        use crate::jwks_refresh::JwksSnapshot;
+
+        let key = shared_test_key();
+        let mut keys = JwtKeySet::new();
+        keys.insert(JwkRsaKey {
+            kid: "key-1".to_string(),
+            n: key.n.clone(),
+            e: key.e.clone(),
+        });
+        let snapshot = std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
+            JwksSnapshot::discovering(keys),
+        )));
+        let auth = JwtAuthenticator::new_shared(
+            snapshot,
+            JwtValidationConfig {
+                tenant_map: HashMap::new(),
+                ..default_config()
+            },
+            // Zero bound: any nonzero age is stale. No sleeping needed.
+            Some(std::time::Duration::ZERO),
+        );
+        let token = build_jwt(key, &header_json("key-1"), claims(&[]).as_bytes());
+
+        match auth.authenticate(&headers_with_bearer(&token)) {
+            AuthOutcome::Rejected(AuthError::JwtJwksStale) => {}
+            other => panic!(
+                "a stale snapshot must be Rejected(JwtJwksStale); Authenticated={}",
+                matches!(other, AuthOutcome::Authenticated(_))
+            ),
+        }
+    }
+
+    // --- 22: a claim value absent from a non-empty map is Rejected, never
+    // passed through as a tenant name.
+    #[test]
+    fn an_unmapped_tenant_claim_value_is_rejected_never_passed_through() {
+        let key = shared_test_key();
+        let config = JwtValidationConfig {
+            tenant_map: HashMap::from([("entra-tid-1".to_string(), "acme".to_string())]),
+            ..default_config()
+        };
+        let auth = authenticator_with_key(key, "key-1", config);
+        let token = build_jwt(
+            key,
+            &header_json("key-1"),
+            claims(&[("tenant", serde_json::json!("some-other-tid"))]).as_bytes(),
+        );
+
+        match auth.authenticate(&headers_with_bearer(&token)) {
+            AuthOutcome::Rejected(AuthError::JwtTenantNotMapped) => {}
+            other => panic!(
+                "an unmapped claim value must be Rejected(JwtTenantNotMapped), never admitted \
+                 under the raw value; Authenticated={}",
+                matches!(other, AuthOutcome::Authenticated(_))
+            ),
+        }
     }
 }

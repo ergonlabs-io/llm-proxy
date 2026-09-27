@@ -66,6 +66,19 @@ rand = { workspace = true }
 # matchers, so accepting its config without compiling it would be a silent
 # partial implementation.
 regex = { workspace = true }
+# WP-50 increment 2c-iv: OIDC discovery + background JWKS refresh. All
+# network crates here were already in the tree (hyper, tokio-rustls, rustls,
+# rustls-pemfile, rustls-native-certs) -- this adds edges, not new crates, and
+# stays on the workspace's `ring` crypto provider (see `jwt_auth`'s own note
+# on why `jsonwebtoken` 9.x is pinned).
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
 proxy-api = { workspace = true }
@@ -82,6 +95,9 @@ proxy-api = { workspace = true }
 # TEST_KEY_PEM); key GENERATION is no longer used, because 2048-bit RSA keygen
 # per nextest process took the workspace suite from ~23s to 60.7s.
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+# WP-50 increment 2c-iv tests: generates a localhost TLS cert at test time so
+# the mock OIDC server speaks real HTTPS with no committed key material.
+rcgen = { workspace = true }
 
 [features]
 # Each non-core filter lands behind a feature flag (default-on set decided in WP-31).

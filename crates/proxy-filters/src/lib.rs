@@ -62,6 +62,7 @@ pub mod body_rewrite_filter;
 pub mod control;
 pub mod control_redis;
 pub mod cors;
+pub mod jwks_refresh;
 pub mod jwt_auth;
 pub mod local_ratelimit;
 pub mod model_authz;

@@ -414,8 +414,21 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "persistent",
             "shared",
             "poll_interval_seconds",
+            "jwt_providers",
         ],
         "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
+        "llmproxy.filters.v0.JwtProvider" => &[
+            "tenant_claim",
+            "issuer",
+            "audience",
+            "keys",
+            "tenant_values",
+            "discovery_url",
+            "refresh_interval_seconds",
+            "trusted_ca",
+            "subject_claim",
+        ],
+        "llmproxy.filters.v0.JwtKey" => &["kid", "n", "e"],
         // WP-47 increment 2: the owned token-budget shape.  Keep both fields
         // here even though the factory performs the required/value checks:
         // this is the forward-compat guard that rejects a future proto field

@@ -94,6 +94,16 @@ message Authentication {
   // (ADR-0006 §3) -- and that means **a revoked key stops working within
   // `poll_interval_seconds` × 1.25, which is 60 seconds at the default.**
   uint32 poll_interval_seconds = 5;
+
+  // WP-50 increment 2c-ii: JWT providers verified against statically
+  // configured JWKS (RS256 only). Each entry becomes one `JwtAuthenticator`
+  // appended to the filter's `AuthenticatorChain` AFTER the virtual-key
+  // authenticator: `Bearer llmp_...` stays virtual-key territory, every other
+  // `Bearer` value is claimed as a JWT by the first JWT provider in order.
+  // May be empty (no JWT accepted). Clock skew uses the authenticator's
+  // built-in default; OIDC discovery / background refresh is a later
+  // increment, not this field.
+  repeated JwtProvider jwt_providers = 7;
 }
 
 // Keeps every minted key, revocation, and tenant policy only in process
@@ -182,4 +192,82 @@ message VirtualKey {
   // simply typed the wrong thing. The DOWNSTREAM response is identical for
   // both -- the difference reaches the access log, never the caller.
   bool revoked = 4;
+}
+
+// WP-50 increment 2c-ii: one JWT issuer accepted by the filter, verified
+// against a statically configured key set (RS256 only). One entry becomes one
+// `JwtAuthenticator` on the chain; entries are tried in config order and the
+// first terminal outcome wins (same `Rejected`-stops-the-chain rule as the
+// virtual-key authenticator).
+message JwtProvider {
+  // Required. Which claim in a verified token becomes the llm-proxy tenant.
+  // Never defaulted: a verified token missing this claim (or carrying it as
+  // an empty string) is rejected.
+  string tenant_claim = 1;
+
+  // Optional. When set (non-empty), the token's `iss` must equal this value,
+  // and a token omitting `iss` is rejected. When unset, no issuer check is
+  // applied.
+  string issuer = 2;
+
+  // Optional. When set (non-empty), the token's `aud` must contain this
+  // value, and a token omitting `aud` is rejected. When unset, no audience
+  // check is applied.
+  string audience = 3;
+
+  // The static key set. Must contain at least one key: a provider with no
+  // keys verifies nothing and therefore refuses everything it claims, which
+  // is a misconfiguration, not a fail-closed policy.
+  repeated JwtKey keys = 4;
+
+  // Optional. Maps a verified token's tenant-claim VALUE to the llm-proxy
+  // tenant to admit it as (e.g. an Entra `tid` -> `acme`). When empty, the
+  // claim value is used directly as the tenant. When non-empty, a verified
+  // token whose claim value appears in no entry is rejected
+  // (`JwtTenantNotMapped`): a non-empty map means "only these mappings",
+  // so an arbitrary issuer-side value (any Entra tenant's `tid`) can never
+  // become an implicitly trusted llm-proxy tenant.
+  map<string, string> tenant_values = 5;
+
+  // Optional. OIDC discovery URL for this provider (e.g. an Entra tenant's
+  // `.../v2.0/.well-known/openid-configuration`). When set, a background
+  // thread fetches the discovery document, follows its `jwks_uri`, and
+  // republishes the key set every `refresh_interval_seconds` -- request
+  // workers never fetch. Must use the `https` scheme. When set, `keys` above
+  // may be empty (the first refresh populates the set; until then every JWT
+  // for this provider is refused); without it, `keys` must be non-empty.
+  string discovery_url = 6;
+
+  // How often the background JWKS refresh runs, in seconds. `0` (proto3's
+  // implicit default) means the built-in default of 600 seconds. Only read
+  // when `discovery_url` is set. A snapshot older than six consecutive
+  // missed refreshes is refused rather than served (`JwtJwksStale`).
+  uint32 refresh_interval_seconds = 7;
+
+  // Optional. PEM bundle of CA certificates to trust for the discovery and
+  // JWKS fetches, instead of the system roots (e.g. a TLS-intercepting
+  // enterprise proxy, or a test CA). Same `DataSource` shape and
+  // `filename`/`inline_string`-only rule as `hmac_secret`.
+  envoy.config.core.v3.DataSource trusted_ca = 8;
+
+  // Optional claim identifying the individual or workload principal. When
+  // configured, it is combined with issuer and tenant to form the stable
+  // accounting identity; use Entra's `oid` for workforce tokens. Without it,
+  // legacy `kid` identity remains for compatibility.
+  string subject_claim = 9;
+}
+
+// One RSA public key in a `JwtProvider`'s static set, as base64url-encoded
+// `n`/`e` text (the JWKS document's own encoding). The filter decodes both
+// at config load; undecodable text is a load error naming its dotted path.
+message JwtKey {
+  // Required. Selects this key at verification time against a token's `kid`
+  // header. Must be unique within its provider.
+  string kid = 1;
+
+  // Required. RSA modulus, base64url (RFC 4648 §5) without padding.
+  string n = 2;
+
+  // Required. RSA public exponent, base64url (RFC 4648 §5) without padding.
+  string e = 3;
 }
