@@ -62,6 +62,9 @@ export function Overview({ conn }: { conn: AdminConn }) {
   const [modelsBusy, setModelsBusy] = useState(false)
 
   const authed = !!conn.token
+  // Vite serves the UI under /ui/ but does not serve the Rust admin API. An
+  // empty URL is valid for the embedded production UI, not the dev server.
+  const needsAdminUrl = import.meta.env.DEV && !conn.adminUrl.trim()
   const keysPath = scopedWritePath('/keys', conn.chainPrefix)
 
   async function refresh() {
@@ -114,13 +117,21 @@ export function Overview({ conn }: { conn: AdminConn }) {
     }
   }
 
-  // Models are ungated, so they load with the page. Keys are bearer-gated:
-  // load as soon as a token exists, and drop the list when it is removed so a
-  // stale inventory is never shown as if it were current.
+  // Models are ungated, so production can load them from the same-origin admin
+  // server immediately. In Vite development, wait for an explicit Admin URL:
+  // otherwise the request targets Vite itself and produces a misleading 404.
   useEffect(() => {
+    if (import.meta.env.DEV && !conn.adminUrl.trim()) {
+      setModelsRes(null)
+      setModelRows(null)
+      return
+    }
     void loadModels()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [conn.adminUrl])
+
+  // Keys are bearer-gated: load as soon as a token exists, and drop the list
+  // when it is removed so a stale inventory is never shown as if it were current.
   useEffect(() => {
     if (conn.token) {
       void loadKeys()
@@ -140,8 +151,13 @@ export function Overview({ conn }: { conn: AdminConn }) {
           <CardTitle>Status</CardTitle>
         </CardHeader>
         <CardContent>
+          {needsAdminUrl && (
+            <p className="mb-3 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              Set an Admin URL in the header to query a running admin server while using Vite.
+            </p>
+          )}
           <div className="mb-3 flex items-center gap-2">
-            <Button size="sm" variant="outline" onClick={refresh} disabled={busy}>
+            <Button size="sm" variant="outline" onClick={refresh} disabled={busy || needsAdminUrl}>
               <RefreshCw size={14} /> {busy ? 'Loading...' : 'Refresh'}
             </Button>
             {ready && (
@@ -176,7 +192,7 @@ export function Overview({ conn }: { conn: AdminConn }) {
               <option value="prometheus">GET /stats/prometheus</option>
               <option value="text">GET /stats (404 when unwired)</option>
             </select>
-            <Button size="sm" variant="outline" onClick={loadStats}>
+            <Button size="sm" variant="outline" onClick={loadStats} disabled={needsAdminUrl}>
               Load
             </Button>
           </div>
@@ -247,7 +263,7 @@ export function Overview({ conn }: { conn: AdminConn }) {
         <CardHeader>
           <div className="flex items-center justify-between">
             <CardTitle>Models (GET /models)</CardTitle>
-            <Button size="sm" variant="outline" onClick={loadModels} disabled={modelsBusy}>
+            <Button size="sm" variant="outline" onClick={loadModels} disabled={modelsBusy || needsAdminUrl}>
               <RefreshCw size={14} /> {modelsBusy ? 'Loading...' : 'Refresh'}
             </Button>
           </div>
