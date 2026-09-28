@@ -47,3 +47,10 @@ testing/diffrig/captures/
 
 admin-ui/node_modules/
 admin-ui/dist/
+
+# Browser-automation output: the Playwright/browse bridge drops console logs
+# and page snapshots at the repository root whenever a session drives the
+# admin UI from here. Tool output, not repo content -- left alone it shows up
+# as untracked noise in `git status`, and it reappears as soon as the next
+# session starts, so ignoring it beats repeatedly deleting it.
+.playwright-mcp/
