@@ -1,40 +1,62 @@
+<div align="center">
+
 # llm-proxy
 
-One static binary and one YAML file between your applications and your model
-providers, so token metering, budgets, authentication, failover, and access
-logging happen in one place instead of in every service that calls a model.
+### One static binary and one YAML file between your applications and your model providers.
 
-It is an Envoy-shaped proxy specialised for LLM traffic. The data plane is
-Envoy's — listeners, filter chains, clusters, load balancers, health checking,
-outlier detection, retries, xDS — and the LLM parts (token accounting, spend
-budgets, provider dialects, per-tenant quotas) are filters and cluster policy on
-top of it, not a parallel system.
+**llm-proxy** puts token metering, budgets, authentication, failover, and access
+logging in one place instead of in every service that calls a model. It is a
+full proxy data plane specialised for LLM traffic: the core is general-purpose
+and production-grade — listeners, filter chains, clusters, load balancers,
+health checking, outlier detection, retries, xDS — and the LLM parts (token
+accounting, spend budgets, provider dialects, per-tenant quotas) are filters
+and cluster policy on top of it, not a parallel system.
 
-**Status: pre-1.0.** `v0.2.0` is the current tag; `v0.3.0` (dynamic
-configuration) is in progress. The data plane serves real traffic and is covered
-by **1868 tests**. Interfaces still change between releases and there are no
-backports to earlier tags. Read [What is not built yet](#what-is-not-built-yet)
-before you depend on it — that section is deliberately specific.
+[![CI](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+![Version: v0.2.0](https://img.shields.io/badge/version-v0.2.0-blue.svg)
+![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)
+![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
+
+</div>
+
+```sh
+cargo run -p proxy -- --config examples/llmproxy-ollama.yaml            # serve, against a local Ollama
+cargo run -p proxy -- --config examples/llmproxy.yaml --mode validate   # check a configuration; exit
+cargo run -p proxy -- --config examples/llmproxy.yaml --mode translate  # print the data-plane bootstrap it lowers to
+```
+
+> [!NOTE]
+> **The data plane serves real traffic and is covered by 1,868 tests.**
+> `v0.2.0` is the current tag; `v0.3.0` (dynamic configuration) is in progress.
+> Interfaces still change between releases and there are no backports to earlier
+> tags. Read [What is not built yet](#what-is-not-built-yet) before you depend
+> on it — that section is deliberately specific — and
+> [Roadmap](#roadmap) for where each release stands.
+
+---
 
 ## Why this shape
 
 Two design decisions explain most of the code.
 
-**Envoy semantics, not an Envoy-inspired approximation.** The proxy reads a
-standard Envoy bootstrap and speaks xDS. Response flags, access-log operators,
-retry-on conditions, outlier ejection, cluster warming — these follow Envoy's
-documented behaviour rather than a convenient reinterpretation of it, so
-operators who already run Envoy do not have to learn a second set of rules, and
-divergences have to be argued for in writing (`internal-docs/envoy-divergences.md`).
+**Real data-plane semantics, not an approximation.** The proxy reads a
+standard proxy bootstrap configuration and speaks xDS — the config format and
+protocol the industry's mainstream data planes use. Response flags, access-log
+operators, retry-on conditions, outlier ejection, cluster warming — these
+follow that ecosystem's documented behaviour rather than a convenient
+reinterpretation of it, so operators who already run one of these data planes
+do not have to learn a second set of rules, and divergences have to be argued
+for in writing (`internal-docs/` keeps the divergence log).
 
-**A small LLM-native dialect that lowers onto it.** Nobody wants to write an
-Envoy bootstrap to put a rate limit in front of OpenAI. `--config` takes a
-compact dialect — providers, routes, limits — which lowers to standard Envoy
-resources and then flows through the identical parse → validate → IR pipeline as
-bootstrap mode. `--mode translate` prints exactly what it lowered to. The rule
-that keeps this honest: **a capability must exist in the Envoy-mode surface
-before the dialect may expose it.** The dialect is a front end, never a second
-config system.
+**A small LLM-native dialect that lowers onto it.** Nobody wants to write a
+full data-plane bootstrap to put a rate limit in front of OpenAI. `--config`
+takes a compact dialect — providers, routes, limits — which lowers to standard
+data-plane resources and then flows through the identical parse → validate → IR
+pipeline as bootstrap mode. `--mode translate` prints exactly what it lowered
+to. The rule that keeps this honest: **a capability must exist in the
+bootstrap-mode surface before the dialect may expose it.** The dialect is a
+front end, never a second config system.
 
 Both surfaces are **strict**. An unknown or misspelled field is an error
 carrying its full dotted path, never a silent no-op — a silently ignored field
@@ -72,10 +94,11 @@ and did not is worse than no limit at all.
  side channels
  ─────────────
  admin :9901   read:  /ready /config_dump /clusters /server_info
-                      /stats /stats/prometheus /models
-               write: /keys /tenants /tenants/{id}/policy|budget
-                      GET /keys lists the keys, same gate as the writes
-                      (bearer-gated; no token means 403, never open)
+                       /stats /stats/prometheus /models
+                write: /keys /tenants /tenants/{id}/policy|budget
+                       GET /keys lists the keys, same gate as the writes
+                       (bearer-gated; no token means 403, never open)
+                ui:    /ui — single-page admin console over the same API
  logs          access logs with tokens, TTFT, TPOT, response flags
  traces        OTLP, W3C traceparent propagated
  config        SIGHUP reload, or xDS from a control plane
@@ -90,116 +113,128 @@ provider on failover. That has been a real key-disclosure bug here twice.
 
 ## What it does today
 
-**Speaks your provider's API.** OpenAI Chat Completions, OpenAI Responses, and
-Anthropic Messages. Point an existing client at llm-proxy by changing its base
-URL; requests and responses pass through unchanged.
+- **Speaks your provider's API.** OpenAI Chat Completions, OpenAI Responses, and
+  Anthropic Messages. Point an existing client at llm-proxy by changing its base
+  URL; requests and responses pass through unchanged.
 
-**Streams properly.** Server-sent events are forwarded as they arrive, and the
-proxy never injects frames of its own into a stream. An unclean end of stream
-stays unclean, because inventing a well-formed ending would hide a real failure
-from the client.
+- **Streams properly.** Server-sent events are forwarded as they arrive, and the
+  proxy never injects frames of its own into a stream. An unclean end of stream
+  stays unclean, because inventing a well-formed ending would hide a real failure
+  from the client.
 
-**Meters tokens.** Input, output, and separately-priced buckets are read from
-provider responses, for streaming and non-streaming requests alike, and land in
-the access log.
+- **Meters tokens.** Input, output, and separately-priced buckets are read from
+  provider responses, for streaming and non-streaming requests alike, and land in
+  the access log.
 
-**Enforces token budgets.** A tenant over its limit gets a 429 with
-`x-ratelimit-*` headers before the request reaches a provider. A request already
-in flight is never cut short. Limits are keyed to the authenticated tenant, so
-changing a header does not buy a fresh quota. A tenant can read its own
-current-window standing at `GET /v1/usage`, scoped to the key it presented —
-never to a tenant it names itself.
+- **Enforces token budgets.** A tenant over its limit gets a 429 with
+  `x-ratelimit-*` headers before the request reaches a provider. A request already
+  in flight is never cut short. Limits are keyed to the authenticated tenant, so
+  changing a header does not buy a fresh quota. A tenant can read its own
+  current-window standing at `GET /v1/usage`, scoped to the key it presented —
+  never to a tenant it names itself.
 
-**Enforces spend budgets.** Token counts are priced from an integer micro-USD
-table and charged against a per-tenant ceiling; over it, a 429 with
-`spend_budget_exceeded`. Cost is only knowable when a response ends, so the
-request that crosses the line is admitted and the *next* one is refused —
-overspend is bounded by one request, never unbounded.
+- **Enforces spend budgets.** Token counts are priced from an integer micro-USD
+  table and charged against a per-tenant ceiling; over it, a 429 with
+  `spend_budget_exceeded`. Cost is only knowable when a response ends, so the
+  request that crosses the line is admitted and the *next* one is refused —
+  overspend is bounded by one request, never unbounded.
 
-**Authenticates callers.** Virtual keys verified with HMAC-SHA256 in constant
-time. Authentication fails closed: with an `auth` block configured, a request
-with no recognised credential is refused rather than admitted anonymously.
+- **Authenticates callers.** Virtual keys verified with HMAC-SHA256 in constant
+  time. Authentication fails closed: with an `auth` block configured, a request
+  with no recognised credential is refused rather than admitted anonymously.
 
-**Authorizes models.** A tenant can be restricted to named models and exclude
-specific models from that grant. The effective access is allow minus deny,
-enforced before routing. It fails closed on an unauthenticated request and
-defaults to all models for an authenticated tenant with no policy.
+- **Authorizes models.** A tenant can be restricted to named models and exclude
+  specific models from that grant. The effective access is allow minus deny,
+  enforced before routing. It fails closed on an unauthenticated request and
+  defaults to all models for an authenticated tenant with no policy.
 
-**Mints and revokes keys at runtime.** A bearer-gated admin write API creates
-tenants, mints and revokes virtual keys, and sets per-tenant policies and
-budgets, against an in-memory, embedded (redb), or shared (Redis) control-plane
-store. Revocation takes effect on the auth path without a restart.
+- **Mints and revokes keys at runtime.** A bearer-gated admin write API creates
+  tenants, mints and revokes virtual keys, and sets per-tenant policies and
+  budgets, against an in-memory, embedded (redb), or shared (Redis) control-plane
+  store. Revocation takes effect on the auth path without a restart.
 
-**Fails over between providers.** A route can name an ordered list; if the
-primary fails, the next is tried, with retries, retry budgets, and per-try
-timeouts. Every provider in a chain must speak the same wire format, and a chain
-that mixes formats is rejected when the configuration loads rather than at
-request time.
+- **Fails over between providers.** A route can name an ordered list; if the
+  primary fails, the next is tried, with retries, retry budgets, and per-try
+  timeouts. Every provider in a chain must speak the same wire format, and a chain
+  that mixes formats is rejected when the configuration loads rather than at
+  request time.
 
-**Keeps bad upstreams out of rotation.** Active health checks and outlier
-detection eject hosts that fail, with the ejection visible in `/clusters` and in
-the access log's response flags. Circuit breakers bound connections, pending
-requests, and in-flight requests per cluster.
+- **Keeps bad upstreams out of rotation.** Active health checks and outlier
+  detection eject hosts that fail, with the ejection visible in `/clusters` and in
+  the access log's response flags. Circuit breakers bound connections, pending
+  requests, and in-flight requests per cluster.
 
-**Terminates TLS.** Listener TLS from the dialect; mTLS, SAN matchers, and dual
-certificates from the Envoy surface.
+- **Terminates TLS.** Listener TLS from the dialect; mTLS, SAN matchers, and dual
+  certificates from the bootstrap surface.
 
-**Tunnels HTTP upgrades.** A WebSocket `Upgrade` — the shape several providers'
-realtime APIs use — passes through byte for byte once the upstream accepts it.
-Bootstrap configuration only; `upgrade_configs` is not reachable from the
-dialect.
+- **Tunnels HTTP upgrades.** A WebSocket `Upgrade` — the shape several providers'
+  realtime APIs use — passes through byte for byte once the upstream accepts it.
+  Bootstrap configuration only; `upgrade_configs` is not reachable from the
+  dialect.
 
-**Tells you what it is doing.** Access logs with token counts,
-time-to-first-token, time-per-output-token, and Envoy response flags. OTLP
-traces with W3C `traceparent` propagation. An admin endpoint serving `/ready`,
-`/config_dump`, `/clusters`, `/server_info`, `/stats`, `/stats/prometheus`
-and the model inventory `/models` unauthenticated, and the control-plane
-writes plus the `GET /keys` key inventory behind a bearer token — unset
-means 403, never open.
+- **Tells you what it is doing.** Access logs with token counts,
+  time-to-first-token, time-per-output-token, and standard response flags. OTLP
+  traces with W3C `traceparent` propagation. An admin endpoint serving `/ready`,
+  `/config_dump`, `/clusters`, `/server_info`, `/stats`, `/stats/prometheus`
+  and the model inventory `/models` unauthenticated, and the control-plane
+  writes plus the `GET /keys` key inventory behind a bearer token — unset
+  means 403, never open. A single-page admin console at `/ui` drives the same
+  API.
 
-**Survives operations.** Configuration reloads on SIGHUP — and a configuration
-that fails to parse leaves the previous one serving, with the error logged
-against its exact field path. SIGTERM drains connections instead of dropping
-them. A config swap under live traffic is covered by a differential test that
-asserts every in-flight SSE stream still reaches its terminal frame.
+- **Survives operations.** Configuration reloads on SIGHUP — and a configuration
+  that fails to parse leaves the previous one serving, with the error logged
+  against its exact field path. SIGTERM drains connections instead of dropping
+  them. A config swap under live traffic is covered by a differential test that
+  asserts every in-flight SSE stream still reaches its terminal frame.
 
-**Takes configuration from a control plane.** ADS state-of-the-world for
-clusters, listeners, and endpoints, with correct ACK/NACK, reconnect with
-backoff, and last-good config retained on failure. Conformance is checked
-against go-control-plane (`make xds-conformance`), not only against our own
-harness — a harness we wrote both sides of cannot catch us agreeing with
-ourselves and both being wrong. See
-[What is not built yet](#what-is-not-built-yet) for how far this goes today.
+- **Takes configuration from a control plane.** ADS state-of-the-world for
+  clusters, listeners, and endpoints, with correct ACK/NACK, reconnect with
+  backoff, and last-good config retained on failure. Conformance is checked
+  against go-control-plane (`make xds-conformance`), not only against our own
+  harness — a harness we wrote both sides of cannot catch us agreeing with
+  ourselves and both being wrong. See [Roadmap](#roadmap) for where v0.3.0
+  stands.
 
 ## Build
 
 Requires a Rust toolchain and `protoc` (`brew install protobuf`, or
-`apt install protobuf-compiler`).
+`apt install protobuf-compiler`). The result is a single static binary,
+`llm-proxy`, with no runtime dependencies.
 
 ```sh
-cargo build --workspace
-make ci          # fmt, clippy, tests, doctests, qa — what CI enforces
-make tq          # the whole test suite via nextest
+git clone https://github.com/ergonlabs-io/llm-proxy.git
+cd llm-proxy
+cargo build --workspace          # -> target/debug/llm-proxy
+make ci                          # fmt, clippy, tests, doctests, qa — what CI enforces
+make tq                          # the whole test suite via nextest
 ```
 
-## Try it
+## Quick start
 
-`examples/llmproxy-ollama.yaml` runs against a local Ollama and needs no API
-keys or environment variables:
+**1. Check the configuration without starting anything.**
 
 ```sh
-# Check the configuration without starting anything.
 cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode validate
 # configuration 'examples/llmproxy-ollama.yaml' OK (1 listener(s), 1 cluster(s), 0 warning(s))
-
-# See what it lowers to.
-cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode translate
-
-# Serve.
-cargo run -p proxy -- --config examples/llmproxy-ollama.yaml
 ```
 
-Then send it an ordinary OpenAI-shaped request on the port the file lists.
+`examples/llmproxy-ollama.yaml` runs against a local Ollama and needs no API
+keys or environment variables. `--mode validate` warns about any field that
+parses but is not yet enforced, so a configuration that says more than the proxy
+does tells you at load time rather than in production.
+
+**2. See what it lowers to.**
+
+```sh
+cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode translate
+```
+
+**3. Serve, and send it an ordinary OpenAI-shaped request** on the port the file
+lists:
+
+```sh
+cargo run -p proxy -- --config examples/llmproxy-ollama.yaml
+```
 
 A useful configuration is small:
 
@@ -226,10 +261,6 @@ limits:
     tokens_per_minute: 100k
 ```
 
-`--mode validate` warns about any field that parses but is not yet enforced, so
-a configuration that says more than the proxy does tells you at load time rather
-than in production.
-
 `examples/llmproxy.yaml` is the annotated version of the same file, and
 `schema/llmproxy-v0.schema.json` is the authority on every field — editors that
 understand `yaml-language-server` autocomplete against it.
@@ -239,9 +270,9 @@ understand `yaml-language-server` autocomplete against it.
 | Flag | Format |
 |---|---|
 | `--config PATH` | The LLM-native dialect. Always strict. |
-| `-c, --config-path PATH` | An Envoy bootstrap (`.yaml`/`.json`/`.pb`). Strict unless `--permissive`. |
+| `-c, --config-path PATH` | A data-plane bootstrap (`.yaml`/`.json`/`.pb`). Strict unless `--permissive`. |
 
-Bootstrap mode is where the full Envoy surface lives, including
+Bootstrap mode is where the full standard surface lives, including
 `dynamic_resources` for xDS. Dialect mode covers the common gateway shape and
 lowers onto it.
 
@@ -251,7 +282,7 @@ lowers onto it.
 |---|---|
 | `--mode serve` | Run the proxy. The default. |
 | `--mode validate` | Check a configuration and exit. |
-| `--mode translate` | Print the Envoy bootstrap a `--config` dialect file lowers to. |
+| `--mode translate` | Print the data-plane bootstrap a `--config` dialect file lowers to. |
 | `--mode keygen` | Print a fresh virtual key and its digest. Needs `--tenant` and `--hmac-secret-file`; touches no configuration file. |
 
 ## Measured capacity
@@ -274,6 +305,22 @@ gate p99 ≤ 6900 ms and TTFT p99 ≤ 1000 ms. 80,507 requests over 20 levels on
 Full method, the not-harness-bound argument, and what is *not* saturated:
 `internal-docs/capacity/README.md`. Reproduce with `make sweep`.
 
+## Roadmap
+
+| Release | Theme | |
+|---|---|---|
+| **v0.0.1** | First light — pass-through to OpenAI and Anthropic, streaming and not | Shipped 2026-08-01 |
+| **v0.1.0** | LLM gateway — token metering, rate limits, provider failover | Shipped 2026-08-08 |
+| **v0.2.0** | Production-ready serving — capacity report, admin endpoints, swap-under-load | Shipped 2026-08-29 |
+| **v0.3.0** | Dynamic configuration — ADS/xDS | In progress |
+| **v0.4.0** | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Planned |
+| **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
+
+Ship gates, evidence, and deliberate caveats for each release:
+[`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md). The v0.4.0 gate is
+a corpus scorecard that climbs only when real-world bootstrap configs stop being
+rejected — it cannot be gamed by adding tests.
+
 ## What is not built yet
 
 Stated plainly, because a feature list without this is not much use:
@@ -288,10 +335,12 @@ Stated plainly, because a feature list without this is not much use:
   local plaintext servers. Upgrade requests bypass the cache by design.
 - **Dynamic configuration is partial.** CDS, LDS, RDS, SDS, and EDS are wired.
   RDS-dependent and replacement listeners warm while last-good generations keep
-  serving, and ADS initial-fetch timeout is honored. Delta xDS, file transport,
-  init-manager sequencing, and full 5k-rps differential rename-churn verification
-  remain open (`v0.3.0`). SDS supports downstream certificate and validation-context
-  delivery with inline data sources. Static config plus SIGHUP remains supported.
+  serving, and ADS initial-fetch timeout is honored. Delta xDS runs end to end
+  for strict incremental updates; file transport, init-manager sequencing, SDS
+  removal, and full 5k-rps differential rename-churn verification remain open
+  (`v0.3.0`). SDS supports downstream certificate and validation-context
+  delivery with inline data sources. Static config plus SIGHUP remains
+  supported.
 - **File-sourced credentials and certificates are read once.** `api_key_file`,
   `hmac_secret_file`, `cert_file`/`key_file` take effect on restart or SIGHUP —
   nothing watches them. Changing the control-plane store spec or its poll
@@ -300,7 +349,7 @@ Stated plainly, because a feature list without this is not much use:
   closed, and so does model authz for an unauthenticated request — but an
   authenticated tenant absent from the policy snapshot is allowed everything.
   There is no per-provider authorization.
-- **Model authz and spend budgets are Envoy-bootstrap only.** Neither filter is
+- **Model authz and spend budgets are bootstrap-mode only.** Neither filter is
   in the chain the `llmproxy` dialect lowers to.
 - **Spend ceilings are enforced per process.** N replicas means N ceilings, even
   with a shared store.
@@ -313,7 +362,7 @@ Stated plainly, because a feature list without this is not much use:
   tenant, or on the `authorization` header when there is none, so only
   `key: tenant` and `key: header:authorization` do anything. All of these warn
   at load rather than failing silently.
-- **Token-usage metrics do not appear on `/stats`.** They have no Envoy
+- **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
 - **`--drain-strategy` has no effect.** It is accepted and warns at startup.
 - **No embeddings and no `/v1/models` handling.** A request to any other path
@@ -339,7 +388,8 @@ crates/
   proxy-observability/    stats registry, access-log formatter, OTLP
   proxy-admin/            the admin server
   proxy-xds/              xDS client: subscriptions, ACK/NACK, backoff
-  proxy-api/              generated Envoy v3 protos (the only place)
+  proxy-api/              generated data-plane API protos (the only place)
+admin-ui/                 the single-page admin console served at /ui
 docs/site/                Astro Starlight user documentation
 examples/                 runnable configurations
 schema/                   llmproxy-v0.schema.json — normative for the dialect
@@ -355,6 +405,25 @@ getting started, the configuration reference, providers and routing,
 authentication, limits and budgets, observability, and operations. Build it with
 `make docs-build`, or run it locally with `make docs-dev`. It is not published to
 a public URL yet.
+
+## Development
+
+The Makefile is the entry point; `make help` lists every target.
+
+```sh
+make tq-changed        # changed crates only — the default edit loop
+make tq-<crate>        # one crate, e.g. make tq-proxy-http
+make tq                # full workspace via nextest
+make tq-doc            # doctests (nextest does not run them)
+make ci                # fmt, clippy, tests, doctests, and QA — what CI enforces
+make validate          # load examples/tcp-proxy.yaml
+make xds-conformance   # xDS behaviour against a real go-control-plane server
+make sweep             # the capacity sweep behind the numbers above
+```
+
+Release gates, work packages, and architecture decision records are in
+`internal-docs/`; contribution conventions are summarised in
+[`AGENTS.md`](AGENTS.md).
 
 ## Contributing and security
 
