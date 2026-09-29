@@ -1582,11 +1582,15 @@ async fn initial_fetch_timeout_marks_ready_live_without_warming_an_eds_cluster()
     .expect("write config");
 
     let (mut child, stderr_rx) = spawn_proxy(&config_path);
-    assert!(
-        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
-        "listener at {listener_addr} did not bind in time; stderr so far: {:?}",
-        drain_available_lines(&stderr_rx)
-    );
+
+    // Observation order is forced by the boot sequence: the admin server is
+    // started BEFORE the gated worker pool, while the listener can only bind
+    // once the startup gate releases -- and with a never-fed EDS cluster the
+    // gate releases exactly when the warming deadline expires. Waiting for
+    // the listener first (as this test once did) blocks until AFTER the
+    // deadline, making the INITIALIZING phase structurally unobservable and
+    // the first assertion a guaranteed failure. Poll admin, which is up
+    // while the deadline is still in force.
     assert!(
         wait_for_connectable(("127.0.0.1", admin_port), STARTUP_TIMEOUT),
         "admin at {admin_addr} did not bind in time; stderr so far: {:?}",
@@ -1603,7 +1607,13 @@ async fn initial_fetch_timeout_marks_ready_live_without_warming_an_eds_cluster()
         "expected Envoy-compatible initializing body before timeout, got:\n{before_timeout}"
     );
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // The gate's 200ms deadline expiring is what lets the listener bind, so
+    // this wait doubles as "wait past the timeout" -- no fixed sleep needed.
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "listener at {listener_addr} did not bind after the warming deadline; stderr so far: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
 
     let after_timeout = get(admin_addr, "/ready", "admin.local");
     assert!(

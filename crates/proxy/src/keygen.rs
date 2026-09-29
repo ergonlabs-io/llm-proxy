@@ -105,15 +105,32 @@ pub fn run(tenant: &str, key_id: &str, hmac_secret_file: Option<&PathBuf>) -> Re
 mod tests {
     use super::*;
 
+    // Rust note: `std::env::set_var`/`remove_var` mutate PROCESS-GLOBAL state,
+    // and `cargo test` runs `#[test]` fns on separate threads by default.
+    // Both tests below touch `SECRET_ENV_VAR` (one sets it, the other asserts
+    // it is absent), so without this lock they race: the "neither source is
+    // set" test could observe the other test's `env-secret` mid-flight and
+    // "pass" a resolution that should have errored -- or fail, depending on
+    // thread timing. An edge here must not make CI a coin flip (ground rule:
+    // a flaky test is a broken test).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Held for the whole body of each env-touching test. `into_inner` on
+    /// poisoning so one test's panic does not cascade "dead" locks into the
+    /// others -- the `()` payload guards nothing but ordering.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn resolve_secret_prefers_file_over_env_var() {
-        // Rust note: `std::env::set_var`/`remove_var` are process-global, so
-        // this test is written to leave the var exactly as it found it
-        // (removed) even on an early `expect` panic -- there's no other test
-        // in this crate that reads `LLMPROXY_AUTH_SECRET`, but the CLI
-        // integration tests under `tests/` spawn a fresh process each time,
-        // so they don't inherit whatever this in-process test leaves behind
-        // either way.
+        let _env_guard = lock_env();
+        // Written to leave the var exactly as it found it (removed) even on an
+        // early `expect` panic -- the CLI integration tests under `tests/`
+        // spawn a fresh process each time, so they never inherit whatever
+        // this in-process test leaves behind either way.
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "llm-proxy-keygen-unit-test-secret-{}.txt",
@@ -134,6 +151,7 @@ mod tests {
 
     #[test]
     fn resolve_secret_errors_clearly_when_neither_source_is_set() {
+        let _env_guard = lock_env();
         std::env::remove_var(SECRET_ENV_VAR);
         let err = resolve_secret(None).expect_err("no secret configured must be an error");
         assert!(err.contains(SECRET_ENV_VAR));
