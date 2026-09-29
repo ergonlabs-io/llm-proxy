@@ -11,7 +11,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Work toward **v0.3.0** (ADS/xDS) is in progress. The proxy now connects to an ADS control plane,
+Follow-up work for the v0.3.0 dynamic-configuration gate.
+
+## [0.3.0] - 2026-09-29
+
+This release advances **v0.3.0** (ADS/xDS). The proxy now connects to an ADS control plane,
 ACKs/NACKs strict LDS/CDS/RDS/SDS/EDS resources, applies accepted snapshots, reconnects with
 resync, and gates readiness/request admission on cluster warming. Named RDS delivery warms
 dependent listeners; replacement listeners retain last-good generations until warm, and ADS

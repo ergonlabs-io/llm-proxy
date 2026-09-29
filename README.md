@@ -14,7 +14,7 @@ and cluster policy on top of it, not a parallel system.
 
 [![CI](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Version: v0.2.0](https://img.shields.io/badge/version-v0.2.0-blue.svg)
+![Version: v0.3.0](https://img.shields.io/badge/version-v0.3.0-blue.svg)
 ![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
@@ -28,7 +28,7 @@ cargo run -p proxy -- --config examples/llmproxy.yaml --mode translate  # print 
 
 > [!NOTE]
 > **The data plane serves real traffic and is covered by 1,868 tests.**
-> `v0.2.0` is the current tag; `v0.3.0` (dynamic configuration) is in progress.
+> `v0.3.0` is the current release; dynamic configuration remains partially complete.
 > Interfaces still change between releases and there are no backports to earlier
 > tags. Read [What is not built yet](#what-is-not-built-yet) before you depend
 > on it — that section is deliberately specific — and
@@ -218,7 +218,7 @@ curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts
 ```
 
 The installer detects the operating system and CPU architecture and installs to
-`~/.local/bin/llm-proxy`. Set `LLM_PROXY_VERSION=v0.2.0` to pin a release or
+`~/.local/bin/llm-proxy`. Set `LLM_PROXY_VERSION=v0.3.0` to pin a release or
 `LLM_PROXY_INSTALL_DIR=/usr/local/bin` to choose another destination.
 
 ## Quick start
@@ -324,7 +324,7 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.0.1** | First light — pass-through to OpenAI and Anthropic, streaming and not | Shipped 2026-08-01 |
 | **v0.1.0** | LLM gateway — token metering, rate limits, provider failover | Shipped 2026-08-08 |
 | **v0.2.0** | Production-ready serving — capacity report, admin endpoints, swap-under-load | Shipped 2026-08-29 |
-| **v0.3.0** | Dynamic configuration — ADS/xDS | In progress |
+| **v0.3.0** | Dynamic configuration — ADS/xDS | Released 2026-09-29; gate follow-up remains |
 | **v0.4.0** | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Planned |
 | **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
 
