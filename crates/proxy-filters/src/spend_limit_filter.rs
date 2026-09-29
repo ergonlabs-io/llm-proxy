@@ -1,7 +1,7 @@
 //! WP-50 increment 3c-iii-b / WP-64 — wires [`crate::spend`]'s price table,
 //! per-key spend accumulator, and per-key budget into a real decode/encode
 //! `HttpFilter`: `llmproxy.spend_limit`. See
-//! `internal-docs/wp-50-3c-spend-budgets.md`'s "3c-iii" section, normative
+//! `internal-docs/IMPLEMENTATION_PLAN.md`'s "3c-iii" section, normative
 //! here.
 //!
 //! # The check/record split is inherent, not a shortcut -- restated from

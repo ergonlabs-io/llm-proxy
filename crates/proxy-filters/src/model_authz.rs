@@ -3,7 +3,7 @@
 //! This module answers one question: **given a tenant's [`crate::auth::TenantPolicy`],
 //! is a requested model permitted?** It does not touch `HttpFilter`, proto
 //! decoding, or `StreamInfo` — those are [`crate::model_authz_filter`]. See
-//! `internal-docs/wp-50-inc3-design-brief.md`'s "3a" section, which is
+//! `internal-docs/IMPLEMENTATION_PLAN.md`'s "3a" section, which is
 //! normative here.
 //!
 //! # Matching rule: exact match, or one trailing `*` glob — no regex

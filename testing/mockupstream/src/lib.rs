@@ -25,8 +25,7 @@
 //! - [`profiles`]: named per-request distributions for TTFT, inter-token
 //!   delay, and streamed length (`mock-fast-short`/`mock-medium`/
 //!   `mock-slow-long` built in, `--profiles <file>` to add/override),
-//!   selected by the request's `model` -- see
-//!   `internal-docs/scale-test-plan.md` §3/§5.
+//!   selected by the request's `model`.
 //! - [`handler`]: routes `POST /v1/chat/completions`, `POST /v1/messages`,
 //!   `GET /health`, turns anything else into a 404, and draws each
 //!   request's timing/length from its resolved profile.

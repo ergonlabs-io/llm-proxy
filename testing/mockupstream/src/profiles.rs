@@ -1,8 +1,8 @@
 //! Named response profiles: per-profile distributions for TTFT, inter-token
 //! delay, and streamed length, selected by the request's `model` string.
 //!
-//! See `internal-docs/scale-test-plan.md` §3/§5: a scale test needs a mix of
-//! fast/short and slow/long streams coexisting, not every stream advancing
+//! A scale test needs a mix of fast/short and slow/long streams coexisting,
+//! not every stream advancing
 //! on the same clock. A [`Profile`] is three independent [`Dist`]s; sampling
 //! one draws a `Duration`/count with `rand`, never blocks, and never
 //! allocates beyond the small `Vec` of per-token delays the caller builds
@@ -105,8 +105,8 @@ pub struct ProfileFile {
 }
 
 impl ProfileSet {
-    /// Built-in profiles matching `internal-docs/scale-test-plan.md` §5's
-    /// proposed workload mix (~60% short / 30% medium / 10% long; TTFT
+    /// Built-in profiles matching the workload mix (~60% short / 30% medium /
+    /// 10% long; TTFT
     /// 200-600ms; inter-token 10-40ms across the mix), plus the CLI-derived
     /// `default` fallback for any `model` that names none of them.
     pub fn with_builtins(default_profile: Profile) -> Self {

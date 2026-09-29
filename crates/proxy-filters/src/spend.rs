@@ -1,5 +1,5 @@
 //! WP-50 increment 3c-i — the spend-budget filter's price table, as a pure
-//! library. See `internal-docs/wp-50-3c-spend-budgets.md`, normative here.
+//! library. See `internal-docs/IMPLEMENTATION_PLAN.md`, normative here.
 //!
 //! This module answers exactly one question: **what did this request cost?**
 //! It does not touch `HttpFilter`, proto decoding, `StreamInfo`, or any
@@ -378,7 +378,7 @@ fn round_once(numerator: u128) -> u64 {
 
 // ============================================================================
 // WP-50 increment 3c-ii-b -- periods, the accumulator, and the flusher.
-// Normative: `internal-docs/wp-50-3c-spend-budgets.md`'s "3c-ii-b" section.
+// Normative: `internal-docs/IMPLEMENTATION_PLAN.md`'s "3c-ii-b" section.
 // ============================================================================
 //
 // [`PriceTable`] above answers "what did this request cost"; everything

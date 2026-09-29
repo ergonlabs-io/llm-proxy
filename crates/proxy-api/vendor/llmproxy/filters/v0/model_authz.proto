@@ -1,5 +1,5 @@
 // Per-tenant model allow-lists for the llm-proxy data plane (WP-50 increment
-// 3a). See `internal-docs/wp-50-inc3-design-brief.md`'s "3a" and "The
+// 3a). See `internal-docs/IMPLEMENTATION_PLAN.md`'s "3a" and "The
 // load-bearing seam" sections -- normative for this filter.
 //
 // Vendored for its own sake, same reasoning as `auth.proto`: a per-tenant

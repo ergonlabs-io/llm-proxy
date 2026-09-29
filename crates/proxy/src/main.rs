@@ -1105,12 +1105,11 @@ fn publish_to_workers(
 }
 
 /// Applies an already-built [`ConfigSnapshot`] to every piece of running
-/// state, in the one order that is safe. This is the shared tail end WP-20's
-/// design brief requires: `reload` below (the SIGHUP producer) is the first
+/// state, in the one order that is safe. This is the shared apply path:
+/// `reload` below (the SIGHUP producer) is the first
 /// caller, and the ADS client -- the *second* producer of `Arc<ConfigSnapshot>`,
 /// landing next -- calls this SAME function rather than reaching around it to
-/// publish on its own (`internal-docs/wp-20-design-brief.md`, "The apply path
-/// is solved, and xDS must not invent a second one").
+/// publish on its own.
 ///
 /// Order of operations, and why -- unchanged from what used to be inline in
 /// `reload`, just no longer duplicated for a second caller:

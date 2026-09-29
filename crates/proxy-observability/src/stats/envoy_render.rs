@@ -1,6 +1,6 @@
 //! WP-23 increment 3 — renders a [`Registry`] into Envoy's flat `/stats`
 //! text format, and nothing else: no Prometheus (increment 4), no OTLP
-//! (WP-51). See `docs/wp-23-stats-design-brief.md`'s Decision 4 for the
+//! (WP-51). See `internal-docs/IMPLEMENTATION_PLAN.md`'s Decision 4 for the
 //! naming rules this module implements.
 //!
 //! # Name rendering: one-to-many, and some render to nothing

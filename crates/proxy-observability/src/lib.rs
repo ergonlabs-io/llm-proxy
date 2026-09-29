@@ -11,7 +11,7 @@ pub mod sink;
 /// WP-23 increments 1–3: the stats registry core (instruments, `Handle`
 /// resolution, sharded counters/histograms) and the Envoy `/stats` text
 /// renderer (`stats::envoy_render`). Prometheus rendering (`/stats/prometheus`)
-/// lands in a later increment; see `docs/wp-23-stats-design-brief.md`.
+/// lands in a later increment; see `internal-docs/IMPLEMENTATION_PLAN.md`.
 pub mod stats;
 /// WP-51 increment 2 foundation: our own span model plus W3C `traceparent`
 /// parsing. Pure library, not wired into the request path yet.

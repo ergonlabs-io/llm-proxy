@@ -33,21 +33,21 @@
 //!     it into a real decode-path `HttpFilter` under
 //!     `type.llmproxy.dev/llmproxy.filters.v0.Authentication`. The token
 //!     limiter is not yet re-keyed onto `Principal.tenant` -- see
-//!     `docs/wp-50-auth-design-brief.md`. Increment 3a ([`model_authz`] +
+//!     `internal-docs/IMPLEMENTATION_PLAN.md`. Increment 3a ([`model_authz`] +
 //!     [`model_authz_filter`]) adds per-tenant model allow-lists: a pure
 //!     `ModelAccess`/`ModelPattern` matcher plus a decode-path `HttpFilter`
 //!     (`llmproxy.model_authz`) that must run after both `llmproxy.auth`
 //!     (needs the tenant) and `llmproxy.body_rewrite` (needs the model) --
-//!     see `internal-docs/wp-50-inc3-design-brief.md`. Increment 3b-i
+//!     see `internal-docs/IMPLEMENTATION_PLAN.md`. Increment 3b-i
 //!     ([`control`]) adds the `ControlPlaneStore` trait, an in-memory impl,
 //!     and the published `ControlPlaneSnapshot` `VirtualKeyAuthenticator` now
 //!     reads instead of a static `KeySet` -- see
-//!     `internal-docs/wp-50-3b-store-design-brief.md`. `redb` and the admin
+//!     `internal-docs/IMPLEMENTATION_PLAN.md`. `redb` and the admin
 //!     write API are 3b-ii, not built here. Increment 3c-i ([`spend`]) adds
 //!     the spend-budget filter's price table: a pure `(cluster, model)` ->
 //!     per-bucket-price lookup and the integer-micro-dollar cost function
 //!     over one request's `usage::TokenUsage` -- see
-//!     `internal-docs/wp-50-3c-spend-budgets.md`. No accumulation, no
+//!     `internal-docs/IMPLEMENTATION_PLAN.md`. No accumulation, no
 //!     enforcement, and no `HttpFilter` yet; those are 3c-ii/iii. Increment
 //!     2c-i ([`jwt_auth`]) adds a second `Authenticator`: RS256-only JWT
 //!     verification against a STATICALLY configured JWKS (no network fetch,

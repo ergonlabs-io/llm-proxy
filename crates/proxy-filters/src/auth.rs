@@ -3,7 +3,7 @@
 //! **Library only.** This module resolves an inbound request's credential to
 //! a [`Principal`] (or refuses it); it is not wired into an `HttpFilter`
 //! here, and the token limiter is not yet re-keyed onto `Principal.tenant` --
-//! both are a separate increment. See `docs/wp-50-auth-design-brief.md`,
+//! both are a separate increment. See `internal-docs/IMPLEMENTATION_PLAN.md`,
 //! which is normative and agreed with the repo owner; this module implements
 //! its increment 2a ("virtual keys, in-memory") exactly as scoped there.
 //!

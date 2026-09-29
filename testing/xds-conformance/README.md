@@ -32,7 +32,7 @@ talks to in production.
 
 - **LDS, RDS, EDS, or SDS.** The fixture serves one CDS resource. WP-20's own
   scope is CDS/LDS; RDS is WP-21's, EDS is explicitly deferred (see
-  `internal-docs/wp-20-design-brief.md`), and SDS is WP-22's.
+  `internal-docs/IMPLEMENTATION_PLAN.md`), and SDS is WP-22's.
 - **Reconnect, resync, or backoff** (`AdsClient::run`, increment 3b). This fixture
   drives exactly one stream via `AdsClient::run_once`; it does not drop the
   connection or assert on `Reconnect`'s jittered delay.

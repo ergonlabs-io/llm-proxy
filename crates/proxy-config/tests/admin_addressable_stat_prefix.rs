@@ -4,7 +4,7 @@
 //! `proxy-admin`'s `/chains/{stat_prefix}/...`). Envoy itself tolerates a
 //! duplicate `stat_prefix` everywhere (it merges stats), so a duplicate
 //! among chains that register no admin-addressable singleton must stay
-//! legal -- see `internal-docs/wp-50-3c-spend-budgets.md`'s "addressing
+//! legal -- see `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing
 //! follows Envoy" and `lower::check_admin_addressable_stat_prefixes`'s doc.
 
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};

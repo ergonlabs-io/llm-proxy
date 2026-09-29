@@ -36,7 +36,7 @@ import "envoy/config/core/v3/base.proto";
 // presents no recognized credential is refused, never admitted anonymously.
 // (Authorization is the opposite axis and defaults OPEN -- an authenticated
 // tenant with no configured policy may use every model and provider. See
-// `docs/wp-50-auth-design-brief.md`.)
+// `internal-docs/IMPLEMENTATION_PLAN.md`.)
 message Authentication {
   // Required. The operator secret that keys the HMAC over virtual keys.
   //

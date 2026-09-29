@@ -4,7 +4,7 @@
 //! resolution survive a config swap. Pure library: no HTTP, no `/stats`
 //! rendering, no Prometheus, no instrumentation call sites — rendering is
 //! increment 3 (`envoy_render`, this crate), and call sites are increment 6
-//! (`docs/wp-23-stats-design-brief.md`, which is normative for every
+//! (`internal-docs/IMPLEMENTATION_PLAN.md`, which is normative for every
 //! decision below).
 //!
 //! # Decision 1 — the hot path increments an index, not a name
@@ -71,7 +71,7 @@
 //! moment it is shared. Handles could only ever be resolved at boot, and a
 //! config swap that introduced a new cluster could never register its
 //! counters — the new cluster would serve traffic and report nothing,
-//! silently, forever. See `docs/wp-23-stats-design-brief.md`'s "Correction,
+//! silently, forever. See `internal-docs/IMPLEMENTATION_PLAN.md`'s "Correction,
 //! 2026-08-09" section for the full argument.
 //!
 //! The fix keeps the compile-time guarantee, but moves it from a *receiver*

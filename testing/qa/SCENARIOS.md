@@ -45,7 +45,7 @@ in the way:
    the router in the dialect's chain, and each route carries a
    `typed_per_filter_config` override naming its own provider's dialect — which
    is what lets one proxy meter OpenAI and Anthropic correctly from one config.
-   See `internal-docs/wp-33-design-brief.md`.
+   See `internal-docs/IMPLEMENTATION_PLAN.md`.
 
 Gap 1 was not anticipated by the code review that produced the WP-33 brief —
 an independently written black-box test found it from the outside. That is the
@@ -199,7 +199,7 @@ off the agent's judgment alone.
 ### QA-1 — Per-route token counts are correct for both providers, from one proxy and one config
 
 **Why:** this is v0.1.0's per-route dialect claim and the acceptance criterion
-in `internal-docs/wp-33-design-brief.md`. A per-listener dialect physically cannot pass
+in `internal-docs/IMPLEMENTATION_PLAN.md`. A per-listener dialect physically cannot pass
 it, which is what makes it proof rather than coverage.
 
 **Config:** `llmproxy` dialect, two providers, two routes — `gpt-*` → openai,

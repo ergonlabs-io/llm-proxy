@@ -114,7 +114,7 @@ rlimit = "0.10"
 # WP-50 increment 3b: the embedded, persistent-by-default `ControlPlaneStore`
 # (tenants/keys/policies) -- pure-Rust, ACID, single-file, no C toolchain
 # (unlike SQLite), matching the "hermetic build" property `rustls`/`ring`
-# were chosen for above. See internal-docs/wp-50-3b-store-design-brief.md's
+# were chosen for above. See internal-docs/IMPLEMENTATION_PLAN.md's
 # "redb data model" section.
 redb = "4.2"
 

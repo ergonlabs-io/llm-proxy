@@ -1,5 +1,5 @@
 //! WP-23 increment 4 — renders a [`Registry`] into Prometheus text exposition
-//! format. See `docs/wp-23-stats-design-brief.md`'s Decision 4 for the naming
+//! format. See `internal-docs/IMPLEMENTATION_PLAN.md`'s Decision 4 for the naming
 //! rules this module implements, and [`envoy_render`](super::envoy_render)
 //! for the sibling renderer this one deliberately does *not* copy the shape
 //! of (see "Names vs. labels" below).

@@ -669,7 +669,7 @@ impl SharedFactoryState {
 /// identities; a stateless filter ignores all three.
 ///
 /// WP-50 3c-ii-a split these into two fields with two different jobs, per
-/// `internal-docs/wp-50-3c-spend-budgets.md`'s "addressing follows Envoy":
+/// `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing follows Envoy":
 /// - **`scope`** KEYS singletons. It is positional, internal, and always
 ///   unique per chain build, even for two chains that would otherwise be
 ///   indistinguishable (same listener config repeated, same `stat_prefix`).

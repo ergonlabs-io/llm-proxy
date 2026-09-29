@@ -1951,7 +1951,7 @@ fn check_lane_h_filter_order(
 /// `stat_prefix` collide exactly the same as two chains on one listener).
 ///
 /// Deliberately narrow, per
-/// `internal-docs/wp-50-3c-spend-budgets.md`'s "addressing follows Envoy":
+/// `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing follows Envoy":
 /// Envoy tolerates a duplicate `stat_prefix` everywhere (it merges stats),
 /// and a duplicate among chains that register NO admin-addressable
 /// singleton must stay legal -- e.g. two `llmproxy.token_limit`-only chains

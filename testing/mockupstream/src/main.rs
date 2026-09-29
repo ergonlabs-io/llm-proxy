@@ -83,8 +83,7 @@ struct Cli {
     tokens: u32,
 
     /// Reported input token count -- shared by every profile; only output
-    /// length/timing vary per profile (see `internal-docs/scale-test-plan.md`
-    /// §3, which varies output shape, not input).
+    /// length/timing vary per profile.
     #[arg(long = "prompt-tokens", default_value_t = 10)]
     prompt_tokens: u32,
 

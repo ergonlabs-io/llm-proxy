@@ -66,7 +66,7 @@
 //! configures `llmproxy.auth`, and explicitly refuses (rather than guessing)
 //! when more than one does -- see `server::resolve_control_plane`'s doc for
 //! why guessing would be a real cross-tenant write hazard, and
-//! `internal-docs/wp-50-3c-spend-budgets.md`'s "addressing follows Envoy"
+//! `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing follows Envoy"
 //! for why `stat_prefix`, not the internal positional chain identity, is the
 //! externally-addressable name.
 //!

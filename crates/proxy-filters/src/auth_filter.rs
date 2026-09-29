@@ -2,7 +2,7 @@
 //! `HttpFilter`.
 //!
 //! **Library only** in `auth.rs`; this module is the seam that actually sits
-//! in the decode path. See `docs/wp-50-auth-design-brief.md` (normative,
+//! in the decode path. See `internal-docs/IMPLEMENTATION_PLAN.md` (normative,
 //! agreed with the repo owner) for the full design; this file implements the
 //! filter half of increment 2a ("virtual keys, in-memory") exactly as scoped
 //! there.

@@ -1,7 +1,7 @@
 //! WP-50 increment 3b-i — the control-plane store seam, its published
 //! snapshot, and `ControlPlane`, the type that turns one into the other.
 //!
-//! **Normative:** `internal-docs/wp-50-3b-store-design-brief.md`, sections
+//! **Normative:** `internal-docs/IMPLEMENTATION_PLAN.md`, sections
 //! "the seam", "`ControlPlaneStore` trait", and "Snapshot rebuild + bootstrap
 //! merge". This module implements exactly the 3b-i slice that brief scopes:
 //! the trait, an in-memory store, the published snapshot, and rewiring
@@ -290,7 +290,7 @@ pub trait ControlPlaneStore: Send + Sync {
     // WP-50 increment 3c-ii-b: spend rows, keyed `(stat_prefix, tenant,
     // period)`. `stat_prefix` is a plain `&str` (not this crate's
     // `TenantId`/`KeyId` newtypes) because it names a FILTER CHAIN, per the
-    // "external name" split in `internal-docs/wp-50-3c-spend-budgets.md`'s
+    // "external name" split in `internal-docs/IMPLEMENTATION_PLAN.md`'s
     // "RESOLVED -- addressing follows Envoy" section -- the same
     // operator-chosen `stat_prefix` A1 already uses to address a chain from
     // the admin server.

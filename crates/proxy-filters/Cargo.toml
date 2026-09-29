@@ -19,7 +19,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 prost-reflect = { workspace = true }
 # WP-50 increment 2a: virtual-key authentication (HMAC-SHA256 + constant-time
-# compare). See docs/wp-50-auth-design-brief.md for why a keyed cryptographic
+# compare). See internal-docs/IMPLEMENTATION_PLAN.md for why a keyed cryptographic
 # hash and NOT `token_limit_filter::hash_credential`'s FNV-1a.
 ring = { workspace = true }
 # WP-50 increment 3b-ii: `auth::generate_plaintext_key` -- the single shared

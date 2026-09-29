@@ -7,7 +7,7 @@
 // to be right about money -- not something to carry as an unvalidated JSON
 // blob inside a borrowed field.
 //
-// See `internal-docs/wp-50-3c-spend-budgets.md`, normative for this file.
+// See `internal-docs/IMPLEMENTATION_PLAN.md`, normative for this file.
 
 syntax = "proto3";
 

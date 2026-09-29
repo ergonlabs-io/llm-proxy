@@ -1,6 +1,6 @@
 //! WP-50 increment 3a — wires [`crate::model_authz`]'s `ModelAccess`/
 //! `ModelPattern` matcher into a real decode-path `HttpFilter`:
-//! `llmproxy.model_authz`. See `internal-docs/wp-50-inc3-design-brief.md`'s
+//! `llmproxy.model_authz`. See `internal-docs/IMPLEMENTATION_PLAN.md`'s
 //! "3a" and "The load-bearing seam" sections, which are normative here.
 //!
 //! # Decode-path only, and it must run LAST among the Lane-H filters it needs
@@ -62,7 +62,7 @@
 //! **An authenticated tenant ABSENT from the snapshot's `policies` is
 //! ALLOWED**, not refused -- this is WP-50 increment 3b-iv's reversal of
 //! this filter's original (3a) case 3, an owner decision recorded in
-//! `internal-docs/wp-50-3b-iv-model-authz-snapshot.md`. Authorization
+//! `internal-docs/IMPLEMENTATION_PLAN.md`. Authorization
 //! defaults OPEN (`ModelAccess::default()` is `All`; see
 //! `crate::model_authz::ModelAccess`'s doc), and as of this increment that
 //! default applies uniformly whether the tenant is missing because this

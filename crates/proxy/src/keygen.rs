@@ -11,7 +11,7 @@
 //! nothing in the proxy generated them -- an operator following the docs
 //! invented a key by hand, which is exactly the low-entropy, user-chosen
 //! secret that argument says these are not. This command is what makes the
-//! sentence true: see `docs/wp-50-auth-design-brief.md` and the module doc
+//! sentence true: see `internal-docs/IMPLEMENTATION_PLAN.md` and the module doc
 //! this paragraph quotes.
 //!
 //! # One shared derivation, not two
