@@ -3,8 +3,8 @@
 //! Implemented: Envoy bootstrap loading (`-c`, WP-03), PGV validation (WP-04),
 //! IR building (WP-05), the simple dialect (`--config`, WP-38), `--mode
 //! validate` / `--mode translate`, `--mode keygen` (WP-50 increment 2a-iv,
-//! see `keygen`), serve mode's control runtime, worker pool, SIGTERM/SIGINT
-//! drain sequence (WP-06 chunk C), and the per-worker listener manager
+//! see `keygen`), `init`, serve mode's control runtime, worker pool,
+//! SIGTERM/SIGINT drain sequence (WP-06 chunk C), and the per-worker listener manager
 //! (WP-07 chunk C) that binds sockets and accepts connections. The L4
 //! network filter chain (`tcp_proxy` etc.) is still a stub -- see
 //! `proxy_core::listener`'s `TODO(WP-09)`.
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use proxy_api::envoy::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use proxy_api::envoy::service::discovery::v3::{DeltaDiscoveryResponse, DiscoveryResponse};
 use proxy_config::ir::{AdsProtocol, DiscoverySource, NodeIdentity, SnapshotVersion};
@@ -40,6 +40,7 @@ use proxy_xds::{
 use tokio::sync::{mpsc, oneshot, Notify};
 use tonic::transport::Channel;
 
+mod init;
 mod keygen;
 
 #[derive(Parser)]
@@ -52,13 +53,16 @@ mod keygen;
 // requirement already is.
 #[command(group(clap::ArgGroup::new("input").args(["config_path", "config"])))]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to a bootstrap configuration (.yaml / .yml / .json / .pb).
-    /// Required for `serve`/`validate`/`translate`; unused by `keygen`.
+    /// Required for `serve`/`validate`/`translate`; unused by `keygen` and `init`.
     #[arg(short = 'c', long = "config-path", value_name = "PATH")]
     config_path: Option<PathBuf>,
 
     /// Path to a simple llm-proxy config (schema/llmproxy-v0.schema.json).
-    /// Required for `serve`/`validate`/`translate`; unused by `keygen`.
+    /// Required for `serve`/`validate`/`translate`; unused by `keygen` and `init`.
     #[arg(long = "config", value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -130,6 +134,16 @@ struct Args {
     /// but not yet used: dynamic configuration is not implemented.
     #[arg(long = "service-cluster", value_name = "NAME")]
     service_cluster: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a starter config, authentication secret, and default-tenant key.
+    Init {
+        /// Directory to initialize.
+        #[arg(value_name = "DIRECTORY", default_value = ".")]
+        directory: PathBuf,
+    },
 }
 
 // Rust note: `default_value_t` needs a plain expression it can call while
@@ -211,6 +225,16 @@ fn init_tracing(level: LogLevel) {
 fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing(args.log_level);
+
+    if let Some(Command::Init { directory }) = &args.command {
+        return match init::run(directory) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // `keygen` needs no config -- and, unlike every other mode, must never
     // reach `load`/`build_snapshot` below. Handled first and returns
@@ -2606,6 +2630,7 @@ mod tests {
     /// this to compile rather than silently getting an arbitrary value.
     fn test_args(config_path: Option<PathBuf>, config: Option<PathBuf>, permissive: bool) -> Args {
         Args {
+            command: None,
             config_path,
             config,
             mode: Mode::Serve,
