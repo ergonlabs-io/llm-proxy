@@ -24,6 +24,9 @@ fn init_creates_a_valid_install_without_overwriting_it() {
     );
     assert!(dir.join("llmproxy.yaml").is_file());
     assert!(dir.join("auth-secret").is_file());
+    assert!(std::fs::read_to_string(dir.join("llmproxy.yaml"))
+        .unwrap()
+        .contains("output: ./llmproxy-access.log"));
     assert!(String::from_utf8_lossy(&first.stdout).contains("tenant: default"));
 
     let validate = Command::new(BIN)

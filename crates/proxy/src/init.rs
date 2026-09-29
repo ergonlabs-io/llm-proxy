@@ -139,7 +139,7 @@ routes:
 
 observability:
   access_logs:
-    output: stdout
+    output: ./llmproxy-access.log
     format: json
 "#
     )
@@ -164,5 +164,12 @@ mod tests {
                 "missing provider example {provider}"
             );
         }
+    }
+
+    #[test]
+    fn starter_writes_access_logs_to_a_file() {
+        let text = starter_config(&"a".repeat(64));
+        assert!(text.contains("output: ./llmproxy-access.log"));
+        assert!(!text.contains("output: stdout"));
     }
 }

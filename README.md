@@ -209,6 +209,18 @@ make ci                          # fmt, clippy, tests, doctests, qa — what CI 
 make tq                          # the whole test suite via nextest
 ```
 
+### Install a release
+
+On macOS or Linux, install the latest published binary with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | bash
+```
+
+The installer detects the operating system and CPU architecture and installs to
+`~/.local/bin/llm-proxy`. Set `LLM_PROXY_VERSION=v0.2.0` to pin a release or
+`LLM_PROXY_INSTALL_DIR=/usr/local/bin` to choose another destination.
+
 ## Quick start
 
 **1. Check the configuration without starting anything.**
