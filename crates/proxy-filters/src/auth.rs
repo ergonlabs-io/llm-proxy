@@ -543,7 +543,9 @@ pub fn generate_plaintext_key(rng: &ring::rand::SystemRandom) -> String {
 /// above, so there is nothing external to validate.
 fn decode_hex_digest(hex: &str) -> Vec<u8> {
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let s = std::str::from_utf8(pair).expect("digest_hex output is ASCII");
             u8::from_str_radix(s, 16).expect("digest_hex output is valid hex")

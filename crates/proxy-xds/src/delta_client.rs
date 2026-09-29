@@ -47,8 +47,10 @@ impl DeltaResponseHandler for FnDeltaHandler {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeltaAdsError {
+    // Rust note: boxed like `AdsError::Stream` — `tonic::Status` is 176
+    // bytes; boxing keeps this enum small while `From` preserves `?`.
     #[error("delta ADS stream error: {0}")]
-    Stream(#[from] tonic::Status),
+    Stream(Box<tonic::Status>),
 
     #[error(
         "delta ADS response for type_url `{0}`, which no subscribed DeltaSubscriptionState covers"
@@ -57,6 +59,12 @@ pub enum DeltaAdsError {
 
     #[error("delta ADS outbound request channel closed while stream was still open")]
     OutboundClosed,
+}
+
+impl From<tonic::Status> for DeltaAdsError {
+    fn from(status: tonic::Status) -> Self {
+        Self::Stream(Box::new(status))
+    }
 }
 
 struct OutboundStream(mpsc::Receiver<DeltaDiscoveryRequest>);

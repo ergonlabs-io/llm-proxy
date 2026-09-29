@@ -74,7 +74,9 @@ fn parse_output(stdout: &str) -> (String, String) {
 fn decode_hex(hex: &str) -> Vec<u8> {
     assert_eq!(hex.len() % 2, 0, "odd-length hex string: {hex:?}");
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let s = std::str::from_utf8(pair).expect("hex digest is ASCII");
             u8::from_str_radix(s, 16).unwrap_or_else(|e| panic!("bad hex byte {s:?}: {e}"))

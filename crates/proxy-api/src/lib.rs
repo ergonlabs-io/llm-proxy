@@ -15,7 +15,10 @@
 //! Rust note: the generated code is produced by `build.rs` at compile time into
 //! `OUT_DIR`; `include!` splices that file into this crate as if written here.
 
-// The generated module tree is large and machine-written; skip doc lints on it.
+// The generated module tree is large and machine-written; skip lints we cannot
+// fix without editing tonic/prost output. `result_large_err` fires on generated
+// gRPC clients because `tonic::Status` itself is 176 bytes — boxing it would
+// mean forking the generator.
 #[allow(
     missing_docs,
     rustdoc::invalid_html_tags,
@@ -25,7 +28,8 @@
     clippy::doc_overindented_list_items,
     clippy::large_enum_variant,
     clippy::enum_variant_names,
-    clippy::len_without_is_empty
+    clippy::len_without_is_empty,
+    clippy::result_large_err
 )]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated.rs"));

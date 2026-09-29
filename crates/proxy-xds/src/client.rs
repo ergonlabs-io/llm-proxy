@@ -121,8 +121,13 @@ impl ResponseHandler for FnHandler {
 pub enum AdsError {
     /// The stream itself failed (transport error, or the server closed it
     /// with a non-OK status).
+    ///
+    /// Rust note: boxed because `tonic::Status` is 176 bytes — without the
+    /// box this enum would be that large too, and every function returning
+    /// `Result<_, AdsError>` would carry it by value on all paths. The
+    /// `From<tonic::Status>` impl below keeps `?` working unchanged.
     #[error("ADS stream error: {0}")]
-    Stream(#[from] tonic::Status),
+    Stream(Box<tonic::Status>),
 
     /// A `DiscoveryResponse` named a `type_url` no [`SubscriptionState`] this
     /// client was constructed with covers. Never silently ignored -- this is
@@ -134,6 +139,12 @@ pub enum AdsError {
     /// stream ended -- while a request was still queued to send on it.
     #[error("ADS outbound request channel closed while the stream was still open")]
     OutboundClosed,
+}
+
+impl From<tonic::Status> for AdsError {
+    fn from(status: tonic::Status) -> Self {
+        Self::Stream(Box::new(status))
+    }
 }
 
 /// Wraps an `mpsc::Receiver<DiscoveryRequest>` as the `Stream` tonic's

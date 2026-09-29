@@ -396,6 +396,13 @@ pub struct RefreshSpec {
     pub label: String,
 }
 
+/// What a `fetch` closure handed to [`refresh_once`] returns: a boxed,
+/// sendable future over the raw bytes or the refresh failure. A `type`
+/// alias because the shape recurs in every fetcher and clippy's
+/// `type_complexity` would otherwise flag each one.
+type FetchFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, RefreshError>> + Send>>;
+
 /// One refresh attempt: discovery -> `jwks_uri` -> key set -> atomic
 /// publish. The `fetch` indirection is what lets tests drive this without a
 /// network: production passes [`fetch_bytes`], tests pass a stub or a
@@ -409,11 +416,7 @@ where
     // Rust note: boxed future rather than `F: Fn(String) -> impl Future`,
     // so the closure may move owned captures (URL, CA bytes) into the
     // fetch without borrowing them past the call.
-    F: Fn(
-        String,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<u8>, RefreshError>> + Send>,
-    >,
+    F: Fn(String) -> FetchFuture,
 {
     let discovery = fetch(spec.discovery_url.clone()).await?;
     let jwks_uri = parse_discovery_doc(&discovery, spec.expected_issuer.as_deref())?;
@@ -465,10 +468,7 @@ async fn refresh_if_alive(weak: &Weak<ArcSwap<JwksSnapshot>>, spec: &RefreshSpec
     let snapshot = weak.upgrade()?;
     let ca_pem = spec.ca_pem.clone();
     if let Err(e) = refresh_once(&snapshot, spec, |url| {
-        Box::pin(fetch_bytes(url, ca_pem.clone()))
-            as std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<Vec<u8>, RefreshError>> + Send>,
-            >
+        Box::pin(fetch_bytes(url, ca_pem.clone())) as FetchFuture
     })
     .await
     {
@@ -500,24 +500,14 @@ mod tests {
     use super::*;
     use crate::auth::Authenticator;
 
-    fn fetch_ok(
-        discovery_body: Vec<u8>,
-        jwks_body: Vec<u8>,
-    ) -> impl Fn(
-        String,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<u8>, RefreshError>> + Send>,
-    > {
+    fn fetch_ok(discovery_body: Vec<u8>, jwks_body: Vec<u8>) -> impl Fn(String) -> FetchFuture {
         move |url| {
             let body = if url.contains("openid-configuration") {
                 discovery_body.clone()
             } else {
                 jwks_body.clone()
             };
-            Box::pin(async move { Ok(body) })
-                as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<Vec<u8>, RefreshError>> + Send>,
-                >
+            Box::pin(async move { Ok(body) }) as FetchFuture
         }
     }
 
@@ -858,10 +848,7 @@ mod tests {
         assert!(snapshot.load().keys().is_empty());
         let ca = spec.ca_pem.clone();
         refresh_once(&snapshot, &spec, move |url| {
-            Box::pin(fetch_bytes(url, ca.clone()))
-                as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<Vec<u8>, RefreshError>> + Send>,
-                >
+            Box::pin(fetch_bytes(url, ca.clone())) as FetchFuture
         })
         .await
         .expect("refresh over real TLS must succeed");

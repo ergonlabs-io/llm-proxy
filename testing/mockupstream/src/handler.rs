@@ -121,7 +121,7 @@ async fn handle_dialect(
         Ok(bytes) => bytes,
         Err(resp) => {
             state.stats.record_rejected();
-            return resp;
+            return *resp;
         }
     };
     let meta = request::parse_request_meta(&body);
@@ -171,7 +171,11 @@ async fn handle_dialect(
 
 /// Read the whole request body, capped at [`MAX_BODY_BYTES`]. Returns the
 /// bytes on success, or an already-rendered 413 response on overflow.
-async fn read_capped_body(req: Request<Incoming>) -> Result<Bytes, Response<ResponseBody>> {
+///
+/// Rust note: the response rides in a `Box` because `Response` alone is over
+/// the size at which clippy considers an `Err` variant too large to carry by
+/// value; the single caller unboxes it immediately.
+async fn read_capped_body(req: Request<Incoming>) -> Result<Bytes, Box<Response<ResponseBody>>> {
     let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
     match limited.collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
@@ -181,10 +185,10 @@ async fn read_capped_body(req: Request<Incoming>) -> Result<Bytes, Response<Resp
             // a mock upstream serving loopback load-test traffic, so folding
             // both into one 413 is an acceptable simplification -- a real
             // provider's exact error taxonomy isn't the thing under test).
-            Err(json_error(
+            Err(Box::new(json_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &format!("request body exceeds {MAX_BODY_BYTES} bytes"),
-            ))
+            )))
         }
     }
 }

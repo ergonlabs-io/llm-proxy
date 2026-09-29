@@ -227,11 +227,11 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
     );
     assert!(summary.success > 0, "no successful requests: {summary:?}");
     assert!(
-        upstream_a.log.requests().len() > 0,
+        !upstream_a.log.requests().is_empty(),
         "upstream A saw no traffic"
     );
     assert!(
-        upstream_b.log.requests().len() > 0,
+        !upstream_b.log.requests().is_empty(),
         "upstream B saw no traffic"
     );
 
