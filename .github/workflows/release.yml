@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -102,8 +101,9 @@ jobs:
           fi
 
       - name: Update latest tag
+        if: secrets.RELEASE_TOKEN != ''
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           git fetch origin "$RELEASE_TAG"
