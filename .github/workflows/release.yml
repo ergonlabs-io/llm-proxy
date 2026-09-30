@@ -73,6 +73,8 @@ jobs:
     name: Publish GitHub release
     needs: build
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v4
@@ -101,9 +103,9 @@ jobs:
           fi
 
       - name: Update latest tag
-        if: secrets.RELEASE_TOKEN != ''
+        if: env.RELEASE_TOKEN != ''
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ env.RELEASE_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           git fetch origin "$RELEASE_TAG"
