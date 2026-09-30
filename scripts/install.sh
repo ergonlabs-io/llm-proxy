@@ -24,7 +24,13 @@ case "$(uname -s)" in
 esac
 
 case "$(uname -m)" in
-  x86_64|amd64) arch="amd64" ;;
+  x86_64|amd64)
+    if [[ "$os" == "darwin" ]]; then
+      echo "error: Intel macOS is not supported; use an Apple Silicon Mac" >&2
+      exit 1
+    fi
+    arch="amd64"
+    ;;
   arm64|aarch64) arch="arm64" ;;
   *) echo "error: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
