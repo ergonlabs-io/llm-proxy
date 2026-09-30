@@ -83,6 +83,8 @@ pub struct LevelStats {
     /// Used, alongside `steady_state_secs`, by the capacity report's
     /// cost-model fit (`report::fit_cost_model`).
     pub requests_completed: u64,
+    /// Observed downstream TCP connections opened during this level.
+    pub connections_opened: u64,
     pub steady_state_secs: f64,
     pub peak_rss_bytes: Option<u64>,
     pub mean_cpu_percent: Option<f64>,
@@ -238,6 +240,7 @@ where
                 ttft_p99: None,
                 error_rate: 1.0,
                 requests_completed: 0,
+                connections_opened: 0,
                 steady_state_secs: 0.0,
                 peak_rss_bytes: None,
                 mean_cpu_percent: None,
@@ -269,6 +272,7 @@ mod tests {
             ttft_p99: Some(Duration::from_millis(50)),
             error_rate: 0.0,
             requests_completed: n as u64 * 10,
+            connections_opened: n as u64 * 10,
             steady_state_secs: 10.0,
             peak_rss_bytes: Some(1_000_000 + n as u64 * 10_000),
             mean_cpu_percent: Some(1.0 + n as f64 * 0.5),

@@ -14,6 +14,7 @@
 //! first if this one is unfamiliar.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use diffrig::harness::{
@@ -22,6 +23,7 @@ use diffrig::harness::{
 };
 use diffrig::upstreams::{OpenAiConfig, OpenAiUpstream};
 use serde_json::json;
+use serde_json::Value;
 
 // ------------------------------------------------------------------ config --
 
@@ -35,6 +37,10 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_KEY: &str = "key-primary";
 const STANDBY_KEY: &str = "key-standby";
 const STANDBY_RESPONSE_TEXT: &str = "standby served this completion";
+const CLIENT_KEY: &str = "llmp_fallback-billing-key";
+const CLIENT_KEY_ID: &str = "fallback-billing-key";
+const HMAC_SECRET: &str = "fallback-billing-hmac-secret";
+const ADMIN_TOKEN: &str = "fallback-billing-admin-token";
 
 /// Render the dialect (`llmproxy-v0`) config: one listener, one route whose
 /// provider is `primary` with `fallbacks: [standby]`. Neither provider is
@@ -89,6 +95,70 @@ models:
       - {{ provider: primary, model: primary-upstream-model }}
       - {{ provider: standby, model: standby-upstream-model }}
 "#
+    )
+}
+
+fn digest_hex(secret: &str, plaintext_key: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let digest = ring::hmac::sign(&key, plaintext_key.as_bytes());
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn billing_dialect_config(
+    listener_port: u16,
+    admin_port: u16,
+    primary_port: u16,
+    standby_port: u16,
+    access_log: &Path,
+) -> String {
+    let digest = digest_hex(HMAC_SECRET, CLIENT_KEY);
+    format!(
+        r#"
+version: 0
+listen: "127.0.0.1:{listener_port}"
+admin: "127.0.0.1:{admin_port}"
+auth:
+  hmac_secret: "{HMAC_SECRET}"
+  keys:
+    - {{ id: "{CLIENT_KEY_ID}", tenant: tenant-a, digest: "{digest}" }}
+providers:
+  openai:
+    base_url: "http://127.0.0.1:{primary_port}"
+    api_key: "{PRIMARY_KEY}"
+  standby:
+    base_url: "http://127.1:{standby_port}"
+    api_key: "{STANDBY_KEY}"
+routes:
+  - model: "gpt-*"
+    provider: openai
+    fallbacks: [standby]
+models:
+  gpt-4o-mini:
+    providers:
+      - {{ provider: openai, model: primary-upstream-model }}
+      - {{ provider: standby, model: standby-upstream-model }}
+pricing:
+  price_list:
+    version: fallback-card
+    effective_from: "2026-01-01T00:00:00Z"
+    entries:
+      - provider_type: openai
+        model: gpt-4o-mini
+        tier_mode: whole_request
+        tiers:
+          - {{ input_nanodollars_per_token: 1000000000, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: 1000000000 }}
+      - provider_type: openai-compatible
+        model: gpt-4o-mini
+        tier_mode: whole_request
+        tiers:
+          - {{ input_nanodollars_per_token: 2000000000, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: 3000000000 }}
+observability:
+  force_usage_reporting: true
+  access_logs:
+    output: "{}"
+    format: text
+"#,
+        access_log.display()
     )
 }
 
@@ -158,6 +228,139 @@ async fn spawn_suite(
     proxy.wait_until_ready(listener_addr, READY_TIMEOUT);
 
     (listener_addr, primary, standby, scratch, proxy)
+}
+
+async fn spawn_billing_suite(
+    label: &str,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    OpenAiUpstream,
+    OpenAiUpstream,
+    PathBuf,
+    ScratchDir,
+    ProxyProcess,
+) {
+    let primary = OpenAiUpstream::spawn(primary_config())
+        .await
+        .expect("spawn primary mock");
+    let standby = OpenAiUpstream::spawn(standby_config())
+        .await
+        .expect("spawn standby mock");
+    let scratch = ScratchDir::new(label);
+    let listener_port = free_port();
+    let admin_port = free_port();
+    let listener_addr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    let access_log = scratch.path().join("access.log");
+    let dialect = billing_dialect_config(
+        listener_port,
+        admin_port,
+        primary.port(),
+        standby.port(),
+        &access_log,
+    );
+    let simple = proxy_simple_config::parse_simple_config(&dialect).expect("parse billing config");
+    let mut bootstrap = proxy_simple_config::lower(&simple)
+        .expect("lower billing config")
+        .bootstrap;
+
+    let filters = bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
+        ["typed_config"]["http_filters"]
+        .as_array_mut()
+        .expect("lowered HTTP filter list");
+    let usage_index = filters
+        .iter()
+        .position(|filter| filter["name"] == "llmproxy.usage")
+        .expect("usage filter");
+    filters.insert(
+        usage_index,
+        json!({
+            "name": "llmproxy.spend_limit",
+            "typed_config": {
+                "@type": "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit",
+                "pricing": [
+                    {
+                        "cluster": "provider:openai",
+                        "models": [{
+                            "model": "gpt-4o-mini",
+                            "input_per_million": "1000000.00",
+                            "output_per_million": "1000000.00",
+                            "cached_per_million": "0.00",
+                            "cache_creation_per_million": "0.00"
+                        }]
+                    },
+                    {
+                        "cluster": "provider:standby",
+                        "models": [{
+                            "model": "gpt-4o-mini",
+                            "input_per_million": "2000000.00",
+                            "output_per_million": "3000000.00",
+                            "cached_per_million": "0.00",
+                            "cache_creation_per_million": "0.00"
+                        }]
+                    }
+                ]
+            }
+        }),
+    );
+    bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
+        ["typed_config"]["access_log"][0]["typed_config"]["log_format"] = json!({
+        "text_format": "%UPSTREAM_CLUSTER% %LLM_INPUT_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_LIST_COST%\n"
+    });
+
+    let config_yaml = serde_yaml::to_string(&bootstrap).expect("serialize bootstrap");
+    let config_path = scratch.write("envoy.yaml", &config_yaml);
+    let bin = resolve_llm_proxy_bin();
+    let mut proxy = ProxyProcess::spawn_envoy_with_env(
+        &bin,
+        &config_path,
+        &scratch.path().join("proxy.log"),
+        &[("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)],
+    );
+    proxy.wait_until_ready(admin_addr, READY_TIMEOUT);
+    proxy.wait_until_ready(listener_addr, READY_TIMEOUT);
+    (
+        listener_addr,
+        admin_addr,
+        primary,
+        standby,
+        access_log,
+        scratch,
+        proxy,
+    )
+}
+
+async fn admin_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &Value,
+) -> diffrig::harness::RawResponse {
+    let bearer = format!("Bearer {ADMIN_TOKEN}");
+    tokio::time::timeout(
+        CLIENT_TIMEOUT,
+        send_json(addr, method, path, &[("authorization", &bearer)], body),
+    )
+    .await
+    .expect("admin request timed out")
+}
+
+fn read_access_log(path: &Path) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Some(line) = text.lines().find(|line| !line.trim().is_empty()) {
+                return line.to_string();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no access-log line appeared at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn chat_request_body() -> serde_json::Value {
@@ -402,6 +605,80 @@ async fn failover_preserves_streaming_on_the_selected_standby() {
     assert_eq!(primary.log.requests().len(), 1);
     assert_eq!(standby.log.requests().len(), 1);
     assert_eq!(standby.bodies.bodies()[0]["stream"], true);
+
+    drop(proxy);
+    primary.shutdown().await;
+    standby.shutdown().await;
+    drop(scratch);
+}
+
+/// WP-53/WP-64/WP-65 joined acceptance: the authenticated key survives a
+/// primary 429, the streamed standby usage is charged to that stable key at
+/// the standby cluster's price, and the immutable list-price record uses the
+/// selected provider's rate-card entry/version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_streaming_fallback_charges_the_key_at_the_standby_price() {
+    let (listener, admin, primary, standby, access_log, scratch, proxy) =
+        spawn_billing_suite("fallback-billing").await;
+
+    let budget = admin_request(
+        admin,
+        "PUT",
+        &format!("/keys/{CLIENT_KEY_ID}/budget"),
+        &json!({ "budget": { "max_usd": "100.00", "period": "daily" } }),
+    )
+    .await;
+    assert_eq!(budget.status, 204, "set key budget: {}", budget.body);
+
+    let body = json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi there"}],
+        "stream": true,
+    });
+    let bearer = format!("Bearer {CLIENT_KEY}");
+    let (status, _, events) = tokio::time::timeout(
+        CLIENT_TIMEOUT,
+        send_json_collect_sse(
+            listener,
+            "POST",
+            "/v1/chat/completions",
+            &[
+                ("authorization", &bearer),
+                ("x-llmproxy-model", "gpt-4o-mini"),
+            ],
+            &body,
+        ),
+    )
+    .await
+    .expect("authenticated streaming fallback timed out");
+    assert_eq!(status, 200);
+    assert!(events.iter().any(|event| event.data.contains("standby")));
+    assert_eq!(primary.log.requests().len(), 1);
+    assert_eq!(standby.log.requests().len(), 1);
+    assert_eq!(
+        standby.bodies.bodies()[0]["model"],
+        "standby-upstream-model"
+    );
+
+    let spend = admin_request(
+        admin,
+        "GET",
+        &format!("/keys/{CLIENT_KEY_ID}/spend"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(spend.status, 200, "read key spend: {}", spend.body);
+    let spend_json: Value = serde_json::from_str(&spend.body).expect("spend JSON");
+    assert_eq!(
+        spend_json["spend_micro_usd"], 16_000_000,
+        "2 input tokens at $2/token plus 4 standby output tokens at $3/token"
+    );
+
+    let line = read_access_log(&access_log);
+    assert_eq!(
+        line, "provider:standby 2 4 16000000000",
+        "selected cluster, terminal token usage, and immutable list cost"
+    );
 
     drop(proxy);
     primary.shutdown().await;

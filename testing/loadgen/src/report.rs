@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::driver::OpenLoopStats;
+use crate::driver::{DownstreamMode, OpenLoopStats};
 use crate::metrics::RunSummary;
 use crate::rig::{self, RigInfo};
 use crate::sweep::{self, SloViolation};
@@ -28,6 +28,8 @@ pub struct RunConfigEcho {
     pub duration_secs: u64,
     pub warmup_secs: u64,
     pub timeout_secs: u64,
+    pub downstream_mode: DownstreamMode,
+    pub downstream_h1_pool_size: usize,
     #[serde(flatten)]
     pub mode: ModeConfig,
 }
@@ -150,6 +152,14 @@ pub fn print_summary(report: &RunReport) {
     println!(
         "tokens_received={} bytes_received={}",
         r.tokens_received, r.bytes_received
+    );
+    println!(
+        "downstream: mode={:?} connections_opened={} reused={} logical_streams={} streams_per_connection={:.2}",
+        report.config.downstream_mode,
+        r.transport.connections_opened,
+        r.transport.connections_reused,
+        r.transport.logical_streams,
+        r.transport.streams_per_connection,
     );
 
     if let Some(open) = &report.open_loop {
@@ -374,7 +384,13 @@ pub fn build_capacity_report(
     let peak_connect_rate = sweep_report
         .levels
         .iter()
-        .map(|l| l.stats.throughput_rps)
+        .map(|l| {
+            if l.stats.steady_state_secs > 0.0 {
+                l.stats.connections_opened as f64 / l.stats.steady_state_secs
+            } else {
+                0.0
+            }
+        })
         .fold(0.0_f64, f64::max);
     let harness_bound = rig::harness_bound(reached, peak_connect_rate, rig_info, 10);
 
@@ -516,6 +532,7 @@ mod capacity_tests {
                 ttft_p99: Some(std::time::Duration::from_millis(20)),
                 error_rate: 0.0,
                 requests_completed: requests,
+                connections_opened: requests,
                 steady_state_secs: 10.0,
                 peak_rss_bytes: Some(rss_bytes),
                 mean_cpu_percent: Some(mean_cpu_percent),
@@ -616,6 +633,7 @@ mod capacity_tests {
             ttft_p99: None,
             error_rate: 1.0,
             requests_completed: 0,
+            connections_opened: 0,
             steady_state_secs: 10.0,
             peak_rss_bytes: None,
             mean_cpu_percent: None,

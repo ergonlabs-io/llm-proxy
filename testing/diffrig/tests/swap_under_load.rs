@@ -547,6 +547,7 @@ async fn config_swap_under_live_traffic_drops_no_streams() {
 
     let nonstream_cfg = Arc::new(RunConfig {
         targets: vec![Target {
+            tls: false,
             host: "127.0.0.1".to_string(),
             port: listener_port,
         }],
@@ -557,6 +558,7 @@ async fn config_swap_under_live_traffic_drops_no_streams() {
         api_key: None,
         stream: false,
         timeout: Duration::from_secs(5),
+        transport: Default::default(),
     });
     let nonstream_handle = tokio::spawn(run_open_loop(
         nonstream_cfg,

@@ -112,6 +112,7 @@ fn base_cfg(addr: std::net::SocketAddr, endpoint: Endpoint, stream: bool) -> Arc
         api_key: None,
         stream,
         timeout: Duration::from_secs(5),
+        transport: Default::default(),
     })
 }
 

@@ -72,6 +72,7 @@ async fn closed_loop_end_to_end_smoke() {
         api_key: None,
         stream: true,
         timeout: Duration::from_secs(5),
+        transport: Default::default(),
     });
 
     let summary = driver::run_closed_loop(cfg, 2, Duration::from_millis(500), Duration::ZERO).await;
@@ -100,6 +101,7 @@ async fn open_loop_paces_without_counting_response_drain_as_dispatch_time() {
         api_key: None,
         stream: true,
         timeout: Duration::from_secs(5),
+        transport: Default::default(),
     });
 
     let (summary, stats) =

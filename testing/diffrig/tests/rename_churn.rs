@@ -13,10 +13,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use diffrig::harness::{free_port, resolve_llm_proxy_bin, ScratchDir};
+use diffrig::harness::{ScratchDir, free_port, resolve_llm_proxy_bin};
 use diffrig::upstreams::{OpenAiConfig, OpenAiUpstream};
 use loadgen::dialect::Endpoint;
-use loadgen::driver::{run_open_loop, RunConfig, Target};
+use loadgen::driver::{
+    DownstreamMode, RunConfig, Target, TransportConfig, run_closed_loop, run_open_loop,
+};
 
 const RATE: f64 = 5_000.0;
 const LOAD_DURATION: Duration = Duration::from_secs(3);
@@ -113,6 +115,45 @@ impl Drop for RunningProxy {
     }
 }
 
+async fn reload_probe(listener_port: u16) {
+    // Long-lived keep-alive connections retain the listener generation that
+    // accepted them. Open a fresh, short-lived connection after each SIGHUP
+    // to prove the replacement generation routes traffic as intended.
+    let summary = run_closed_loop(
+        Arc::new(RunConfig {
+            targets: vec![Target {
+                tls: false,
+                host: "127.0.0.1".to_string(),
+                port: listener_port,
+            }],
+            endpoint: Endpoint::Chat,
+            model: "rename-churn".to_string(),
+            prompt: "reload probe".to_string(),
+            max_tokens: 1,
+            api_key: None,
+            stream: false,
+            timeout: REQUEST_TIMEOUT,
+            transport: Default::default(),
+        }),
+        1,
+        Duration::from_millis(50),
+        Duration::ZERO,
+    )
+    .await;
+    assert_eq!(
+        summary.transport_errors, 0,
+        "reload probe failed: {summary:?}"
+    );
+    assert!(
+        summary.http_errors.is_empty(),
+        "reload probe failed: {summary:?}"
+    );
+    assert!(
+        summary.success > 0,
+        "reload probe got no response: {summary:?}"
+    );
+}
+
 #[ignore = "5k-rps acceptance; run on a dedicated capacity host"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
@@ -157,6 +198,7 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
 
     let load_config = Arc::new(RunConfig {
         targets: vec![Target {
+            tls: false,
             host: "127.0.0.1".to_string(),
             port: listener_port,
         }],
@@ -167,6 +209,14 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
         api_key: None,
         stream: false,
         timeout: REQUEST_TIMEOUT,
+        // This is a request-path churn drill, not a short-connection capacity
+        // drill. Reuse a bounded set of downstream HTTP/1.1 connections so
+        // connection setup cannot mask reload failures at 5k RPS.
+        transport: TransportConfig {
+            mode: DownstreamMode::H1Pool,
+            h1_pool_size: 64,
+            ca_file: None,
+        },
     });
     let load = tokio::spawn(run_open_loop(
         load_config,
@@ -196,6 +246,7 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
         )
         .expect("write renamed generation");
         proxy.reload();
+        reload_probe(listener_port).await;
     }
 
     // Invalid replacement must leave last-good generation serving.
@@ -203,6 +254,7 @@ async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
     std::fs::write(&config_path, "static_resources:\n  listeners: [broken")
         .expect("write invalid generation");
     proxy.reload();
+    reload_probe(listener_port).await;
 
     let (summary, stats) = load.await.expect("load task panicked");
     let failure_logs = std::fs::read_to_string(&log_path)

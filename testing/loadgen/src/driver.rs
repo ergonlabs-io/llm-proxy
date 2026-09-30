@@ -1,29 +1,53 @@
 //! The two load modes (closed-loop / open-loop) and the single-stream
 //! request/response cycle they both drive.
 //!
-//! Every stream opens its own fresh TCP connection (connect-per-stream, no
-//! pooling/keep-alive reuse) -- see the environment note in the crate's
-//! design doc: this is deliberate so the rig's ephemeral-port ceiling is
-//! exercised the same way a from-scratch client hitting the proxy would be,
-//! and so one stream's connection lifecycle can never affect another's
-//! latency measurement.
+//! The default remains connect-per-stream. Opt-in transports provide bounded
+//! HTTP/1.1 keep-alive reuse and TLS/ALPN HTTP/2 multiplexing.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::Request;
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::ServerName;
 use serde::Serialize;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
+use tokio_rustls::TlsConnector;
 
 use crate::dialect::{Endpoint, FrameKind};
-use crate::metrics::{Aggregator, Outcome, RunSummary, StreamResult};
+use crate::metrics::{Aggregator, Outcome, RunSummary, StreamResult, TransportSummary};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownstreamMode {
+    Short,
+    H1Pool,
+    H2,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransportConfig {
+    pub mode: DownstreamMode,
+    pub h1_pool_size: usize,
+    pub ca_file: Option<PathBuf>,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            mode: DownstreamMode::Short,
+            h1_pool_size: 32,
+            ca_file: None,
+        }
+    }
+}
 use crate::sse::SseParser;
 
 /// One upstream to send requests to. Connect-per-stream means every stream
@@ -31,6 +55,7 @@ use crate::sse::SseParser;
 /// fresh.
 #[derive(Debug, Clone)]
 pub struct Target {
+    pub tls: bool,
     pub host: String,
     pub port: u16,
 }
@@ -61,18 +86,18 @@ fn parse_target(raw: &str) -> anyhow::Result<Target> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid target {raw:?}: {e}"))?;
     let scheme = uri.scheme_str().unwrap_or("http");
-    if scheme != "http" {
-        anyhow::bail!(
-            "target {raw:?}: only plain http:// targets are supported \
-             (upstream TLS origination in the driver is a later milestone)"
-        );
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!("target {raw:?}: scheme must be http or https");
     }
     let authority = uri
         .authority()
         .ok_or_else(|| anyhow::anyhow!("target {raw:?} has no host"))?;
     Ok(Target {
+        tls: scheme == "https",
         host: authority.host().to_string(),
-        port: authority.port_u16().unwrap_or(80),
+        port: authority
+            .port_u16()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 }),
     })
 }
 
@@ -86,20 +111,71 @@ pub struct RunConfig {
     pub api_key: Option<String>,
     pub stream: bool,
     pub timeout: Duration,
+    pub transport: TransportConfig,
 }
 
-fn pick_target<'a>(cfg: &'a RunConfig, idx: &AtomicUsize) -> &'a Target {
+#[derive(Default)]
+struct TransportCounters {
+    opened: AtomicU64,
+    reused: AtomicU64,
+    streams: AtomicU64,
+}
+
+impl TransportCounters {
+    fn snapshot(&self) -> TransportSummary {
+        let connections_opened = self.opened.load(Ordering::Relaxed);
+        let logical_streams = self.streams.load(Ordering::Relaxed);
+        TransportSummary {
+            connections_opened,
+            connections_reused: self.reused.load(Ordering::Relaxed),
+            logical_streams,
+            streams_per_connection: if connections_opened == 0 {
+                0.0
+            } else {
+                logical_streams as f64 / connections_opened as f64
+            },
+        }
+    }
+}
+
+type H1Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+type H2Sender = hyper::client::conn::http2::SendRequest<Full<Bytes>>;
+
+struct ClientState {
+    cfg: TransportConfig,
+    counters: Arc<TransportCounters>,
+    h1: Vec<Mutex<Option<H1Sender>>>,
+    h1_next: AtomicUsize,
+    h2: Vec<Mutex<Option<H2Sender>>>,
+}
+
+impl ClientState {
+    fn new(cfg: TransportConfig, targets: usize) -> Self {
+        let size = cfg.h1_pool_size.max(1);
+        Self {
+            cfg,
+            counters: Arc::new(TransportCounters::default()),
+            h1: (0..targets * size).map(|_| Mutex::new(None)).collect(),
+            h1_next: AtomicUsize::new(0),
+            h2: (0..targets).map(|_| Mutex::new(None)).collect(),
+        }
+    }
+}
+
+fn pick_target<'a>(cfg: &'a RunConfig, idx: &AtomicUsize) -> (usize, &'a Target) {
     // Rust note: `Relaxed` is enough here -- this counter only needs to hand
     // out distinct-ish indices for round-robin, not to synchronize any other
     // memory access, so the stronger orderings would just cost more for no
     // benefit.
     let i = idx.fetch_add(1, Ordering::Relaxed);
-    &cfg.targets[i % cfg.targets.len()]
+    let index = i % cfg.targets.len();
+    (index, &cfg.targets[index])
 }
 
 enum ExecError {
     Http(u16),
     Transport,
+    Timeout,
     /// The body ended (cleanly, no transport error) without ever producing a
     /// `FrameKind::Terminal` frame -- the proxy (or upstream) cut the stream
     /// short. Kept distinct from `Transport`: "the connection broke" and
@@ -121,29 +197,11 @@ struct Measured {
 /// Run one request/response cycle against `target`, streaming and
 /// classifying SSE frames as they arrive (or, in `--no-stream` mode, just
 /// reading the whole body).
-async fn execute(cfg: &RunConfig, target: &Target) -> Result<Measured, ExecError> {
-    let stream = TcpStream::connect((target.host.as_str(), target.port))
-        .await
-        .map_err(|_| ExecError::Transport)?;
-    let io = TokioIo::new(stream);
-
-    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        .handshake::<_, Full<Bytes>>(io)
-        .await
-        .map_err(|_| ExecError::Transport)?;
-    // Rust note: unlike the proxy's own upstream codec (`proxy-http`'s
-    // `send_upstream_http1`), our request body is `Full<Bytes>` (`Send`),
-    // so the connection-driving future is `Send` too and can go on the
-    // normal multi-threaded `tokio::spawn` -- no `spawn_local`/`LocalSet`
-    // needed. Detached (dropped `JoinHandle`): the connection tears down
-    // when `sender`/the response body are dropped either way.
-    tokio::spawn(conn);
-
+fn request(cfg: &RunConfig, target: &Target) -> Request<Full<Bytes>> {
     let body_value = cfg
         .endpoint
         .build_body(&cfg.model, &cfg.prompt, cfg.max_tokens, cfg.stream);
     let body_bytes = serde_json::to_vec(&body_value).expect("request body is always serializable");
-
     let mut builder = Request::builder()
         .method("POST")
         .uri(cfg.endpoint.path())
@@ -156,14 +214,87 @@ async fn execute(cfg: &RunConfig, target: &Target) -> Result<Measured, ExecError
     for (name, value) in cfg.endpoint.auth_headers(cfg.api_key.as_deref()) {
         builder = builder.header(name, value);
     }
-    let request = builder
+    builder
         .body(Full::new(Bytes::from(body_bytes)))
-        .expect("method/uri/headers are all valid; building can't fail here");
+        .expect("valid request")
+}
 
-    let response = sender
-        .send_request(request)
+fn tls_config(ca_file: Option<&PathBuf>) -> Result<rustls::ClientConfig, ExecError> {
+    let mut roots = rustls::RootCertStore::empty();
+    if let Some(path) = ca_file {
+        let file = std::fs::File::open(path).map_err(|_| ExecError::Transport)?;
+        for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(file)) {
+            roots
+                .add(cert.map_err(|_| ExecError::Transport)?)
+                .map_err(|_| ExecError::Transport)?;
+        }
+    } else {
+        let native = rustls_native_certs::load_native_certs();
+        for cert in native.certs {
+            let _ = roots.add(cert);
+        }
+        if !native.errors.is_empty() && roots.is_empty() {
+            return Err(ExecError::Transport);
+        }
+    }
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(config)
+}
+
+async fn new_h1(target: &Target, counters: &TransportCounters) -> Result<H1Sender, ExecError> {
+    if target.tls {
+        return Err(ExecError::Transport);
+    }
+    let stream = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .map_err(|_| ExecError::Transport)?;
+    counters.opened.fetch_add(1, Ordering::Relaxed);
+    let io = TokioIo::new(stream);
+    let (sender, conn) = hyper::client::conn::http1::Builder::new()
+        .handshake::<_, Full<Bytes>>(io)
+        .await
+        .map_err(|_| ExecError::Transport)?;
+    tokio::spawn(conn);
+    Ok(sender)
+}
+
+async fn new_h2(
+    target: &Target,
+    cfg: &TransportConfig,
+    counters: &TransportCounters,
+) -> Result<H2Sender, ExecError> {
+    if !target.tls {
+        return Err(ExecError::Transport);
+    }
+    let tcp = TcpStream::connect((target.host.as_str(), target.port))
+        .await
+        .map_err(|_| ExecError::Transport)?;
+    let server_name =
+        ServerName::try_from(target.host.clone()).map_err(|_| ExecError::Transport)?;
+    let tls = TlsConnector::from(Arc::new(tls_config(cfg.ca_file.as_ref())?))
+        .connect(server_name, tcp)
+        .await
+        .map_err(|_| ExecError::Transport)?;
+    if tls.get_ref().1.alpn_protocol() != Some(b"h2") {
+        return Err(ExecError::Transport);
+    }
+    counters.opened.fetch_add(1, Ordering::Relaxed);
+    let (sender, conn) =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
+            .await
+            .map_err(|_| ExecError::Transport)?;
+    tokio::spawn(conn);
+    Ok(sender)
+}
+
+async fn consume_response(
+    cfg: &RunConfig,
+    response: Response<hyper::body::Incoming>,
+) -> Result<Measured, ExecError> {
     let status = response.status();
     if !status.is_success() {
         return Err(ExecError::Http(status.as_u16()));
@@ -245,6 +376,92 @@ async fn execute(cfg: &RunConfig, target: &Target) -> Result<Measured, ExecError
     })
 }
 
+async fn execute(
+    cfg: &RunConfig,
+    state: &ClientState,
+    target_index: usize,
+    target: &Target,
+) -> Result<Measured, ExecError> {
+    state.counters.streams.fetch_add(1, Ordering::Relaxed);
+    match state.cfg.mode {
+        DownstreamMode::Short => {
+            let mut sender = new_h1(target, &state.counters).await?;
+            consume_response(
+                cfg,
+                sender
+                    .send_request(request(cfg, target))
+                    .await
+                    .map_err(|_| ExecError::Transport)?,
+            )
+            .await
+        }
+        DownstreamMode::H1Pool => {
+            let size = state.cfg.h1_pool_size.max(1);
+            let slot_index =
+                target_index * size + state.h1_next.fetch_add(1, Ordering::Relaxed) % size;
+            let started = Instant::now();
+            let mut slot =
+                match tokio::time::timeout(cfg.timeout, state.h1[slot_index].lock()).await {
+                    Ok(slot) => slot,
+                    Err(_) => return Err(ExecError::Timeout),
+                };
+            let remaining = cfg.timeout.saturating_sub(started.elapsed());
+            let operation = async {
+                if slot.is_some() {
+                    state.counters.reused.fetch_add(1, Ordering::Relaxed);
+                }
+                if slot.is_none() {
+                    *slot = Some(new_h1(target, &state.counters).await?);
+                }
+                let result = slot
+                    .as_mut()
+                    .expect("initialized")
+                    .send_request(request(cfg, target))
+                    .await;
+                let response = match result {
+                    Ok(r) => r,
+                    Err(_) => {
+                        *slot = None;
+                        return Err(ExecError::Transport);
+                    }
+                };
+                consume_response(cfg, response).await
+            };
+            match tokio::time::timeout(remaining, operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // A cancelled HTTP/1 response cannot safely return its
+                    // connection to the pool: unread response bytes would
+                    // corrupt the next request. Evict the slot while keeping
+                    // the outcome classified as the timeout that caused it.
+                    *slot = None;
+                    Err(ExecError::Timeout)
+                }
+            }
+        }
+        DownstreamMode::H2 => {
+            let mut slot = state.h2[target_index].lock().await;
+            if slot.is_some() {
+                state.counters.reused.fetch_add(1, Ordering::Relaxed);
+            }
+            if slot.is_none() {
+                *slot = Some(new_h2(target, &state.cfg, &state.counters).await?);
+            }
+            let sender = slot.as_mut().expect("initialized").clone();
+            drop(slot);
+            let mut sender = sender;
+            consume_response(
+                cfg,
+                sender
+                    .send_request(request(cfg, target))
+                    .await
+                    .map_err(|_| ExecError::Transport)?,
+            )
+            .await
+        }
+    }
+}
+
 fn success_result(
     scheduled_start: Instant,
     send_start: Instant,
@@ -290,11 +507,19 @@ fn failed_result(scheduled_start: Instant, send_start: Instant, outcome: Outcome
 /// recorded here, right as the connection attempt begins.
 async fn run_one_stream(
     cfg: &RunConfig,
+    state: &ClientState,
+    target_index: usize,
     target: &Target,
     scheduled_start: Instant,
 ) -> StreamResult {
     let send_start = Instant::now();
-    match tokio::time::timeout(cfg.timeout, execute(cfg, target)).await {
+    let execution = execute(cfg, state, target_index, target);
+    let outcome = if state.cfg.mode == DownstreamMode::H1Pool {
+        Ok(execution.await)
+    } else {
+        tokio::time::timeout(cfg.timeout, execution).await
+    };
+    match outcome {
         Ok(Ok(measured)) => success_result(scheduled_start, send_start, measured),
         Ok(Err(ExecError::Http(status))) => {
             failed_result(scheduled_start, send_start, Outcome::HttpError(status))
@@ -302,6 +527,7 @@ async fn run_one_stream(
         Ok(Err(ExecError::Transport)) => {
             failed_result(scheduled_start, send_start, Outcome::TransportError)
         }
+        Ok(Err(ExecError::Timeout)) => failed_result(scheduled_start, send_start, Outcome::Timeout),
         Ok(Err(ExecError::Truncated)) => {
             failed_result(scheduled_start, send_start, Outcome::Truncated)
         }
@@ -322,6 +548,7 @@ pub async fn run_closed_loop(
     let deadline = run_start + duration;
     let warmup_end = run_start + warmup;
     let target_idx = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(ClientState::new(cfg.transport.clone(), cfg.targets.len()));
     let (tx, rx) = mpsc::unbounded_channel::<StreamResult>();
 
     let mut workers = Vec::with_capacity(concurrency);
@@ -329,11 +556,13 @@ pub async fn run_closed_loop(
         let cfg = cfg.clone();
         let target_idx = target_idx.clone();
         let tx = tx.clone();
+        let state = state.clone();
         workers.push(tokio::spawn(async move {
             while Instant::now() < deadline {
-                let target = pick_target(&cfg, &target_idx);
+                let (target_index, target) = pick_target(&cfg, &target_idx);
                 let scheduled_start = Instant::now();
-                let result = run_one_stream(&cfg, target, scheduled_start).await;
+                let result =
+                    run_one_stream(&cfg, &state, target_index, target, scheduled_start).await;
                 if tx.send(result).is_err() {
                     break;
                 }
@@ -345,7 +574,7 @@ pub async fn run_closed_loop(
     // closes once every `Sender` clone is gone.
     drop(tx);
 
-    let collector = spawn_collector(rx, warmup_end);
+    let collector = spawn_collector(rx, warmup_end, state.counters.clone());
     for worker in workers {
         let _ = worker.await;
     }
@@ -386,6 +615,7 @@ pub async fn run_open_loop(
     let interval = Duration::from_secs_f64(1.0 / rate);
     let total_requests = (rate * duration.as_secs_f64()).round().max(0.0) as u64;
     let target_idx = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(ClientState::new(cfg.transport.clone(), cfg.targets.len()));
     let (tx, rx) = mpsc::unbounded_channel::<StreamResult>();
 
     // Pace from one scheduler instead of registering one sleeping Tokio task
@@ -399,9 +629,10 @@ pub async fn run_open_loop(
         let cfg = cfg.clone();
         let target_idx = target_idx.clone();
         let tx = tx.clone();
+        let state = state.clone();
         requests.spawn(async move {
-            let target = pick_target(&cfg, &target_idx);
-            let result = run_one_stream(&cfg, target, scheduled_start).await;
+            let (target_index, target) = pick_target(&cfg, &target_idx);
+            let result = run_one_stream(&cfg, &state, target_index, target, scheduled_start).await;
             let _ = tx.send(result);
         });
 
@@ -411,7 +642,7 @@ pub async fn run_open_loop(
     }
     drop(tx);
 
-    let collector = spawn_collector_with_backlog(rx, warmup_end);
+    let collector = spawn_collector_with_backlog(rx, warmup_end, state.counters.clone());
     while requests.join_next().await.is_some() {}
     let (summary, p99_backlog, max_backlog, last_send_start) =
         collector.await.expect("collector task panicked");
@@ -454,12 +685,14 @@ fn is_driver_saturated(
 fn spawn_collector(
     mut rx: mpsc::UnboundedReceiver<StreamResult>,
     warmup_end: Instant,
+    counters: Arc<TransportCounters>,
 ) -> tokio::task::JoinHandle<RunSummary> {
     tokio::spawn(async move {
         let mut aggregator = Aggregator::new(warmup_end);
         while let Some(result) = rx.recv().await {
             aggregator.record(result);
         }
+        aggregator.set_transport(counters.snapshot());
         aggregator.finish()
     })
 }
@@ -467,6 +700,7 @@ fn spawn_collector(
 fn spawn_collector_with_backlog(
     mut rx: mpsc::UnboundedReceiver<StreamResult>,
     warmup_end: Instant,
+    counters: Arc<TransportCounters>,
 ) -> tokio::task::JoinHandle<(RunSummary, Duration, Duration, Option<Instant>)> {
     tokio::spawn(async move {
         let mut aggregator = Aggregator::new(warmup_end);
@@ -495,6 +729,7 @@ fn spawn_collector_with_backlog(
                 .saturating_sub(1);
             backlogs[index]
         };
+        aggregator.set_transport(counters.snapshot());
         (
             aggregator.finish(),
             p99_backlog,

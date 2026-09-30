@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use loadgen::dialect::Endpoint;
-use loadgen::driver::{self, RunConfig};
+use loadgen::driver::{self, DownstreamMode, RunConfig, TransportConfig};
 use loadgen::report::{self, ModeConfig, RunConfigEcho, RunReport};
 use loadgen::rig;
 use loadgen::sampler;
@@ -17,6 +17,18 @@ use loadgen::sweep::{self, SloConfig, SweepConfig};
 #[derive(Parser)]
 #[command(name = "loadgen")]
 struct Cli {
+    /// Downstream connection strategy. h2 requires an https target and ALPN h2.
+    #[arg(long = "downstream-mode", value_enum, default_value_t = DownstreamMode::Short)]
+    downstream_mode: DownstreamMode,
+
+    /// Maximum persistent connections per target in h1-pool mode.
+    #[arg(long = "downstream-h1-pool-size", default_value_t = 32)]
+    downstream_h1_pool_size: usize,
+
+    /// PEM CA bundle for a private TLS target (used by h2 mode).
+    #[arg(long = "downstream-ca-file")]
+    downstream_ca_file: Option<PathBuf>,
+
     /// Print the detected harness limits (fd limit, ephemeral port range,
     /// somaxconn) and the theoretical max concurrency they imply, then
     /// exit without driving any load. Use this before a long `--sweep` run
@@ -206,7 +218,14 @@ async fn main() -> anyhow::Result<ExitCode> {
         let baseline_targets = driver::parse_targets(&args.baseline_target)?;
         let echo = baseline_targets
             .iter()
-            .map(|t| format!("http://{}:{}", t.host, t.port))
+            .map(|t| {
+                format!(
+                    "{}://{}:{}",
+                    if t.tls { "https" } else { "http" },
+                    t.host,
+                    t.port
+                )
+            })
             .collect();
         let baseline_cfg = Arc::new(build_run_config(&args, endpoint, baseline_targets));
         let (baseline_result, _baseline_open_loop) =
@@ -225,6 +244,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         duration_secs: args.duration_secs,
         warmup_secs: args.warmup_secs,
         timeout_secs: args.timeout_secs,
+        downstream_mode: args.downstream_mode,
+        downstream_h1_pool_size: args.downstream_h1_pool_size,
         mode,
     };
 
@@ -272,6 +293,11 @@ fn build_run_config(args: &Cli, endpoint: Endpoint, targets: Vec<driver::Target>
         api_key: args.api_key.clone(),
         stream: !args.no_stream,
         timeout: Duration::from_secs(args.timeout_secs),
+        transport: TransportConfig {
+            mode: args.downstream_mode,
+            h1_pool_size: args.downstream_h1_pool_size,
+            ca_file: args.downstream_ca_file.clone(),
+        },
     }
 }
 
@@ -392,6 +418,7 @@ fn level_stats(
         ttft_p99,
         error_rate: summary.error_rate,
         requests_completed: summary.streams_counted,
+        connections_opened: summary.transport.connections_opened,
         steady_state_secs,
         peak_rss_bytes: sample_summary.map(|s| s.peak_rss_bytes),
         mean_cpu_percent: sample_summary.and_then(|s| s.mean_cpu_percent),

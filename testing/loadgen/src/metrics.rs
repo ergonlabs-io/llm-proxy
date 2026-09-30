@@ -84,11 +84,20 @@ pub struct RunSummary {
     pub error_rate: f64,
     pub tokens_received: u64,
     pub bytes_received: u64,
+    pub transport: TransportSummary,
     pub ttft_from_scheduled_us: Option<Percentiles>,
     pub ttft_from_send_us: Option<Percentiles>,
     pub inter_token_us: Option<Percentiles>,
     pub total_from_scheduled_us: Option<Percentiles>,
     pub total_from_send_us: Option<Percentiles>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TransportSummary {
+    pub connections_opened: u64,
+    pub connections_reused: u64,
+    pub logical_streams: u64,
+    pub streams_per_connection: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +143,7 @@ pub struct Aggregator {
     inter_token: Histogram<u64>,
     total_from_scheduled: Histogram<u64>,
     total_from_send: Histogram<u64>,
+    transport: TransportSummary,
 }
 
 impl Aggregator {
@@ -164,7 +174,12 @@ impl Aggregator {
             inter_token: make(),
             total_from_scheduled: make(),
             total_from_send: make(),
+            transport: TransportSummary::default(),
         }
+    }
+
+    pub fn set_transport(&mut self, transport: TransportSummary) {
+        self.transport = transport;
     }
 
     pub fn record(&mut self, result: StreamResult) {
@@ -245,6 +260,7 @@ impl Aggregator {
             error_rate,
             tokens_received: self.tokens_received,
             bytes_received: self.bytes_received,
+            transport: self.transport,
             ttft_from_scheduled_us: non_empty(&self.ttft_from_scheduled),
             ttft_from_send_us: non_empty(&self.ttft_from_send),
             inter_token_us: non_empty(&self.inter_token),

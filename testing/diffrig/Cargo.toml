@@ -42,6 +42,7 @@ ring = { workspace = true }
 # the non-streaming half of that test's traffic mix (see its module doc for
 # why the streaming half is not driven through it).
 loadgen = { path = "../loadgen" }
+proxy-simple-config = { path = "../../crates/proxy-simple-config" }
 
 [lints]
 workspace = true

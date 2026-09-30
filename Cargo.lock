@@ -477,6 +477,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "loadgen",
+ "proxy-simple-config",
  "rcgen",
  "ring",
  "rustls",
@@ -1102,10 +1103,15 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rcgen",
  "rlimit",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
