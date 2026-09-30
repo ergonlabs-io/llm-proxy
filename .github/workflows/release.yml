@@ -49,6 +49,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Build admin UI
+        working-directory: admin-ui
+        run: npm ci && npm run build
+
       - name: Build release binary
         run: cargo build --locked --release -p proxy
 
@@ -58,7 +69,8 @@ jobs:
         run: |
           staging="$(mktemp -d)"
           cp target/release/llm-proxy "$staging/llm-proxy"
-          tar -C "$staging" -czf "$ASSET_NAME" llm-proxy
+          cp -R admin-ui/dist "$staging/admin-ui-dist"
+          tar -C "$staging" -czf "$ASSET_NAME" llm-proxy admin-ui-dist
           shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256"
 
       - name: Upload package

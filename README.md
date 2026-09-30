@@ -93,7 +93,7 @@ and did not is worse than no limit at all.
 
  side channels
  ─────────────
- admin :9901   read:  /ready /config_dump /clusters /server_info
+ admin :53422  read:  /ready /config_dump /clusters /server_info
                        /stats /stats/prometheus /models
                 write: /keys /tenants /tenants/{id}/policy|budget
                        GET /keys lists the keys, same gate as the writes
@@ -220,6 +220,14 @@ curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts
 The installer detects the operating system and CPU architecture and installs to
 `~/.local/bin/llm-proxy`. Set `LLM_PROXY_VERSION=v0.3.0` to pin a release or
 `LLM_PROXY_INSTALL_DIR=/usr/local/bin` to choose another destination.
+To create the starter configuration and start the proxy immediately, append
+`--start`; it uses proxy port `53421` and admin/UI port `53422`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | bash -s -- --start
+```
+
+The admin UI is available at `http://127.0.0.1:53422/ui/`.
 
 ## Quick start
 
@@ -252,8 +260,8 @@ A useful configuration is small:
 
 ```yaml
 version: 0
-listen: 0.0.0.0:8080
-admin: 127.0.0.1:9901
+listen: 0.0.0.0:53421
+admin: 127.0.0.1:53422
 
 providers:
   openai:                              # type and base_url inferred from the name

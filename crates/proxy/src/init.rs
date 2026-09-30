@@ -95,8 +95,8 @@ fn starter_config(digest: &str) -> String {
         r#"# llm-proxy starter configuration
 version: 0
 
-listen: 0.0.0.0:8080
-admin: 127.0.0.1:9901
+listen: 0.0.0.0:53421
+admin: 127.0.0.1:53422
 
 # Every generated account starts in the reserved `default` tenant. Add more
 # keys with: llm-proxy --mode keygen --tenant default --hmac-secret-file ./auth-secret
