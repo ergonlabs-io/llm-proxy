@@ -2848,3 +2848,92 @@ async fn ui_load_requires_index_html() {
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     std::fs::remove_dir(&dir).ok();
 }
+
+#[tokio::test]
+async fn key_rotation_conflicts_and_api_version_are_explicit() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    let body = r#"{"schema_version":2,"tenant":"tenant-a","key_id":"stable"}"#;
+    let (status, _, first) = request(addr, "POST", "/keys", Some(ADMIN_TOKEN), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first["schema_version"], 2);
+    let (status, _, second) = request(addr, "POST", "/keys", Some(ADMIN_TOKEN), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert_ne!(first["key"], second["key"]);
+    let authenticator = test_authenticator(handle);
+    assert!(matches!(
+        authenticator.authenticate(&headers_with_bearer(second["key"].as_str().unwrap())),
+        AuthOutcome::Authenticated(_)
+    ));
+    assert!(matches!(
+        authenticator.authenticate(&headers_with_bearer(first["key"].as_str().unwrap())),
+        AuthOutcome::Rejected(AuthError::UnknownKey)
+    ));
+    for body in [
+        r#"{"schema_version":99,"tenant":"tenant-a","key_id":"new"}"#,
+        r#"{"schema_version":1,"tenant":"tenant-a","key_id":"new"}"#,
+    ] {
+        assert_eq!(
+            request(addr, "POST", "/keys", Some(ADMIN_TOKEN), body)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        request(
+            addr,
+            "POST",
+            "/keys",
+            Some(ADMIN_TOKEN),
+            r#"{"tenant":"tenant-b","key_id":"stable"}"#
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(
+            addr,
+            "PUT",
+            "/keys/stable/budget",
+            Some(ADMIN_TOKEN),
+            r#"{"schema_version":99,"budget":null}"#
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(
+            addr,
+            "PUT",
+            "/keys/stable/budget",
+            Some(ADMIN_TOKEN),
+            r#"{"schema_version":2,"budget":{"max_usd":"1.00","period":"daily"}}"#
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(addr, "DELETE", "/keys/stable", Some(ADMIN_TOKEN), "")
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(addr, "POST", "/keys", Some(ADMIN_TOKEN), body)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}

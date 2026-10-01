@@ -143,12 +143,12 @@ pricing:
     effective_from: "2026-01-01T00:00:00Z"
     entries:
       - provider_type: openai
-        model: gpt-4o-mini
+        model: primary-upstream-model
         tier_mode: whole_request
         tiers:
           - {{ input_nanodollars_per_token: 1000000000, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: 1000000000 }}
       - provider_type: openai-compatible
-        model: gpt-4o-mini
+        model: standby-upstream-model
         tier_mode: whole_request
         tiers:
           - {{ input_nanodollars_per_token: 2000000000, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: 3000000000 }}
@@ -306,7 +306,7 @@ async fn spawn_billing_suite(
     );
     bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
         ["typed_config"]["access_log"][0]["typed_config"]["log_format"] = json!({
-        "text_format": "%UPSTREAM_CLUSTER% %LLM_INPUT_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_LIST_COST%\n"
+        "text_format": "%UPSTREAM_CLUSTER% %LLM_INPUT_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_LIST_COST% %LLM_KEY_ID% %LLM_TENANT% %LLM_USER_ID% %LLM_REQUESTED_MODEL% %LLM_SELECTED_MODEL% %LLM_RATE_CARD_VERSION% %RESPONSE_CODE%\n"
     });
 
     let config_yaml = serde_yaml::to_string(&bootstrap).expect("serialize bootstrap");
@@ -675,8 +675,18 @@ async fn authenticated_streaming_fallback_charges_the_key_at_the_standby_price()
     );
 
     let line = read_access_log(&access_log);
+    let fields: Vec<_> = line.split_whitespace().collect();
+    let card = fields.get(9).expect("immutable rate-card version");
+    let digest = card
+        .strip_prefix("fallback-card+")
+        .expect("configured card name and content digest");
+    assert_eq!(digest.len(), 12);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(
-        line, "provider:standby 2 4 16000000000",
+        line,
+        format!(
+            "provider:standby 2 4 16000000000 {CLIENT_KEY_ID} tenant-a - gpt-4o-mini standby-upstream-model {card} 200"
+        ),
         "selected cluster, terminal token usage, and immutable list cost"
     );
 

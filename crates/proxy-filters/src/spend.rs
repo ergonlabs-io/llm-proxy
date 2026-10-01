@@ -101,6 +101,8 @@ use std::time::Duration;
 
 use crate::auth::{KeyId, TenantId};
 
+mod recovery;
+
 // WP-50 increment 3c-ii-b: UTC calendar-aligned period keys. `chrono` is
 // already a workspace dependency (`proxy-cluster`, `proxy-observability`
 // use it); this crate had no prior need for wall-clock rendering.
@@ -737,8 +739,11 @@ const NEVER_FLUSHED: i64 = i64::MIN;
 /// `crate::token_limit::InProcessBudgetStore`'s window map -- a plain
 /// struct behind the accumulator's one `Mutex`, with no store I/O involved
 /// in building or reading it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Bucket {
+    /// Immutable payload for an ambiguous attempt; new charges stay pending.
+    attempt: Option<FlushAttempt>,
     /// The last total the STORE confirmed for this row, in micro-dollars.
     /// Includes every other replica's spend, because it is whatever
     /// [`ControlPlaneStore::add_spend`] returned on the last successful
@@ -785,7 +790,20 @@ struct Bucket {
 /// the thread's clone of `Inner` never keeps `SpendAccumulator` itself
 /// alive, and dropping the last external `Arc<SpendAccumulator>` runs
 /// `Drop` immediately regardless of whether the thread is still running.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlushAttempt {
+    seq: u64,
+    delta: u64,
+}
+
 struct Inner {
+    flush_lock: Mutex<()>,
+    journal: Option<recovery::Journal>,
+    journal_checkpoint_millis: AtomicI64,
+    journal_pending_micros: AtomicU64,
+    journal_pending_rows: AtomicU64,
+    memory_only_requests: std::sync::atomic::AtomicBool,
     stat_prefix: String,
     store: Arc<dyn ControlPlaneStore>,
     /// This replica's identity, from `service_node`. Half of every
@@ -858,7 +876,9 @@ impl Inner {
         buckets
             .entry((tenant.clone(), period_key.clone()))
             .or_insert_with(|| {
-                let total_micros =
+                let total_micros = if self.memory_only_requests.load(Ordering::Relaxed) {
+                    0
+                } else {
                     match self.store.load_spend(&self.stat_prefix, tenant, period_key) {
                         Ok(total) => total,
                         Err(err) => {
@@ -873,7 +893,8 @@ impl Inner {
                             );
                             0
                         }
-                    };
+                    }
+                };
                 Bucket {
                     base_micros: total_micros,
                     ..Bucket::default()
@@ -907,11 +928,12 @@ impl Inner {
     /// Additive writes are composable but not idempotent, so this owns
     /// delivery: each attempt carries `(node_id, seq)`, and `seq` advances
     /// ONLY after the store confirms. A failed or lost write is retried next
-    /// tick under the SAME sequence, so if the first attempt did land and
+    /// tick under the SAME sequence and frozen delta, so if the first attempt did land and
     /// only its response was lost, the store recognises the replay and
     /// returns the total instead of charging twice. The cost of a crash is
-    /// therefore bounded at one flush interval of un-flushed spend, never a
-    /// double charge.
+    /// limited to charges since the last successful local checkpoint when a journal
+    /// is configured. Without it an outage backlog is volatile. Neither bound
+    /// assumes a flush thread can make progress during a store or disk failure.
     ///
     /// Best-effort across buckets: one tenant's write failing does not stop
     /// the rest, but the first failure is returned so the caller (the
@@ -940,77 +962,134 @@ impl Inner {
         Duration::from_millis(u64::try_from(elapsed).unwrap_or(0))
     }
 
+    fn checkpoint(
+        &self,
+        buckets: &HashMap<(TenantId, PeriodKey), Bucket>,
+    ) -> Result<(), StoreError> {
+        if let Some(journal) = &self.journal {
+            journal.save(buckets)?;
+            self.journal_pending_micros.store(
+                buckets.values().fold(0u64, |sum, row| {
+                    sum.saturating_add(row.pending_delta_micros)
+                }),
+                Ordering::Relaxed,
+            );
+            self.journal_pending_rows.store(
+                buckets
+                    .values()
+                    .filter(|row| row.pending_delta_micros != 0)
+                    .count() as u64,
+                Ordering::Relaxed,
+            );
+            // Published last, after a durable transaction; callers can gate a crash drill on it.
+            self.journal_checkpoint_millis
+                .store(Utc::now().timestamp_millis(), Ordering::Release);
+        }
+        Ok(())
+    }
+
     fn flush_now(&self) -> Result<(), StoreError> {
-        // Rust note: the buckets lock is held across store I/O, as it was
-        // before WP-60. That blocks `record` for the duration of a flush,
-        // and it is what lets the read-modify-write of `base_micros` and
-        // `pending_delta_micros` below be a plain subtraction rather than a
-        // compare-and-swap.
-        let mut buckets = self
-            .buckets
+        // Serialize deliveries, but never hold the request buckets lock across I/O.
+        let _flush = self
+            .flush_lock
             .lock()
-            .expect("spend accumulator mutex poisoned");
+            .expect("spend flusher mutex poisoned");
+        let snapshot = || {
+            self.buckets
+                .lock()
+                .expect("spend accumulator mutex poisoned")
+                .clone()
+        };
+        let initial = snapshot();
+        // Capture accumulated outage spend even when Redis cannot seed a sequence.
+        self.checkpoint(&initial)?;
         let mut first_err = None;
-        for ((tenant, period_key), bucket) in buckets.iter_mut() {
-            // Seed the sequence from the store on first flush of this row.
-            // Read here rather than in `get_or_load_bucket` because that
-            // runs on the REQUEST path, where an extra store read costs
-            // every first request of a period, and where a failure must not
-            // be able to stop the flush from being retried.
-            let seq = match bucket.next_seq {
+        let mut attempts = Vec::new();
+        for (tenant, period_key) in initial.keys() {
+            let existing = self
+                .buckets
+                .lock()
+                .expect("spend accumulator mutex poisoned")
+                .get(&(tenant.clone(), period_key.clone()))
+                .expect("known bucket")
+                .next_seq;
+            let seq = match existing {
+                Some(u64::MAX) => {
+                    first_err.get_or_insert_with(|| {
+                        StoreError::Unavailable("spend flush sequence exhausted".into())
+                    });
+                    continue;
+                }
                 Some(seq) => seq,
-                None => {
-                    match self.store.last_flush_seq(
-                        &self.stat_prefix,
-                        tenant,
-                        period_key,
-                        &self.node_id,
-                    ) {
-                        Ok(last) => {
-                            let seq = last + 1;
-                            bucket.next_seq = Some(seq);
-                            seq
-                        }
-                        Err(err) => {
-                            // Do NOT guess a sequence -- see
-                            // `ControlPlaneStore::last_flush_seq`'s doc. A
-                            // guess that lands below the stored one makes
-                            // every future flush of this row a silent no-op.
-                            // Skipping costs one interval; guessing costs the
-                            // spend.
-                            if first_err.is_none() {
-                                first_err = Some(err);
-                            }
+                None => match self.store.last_flush_seq(
+                    &self.stat_prefix,
+                    tenant,
+                    period_key,
+                    &self.node_id,
+                ) {
+                    Ok(last) => match last.checked_add(1) {
+                        Some(seq) => seq,
+                        None => {
+                            first_err.get_or_insert_with(|| {
+                                StoreError::Unavailable("spend flush sequence exhausted".into())
+                            });
                             continue;
                         }
+                    },
+                    Err(err) => {
+                        first_err.get_or_insert(err);
+                        continue;
                     }
-                }
+                },
             };
-            let delta = bucket.pending_delta_micros;
+            let mut buckets = self
+                .buckets
+                .lock()
+                .expect("spend accumulator mutex poisoned");
+            let bucket = buckets
+                .get_mut(&(tenant.clone(), period_key.clone()))
+                .expect("known bucket");
+            bucket.next_seq = Some(seq);
+            let attempt = *bucket.attempt.get_or_insert(FlushAttempt {
+                seq,
+                delta: bucket.pending_delta_micros,
+            });
+            attempts.push((tenant.clone(), period_key.clone(), attempt));
+        }
+        // Freeze all token/payload pairs in ONE durable transaction before Redis writes.
+        self.checkpoint(&snapshot())?;
+        for (tenant, period_key, attempt) in attempts {
             match self.store.add_spend(
                 &self.stat_prefix,
-                tenant,
-                period_key,
-                delta,
+                &tenant,
+                &period_key,
+                attempt.delta,
                 FlushToken {
                     node_id: &self.node_id,
-                    seq,
+                    seq: attempt.seq,
                 },
             ) {
                 Ok(total) => {
+                    let mut buckets = self
+                        .buckets
+                        .lock()
+                        .expect("spend accumulator mutex poisoned");
+                    let bucket = buckets
+                        .get_mut(&(tenant, period_key))
+                        .expect("known bucket");
                     bucket.base_micros = total;
-                    bucket.pending_delta_micros = bucket.pending_delta_micros.saturating_sub(delta);
-                    bucket.next_seq = Some(seq + 1);
+                    bucket.pending_delta_micros =
+                        bucket.pending_delta_micros.saturating_sub(attempt.delta);
+                    bucket.next_seq = attempt.seq.checked_add(1);
+                    bucket.attempt = None;
                 }
                 Err(err) => {
-                    // Leave `next_seq` where it is: the retry must reuse this
-                    // sequence, or a write that did land becomes a second
-                    // charge instead of a recognised replay.
-                    if first_err.is_none() {
-                        first_err = Some(err);
-                    }
+                    first_err.get_or_insert(err);
                 }
             }
+        }
+        if let Err(err) = self.checkpoint(&snapshot()) {
+            first_err.get_or_insert(err);
         }
         match first_err {
             Some(err) => Err(err),
@@ -1051,6 +1130,10 @@ struct Flusher {
 /// method's doc for the "never-spent tenant reports zeros" guarantee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendReport {
+    /// Last durable local checkpoint, independently of Redis reconciliation.
+    pub journal_checkpoint_at: Option<DateTime<Utc>>,
+    pub journal_pending_micro_usd: u64,
+    pub journal_pending_rows: u64,
     /// The tenant's live spend total for this period, in micro-dollars.
     pub total_micros: u64,
     /// Requests this period whose `(cluster, model)` had no configured
@@ -1154,6 +1237,12 @@ impl SpendAccumulator {
     ) -> Self {
         SpendAccumulator {
             inner: Arc::new(Inner {
+                flush_lock: Mutex::new(()),
+                journal: None,
+                journal_checkpoint_millis: AtomicI64::new(NEVER_FLUSHED),
+                journal_pending_micros: AtomicU64::new(0),
+                journal_pending_rows: AtomicU64::new(0),
+                memory_only_requests: std::sync::atomic::AtomicBool::new(false),
                 stat_prefix,
                 store,
                 node_id,
@@ -1166,6 +1255,56 @@ impl SpendAccumulator {
             }),
             flusher: Mutex::new(None),
         }
+    }
+
+    /// Enables a versioned per-replica recovery file before the flusher starts.
+    /// Paths must survive process replacement and must be distinct per live replica/chain.
+    pub fn with_recovery_journal(mut self, path: &std::path::Path) -> Result<Self, StoreError> {
+        let inner = Arc::get_mut(&mut self.inner).expect("journal configured before sharing");
+        let (journal, buckets) = recovery::Journal::open(path, &inner.stat_prefix, &inner.node_id)?;
+        *inner
+            .buckets
+            .get_mut()
+            .expect("spend accumulator mutex poisoned") = buckets;
+        inner.journal = Some(journal);
+        // Replay before serving when possible. An outage retains the journal for the flusher.
+        if let Err(err) = inner.flush_now() {
+            tracing::warn!(error = %err, "spend recovery replay deferred until store recovery");
+        }
+        Ok(self)
+    }
+
+    /// Startup prefetch: production request workers never read a store on first touch.
+    /// New keys/windows begin with local state and reconcile on the next flusher tick.
+    pub fn prepare_request_workers(&self, keys: &[KeyId]) -> Result<(), StoreError> {
+        let now = Utc::now();
+        let mut buckets = self
+            .inner
+            .buckets
+            .lock()
+            .expect("spend accumulator mutex poisoned");
+        for key in keys {
+            for period in [Period::Daily, Period::Monthly] {
+                for date in [now, now + chrono::Duration::days(1)] {
+                    let row = (key_spend_subject(key), period.key_for(date));
+                    if let std::collections::hash_map::Entry::Vacant(entry) = buckets.entry(row) {
+                        let row = entry.key();
+                        let total =
+                            self.inner
+                                .store
+                                .load_spend(&self.inner.stat_prefix, &row.0, &row.1)?;
+                        entry.insert(Bucket {
+                            base_micros: total,
+                            ..Bucket::default()
+                        });
+                    }
+                }
+            }
+        }
+        self.inner
+            .memory_only_requests
+            .store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Records one request's charge against `tenant`'s bucket for the
@@ -1439,6 +1578,11 @@ impl SpendAccumulator {
         // the design brief's "sorted for stable output" requirement.
         let unpriced_pairs: Vec<(String, String)> = bucket.unpriced_pairs.iter().cloned().collect();
         let report = SpendReport {
+            journal_checkpoint_at: DateTime::<Utc>::from_timestamp_millis(
+                self.inner.journal_checkpoint_millis.load(Ordering::Acquire),
+            ),
+            journal_pending_micro_usd: self.inner.journal_pending_micros.load(Ordering::Relaxed),
+            journal_pending_rows: self.inner.journal_pending_rows.load(Ordering::Relaxed),
             total_micros: bucket
                 .base_micros
                 .saturating_add(bucket.pending_delta_micros),
@@ -3059,6 +3203,7 @@ mod tests {
             6_000_000
         );
 
+        record_micros(&accumulator, &tenant, now, 2_000_000);
         accumulator.flush_now().unwrap();
         assert_eq!(
             store
@@ -3069,7 +3214,16 @@ mod tests {
             "the retry must reuse the sequence of the attempt that failed, so the store \
              recognises it as a replay; a fresh sequence charges the same spend twice"
         );
-        assert_eq!(accumulator.current_total(&tenant, &period_key), 6_000_000);
+        assert_eq!(accumulator.current_total(&tenant, &period_key), 8_000_000);
+        accumulator.flush_now().unwrap();
+        assert_eq!(
+            store
+                .inner
+                .load_spend("test-chain", &tenant, &period_key)
+                .unwrap(),
+            8_000_000,
+            "new charges must survive replay of the frozen earlier payload"
+        );
     }
 
     /// The crash bound: everything recorded BEFORE a successful flush is

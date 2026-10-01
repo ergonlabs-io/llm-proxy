@@ -138,7 +138,11 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "llm_tokens=\"%LLM_INPUT_TOKENS%/%LLM_CACHED_TOKENS%/%LLM_CACHE_CREATION_TOKENS%/",
     "%LLM_OUTPUT_TOKENS%/%LLM_TOTAL_TOKENS%\" llm_ttft_ms=\"%LLM_TTFT%\" ",
     "llm_tpot_ms=\"%LLM_TPOT%\" llm_max_stall_ms=\"%LLM_MAX_STALL%\" ",
-    "llm_response_chunks=\"%LLM_RESPONSE_CHUNKS%\"\n",
+    "llm_response_chunks=\"%LLM_RESPONSE_CHUNKS%\" ",
+    "key_id=\"%LLM_KEY_ID%\" tenant=\"%LLM_TENANT%\" user_id=\"%LLM_USER_ID%\" ",
+    "requested_model=\"%LLM_REQUESTED_MODEL%\" selected_provider=\"%UPSTREAM_CLUSTER%\" ",
+    "selected_model=\"%LLM_SELECTED_MODEL%\" rate_card_version=\"%LLM_RATE_CARD_VERSION%\" ",
+    "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\"\n",
 );
 
 /// The header Anthropic requires on every Messages API request.
@@ -784,7 +788,7 @@ fn provider_secret(
             return Err(ConfigError::InvalidValue {
                 field_path: format!("providers.{provider_name}.{field}"),
                 reason: "is required".to_string(),
-            })
+            });
         }
         (Some(_), Some(_)) => unreachable!("validated: provider secret sources are exclusive"),
     };
@@ -1891,6 +1895,14 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "llm_tpot_ms": "%LLM_TPOT%",
                 "llm_max_stall_ms": "%LLM_MAX_STALL%",
                 "llm_response_chunks": "%LLM_RESPONSE_CHUNKS%",
+                "llm_key_id": "%LLM_KEY_ID%",
+                "llm_tenant": "%LLM_TENANT%",
+                "llm_user_id": "%LLM_USER_ID%",
+                "llm_requested_model": "%LLM_REQUESTED_MODEL%",
+                "llm_selected_model": "%LLM_SELECTED_MODEL%",
+                "llm_rate_card_version": "%LLM_RATE_CARD_VERSION%",
+                "selected_provider": "%UPSTREAM_CLUSTER%",
+                "llm_list_cost_nanodollars": "%LLM_LIST_COST%",
             }
         }),
     };
@@ -1957,7 +1969,7 @@ fn lower_tracing(tracing: &crate::model::Tracing) -> Result<Value, ConfigError> 
                 field_path: "observability.tracing.otlp_endpoint".to_string(),
                 reason: "is required and must not be empty when `observability.tracing` is set"
                     .to_string(),
-            })
+            });
         }
     };
     if !(0.0..=1.0).contains(&tracing.sample_ratio) {

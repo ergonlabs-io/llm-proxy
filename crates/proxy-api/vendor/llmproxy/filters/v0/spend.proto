@@ -73,6 +73,16 @@ message SpendLimit {
   // What this replica does once `reconciliation_bound_seconds` has elapsed.
   // `ON_RECONCILIATION_EXPIRED_UNSPECIFIED` means `ALLOW`.
   OnReconciliationExpired on_reconciliation_expired = 5;
+
+  // Optional per-replica/chain redb file. The flusher checkpoints pending deltas
+  // and exact retry tokens before Redis I/O. Keep this file on durable storage
+  // across restarts and use a stable, unique service_node. Empty disables it.
+  // Requests since the last checkpoint remain volatile; no request-path disk I/O.
+  string recovery_journal_path = 6;
+
+  // Required opt-in when legacy tenant budgets exist. START_KEYS_FRESH retains
+  // tenant history while explicitly starting key enforcement; never copies totals.
+  LegacyTenantBudgetCutover legacy_tenant_budget_cutover = 7;
 }
 
 // What a replica does when its spend state is stale -- ADR-0006 section 5.
@@ -224,4 +234,10 @@ message ModelPrice {
   string cached_per_million = 4;
   // Price per 1,000,000 cache-WRITE input tokens.
   string cache_creation_per_million = 5;
+}
+
+// Existing aggregate tenant history cannot establish per-key charges.
+enum LegacyTenantBudgetCutover {
+  LEGACY_TENANT_BUDGET_CUTOVER_UNSPECIFIED = 0;
+  START_KEYS_FRESH = 1;
 }

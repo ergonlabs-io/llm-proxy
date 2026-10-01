@@ -441,7 +441,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
                 Some(Readiness::Initializing { .. }) => {
                     text(StatusCode::SERVICE_UNAVAILABLE, "INITIALIZING")
                 }
-            }
+            };
         }
         "/config_dump" => {
             let snapshot = config.load();
@@ -1167,6 +1167,7 @@ fn parse_json_body<T: serde::de::DeserializeOwned>(
 fn store_error_response(endpoint: &str, err: StoreError) -> Response<Full<Bytes>> {
     match err {
         StoreError::NotFound => text(StatusCode::NOT_FOUND, "not found"),
+        StoreError::Conflict(reason) => text(StatusCode::CONFLICT, &reason),
         other => {
             tracing::warn!(endpoint, error = %other, "admin write failed: control-plane store error");
             text(StatusCode::INTERNAL_SERVER_ERROR, &other.to_string())
@@ -1174,9 +1175,26 @@ fn store_error_response(endpoint: &str, err: StoreError) -> Response<Full<Bytes>
     }
 }
 
+fn read_api_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<(), D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if version == proxy_filters::control::SPEND_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported spend API schema version {version}"
+        )))
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MintKeyRequest {
+    #[serde(
+        default,
+        rename = "schema_version",
+        deserialize_with = "read_api_schema_version"
+    )]
+    _schema_version: (),
     tenant: String,
     key_id: String,
 }
@@ -1211,6 +1229,12 @@ struct SetPolicyRequest {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetBudgetRequest {
+    #[serde(
+        default,
+        rename = "schema_version",
+        deserialize_with = "read_api_schema_version"
+    )]
+    _schema_version: (),
     budget: Option<BudgetSpec>,
 }
 
@@ -1310,12 +1334,12 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
     let count = rendered.len();
     json(
         StatusCode::OK,
-        &serde_json::json!({ "keys": rendered, "count": count }),
+        &serde_json::json!({ "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION, "keys": rendered, "count": count }),
     )
 }
 
 fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<Bytes>> {
-    let MintKeyRequest { tenant, key_id } = match parse_json_body(body) {
+    let MintKeyRequest { tenant, key_id, .. } = match parse_json_body(body) {
         Ok(request) => request,
         Err(response) => return response,
     };
@@ -1341,6 +1365,7 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
             json(
                 StatusCode::CREATED,
                 &serde_json::json!({
+                    "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION,
                     "key_id": minted.key_id.as_str(),
                     "tenant": minted.tenant.as_str(),
                     "key": minted.plaintext,
@@ -1689,6 +1714,9 @@ fn handle_get_spend(
             "budget_micro_usd": budget_micros,
             "remaining_micro_usd": remaining_micros,
             "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
+            "journal_checkpoint_at": report.journal_checkpoint_at.map(|dt| dt.to_rfc3339()),
+            "journal_pending_micro_usd": report.journal_pending_micro_usd,
+            "journal_pending_rows": report.journal_pending_rows,
             // WP-62 / ADR-0006 §5. `last_flush_at` alone answers "when",
             // which forces every reader to do the subtraction and to know
             // what bound this deployment configured; these three answer
@@ -1744,6 +1772,7 @@ fn handle_get_key_spend(
     json(
         StatusCode::OK,
         &serde_json::json!({
+            "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION,
             "key_id": key_id.as_str(),
             "tenant": tenant.as_str(),
             "period": period_key.as_str(),
@@ -1754,6 +1783,9 @@ fn handle_get_key_spend(
             "budget_micro_usd": budget_micros,
             "remaining_micro_usd": remaining_micros,
             "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
+            "journal_checkpoint_at": report.journal_checkpoint_at.map(|dt| dt.to_rfc3339()),
+            "journal_pending_micro_usd": report.journal_pending_micro_usd,
+            "journal_pending_rows": report.journal_pending_rows,
             "reconciliation_age_seconds": report.reconciliation_age_seconds,
             "reconciliation_expired": report.reconciliation_expired,
             "unreconciled_admissions": report.unreconciled_admissions,

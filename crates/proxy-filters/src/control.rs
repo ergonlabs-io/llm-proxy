@@ -114,6 +114,34 @@ pub struct StoredControlPlane {
     pub budgets: HashMap<TenantId, TenantBudget>,
 }
 
+/// Version 2 uses stable key budget subjects; absent versions are legacy version 1.
+pub const SPEND_SCHEMA_VERSION: u32 = 2;
+fn legacy_schema_version() -> u32 {
+    1
+}
+fn read_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if matches!(version, 1 | SPEND_SCHEMA_VERSION) {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported spend schema version {version}"
+        )))
+    }
+}
+
+fn validate_key_update(previous: &StoredKey, next: &StoredKey) -> Result<(), StoreError> {
+    if previous.tenant != next.tenant {
+        return Err(StoreError::Conflict("key ownership is immutable".into()));
+    }
+    if previous.revoked && (!next.revoked || previous.digest != next.digest) {
+        return Err(StoreError::Conflict(
+            "revoked key IDs cannot be reused".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Why a [`ControlPlaneStore`] call failed.
 ///
 /// Deliberately small in this increment (`InMemoryControlPlaneStore`'s writes
@@ -129,6 +157,8 @@ pub enum StoreError {
     /// A write targeted a row the store has never seen (e.g. revoking an
     /// unknown `key_id`).
     NotFound,
+    /// Stable key ownership or terminal revocation forbids this update.
+    Conflict(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -138,6 +168,7 @@ impl std::fmt::Display for StoreError {
                 write!(f, "control-plane store unavailable: {reason}")
             }
             StoreError::NotFound => write!(f, "control-plane store: not found"),
+            StoreError::Conflict(reason) => write!(f, "control-plane store conflict: {reason}"),
         }
     }
 }
@@ -267,7 +298,9 @@ pub trait ControlPlaneStore: Send + Sync {
     // API (3b-ii) does, off the request path.
     fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
     fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
-    /// Inserts or overwrites the row for `rec.key_id`.
+    /// Creates or rotates a stable key atomically. Ownership is immutable;
+    /// revoked IDs are permanent tombstones. Updating an active key's digest
+    /// immediately replaces its secret with no overlap, preserving budget/spend.
     fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError>;
     /// Sets `revoked = true` on the row named by `key_id` and keeps it (the
     /// audit trail survives a revoke) -- see `StoredKey::revoked`'s use in
@@ -558,6 +591,9 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .state
             .lock()
             .expect("control-plane store mutex poisoned");
+        if let Some(previous) = state.keys.get(&rec.key_id) {
+            validate_key_update(previous, rec)?;
+        }
         state.keys.insert(rec.key_id.clone(), rec.clone());
         state.generation += 1;
         Ok(())
@@ -776,6 +812,11 @@ const GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("gener
 ///   cost of JSON is free in context.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodedKeyRow {
+    #[serde(
+        default = "legacy_schema_version",
+        deserialize_with = "read_schema_version"
+    )]
+    pub(crate) schema_version: u32,
     pub(crate) digest: [u8; 32],
     pub(crate) tenant: String,
     pub(crate) revoked: bool,
@@ -859,6 +900,11 @@ impl From<EncodedPeriod> for crate::spend::Period {
 /// [`EncodedPeriod`] above.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodedTenantBudget {
+    #[serde(
+        default = "legacy_schema_version",
+        deserialize_with = "read_schema_version"
+    )]
+    schema_version: u32,
     max_micros: u64,
     period: EncodedPeriod,
 }
@@ -866,6 +912,7 @@ pub(crate) struct EncodedTenantBudget {
 impl From<&TenantBudget> for EncodedTenantBudget {
     fn from(budget: &TenantBudget) -> Self {
         EncodedTenantBudget {
+            schema_version: SPEND_SCHEMA_VERSION,
             max_micros: budget.max_micros.as_micros(),
             period: budget.period.into(),
         }
@@ -1183,10 +1230,23 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         let previous_tenant: Option<String> = {
             let mut keys_table = txn.open_table(KEYS_TABLE).map_err(store_err)?;
             let previous = match keys_table.get(rec.key_id.as_str()).map_err(store_err)? {
-                Some(guard) => Some(decode_json::<EncodedKeyRow>(guard.value())?.tenant),
+                Some(guard) => {
+                    let previous: EncodedKeyRow = decode_json(guard.value())?;
+                    validate_key_update(
+                        &StoredKey {
+                            key_id: rec.key_id.clone(),
+                            digest: previous.digest,
+                            tenant: TenantId::new(previous.tenant.clone()),
+                            revoked: previous.revoked,
+                        },
+                        rec,
+                    )?;
+                    Some(previous.tenant)
+                }
                 None => None,
             };
             let row = EncodedKeyRow {
+                schema_version: SPEND_SCHEMA_VERSION,
                 digest: rec.digest,
                 tenant: rec.tenant.as_str().to_string(),
                 revoked: rec.revoked,
@@ -1811,6 +1871,22 @@ impl ControlPlane {
     /// section and every other write method below: a reader must never
     /// observe a republish that predates the write it is meant to reflect.
     pub fn mint_key(&self, tenant: &TenantId, key_id: &KeyId) -> Result<MintedKey, StoreError> {
+        let snapshot = self.published.load();
+        if let Some(owner) = snapshot.key_tenants.get(key_id) {
+            if owner != tenant {
+                return Err(StoreError::Conflict("key ownership is immutable".into()));
+            }
+            if snapshot
+                .keys
+                .iter()
+                .any(|(_, record)| &record.key_id == key_id && record.revoked)
+            {
+                return Err(StoreError::Conflict(
+                    "revoked key IDs cannot be reused".into(),
+                ));
+            }
+        }
+        drop(snapshot);
         let rng = ring::rand::SystemRandom::new();
         let plaintext = crate::auth::generate_plaintext_key(&rng);
         let digest = crate::auth::digest_bytes(&self.secret, &plaintext);
@@ -3258,6 +3334,104 @@ mod tests {
             "setting a policy must not clobber the tenant's already-configured budget"
         );
         assert_eq!(policy.model_access, access);
+    }
+
+    #[test]
+    fn rotation_preserves_key_budget_history_and_model_grants() {
+        for store in [
+            Box::new(InMemoryControlPlaneStore::default()) as Box<dyn ControlPlaneStore>,
+            Box::new(RedbControlPlaneStore::in_memory()),
+        ] {
+            let cp = ControlPlane::new(store, HmacSecret::new(b"rotation-secret"), KeySet::new())
+                .unwrap();
+            let tenant = TenantId::new("tenant-a");
+            let id = KeyId::new("stable-key");
+            let first = cp.mint_key(&tenant, &id).unwrap();
+            let budget = TenantBudget {
+                max_micros: crate::spend::MicroUsd::from_micros(10),
+                period: crate::spend::Period::Daily,
+            };
+            cp.set_policy(
+                &tenant,
+                &ModelAccess::Only(vec![ModelPattern::new("allowed")]),
+            )
+            .unwrap();
+            cp.set_key_budget(&id, Some(&budget)).unwrap();
+            let subject = key_spend_subject(&id);
+            let period = budget.period.key_for_now();
+            cp.store()
+                .add_spend(
+                    "chain",
+                    &subject,
+                    &period,
+                    7,
+                    FlushToken {
+                        node_id: "node",
+                        seq: 1,
+                    },
+                )
+                .unwrap();
+            let rotated = cp.mint_key(&tenant, &id).unwrap();
+            let auth =
+                VirtualKeyAuthenticator::new(HmacSecret::new(b"rotation-secret"), cp.handle());
+            assert!(matches!(
+                auth.authenticate(&headers_with_authorization(&format!(
+                    "Bearer {}",
+                    first.plaintext
+                ))),
+                AuthOutcome::Rejected(AuthError::UnknownKey)
+            ));
+            assert!(matches!(
+                auth.authenticate(&headers_with_authorization(&format!(
+                    "Bearer {}",
+                    rotated.plaintext
+                ))),
+                AuthOutcome::Authenticated(_)
+            ));
+            assert_eq!(cp.handle().load().key_budgets.get(&id), Some(&budget));
+            assert_eq!(
+                cp.store().load_spend("chain", &subject, &period).unwrap(),
+                7
+            );
+            assert_eq!(
+                cp.handle().load().policies["tenant-a"].model_access,
+                ModelAccess::Only(vec![ModelPattern::new("allowed")])
+            );
+            let generation = cp.store().policy_generation().unwrap();
+            assert!(matches!(
+                cp.mint_key(&TenantId::new("tenant-b"), &id),
+                Err(StoreError::Conflict(_))
+            ));
+            assert_eq!(cp.store().policy_generation().unwrap(), generation);
+            cp.revoke_key(&id).unwrap();
+            cp.delete_tenant(&tenant).unwrap();
+            let generation = cp.store().policy_generation().unwrap();
+            assert!(matches!(
+                cp.mint_key(&tenant, &id),
+                Err(StoreError::Conflict(_))
+            ));
+            assert_eq!(cp.store().policy_generation().unwrap(), generation);
+            assert_eq!(
+                cp.store().load_spend("chain", &subject, &period).unwrap(),
+                7
+            );
+        }
+    }
+
+    #[test]
+    fn stored_schema_reads_legacy_rows_and_rejects_future_versions() {
+        let legacy: EncodedTenantBudget =
+            decode_json(br#"{"max_micros":5,"period":"Daily"}"#).unwrap();
+        assert_eq!(legacy.schema_version, 1);
+        let budget: TenantBudget = legacy.into();
+        let encoded: EncodedTenantBudget = (&budget).into();
+        let value: serde_json::Value = serde_json::from_slice(&encode_json(&encoded)).unwrap();
+        assert_eq!(value["schema_version"], SPEND_SCHEMA_VERSION);
+        assert!(decode_json::<EncodedTenantBudget>(
+            br#"{"schema_version":99,"max_micros":5,"period":"Daily"}"#
+        )
+        .is_err());
+        assert!(decode_json::<EncodedKeyRow>(br#"{"schema_version":99,"digest":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"tenant":"a","revoked":false}"#).is_err());
     }
 
     // --- mutation pins: a write that skips `self.rebuild()` must not be

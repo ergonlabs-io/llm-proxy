@@ -17,6 +17,8 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-7  | SIGTERM during an active stream drains to completion       | passing                                                 |
 | QA-8  | Circuit-breaker rejection fails fast, does not queue       | approved                                                |
 | QA-10 | TTFT and TPOT reach the access log with sane values        | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
+| QA-11 | Redis tenant-to-key cutover and persisted spend after SIGKILL | passing — requires `QA_REDIS_ADDR` |
+| QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -433,3 +435,54 @@ Timing assertions are shape-with-tolerance, never tight equality, per this
 document's own standing rule.
 
 **Ignored by default:** no.
+
+## QA-11 — Redis spend migration/restart
+
+Run against a disposable Redis instance with no authentication:
+
+```sh
+QA_REDIS_ADDR=127.0.0.1:6379 make qa-case CASE=TestQA11
+```
+
+Without `QA_REDIS_ADDR`, this case explicitly skips. With it, a connection
+failure fails the case. The test uses a unique namespace and removes only its
+own rows. The harness supervises both proxy processes and bounds network calls.
+
+The fixture seeds the existing Redis tenant budget/spend format and two stable
+keys under that tenant. The explicit cutover policy starts fresh key ceilings;
+legacy aggregate history cannot establish individual key charges. Both keys must
+start at zero, and the legacy budget and historical total must remain unchanged.
+Key A reaches its ceiling, then the test waits for Redis to acknowledge the
+charge before sending SIGKILL. The restarted binary uses the same writer ID and
+must retain A's budget/history, deny A, and admit B independently. Raising A's
+ceiling allows one more charge; its persisted total and writer sequence must
+advance without loss or duplication. Denied requests never reach the upstream.
+
+This proves the current compatible row layout and an explicit fresh-key cutover,
+not a general migration tool or evidence-based historical per-key seeding. It
+does not recover an unflushed RAM backlog after SIGKILL, exercise a Redis
+partition, or prove three-process convergence; QA-12 covers those separately.
+
+QA-11 also rotates A's secret through the admin API, verifies the old secret is
+rejected and the same budget/history remains, and rejects ownership changes
+and revoked ID reuse.
+
+## QA-12 — Redis partition and checkpointed process recovery
+
+Run `QA_REDIS_ADDR=127.0.0.1:6379 make qa-case CASE=TestQA12` against disposable
+Redis. Missing configuration skips explicitly; connection failure fails.
+
+Three supervised proxy processes share one namespace, with distinct stable
+writer IDs and recovery journal paths. Baseline charges converge to $6 with
+each writer's own sequence advancing. A TCP relay then closes existing Redis
+connections and refuses new ones. Each replica reports stale reconciliation,
+admits one local $2 charge, and rejects the next at its local $8 ceiling.
+
+The drill waits for a durable journal checkpoint of the outage charge before
+SIGKILL of one replica. Restoring the same Redis address and restarting that
+replica with the same writer ID and journal must replay all deltas exactly once:
+every replica converges to $12, clears pending rows and reconciliation expiry,
+and denies further requests. A second clean restart must retain $12 without
+duplication. The test bounds calls, supervises processes, and removes its own
+namespace. Charges accrued after the last checkpoint remain volatile; this
+does not claim synchronous per-request durability.

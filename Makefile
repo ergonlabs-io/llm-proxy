@@ -107,6 +107,12 @@ tq-changed: ## Test only crates you changed, e.g. make tq-changed BASE=main
 	echo "tq-changed: testing$$args  (vs $$base; reverse deps NOT included)"; \
 	cargo nextest run $$args
 
+# Default workspace runs skip these external-store tests.
+.PHONY: tq-redis
+tq-redis: ## Run Redis store tests (requires LLM_PROXY_TEST_REDIS)
+	@test -n "$$LLM_PROXY_TEST_REDIS" || (echo "LLM_PROXY_TEST_REDIS is required"; exit 1)
+	cargo nextest run -p proxy-filters --run-ignored all -E 'test(redis)'
+
 tq-%: ## Test one crate via nextest, e.g. make tq-proxy-http
 	cargo nextest run -p $*
 

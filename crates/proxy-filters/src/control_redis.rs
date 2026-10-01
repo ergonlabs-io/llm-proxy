@@ -54,6 +54,7 @@ use crate::auth::{KeyId, TenantId};
 use crate::control::{
     decode_json, encode_json, store_err, ControlPlaneStore, EncodedKeyRow, EncodedModelAccess,
     EncodedTenantBudget, FlushToken, StoreError, StoredControlPlane, StoredKey,
+    SPEND_SCHEMA_VERSION,
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
@@ -125,6 +126,27 @@ end
 local row = cjson.decode(raw)
 row['revoked'] = true
 redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(row))
+redis.call('INCR', KEYS[2])
+return 1
+"#;
+
+// Ownership, tombstone checks, write, and generation bump share one Redis transaction.
+const PUT_KEY_LUA: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+local next = cjson.decode(ARGV[2])
+if raw then
+  local previous = cjson.decode(raw)
+  local version = previous['schema_version'] or 1
+  if version ~= 1 and version ~= 2 then return -3 end
+  if previous['tenant'] ~= next['tenant'] then return -1 end
+  if previous['revoked'] then
+    if not next['revoked'] then return -2 end
+    for i = 1, #previous['digest'] do
+      if previous['digest'][i] ~= next['digest'][i] then return -2 end
+    end
+  end
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
 redis.call('INCR', KEYS[2])
 return 1
 "#;
@@ -253,7 +275,14 @@ impl RedisControlPlaneStore {
             .lock()
             .expect("redis control-plane store connection mutex poisoned");
         if guard.is_none() {
-            *guard = Some(self.client.get_connection().map_err(store_err)?);
+            let timeout = std::time::Duration::from_secs(1);
+            let conn = self
+                .client
+                .get_connection_with_timeout(timeout)
+                .map_err(store_err)?;
+            conn.set_read_timeout(Some(timeout)).map_err(store_err)?;
+            conn.set_write_timeout(Some(timeout)).map_err(store_err)?;
+            *guard = Some(conn);
         }
         // Rust note: `.as_mut()` on the `Option`, not `.take()` -- a
         // successful call must leave the connection in the `Mutex` for the
@@ -466,27 +495,30 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     }
 
     fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
-        let keys_key = self.keys_key();
-        let generation_key = self.generation_key();
         let row = EncodedKeyRow {
+            schema_version: SPEND_SCHEMA_VERSION,
             digest: rec.digest,
-            tenant: rec.tenant.as_str().to_string(),
+            tenant: rec.tenant.as_str().into(),
             revoked: rec.revoked,
         };
-        let encoded = encode_json(&row);
-        self.with_connection(|conn| {
-            redis::pipe()
-                .atomic()
-                .cmd("HSET")
-                .arg(&keys_key)
+        let result: i64 = self.with_connection(|conn| {
+            Script::new(PUT_KEY_LUA)
+                .key(self.keys_key())
+                .key(self.generation_key())
                 .arg(rec.key_id.as_str())
-                .arg(&encoded)
-                .ignore()
-                .cmd("INCR")
-                .arg(&generation_key)
-                .ignore()
-                .query::<()>(conn)
-        })
+                .arg(encode_json(&row))
+                .invoke(conn)
+        })?;
+        match result {
+            1 => Ok(()),
+            -1 => Err(StoreError::Conflict("key ownership is immutable".into())),
+            -2 => Err(StoreError::Conflict(
+                "revoked key IDs cannot be reused".into(),
+            )),
+            _ => Err(StoreError::Unavailable(
+                "unsupported spend schema version".into(),
+            )),
+        }
     }
 
     /// See [`REVOKE_KEY_LUA`]'s doc for why the existence check and the
@@ -746,6 +778,56 @@ mod tests {
             .as_nanos();
         RedisControlPlaneStore::open_with_namespace(&url, format!("llmproxy-test-{label}-{nanos}"))
             .expect("Client::open only parses the URL and must not fail here")
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_rotation_keeps_history_and_rejects_owner_changes_and_tombstone_reuse() {
+        let store = test_store("key-lifecycle");
+        let id = KeyId::new("stable");
+        let tenant = TenantId::new("owner");
+        let subject = crate::spend::key_spend_subject(&id);
+        let period = PeriodKey::for_test("2026-09");
+        let mut row = StoredKey {
+            key_id: id.clone(),
+            digest: [1; 32],
+            tenant: tenant.clone(),
+            revoked: false,
+        };
+        store.put_key(&row).unwrap();
+        let budget = TenantBudget {
+            max_micros: crate::spend::MicroUsd::from_micros(10),
+            period: crate::spend::Period::Monthly,
+        };
+        store.set_budget(&subject, Some(&budget)).unwrap();
+        store
+            .add_spend(
+                "chain",
+                &subject,
+                &period,
+                7,
+                FlushToken {
+                    node_id: "node",
+                    seq: 1,
+                },
+            )
+            .unwrap();
+        row.digest = [2; 32];
+        store.put_key(&row).unwrap();
+        assert_eq!(store.load().unwrap().keys[0].digest, [2; 32]);
+        assert_eq!(store.load().unwrap().budgets.get(&subject), Some(&budget));
+        assert_eq!(store.load_spend("chain", &subject, &period).unwrap(), 7);
+        let generation = store.policy_generation().unwrap();
+        row.tenant = TenantId::new("other");
+        assert!(matches!(store.put_key(&row), Err(StoreError::Conflict(_))));
+        assert_eq!(store.policy_generation().unwrap(), generation);
+        row.tenant = tenant;
+        store.revoke_key(&id).unwrap();
+        let generation = store.policy_generation().unwrap();
+        assert!(matches!(store.put_key(&row), Err(StoreError::Conflict(_))));
+        assert_eq!(store.policy_generation().unwrap(), generation);
+        assert!(store.load().unwrap().keys[0].revoked);
+        assert_eq!(store.load_spend("chain", &subject, &period).unwrap(), 7);
     }
 
     #[test]

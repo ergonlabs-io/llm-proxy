@@ -208,6 +208,8 @@ pub struct StreamInfo {
     /// authorize a request against a tenant's model allow-list, and fails
     /// closed on `None` -- see that filter's module doc.
     pub requested_model: Option<String>,
+    /// Provider-owned model selected for the current upstream attempt.
+    pub selected_model: Option<String>,
     /// WP-51 increment 2: this stream's SERVER span context, set by
     /// `filter_manager::FilterChainHandler::handle` right after `StreamInfo`
     /// is built -- `None` whenever tracing is off (`ConfigSnapshot::tracing`
@@ -250,6 +252,7 @@ impl Default for StreamInfo {
             llm: LlmStats::default(),
             auth: AuthInfo::default(),
             requested_model: None,
+            selected_model: None,
             trace: None,
             on_upgrade: None,
         }

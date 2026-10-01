@@ -12,13 +12,11 @@
 //! [`crate::token_limit_filter`] -- checks on the **decode** path (before a
 //! request is sent upstream, against whatever the key's live spend
 //! already is) and records on the **encode** path, at response end. The
-//! consequence is the same shape as `token_limit`'s: the ONE request whose
-//! cost pushes a key over its ceiling is necessarily ADMITTED (its own
-//! cost cannot be known yet at the moment it is checked), and it is the
-//! **next** request that gets refused. Overspend past a configured ceiling
-//! is therefore bounded by at most one request's cost, never unbounded --
-//! this is an accepted, documented property of "check before you know the
-//! price", not a bug to fix by delaying the response.
+//! cost of every request admitted before prior responses finish can exceed
+//! the ceiling. There are no spend reservations: overspend includes all admitted
+//! in-flight costs plus remote charges not yet reconciled. Without separate
+//! concurrency and request-cost limits there is no finite strict overspend bound.
+//! Sequential traffic can exceed the ceiling by one request's cost.
 //!
 //! # Filter position: mirrors `token_limit_filter`'s two ordering rules
 //! exactly, restated for key + usage instead of tenant + usage
@@ -39,7 +37,7 @@
 //! `proxy_config::lower::check_lane_h_filter_order` enforces both at config
 //! load; this comment states the reasoning, not the guard.
 //!
-//! # No key -> admit; no budget -> admit (unlimited)
+//! # Missing key identity is denied when any key budget is configured
 //!
 //! Two DIFFERENT "nothing to enforce" cases, both admitting, for different
 //! reasons:
@@ -48,7 +46,9 @@
 //!   authenticator, and duplicating `llmproxy.auth`'s own fail-closed 401
 //!   here would only produce a second, confusingly different refusal reason
 //!   for the same underlying fact ("this request was never authenticated").
-//!   Nothing is recorded either -- there is no key to attribute spend to.
+//!   With configured key budgets this returns 403, preventing a JWT or missing
+//!   key identity from bypassing policy. With no key budgets, it admits without
+//!   recording unattributable spend.
 //! - **The authenticated key has no configured [`crate::spend::TenantBudget`]**
 //!   (absent from the snapshot's `key_budgets`). Mirrors
 //!   [`crate::model_authz_filter`]'s and
@@ -361,6 +361,26 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         let default_period = parse_default_period(config)?;
         let flush_interval = parse_flush_interval(config);
         let reconciliation = parse_reconciliation(config)?;
+        let journal_path = config
+            .get_field_by_name("recovery_journal_path")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let cutover = config
+            .get_field_by_name("legacy_tenant_budget_cutover")
+            .and_then(|v| v.as_enum_number())
+            .unwrap_or(0);
+        if !matches!(cutover, 0 | 1) {
+            return Err(invalid(
+                "typed_config.legacy_tenant_budget_cutover",
+                "unsupported cutover policy",
+            ));
+        }
+        if !journal_path.is_empty() && (ctx.node_id().is_empty() || ctx.node_id() == "-") {
+            return Err(invalid(
+                "typed_config.recovery_journal_path",
+                "recovery requires an explicit stable service_node or bootstrap node.id",
+            ));
+        }
 
         // WP-50 3c-iii-b: resolve the SAME `ControlPlane` singleton
         // `llmproxy.auth`'s factory registers -- see `model_authz_filter`'s
@@ -385,6 +405,20 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                 "the control-plane singleton registered under auth_filter::TYPE_URL is \
                  always a ControlPlane",
             );
+
+        if cutover == 0
+            && control_plane
+                .handle()
+                .load()
+                .policies
+                .values()
+                .any(|policy| policy.budget.is_some())
+        {
+            return Err(invalid(
+                "typed_config.legacy_tenant_budget_cutover",
+                "legacy tenant budgets require an explicit START_KEYS_FRESH cutover; retain history and configure key budgets before serving",
+            ));
+        }
 
         // Seed or join the usage filter's live rate-card registry. The usage
         // factory may be built later because spend must precede usage in the
@@ -423,13 +457,32 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         let store = control_plane.store();
         let shared = ctx
             .get_or_try_init(TYPE_URL, || {
-                let accumulator = Arc::new(SpendAccumulator::with_reconciliation(
+                let mut accumulator = SpendAccumulator::with_reconciliation(
                     ctx.stat_prefix.clone(),
                     store,
                     default_period,
                     resolve_node_id(ctx.node_id(), &ctx.stat_prefix),
                     reconciliation,
-                ));
+                );
+                if !journal_path.is_empty() {
+                    accumulator = accumulator
+                        .with_recovery_journal(std::path::Path::new(&journal_path))
+                        .map_err(|err| {
+                            invalid("typed_config.recovery_journal_path", err.to_string())
+                        })?;
+                }
+                let keys: Vec<_> = control_plane
+                    .list_keys()
+                    .into_iter()
+                    .map(|key| key.key_id)
+                    .collect();
+                accumulator.prepare_request_workers(&keys).map_err(|err| {
+                    invalid(
+                        "typed_config",
+                        format!("spend startup prefetch failed: {err}"),
+                    )
+                })?;
+                let accumulator = Arc::new(accumulator);
                 accumulator.start_flusher(flush_interval);
                 Ok(Arc::new(SharedSpendLimitState {
                     accumulator,
@@ -619,12 +672,13 @@ impl SpendLimitFilterInstance {
         // before calling `self.accumulator.record` below -- `stream_info()`
         // must not be held across another call (see its doc), same pattern
         // as `token_limit_filter::record_if_present`.
-        let (usage, cluster, model) = {
+        let (usage, cluster, model, selected_model) = {
             let info = cb.stream_info();
             (
                 info.llm.usage,
                 info.upstream_cluster.clone(),
                 info.requested_model.clone(),
+                info.selected_model.clone(),
             )
         };
 
@@ -645,7 +699,7 @@ impl SpendLimitFilterInstance {
         let charge = PricingRegistry::cost_micro_usd_for(
             self.pricing_snapshot.as_ref(),
             cluster.as_deref(),
-            model.as_deref(),
+            selected_model.as_deref().or(model.as_deref()),
             &usage,
         )
         .map(|micros| Charge::Priced(MicroUsd::from_micros(micros)))
@@ -685,6 +739,15 @@ impl HttpFilter for SpendLimitFilterInstance {
             self.key_id = None;
             self.period = None;
             self.budget_applies = false;
+            if !self.snapshot.load().key_budgets.is_empty() {
+                cb.send_local_reply(
+                    StatusCode::FORBIDDEN,
+                    "authenticated key identity required for spend policy",
+                    None,
+                    "spend_identity_missing",
+                );
+                return FilterHeadersStatus::StopIteration;
+            }
             return FilterHeadersStatus::Continue;
         };
 
@@ -1557,6 +1620,167 @@ mod tests {
 
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert!(cb.local_reply.is_none(), "no tenant must never be denied");
+    }
+
+    #[test]
+    fn configured_key_policy_rejects_missing_authenticated_key_identity() {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                max_micros: MicroUsd::from_micros(10),
+                period: Period::Daily,
+            },
+        )]);
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let mut filter = harness.new_instance();
+        let mut cb = TestCallbacks::new();
+        cb.stream_info.borrow_mut().auth.tenant = Some("tenant-a".into());
+        let status = filter.decode_headers(&mut cb, &mut request_headers(), true);
+        assert_eq!(status, FilterHeadersStatus::StopIteration);
+        assert_eq!(cb.local_reply.as_ref().unwrap().0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn concurrent_admissions_can_exceed_the_ceiling_until_completion() {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                max_micros: MicroUsd::from_micros(1),
+                period: Period::Daily,
+            },
+        )]);
+        let mut table = PriceTable::new();
+        table.insert(
+            "cluster-a",
+            "m",
+            ModelPrices {
+                input_per_million: MicroUsd::from_micros(1_000_000),
+                ..Default::default()
+            },
+        );
+        let harness = filter_with(&cp, table, Period::Monthly);
+        let mut first = harness.new_instance();
+        let mut second = harness.new_instance();
+        let mut first_cb = TestCallbacks::new();
+        first_cb.set_tenant("tenant-a");
+        let mut second_cb = TestCallbacks::new();
+        second_cb.set_tenant("tenant-a");
+        assert_eq!(
+            first.decode_headers(&mut first_cb, &mut request_headers(), true),
+            FilterHeadersStatus::Continue
+        );
+        assert_eq!(
+            second.decode_headers(&mut second_cb, &mut request_headers(), true),
+            FilterHeadersStatus::Continue
+        );
+        for (filter, cb) in [(&mut first, &mut first_cb), (&mut second, &mut second_cb)] {
+            cb.set_upstream("cluster-a", "m");
+            cb.set_usage(usage(3));
+            filter.encode_data(cb, &mut Bytes::new(), true);
+        }
+        assert_eq!(
+            harness
+                .accumulator
+                .current_total_key(&test_key_id("tenant-a"), &Period::Daily.key_for_now()),
+            6
+        );
+        assert_eq!(
+            run_request(&harness, "tenant-a", None, None).0.unwrap().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn one_key_accumulates_across_models_and_selected_providers() {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                max_micros: MicroUsd::from_micros(5),
+                period: Period::Daily,
+            },
+        )]);
+        let mut table = PriceTable::new();
+        table.insert(
+            "cluster-a",
+            "first",
+            ModelPrices {
+                input_per_million: MicroUsd::from_micros(1_000_000),
+                ..Default::default()
+            },
+        );
+        table.insert(
+            "cluster-b",
+            "second",
+            ModelPrices {
+                input_per_million: MicroUsd::from_micros(2_000_000),
+                ..Default::default()
+            },
+        );
+        let harness = filter_with(&cp, table, Period::Monthly);
+        assert!(
+            run_request(&harness, "tenant-a", Some(("cluster-a", "first")), Some(1))
+                .0
+                .is_none()
+        );
+        assert!(
+            run_request(&harness, "tenant-a", Some(("cluster-b", "second")), Some(2))
+                .0
+                .is_none()
+        );
+        assert_eq!(
+            harness
+                .accumulator
+                .current_total_key(&test_key_id("tenant-a"), &Period::Daily.key_for_now()),
+            5
+        );
+        assert_eq!(
+            run_request(&harness, "tenant-a", Some(("cluster-a", "first")), Some(1))
+                .0
+                .unwrap()
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn legacy_tenant_budgets_require_explicit_cutover_even_when_zero() {
+        for limit in [0, 10] {
+            let cp = control_plane_with(&[]);
+            cp.set_budget(
+                &TenantId::new("tenant-a"),
+                Some(&TenantBudget {
+                    max_micros: MicroUsd::from_micros(limit),
+                    period: Period::Daily,
+                }),
+            )
+            .unwrap();
+            let ctx = FactoryContext::default();
+            ctx.shared
+                .get_or_try_init(&ctx.scope, &ctx.stat_prefix, auth_filter::TYPE_URL, || {
+                    Ok(cp.clone() as Arc<dyn std::any::Any + Send + Sync>)
+                })
+                .unwrap();
+            let mut config = spend_limit_config(vec![]);
+            let error = SpendLimitFilterFactory
+                .create(&config, &ctx)
+                .err()
+                .expect("legacy budget must require cutover");
+            assert!(error.to_string().contains("legacy_tenant_budget_cutover"));
+            config.set_field_by_name(
+                "legacy_tenant_budget_cutover",
+                prost_reflect::Value::EnumNumber(1),
+            );
+            assert!(SpendLimitFilterFactory.create(&config, &ctx).is_ok());
+            assert!(cp.handle().load().key_budgets.is_empty());
+            assert_eq!(
+                cp.handle().load().policies["tenant-a"]
+                    .budget
+                    .unwrap()
+                    .max_micros
+                    .as_micros(),
+                limit
+            );
+        }
     }
 
     /// The accumulator must flush into the SAME store the `ControlPlane`

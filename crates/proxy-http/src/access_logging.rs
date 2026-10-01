@@ -482,6 +482,7 @@ impl LoggingBody {
             trace,
             tenant,
             response_code_details,
+            usage_attribution,
         ) = {
             let mut info = ctx.stream_info.borrow_mut();
             info.bytes_sent = self.bytes_sent;
@@ -520,6 +521,14 @@ impl LoggingBody {
                 // everything else `LogContext` borrows, same reasoning as
                 // this destructure's own doc above.
                 info.response_code_details.clone(),
+                (
+                    info.auth.key_id.clone(),
+                    info.selected_model.clone(),
+                    info.llm
+                        .list_cost
+                        .as_ref()
+                        .map(|cost| cost.rate_card_version.clone()),
+                ),
             )
         };
 
@@ -644,6 +653,12 @@ impl LoggingBody {
             llm_max_stall,
             llm_response_chunks,
             llm_list_cost_nanodollars,
+            llm_key_id: usage_attribution.0.as_deref(),
+            llm_tenant: tenant.as_deref(),
+            llm_user_id: None,
+            llm_requested_model: requested_model.as_deref(),
+            llm_selected_model: usage_attribution.1.as_deref(),
+            llm_rate_card_version: usage_attribution.2.as_deref(),
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
             request_authority: ctx.request.authority.as_deref(),

@@ -227,12 +227,12 @@ order is load-bearing, not stylistic.
 ## Managing keys and tenants at runtime
 
 Minting a key, revoking one, creating or deleting a tenant, and setting a
-tenant's model allow-list or spend budget are all bearer-gated HTTP calls
+tenant's model allow-list or key's spend budget are all bearer-gated HTTP calls
 against the admin server, not config-file edits: `POST /keys`,
 `DELETE /keys/{id}`, `POST /tenants`, `DELETE /tenants/{id}`,
-`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`, a read-only
+`PUT /tenants/{id}/policy`, `PUT /keys/{id}/budget`, a read-only
 `GET /keys` listing every key (id, tenant, revocation, budget -- no
-plaintext), and a read-only `GET /tenants/{id}/spend`
+plaintext), and a read-only `GET /keys/{id}/spend`
 (`crates/proxy-admin/src/server.rs`'s `AVAILABLE_ENDPOINTS`, and its
 `WriteRoute::expected_method` table). Each of these
 paths also has a scoped form, `/chains/{stat_prefix}/...`, that names the
@@ -259,10 +259,13 @@ every write plus the two financial/identity reads, `GET .../spend` and
 `GET /keys`; the config-shaped reads (`/ready`, `/config_dump`, `/clusters`,
 `/models`, `/server_info`, `/stats*`) ignore the token entirely.
 
-Keys and tenant policy live in one of two stores, selected by
-`typed_config.store` on the `llmproxy.auth` filter. The default,
+See [Spend policies and recovery](/limits-and-budgets/spend-policies/) for
+rotation, permanent revocation tombstones, API versioning, and migration.
+
+Keys and tenant policy live in one of three stores, selected by
+the auth store oneof (`in_memory`, `persistent`, or `shared`) on the `llmproxy.auth` filter. The default,
 `in_memory`, holds everything only for the life of the process. Setting
-`typed_config.store.persistent.path` selects `RedbControlPlaneStore`, an
+`typed_config.persistent.path` selects `RedbControlPlaneStore`, an
 embedded on-disk store that survives a restart of that one process
 (`crates/proxy-filters/src/auth_filter.rs:182-213`, `StoreSpec` and
 `parse_store`). This selection is Envoy-mode only: the dialect's schema
@@ -290,14 +293,6 @@ running process; a config reload is not.
   treated as `NoCredential`, not `Rejected`, specifically so a second
   authenticator can claim it later — but there is no JWT validator today
   (WP-50 increment 2c).
-- **A shared, multi-replica store.** `RedisControlPlaneStore` exists and its
-  own tests pass against a real Redis
-  (`crates/proxy-filters/src/control_redis.rs`), but nothing can select it:
-  `StoreSpec` only has `InMemory` and `Persistent` variants, and `parse_store`
-  only matches `in_memory` and `persistent`
-  (`crates/proxy-filters/src/auth_filter.rs:182-213`). Today every store is
-  single-process; running more than one replica means each has its own,
-  independent key set and budget.
 - **Model allow-lists or budgets from the `llmproxy` dialect's config file.**
   `schema/llmproxy-v0.schema.json`'s `Auth` type has no such field. Setting
   either requires the admin write API or a hand-written Envoy-mode

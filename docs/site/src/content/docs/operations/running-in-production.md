@@ -48,7 +48,7 @@ the same record.
 |---|---|---|---|---|
 | 1 · configuration | listeners, routes, clusters, filters | operator / xDS | already solved, unrelated to this page | wrong routing |
 | 2 · identity & policy | tenants, virtual keys, revocations, budget ceilings | admin API | yes, if `store: shared` | a revoked key still authenticates |
-| 3 · accrued counters | spend in micro-dollars, per tenant per period | data plane, constantly | yes, if `store: shared` | budget over-admitted |
+| 3 · accrued counters | spend in micro-dollars, per stable key per period | data plane, constantly | yes, if `store: shared` | budget over-admitted |
 | 4 · live gauges | concurrency / in-flight requests | data plane, constantly | **no — see below** | unscoped, not designed yet |
 
 Tiers 2 and 3 are what `store: shared` gives you. Tier 4 is not part of this
@@ -73,11 +73,10 @@ http_filters:
           tenant: acme
           digest_hex: 3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a
           revoked: false
-      store:
-        shared:
-          url:
-            filename: /etc/llmproxy/redis-url.txt
-          namespace: prod
+      shared:
+        url:
+          filename: /etc/llmproxy/redis-url.txt
+        namespace: prod
       poll_interval_seconds: 48
   - name: llmproxy.spend_limit
     typed_config:
@@ -90,6 +89,7 @@ http_filters:
               output_per_million: "10.00"
               cached_per_million: "1.25"
               cache_creation_per_million: "3.75"
+      recovery_journal_path: /var/lib/llmproxy/spend-recovery.redb
       flush_interval_seconds: 5
       reconciliation_bound_seconds: 60
   - name: envoy.filters.http.router
@@ -175,6 +175,9 @@ replica (a pod name, a hostname) — do not rely on the synthesized fallback,
 which exists so a metering detail never blocks the process from starting
 (CLAUDE.md rule 17), not as a supported production identity.
 
+With `recovery_journal_path` configured, a stable node ID is required at load;
+the synthesized fallback is rejected for recoverable replicas.
+
 ## Spend counters converge — they do not update instantly
 
 With a shared store, `add_spend` is additive: each flush sends a delta and a
@@ -197,6 +200,10 @@ over-admission at roughly:
 ```
 flush_interval x replica_count x peak spend rate
 ```
+
+This estimates completed-charge propagation only. Concurrent in-flight costs
+are additional; without reservations, concurrency limits, and request-cost
+limits there is no finite strict overspend bound.
 
 (ADR-0006 §4.) At the 5-second default with 4 replicas each admitting up to
 $10/second at peak, that is on the order of $200 of over-admission before
@@ -269,7 +276,7 @@ While a replica is stale, over-admission grows to roughly:
 doc, lines 1077–1080.) Unlike the steady-state bound above, this one is not
 capped by a flush interval — it grows for as long as the outage lasts,
 because `ALLOW` is the only wired behavior. Watch it end-to-end: `GET
-/tenants/{id}/spend` (or `GET /chains/{stat_prefix}/tenants/{id}/spend`)
+/keys/{id}/spend` (or `GET /chains/{stat_prefix}/keys/{id}/spend`)
 reports `reconciliation_age_seconds`, `reconciliation_expired`, and a
 cumulative `unreconciled_admissions` count for exactly this reason
 (`crates/proxy-admin/src/server.rs`, lines 1291–1293). Alert on
@@ -279,9 +286,11 @@ config value you already chose.
 The ledger self-heals once the store comes back: every replica's
 accumulated delta flushes on recovery and the store's additive write
 composes the backlog, so the total becomes exactly correct — nothing is
-lost, only delayed (ADR-0006 §5). A crash still loses at most one flush
-interval of that replica's own spend, unchanged from single-replica
-behavior (`a_crash_loses_at_most_the_spend_recorded_since_the_last_flush`).
+lost, only delayed (ADR-0006 §5). A configured local recovery journal preserves checkpointed outage
+backlog across SIGKILL. Charges since the last successful local checkpoint
+remain volatile; without a journal, the entire unflushed outage backlog is
+volatile. See [Spend policies and recovery](/limits-and-budgets/spend-policies/)
+for configuration, migration, key lifecycle, and concurrent admission limits.
 
 ## What stays local, even with a shared store
 
@@ -311,18 +320,19 @@ behavior (`a_crash_loses_at_most_the_spend_recorded_since_the_last_flush`).
 
 ## Verifying a Redis-backed store
 
-The Redis-backed implementation's own tests are `#[ignore]`d by default and
-need a real Redis reachable at `127.0.0.1:6379` to run:
+Run the process acceptance drills against disposable Redis:
 
 ```sh
-cargo nextest run -p proxy-filters --run-ignored all -E 'test(redis)'
+QA_REDIS_ADDR=127.0.0.1:6379 make qa-case CASE='TestQA11|TestQA12'
 ```
 
-A plain `make tq` never exercises this path. The test suite itself states
-what it does not prove: nothing in it exercises a real `kill -9`, a socket
-reconnection after a network partition, or process supervision — that is a
-deliberate gap, left to a separate QA harness, not something to assume is
-covered.
+QA-11 covers legacy tenant-history retention and key restart enforcement.
+QA-12 covers three real processes, a socket partition, stale admissions, local
+enforcement, checkpointed backlog recovery after SIGKILL, and exact replay.
+Both explicitly skip when `QA_REDIS_ADDR` is absent; a plain `make tq` does not
+run them. The lower-level Redis tests also require a real Redis and an explicit
+ignored-test run. See the Makefile's `t1` target and
+`crates/proxy-filters/src/control_redis.rs` for their environment variable.
 
 ## Troubleshooting
 
@@ -332,5 +342,5 @@ covered.
 | Load error naming `typed_config.on_reconciliation_expired` | `on_reconciliation_expired` was set to `DENY` or `DEGRADE` | Remove the field, or set it to `ALLOW` explicitly — neither alternative is implemented |
 | Load error: `llmproxy.spend_limit requires llmproxy.auth earlier in the same filter chain` | `llmproxy.spend_limit` appears before, or without, `llmproxy.auth` in `http_filters` | Place `llmproxy.auth` earlier in the same chain |
 | A revoked key still authenticates on some replicas | Expected for up to `poll_interval_seconds x 1.25` (60s at the default) — see [Policy and key revocation](#policy-and-key-revocation-propagation-is-bounded-not-instant) | Wait out the bound, or lower `poll_interval_seconds` (raises store read load) |
-| `GET /tenants/{id}/spend` reports `reconciliation_expired: true` | This replica has not reconciled with the shared store within `reconciliation_bound_seconds` — a store outage or partition | Check connectivity to the shared store; enforcement continues on last-known totals in the meantime |
+| `GET /keys/{id}/spend` reports `reconciliation_expired: true` | This replica has not reconciled with the shared store within `reconciliation_bound_seconds` — a store outage or partition | Check connectivity to the shared store; enforcement continues on last-known totals in the meantime |
 | A budget trips later than expected, or several replicas each admit up to the full ceiling | Every replica was given the same `--service-node` value (or all left it unset and happened to share a synthesized id, which the pid/timestamp scheme makes very unlikely) | Give every replica a distinct, stable `--service-node` |

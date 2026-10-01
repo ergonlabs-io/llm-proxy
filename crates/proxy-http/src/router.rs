@@ -715,6 +715,8 @@ impl RouterHandler {
         apply_request_transforms(fwd, matcher, request_headers_to_add, &mut attempt_head);
         apply_cluster_request_path_rewrite(attempt_entry.request_path_rewrite(), &mut attempt_head);
         let requested_model = dcb.stream_info().requested_model.clone();
+        dcb.stream_info().selected_model =
+            selected_provider_model(attempt_entry.provider_runtime(), requested_model.as_deref());
         apply_cluster_provider_path_template(
             attempt_entry
                 .provider_runtime()
@@ -1332,6 +1334,10 @@ impl RouterHandler {
                     &mut attempt_head,
                 );
                 let requested_model = dcb.stream_info().requested_model.clone();
+                dcb.stream_info().selected_model = selected_provider_model(
+                    attempt_entry.provider_runtime(),
+                    requested_model.as_deref(),
+                );
                 apply_cluster_provider_path_template(
                     attempt_entry
                         .provider_runtime()
@@ -2114,6 +2120,29 @@ fn apply_cluster_request_path_rewrite(
 /// Render provider-owned URL templates after final cluster selection. Model
 /// mappings live on the cluster, so a fallback uses its own upstream model
 /// identifier rather than the primary's.
+fn selected_provider_model(
+    runtime: Option<&proxy_config::ir::ProviderRuntimeConfig>,
+    requested: Option<&str>,
+) -> Option<String> {
+    let requested = requested?;
+    let mappings = runtime.map(|runtime| match runtime.path_template.as_ref() {
+        Some(proxy_config::ir::ProviderPathTemplate::Vertex { models, .. })
+        | Some(proxy_config::ir::ProviderPathTemplate::Bedrock { models }) => models.as_slice(),
+        None => runtime.model_rewrites.as_slice(),
+    });
+    Some(
+        mappings
+            .and_then(|mappings| {
+                mappings
+                    .iter()
+                    .find(|mapping| provider_model_pattern_matches(&mapping.pattern, requested))
+                    .map(|mapping| mapping.upstream_model.as_str())
+            })
+            .unwrap_or(requested)
+            .to_string(),
+    )
+}
+
 fn apply_cluster_provider_path_template(
     template: Option<&proxy_config::ir::ProviderPathTemplate>,
     requested_model: Option<&str>,

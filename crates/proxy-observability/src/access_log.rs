@@ -136,6 +136,12 @@ pub enum FormatOp {
     LlmResponseChunks,
     /// WP-53: `%LLM_LIST_COST%`, in integer nanodollars.
     LlmListCost,
+    LlmKeyId,
+    LlmTenant,
+    LlmUserId,
+    LlmRequestedModel,
+    LlmSelectedModel,
+    LlmRateCardVersion,
 }
 
 /// The argument to `%REQ%`/`%RESP%`/`%TRAILER%`: a primary header name, an
@@ -401,10 +407,34 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmListCost
         }
+        "LLM_KEY_ID" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmKeyId
+        }
+        "LLM_TENANT" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmTenant
+        }
+        "LLM_USER_ID" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmUserId
+        }
+        "LLM_REQUESTED_MODEL" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmRequestedModel
+        }
+        "LLM_SELECTED_MODEL" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmSelectedModel
+        }
+        "LLM_RATE_CARD_VERSION" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmRateCardVersion
+        }
         other => {
             return Err(err(format!(
                 "unknown access-log format operator `%{other}%` in format string `{input}`"
-            )))
+            )));
         }
     })
 }
@@ -483,6 +513,14 @@ pub struct LogContext<'a> {
     pub llm_response_chunks: u64,
     /// WP-53's request-time list price. `None` is unpriced/unknown, not zero.
     pub llm_list_cost_nanodollars: Option<u64>,
+    /// Usage attribution; absent identities and unpriced cards remain absent.
+    pub llm_key_id: Option<&'a str>,
+    pub llm_tenant: Option<&'a str>,
+    pub llm_user_id: Option<&'a str>,
+    pub llm_requested_model: Option<&'a str>,
+    pub llm_selected_model: Option<&'a str>,
+    pub llm_rate_card_version: Option<&'a str>,
+
     /// Envoy request pseudo-header `:method` -- e.g. `GET`. These four fields
     /// exist because `:method`/`:path`/`:authority`/`:scheme` are not legal
     /// `http::HeaderName`s (a colon isn't a valid HTTP field-name character),
@@ -642,6 +680,12 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::LlmResponseChunks => {
             let _ = write!(out, "{}", ctx.llm_response_chunks);
         }
+        FormatOp::LlmKeyId => out.push_str(ctx.llm_key_id.unwrap_or("-")),
+        FormatOp::LlmTenant => out.push_str(ctx.llm_tenant.unwrap_or("-")),
+        FormatOp::LlmUserId => out.push_str(ctx.llm_user_id.unwrap_or("-")),
+        FormatOp::LlmRequestedModel => out.push_str(ctx.llm_requested_model.unwrap_or("-")),
+        FormatOp::LlmSelectedModel => out.push_str(ctx.llm_selected_model.unwrap_or("-")),
+        FormatOp::LlmRateCardVersion => out.push_str(ctx.llm_rate_card_version.unwrap_or("-")),
         FormatOp::LlmListCost => match ctx.llm_list_cost_nanodollars {
             Some(cost) => {
                 let _ = write!(out, "{cost}");
@@ -938,6 +982,13 @@ mod tests {
             llm_max_stall: None,
             llm_response_chunks: 0,
             llm_list_cost_nanodollars: None,
+            llm_key_id: None,
+            llm_tenant: None,
+            llm_user_id: None,
+            llm_requested_model: None,
+            llm_selected_model: None,
+            llm_rate_card_version: None,
+
             request_method: Some("POST"),
             request_path: Some("/v1/chat/completions"),
             request_authority: Some("api.example.com"),
@@ -946,10 +997,30 @@ mod tests {
     }
 
     #[test]
+    fn renders_usage_attribution_and_absence() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%LLM_KEY_ID% %LLM_TENANT% %LLM_USER_ID% %LLM_REQUESTED_MODEL% %LLM_SELECTED_MODEL% %LLM_RATE_CARD_VERSION%");
+        assert_eq!(render(&fs, &c), "- - - - - -");
+        c.llm_key_id = Some("stable-key");
+        c.llm_tenant = Some("tenant-a");
+        c.llm_requested_model = Some("alias");
+        c.llm_selected_model = Some("provider-model");
+        c.llm_rate_card_version = Some("card-v2");
+        assert_eq!(
+            render(&fs, &c),
+            "stable-key tenant-a - alias provider-model card-v2"
+        );
+        assert!(parse_format("%LLM_KEY_ID(secret)%").is_err());
+    }
+
+    #[test]
     fn renders_scalars() {
         let empty = http::HeaderMap::new();
         let c = ctx(&empty, &empty, &empty, &[]);
-        let fs = parse("%PROTOCOL% %RESPONSE_CODE% %DURATION% %BYTES_RECEIVED% %BYTES_SENT% %UPSTREAM_HOST% %UPSTREAM_CLUSTER% %DOWNSTREAM_REMOTE_ADDRESS%");
+        let fs = parse(
+            "%PROTOCOL% %RESPONSE_CODE% %DURATION% %BYTES_RECEIVED% %BYTES_SENT% %UPSTREAM_HOST% %UPSTREAM_CLUSTER% %DOWNSTREAM_REMOTE_ADDRESS%",
+        );
         assert_eq!(
             render(&fs, &c),
             "HTTP/1.1 200 42 10 20 10.0.0.1:8080 my_cluster 127.0.0.1:1234"
@@ -966,7 +1037,9 @@ mod tests {
         c.upstream_host = None;
         c.upstream_cluster = None;
         c.downstream_remote_address = None;
-        let fs = parse("%PROTOCOL% %RESPONSE_CODE% %DURATION% %UPSTREAM_HOST% %UPSTREAM_CLUSTER% %DOWNSTREAM_REMOTE_ADDRESS% %REQ(x)% %RESPONSE_FLAGS%");
+        let fs = parse(
+            "%PROTOCOL% %RESPONSE_CODE% %DURATION% %UPSTREAM_HOST% %UPSTREAM_CLUSTER% %DOWNSTREAM_REMOTE_ADDRESS% %REQ(x)% %RESPONSE_FLAGS%",
+        );
         assert_eq!(render(&fs, &c), "- - - - - - - -");
     }
 

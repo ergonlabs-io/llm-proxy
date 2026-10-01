@@ -318,18 +318,26 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
         let tier_mode = match entry.tier_mode.as_str() {
             "whole_request" => TierMode::WholeRequest,
             "graduated" => TierMode::Graduated,
-            other => return Err(invalid_config(format!("price_list.entries[{entry_index}].tier_mode must be whole_request or graduated, got `{other}`"))),
+            other => {
+                return Err(invalid_config(format!(
+                    "price_list.entries[{entry_index}].tier_mode must be whole_request or graduated, got `{other}`"
+                )));
+            }
         };
         let mut previous = None;
         for (tier_index, tier) in entry.tiers.iter().enumerate() {
             if tier.up_to.is_none() && tier_index + 1 != entry.tiers.len() {
-                return Err(invalid_config(format!("price_list.entries[{entry_index}].tiers[{tier_index}] open-ended tier must be last")));
+                return Err(invalid_config(format!(
+                    "price_list.entries[{entry_index}].tiers[{tier_index}] open-ended tier must be last"
+                )));
             }
             if tier
                 .up_to
                 .is_some_and(|up_to| previous.is_some_and(|p| up_to <= p))
             {
-                return Err(invalid_config(format!("price_list.entries[{entry_index}].tiers[{tier_index}].up_to must strictly increase")));
+                return Err(invalid_config(format!(
+                    "price_list.entries[{entry_index}].tiers[{tier_index}].up_to must strictly increase"
+                )));
             }
             if tier.up_to.is_some() {
                 previous = tier.up_to;
@@ -631,7 +639,10 @@ impl UsageFilterInstance {
             let pricing = self.pricing.as_ref()?;
             let cluster = stream_info.upstream_cluster.as_deref()?;
             let provider_type = pricing.providers.get(cluster)?;
-            let model = stream_info.requested_model.as_deref()?;
+            let model = stream_info
+                .selected_model
+                .as_deref()
+                .or(stream_info.requested_model.as_deref())?;
             pricing
                 .list
                 .list_cost_nanodollars(provider_type, model, &usage)

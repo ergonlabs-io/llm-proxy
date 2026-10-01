@@ -484,6 +484,13 @@ mod tests {
             llm_max_stall: None,
             llm_response_chunks: 0,
             llm_list_cost_nanodollars: None,
+            llm_key_id: None,
+            llm_tenant: None,
+            llm_user_id: None,
+            llm_requested_model: None,
+            llm_selected_model: None,
+            llm_rate_card_version: None,
+
             request_method: None,
             request_path: None,
             request_authority: None,
