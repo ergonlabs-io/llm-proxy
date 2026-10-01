@@ -583,6 +583,34 @@
           "default": true,
           "examples": [true, false]
         },
+        "metrics": {
+          "type": "object",
+          "description": "OTLP metric export. Independent of `tracing`: set this without `tracing` to export metrics with tracing fully off, and note that turning tracing off does not stop metrics. Omit entirely for no OTLP metric export -- which does not disable `/stats/prometheus`, which works with no OTLP configuration at all. `export_deadline` must be shorter than `export_interval`, or every export is abandoned as a timeout before the next one is due.",
+          "additionalProperties": false,
+          "required": ["otlp_endpoint"],
+          "properties": {
+            "otlp_endpoint": {
+              "type": "string",
+              "description": "The OTLP/gRPC collector endpoint for metrics. May differ from the tracing one.",
+              "examples": ["http://localhost:4317"]
+            },
+            "service_name": {
+              "type": "string",
+              "description": "OTLP resource attribute `service.name`.",
+              "default": "llm-proxy"
+            },
+            "export_interval": {
+              "$ref": "#/$defs/Duration",
+              "description": "How often to snapshot and export the registry. Each export is a full cumulative snapshot, so this trades collector bandwidth against freshness. Bounded to 1s-1h.",
+              "default": "15s"
+            },
+            "export_deadline": {
+              "$ref": "#/$defs/Duration",
+              "description": "Per-export deadline. This is what bounds a collector that accepts a connection and then stops responding, rather than merely retrying it. Must be less than `export_interval`.",
+              "default": "10s"
+            }
+          }
+        },
         "tracing": {
           "type": "object",
           "description": "OTLP trace export (WP-51 increment 3): config surface only -- nothing exports a span yet. Omit entirely to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.",
@@ -598,6 +626,11 @@
               "type": "string",
               "description": "OTLP resource attribute `service.name`.",
               "default": "llm-proxy"
+            },
+            "export_deadline": {
+              "$ref": "#/$defs/Duration",
+              "description": "Per-export deadline for trace-batch RPCs. Bounds a collector that accepts the connection and then stops responding: each hung attempt costs one timeout, never an indefinite stall. Bounded to 100ms-60s.",
+              "default": "5s"
             },
             "sample_ratio": {
               "type": "number",

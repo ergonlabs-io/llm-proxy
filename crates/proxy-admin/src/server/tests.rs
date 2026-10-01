@@ -164,6 +164,15 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         secrets: HashMap::new(),
         admin: Some("127.0.0.1:9901".parse().unwrap()),
         tracing: None,
+        // WP-51 increment 4: metric export is a separate IR field from trace
+        // export precisely so the two are independently configurable; these
+        // admin-server fixtures exercise neither, and a snapshot literal is
+        // exhaustive by design, so a new root field has to be named here. This
+        // is the same hazard `ir.rs`'s `with_dynamic_resources` doc describes
+        // from the other side: the compile error is the cheap half, and
+        // `tests/ir_readership.rs` is what would have caught a field that was
+        // named here but never read.
+        metrics: None,
         // WP-20 increment 1: this fixture is a static-config snapshot, which
         // is what `None` means -- no control plane is involved.
         ads: None,
@@ -313,6 +322,8 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         secrets: HashMap::new(),
         admin: None,
         tracing: None,
+        // WP-51 increment 4: see the other snapshot fixture in this file.
+        metrics: None,
         ads: None,
         version: SnapshotVersion(1),
     })

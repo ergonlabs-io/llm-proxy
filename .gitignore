@@ -37,6 +37,8 @@ testing/diffrig/captures/
 !internal-docs/**/*.md
 !internal-docs/**/*.yaml
 !internal-docs/**/*.json
+# Implementation contracts cited by the operational telemetry code.
+!docs/telemetry-design.md
 # The published documentation site. Every page under here is Markdown, so
 # `*.md` denied all of them by default and each one had to be `git add -f`'d
 # — which means a page an author forgot to force-add was invisible to

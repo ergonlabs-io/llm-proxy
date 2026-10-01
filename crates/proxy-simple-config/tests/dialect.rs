@@ -937,6 +937,7 @@ observability:
             otlp_endpoint: "http://localhost:4317".to_string(),
             service_name: "my-gateway".to_string(),
             sample_ratio: 0.5,
+            export_deadline: std::time::Duration::from_secs(5),
         })
     );
 }
@@ -966,6 +967,7 @@ observability:
             otlp_endpoint: "http://collector:4317".to_string(),
             service_name: "llm-proxy".to_string(),
             sample_ratio: 1.0,
+            export_deadline: std::time::Duration::from_secs(5),
         })
     );
 }
@@ -1044,6 +1046,328 @@ tracing:
     };
     assert_eq!(field_path, "tracing");
     assert!(reason.contains("reserved"), "got: {reason}");
+}
+
+// ------------------------------------------ WP-51 increment 4: metric export --
+
+/// No `observability` at all means no `node` key on the lowered bootstrap, and
+/// both OTLP surfaces stay `None` all the way through. The metrics mirror of
+/// `no_tracing_block_emits_no_node_key`, and the reason both exist is the same:
+/// an accidental default here would be an operator's proxy silently shipping
+/// telemetry somewhere they did not name.
+#[test]
+fn no_observability_blocks_emit_no_node_key() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("must parse");
+    let lowered = proxy_simple_config::lower(&config).expect("must lower");
+    assert!(
+        lowered.bootstrap.get("node").is_none(),
+        "no observability configured must mean no node key at all, got {:?}",
+        lowered.bootstrap
+    );
+    let snapshot =
+        proxy_config::build_snapshot(&lower_to_loaded(&config).expect("must lower")).expect("IR");
+    assert_eq!(snapshot.tracing, None);
+    assert_eq!(snapshot.metrics, None);
+}
+
+/// The load-bearing case for the whole increment: `observability.metrics`
+/// lowers all the way through the real Envoy-mode loader into
+/// `ConfigSnapshot::metrics` with NO `tracing` block present. Before the split
+/// this configuration was inexpressible -- metrics were only ever exported by
+/// the task spawned for a `TracingConfig`.
+#[test]
+fn metrics_block_lowers_end_to_end_with_tracing_absent() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  metrics:
+    otlp_endpoint: "http://localhost:4317"
+    service_name: "my-gateway"
+    export_interval: "30s"
+    export_deadline: "5s"
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    assert_eq!(
+        snapshot.tracing, None,
+        "a metrics block must not imply tracing is on"
+    );
+    assert_eq!(
+        snapshot.metrics,
+        Some(proxy_config::ir::MetricsExportConfig {
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            service_name: "my-gateway".to_string(),
+            // The dialect's `"30s"` string form must arrive as 30 *seconds*,
+            // matching what a raw Envoy config's plain `30` means -- if the two
+            // front ends disagreed about the unit, the same number would mean
+            // two different intervals depending on which dialect wrote it.
+            export_interval: std::time::Duration::from_secs(30),
+            export_deadline: std::time::Duration::from_secs(5),
+        })
+    );
+}
+
+/// Both blocks together must land as two sibling keys under ONE
+/// `node.metadata`, with neither clobbering the other. This is a real
+/// regression target, not a theoretical one: the lowering used to assign
+/// `bootstrap["node"]` once per block, so whichever came second would have
+/// replaced the first entirely -- silently disabling whichever surface the
+/// dialect happened to list first in the file.
+#[test]
+fn both_observability_blocks_emit_both_metadata_keys() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://traces:4317"
+  metrics:
+    otlp_endpoint: "http://metrics:4317"
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+
+    let tracing = snapshot.tracing.expect("tracing configured");
+    let metrics = snapshot.metrics.expect("metrics configured");
+    assert_eq!(tracing.otlp_endpoint, "http://traces:4317");
+    assert_eq!(metrics.otlp_endpoint, "http://metrics:4317");
+}
+
+/// The order-dependence the previous test is really about, pinned directly:
+/// `metrics` listed BEFORE `tracing` in the same file must produce the same
+/// two-key result. A "whichever is written last wins" bug would pass the
+/// tracing-first test above and fail this one.
+#[test]
+fn metrics_before_tracing_still_keeps_both_blocks() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  metrics:
+    otlp_endpoint: "http://metrics:4317"
+  tracing:
+    otlp_endpoint: "http://traces:4317"
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    assert_eq!(
+        snapshot.tracing.expect("tracing").otlp_endpoint,
+        "http://traces:4317"
+    );
+    assert_eq!(
+        snapshot.metrics.expect("metrics").otlp_endpoint,
+        "http://metrics:4317"
+    );
+}
+
+/// `service_name` and both durations default when omitted; only `otlp_endpoint`
+/// is required.
+#[test]
+fn metrics_block_defaults_service_name_and_durations() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  metrics:
+    otlp_endpoint: "http://collector:4317"
+"#,
+    )
+    .expect("must parse");
+    let snapshot = proxy_config::build_snapshot(&lower_to_loaded(&config).expect("must lower"))
+        .expect("must build IR");
+    let metrics = snapshot.metrics.expect("configured");
+    assert_eq!(metrics.service_name, "llm-proxy");
+    assert_eq!(metrics.export_interval, std::time::Duration::from_secs(15));
+    assert_eq!(metrics.export_deadline, std::time::Duration::from_secs(10));
+}
+
+/// Ground rule #1: a `metrics` block with no `otlp_endpoint` is a hard error
+/// with the operator-facing dialect path -- not a silently-disabled block.
+#[test]
+fn metrics_block_without_otlp_endpoint_is_a_hard_error() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  metrics: {}
+"#,
+    )
+    .expect("must parse");
+    let err = proxy_simple_config::lower(&config)
+        .expect_err("a metrics block with no otlp_endpoint must not lower");
+    let ConfigError::InvalidValue { field_path, .. } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "observability.metrics.otlp_endpoint");
+}
+
+/// An unknown key inside the block is rejected by serde's
+/// `deny_unknown_fields`, named against the block's own path rather than the
+/// whole file.
+#[test]
+fn metrics_block_rejects_unknown_keys() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  metrics:
+    otlp_endpoint: "http://localhost:4317"
+    interval: "30s"
+"#,
+    )
+    .expect_err("an unknown key must not parse");
+    let text = err.to_string();
+    assert!(
+        text.contains("observability.metrics") || text.contains("interval"),
+        "error should name the offending field, got: {text}"
+    );
+}
+
+/// A duration that does not match the dialect's own syntax is rejected at
+/// PARSE time, naming the dialect path -- before it can reach the Envoy-mode
+/// reader, which would otherwise report a `node.metadata[...]`-rooted path for
+/// what is plainly a dialect syntax error.
+#[test]
+fn metrics_block_rejects_a_malformed_duration() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  metrics:
+    otlp_endpoint: "http://localhost:4317"
+    export_interval: "30 seconds"
+"#,
+    )
+    .expect_err("a malformed duration must not parse");
+    let text = err.to_string();
+    assert!(
+        text.contains("export_interval"),
+        "error should name export_interval, got: {text}"
+    );
+}
+
+/// The cross-field rule (`export_deadline` must be shorter than
+/// `export_interval`) is enforced by the Envoy-mode reader, not reimplemented
+/// here -- `lower_metrics`'s doc says why. The error therefore still names a
+/// full dotted path, just one rooted at the carrier this dialect lowered
+/// through, and it MUST still be an error rather than a config that loads and
+/// then times out on every single tick.
+#[test]
+fn deadline_at_or_above_the_interval_is_rejected_end_to_end() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  metrics:
+    otlp_endpoint: "http://localhost:4317"
+    export_interval: "10s"
+    export_deadline: "10s"
+"#,
+    )
+    .expect("must parse");
+    // The rejection lands in `build_snapshot`, not in `lower_to_loaded`: the
+    // dialect's own parse and lowering both succeed (they emit the two durations
+    // verbatim), and it is the Envoy-mode IR build that owns the cross-field
+    // rule. Asserting on the right stage matters -- a test written against
+    // `lower_to_loaded` would pass for the wrong reason if the check were ever
+    // duplicated into the dialect, and would fail confusingly if it were not.
+    let loaded = lower_to_loaded(&config).expect("dialect parse+lower must succeed");
+    let err =
+        proxy_config::build_snapshot(&loaded).expect_err("deadline >= interval must not build");
+    let ConfigError::InvalidValue { field_path, reason } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(
+        field_path,
+        "node.metadata[\"io.llmproxy.metrics\"].export_deadline"
+    );
+    assert!(
+        reason.contains("export_interval"),
+        "the message must state the relationship, got: {reason}"
+    );
+}
+
+/// A malformed duration reaching the Envoy-mode reader through a path that
+/// bypasses the dialect's own parser is still rejected there -- the
+/// authoritative check lives in `convert_metrics_metadata`, and this is the
+/// test that would catch someone deleting it and trusting the dialect alone.
+#[test]
+fn the_envoy_mode_reader_enforces_its_own_bounds() {
+    // An explicit 30s deadline against the 15s DEFAULT interval, so this
+    // exercises the reader's cross-field check against a defaulted value rather
+    // than against an explicit one -- the case an implementation that only
+    // compares when the interval was supplied would get wrong.
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.metrics:
+      otlp_endpoint: "http://localhost:4317"
+      export_deadline: 30
+"#;
+    let loaded = proxy_config::parse_bootstrap(
+        yaml.as_bytes(),
+        proxy_config::ConfigFormat::Yaml,
+        proxy_config::StrictMode::Strict,
+    )
+    .expect("must parse");
+    let err = proxy_config::build_snapshot(&loaded)
+        .expect_err("a deadline above the defaulted interval must not build");
+    let ConfigError::InvalidValue { field_path, .. } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(
+        field_path,
+        "node.metadata[\"io.llmproxy.metrics\"].export_deadline"
+    );
 }
 
 // ------------------------------------------------------- WP-33: usage filter --
@@ -3585,4 +3909,145 @@ routes:
 "#,
     )
     .expect("an anthropic provider derives its own dialect");
+}
+
+// ------------------------------------ WP-51 increment 4: tracing export deadline --
+
+/// `observability.tracing.export_deadline` lowers with the dialect's own
+/// duration syntax and defaults to 5s when omitted -- the same deadline
+/// semantics the metrics block got, since neither exporter may stall forever.
+#[test]
+fn tracing_export_deadline_lowers_and_defaults() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://localhost:4317"
+    export_deadline: "2s"
+"#,
+    )
+    .expect("must parse");
+    let snapshot = proxy_config::build_snapshot(&lower_to_loaded(&config).expect("must lower"))
+        .expect("must build IR");
+    assert_eq!(
+        snapshot.tracing.expect("configured").export_deadline,
+        std::time::Duration::from_secs(2)
+    );
+
+    // And the default, when the key is absent.
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://localhost:4317"
+"#,
+    )
+    .expect("must parse");
+    let snapshot = proxy_config::build_snapshot(&lower_to_loaded(&config).expect("must lower"))
+        .expect("must build IR");
+    assert_eq!(
+        snapshot.tracing.expect("configured").export_deadline,
+        std::time::Duration::from_secs(5)
+    );
+}
+
+/// A malformed duration is a parse-time error naming the dialect path, before
+/// it can reach the Envoy-mode reader.
+#[test]
+fn tracing_export_deadline_rejects_a_malformed_duration() {
+    let err = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://localhost:4317"
+    export_deadline: "5 seconds"
+"#,
+    )
+    .expect_err("a malformed duration must not parse");
+    assert!(
+        err.to_string().contains("export_deadline"),
+        "error should name export_deadline, got: {err}"
+    );
+}
+
+/// The Envoy-mode reader's own bounds (`100ms..=60s`) apply to the dialect's
+/// output too: the lowering forwards plain seconds, and the authoritative
+/// reader rejects out-of-band values end to end. `60s` itself must LOAD -- the
+/// ceiling is inclusive, same as the interval's bounds. The floor case uses
+/// `100ms` rather than a fractional-second string because the dialect's
+/// `SimpleDuration` syntax is integer-plus-unit (`^[0-9]+(ms|s|m|h)$`), so
+/// `0.05s` is a syntax error at parse time -- which is its own (separate)
+/// test, not this one.
+#[test]
+fn tracing_export_deadline_out_of_band_is_rejected_end_to_end() {
+    for (value, expect_ok) in [("100ms", true), ("60s", true), ("120s", false)] {
+        let config = parse(&format!(
+            r#"
+version: 0
+providers:
+  openai: {{ api_key: ${{OPENAI_API_KEY}} }}
+routes:
+  - {{ model: "*", provider: openai }}
+observability:
+  tracing:
+    otlp_endpoint: "http://localhost:4317"
+    export_deadline: "{value}"
+"#
+        ))
+        .expect("must parse");
+        let loaded = lower_to_loaded(&config).expect("dialect parse+lower must succeed");
+        let built = proxy_config::build_snapshot(&loaded);
+        assert_eq!(
+            built.is_ok(),
+            expect_ok,
+            "export_deadline={value} must {}",
+            if expect_ok { "load" } else { "be rejected" }
+        );
+    }
+}
+
+/// A sub-floor deadline expressed in the dialect's own millisecond syntax
+/// (`50ms`) reaches the Envoy-mode reader and is rejected there, naming the
+/// carrier-rooted path -- the same shape as the metrics side's cross-field
+/// error, and the proof that the reader owns the bound rather than the dialect.
+#[test]
+fn tracing_export_deadline_below_the_floor_is_rejected_end_to_end() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: "*", provider: openai }
+observability:
+  tracing:
+    otlp_endpoint: "http://localhost:4317"
+    export_deadline: "50ms"
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("dialect parse+lower must succeed");
+    let err = proxy_config::build_snapshot(&loaded).expect_err("50ms must not build");
+    let ConfigError::InvalidValue { field_path, .. } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(
+        field_path,
+        "node.metadata[\"io.llmproxy.tracing\"].export_deadline"
+    );
 }

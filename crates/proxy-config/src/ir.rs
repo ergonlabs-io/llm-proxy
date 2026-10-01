@@ -59,6 +59,15 @@ pub struct ConfigSnapshot {
     /// [`TracingConfig`]'s doc for the config shape and the sampling
     /// contract.
     pub tracing: Option<TracingConfig>,
+    /// OTLP metric export, when configured. `None` -- the default, and the
+    /// behavior of every config written before this field existed -- means no
+    /// metric export task runs at all. It says nothing about whether metrics
+    /// are *collected*: the stats registry is populated unconditionally and
+    /// `/stats/prometheus` renders it with no OTLP configuration of any kind,
+    /// which is design doc §5.3's "Prometheus scrape remains available without
+    /// OTLP or tracing" and is why this field is independent of
+    /// [`Self::tracing`] rather than a mode of it.
+    pub metrics: Option<MetricsExportConfig>,
     /// ADS transport configuration (WP-20), from bootstrap `dynamic_resources`.
     /// `None` -- the default, and every release through v0.2.0 -- means fully
     /// static configuration and no control-plane connection is ever attempted.
@@ -145,6 +154,10 @@ impl ConfigSnapshot {
             secrets: self.secrets.clone(),
             admin: self.admin,
             tracing: self.tracing.clone(),
+            // Carried forward for the same reason `tracing` is: metric export
+            // is bootstrap-scoped (a collector endpoint), not an xDS resource,
+            // so a listener/cluster/route delivery has nothing to say about it.
+            metrics: self.metrics.clone(),
             ads: self.ads.clone(),
             version,
         }
@@ -240,6 +253,73 @@ pub struct TracingConfig {
     /// Default: `1.0` (sample everything). See this type's doc for what this
     /// does and does not govern.
     pub sample_ratio: f64,
+    /// Per-export deadline, applied as a `tokio::time::timeout` around each
+    /// trace-batch export RPC. Default: 5s.
+    ///
+    /// WP-51 increment 4 (review): the metric exporter got its deadline in the
+    /// same increment that split the two signals, and leaving traces without
+    /// one repeated, exactly, the hazard the split exists to prevent -- a
+    /// collector that accepts a connection and then goes silent parked the
+    /// trace exporter's `.await` forever, buffering every later batch and
+    /// filling the bounded sink behind it. Now neither signal can be stalled
+    /// indefinitely by the other's collector or its own. Bounded at lowering
+    /// to `100ms..=60s` (the ceiling is
+    /// `proxy_observability::otlp::TRACE_EXPORT_DEADLINE_MAX`, a multiple of
+    /// the fixed 5s batch interval, so one timeout costs at most a bounded
+    /// number of batch cycles rather than an unbounded number of RPCs).
+    pub export_deadline: Duration,
+}
+
+/// OTLP metric-export configuration -- the second, independent half of
+/// operational export (`docs/telemetry-design.md` §5.3: "Configure OTLP metric
+/// export independently of trace sampling/export. Disabling traces must not
+/// disable metrics").
+///
+/// **This is a separate field from [`ConfigSnapshot::tracing`] rather than a
+/// flag on it, and that separation is the point of the type.** Until this
+/// existed, [`ConfigSnapshot::tracing`] was the only OTLP configuration in the
+/// IR and the metric exporter rode along inside the trace exporter's task: a
+/// config with no `tracing` block exported no metrics over OTLP at all, even
+/// though the stats registry those metrics are read from is populated
+/// unconditionally and Prometheus scrape (`/stats/prometheus`) works with no
+/// OTLP configuration whatsoever. Two config surfaces means an operator can
+/// export metrics with tracing fully off, and turning tracing off can no longer
+/// silently stop metrics.
+///
+/// Both halves may name the same collector, and `crates/proxy/src/main.rs`
+/// spawns their exporter tasks independently, so a slow or failing *trace*
+/// export cannot indefinitely delay metric snapshots (design doc §5.3:
+/// "Separate metric and span scheduling/deadlines"). The registry is
+/// cumulative and never cleared, so a metric snapshot that fails to export is
+/// superseded by the next one rather than losing an interval's worth of data
+/// the way a dropped trace batch does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsExportConfig {
+    /// The OTLP/gRPC collector endpoint, e.g. `"http://localhost:4317"`.
+    /// Validated non-empty at lowering; no default. May differ from
+    /// [`TracingConfig::otlp_endpoint`] -- pointing metrics and traces at
+    /// different collectors is a normal deployment, not a mistake.
+    pub otlp_endpoint: String,
+    /// OTLP resource attribute `service.name`. Default: `"llm-proxy"`.
+    pub service_name: String,
+    /// How often to snapshot and export the registry. Default: 15s.
+    ///
+    /// The registry read is cheap (a summed pass over already-resolved
+    /// handles) and each export is a cumulative full snapshot, so a shorter
+    /// interval costs bandwidth rather than correctness. Bounded at lowering to
+    /// `1s..=1h` -- see `convert_metrics_metadata` in `lower.rs`.
+    pub export_interval: Duration,
+    /// Per-export deadline, applied as a `tokio::time::timeout` around each
+    /// export RPC. Default: 10s.
+    ///
+    /// This is what makes a hung collector *bounded* rather than merely
+    /// best-effort: tonic's `connect_lazy` channel reconnects on its own, but a
+    /// connection that establishes and then stops responding would otherwise
+    /// hold the export task's `.await` open indefinitely, and with it every
+    /// later tick. Validated at lowering to be strictly less than
+    /// [`Self::export_interval`], so a deadline expiry can never cause ticks to
+    /// pile up behind each other.
+    pub export_deadline: Duration,
 }
 
 // ---------------------------------------------------------------- listeners --

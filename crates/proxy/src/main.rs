@@ -684,41 +684,112 @@ async fn run_serve(
         ));
     let registry = stats_control.registry();
 
-    // WP-51 increment 2+3a: one `SpanSink` shared across every worker, same
-    // "control computes, workers get a cheap handle" shape as `registry`
-    // just above -- built (and its exporter task spawned) only when the boot
-    // snapshot's `tracing` is `Some`. `None` means no sink is ever
-    // constructed and no exporter task ever runs: every `FilterChainHandler`/
-    // `RouterFilterFactory` `proxy-core`'s `build_hcm_handler` builds gets
-    // `tracing_handles: None`, so tracing-off costs nothing beyond the one
-    // `is_none` check each of those already documents.
+    // Resolve operational health series even when exporters are disabled.
+    // Only configured tracing creates a channel; its sender is owned by workers
+    // so joining them closes the channel and triggers the final trace flush.
+    let trace_channel = snapshot
+        .tracing
+        .as_ref()
+        .map(|_| proxy_observability::trace::SpanSink::new(SPAN_SINK_CAPACITY));
+    let trace_counters = proxy_observability::otlp::ExportCounters::resolve(
+        &stats_control,
+        trace_channel.as_ref().map(|(sink, _)| sink.drop_counter()),
+    );
+    let mut trace_export_shutdown: Option<(tokio::task::JoinHandle<()>, Duration)> = None;
+    let mut metric_export_shutdown: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+        Duration,
+    )> = None;
+
+    let tracing_handles =
+        snapshot
+            .tracing
+            .as_ref()
+            .zip(trace_channel)
+            .map(|(cfg, (sink, spans_rx))| {
+                tracing::info!(
+                    otlp_endpoint = %cfg.otlp_endpoint,
+                    service_name = %cfg.service_name,
+                    sample_ratio = cfg.sample_ratio,
+                    export_deadline_ms = cfg.export_deadline.as_millis() as u64,
+                    "OTLP trace export enabled"
+                );
+                let handle = tokio::spawn(proxy_observability::otlp::run_trace_exporter(
+                    spans_rx,
+                    cfg.otlp_endpoint.clone(),
+                    cfg.service_name.clone(),
+                    registry.clone(),
+                    trace_counters.clone(),
+                    cfg.export_deadline,
+                ));
+                // Bound total shutdown work as well as individual RPCs. A prolonged
+                // outage can leave several batches queued; do not wait for all of them
+                // indefinitely before exiting.
+                trace_export_shutdown =
+                    Some((handle, cfg.export_deadline * 2 + Duration::from_secs(1)));
+                proxy_core::listener::TracingHandles {
+                    sink,
+                    sample_ratio: cfg.sample_ratio,
+                }
+            });
+
+    // WP-51 increment 4: metric export, spawned INDEPENDENTLY of the trace
+    // exporter above. `snapshot.metrics` is a separate IR field precisely so
+    // this block is reachable with `snapshot.tracing` set to `None` -- before
+    // the split, a config with no `tracing` block exported no OTLP metrics at
+    // all, even though the registry they are read from is always populated
+    // (`docs/telemetry-design.md` §5.3). Separate task, separate ticker,
+    // separate deadline, separate `Endpoint`: a slow or failing trace export
+    // cannot delay a metric snapshot.
     //
-    // The exporter task is spawned with a plain `tokio::spawn`, not
-    // `tokio::task::spawn_local` -- it holds no `!Send` data-plane state
-    // (ADR-0003 governs workers, not this control-runtime-only task), and
-    // `run_serve` itself is already running ON the control runtime (this
-    // function is `control_rt.block_on`'d from `main`), so `tokio::spawn`
-    // here lands the task on that same runtime, alongside the config
-    // reload/signal loop below -- never on a worker's `LocalSet`.
-    let tracing_handles = snapshot.tracing.as_ref().map(|cfg| {
-        let (sink, spans_rx) = proxy_observability::trace::SpanSink::new(SPAN_SINK_CAPACITY);
+    // Built and then conditionally MOVED into a task -- not built inside the
+    // `if`. Resolving the failure series unconditionally is what makes
+    // `llmproxy_otel_export_failures{signal="metrics"}` visible on
+    // `/stats/prometheus` from the very first scrape of a process with no
+    // metric export at all: a dashboard that only grows a series once something
+    // has gone wrong cannot tell "zero failures" from "not instrumented", and
+    // the design doc's failure matrix leans on these counters being dependable.
+    // Span drops are deliberately NOT resolved here -- they are trace-path
+    // facts owned by the trace exporter (see `ExportCounters`' doc), and
+    // resolving them from this side is exactly the cross-domain coupling the
+    // review rejected: a Prometheus-only deployment would otherwise have
+    // reported zero span drops forever.
+    let metric_health = proxy_observability::otlp::MetricExportHealth::resolve(&stats_control);
+    if let Some(cfg) = snapshot.metrics.as_ref() {
         tracing::info!(
             otlp_endpoint = %cfg.otlp_endpoint,
             service_name = %cfg.service_name,
-            sample_ratio = cfg.sample_ratio,
-            "OTLP trace export enabled"
+            export_interval_ms = cfg.export_interval.as_millis() as u64,
+            export_deadline_ms = cfg.export_deadline.as_millis() as u64,
+            "OTLP metric export enabled"
         );
-        tokio::spawn(proxy_observability::otlp::run_exporter(
-            spans_rx,
+        // The `oneshot` sender and the task handle are retained so the drain
+        // sequence can ask for a final snapshot and wait for it; with metrics
+        // off there is no task and nothing to signal.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(proxy_observability::otlp::run_metric_exporter(
+            registry.clone(),
             cfg.otlp_endpoint.clone(),
             cfg.service_name.clone(),
-            registry.clone(),
+            cfg.export_interval,
+            cfg.export_deadline,
+            metric_health,
+            shutdown_rx,
         ));
-        proxy_core::listener::TracingHandles {
-            sink,
-            sample_ratio: cfg.sample_ratio,
-        }
-    });
+        // The shutdown budget is TWO deadlines plus slack, not one: the signal can
+        // arrive while an ordinary tick's snapshot is mid-export (up to one
+        // deadline), and the final snapshot it then sends is itself bounded by
+        // another. A one-deadline budget is a coin flip against the in-flight
+        // export -- this exact shape was caught in review with a slow
+        // collector: the budget expired while the final snapshot was
+        // legitimately still on the wire and the runtime dropped the task with
+        // the data aboard. Both bounds derive from the operator's own
+        // `export_deadline`, so the worst-case exit latency is chosen, not
+        // imposed.
+        let final_snapshot_budget = cfg.export_deadline * 2 + Duration::from_secs(1);
+        metric_export_shutdown = Some((shutdown_tx, handle, final_snapshot_budget));
+    }
 
     // Every consumer that must observe a SIGHUP-published snapshot registers
     // its `WorkerConfigHandle` into this ONE registry -- the admin server
@@ -1045,6 +1116,59 @@ async fn run_serve(
     }
 
     let outcome = graceful_shutdown(publisher, drain_time, strategy).await;
+
+    // Workers have dropped their senders. Flush remaining traces before taking
+    // the final metric snapshot so export failures and drops are included.
+    if let Some((mut handle, budget)) = trace_export_shutdown.take() {
+        match tokio::time::timeout(budget, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "trace exporter stopped unexpectedly"),
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                tracing::warn!(
+                    budget_ms = budget.as_millis() as u64,
+                    "trace exporter exceeded the shutdown budget; pending spans may be lost"
+                );
+            }
+        }
+    }
+
+    // WP-51 increment 4: ask the metric exporter for one last snapshot and WAIT
+    // for it, AFTER `graceful_shutdown` has returned -- so the final
+    // cumulative figures include everything the drain period itself served, and
+    // so a slow collector's deadline can never delay the drain. An earlier
+    // revision fired this before the drain and was corrected in review on both
+    // counts: drain-period traffic was missing from the "final" snapshot, and
+    // the pre-drain await added up to one export deadline of latency to every
+    // shutdown for no benefit.
+    //
+    // Design doc §13's other half still holds: this proves delivery of the
+    // last snapshot at the collector's ACK level and nothing more, and the
+    // wait is bounded (the exporter's deadline plus slack, captured at spawn)
+    // so an unreachable collector cannot hang exit -- the process was already
+    // done serving when this starts, so the only cost here is exit latency,
+    // and it is one bounded RPC, not a reconnect loop.
+    //
+    // Each `send`/`await` result is deliberately ignored rather than unwrapped:
+    // a closed channel or a panicked task means the exporter was already gone
+    // (or never started), and there is no useful recovery for either at this
+    // point in shutdown. The proxy is exiting; a missing final metric snapshot
+    // must not change its exit behavior.
+    if let Some((tx, handle, final_snapshot_budget)) = metric_export_shutdown.take() {
+        let _ = tx.send(());
+        if tokio::time::timeout(final_snapshot_budget, handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                budget_ms = final_snapshot_budget.as_millis() as u64,
+                "metric exporter did not finish its final snapshot before the shutdown budget \
+                 expired; the last cumulative figures may not reach the collector"
+            );
+        }
+    }
+
     tracing::info!(?outcome, "drain sequence finished, exiting");
     ExitCode::SUCCESS
 }

@@ -227,7 +227,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         field_name: "otlp_endpoint",
         kind: EntryKind::ReadOutsideRuntimeCrates,
         reason: "WP-51 increment 3a: the OTLP exporter that reads this field \
-                  (`proxy_observability::otlp::run_exporter`, called from \
+                  (`proxy_observability::otlp::run_trace_exporter`, called from \
                   `crates/proxy/src/main.rs`'s `run_serve`) lives on the \
                   control side, in `proxy-observability`/`proxy` -- neither is \
                   a RUNTIME_CRATES entry (see this file's module doc for why: \
@@ -241,13 +241,82 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   at all -- this is a known limitation of the text-based scan, \
                   not a second inert field.",
     },
+    // --- WP-51 increment 4: OTLP metric export. Same shape as the two
+    //     `TracingConfig` entries above -- the reader is
+    //     `proxy_observability::otlp::run_metric_exporter`, spawned from
+    //     `crates/proxy/src/main.rs`'s `run_serve` and running on the control
+    //     runtime, which is neither a RUNTIME_CRATES entry nor a
+    //     data-plane path (see this file's module doc for why those two facts
+    //     are different questions). These fields ARE acted on: an operator who
+    //     configures `io.llmproxy.metrics` gets a running exporter task with
+    //     exactly this interval, deadline, and endpoint.
+    //
+    //     `service_name` is deliberately absent from this group because the
+    //     scan would have matched it anyway (it collides with
+    //     `EdsClusterConfig.service_name`, read by `proxy-xds`) -- which is
+    //     exactly the false pass the `KnownInertNameCollision` entries above
+    //     exist to flag. It gets no entry at all, because the field genuinely
+    //     has no reader this scan can see and pretending otherwise would make
+    //     the list longer for no gain.
+    AllowlistEntry {
+        struct_name: "ConfigSnapshot",
+        field_name: "metrics",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-51 increment 4: read at `crates/proxy/src/main.rs`'s \
+                  `run_serve` (`snapshot.metrics.as_ref()`), which decides whether to spawn \
+                  `proxy_observability::otlp::run_metric_exporter` at all. Control-side \
+                  bootstrap wiring, outside RUNTIME_CRATES for the same reason \
+                  `ConfigSnapshot.tracing` is -- see the `TracingConfig.otlp_endpoint` entry \
+                  above.",
+    },
+    AllowlistEntry {
+        struct_name: "MetricsExportConfig",
+        field_name: "otlp_endpoint",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-51 increment 4: passed to \
+                  `proxy_observability::otlp::run_metric_exporter` as the OTLP endpoint, \
+                  which builds its own lazy `tonic` `Endpoint` from it. The trace path's \
+                  equivalent reader is `otlp::run_trace_exporter`; both are control-side.",
+    },
+    AllowlistEntry {
+        struct_name: "MetricsExportConfig",
+        field_name: "export_interval",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-51 increment 4: passed to \
+                  `proxy_observability::otlp::run_metric_exporter` as its \
+                  `tokio::time::interval` period. Independent of the trace exporter's fixed \
+                  5s batch interval by design (`docs/telemetry-design.md` §5.3, separate \
+                  scheduling), so there is no data-plane reader to find.",
+    },
+    AllowlistEntry {
+        struct_name: "MetricsExportConfig",
+        field_name: "export_deadline",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-51 increment 4: passed to \
+                  `proxy_observability::otlp::run_metric_exporter` and applied as the \
+                  `tokio::time::timeout` around each export RPC. Bounds a collector that \
+                  accepts a connection and then stops responding; the trace exporter has no \
+                  equivalent today, which is itself a known gap rather than an oversight.",
+    },
+    AllowlistEntry {
+        struct_name: "TracingConfig",
+        field_name: "export_deadline",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "WP-51 increment 4 review round: passed to \
+                  `proxy_observability::otlp::run_trace_exporter` as the per-batch export RPC \
+                  deadline, closing the gap the `MetricsExportConfig.export_deadline` entry \
+                  above used to call out -- a collector that accepts a trace connection and \
+                  then goes silent now costs one bounded timeout per attempt instead of \
+                  parking the exporter. Control-side, outside RUNTIME_CRATES like its \
+                  metric-side twin.",
+    },
     AllowlistEntry {
         struct_name: "TracingConfig",
         field_name: "service_name",
         kind: EntryKind::KnownInertNameCollision,
         reason: "Same as `otlp_endpoint` immediately above: read by \
                   `proxy_observability::otlp::build_resource`, which \
-                  `run_exporter` calls -- control-side, outside RUNTIME_CRATES. \
+                  `run_trace_exporter` calls -- control-side, outside RUNTIME_CRATES. \
                   Reclassified from KnownInert to KnownInertNameCollision by \
                   WP-21 increment 2b-ii: `EdsClusterConfig.service_name` is a \
                   different field with the same name, and \

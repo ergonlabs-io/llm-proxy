@@ -76,6 +76,7 @@ node:
             otlp_endpoint: "http://localhost:4317".to_string(),
             service_name: "my-gateway".to_string(),
             sample_ratio: 0.5,
+            export_deadline: std::time::Duration::from_secs(5),
         })
     );
 }
@@ -97,6 +98,7 @@ node:
             otlp_endpoint: "http://collector:4317".to_string(),
             service_name: "llm-proxy".to_string(),
             sample_ratio: 1.0,
+            export_deadline: std::time::Duration::from_secs(5),
         })
     );
 }
@@ -269,5 +271,142 @@ static_resources:
     assert_eq!(
         err_path(&err),
         "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.tracing"
+    );
+}
+
+// ------------------------------------------ WP-51 increment 4: export deadline --
+
+/// The default when the field is absent: 5s, matching the fixed batch
+/// interval. Present in the IR so the exporter always has a bounded RPC --
+/// a deadline that had to be configured would be a deadline that usually
+/// wasn't.
+#[test]
+fn export_deadline_defaults_to_five_seconds() {
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.tracing:
+      otlp_endpoint: "http://localhost:4317"
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    assert_eq!(
+        snapshot.tracing.expect("configured").export_deadline,
+        std::time::Duration::from_secs(5)
+    );
+}
+
+/// An explicit deadline lowers through.
+#[test]
+fn export_deadline_lowers_when_set() {
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.tracing:
+      otlp_endpoint: "http://localhost:4317"
+      export_deadline: 2
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    assert_eq!(
+        snapshot.tracing.expect("configured").export_deadline,
+        std::time::Duration::from_secs(2)
+    );
+}
+
+/// Below the 100ms floor. A deadline that tight would expire against a healthy
+/// collector on a slow network, turning trace export off entirely while
+/// looking correctly configured -- the same reasoning as the metric side's
+/// identical floor.
+#[test]
+fn export_deadline_below_the_floor_is_a_hard_error() {
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.tracing:
+      otlp_endpoint: "http://localhost:4317"
+      export_deadline: 0.05
+"#;
+    let err = snapshot_from(yaml).expect_err("a 50ms deadline must not load");
+    assert_eq!(
+        err_path(&err),
+        "node.metadata[\"io.llmproxy.tracing\"].export_deadline"
+    );
+}
+
+/// Above the 60s ceiling -- the value the exporter module itself publishes as
+/// its sane maximum, so loader and exporter cannot drift. A deadline longer
+/// than several batch cycles would let a wedged export hold batches in memory
+/// across multiple cycles before being abandoned.
+#[test]
+fn export_deadline_above_the_ceiling_is_a_hard_error() {
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.tracing:
+      otlp_endpoint: "http://localhost:4317"
+      export_deadline: 120
+"#;
+    let err = snapshot_from(yaml).expect_err("a 120s deadline must not load");
+    assert_eq!(
+        err_path(&err),
+        "node.metadata[\"io.llmproxy.tracing\"].export_deadline"
+    );
+}
+
+/// A non-number deadline is rejected with its own path rather than falling
+/// back to the default.
+#[test]
+fn non_numeric_export_deadline_is_a_hard_error() {
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.tracing:
+      otlp_endpoint: "http://localhost:4317"
+      export_deadline: "5s"
+"#;
+    let err = snapshot_from(yaml).expect_err("a string deadline must not load");
+    assert_eq!(
+        err_path(&err),
+        "node.metadata[\"io.llmproxy.tracing\"].export_deadline"
+    );
+}
+
+/// The huge-finite case the metrics side panicked on before the P1 fix. The
+/// trace path shares the same `seconds_to_duration` helper, so it inherits the
+/// fix -- this test pins that inheritance, since the two surfaces are easy to
+/// assume independent and the panic was originally reproduced only through the
+/// metrics field.
+#[test]
+fn huge_finite_export_deadline_is_a_hard_error_not_a_panic() {
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.tracing:
+      otlp_endpoint: "http://localhost:4317"
+      export_deadline: 1.0e100
+"#;
+    let err = snapshot_from(yaml).expect_err("1e100 must not load and must not panic");
+    assert_eq!(
+        err_path(&err),
+        "node.metadata[\"io.llmproxy.tracing\"].export_deadline"
+    );
+}
+
+/// An unknown key alongside the new field is still a hard error -- adding
+/// `export_deadline` to the accepted set must not have loosened the strict
+/// walk for everything else.
+#[test]
+fn unknown_key_beside_export_deadline_is_still_a_hard_error() {
+    let yaml = r#"
+node:
+  metadata:
+    io.llmproxy.tracing:
+      otlp_endpoint: "http://localhost:4317"
+      export_deadline: 2
+      endpoint: "http://localhost:4317"
+"#;
+    let err = snapshot_from(yaml).expect_err("an unknown key must not load");
+    assert_eq!(
+        err_path(&err),
+        "node.metadata[\"io.llmproxy.tracing\"].endpoint"
     );
 }

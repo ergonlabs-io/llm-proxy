@@ -278,14 +278,29 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             "address": { "socket_address": { "address": host, "port_value": port } }
         });
     }
+    // Both namespace keys share one `node.metadata` object rather than each
+    // replacing it. Written as a merge (read-modify-write) rather than two
+    // assignments because the two blocks are independently optional: a config
+    // with only `observability.metrics` and one with both must both lower to a
+    // valid `node`, and an unconditional second assignment would silently
+    // clobber whichever block was written first.
+    let mut metadata = serde_json::Map::new();
     if let Some(tracing) = config
         .observability
         .as_ref()
         .and_then(|o| o.tracing.as_ref())
     {
-        bootstrap["node"] = json!({
-            "metadata": { TRACING_METADATA_KEY: lower_tracing(tracing)? }
-        });
+        metadata.insert(TRACING_METADATA_KEY.to_string(), lower_tracing(tracing)?);
+    }
+    if let Some(metrics) = config
+        .observability
+        .as_ref()
+        .and_then(|o| o.metrics.as_ref())
+    {
+        metadata.insert(METRICS_METADATA_KEY.to_string(), lower_metrics(metrics)?);
+    }
+    if !metadata.is_empty() {
+        bootstrap["node"] = json!({ "metadata": metadata });
     }
 
     Ok(Lowered {
@@ -1982,6 +1997,58 @@ fn lower_tracing(tracing: &crate::model::Tracing) -> Result<Value, ConfigError> 
         "otlp_endpoint": endpoint,
         "service_name": tracing.service_name,
         "sample_ratio": tracing.sample_ratio,
+        "export_deadline": tracing.export_deadline.0.as_secs_f64(),
+    }))
+}
+
+// ----------------------------------------------------------------- metrics --
+
+/// Namespace key `observability.metrics` is carried through in -- must equal
+/// `proxy_config::lower`'s own constant for the same reason
+/// [`TRACING_METADATA_KEY`]'s doc gives (it is duplicated as a literal rather
+/// than imported because `METRICS_METADATA_KEY` there is private, and
+/// `crates/proxy-simple-config/tests/dialect.rs` round-trips this dialect
+/// through the real Envoy-mode loader -- so a typo here shows up as a
+/// silently-unexported metric block rather than as a compile error).
+const METRICS_METADATA_KEY: &str = "io.llmproxy.metrics";
+
+/// `observability.metrics` -> `Bootstrap.node.metadata["io.llmproxy.metrics"]`
+/// -> (through the real Envoy-mode loader's
+/// `proxy_config::lower::convert_metrics_metadata`) `ConfigSnapshot::metrics`.
+///
+/// Durations go onto the wire as plain **seconds numbers**, which is what that
+/// reader expects: a `google.protobuf.Struct` cannot express a protobuf
+/// `Duration`. The dialect's own `SimpleDuration` syntax is resolved here
+/// rather than forwarded as a string, so an operator writing `"30s"` in the
+/// dialect and an operator writing `30` in raw Envoy config get the same
+/// interval.
+///
+/// The `export_deadline < export_interval` rule is deliberately **not**
+/// reimplemented here even though this function already validates
+/// `sample_ratio` and `otlp_endpoint` for the tracing block. Two reasons: it is
+/// a cross-field rule about what the exporter can actually do (the
+/// `MetricsExportConfig::export_deadline` doc owns the reasoning), and this
+/// crate's contract is that anything it can express is expressible in Envoy
+/// mode too -- duplicating a check the authoritative reader already performs
+/// would create two places to keep in agreement and neither would be the one
+/// that matters. The Envoy-mode error still names a full dotted path, just one
+/// rooted at `node.metadata[...]` rather than at `observability.metrics`.
+fn lower_metrics(metrics: &crate::model::Metrics) -> Result<Value, ConfigError> {
+    let endpoint = match &metrics.otlp_endpoint {
+        Some(e) if !e.is_empty() => e,
+        _ => {
+            return Err(ConfigError::InvalidValue {
+                field_path: "observability.metrics.otlp_endpoint".to_string(),
+                reason: "is required and must not be empty when `observability.metrics` is set"
+                    .to_string(),
+            });
+        }
+    };
+    Ok(json!({
+        "otlp_endpoint": endpoint,
+        "service_name": metrics.service_name,
+        "export_interval": metrics.export_interval.0.as_secs_f64(),
+        "export_deadline": metrics.export_deadline.0.as_secs_f64(),
     }))
 }
 

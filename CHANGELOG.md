@@ -13,6 +13,46 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 Follow-up work for the v0.3.0 dynamic-configuration gate.
 
+### Added
+
+- **Independent OTLP metric export.** Metric export is now configurable and scheduled separately
+  from trace export, per `docs/telemetry-design.md` §5.3. Envoy mode reads a new
+  `node.metadata["io.llmproxy.metrics"]` namespace (`otlp_endpoint` required; `service_name`,
+  `export_interval` (default 15s), `export_deadline` (default 10s) optional) into a new
+  `ConfigSnapshot.metrics`; the `llmproxy` dialect exposes the same surface as
+  `observability.metrics`, with durations in the dialect's `"30s"` string syntax. Metrics export
+  now works with tracing entirely off, and turning tracing on no longer implies metrics on — a
+  config that named neither sends nothing, and one that named both sends each signal to its own
+  endpoint. `export_interval` is bounded to 1s–1h and `export_deadline` must be shorter than the
+  interval, both rejected at load with a full dotted path. The metric exporter runs on its own
+  task, ticker, and connection, with a per-export deadline that bounds a collector which accepts a
+  connection and then stops responding; forwarding and `/stats` scrape are unaffected by either.
+  Two new self-instruments, `llmproxy_otel_export_failures{signal="traces"|"metrics"}` and
+  `llmproxy_otel_spans_dropped`, make an unreachable collector visible as a metric rather than as a
+  gap in a dashboard; both series exist from the first scrape on a process with no OTLP configured
+  at all. No request bodies, request records, or other end-user telemetry is captured — that work
+  has not started.
+
+- **Review fixes to the above (2026-10-01).** Four findings from review, all fixed: (1) config
+  load could PANIC — a huge but finite `export_interval` like `1.0e100` passed the finite/positive
+  guards and aborted the process inside `Duration::from_secs_f64`; the conversion is now the
+  fallible `try_from_secs_f64` and rejects with a full dotted path. (2) The final metric snapshot
+  was requested BEFORE the drain, so it missed drain-period traffic and could delay draining by
+  the export deadline; the exporter is now signalled and awaited after `graceful_shutdown`
+  returns, and the shutdown budget covers an in-flight snapshot plus the final one. (3) Span
+  losses were underreported: failed trace batches counted the failure but not the batch's span
+  count, and the drop series was published by the METRIC exporter, so a Prometheus-only deployment
+  reported zero forever; the trace exporter now owns a combined queue+batch drop ledger and
+  publishes it whatever the metric exporter is doing. (4) Trace export was unbounded — a hung
+  collector parked the trace exporter forever; traces now have their own `export_deadline`
+  (`TracingConfig::export_deadline`, default 5s, bounded 100ms–60s, dialect
+  `observability.tracing.export_deadline`), matching the metric side.
+
+- **Trace shutdown and drop-counter semantics.** Trace producers close after worker drain and
+  the proxy waits within a bounded budget for the final trace batch before exporting final
+  metrics. Pending exports are cancelled if the shutdown budget expires. Span losses are
+  exported as a monotonic counter, including queue losses and failed batches.
+
 ## [0.3.0] - 2026-09-29
 
 This release advances **v0.3.0** (ADS/xDS). The proxy now connects to an ADS control plane,

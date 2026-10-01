@@ -293,6 +293,43 @@ impl SpanSink {
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    /// A handle onto the same cumulative drop counter [`Self::dropped_count`]
+    /// reads, for a caller that is not itself a sink -- specifically the OTLP
+    /// metric exporter, which republishes this figure as
+    /// [`crate::stats::instruments::OTEL_SPANS_DROPPED`] on its own interval.
+    ///
+    /// This is a separate type rather than a handed-out
+    /// `Arc<AtomicU64>` because the exporter wants a *read*, not the ability to
+    /// `fetch_add` or reset a counter owned by the trace path. The drop count is
+    /// otherwise invisible to operators: the spans it describes were never
+    /// exported, so the trace backend holds no record of them at all, and
+    /// `docs/telemetry-design.md` §5.5 makes aggregate drop counters the
+    /// dependable loss signal precisely because a per-request loss event
+    /// cannot itself be delivered when the pipeline is what broke.
+    pub fn drop_counter(&self) -> SpanDropCounter {
+        SpanDropCounter(Arc::clone(&self.dropped))
+    }
+}
+
+/// Read-only view of a [`SpanSink`]'s cumulative drop count. See
+/// [`SpanSink::drop_counter`] for why this is its own type rather than a bare
+/// `Arc<AtomicU64>`.
+///
+/// `Clone` on purpose, and cheap (an `Arc` refcount bump): the metric exporter
+/// holds one of these for the life of the process while every worker holds its
+/// own [`SpanSink`] clone of the same underlying counter.
+#[derive(Clone, Debug)]
+pub struct SpanDropCounter(Arc<AtomicU64>);
+
+impl SpanDropCounter {
+    /// The process-cumulative drop count. Monotonic within a process lifetime
+    /// and zero again after a restart -- which is exactly why the exporter
+    /// publishes it as a *delta* onto a registry counter rather than as a set
+    /// value (see [`crate::stats::instruments::OTEL_SPANS_DROPPED`]).
+    pub fn load(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]

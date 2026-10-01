@@ -453,6 +453,19 @@ pub struct Observability {
     /// whole `observability` block is absent -- means tracing is off.
     #[serde(default)]
     pub tracing: Option<Tracing>,
+    /// OTLP metric export. **Independent of [`Self::tracing`]**, and that
+    /// independence is the point: an operator can export metrics with tracing
+    /// entirely off, and turning tracing off does not stop metrics. Before
+    /// this field existed the only OTLP configuration in the proxy was
+    /// `observability.tracing`, and the metric exporter was constructed inside
+    /// the task spawned for it -- so a config with no `tracing` block exported
+    /// no metrics over OTLP at all, even though the registry those metrics are
+    /// read from is always populated and `/stats/prometheus` works with no
+    /// OTLP configuration of any kind. `None` -- when this key is absent, or
+    /// when the whole `observability` block is absent -- means no OTLP metric
+    /// export, which says nothing about whether metrics are being collected.
+    #[serde(default)]
+    pub metrics: Option<Metrics>,
 }
 
 /// `observability.tracing`. The top-level `tracing` key is RESERVED and
@@ -479,6 +492,58 @@ pub struct Tracing {
     /// Default: `1.0`.
     #[serde(default = "default_tracing_sample_ratio")]
     pub sample_ratio: f64,
+    /// Per-export deadline for trace-batch RPCs. Default: `"5s"`. Bounds a
+    /// collector that accepts the connection and then stops responding; the
+    /// Envoy-mode reader also enforces `100ms..=60s`, and rejects the field at
+    /// load with a full dotted path if it is outside that band. Optional --
+    /// the deadline is a tuning knob, not a required decision.
+    #[serde(default = "default_tracing_export_deadline")]
+    pub export_deadline: SimpleDuration,
+}
+
+fn default_tracing_export_deadline() -> SimpleDuration {
+    SimpleDuration(Duration::from_secs(5))
+}
+
+/// `observability.metrics`. Deliberately a sibling of [`Tracing`] rather than
+/// extra keys on it: see [`Observability::metrics`]'s doc for why metric export
+/// has to be expressible with tracing off.
+///
+/// `export_interval`/`export_deadline` reuse the same [`SimpleDuration`] string
+/// syntax as the rest of this dialect (`"30s"`, `"5m"`, ...) rather than raw
+/// seconds numbers, for the same reason every other timeout here does: a bare
+/// number next to a field named `export_interval` is a unit guessing game, and
+/// this dialect already made that choice once.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    /// Required (and must be non-empty) when this block is present -- there is
+    /// no sensible destination to guess. `Option` for the same
+    /// full-dotted-path-on-both-missing-and-empty reason as
+    /// [`Tracing::otlp_endpoint`].
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// OTLP resource attribute `service.name`. Default: `"llm-proxy"`.
+    #[serde(default = "default_tracing_service_name")]
+    pub service_name: String,
+    /// How often to snapshot and export the registry. Default: `"15s"`.
+    #[serde(default = "default_metrics_export_interval")]
+    pub export_interval: SimpleDuration,
+    /// Per-export deadline. Default: `"10s"`. Validated at lowering to be
+    /// shorter than `export_interval` -- see
+    /// `proxy_config::ir::MetricsExportConfig::export_deadline` for why a
+    /// deadline at or above the interval is a configuration that cannot do
+    /// what it looks like it does.
+    #[serde(default = "default_metrics_export_deadline")]
+    pub export_deadline: SimpleDuration,
+}
+
+fn default_metrics_export_interval() -> SimpleDuration {
+    SimpleDuration(Duration::from_secs(15))
+}
+
+fn default_metrics_export_deadline() -> SimpleDuration {
+    SimpleDuration(Duration::from_secs(10))
 }
 
 fn default_tracing_service_name() -> String {

@@ -604,6 +604,68 @@ pub mod instruments {
         ],
         buckets: Some(&GEN_AI_TIME_PER_OUTPUT_TOKEN_BUCKETS_SECONDS),
     };
+
+    // ------------------------------------------------ operational self-signals --
+    //
+    // Everything above this line is about TRAFFIC -- a request happened, it
+    // cost tokens, it was slow. The instruments below describe the telemetry
+    // pipeline itself, which belongs to the operational domain
+    // `docs/telemetry-design.md` §1 separates out. They are what an operator
+    // reads when the question is "is the observability itself lying to me",
+    // and they are the reason a collector outage is visible as a metric
+    // rather than only as a gap in someone else's dashboard.
+    //
+    // They live under the `llmproxy_otel_*` prefix rather than `llm_*`
+    // because they are this proxy's own operational identity with no
+    // upstream semconv equivalent -- same reasoning as `UPSTREAM_RQ`'s
+    // gateway-metrics name, and deliberately NOT `llm_capture_*`: the
+    // end-user request-record/transcript pipeline is a separate domain with
+    // separate resources and failure behavior (design doc §1), and reusing one
+    // prefix across the two would invite exactly the "these are the same
+    // thing" reading the design exists to prevent.
+
+    /// The `signal` attribute's two legal values. Finite and exhaustive by
+    /// construction: the exporter tasks are the only writers, and there is
+    /// exactly one of each. A free-form string here would be an unbounded
+    /// label source for no benefit.
+    pub const EXPORT_SIGNAL_TRACES: &str = "traces";
+    pub const EXPORT_SIGNAL_METRICS: &str = "metrics";
+
+    /// OTLP export attempts that failed, by signal. Counts connect errors,
+    /// collector rejections, and deadline expiries alike -- all three are the
+    /// same operator-facing fact (this snapshot did not arrive) and
+    /// distinguishing them would mean labelling a `tonic::Status` variant
+    /// whose set is not ours to bound.
+    ///
+    /// Resolved once per signal at boot, never per failure, so cardinality is
+    /// exactly two series for the life of the process. A failure counter with
+    /// no success counter is deliberately still useful: it is compared against
+    /// the export interval, not against a ratio, and design doc §5.5 makes
+    /// these aggregate counters the dependable signal precisely because a
+    /// per-request loss event cannot itself be delivered when the pipeline is
+    /// what's broken.
+    pub const OTEL_EXPORT_FAILURES: Instrument = Instrument {
+        name: "llmproxy_otel_export_failures",
+        kind: InstrumentKind::Counter,
+        unit: "{failure}",
+        attribute_keys: &["signal"],
+        buckets: None,
+    };
+
+    /// Spans discarded before export: dropped by `SpanSink::emit` because its
+    /// bounded channel was full, plus every span in a batch whose export
+    /// failed.
+    ///
+    /// Monotonic within a process lifetime. The trace exporter adds only the
+    /// increase in its combined queue/batch drop ledger, so this is a counter
+    /// in both Prometheus and OTLP even though it is republished periodically.
+    pub const OTEL_SPANS_DROPPED: Instrument = Instrument {
+        name: "llmproxy_otel_spans_dropped",
+        kind: InstrumentKind::Counter,
+        unit: "{span}",
+        attribute_keys: &[],
+        buckets: None,
+    };
 }
 
 /// Identifies a worker thread/runtime for [`Registry::incr`]/

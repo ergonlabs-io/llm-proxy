@@ -35,6 +35,10 @@ use proxy_api::envoy::extensions::upstreams::http::v3 as upstream_http_v3;
 use proxy_api::envoy::r#type::matcher::v3 as matcher_v3;
 use proxy_api::envoy::r#type::v3 as type_v3;
 use proxy_observability::access_log::{parse_format, FormatString};
+// The trace exporter's own bound on a sane export deadline -- referenced here
+// rather than restated so loader and exporter cannot drift (this crate already
+// depends on `proxy-observability` for `FormatString`/`ResponseFlag` above).
+use proxy_observability::otlp::TRACE_EXPORT_DEADLINE_MAX;
 use proxy_observability::ResponseFlag;
 
 use crate::error::ConfigError;
@@ -67,6 +71,12 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     // WP-51 increment 3: see `convert_tracing_metadata`'s doc for why this
     // reads `node.metadata` rather than a `static_resources`-adjacent field.
     snapshot.tracing = convert_tracing_metadata(b.node.as_ref(), "node")?;
+    // Deliberately a SEPARATE namespace key and a separate IR field from the
+    // `tracing` block above, not a mode of it: `docs/telemetry-design.md` §5.3
+    // requires metric export to be configurable with tracing off, and a shared
+    // block could not express that without a flag whose false value would still
+    // require the operator to write the tracing namespace at all.
+    snapshot.metrics = convert_metrics_metadata(b.node.as_ref(), "node")?;
 
     // WP-20 increment 1. Lowered before `static_resources` so the ADS
     // cluster-existence check below can run against the finished cluster map.
@@ -4218,7 +4228,7 @@ fn convert_tracing_metadata(
         .filter(|k| {
             !matches!(
                 k.as_str(),
-                "otlp_endpoint" | "service_name" | "sample_ratio"
+                "otlp_endpoint" | "service_name" | "sample_ratio" | "export_deadline"
             )
         })
         .collect();
@@ -4227,8 +4237,8 @@ fn convert_tracing_metadata(
         return Err(unsupported(
             format!("{tracing_path}.{key}"),
             format!(
-                "`{TRACING_METADATA_KEY}` only supports `otlp_endpoint`, `service_name`, and \
-                 `sample_ratio`"
+                "`{TRACING_METADATA_KEY}` only supports `otlp_endpoint`, `service_name`, \
+                 `sample_ratio`, and `export_deadline`"
             ),
         ));
     }
@@ -4272,11 +4282,289 @@ fn convert_tracing_metadata(
         return Err(invalid(&ratio_path, "must be between 0.0 and 1.0"));
     }
 
+    // Same shape as `export_deadline` in `convert_metrics_metadata` below:
+    // seconds numbers, bounded away from the two degenerate extremes. There
+    // is no cross-field check here because the trace batch interval is a
+    // fixed constant, not a config field -- unlike the metric side, which
+    // validates the deadline against the interval it is paired with. The
+    // ceiling (`TRACE_EXPORT_DEADLINE_MAX`) is imported from the module that
+    // actually enforces deadline semantics, so the loader cannot drift from
+    // the exporter's own bound on what a sane deadline is.
+    let deadline_path = format!("{tracing_path}.export_deadline");
+    let export_deadline = match tracing
+        .fields
+        .get("export_deadline")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::NumberValue(v)) => seconds_to_duration(*v, &deadline_path)?,
+        Some(_) => return Err(invalid(&deadline_path, "must be a number of seconds")),
+        None => DEFAULT_TRACING_EXPORT_DEADLINE,
+    };
+    if export_deadline < METRICS_EXPORT_DEADLINE_MIN {
+        return Err(invalid(
+            &deadline_path,
+            format!(
+                "must be at least {}ms, got {}s",
+                METRICS_EXPORT_DEADLINE_MIN.as_millis(),
+                export_deadline.as_secs_f64()
+            ),
+        ));
+    }
+    if export_deadline > TRACE_EXPORT_DEADLINE_MAX {
+        return Err(invalid(
+            &deadline_path,
+            format!(
+                "must be at most {}s, got {}s",
+                TRACE_EXPORT_DEADLINE_MAX.as_secs(),
+                export_deadline.as_secs_f64()
+            ),
+        ));
+    }
+
     Ok(Some(TracingConfig {
         otlp_endpoint,
         service_name,
         sample_ratio,
+        export_deadline,
     }))
+}
+
+// ----------------------------------------------------------------- metrics --
+
+/// Namespace key the `llmproxy` dialect uses to carry [`MetricsExportConfig`]
+/// through `Bootstrap.node.metadata` -- the same carrier, and for the same
+/// reason, as [`TRACING_METADATA_KEY`]; see [`convert_tracing_metadata`]'s doc
+/// for why `Node.metadata` stands in for the real-but-unmapped
+/// `HttpConnectionManager.tracing.provider`.
+///
+/// A different key from the tracing one, and that is the load-bearing detail:
+/// `io.llmproxy.metrics` is readable and writable with no
+/// `io.llmproxy.tracing` present, which is what makes "export metrics, turn
+/// traces off" expressible at all.
+const METRICS_METADATA_KEY: &str = "io.llmproxy.metrics";
+
+/// Bounds on [`MetricsExportConfig::export_interval`]. The floor keeps a
+/// typo'd `0.1` from turning the exporter into a busy loop that exports a
+/// full cumulative snapshot ten times a second; the ceiling keeps a typo'd
+/// `86400` (a plausible "once a day" slip for someone thinking in seconds when
+/// the value is read as... seconds) from silently disabling metric export
+/// entirely for a day at a time. Both are `Duration`-typed here so the same
+/// parsed value flows into the IR without a second unit decision.
+const METRICS_EXPORT_INTERVAL_MIN: StdDuration = StdDuration::from_secs(1);
+const METRICS_EXPORT_INTERVAL_MAX: StdDuration = StdDuration::from_secs(3_600);
+const METRICS_EXPORT_DEADLINE_MIN: StdDuration = StdDuration::from_millis(100);
+
+/// Default export interval when the namespace omits `export_interval`. 15s is
+/// the conventional OTel/Prometheus scrape default and is what a collector's
+/// own dashboards are sized for; it is a default rather than a hardcoded
+/// constant in the exporter because an operator whose collector charges per
+/// request or runs a tight budget needs to be able to move it.
+const DEFAULT_METRICS_EXPORT_INTERVAL: StdDuration = StdDuration::from_secs(15);
+
+/// Default per-export deadline when the namespace omits `export_deadline`.
+/// Comfortably under [`DEFAULT_METRICS_EXPORT_INTERVAL`] so the default pairing
+/// satisfies the deadline-below-interval rule without the operator having to
+/// think about it.
+const DEFAULT_METRICS_EXPORT_DEADLINE: StdDuration = StdDuration::from_secs(10);
+
+/// Default trace-batch export deadline for `io.llmproxy.tracing`. Matches the
+/// fixed 5s batch interval, so the common case never times out against a
+/// healthy collector while a wedged one costs one interval per attempt.
+const DEFAULT_TRACING_EXPORT_DEADLINE: StdDuration = StdDuration::from_secs(5);
+
+/// Lower `Bootstrap.node.metadata["io.llmproxy.metrics"]` into
+/// [`ConfigSnapshot::metrics`]. The expected shape is
+/// `{ otlp_endpoint: "..." (required), service_name: "..." (optional, default
+/// "llm-proxy"), export_interval: <seconds> (optional, default 15),
+/// export_deadline: <seconds> (optional, default 10) }`.
+///
+/// Structurally a sibling of [`convert_tracing_metadata`] -- same opaque
+/// `google.protobuf.Struct` walk, same ground-rule-#1 enforcement, same
+/// deterministic (sorted) unknown-key reporting -- with two additions the
+/// tracing block has no reason to make:
+///
+/// - Durations arrive as plain `NumberValue` **seconds**, because a
+///   `Struct` cannot express a protobuf `Duration` and the alternative
+///   (a string like `"15s"`) would be a second mini-parser to keep
+///   consistent with the `llmproxy` dialect's own duration syntax in
+///   `proxy-simple-config` for no benefit at this surface.
+/// - `export_deadline` is checked against `export_interval`, not just against
+///   its own floor. A deadline at or above the interval is a configuration
+///   that cannot do what it looks like it does: every tick's export would be
+///   abandoned as a timeout before the next tick was even due, and
+///   `MissedTickBehavior::Delay` would then hold each subsequent tick until
+///   the previous one finished. Rejecting it at load is the only place this
+///   can be caught, since the runtime has no way to act on it either way.
+fn convert_metrics_metadata(
+    node: Option<&core_v3::Node>,
+    path: &str,
+) -> Result<Option<MetricsExportConfig>, ConfigError> {
+    let Some(metrics) = node
+        .and_then(|n| n.metadata.as_ref())
+        .and_then(|m| m.fields.get(METRICS_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let metrics_path = format!("{path}.metadata[\"{METRICS_METADATA_KEY}\"]");
+    let Some(prost_types::value::Kind::StructValue(metrics)) = &metrics.kind else {
+        return Err(invalid(&metrics_path, "must be an object"));
+    };
+
+    // Rust note: `Struct::fields` is a `HashMap`, so sort keys before
+    // reporting one to keep the error deterministic across runs.
+    let mut unknown: Vec<&String> = metrics
+        .fields
+        .keys()
+        .filter(|k| {
+            !matches!(
+                k.as_str(),
+                "otlp_endpoint" | "service_name" | "export_interval" | "export_deadline"
+            )
+        })
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{metrics_path}.{key}"),
+            format!(
+                "`{METRICS_METADATA_KEY}` only supports `otlp_endpoint`, `service_name`, \
+                 `export_interval`, and `export_deadline`"
+            ),
+        ));
+    }
+
+    let endpoint_path = format!("{metrics_path}.otlp_endpoint");
+    let otlp_endpoint = match metrics
+        .fields
+        .get("otlp_endpoint")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::StringValue(v)) if !v.is_empty() => v.clone(),
+        Some(prost_types::value::Kind::StringValue(_)) => {
+            return Err(invalid(&endpoint_path, "must not be empty"))
+        }
+        Some(_) => return Err(invalid(&endpoint_path, "must be a string")),
+        None => return Err(invalid(&endpoint_path, "is required")),
+    };
+
+    let service_name_path = format!("{metrics_path}.service_name");
+    let service_name = match metrics
+        .fields
+        .get("service_name")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::StringValue(v)) => v.clone(),
+        Some(_) => return Err(invalid(&service_name_path, "must be a string")),
+        None => "llm-proxy".to_string(),
+    };
+
+    let interval_path = format!("{metrics_path}.export_interval");
+    let export_interval: StdDuration = match metrics
+        .fields
+        .get("export_interval")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::NumberValue(v)) => seconds_to_duration(*v, &interval_path)?,
+        Some(_) => return Err(invalid(&interval_path, "must be a number of seconds")),
+        None => DEFAULT_METRICS_EXPORT_INTERVAL,
+    };
+    if !(METRICS_EXPORT_INTERVAL_MIN..=METRICS_EXPORT_INTERVAL_MAX).contains(&export_interval) {
+        return Err(invalid(
+            &interval_path,
+            format!(
+                "must be between {}s and {}s, got {}s",
+                METRICS_EXPORT_INTERVAL_MIN.as_secs(),
+                METRICS_EXPORT_INTERVAL_MAX.as_secs(),
+                export_interval.as_secs_f64()
+            ),
+        ));
+    }
+
+    let deadline_path = format!("{metrics_path}.export_deadline");
+    let export_deadline: StdDuration = match metrics
+        .fields
+        .get("export_deadline")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::NumberValue(v)) => seconds_to_duration(*v, &deadline_path)?,
+        Some(_) => return Err(invalid(&deadline_path, "must be a number of seconds")),
+        None => DEFAULT_METRICS_EXPORT_DEADLINE,
+    };
+    if export_deadline < METRICS_EXPORT_DEADLINE_MIN {
+        return Err(invalid(
+            &deadline_path,
+            format!(
+                "must be at least {}ms, got {}s",
+                METRICS_EXPORT_DEADLINE_MIN.as_millis(),
+                export_deadline.as_secs_f64()
+            ),
+        ));
+    }
+    // The cross-field check, stated as its own error rather than folded into
+    // either field's own range check so the message can name the relationship
+    // rather than making the operator derive it: a deadline >= interval means
+    // no export can ever complete before the next one is due.
+    if export_deadline >= export_interval {
+        return Err(invalid(
+            &deadline_path,
+            format!(
+                "must be less than `export_interval` ({}s), got {}s -- otherwise every export \
+                 is abandoned as a timeout before the next one is due",
+                export_interval.as_secs_f64(),
+                export_deadline.as_secs_f64()
+            ),
+        ));
+    }
+
+    Ok(Some(MetricsExportConfig {
+        otlp_endpoint,
+        service_name,
+        export_interval,
+        export_deadline,
+    }))
+}
+
+/// Convert a `google.protobuf.Value` number of seconds into a [`StdDuration`],
+/// rejecting every shape a `Struct` number can take that is not a usable
+/// interval.
+///
+/// Rust note: the conversion is `Duration::try_from_secs_f64`, NOT
+/// `from_secs_f64`. The panicking variant is guarded only against negative,
+/// NaN, and infinite input -- a huge but perfectly finite value like `1e100`
+/// sails past all three of those checks and still panics on overflow, and a
+/// review found exactly that (`export_interval: 1.0e100` aborted config load
+/// with exit code 101). `try_from_secs_f64` folds the overflow case into
+/// `Err(Overflow)`, which this function turns into the same dotted-path
+/// `ConfigError` as every other bad value -- the whole point being that no
+/// number a config file can contain should be able to abort the process at
+/// load time. `f64` also has far more exponent range than `Duration`'s
+/// `u64`-seconds representation, so the overflow band is enormous (roughly
+/// everything above ~5.8e11 years in seconds) and completely unreachable from
+/// any legitimate interval; an `Err` from it can only mean "the number is
+/// nonsense", never "the config was rejected unfairly".
+///
+/// Sub-second values survive the round trip intact -- the conversion keeps
+/// nanosecond precision -- which matters because a legitimate
+/// `export_deadline: 0.5` must not be rounded to zero.
+fn seconds_to_duration(seconds: f64, path: &str) -> Result<StdDuration, ConfigError> {
+    if !seconds.is_finite() {
+        return Err(invalid(path, "must be a finite number of seconds"));
+    }
+    if seconds <= 0.0 {
+        return Err(invalid(
+            path,
+            "must be a positive number of seconds (0 means \"never export\"; omit the field \
+             to take the default instead)",
+        ));
+    }
+    StdDuration::try_from_secs_f64(seconds).map_err(|_| {
+        invalid(
+            path,
+            "is too large to represent as a duration (the largest interval this proxy accepts \
+             for any timing field is 3600s; this value is beyond even a u64-seconds \
+             representation)",
+        )
+    })
 }
 
 /// Type URL key Envoy expects for the one `typed_extension_protocol_options`
