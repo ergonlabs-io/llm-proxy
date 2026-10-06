@@ -372,6 +372,10 @@ pub struct BoundedRecordSink {
     tx: mpsc::Sender<RequestRecord>,
     counters: Arc<DropCounters>,
     max_attempts: u16,
+    /// Optional process-level capture instrumentation. Keeping it optional
+    /// preserves this sink's use as a pure bounded test/sidecar primitive;
+    /// production installs it at metadata-delivery startup.
+    delivery_stats: Option<crate::stats::MetadataDeliveryStats>,
 }
 
 impl BoundedRecordSink {
@@ -382,6 +386,7 @@ impl BoundedRecordSink {
                 tx,
                 counters: Arc::new(DropCounters::default()),
                 max_attempts: MAX_ATTEMPTS,
+                delivery_stats: None,
             },
             rx,
         )
@@ -394,21 +399,41 @@ impl BoundedRecordSink {
         self.max_attempts = maximum.clamp(1, MAX_ATTEMPTS);
         self
     }
+
+    /// Attach the pre-resolved, finite operational series for the production
+    /// metadata lane. This cannot affect `submit`'s nonblocking outcome: the
+    /// registry update is an in-memory atomic increment after that outcome is
+    /// known, never collector I/O.
+    pub fn with_delivery_stats(mut self, stats: crate::stats::MetadataDeliveryStats) -> Self {
+        self.delivery_stats = Some(stats);
+        self
+    }
 }
 
 impl RequestRecordSink for BoundedRecordSink {
     fn submit(&self, record: RequestRecord) -> SubmitResult {
-        if record.retained_bytes() > MAX_RECORD_BYTES || record.validate(self.max_attempts).is_err()
+        let result = if record.retained_bytes() > MAX_RECORD_BYTES
+            || record.validate(self.max_attempts).is_err()
         {
-            self.counters.record(SubmitResult::CapacityExceeded);
-            return SubmitResult::CapacityExceeded;
-        }
-        let result = match self.tx.try_send(record) {
-            Ok(()) => SubmitResult::Accepted,
-            Err(mpsc::error::TrySendError::Full(_)) => SubmitResult::CapacityExceeded,
-            Err(mpsc::error::TrySendError::Closed(_)) => SubmitResult::Closed,
+            SubmitResult::CapacityExceeded
+        } else {
+            match self.tx.try_reserve() {
+                Ok(permit) => {
+                    // Publish occupancy before the receiver can see the record.
+                    if let Some(stats) = &self.delivery_stats {
+                        stats.record_enqueued();
+                    }
+                    permit.send(record);
+                    SubmitResult::Accepted
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => SubmitResult::CapacityExceeded,
+                Err(mpsc::error::TrySendError::Closed(_)) => SubmitResult::Closed,
+            }
         };
         self.counters.record(result);
+        if let Some(stats) = &self.delivery_stats {
+            stats.record_submission(result);
+        }
         result
     }
     fn max_attempts(&self) -> u16 {
@@ -506,6 +531,30 @@ pub(crate) mod tests {
         assert_eq!(sink.submit(record()), SubmitResult::Accepted);
         assert_eq!(sink.submit(record()), SubmitResult::CapacityExceeded);
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn concurrent_dequeue_never_observes_unsigned_depth_underflow() {
+        let control = crate::stats::StatsControl::new(1);
+        let registry = control.registry();
+        let stats = crate::stats::MetadataDeliveryStats::resolve(&control);
+        let (sink, mut receiver) = BoundedRecordSink::new(1);
+        let sink = sink.with_delivery_stats(stats.clone());
+        let depth = control.resolve(&crate::stats::instruments::METADATA_QUEUE_DEPTH, &[]);
+        let observer_registry = registry.clone();
+        let receiver_thread = std::thread::spawn(move || {
+            while receiver.blocking_recv().is_some() {
+                stats.record_dequeued();
+                assert!(observer_registry.value(depth) <= 2);
+            }
+        });
+        for _ in 0..10_000 {
+            sink.submit(record());
+            assert!(registry.value(depth) <= 2);
+        }
+        drop(sink);
+        receiver_thread.join().unwrap();
+        assert_eq!(registry.value(depth), 0);
     }
 
     #[test]

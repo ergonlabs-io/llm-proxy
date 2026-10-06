@@ -567,6 +567,9 @@ impl LoggingBody {
                     .as_deref()
                     .map(proxy_observability::records::bounded_field)
                     .unwrap_or_else(|| "default".to_owned()),
+                // AuthInfo deliberately exposes tenant and credential only.
+                // A body-supplied user_id is untrusted, so leave this null
+                // until authentication publishes an authenticated principal.
                 user_id: None,
                 key_id: usage_attribution
                     .0
@@ -616,16 +619,20 @@ impl LoggingBody {
                     completeness: proxy_observability::records::UsageCompleteness::Complete,
                     provenance: "provider".to_owned(),
                 }),
-                cost: llm_list_cost_nanodollars.map(|amount| proxy_observability::records::Cost {
-                    amount,
-                    unit: "nanodollars".to_owned(),
-                    currency: "USD".to_owned(),
-                    rate_card_version: usage_attribution
-                        .2
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_owned()),
-                    kind: "list".to_owned(),
-                }),
+                // A numeric amount without its immutable rate-card version
+                // is not an auditable cost. Keep the whole cost null rather
+                // than inventing an "unknown" version.
+                cost: llm_list_cost_nanodollars
+                    .zip(usage_attribution.2.as_deref())
+                    .map(
+                        |(amount, rate_card_version)| proxy_observability::records::Cost {
+                            amount,
+                            unit: "nanodollars".to_owned(),
+                            currency: "USD".to_owned(),
+                            rate_card_version: rate_card_version.to_owned(),
+                            kind: "list".to_owned(),
+                        },
+                    ),
                 attempt_count: attempts.len().min(u16::MAX as usize) as u16,
                 physical_attempt_count: ctx.stream_info.borrow().physical_attempt_count,
                 attempts_truncated: ctx.stream_info.borrow().attempts_truncated,
@@ -1084,6 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_usage_and_list_cost_belong_only_to_the_selected_attempt() {
+        let version = format!("operator-{}+content-hash", "v".repeat(600));
         let capture = Arc::new(CaptureSink::default());
         let mut ctx = flags_ctx(&capture);
         let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
@@ -1108,7 +1116,7 @@ mod tests {
             });
             info.llm.list_cost = Some(crate::stream_info::LlmListCost {
                 nanodollars: 987_654,
-                rate_card_version: "v1+abcdef".into(),
+                rate_card_version: version.clone(),
             });
         }
         let body = local_boxed(
@@ -1125,7 +1133,7 @@ mod tests {
         assert_eq!(cost.amount, 987_654);
         assert_eq!(cost.unit, "nanodollars");
         assert_eq!(cost.kind, "list");
-        assert_eq!(cost.rate_card_version, "v1+abcdef");
+        assert_eq!(cost.rate_card_version, version);
         assert!(records.try_recv().is_err());
     }
 

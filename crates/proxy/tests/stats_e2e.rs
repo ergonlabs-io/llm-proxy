@@ -292,6 +292,16 @@ fn spawn_mock_llm_upstream(prompt_tokens: u32, completion_tokens: u32) -> (Child
 /// closes) and not a fabricated reading.
 #[test]
 fn served_requests_are_reflected_in_stats() {
+    check_metadata_delivery(false);
+}
+
+#[test]
+#[cfg(unix)]
+fn metadata_write_failure_preserves_forwarding_and_readiness() {
+    check_metadata_delivery(true);
+}
+
+fn check_metadata_delivery(fail_collector: bool) {
     let upstream_addr = spawn_mock_upstream();
     let listener_port = free_port();
     let admin_port = free_port();
@@ -356,8 +366,22 @@ static_resources:
     // `ChildGuard` (not a bare `Child`): this function gained several more
     // assertions in WP-23 increment 6b, each a new chance to panic before
     // reaching the manual `kill` at the bottom -- see `ChildGuard`'s doc.
-    let mut child = ChildGuard(
+    // Inherit an ignored SIGXFSZ and a one-block file size limit to produce a
+    // real append error on a regular file, without filesystem-global changes.
+    let mut command = if fail_collector {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "trap '' XFSZ; ulimit -f 1; exec \"$@\"",
+            "metadata-test",
+            BIN,
+        ]);
+        command
+    } else {
         Command::new(BIN)
+    };
+    let mut child = ChildGuard(
+        command
             .args([
                 "-c",
                 config_path.to_str().unwrap(),
@@ -405,6 +429,33 @@ static_resources:
     }
 
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    if fail_collector {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let scrape = get(admin_addr, "/stats/prometheus", "admin.local");
+            if scrape.contains("envoy_llmproxy_metadata_write_failures 1") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "collector never reported its write failure: {scrape}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(get(listener_addr, "/after-failure", "test.local").starts_with("HTTP/1.1 200"));
+        assert!(get(admin_addr, "/ready", "admin.local").starts_with("HTTP/1.1 200"));
+        let scrape = get(admin_addr, "/stats/prometheus", "admin.local");
+        assert!(
+            scrape.contains("envoy_llmproxy_metadata_admission{outcome=\"closed\"} 1")
+                || scrape.contains("envoy_llmproxy_metadata_admission{outcome=\"closed\"} 2"),
+            "the post-failure request must encounter closed capture admission: {scrape}"
+        );
+        assert!(scrape.contains("envoy_llmproxy_metadata_queue_depth 0"));
+        drop(child);
+        let _ = std::fs::remove_file(&records_path);
+        let _ = std::fs::remove_file(&config_path);
+        return;
+    }
     let stats_response = get(admin_addr, "/stats", "admin.local");
     assert!(
         stats_response.starts_with("HTTP/1.1 200"),

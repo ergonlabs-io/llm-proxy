@@ -4,6 +4,7 @@
 //! durability acknowledgement and this file is not a billing ledger.
 
 use crate::records::{BoundedRecordSink, DropCounters};
+use crate::stats::MetadataDeliveryStats;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
@@ -33,7 +34,11 @@ pub struct DeliverySummary {
 }
 
 impl MetadataDelivery {
-    pub fn start(path: &Path, capacity: usize) -> io::Result<(BoundedRecordSink, Self)> {
+    pub fn start(
+        path: &Path,
+        capacity: usize,
+        stats: MetadataDeliveryStats,
+    ) -> io::Result<(BoundedRecordSink, Self)> {
         if capacity == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -61,15 +66,23 @@ impl MetadataDelivery {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        Self::start_writer(file, capacity, instance_id)
+        Self::start_writer(file, capacity, instance_id, Some(stats))
     }
 
     fn start_writer(
         mut file: impl Write + Send + 'static,
         capacity: usize,
         instance_id: String,
+        stats: Option<MetadataDeliveryStats>,
     ) -> io::Result<(BoundedRecordSink, Self)> {
         let (sink, mut receiver) = BoundedRecordSink::new(capacity);
+        let sink = match stats.as_ref() {
+            Some(stats) => {
+                stats.configure_queue(capacity);
+                sink.with_delivery_stats(stats.clone())
+            }
+            None => sink,
+        };
         let counters = sink.counters();
         let written = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicU64::new(0));
@@ -79,7 +92,11 @@ impl MetadataDelivery {
         std::thread::Builder::new()
             .name("llmproxy-metadata".into())
             .spawn(move || {
+                let mut write_failed = false;
                 while let Some(mut record) = receiver.blocking_recv() {
+                    if let Some(stats) = &stats {
+                        stats.record_dequeued();
+                    }
                     record.instance_id.clone_from(&instance_id);
                     let result = serde_json::to_vec(&record)
                         .map_err(io::Error::other)
@@ -89,9 +106,27 @@ impl MetadataDelivery {
                         });
                     if result.is_ok() {
                         thread_written.fetch_add(1, Ordering::Relaxed);
+                        if let Some(stats) = &stats {
+                            stats.record_written();
+                        }
                     } else {
                         thread_failed.fetch_add(1, Ordering::Relaxed);
-                        break; // Disable admission after a partial/error write.
+                        if let Some(stats) = &stats {
+                            stats.record_write_failure();
+                        }
+                        write_failed = true;
+                        // Stop admission before discarding anything left in
+                        // the channel. Capture failure is isolated from
+                        // forwarding; this only frees the bounded queue.
+                        receiver.close();
+                        break;
+                    }
+                }
+                if write_failed {
+                    while receiver.blocking_recv().is_some() {
+                        if let Some(stats) = &stats {
+                            stats.record_dequeued();
+                        }
                     }
                 }
                 let _ = done_tx.send(());
@@ -133,6 +168,7 @@ impl MetadataDelivery {
 mod tests {
     use super::*;
     use crate::records::{tests::record, RequestRecordSink, SubmitResult};
+    use crate::stats::{prometheus_render, MetadataDeliveryStats, StatsControl};
 
     #[tokio::test]
     async fn queued_records_are_written_before_shutdown_returns() {
@@ -149,7 +185,8 @@ mod tests {
         }
         let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (sink, delivery) =
-            MetadataDelivery::start_writer(Writer(bytes.clone()), 2, "instance".into()).unwrap();
+            MetadataDelivery::start_writer(Writer(bytes.clone()), 2, "instance".into(), None)
+                .unwrap();
         assert_eq!(sink.submit(record()), SubmitResult::Accepted);
         drop(sink);
         let summary = delivery.shutdown(Duration::from_secs(2)).await;
@@ -172,11 +209,107 @@ mod tests {
             }
         }
         let (sink, delivery) =
-            MetadataDelivery::start_writer(Failed, 2, "instance".into()).unwrap();
+            MetadataDelivery::start_writer(Failed, 2, "instance".into(), None).unwrap();
         assert_eq!(sink.submit(record()), SubmitResult::Accepted);
         let summary = delivery.shutdown(Duration::from_secs(2)).await;
         assert_eq!(summary.failed, 1);
         assert_eq!(sink.submit(record()), SubmitResult::Closed);
+    }
+
+    #[tokio::test]
+    async fn metadata_health_renders_admission_queue_and_writer_signals() {
+        struct Blocked {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Write for Blocked {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let stats = MetadataDeliveryStats::resolve(&control);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (sink, delivery) = MetadataDelivery::start_writer(
+            Blocked {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            1,
+            "instance".into(),
+            Some(stats),
+        )
+        .unwrap();
+
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        entered_rx.recv().unwrap(); // first record left the queue for I/O
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        assert_eq!(sink.submit(record()), SubmitResult::CapacityExceeded);
+        let before_write = prometheus_render::render(&registry);
+        assert!(before_write.contains("envoy_llmproxy_metadata_admission{outcome=\"accepted\"} 2"));
+        assert!(before_write
+            .contains("envoy_llmproxy_metadata_admission{outcome=\"capacity_exceeded\"} 1"));
+        assert!(before_write.contains("envoy_llmproxy_metadata_queue_depth 1"));
+        assert!(before_write.contains("envoy_llmproxy_metadata_queue_capacity 1"));
+        let otlp = crate::otlp::map_metrics(
+            &registry,
+            &proxy_api::opentelemetry::proto::resource::v1::Resource::default(),
+        );
+        let names: Vec<&str> = otlp.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter()
+            .map(|metric| metric.name.as_str())
+            .collect();
+        assert!(names.contains(&"llmproxy_metadata_admission"));
+        assert!(names.contains(&"llmproxy_metadata_queue_depth"));
+
+        let _ = release_tx.send(());
+        // The second write intentionally blocks too.
+        entered_rx.recv().unwrap();
+        let _ = release_tx.send(());
+        drop(sink);
+        let summary = delivery.shutdown(Duration::from_secs(2)).await;
+        assert_eq!(summary.written, 2);
+        let rendered = prometheus_render::render(&registry);
+        assert!(rendered.contains("envoy_llmproxy_metadata_queue_depth 0"));
+        assert!(rendered.contains("envoy_llmproxy_metadata_written 2"));
+        assert!(rendered.contains("envoy_llmproxy_metadata_write_failures 0"));
+    }
+
+    #[tokio::test]
+    async fn collector_failure_is_visible_without_a_forwarding_side_effect() {
+        struct Failed;
+        impl Write for Failed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("full"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let stats = MetadataDeliveryStats::resolve(&control);
+        let (sink, delivery) =
+            MetadataDelivery::start_writer(Failed, 1, "instance".into(), Some(stats)).unwrap();
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        let summary = delivery.shutdown(Duration::from_secs(2)).await;
+        assert_eq!(summary.failed, 1);
+        // `submit` reports only metadata admission; callers ignore it, so a
+        // failed file collector cannot turn a completed forwarding path into
+        // a request error.
+        assert_eq!(sink.submit(record()), SubmitResult::Closed);
+        let rendered = prometheus_render::render(&registry);
+        assert!(rendered.contains("envoy_llmproxy_metadata_write_failures 1"));
+        assert!(rendered.contains("envoy_llmproxy_metadata_admission{outcome=\"closed\"} 1"));
     }
 
     #[tokio::test]
@@ -193,7 +326,7 @@ mod tests {
         }
         let (release, wait) = std::sync::mpsc::channel();
         let (sink, delivery) =
-            MetadataDelivery::start_writer(Blocked(wait), 1, "instance".into()).unwrap();
+            MetadataDelivery::start_writer(Blocked(wait), 1, "instance".into(), None).unwrap();
         assert_eq!(sink.submit(record()), SubmitResult::Accepted);
         drop(sink);
         let summary = tokio::time::timeout(

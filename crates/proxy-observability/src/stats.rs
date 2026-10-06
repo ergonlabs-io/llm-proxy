@@ -666,6 +666,166 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+
+    // ------------------------------------------------ metadata capture health --
+    //
+    // These are intentionally a separate `llmproxy_metadata_*` namespace.
+    // Request-record capture is best effort and has different failure and
+    // retention semantics from OTLP export; joining their instruments would
+    // make a collector outage look like a trace-export problem. No capture
+    // identity is an attribute: every dimension below is a closed vocabulary.
+
+    /// Request-record admission attempts, by their terminal queue outcome.
+    ///
+    /// Updated synchronously by `BoundedRecordSink::submit`: accepted records
+    /// are handed to the dedicated writer; capacity and closed outcomes are
+    /// dropped without delaying the request worker. The three outcomes are
+    /// resolved at boot, including when capture is disabled, so scrape and
+    /// OTLP distinguish a real zero from a missing series.
+    pub const METADATA_ADMISSION: Instrument = Instrument {
+        name: "llmproxy_metadata_admission",
+        kind: InstrumentKind::Counter,
+        unit: "{record}",
+        attribute_keys: &["outcome"],
+        buckets: None,
+    };
+    pub const METADATA_ADMISSION_ACCEPTED: &str = "accepted";
+    pub const METADATA_ADMISSION_CAPACITY_EXCEEDED: &str = "capacity_exceeded";
+    pub const METADATA_ADMISSION_CLOSED: &str = "closed";
+
+    /// Queue occupancy measured from producer reservation to collector dequeue
+    /// observation. `depth / llmproxy_metadata_queue_capacity` estimates queue
+    /// utilization. Concurrent reservation/dequeue updates can briefly include
+    /// an unpublished record or one just removed from the channel; this is not
+    /// an atomic channel snapshot. Collector write time is excluded.
+    pub const METADATA_QUEUE_DEPTH: Instrument = Instrument {
+        name: "llmproxy_metadata_queue_depth",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{record}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+
+    /// Configured request-record queue capacity. Set once when capture starts;
+    /// zero means capture was not configured for this process.
+    pub const METADATA_QUEUE_CAPACITY: Instrument = Instrument {
+        name: "llmproxy_metadata_queue_capacity",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{record}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+
+    /// Records successfully serialized and appended by the collector thread.
+    pub const METADATA_WRITTEN: Instrument = Instrument {
+        name: "llmproxy_metadata_written",
+        kind: InstrumentKind::Counter,
+        unit: "{record}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+
+    /// Collector serialization or write failures. A failure closes metadata
+    /// admission but never changes forwarding readiness.
+    pub const METADATA_WRITE_FAILURES: Instrument = Instrument {
+        name: "llmproxy_metadata_write_failures",
+        kind: InstrumentKind::Counter,
+        unit: "{failure}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+}
+
+/// Pre-resolved operational signals for the best-effort request-record
+/// collector. Constructed once by the control side and used by both request
+/// workers (admission) and the dedicated collector thread (dequeue/write).
+/// All updates use `WorkerId(0)`: these are process-level control signals,
+/// not worker-owned traffic measurements.
+#[derive(Clone)]
+pub struct MetadataDeliveryStats {
+    registry: Arc<Registry>,
+    accepted: Handle,
+    capacity_exceeded: Handle,
+    closed: Handle,
+    queue_depth: Handle,
+    queue_capacity: Handle,
+    written: Handle,
+    write_failures: Handle,
+}
+
+impl MetadataDeliveryStats {
+    /// Resolve every finite metadata-capture series, even with capture
+    /// disabled, so both Prometheus scrape and OTLP snapshots carry explicit
+    /// zeroes for an idle process.
+    pub fn resolve(control: &StatsControl) -> Self {
+        Self {
+            registry: control.registry(),
+            accepted: control.resolve(
+                &instruments::METADATA_ADMISSION,
+                &[("outcome", instruments::METADATA_ADMISSION_ACCEPTED)],
+            ),
+            capacity_exceeded: control.resolve(
+                &instruments::METADATA_ADMISSION,
+                &[("outcome", instruments::METADATA_ADMISSION_CAPACITY_EXCEEDED)],
+            ),
+            closed: control.resolve(
+                &instruments::METADATA_ADMISSION,
+                &[("outcome", instruments::METADATA_ADMISSION_CLOSED)],
+            ),
+            queue_depth: control.resolve(&instruments::METADATA_QUEUE_DEPTH, &[]),
+            queue_capacity: control.resolve(&instruments::METADATA_QUEUE_CAPACITY, &[]),
+            written: control.resolve(&instruments::METADATA_WRITTEN, &[]),
+            write_failures: control.resolve(&instruments::METADATA_WRITE_FAILURES, &[]),
+        }
+    }
+
+    /// Lifecycle point: once, when a configured collector takes ownership of
+    /// its bounded channel.
+    pub fn configure_queue(&self, capacity: usize) {
+        self.registry.incr(
+            WorkerId(0),
+            self.queue_capacity,
+            capacity.min(u64::MAX as usize) as u64,
+        );
+    }
+
+    /// Lifecycle point: every nonblocking producer submission.
+    pub fn record_submission(&self, outcome: crate::records::SubmitResult) {
+        match outcome {
+            crate::records::SubmitResult::Accepted => {
+                self.registry.incr(WorkerId(0), self.accepted, 1);
+            }
+            crate::records::SubmitResult::CapacityExceeded => {
+                self.registry.incr(WorkerId(0), self.capacity_exceeded, 1);
+            }
+            crate::records::SubmitResult::Closed => {
+                self.registry.incr(WorkerId(0), self.closed, 1);
+            }
+            crate::records::SubmitResult::Disabled => {}
+        }
+    }
+
+    /// After obtaining a channel permit, before publishing the record. This
+    /// ordering prevents dequeue from subtracting an unpublished increment.
+    pub fn record_enqueued(&self) {
+        self.registry.incr(WorkerId(0), self.queue_depth, 1);
+    }
+
+    /// Lifecycle point: immediately after the collector removes a record from
+    /// the bounded channel, including records discarded after a write failure.
+    pub fn record_dequeued(&self) {
+        self.registry.add(WorkerId(0), self.queue_depth, -1);
+    }
+
+    /// Lifecycle point: successful JSON serialization plus append write.
+    pub fn record_written(&self) {
+        self.registry.incr(WorkerId(0), self.written, 1);
+    }
+
+    /// Lifecycle point: JSON serialization or append write error.
+    pub fn record_write_failure(&self) {
+        self.registry.incr(WorkerId(0), self.write_failures, 1);
+    }
 }
 
 /// Identifies a worker thread/runtime for [`Registry::incr`]/

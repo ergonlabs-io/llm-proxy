@@ -1217,13 +1217,17 @@ impl RouterHandler {
                         .to_string(),
                     );
                     let attempt_trace = info.trace.map(|ctx| ctx.child());
+                    // Pin model attribution before connecting: a failed dial
+                    // still belongs to this physical attempt's selected member.
+                    info.selected_model = selected_provider_model(
+                        attempt_entry.provider_runtime(),
+                        requested_model.as_deref(),
+                    );
+                    let selected_model = info.selected_model.clone();
                     let attempt_info = info.begin_attempt(
                         attempt_cluster,
                         &host.address.to_string(),
-                        selected_provider_model(
-                            attempt_entry.provider_runtime(),
-                            requested_model.as_deref(),
-                        ),
+                        selected_model,
                     );
                     if let Some(attempt) = &attempt_info {
                         attempt.borrow_mut().trace = attempt_trace;

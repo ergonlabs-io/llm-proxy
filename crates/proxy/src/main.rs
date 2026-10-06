@@ -697,8 +697,16 @@ async fn run_serve(
             snapshot.clusters.keys().map(String::as_str),
         ));
     let registry = stats_control.registry();
+    // Request-record capture is an independent best-effort pipeline. Resolve
+    // its finite operational series even when no file collector is configured
+    // so Prometheus and OTLP show explicit zeroes rather than an absent signal.
+    let metadata_stats = proxy_observability::stats::MetadataDeliveryStats::resolve(&stats_control);
     let (metadata_sink, metadata_delivery) = match request_records_file {
-        Some(path) => match proxy_observability::metadata::MetadataDelivery::start(&path, 1024) {
+        Some(path) => match proxy_observability::metadata::MetadataDelivery::start(
+            &path,
+            1024,
+            metadata_stats,
+        ) {
             Ok((sink, delivery)) => (
                 Some(
                     Arc::new(sink.with_max_attempts(request_record_max_attempts))
