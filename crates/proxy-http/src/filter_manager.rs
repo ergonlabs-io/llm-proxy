@@ -477,6 +477,7 @@ pub struct FilterChainHandler {
     /// at all in that case, so the per-request cost is exactly one `is_none`
     /// check.
     tracing: Option<TracingWiring>,
+    request_record_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
 }
 
 /// [`FilterChainHandler::tracing`]'s payload -- bundled rather than two
@@ -515,6 +516,7 @@ impl FilterChainHandler {
             token_stats: None,
             latency_stats: None,
             tracing: None,
+            request_record_sink: None,
         }
     }
 
@@ -655,6 +657,14 @@ impl FilterChainHandler {
         self.tracing = Some(TracingWiring { sink, sample_ratio });
         self
     }
+
+    pub fn with_request_record_sink(
+        mut self,
+        sink: Arc<dyn proxy_observability::records::RequestRecordSink>,
+    ) -> Self {
+        self.request_record_sink = Some(sink);
+        self
+    }
 }
 
 impl StreamHandler for FilterChainHandler {
@@ -734,6 +744,20 @@ impl StreamHandler for FilterChainHandler {
             // every filter (including an encode filter's end-of-stream
             // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
+            if let Some(sink) = &self.request_record_sink {
+                let mut info = stream_info.borrow_mut();
+                info.metadata_enabled = true;
+                info.metadata_attempt_limit = sink
+                    .max_attempts()
+                    .min(proxy_observability::records::MAX_ATTEMPTS);
+                info.metadata_request_id = Some(
+                    proxy_observability::trace::TraceContext::new_root(false)
+                        .trace_id
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                );
+            }
             // S10 (WP-10 increment 2b/2c): move the downstream `OnUpgrade`
             // handle (if this request asked for one) off `req` and onto the
             // just-built `StreamInfo`, before `req` moves into `mgr.run(req)`
@@ -815,6 +839,7 @@ impl StreamHandler for FilterChainHandler {
                 && self.token_stats.is_none()
                 && self.latency_stats.is_none()
                 && self.tracing.is_none()
+                && self.request_record_sink.is_none()
             {
                 return resp;
             }
@@ -840,6 +865,7 @@ impl StreamHandler for FilterChainHandler {
                 token_stats: self.token_stats.clone(),
                 latency_stats: self.latency_stats.clone(),
                 span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
+                request_record_sink: self.request_record_sink.clone(),
             };
             HttpResponseParts {
                 head: resp.head,

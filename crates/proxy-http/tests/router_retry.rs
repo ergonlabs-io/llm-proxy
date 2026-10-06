@@ -449,6 +449,143 @@ async fn a_503_is_retried_and_the_second_attempts_200_is_returned() {
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_records_distinct_retry_outcomes_without_access_logs() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, _, _) = spawn_upstream_fails_then_succeeds(1, 503).await;
+            let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+            let (spans, mut span_records) = proxy_observability::trace::SpanSink::new(4);
+            let router = build_router(addr, forward_to_up(Some(retry_policy("5xx", 1))))
+                .await
+                .with_request_record_sink(Arc::new(sink))
+                .with_tracing(spans, 0.0);
+            let mut req = request_with_body("/v1/chat?secret=query", b"test");
+            req.head.headers.insert(
+                "x-request-id",
+                HeaderValue::from_static("caller-controlled"),
+            );
+            req.head
+                .headers
+                .insert("authorization", HeaderValue::from_static("secret"));
+            let response = router.handle(req).await;
+            assert_eq!(response.head.status, StatusCode::OK);
+            response.body.collect().await.unwrap();
+            let record = records.try_recv().unwrap();
+            assert_ne!(record.request_id, "caller-controlled");
+            assert_eq!(record.route, "/v1/chat");
+            assert!(record.trace_id.is_some());
+            assert!(record.response_flags.is_empty());
+            assert!(record.user_id.is_none());
+            assert!(record.selected_provider.is_none());
+            assert!(record.routing_revision.is_none());
+            assert!(record.policy_generation.is_none());
+            assert!(record.capture_policy_version.is_none());
+            assert_ne!(record.attempts[0].span_id, record.attempts[1].span_id);
+            assert_eq!(
+                record.attempts[0].parent_span_id,
+                record.attempts[1].parent_span_id
+            );
+            assert!(span_records.try_recv().is_err());
+            assert_eq!(record.attempt_count, 2);
+            assert_eq!(record.physical_attempt_count, 2);
+            assert_eq!(record.attempts[0].status, Some(503));
+            assert_eq!(record.attempts[1].status, Some(200));
+            assert_eq!(record.attempts[1].retry_reason.as_deref(), Some("retry"));
+            for attempt in &record.attempts {
+                assert_eq!(attempt.trace_id, record.trace_id);
+                assert!(attempt.span_id.is_some());
+                assert!(attempt.parent_span_id.is_some());
+                assert_ne!(attempt.span_id, attempt.parent_span_id);
+                assert_eq!(attempt.cluster.as_deref(), Some("up"));
+                assert_eq!(attempt.bytes_request, Some(4));
+                assert_eq!(
+                    attempt.termination,
+                    proxy_observability::records::Termination::Complete
+                );
+                assert_ne!(attempt.started_at, "0.000000000Z");
+                assert!(attempt.usage.is_none());
+                assert!(attempt.cost.is_none());
+            }
+            assert_ne!(record.attempts[0].event_id, record.attempts[1].event_id);
+            assert!(records.try_recv().is_err());
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_queue_overload_does_not_change_forwarding() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, count, _) = spawn_upstream_fails_then_succeeds(0, 503).await;
+            let (sink, _receiver) = proxy_observability::records::BoundedRecordSink::new(1);
+            let counters = sink.counters();
+            let handler = build_router(addr, forward_to_up(None))
+                .await
+                .with_request_record_sink(Arc::new(sink));
+            for _ in 0..2 {
+                let response = handler.handle(request("/v1/chat")).await;
+                assert_eq!(response.head.status, StatusCode::OK);
+                response.body.collect().await.unwrap();
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+            assert_eq!(counters.snapshot().accepted, 1);
+            assert_eq!(counters.snapshot().capacity_exceeded, 1);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_attempt_limit_does_not_limit_retries() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, count, _) = spawn_upstream_fails_then_succeeds(1, 503).await;
+            let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+            let router = build_router(addr, forward_to_up(Some(retry_policy("5xx", 1))))
+                .await
+                .with_request_record_sink(Arc::new(sink.with_max_attempts(1)));
+            let response = router.handle(request("/v1/chat")).await;
+            assert_eq!(response.head.status, StatusCode::OK);
+            response.body.collect().await.unwrap();
+            let record = records.try_recv().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+            assert_eq!(record.attempt_count, 1);
+            assert_eq!(record.physical_attempt_count, 2);
+            assert!(record.attempts_truncated);
+            assert_eq!(record.attempts[0].status, Some(503));
+            assert!(record.attempts[0].usage.is_none());
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_exhausted_retry_flags_and_body_user_are_not_identity() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, _, _) = spawn_upstream_fails_then_succeeds(2, 503).await;
+            let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+            let router = build_router(addr, forward_to_up(Some(retry_policy("5xx", 1))))
+                .await
+                .with_request_record_sink(Arc::new(sink));
+            let response = router
+                .handle(request_with_body("/v1/chat", br#"{"user_id":"victim"}"#))
+                .await;
+            assert_eq!(response.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            response.body.collect().await.unwrap();
+            let record = records.try_recv().unwrap();
+            assert_eq!(record.response_flags, ["URX"]);
+            assert_eq!(record.tenant_id, "default");
+            assert!(record.user_id.is_none());
+            assert!(record.key_id.is_none());
+            assert!(record.trace_id.is_none());
+            assert!(record.attempts.iter().all(|a| a.trace_id.is_none()
+                && a.span_id.is_none()
+                && a.parent_span_id.is_none()));
+            assert!(records.try_recv().is_err());
+        })
+        .await;
+}
+
 /// WP-23 increment 6a: a retried request is TWO upstream attempts against
 /// the same cluster, so `upstream_rq` must count 2, not 1 -- Envoy's
 /// `upstream_rq_total` counts requests issued to a cluster, not downstream
@@ -906,6 +1043,7 @@ async fn per_try_timeout_abandons_a_stalling_attempt_and_the_retry_succeeds() {
                 // Attempt 0 stalls past the 50ms per-try timeout; attempt 1
                 // (the retry) answers immediately.
                 let (addr, count) = spawn_upstream_stalls_then_answers(1).await;
+                let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
                 let router = build_router(
                     addr,
                     forward_to_up(Some(retry_policy_with_per_try_timeout(
@@ -914,7 +1052,8 @@ async fn per_try_timeout_abandons_a_stalling_attempt_and_the_retry_succeeds() {
                         Duration::from_millis(50),
                     ))),
                 )
-                .await;
+                .await
+                .with_request_record_sink(Arc::new(sink));
 
                 let resp = router.handle(request("/v1/chat")).await;
                 assert_eq!(resp.head.status, StatusCode::OK);
@@ -922,6 +1061,17 @@ async fn per_try_timeout_abandons_a_stalling_attempt_and_the_retry_succeeds() {
                     count.load(Ordering::SeqCst),
                     2,
                     "expected the stalled attempt plus one retry"
+                );
+                resp.body.collect().await.unwrap();
+                let record = records.try_recv().unwrap();
+                assert_eq!(
+                    record.attempts[0].termination,
+                    proxy_observability::records::Termination::Timeout
+                );
+                assert!(record.attempts[0].duration_ms >= 40);
+                assert_eq!(
+                    record.attempts[1].termination,
+                    proxy_observability::records::Termination::Complete
                 );
             })
             .await;
@@ -968,7 +1118,10 @@ async fn a_safe_request_hedges_without_cancelling_the_original_attempt() {
                 let mut policy =
                     retry_policy_with_per_try_timeout("5xx", 1, Duration::from_millis(50));
                 policy.hedge_on_per_try_timeout = true;
-                let router = build_router(addr, forward_to_up(Some(policy))).await;
+                let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+                let router = build_router(addr, forward_to_up(Some(policy)))
+                    .await
+                    .with_request_record_sink(Arc::new(sink));
 
                 let response = router.handle(get_request("/v1/chat")).await;
                 assert_eq!(response.head.status, StatusCode::OK);
@@ -982,6 +1135,18 @@ async fn a_safe_request_hedges_without_cancelling_the_original_attempt() {
                     count.load(Ordering::SeqCst),
                     2,
                     "one original plus one hedge"
+                );
+                response.body.collect().await.unwrap();
+                let record = records.try_recv().unwrap();
+                assert_eq!(record.attempt_count, 2);
+                assert_eq!(record.attempts[0].status, Some(200));
+                assert_eq!(
+                    record.attempts[0].termination,
+                    proxy_observability::records::Termination::Complete
+                );
+                assert_eq!(
+                    record.attempts[1].termination,
+                    proxy_observability::records::Termination::Cancelled
                 );
             })
             .await;

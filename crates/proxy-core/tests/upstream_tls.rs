@@ -319,6 +319,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         token: token_stats,
         latency: latency_stats,
         tracing: None,
+        metadata: None,
     };
 
     let factory_state = Arc::new(SharedFactoryState::default());

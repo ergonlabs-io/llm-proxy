@@ -1,6 +1,9 @@
 //! Per-stream bookkeeping shared by filters, the router, access logs, and stats.
 
-use std::time::{Duration, Instant};
+use proxy_observability::records::Termination;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
 
 use proxy_observability::trace::TraceContext;
 use proxy_observability::ResponseFlag;
@@ -142,6 +145,41 @@ pub struct AuthInfo {
     pub key_id: Option<String>,
 }
 
+/// Physical upstream attempt snapshots. A new entry is created at dispatch,
+/// not when the logical request is created, so retries and fallback members
+/// remain visible independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptInfo {
+    pub attempt_id: String,
+    pub attempt_index: u16,
+    /// Actual CLIENT span, when the router creates one.
+    pub trace: Option<TraceContext>,
+    /// SERVER context available even on paths without a CLIENT span.
+    pub parent_trace: Option<TraceContext>,
+    pub cluster: String,
+    pub host: String,
+    pub upstream_model: Option<String>,
+    pub started_at: SystemTime,
+    pub started_instant: Instant,
+    pub finished_at: Option<SystemTime>,
+    pub duration: Duration,
+    pub status: Option<u16>,
+    pub termination: Termination,
+    pub retry_reason: Option<String>,
+    pub bytes_request: Option<u64>,
+    pub bytes_response: u64,
+}
+
+impl AttemptInfo {
+    pub fn finish(&mut self, termination: Termination) {
+        if self.finished_at.is_none() {
+            self.finished_at = Some(SystemTime::now());
+            self.duration = self.started_instant.elapsed();
+            self.termination = termination;
+        }
+    }
+}
+
 /// Envoy's `StreamInfo`: populated throughout the request lifecycle, consumed by
 /// access logging (WP-24) and stats (WP-23).
 ///
@@ -210,6 +248,13 @@ pub struct StreamInfo {
     pub requested_model: Option<String>,
     /// Provider-owned model selected for the current upstream attempt.
     pub selected_model: Option<String>,
+    pub attempts: Vec<Rc<RefCell<AttemptInfo>>>,
+    pub metadata_enabled: bool,
+    pub metadata_request_id: Option<String>,
+    pub metadata_attempt_limit: u16,
+    pub attempts_truncated: bool,
+    pub physical_attempt_count: u64,
+    pub selected_attempt: Option<Rc<RefCell<AttemptInfo>>>,
     /// WP-51 increment 2: this stream's SERVER span context, set by
     /// `filter_manager::FilterChainHandler::handle` right after `StreamInfo`
     /// is built -- `None` whenever tracing is off (`ConfigSnapshot::tracing`
@@ -253,6 +298,13 @@ impl Default for StreamInfo {
             auth: AuthInfo::default(),
             requested_model: None,
             selected_model: None,
+            attempts: Vec::new(),
+            metadata_enabled: false,
+            metadata_request_id: None,
+            metadata_attempt_limit: proxy_observability::records::MAX_ATTEMPTS,
+            attempts_truncated: false,
+            physical_attempt_count: 0,
+            selected_attempt: None,
             trace: None,
             on_upgrade: None,
         }
@@ -260,6 +312,54 @@ impl Default for StreamInfo {
 }
 
 impl StreamInfo {
+    pub fn begin_attempt(
+        &mut self,
+        cluster: &str,
+        host: &str,
+        upstream_model: Option<String>,
+    ) -> Option<Rc<RefCell<AttemptInfo>>> {
+        if !self.metadata_enabled {
+            return None;
+        }
+        self.physical_attempt_count = self.physical_attempt_count.saturating_add(1);
+        if self.attempts.len()
+            >= self
+                .metadata_attempt_limit
+                .min(proxy_observability::records::MAX_ATTEMPTS) as usize
+        {
+            self.attempts_truncated = true;
+            return None;
+        }
+        let attempt_index = self.attempts.len().saturating_add(1).min(u16::MAX as usize) as u16;
+        let attempt = Rc::new(RefCell::new(AttemptInfo {
+            attempt_id: format!("attempt-{attempt_index}"),
+            attempt_index,
+            trace: None,
+            parent_trace: self.trace,
+            cluster: proxy_observability::records::bounded_field(cluster),
+            host: proxy_observability::records::bounded_field(host),
+            upstream_model: upstream_model.map(|m| proxy_observability::records::bounded_field(&m)),
+            started_at: SystemTime::now(),
+            started_instant: Instant::now(),
+            finished_at: None,
+            duration: Duration::ZERO,
+            status: None,
+            termination: Termination::Unknown,
+            retry_reason: self.attempts.last().map(|previous| {
+                if previous.borrow().cluster == cluster {
+                    "retry"
+                } else {
+                    "fallback"
+                }
+                .to_owned()
+            }),
+            bytes_request: Some(0),
+            bytes_response: 0,
+        }));
+        self.attempts.push(attempt.clone());
+        Some(attempt)
+    }
+
     /// Returns `now - request_started_at` without exposing the raw monotonic
     /// instant outside `proxy-http`. Encode filters use this to publish an
     /// end-to-end first-body-byte duration for OTel metrics.
@@ -275,5 +375,52 @@ impl StreamInfo {
 
     pub fn response_flags(&self) -> &[ResponseFlag] {
         &self.response_flags
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn capture_disabled_and_attempt_limit_do_not_retain_more_state() {
+        let mut info = StreamInfo::default();
+        assert!(info.begin_attempt("a", "host", None).is_none());
+        assert!(info.attempts.is_empty());
+        info.metadata_enabled = true;
+        info.metadata_attempt_limit = 1;
+        assert!(info.begin_attempt("a", "host", None).is_some());
+        assert!(info.begin_attempt("b", "host", None).is_none());
+        assert!(info.attempts_truncated);
+        assert_eq!(info.attempts.len(), 1);
+        assert_eq!(info.physical_attempt_count, 2);
+    }
+}
+
+#[cfg(test)]
+mod metadata_bounds_tests {
+    use super::*;
+    #[test]
+    fn attempt_fields_and_limit_are_bounded_even_for_direct_callers() {
+        let mut info = StreamInfo {
+            metadata_enabled: true,
+            metadata_attempt_limit: u16::MAX,
+            ..Default::default()
+        };
+        let large = "é".repeat(2048);
+        for _ in 0..65 {
+            info.begin_attempt(&large, &large, Some(large.clone()));
+        }
+        assert_eq!(info.attempts.len(), 64);
+        assert_eq!(info.physical_attempt_count, 65);
+        assert!(info.attempts_truncated);
+        let attempt = info.attempts[0].borrow();
+        for field in [
+            &attempt.cluster,
+            &attempt.host,
+            attempt.upstream_model.as_ref().unwrap(),
+        ] {
+            assert_eq!(field.len(), 512);
+            assert!(field.capacity() <= 512);
+        }
     }
 }

@@ -101,6 +101,15 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = default_concurrency())]
     concurrency: usize,
 
+    /// Opt-in end-user metadata JSONL collector. Contains identities and model
+    /// history; configure access and retention on the destination file.
+    #[arg(long, value_name = "PATH")]
+    request_records_file: Option<PathBuf>,
+    /// Maximum retained attempt records per request. Excess attempts are
+    /// explicitly reported as truncated; forwarding retry policy is unchanged.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=64))]
+    request_record_max_attempts: u16,
+
     /// How long the drain sequence waits for connections to close before
     /// forcing worker shutdown (serve mode only).
     #[arg(
@@ -516,6 +525,8 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
         args.service_cluster,
         Arc::new(snapshot),
         config_source,
+        args.request_records_file,
+        args.request_record_max_attempts,
     ))
 }
 
@@ -553,6 +564,7 @@ const ADMIN_TOKEN_ENV_VAR: &str = "LLMPROXY_ADMIN_TOKEN";
 /// missing bundle would invert that priority.
 const ADMIN_UI_DIR_ENV_VAR: &str = "LLMPROXY_ADMIN_UI_DIR";
 
+#[allow(clippy::too_many_arguments)]
 async fn run_serve(
     concurrency: usize,
     drain_time: Duration,
@@ -561,6 +573,8 @@ async fn run_serve(
     service_cluster: Option<String>,
     snapshot: Arc<ConfigSnapshot>,
     config_source: ConfigSource,
+    request_records_file: Option<PathBuf>,
+    request_record_max_attempts: u16,
 ) -> ExitCode {
     // Collected before `snapshot` moves into `WorkerPool::spawn` purely so
     // the startup log line below can name what got bound; each worker binds
@@ -683,6 +697,22 @@ async fn run_serve(
             snapshot.clusters.keys().map(String::as_str),
         ));
     let registry = stats_control.registry();
+    let (metadata_sink, metadata_delivery) = match request_records_file {
+        Some(path) => match proxy_observability::metadata::MetadataDelivery::start(&path, 1024) {
+            Ok((sink, delivery)) => (
+                Some(
+                    Arc::new(sink.with_max_attempts(request_record_max_attempts))
+                        as Arc<dyn proxy_observability::records::RequestRecordSink>,
+                ),
+                Some(delivery),
+            ),
+            Err(err) => {
+                eprintln!("cannot start metadata collector: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => (None, None),
+    };
 
     // Resolve operational health series even when exporters are disabled.
     // Only configured tracing creates a channel; its sender is owned by workers
@@ -957,6 +987,7 @@ async fn run_serve(
                 downstream_stat_handles.clone(),
                 token_usage_stat_handles.clone(),
                 tracing_handles.clone(),
+                metadata_sink.clone(),
                 factory_state.clone(),
                 secret_registry.clone(),
             )
@@ -1029,6 +1060,13 @@ async fn run_serve(
         eprintln!("{message}");
         publisher.shutdown();
         publisher.join();
+        if let Some(delivery) = metadata_delivery {
+            let summary = delivery.shutdown(Duration::from_secs(5)).await;
+            tracing::warn!(
+                ?summary,
+                "metadata delivery stopped after listener startup failure"
+            );
+        }
         return ExitCode::FAILURE;
     }
 
@@ -1116,6 +1154,13 @@ async fn run_serve(
     }
 
     let outcome = graceful_shutdown(publisher, drain_time, strategy).await;
+    if let Some(delivery) = metadata_delivery {
+        let summary = delivery.shutdown(Duration::from_secs(5)).await;
+        tracing::info!(
+            ?summary,
+            "metadata delivery stopped; file writes do not imply durability"
+        );
+    }
 
     // Workers have dropped their senders. Flush remaining traces before taking
     // the final metric snapshot so export failures and drops are included.
@@ -2310,6 +2355,7 @@ async fn worker_main(
     downstream_stat_handles: Arc<proxy_http::stat_handles::DownstreamStatHandles>,
     token_usage_stat_handles: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
     tracing_handles: Option<proxy_core::listener::TracingHandles>,
+    metadata_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     // WP-50 3b-ii part B: this worker's clone of the ONE per-serve
     // `SharedFactoryState` -- see `run_serve`'s own comment on the Arc this
     // is cloned from.
@@ -2365,6 +2411,7 @@ async fn worker_main(
         token: token_stats,
         latency: latency_stats,
         tracing: tracing_handles,
+        metadata: metadata_sink,
     };
 
     let bound = match initial_bind(
@@ -2763,6 +2810,8 @@ mod tests {
             hmac_secret_file: None,
             permissive,
             concurrency: 1,
+            request_records_file: None,
+            request_record_max_attempts: 64,
             drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
             drain_strategy: DrainStrategyArg::Gradual,
             base_id: None,

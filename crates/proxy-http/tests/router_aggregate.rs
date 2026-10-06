@@ -417,3 +417,34 @@ async fn stream_info_reports_the_member_that_actually_served() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_keeps_failed_primary_and_actual_fallback_member() {
+    LocalSet::new()
+        .run_until(async {
+            let (handler, _, _) = build_router().await;
+            let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+            let handler = handler.with_request_record_sink(Arc::new(sink));
+            let response = handler.handle(request("/v1/chat/completions")).await;
+            assert_eq!(response.head.status, StatusCode::OK);
+            response.body.collect().await.unwrap();
+            let record = records.try_recv().unwrap();
+            assert_eq!(record.selected_cluster.as_deref(), Some("b"));
+            assert_eq!(record.attempt_count, 2);
+            assert_eq!(record.physical_attempt_count, 2);
+            assert!(record.selected_provider.is_none());
+            assert!(record.user_id.is_none());
+            assert!(record.usage.is_none());
+            assert!(record.cost.is_none());
+            assert_eq!(record.attempts[0].cluster.as_deref(), Some("a"));
+            assert_eq!(
+                record.attempts[0].termination,
+                proxy_observability::records::Termination::UpstreamError
+            );
+            assert_eq!(record.attempts[0].status, None);
+            assert_eq!(record.attempts[1].cluster.as_deref(), Some("b"));
+            assert_eq!(record.attempts[1].retry_reason.as_deref(), Some("fallback"));
+            assert_eq!(record.attempts[1].status, Some(200));
+        })
+        .await;
+}

@@ -1815,6 +1815,8 @@ dependencies = [
  "http",
  "proxy-api",
  "rand",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tonic",

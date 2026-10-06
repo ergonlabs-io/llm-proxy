@@ -135,10 +135,19 @@ struct HedgedResponse {
     receiver: tokio::sync::oneshot::Receiver<Result<HttpResponseParts, UpstreamCodecError>>,
     task: tokio::task::JoinHandle<()>,
     dispatched_at: std::time::Instant,
+    cluster: String,
+    address: std::net::SocketAddr,
+    trace: Option<TraceContext>,
+    started_system: SystemTime,
+    attempt_info: Option<std::rc::Rc<std::cell::RefCell<crate::stream_info::AttemptInfo>>>,
 }
 
 impl Drop for HedgedResponse {
     fn drop(&mut self) {
+        if let Some(info) = &self.attempt_info {
+            info.borrow_mut()
+                .finish(proxy_observability::records::Termination::Cancelled);
+        }
         self.task.abort();
     }
 }
@@ -745,9 +754,16 @@ impl RouterHandler {
         // doc), never `H1ConnCache::get_or_connect_h1`/
         // `UpstreamConnCache::get_or_connect`.
         let pool = attempt_entry.http_pool(&host, proto);
+        let attempt_info = {
+            let mut info = dcb.stream_info();
+            let model = info.selected_model.clone();
+            info.begin_attempt(attempt_cluster, &host.address.to_string(), model)
+        };
+        let mut attempt_guard = crate::attempt_logging::AttemptGuard(attempt_info.clone());
         let upstream_stream = match pool.new_stream().await {
             Ok(stream) => stream,
             Err(err) => {
+                attempt_guard.finish(proxy_observability::records::Termination::UpstreamError);
                 let (flag, msg): (ResponseFlag, &str) = match &err {
                     PoolError::Overflow => (ResponseFlag::UpstreamOverflow, "upstream overloaded"),
                     PoolError::ConnectFailure(_) | PoolError::ConnectTimeout => (
@@ -772,7 +788,14 @@ impl RouterHandler {
         let body_bytes = self.captured_body.clone();
         dcb.stream_info().bytes_received = body_bytes.len() as u64;
         let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
-        let attempt_body: StreamBody = body_with_trailers(body_bytes, trailers);
+        let mut attempt_body: StreamBody = body_with_trailers(body_bytes, trailers);
+        if let Some(info) = &attempt_info {
+            attempt_body = local_boxed(crate::attempt_logging::AttemptBody::new(
+                attempt_body,
+                info.clone(),
+                false,
+            ));
+        }
 
         let upstream_req = HttpRequestParts {
             head: attempt_head,
@@ -803,6 +826,7 @@ impl RouterHandler {
         let (resp, upstream_on_upgrade) = match send_result {
             Ok(pair) => pair,
             Err(err) => {
+                attempt_guard.finish(proxy_observability::records::Termination::UpstreamError);
                 if crate::codec::is_remote_reset(&err) {
                     dcb.stream_info()
                         .set_response_flag(ResponseFlag::UpstreamRemoteReset);
@@ -814,6 +838,11 @@ impl RouterHandler {
                 return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
             }
         };
+
+        if let Some(info) = &attempt_info {
+            info.borrow_mut().status = Some(resp.head.status.as_u16());
+        }
+        dcb.stream_info().selected_attempt = attempt_info.clone();
 
         if resp.head.status != expected_status {
             // The upstream declined the upgrade -- pass its response
@@ -827,6 +856,14 @@ impl RouterHandler {
             // long as the body is being read, same reasoning
             // `H1ReuseBody`/`GuardedBody` document for their own guards.
             let mut resp = resp;
+            if let Some(info) = &attempt_info {
+                resp.body = local_boxed(crate::attempt_logging::AttemptBody::new(
+                    resp.body,
+                    info.clone(),
+                    true,
+                ));
+            }
+            attempt_guard.0 = None;
             resp.body = local_boxed(GuardedBody::new(resp.body, cb_guard));
             return resp;
         }
@@ -859,6 +896,10 @@ impl RouterHandler {
             );
             return local_reply(StatusCode::BAD_GATEWAY, "upgrade handshake failed");
         };
+
+        // Only the HTTP handshake is observed; upgraded tunnel bytes are
+        // outside the request/response entity-body telemetry boundary.
+        attempt_guard.finish(proxy_observability::records::Termination::Complete);
 
         // Empty body: the tunnel carries every byte from here on over the
         // raw `OnUpgrade` streams, not through this response's `StreamBody`
@@ -1163,8 +1204,9 @@ impl RouterHandler {
                 // `Instant`, used only for the duration stat) because a span
                 // timestamp has to be an absolute epoch offset (see
                 // `FinishedSpan`'s own doc for why).
-                let (attempt_trace, attempt_started_system) = {
+                let (attempt_trace, attempt_started_system, attempt_info) = {
                     let mut info = dcb.stream_info();
+                    let requested_model = info.requested_model.clone();
                     info.upstream_cluster = Some(attempt_cluster.to_string());
                     info.upstream_host = Some(host.address.to_string());
                     info.protocol = Some(
@@ -1174,8 +1216,21 @@ impl RouterHandler {
                         }
                         .to_string(),
                     );
-                    (info.trace.map(|ctx| ctx.child()), SystemTime::now())
+                    let attempt_trace = info.trace.map(|ctx| ctx.child());
+                    let attempt_info = info.begin_attempt(
+                        attempt_cluster,
+                        &host.address.to_string(),
+                        selected_provider_model(
+                            attempt_entry.provider_runtime(),
+                            requested_model.as_deref(),
+                        ),
+                    );
+                    if let Some(attempt) = &attempt_info {
+                        attempt.borrow_mut().trace = attempt_trace;
+                    }
+                    (attempt_trace, SystemTime::now(), attempt_info)
                 };
+                let attempt_guard = crate::attempt_logging::AttemptGuard(attempt_info.clone());
                 let pool = attempt_entry.http_pool(&host, proto);
                 // WP-15 slice A/B: both protocols are now cache-key'd --
                 // h2 upstreams are reused across requests via this worker's
@@ -1208,6 +1263,8 @@ impl RouterHandler {
                         self.stats
                             .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
                         let outcome = AttemptOutcome::from_pool_error(&err);
+                        attempt_guard
+                            .finish(proxy_observability::records::Termination::UpstreamError);
                         report_outlier(attempt_entry, host.address, &outcome);
                         self.emit_client_span(
                             attempt_trace,
@@ -1391,8 +1448,15 @@ impl RouterHandler {
                 // (refcounted) to `.clone()` fresh for every attempt --
                 // there's no separate "streaming" body anymore (see this
                 // function's body-handling doc above).
-                let attempt_body: StreamBody =
+                let mut attempt_body: StreamBody =
                     body_with_trailers(attempt_body_bytes, trailers.clone());
+                if let Some(info) = &attempt_info {
+                    attempt_body = local_boxed(crate::attempt_logging::AttemptBody::new(
+                        attempt_body,
+                        info.clone(),
+                        false,
+                    ));
+                }
 
                 let upstream_req = HttpRequestParts {
                     head: attempt_head,
@@ -1423,7 +1487,7 @@ impl RouterHandler {
                 // side can decide (in `H1ReuseBody`'s `Drop`) whether the
                 // connection it just used is safe to hand to the NEXT
                 // request.
-                let mut send: std::pin::Pin<
+                let send: std::pin::Pin<
                     Box<
                         dyn std::future::Future<
                             Output = Result<HttpResponseParts, UpstreamCodecError>,
@@ -1433,6 +1497,30 @@ impl RouterHandler {
                     Connected::Http1(leased) => Box::pin(leased.send(upstream_req)),
                     Connected::Http2(pooled) => Box::pin(pooled.send(upstream_req)),
                 };
+                let response_info = attempt_info.clone();
+                let mut send = Box::pin(async move {
+                    let mut guard = attempt_guard;
+                    let result = send.await;
+                    match result {
+                        Ok(mut response) => {
+                            if let Some(info) = response_info {
+                                info.borrow_mut().status = Some(response.head.status.as_u16());
+                                response.body =
+                                    local_boxed(crate::attempt_logging::AttemptBody::new(
+                                        response.body,
+                                        info,
+                                        true,
+                                    ));
+                            }
+                            guard.0 = None; // Body now owns terminal observation.
+                            Ok(response)
+                        }
+                        Err(err) => {
+                            guard.finish(proxy_observability::records::Termination::UpstreamError);
+                            Err(err)
+                        }
+                    }
+                });
 
                 // S4.2: a route with a retry policy may additionally set
                 // `per_try_timeout`, a *single attempt's* budget -- distinct
@@ -1481,6 +1569,8 @@ impl RouterHandler {
                 // retain that attempt's own start so service time never
                 // measures from the wrong dispatch.
                 let mut winning_attempt_dispatched_at = attempt_dispatched_at;
+                let mut winning_attempt_info = attempt_info.clone();
+                let mut earlier_winner = None;
                 let attempt_result = if let Some(hedge) = hedged_response.as_mut() {
                     // The original request was still alive when the previous
                     // iteration dispatched this replay.  Both sends are now
@@ -1495,6 +1585,9 @@ impl RouterHandler {
                             match first.expect("hedged attempt task must outlive its receiver") {
                                 Ok(response) => {
                                     winning_attempt_dispatched_at = hedge.dispatched_at;
+                                    winning_attempt_info = hedge.attempt_info.clone();
+                                    earlier_winner = Some((hedge.cluster.clone(), hedge.address, hedge.trace, hedge.started_system));
+                                    hedge.attempt_info = None;
                                     Ok(response)
                                 }
                                 // Envoy discards an error from the timed-out
@@ -1527,6 +1620,9 @@ impl RouterHandler {
                                 {
                                     Ok(response) => {
                                         winning_attempt_dispatched_at = hedge.dispatched_at;
+                                        winning_attempt_info = hedge.attempt_info.clone();
+                                        earlier_winner = Some((hedge.cluster.clone(), hedge.address, hedge.trace, hedge.started_system));
+                                        hedge.attempt_info = None;
                                         Ok(response)
                                     }
                                     Err(_) => Err(second_error),
@@ -1534,6 +1630,12 @@ impl RouterHandler {
                             }
                         },
                     };
+                    if result.is_ok() && !response_from_hedge {
+                        if let Some(info) = &attempt_info {
+                            info.borrow_mut()
+                                .finish(proxy_observability::records::Termination::Cancelled);
+                        }
+                    }
                     hedged_response = None;
                     result
                 } else if hedge_candidate {
@@ -1605,12 +1707,21 @@ impl RouterHandler {
                                             receiver,
                                             task,
                                             dispatched_at: attempt_dispatched_at,
+                                            cluster: attempt_cluster.to_owned(),
+                                            address: host.address,
+                                            trace: attempt_trace,
+                                            started_system: attempt_started_system,
+                                            attempt_info: attempt_info.clone(),
                                         });
                                         continue;
                                     }
                                 }
                             }
                             task.abort();
+                            if let Some(info) = &attempt_info {
+                                info.borrow_mut()
+                                    .finish(proxy_observability::records::Termination::Timeout);
+                            }
                             tracing::debug!(
                                 response_flag = "UT",
                                 cluster = %attempt_cluster,
@@ -1631,6 +1742,11 @@ impl RouterHandler {
                         Some(d) => match tokio::time::timeout(d, send).await {
                             Ok(result) => result,
                             Err(_elapsed) => {
+                                if let Some(info) = &attempt_info {
+                                    let mut info = info.borrow_mut();
+                                    info.termination =
+                                        proxy_observability::records::Termination::Timeout;
+                                }
                                 self.stats.record_attempt_duration_since(
                                     attempt_cluster,
                                     attempt_dispatched_at,
@@ -1685,16 +1801,48 @@ impl RouterHandler {
 
                 match attempt_result {
                     Ok(mut resp) => {
-                        self.stats
-                            .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
+                        let winning_entry = earlier_winner
+                            .as_ref()
+                            .and_then(|winner| self.clusters.cluster(&winner.0));
+                        let (outcome_cluster, outcome_addr, outcome_trace, outcome_start) =
+                            earlier_winner
+                                .as_ref()
+                                .map(|w| (w.0.as_str(), w.1, w.2, w.3))
+                                .unwrap_or((
+                                    attempt_cluster,
+                                    host.address,
+                                    attempt_trace,
+                                    attempt_started_system,
+                                ));
+                        {
+                            let mut info = dcb.stream_info();
+                            info.upstream_cluster = Some(outcome_cluster.to_owned());
+                            info.upstream_host = Some(outcome_addr.to_string());
+                            if let Some(entry) = &winning_entry {
+                                info.upstream_usage_dialect = entry.usage_dialect();
+                                info.selected_model = selected_provider_model(
+                                    entry.provider_runtime(),
+                                    info.requested_model.as_deref(),
+                                );
+                            }
+                            info.selected_attempt = winning_attempt_info.clone();
+                        }
+                        self.stats.record_attempt_duration_since(
+                            outcome_cluster,
+                            winning_attempt_dispatched_at,
+                        );
                         let outcome = AttemptOutcome::Response(resp.head.status.as_u16());
-                        report_outlier(attempt_entry, host.address, &outcome);
+                        report_outlier(
+                            winning_entry.as_deref().unwrap_or(attempt_entry),
+                            outcome_addr,
+                            &outcome,
+                        );
                         self.emit_client_span(
-                            attempt_trace,
+                            outcome_trace,
                             ClientSpanOutcome {
-                                cluster: attempt_cluster,
-                                addr: host.address,
-                                start: attempt_started_system,
+                                cluster: outcome_cluster,
+                                addr: outcome_addr,
+                                start: outcome_start,
                                 status: if resp.head.status.is_server_error() {
                                     SpanStatus::Error
                                 } else {
@@ -1853,6 +2001,13 @@ impl RouterHandler {
         let mut resp = match outcome {
             Ok(resp) => resp,
             Err(_elapsed) => {
+                for attempt in &dcb.stream_info().attempts {
+                    let mut attempt = attempt.borrow_mut();
+                    if attempt.termination == proxy_observability::records::Termination::Unknown {
+                        attempt.termination = proxy_observability::records::Termination::Timeout;
+                        attempt.finish(proxy_observability::records::Termination::Timeout);
+                    }
+                }
                 tracing::debug!(
                     response_flag = "UT",
                     cluster = %cluster_name,

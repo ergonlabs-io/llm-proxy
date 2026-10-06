@@ -23,6 +23,7 @@
 //! filters and Lane H (ground rule #4).
 
 pub mod access_logging;
+mod attempt_logging;
 pub mod codec;
 mod credential_provider;
 pub mod filter;

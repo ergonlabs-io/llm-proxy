@@ -1,0 +1,566 @@
+//! End-user telemetry metadata contracts (design Increment 2).
+//!
+//! These types are owned by the observability boundary so the data plane can
+//! submit an owned, bounded event without knowing about ClickHouse, object
+//! storage, or a capture agent. The sink is deliberately nonblocking: an
+//! unavailable collector must never delay forwarding or alter accounting.
+
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+pub const SCHEMA_VERSION: u16 = 1;
+pub const MAX_RECORD_BYTES: usize = 64 * 1024;
+pub const MAX_ATTEMPTS: u16 = 64;
+
+/// Copy bounded metadata into independent storage. Caller-controlled paths
+/// and models cannot pin an arbitrarily large String allocation in a queue.
+pub fn bounded_field(value: &str) -> String {
+    let mut end = value.len().min(512);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Termination {
+    Complete,
+    LocalReply,
+    UpstreamError,
+    DownstreamDisconnect,
+    Cancelled,
+    Timeout,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCompleteness {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub completeness: UsageCompleteness,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cost {
+    pub amount: u64,
+    pub unit: String,
+    pub currency: String,
+    pub rate_card_version: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    pub schema_version: u16,
+    pub event_id: String,
+    pub request_id: String,
+    pub attempt_id: String,
+    pub attempt_index: u16,
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+    pub cluster: Option<String>,
+    pub provider: Option<String>,
+    pub upstream_model: Option<String>,
+    pub started_at: String,
+    pub finished_at: String,
+    pub duration_ms: u64,
+    pub status: Option<u16>,
+    pub termination: Termination,
+    pub retry_reason: Option<String>,
+    pub bytes_request: Option<u64>,
+    pub bytes_response: u64,
+    pub usage: Option<Usage>,
+    pub cost: Option<Cost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestRecord {
+    pub schema_version: u16,
+    pub event_id: String,
+    pub request_id: String,
+    pub instance_id: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub tenant_id: String,
+    pub user_id: Option<String>,
+    pub key_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub routing_revision: Option<String>,
+    pub policy_generation: Option<u64>,
+    pub capture_policy_version: Option<String>,
+    pub method: String,
+    pub route: String,
+    pub requested_model: Option<String>,
+    pub selected_cluster: Option<String>,
+    pub selected_provider: Option<String>,
+    pub selected_model: Option<String>,
+    pub status: Option<u16>,
+    pub termination: Termination,
+    pub error_category: Option<String>,
+    pub response_flags: Vec<String>,
+    pub duration_ms: u64,
+    pub time_to_first_byte_ms: Option<u64>,
+    pub bytes_request: u64,
+    pub bytes_response: u64,
+    pub usage: Option<Usage>,
+    pub cost: Option<Cost>,
+    /// Number of retained summaries (schema-v1 compatibility).
+    pub attempt_count: u16,
+    /// All physical dispatches, including summaries omitted at the retention limit.
+    pub physical_attempt_count: u64,
+    pub attempts: Vec<AttemptRecord>,
+    pub attempts_truncated: bool,
+}
+
+impl RequestRecord {
+    fn retained_bytes(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>()
+            + self.attempts.capacity() * std::mem::size_of::<AttemptRecord>();
+        total =
+            total.saturating_add(self.response_flags.capacity() * std::mem::size_of::<String>());
+        let mut add = |value: &String| total = total.saturating_add(value.capacity());
+        for value in [
+            &self.event_id,
+            &self.request_id,
+            &self.instance_id,
+            &self.started_at,
+            &self.finished_at,
+            &self.tenant_id,
+            &self.method,
+            &self.route,
+        ] {
+            add(value);
+        }
+        for value in [
+            &self.user_id,
+            &self.key_id,
+            &self.trace_id,
+            &self.routing_revision,
+            &self.capture_policy_version,
+            &self.requested_model,
+            &self.selected_cluster,
+            &self.selected_provider,
+            &self.selected_model,
+            &self.error_category,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            add(value);
+        }
+        for flag in &self.response_flags {
+            add(flag);
+        }
+        if let Some(usage) = &self.usage {
+            add(&usage.provenance);
+        }
+        if let Some(cost) = &self.cost {
+            for value in [
+                &cost.unit,
+                &cost.currency,
+                &cost.rate_card_version,
+                &cost.kind,
+            ] {
+                add(value);
+            }
+        }
+        for attempt in &self.attempts {
+            for value in [
+                &attempt.event_id,
+                &attempt.request_id,
+                &attempt.attempt_id,
+                &attempt.started_at,
+                &attempt.finished_at,
+            ] {
+                add(value);
+            }
+            for value in [
+                &attempt.trace_id,
+                &attempt.span_id,
+                &attempt.parent_span_id,
+                &attempt.cluster,
+                &attempt.provider,
+                &attempt.upstream_model,
+                &attempt.retry_reason,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                add(value);
+            }
+            if let Some(usage) = &attempt.usage {
+                add(&usage.provenance);
+            }
+            if let Some(cost) = &attempt.cost {
+                for value in [
+                    &cost.unit,
+                    &cost.currency,
+                    &cost.rate_card_version,
+                    &cost.kind,
+                ] {
+                    add(value);
+                }
+            }
+        }
+        total
+    }
+    pub fn validate(&self, max_attempts: u16) -> Result<(), &'static str> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err("unsupported schema_version");
+        }
+        if self.tenant_id.is_empty() {
+            return Err("tenant_id must not be empty");
+        }
+        if self.attempt_count as usize != self.attempts.len() {
+            return Err("attempt_count does not match attempts");
+        }
+        if self.physical_attempt_count < u64::from(self.attempt_count)
+            || self.attempts_truncated
+                != (self.physical_attempt_count > u64::from(self.attempt_count))
+        {
+            return Err("physical_attempt_count does not match truncation");
+        }
+        if self.attempt_count > max_attempts {
+            return Err("attempt_count exceeds configured maximum");
+        }
+        if self.event_id.is_empty() || self.request_id.is_empty() {
+            return Err("event_id and request_id are required");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitResult {
+    Accepted,
+    Disabled,
+    CapacityExceeded,
+    Closed,
+}
+
+pub trait RequestRecordSink: Send + Sync {
+    fn submit(&self, record: RequestRecord) -> SubmitResult;
+    fn max_attempts(&self) -> u16 {
+        MAX_ATTEMPTS
+    }
+}
+
+/// Collector boundary owned by the metadata agent. Implementations belong on
+/// the control/sidecar side; request workers only see `RequestRecordSink`.
+pub trait MetadataCollector: Send + 'static {
+    fn commit(&mut self, record: RequestRecord);
+}
+
+pub struct MetadataAgent<C> {
+    receiver: mpsc::Receiver<RequestRecord>,
+    collector: C,
+}
+
+impl<C: MetadataCollector> MetadataAgent<C> {
+    pub fn new(capacity: usize, collector: C) -> (BoundedRecordSink, Self) {
+        let (sink, receiver) = BoundedRecordSink::new(capacity);
+        (
+            sink,
+            Self {
+                receiver,
+                collector,
+            },
+        )
+    }
+
+    /// Drain on a dedicated thread until all producers drop their sink.
+    pub async fn run(self) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut receiver = self.receiver;
+            let mut collector = self.collector;
+            while let Some(record) = receiver.blocking_recv() {
+                collector.commit(record);
+            }
+            let _ = done_tx.send(());
+        });
+        let _ = done_rx.await;
+    }
+
+    /// Drain queued records after shutdown is requested, then return. The
+    /// caller owns the outer timeout. Collector work cannot block its runtime.
+    /// The relay reserves one additional event (at most MAX_RECORD_BYTES).
+    pub async fn drain_until(mut self, mut shutdown: tokio::sync::oneshot::Receiver<()>) {
+        let (tx, mut rx) = mpsc::channel::<RequestRecord>(1);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            while let Some(record) = rx.blocking_recv() {
+                self.collector.commit(record);
+            }
+            let _ = done_tx.send(());
+        });
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    self.receiver.close();
+                    while let Some(record) = self.receiver.recv().await {
+                        if tx.send(record).await.is_err() { break; }
+                    }
+                    break;
+                }
+                record = self.receiver.recv() => match record {
+                    Some(record) => if tx.send(record).await.is_err() { break; },
+                    None => break,
+                }
+            }
+        }
+        drop(tx);
+        let _ = done_rx.await;
+    }
+}
+
+/// Monotonic metadata-lane delivery counters. These deliberately have no
+/// tenant, request, or event dimensions, so capture overload cannot create an
+/// unbounded metric series.
+#[derive(Debug, Default)]
+pub struct DropCounters {
+    accepted: AtomicU64,
+    capacity_exceeded: AtomicU64,
+    closed: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DropCounterSnapshot {
+    pub accepted: u64,
+    pub capacity_exceeded: u64,
+    pub closed: u64,
+}
+
+impl DropCounters {
+    pub fn snapshot(&self) -> DropCounterSnapshot {
+        DropCounterSnapshot {
+            accepted: self.accepted.load(Ordering::Relaxed),
+            capacity_exceeded: self.capacity_exceeded.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, result: SubmitResult) {
+        let counter = match result {
+            SubmitResult::Accepted => &self.accepted,
+            SubmitResult::CapacityExceeded => &self.capacity_exceeded,
+            SubmitResult::Closed => &self.closed,
+            SubmitResult::Disabled => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub struct BoundedRecordSink {
+    tx: mpsc::Sender<RequestRecord>,
+    counters: Arc<DropCounters>,
+    max_attempts: u16,
+}
+
+impl BoundedRecordSink {
+    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<RequestRecord>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                counters: Arc::new(DropCounters::default()),
+                max_attempts: MAX_ATTEMPTS,
+            },
+            rx,
+        )
+    }
+
+    pub fn counters(&self) -> Arc<DropCounters> {
+        self.counters.clone()
+    }
+    pub fn with_max_attempts(mut self, maximum: u16) -> Self {
+        self.max_attempts = maximum.clamp(1, MAX_ATTEMPTS);
+        self
+    }
+}
+
+impl RequestRecordSink for BoundedRecordSink {
+    fn submit(&self, record: RequestRecord) -> SubmitResult {
+        if record.retained_bytes() > MAX_RECORD_BYTES || record.validate(self.max_attempts).is_err()
+        {
+            self.counters.record(SubmitResult::CapacityExceeded);
+            return SubmitResult::CapacityExceeded;
+        }
+        let result = match self.tx.try_send(record) {
+            Ok(()) => SubmitResult::Accepted,
+            Err(mpsc::error::TrySendError::Full(_)) => SubmitResult::CapacityExceeded,
+            Err(mpsc::error::TrySendError::Closed(_)) => SubmitResult::Closed,
+        };
+        self.counters.record(result);
+        result
+    }
+    fn max_attempts(&self) -> u16 {
+        self.max_attempts
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn record() -> RequestRecord {
+        RequestRecord {
+            schema_version: SCHEMA_VERSION,
+            event_id: "e".into(),
+            request_id: "r".into(),
+            instance_id: "i".into(),
+            started_at: "2026-10-01T00:00:00Z".into(),
+            finished_at: "2026-10-01T00:00:01Z".into(),
+            tenant_id: "default".into(),
+            user_id: None,
+            key_id: None,
+            trace_id: None,
+            routing_revision: None,
+            policy_generation: None,
+            capture_policy_version: None,
+            method: "POST".into(),
+            route: "/v1/chat/completions".into(),
+            requested_model: None,
+            selected_cluster: None,
+            selected_provider: None,
+            selected_model: None,
+            status: Some(200),
+            termination: Termination::Complete,
+            error_category: None,
+            response_flags: vec![],
+            duration_ms: 1,
+            time_to_first_byte_ms: None,
+            bytes_request: 0,
+            bytes_response: 0,
+            usage: None,
+            cost: None,
+            attempt_count: 0,
+            physical_attempt_count: 0,
+            attempts: vec![],
+            attempts_truncated: false,
+        }
+    }
+
+    #[test]
+    fn schema_serializes_flags_and_physical_attempt_count() {
+        let mut r = record();
+        r.response_flags = vec!["UF".into(), "URX".into()];
+        r.physical_attempt_count = 2;
+        r.attempts_truncated = true;
+        assert!(r.validate(1).is_ok());
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["response_flags"], serde_json::json!(["UF", "URX"]));
+        assert_eq!(json["physical_attempt_count"], 2);
+        assert_eq!(json["attempt_count"], 0);
+        assert!(json["user_id"].is_null());
+        assert!(json["selected_provider"].is_null());
+        r.attempts_truncated = false;
+        assert!(r.validate(1).is_err());
+    }
+
+    #[test]
+    fn flag_allocations_are_included_in_the_queue_budget() {
+        let (sink, _) = BoundedRecordSink::new(1);
+        let mut r = record();
+        r.response_flags = Vec::with_capacity(MAX_RECORD_BYTES);
+        assert_eq!(sink.submit(r), SubmitResult::CapacityExceeded);
+    }
+
+    #[test]
+    fn record_rejects_mismatched_attempt_count() {
+        let mut r = record();
+        r.attempt_count = 1;
+        assert_eq!(r.validate(3), Err("attempt_count does not match attempts"));
+    }
+    #[test]
+    fn metadata_bound_counts_retained_allocation_not_just_text_length() {
+        let (sink, mut rx) = BoundedRecordSink::new(1);
+        let mut record = record();
+        record.route = String::with_capacity(MAX_RECORD_BYTES + 1);
+        record.route.push('/');
+        assert_eq!(sink.submit(record), SubmitResult::CapacityExceeded);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sink.counters().snapshot().capacity_exceeded, 1);
+    }
+
+    #[test]
+    fn bounded_sink_never_waits_for_capacity() {
+        let (sink, mut rx) = BoundedRecordSink::new(1);
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        assert_eq!(sink.submit(record()), SubmitResult::CapacityExceeded);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn bounded_sink_counts_each_delivery_outcome() {
+        let (sink, mut rx) = BoundedRecordSink::new(1);
+        let counters = sink.counters();
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        assert_eq!(sink.submit(record()), SubmitResult::CapacityExceeded);
+        let _ = rx.try_recv();
+        drop(rx);
+        assert_eq!(sink.submit(record()), SubmitResult::Closed);
+        assert_eq!(
+            counters.snapshot(),
+            DropCounterSnapshot {
+                accepted: 1,
+                capacity_exceeded: 1,
+                closed: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_owns_consumption_and_commits_off_sender_path() {
+        struct Collector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl MetadataCollector for Collector {
+            fn commit(&mut self, record: RequestRecord) {
+                self.0.lock().unwrap().push(record.request_id);
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sink, agent) = MetadataAgent::new(1, Collector(seen.clone()));
+        let task = tokio::spawn(agent.run());
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        drop(sink);
+        task.await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), &["r"]);
+    }
+
+    #[tokio::test]
+    async fn agent_shutdown_drains_current_queue_without_waiting_for_new_records() {
+        struct Collector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl MetadataCollector for Collector {
+            fn commit(&mut self, record: RequestRecord) {
+                self.0.lock().unwrap().push(record.request_id);
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sink, agent) = MetadataAgent::new(2, Collector(seen.clone()));
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(agent.drain_until(shutdown_rx));
+        let _ = shutdown_tx.send(());
+        task.await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), &["r"]);
+    }
+}

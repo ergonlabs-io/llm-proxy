@@ -43,6 +43,7 @@ use hyper::body::{Body, Frame};
 
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
 use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
+use proxy_observability::records::{RequestRecord, RequestRecordSink, SCHEMA_VERSION};
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
 use proxy_observability::ResponseFlag;
@@ -126,15 +127,7 @@ impl AccessLoggerRuntime {
             return;
         }
         self.sink.write_line(&self.render_line(ctx));
-        // `FileSink::write_line` only writes into its `BufWriter` --
-        // stdout/stderr sinks flush themselves per line, but a file sink
-        // doesn't (see its own doc: buffered for throughput). Flushing
-        // here trades a little of that throughput for every access-log
-        // line actually being durable (and readable by anything tailing
-        // the file) as soon as the request it describes finishes, rather
-        // than sitting in an in-process buffer indefinitely -- there's no
-        // periodic-flush component in the data plane yet to do this any
-        // other way.
+        // Flush makes buffered output visible; it is not a durability barrier.
         self.sink.flush();
     }
 }
@@ -273,6 +266,9 @@ pub(crate) struct AccessLogContext {
     /// this, using `stream_info.trace` (set at stream start, `None` when
     /// this is also `None`) as its context.
     pub(crate) span_sink: Option<SpanSink>,
+    /// Optional end-user metadata sink. Submission is a single nonblocking
+    /// try-send at terminal completion; capture loss never changes the reply.
+    pub(crate) request_record_sink: Option<Arc<dyn RequestRecordSink>>,
 }
 
 /// Wraps a response [`StreamBody`] so that -- regardless of whether the
@@ -483,9 +479,17 @@ impl LoggingBody {
             tenant,
             response_code_details,
             usage_attribution,
+            attempts,
         ) = {
             let mut info = ctx.stream_info.borrow_mut();
             info.bytes_sent = self.bytes_sent;
+            if let Some(attempt) = &info.selected_attempt {
+                attempt.borrow_mut().finish(metadata_termination(
+                    info.response_flags(),
+                    ctx.response_code,
+                    info.is_local_reply,
+                ));
+            }
             // WP-33: `LlmTokenUsage` -> `LlmTokens` field-for-field --
             // `proxy-observability` can't name `proxy_http::LlmTokenUsage`
             // (crate layering runs the other way), so this is the boundary
@@ -529,8 +533,155 @@ impl LoggingBody {
                         .as_ref()
                         .map(|cost| cost.rate_card_version.clone()),
                 ),
+                info.attempts
+                    .iter()
+                    .map(|a| a.borrow().clone())
+                    .collect::<Vec<_>>(),
             )
         };
+
+        if let Some(sink) = ctx.request_record_sink.as_ref() {
+            // Request records never use the caller's x-request-id as their
+            // identity. Internal identity is pinned at request admission.
+            let request_id = ctx
+                .stream_info
+                .borrow()
+                .metadata_request_id
+                .clone()
+                .unwrap_or_else(|| {
+                    hex_bytes(&proxy_observability::trace::TraceContext::new_root(false).trace_id)
+                });
+            let termination = metadata_termination(
+                &response_flags,
+                ctx.response_code,
+                ctx.stream_info.borrow().is_local_reply,
+            );
+            let mut record = RequestRecord {
+                schema_version: SCHEMA_VERSION,
+                event_id: format!("{}:terminal", request_id),
+                request_id: request_id.clone(),
+                instance_id: "proxy".to_owned(),
+                started_at: format_system_time(ctx.start_time),
+                finished_at: format_system_time(SystemTime::now()),
+                tenant_id: tenant
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field)
+                    .unwrap_or_else(|| "default".to_owned()),
+                user_id: None,
+                key_id: usage_attribution
+                    .0
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field),
+                trace_id: trace.map(|t| hex_bytes(&t.trace_id)),
+                // Integration owner: pin routing, authenticated policy, and capture
+                // snapshot versions in StreamInfo at FilterChainHandler::handle
+                // admission. Do not read current versions at terminal emission.
+                routing_revision: None,
+                policy_generation: None,
+                capture_policy_version: None,
+                method: proxy_observability::records::bounded_field(&ctx.request.method),
+                route: proxy_observability::records::bounded_field(&ctx.request.path),
+                requested_model: requested_model
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field),
+                selected_cluster: upstream_cluster
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field),
+                // Usage dialect is not provider identity. The trusted pricing
+                // cluster-to-provider map currently lives privately in proxy-filters.
+                selected_provider: None,
+                selected_model: usage_attribution
+                    .1
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field),
+                status: Some(ctx.response_code),
+                termination,
+                error_category: response_code_details
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field),
+                response_flags: response_flags
+                    .iter()
+                    .map(|flag| flag.code().to_owned())
+                    .collect(),
+                duration_ms: stream_duration.as_millis().min(u64::MAX as u128) as u64,
+                time_to_first_byte_ms: llm_time_to_first_body_byte
+                    .map(|d| d.as_millis().min(u64::MAX as u128) as u64),
+                bytes_request: bytes_received,
+                bytes_response: self.bytes_sent,
+                usage: llm_tokens.map(|t| proxy_observability::records::Usage {
+                    input_tokens: t.input,
+                    cache_read_tokens: t.cached,
+                    cache_write_tokens: t.cache_creation,
+                    output_tokens: t.output,
+                    completeness: proxy_observability::records::UsageCompleteness::Complete,
+                    provenance: "provider".to_owned(),
+                }),
+                cost: llm_list_cost_nanodollars.map(|amount| proxy_observability::records::Cost {
+                    amount,
+                    unit: "nanodollars".to_owned(),
+                    currency: "USD".to_owned(),
+                    rate_card_version: usage_attribution
+                        .2
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    kind: "list".to_owned(),
+                }),
+                attempt_count: attempts.len().min(u16::MAX as usize) as u16,
+                physical_attempt_count: ctx.stream_info.borrow().physical_attempt_count,
+                attempts_truncated: ctx.stream_info.borrow().attempts_truncated,
+                attempts: attempts
+                    .into_iter()
+                    .map(|attempt| proxy_observability::records::AttemptRecord {
+                        schema_version: SCHEMA_VERSION,
+                        event_id: format!("{}:attempt:{}", request_id, attempt.attempt_index),
+                        request_id: request_id.clone(),
+                        attempt_id: format!("{}:{}", request_id, attempt.attempt_id),
+                        attempt_index: attempt.attempt_index,
+                        trace_id: attempt
+                            .trace
+                            .or(attempt.parent_trace)
+                            .map(|t| hex_bytes(&t.trace_id)),
+                        span_id: attempt.trace.map(|t| hex_bytes(&t.span_id)),
+                        parent_span_id: attempt.parent_trace.map(|t| hex_bytes(&t.span_id)),
+                        cluster: Some(attempt.cluster.clone()),
+                        provider: None,
+                        upstream_model: attempt.upstream_model,
+                        started_at: format_system_time(attempt.started_at),
+                        finished_at: format_system_time(
+                            attempt.finished_at.unwrap_or_else(SystemTime::now),
+                        ),
+                        duration_ms: attempt.duration.as_millis().min(u64::MAX as u128) as u64,
+                        status: attempt.status,
+                        termination: attempt.termination,
+                        retry_reason: attempt.retry_reason,
+                        bytes_request: attempt.bytes_request,
+                        bytes_response: attempt.bytes_response,
+                        usage: None,
+                        cost: None,
+                    })
+                    .collect(),
+            };
+            if let Some(selected) = ctx.stream_info.borrow().selected_attempt.as_ref() {
+                let index = selected.borrow().attempt_index;
+                if let Some(attempt) = record
+                    .attempts
+                    .iter_mut()
+                    .find(|a| a.attempt_index == index)
+                {
+                    attempt.usage = record.usage.clone();
+                    attempt.cost = record.cost.clone();
+                    if attempt.termination == proxy_observability::records::Termination::Unknown {
+                        attempt.termination = termination;
+                    }
+                    if termination == proxy_observability::records::Termination::Timeout {
+                        attempt.termination = termination;
+                    }
+                }
+            }
+            if record.validate(u16::MAX).is_ok() {
+                let _ = sink.submit(record);
+            }
+        }
 
         // WP-23 increment 6b: record LLM_CLIENT_TOKEN_USAGE here, at the
         // same "stream has ended, exactly once" point access logging itself
@@ -668,6 +819,38 @@ impl LoggingBody {
             logger.log(&log_ctx);
         }
     }
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
+}
+
+fn metadata_termination(
+    flags: &[ResponseFlag],
+    status: u16,
+    local: bool,
+) -> proxy_observability::records::Termination {
+    use proxy_observability::records::Termination;
+    if flags.contains(&ResponseFlag::DownstreamConnectionTermination) {
+        Termination::DownstreamDisconnect
+    } else if flags.iter().any(|f| {
+        matches!(
+            f,
+            ResponseFlag::StreamIdleTimeout | ResponseFlag::UpstreamRequestTimeout
+        )
+    }) {
+        Termination::Timeout
+    } else if flags.contains(&ResponseFlag::UpstreamConnectionTermination) || status >= 500 {
+        Termination::UpstreamError
+    } else if local {
+        Termination::LocalReply
+    } else {
+        Termination::Complete
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Body for LoggingBody {
@@ -841,6 +1024,7 @@ mod tests {
             token_stats: None,
             latency_stats: None,
             span_sink: None,
+            request_record_sink: None,
         };
 
         let body = local_boxed(
@@ -896,6 +1080,88 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render_one_fmt("%LLM_LIST_COST%", llm).await, "987654");
+    }
+
+    #[tokio::test]
+    async fn metadata_usage_and_list_cost_belong_only_to_the_selected_attempt() {
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+        ctx.request_record_sink = Some(Arc::new(sink));
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.metadata_enabled = true;
+            let failed = info.begin_attempt("primary", "host", None).unwrap();
+            failed
+                .borrow_mut()
+                .finish(proxy_observability::records::Termination::UpstreamError);
+            let selected = info
+                .begin_attempt("fallback", "host", Some("upstream-model".into()))
+                .unwrap();
+            info.selected_attempt = Some(selected);
+            info.upstream_cluster = Some("fallback".into());
+            info.llm.usage = Some(LlmTokenUsage {
+                input_tokens: 10,
+                cached_tokens: 2,
+                cache_creation_tokens: 3,
+                output_tokens: 4,
+            });
+            info.llm.list_cost = Some(crate::stream_info::LlmListCost {
+                nanodollars: 987_654,
+                rate_card_version: "v1+abcdef".into(),
+            });
+        }
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|never: std::convert::Infallible| match never {}),
+        );
+        LoggingBody::new(body, ctx).collect().await.unwrap();
+        let record = records.try_recv().unwrap();
+        assert!(record.attempts[0].usage.is_none());
+        assert!(record.attempts[0].cost.is_none());
+        assert_eq!(record.attempts[1].usage, record.usage);
+        assert_eq!(record.attempts[1].cost, record.cost);
+        let cost = record.cost.unwrap();
+        assert_eq!(cost.amount, 987_654);
+        assert_eq!(cost.unit, "nanodollars");
+        assert_eq!(cost.kind, "list");
+        assert_eq!(cost.rate_card_version, "v1+abcdef");
+        assert!(records.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn metadata_identity_uses_auth_and_never_usage_dialect() {
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+        ctx.request_record_sink = Some(Arc::new(sink));
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.auth.tenant = Some("authenticated-tenant".into());
+            info.auth.key_id = Some("k".repeat(4096));
+            info.llm.system = Some(crate::stream_info::GenAiSystem::OpenAi);
+            info.upstream_usage_dialect = Some(proxy_config::ir::UsageDialect::OpenAi);
+            info.set_response_flag(ResponseFlag::NoRouteFound);
+            info.set_response_flag(ResponseFlag::NoRouteFound);
+        }
+        LoggingBody::new(
+            local_boxed(
+                Full::new(Bytes::new()).map_err(|never: std::convert::Infallible| match never {}),
+            ),
+            ctx,
+        )
+        .collect()
+        .await
+        .unwrap();
+        let record = records.try_recv().unwrap();
+        assert_eq!(record.tenant_id, "authenticated-tenant");
+        assert_eq!(record.key_id.unwrap().len(), 512);
+        assert!(record.user_id.is_none());
+        assert!(record.selected_provider.is_none());
+        assert!(record.usage.is_none());
+        assert!(record.cost.is_none());
+        assert_eq!(record.response_flags, ["NR"]);
+        assert!(records.try_recv().is_err());
     }
 
     // --- WP-23 increment 6b: llm token-usage recording plumbing -----------
@@ -1292,6 +1558,7 @@ mod tests {
             token_stats: None,
             latency_stats: None,
             span_sink: None,
+            request_record_sink: None,
         }
     }
 

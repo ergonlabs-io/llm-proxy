@@ -288,6 +288,7 @@ struct HcmRuntime<'a> {
     token_stats: &'a Arc<GenAiTokenStats>,
     latency_stats: &'a Arc<GenAiLatencyStats>,
     tracing_handles: Option<&'a TracingHandles>,
+    metadata: Option<&'a Arc<dyn proxy_observability::records::RequestRecordSink>>,
     factory_state: &'a Arc<SharedFactoryState>,
 }
 
@@ -433,6 +434,7 @@ pub struct StatsRecorders {
     /// `RouterFilterFactory::with_tracing` at all, so every handler it
     /// builds costs nothing extra per request (see those methods' own docs).
     pub tracing: Option<TracingHandles>,
+    pub metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
 }
 
 /// [`StatsRecorders::tracing`]'s payload: a span sink plus the head-sampling
@@ -492,6 +494,7 @@ struct WorkerShared<'a> {
     /// wires it into both the `FilterChainHandler` (SERVER span) and the
     /// `RouterFilterFactory` (CLIENT spans) it builds.
     tracing: &'a Option<TracingHandles>,
+    metadata: &'a Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     /// WP-50 3b-ii part B: the ONE per-serve [`SharedFactoryState`] slot,
     /// shared across every worker's filter-factory build -- same cadence and
     /// construction site (`crates/proxy/src/main.rs`'s `run_serve`) as
@@ -525,6 +528,7 @@ fn spawn_bound(
         token_stats: shared.token_stats,
         latency_stats: shared.latency_stats,
         tracing_handles: shared.tracing.as_ref(),
+        metadata: shared.metadata.as_ref(),
         factory_state: shared.factory_state,
     };
     let hcm = build_listener_hcm(listener_ir, &hcm_runtime)?;
@@ -551,6 +555,7 @@ fn spawn_bound(
             token_stats: shared.token_stats.clone(),
             latency_stats: shared.latency_stats.clone(),
             tracing_handles: shared.tracing.clone(),
+            metadata: shared.metadata.clone(),
             factory_state: shared.factory_state.clone(),
             secret_registry: shared.secret_registry.clone(),
         },
@@ -619,6 +624,7 @@ pub fn initial_bind(
         token_stats: &stats.token,
         latency_stats: &stats.latency,
         tracing: &stats.tracing,
+        metadata: &stats.metadata,
         factory_state,
         secret_registry,
     };
@@ -689,6 +695,7 @@ struct AcceptLoopShared {
     /// doesn't shadow the `tracing` crate this whole module logs through
     /// (`tracing::warn!` a few lines below the destructure).
     tracing_handles: Option<TracingHandles>,
+    metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     /// This worker's [`SharedFactoryState`] handle -- see
     /// [`WorkerShared::factory_state`]; needed here (not just at
     /// [`spawn_bound`] time) for the identical reason `token_stats` is (the
@@ -726,6 +733,7 @@ fn spawn_accept_loop(
         token_stats,
         latency_stats,
         tracing_handles,
+        metadata,
         factory_state,
         secret_registry,
     } = shared;
@@ -819,6 +827,7 @@ fn spawn_accept_loop(
                         token_stats: &token_stats,
                         latency_stats: &latency_stats,
                         tracing_handles: tracing_handles.as_ref(),
+                        metadata: metadata.as_ref(),
                         factory_state: &factory_state,
                     };
                     match build_listener_hcm(l, &hcm_runtime) {
@@ -1405,6 +1414,9 @@ fn build_hcm_handler(
     })?
     .with_token_stats(runtime.token_stats.clone());
     handler = handler.with_gen_ai_latency_stats(runtime.latency_stats.clone());
+    if let Some(sink) = runtime.metadata {
+        handler = handler.with_request_record_sink(sink.clone());
+    }
     // WP-51 increment 2: `.with_tracing` on the FilterChainHandler half of
     // this build -- see the `router_factory` one above for the other half
     // (the CLIENT-span-emitting router terminal); this half is what mints
@@ -1552,6 +1564,7 @@ fn reconcile(
         token_stats: &stats.token,
         latency_stats: &stats.latency,
         tracing: &stats.tracing,
+        metadata: &stats.metadata,
         factory_state,
         secret_registry,
     };
@@ -2325,6 +2338,7 @@ mod tests {
             token: token_stats_for(&stats_control, &initial),
             latency: latency_stats_for(&stats_control),
             tracing: None,
+            metadata: None,
         };
         let factory_state = Arc::new(SharedFactoryState::default());
         let secret_registry = Arc::new(SdsSecretRegistry::new());
@@ -3439,6 +3453,7 @@ mod tests {
                 token: token_stats_for(&stats_control, &snapshot),
                 latency: latency_stats_for(&stats_control),
                 tracing: None,
+                metadata: None,
             };
             let factory_state = Arc::new(SharedFactoryState::default());
             let secret_registry = Arc::new(SdsSecretRegistry::new());
@@ -4461,6 +4476,7 @@ static_resources:
             token_stats: &token_stats,
             latency_stats: &latency_stats,
             tracing_handles: None,
+            metadata: None,
             factory_state: &factory_state,
         };
         let err = match build_listener_hcm(listener_ir, &hcm_runtime) {
@@ -4594,6 +4610,7 @@ static_resources:
             token_stats: &token_stats,
             latency_stats: &latency_stats,
             tracing_handles: None,
+            metadata: None,
             factory_state: &factory_state,
         };
         build_listener_hcm(l1, &hcm_runtime).expect("listener l1's filter chain must build");

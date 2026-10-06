@@ -351,13 +351,23 @@ static_resources:
         listener_port
     ));
     std::fs::write(&config_path, config_yaml).expect("failed to write temp config");
+    let records_path = config_path.with_extension("records.jsonl");
 
     // `ChildGuard` (not a bare `Child`): this function gained several more
     // assertions in WP-23 increment 6b, each a new chance to panic before
     // reaching the manual `kill` at the bottom -- see `ChildGuard`'s doc.
     let mut child = ChildGuard(
         Command::new(BIN)
-            .args(["-c", config_path.to_str().unwrap(), "--concurrency", "1"])
+            .args([
+                "-c",
+                config_path.to_str().unwrap(),
+                "--concurrency",
+                "1",
+                "--drain-time-s",
+                "0",
+                "--request-records-file",
+                records_path.to_str().unwrap(),
+            ])
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn llm-proxy"),
@@ -462,11 +472,42 @@ static_resources:
         if std::time::Instant::now() >= deadline {
             let _ = child.0.kill();
             let _ = child.0.wait();
-            break;
+            panic!("proxy did not finish metadata drain before shutdown deadline");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let records_text = std::fs::read_to_string(&records_path).unwrap();
+    let records: Vec<proxy_observability::records::RequestRecord> = records_text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records.len(),
+        2,
+        "all completed requests must survive graceful shutdown"
+    );
+    assert_ne!(records[0].request_id, records[1].request_id);
+    for record in &records {
+        assert_eq!(record.status, Some(200));
+        assert_eq!(record.tenant_id, "default");
+        assert!(record.user_id.is_none());
+        assert_eq!(record.attempt_count, 1);
+        assert_eq!(record.attempts[0].status, Some(200));
+        assert_eq!(record.attempts[0].cluster.as_deref(), Some("backend"));
+        assert_eq!(
+            record.attempts[0].termination,
+            proxy_observability::records::Termination::Complete
+        );
+        assert_eq!(record.instance_id.len(), 32);
+        assert!(chrono_timestamp_is_rfc3339(&record.started_at));
+    }
+    let _ = std::fs::remove_file(&records_path);
     let _ = std::fs::remove_file(&config_path);
+}
+
+fn chrono_timestamp_is_rfc3339(value: &str) -> bool {
+    // The envelope uses RFC3339 rather than an epoch string ending in Z.
+    value.contains('T') && value.contains('-') && value.ends_with("+00:00")
 }
 
 /// WP-23 increment 6b, task 2: `LLM_CLIENT_TOKEN_USAGE{provider,type}`

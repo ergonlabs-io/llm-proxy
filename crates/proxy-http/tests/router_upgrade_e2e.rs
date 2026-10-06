@@ -439,6 +439,7 @@ async fn upstream_declining_upgrade_passes_the_response_through() {
     LocalSet::new()
         .run_until(async {
             let upstream_addr = spawn_upgrade_declining_upstream().await;
+            let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
             let router = build_router(
                 upstream_addr,
                 vec![UpgradeConfig {
@@ -446,7 +447,8 @@ async fn upstream_declining_upgrade_passes_the_response_through() {
                     enabled: true,
                 }],
             )
-            .await;
+            .await
+            .with_request_record_sink(Arc::new(sink));
 
             let resp = router.handle(upgrade_request("/chat", true)).await;
             assert_eq!(
@@ -461,6 +463,14 @@ async fn upstream_declining_upgrade_passes_the_response_through() {
 
             let body = resp.body.collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], b"no websocket\n");
+            let record = records.try_recv().unwrap();
+            assert_eq!(record.attempt_count, 1);
+            assert_eq!(record.attempts[0].status, Some(200));
+            assert_eq!(record.attempts[0].bytes_response, body.len() as u64);
+            assert_eq!(
+                record.attempts[0].termination,
+                proxy_observability::records::Termination::Complete
+            );
         })
         .await;
 }
