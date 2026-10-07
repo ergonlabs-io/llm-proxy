@@ -99,7 +99,8 @@ pub struct SpoolConfig {
 }
 
 impl SpoolConfig {
-    fn validate(&self) -> Result<()> {
+    /// Validate size arithmetic and bounds without opening files.
+    pub fn validate(&self) -> Result<()> {
         if self.node_id.is_empty() || self.node_id.len() > 128 {
             return Err(Error::InvalidConfig("node_id must be 1..=128 bytes"));
         }

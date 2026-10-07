@@ -34,6 +34,22 @@ pub struct DeliverySummary {
 }
 
 impl MetadataDelivery {
+    /// Opt-in authenticated Unix agent delivery. Success means a verified durable
+    /// local receipt, not remote indexing. Agent outages never close forwarding.
+    #[cfg(unix)]
+    pub fn start_agent(
+        config: crate::capture_transport::AgentTransportConfig,
+        capacity: usize,
+        stats: MetadataDeliveryStats,
+    ) -> io::Result<(BoundedRecordSink, Self)> {
+        let writer = crate::capture_transport::TransportWriter::new(config)?;
+        let instance_id = crate::trace::TraceContext::new_root(false)
+            .trace_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Self::start_writer_policy(writer, capacity, instance_id, Some(stats), false)
+    }
     pub fn start(
         path: &Path,
         capacity: usize,
@@ -70,11 +86,27 @@ impl MetadataDelivery {
     }
 
     fn start_writer(
-        mut file: impl Write + Send + 'static,
+        file: impl Write + Send + 'static,
         capacity: usize,
         instance_id: String,
         stats: Option<MetadataDeliveryStats>,
     ) -> io::Result<(BoundedRecordSink, Self)> {
+        Self::start_writer_policy(file, capacity, instance_id, stats, true)
+    }
+
+    fn start_writer_policy(
+        mut file: impl Write + Send + 'static,
+        capacity: usize,
+        instance_id: String,
+        stats: Option<MetadataDeliveryStats>,
+        close_on_failure: bool,
+    ) -> io::Result<(BoundedRecordSink, Self)> {
+        if capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata queue capacity must be positive",
+            ));
+        }
         let (sink, mut receiver) = BoundedRecordSink::new(capacity);
         let sink = match stats.as_ref() {
             Some(stats) => {
@@ -108,11 +140,17 @@ impl MetadataDelivery {
                         thread_written.fetch_add(1, Ordering::Relaxed);
                         if let Some(stats) = &stats {
                             stats.record_written();
+                            if !close_on_failure {
+                                stats.record_durable();
+                            }
                         }
                     } else {
                         thread_failed.fetch_add(1, Ordering::Relaxed);
                         if let Some(stats) = &stats {
                             stats.record_write_failure();
+                        }
+                        if !close_on_failure {
+                            continue;
                         }
                         write_failed = true;
                         // Stop admission before discarding anything left in

@@ -716,7 +716,8 @@ pub mod instruments {
         buckets: None,
     };
 
-    /// Records successfully serialized and appended by the collector thread.
+    /// Records successfully delivered by the collector thread: append-write in
+    /// legacy mode, authenticated durable-local receipt in agent mode.
     pub const METADATA_WRITTEN: Instrument = Instrument {
         name: "llmproxy_metadata_written",
         kind: InstrumentKind::Counter,
@@ -725,8 +726,18 @@ pub mod instruments {
         buckets: None,
     };
 
-    /// Collector serialization or write failures. A failure closes metadata
-    /// admission but never changes forwarding readiness.
+    /// Agent durability-confirmed records. No attributes; local durability is
+    /// distinct from legacy writes and remote indexing.
+    pub const METADATA_DURABLE: Instrument = Instrument {
+        name: "llmproxy_metadata_durable",
+        kind: InstrumentKind::Counter,
+        unit: "{record}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+
+    /// Collector serialization/write or unconfirmed-delivery failures. Legacy
+    /// write failures close admission; agent mode can reconnect on later events.
     pub const METADATA_WRITE_FAILURES: Instrument = Instrument {
         name: "llmproxy_metadata_write_failures",
         kind: InstrumentKind::Counter,
@@ -750,6 +761,7 @@ pub struct MetadataDeliveryStats {
     queue_depth: Handle,
     queue_capacity: Handle,
     written: Handle,
+    durable: Handle,
     write_failures: Handle,
 }
 
@@ -775,6 +787,7 @@ impl MetadataDeliveryStats {
             queue_depth: control.resolve(&instruments::METADATA_QUEUE_DEPTH, &[]),
             queue_capacity: control.resolve(&instruments::METADATA_QUEUE_CAPACITY, &[]),
             written: control.resolve(&instruments::METADATA_WRITTEN, &[]),
+            durable: control.resolve(&instruments::METADATA_DURABLE, &[]),
             write_failures: control.resolve(&instruments::METADATA_WRITE_FAILURES, &[]),
         }
     }
@@ -820,6 +833,11 @@ impl MetadataDeliveryStats {
     /// Lifecycle point: successful JSON serialization plus append write.
     pub fn record_written(&self) {
         self.registry.incr(WorkerId(0), self.written, 1);
+    }
+
+    /// Lifecycle point: one authenticated agent Durable receipt matching the event.
+    pub fn record_durable(&self) {
+        self.registry.incr(WorkerId(0), self.durable, 1);
     }
 
     /// Lifecycle point: JSON serialization or append write error.

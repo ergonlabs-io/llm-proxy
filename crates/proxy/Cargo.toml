@@ -32,6 +32,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+proxy-capture-agent = { path = "../proxy-capture-agent" }
+proxy-capture-spool = { path = "../proxy-capture-spool" }
+tempfile = { version = "=3.27.0", default-features = false }
 # tests/keygen.rs decodes the printed key's base64url body directly (the
 # generator itself now lives in `proxy_filters::auth::generate_plaintext_key`,
 # which this crate no longer calls outside that test).

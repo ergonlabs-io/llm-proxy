@@ -3,6 +3,8 @@
 //! router (WP-13), retry engine (WP-14) and pools (WP-15).
 
 pub mod access_log;
+#[cfg(unix)]
+pub mod capture_transport;
 pub mod flags;
 pub mod metadata;
 /// WP-51 increment 3a: maps [`trace::FinishedSpan`] to the OTLP wire types

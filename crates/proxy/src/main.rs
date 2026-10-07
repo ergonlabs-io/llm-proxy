@@ -103,8 +103,20 @@ struct Args {
 
     /// Opt-in end-user metadata JSONL collector. Contains identities and model
     /// history; configure access and retention on the destination file.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "request_records_agent")]
     request_records_file: Option<PathBuf>,
+    /// Opt-in Unix metadata agent. Delivery success requires a durable local ACK.
+    #[arg(long, value_name = "SOCKET", requires_all = ["request_records_agent_uid", "request_records_agent_node", "request_records_producer"])]
+    request_records_agent: Option<PathBuf>,
+    /// Expected OS UID of the local metadata agent.
+    #[arg(long, requires = "request_records_agent")]
+    request_records_agent_uid: Option<u32>,
+    /// Expected agent spool node identity, checked on handshake and receipts.
+    #[arg(long, requires = "request_records_agent")]
+    request_records_agent_node: Option<String>,
+    /// Deployment producer ID bound to this proxy's OS UID in agent grants.
+    #[arg(long, requires = "request_records_agent")]
+    request_records_producer: Option<String>,
     /// Maximum retained attempt records per request. Excess attempts are
     /// explicitly reported as truncated; forwarding retry policy is unchanged.
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=64))]
@@ -527,6 +539,14 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
         config_source,
         args.request_records_file,
         args.request_record_max_attempts,
+        args.request_records_agent.map(|socket_path| {
+            proxy_observability::capture_transport::AgentTransportConfig {
+                socket_path,
+                expected_agent_uid: args.request_records_agent_uid.unwrap(),
+                expected_node_id: args.request_records_agent_node.unwrap(),
+                producer_id: args.request_records_producer.unwrap(),
+            }
+        }),
     ))
 }
 
@@ -575,6 +595,7 @@ async fn run_serve(
     config_source: ConfigSource,
     request_records_file: Option<PathBuf>,
     request_record_max_attempts: u16,
+    request_records_agent: Option<proxy_observability::capture_transport::AgentTransportConfig>,
 ) -> ExitCode {
     // Collected before `snapshot` moves into `WorkerPool::spawn` purely so
     // the startup log line below can name what got bound; each worker binds
@@ -701,12 +722,27 @@ async fn run_serve(
     // its finite operational series even when no file collector is configured
     // so Prometheus and OTLP show explicit zeroes rather than an absent signal.
     let metadata_stats = proxy_observability::stats::MetadataDeliveryStats::resolve(&stats_control);
-    let (metadata_sink, metadata_delivery) = match request_records_file {
-        Some(path) => match proxy_observability::metadata::MetadataDelivery::start(
+    let collector = match (request_records_file, request_records_agent) {
+        (Some(path), None) => Some(proxy_observability::metadata::MetadataDelivery::start(
             &path,
             1024,
             metadata_stats,
-        ) {
+        )),
+        (None, Some(agent)) => Some(
+            proxy_observability::metadata::MetadataDelivery::start_agent(
+                agent,
+                1024,
+                metadata_stats,
+            ),
+        ),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            eprintln!("metadata file and agent modes are mutually exclusive");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (metadata_sink, metadata_delivery) = match collector {
+        Some(result) => match result {
             Ok((sink, delivery)) => (
                 Some(
                     Arc::new(sink.with_max_attempts(request_record_max_attempts))
@@ -2819,6 +2855,10 @@ mod tests {
             permissive,
             concurrency: 1,
             request_records_file: None,
+            request_records_agent: None,
+            request_records_agent_uid: None,
+            request_records_agent_node: None,
+            request_records_producer: None,
             request_record_max_attempts: 64,
             drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
             drain_strategy: DrainStrategyArg::Gradual,

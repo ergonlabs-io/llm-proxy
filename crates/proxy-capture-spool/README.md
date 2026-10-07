@@ -1,7 +1,8 @@
 # Encrypted metadata spool
 
 `proxy-capture-spool` is a synchronous Unix library for a future independently
-resourced capture agent. It is not wired into the proxy's JSONL collector. It
+resourced capture agent. The [local agent](../proxy-capture-agent/README.md) now
+uses it; it is not wired into the proxy's legacy JSONL collector. It
 does not implement producer authentication, backend delivery, queries, or YAML
 configuration. Never invoke its file operations on request workers.
 

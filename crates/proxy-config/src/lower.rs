@@ -77,6 +77,16 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     // block could not express that without a flag whose false value would still
     // require the operator to write the tracing namespace at all.
     snapshot.metrics = convert_metrics_metadata(b.node.as_ref(), "node")?;
+    if b.node
+        .as_ref()
+        .and_then(|node| node.metadata.as_ref())
+        .is_some_and(|metadata| metadata.fields.contains_key("io.llmproxy.capture"))
+    {
+        return Err(unsupported(
+            "node.metadata[\"io.llmproxy.capture\"]",
+            "declarative capture policy is not implemented; use the boot-only metadata-agent CLI",
+        ));
+    }
 
     // WP-20 increment 1. Lowered before `static_resources` so the ADS
     // cluster-existence check below can run against the finished cluster map.

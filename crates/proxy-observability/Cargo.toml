@@ -42,6 +42,10 @@ tokio = { workspace = true, features = ["sync", "time"] }
 # protocol serving a different rule.
 proxy-api = { workspace = true }
 tonic = { workspace = true }
+proxy-capture-protocol = { path = "../proxy-capture-protocol" }
+
+[dev-dependencies]
+tempfile = { version = "=3.27.0", default-features = false }
 
 [lints]
 workspace = true
