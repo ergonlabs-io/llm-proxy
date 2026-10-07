@@ -52,6 +52,7 @@ mod keygen;
 // is checked by hand in `main()`, right where `--mode translate`'s own extra
 // requirement already is.
 #[command(group(clap::ArgGroup::new("input").args(["config_path", "config"])))]
+#[command(group(clap::ArgGroup::new("capture_destination").args(["request_records_file", "request_records_agent"])))]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -119,8 +120,8 @@ struct Args {
     request_records_producer: Option<String>,
     /// Maximum retained attempt records per request. Excess attempts are
     /// explicitly reported as truncated; forwarding retry policy is unchanged.
-    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=64))]
-    request_record_max_attempts: u16,
+    #[arg(long, requires="capture_destination", value_parser = clap::value_parser!(u16).range(1..=64))]
+    request_record_max_attempts: Option<u16>,
 
     /// How long the drain sequence waits for connections to close before
     /// forcing worker shutdown (serve mode only).
@@ -309,6 +310,20 @@ fn main() -> ExitCode {
         }
     };
 
+    if snapshot.end_user_capture_configured
+        && (args.request_records_file.is_some()
+            || args.request_records_agent.is_some()
+            || args.request_record_max_attempts.is_some())
+    {
+        eprintln!(
+            "node.metadata[\"io.llmproxy.capture\"]: cannot combine declarative and CLI capture"
+        );
+        return ExitCode::FAILURE;
+    }
+    if snapshot.end_user_capture.is_some() && args.concurrency > 8 {
+        eprintln!("node.metadata[\"io.llmproxy.capture\"].budgets.max_capture_memory_bytes: concurrency {} exceeds eight scratch owners",args.concurrency);
+        return ExitCode::FAILURE;
+    }
     match args.mode {
         Mode::Translate => {
             // Printed in load(); reaching here means it already succeeded.
@@ -538,7 +553,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
         Arc::new(snapshot),
         config_source,
         args.request_records_file,
-        args.request_record_max_attempts,
+        args.request_record_max_attempts.unwrap_or(64),
         args.request_records_agent.map(|socket_path| {
             proxy_observability::capture_transport::AgentTransportConfig {
                 socket_path,
@@ -722,6 +737,33 @@ async fn run_serve(
     // its finite operational series even when no file collector is configured
     // so Prometheus and OTLP show explicit zeroes rather than an absent signal.
     let metadata_stats = proxy_observability::stats::MetadataDeliveryStats::resolve(&stats_control);
+    let legacy_capture = request_records_file.is_some() || request_records_agent.is_some();
+    if legacy_capture && snapshot.end_user_capture_configured {
+        eprintln!(
+            "node.metadata[\"io.llmproxy.capture\"]: cannot combine declarative and CLI capture"
+        );
+        return ExitCode::FAILURE;
+    }
+    let (capture_supervisor, capture_delivery) = if legacy_capture {
+        (None, None)
+    } else {
+        match proxy_observability::capture::CaptureSupervisor::start(metadata_stats.clone()) {
+            Ok((supervisor, delivery)) => {
+                if let Err(error) =
+                    supervisor.configure(snapshot.end_user_capture.clone(), concurrency)
+                {
+                    eprintln!("{error}");
+                    let _ = delivery.shutdown(Duration::from_secs(1)).await;
+                    return ExitCode::FAILURE;
+                }
+                (Some(supervisor), Some(delivery))
+            }
+            Err(error) => {
+                eprintln!("cannot start capture supervisor: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let collector = match (request_records_file, request_records_agent) {
         (Some(path), None) => Some(proxy_observability::metadata::MetadataDelivery::start(
             &path,
@@ -755,7 +797,12 @@ async fn run_serve(
                 return ExitCode::FAILURE;
             }
         },
-        None => (None, None),
+        None => (
+            capture_supervisor.as_ref().map(|s| {
+                Arc::new(s.clone()) as Arc<dyn proxy_observability::records::RequestRecordSink>
+            }),
+            None,
+        ),
     };
 
     // Resolve operational health series even when exporters are disabled.
@@ -1111,6 +1158,9 @@ async fn run_serve(
                 "metadata delivery stopped after listener startup failure"
             );
         }
+        if let Some(delivery) = capture_delivery {
+            let _ = delivery.shutdown(Duration::from_secs(1)).await;
+        }
         return ExitCode::FAILURE;
     }
 
@@ -1137,6 +1187,7 @@ async fn run_serve(
                         &cluster_manager_for_reload,
                         &stats_control,
                         &stat_handle_tables_for_reload,
+                        capture_supervisor.as_ref().map(|s|(s,concurrency)),
                     )
                     .await
                     {
@@ -1197,7 +1248,18 @@ async fn run_serve(
         }
     }
 
+    if let Some(supervisor) = &capture_supervisor {
+        supervisor.stop_admissions();
+    }
     let outcome = graceful_shutdown(publisher, drain_time, strategy).await;
+    if let Some(delivery) = capture_delivery {
+        let deadline = capture_supervisor
+            .as_ref()
+            .map(|s| s.drain_deadline())
+            .unwrap_or(Duration::from_secs(5));
+        let timed_out = delivery.shutdown(deadline).await;
+        tracing::info!(timed_out, "local capture delivery stopped");
+    }
     if let Some(delivery) = metadata_delivery {
         let summary = delivery.shutdown(Duration::from_secs(5)).await;
         tracing::info!(
@@ -1437,6 +1499,7 @@ async fn reload(
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
     stats_control: &proxy_observability::stats::StatsControl,
     tables: &StatHandleTables,
+    capture: Option<(&proxy_observability::capture::CaptureSupervisor, usize)>,
 ) -> Option<SnapshotVersion> {
     let mut snapshot = match source.load() {
         Ok(snapshot) => snapshot,
@@ -1464,6 +1527,17 @@ async fn reload(
     // stamps its own versions differently (from the discovery response, not
     // from a local counter) -- versioning is producer-specific, applying is not.
     snapshot.version = SnapshotVersion(current_version.0 + 1);
+    if let Some((capture, concurrency)) = capture {
+        if let Err(error) = capture.configure(snapshot.end_user_capture.clone(), concurrency) {
+            tracing::error!(%error,"SIGHUP: capture reload rejected; retaining previous snapshot");
+            return None;
+        }
+    } else if snapshot.end_user_capture_configured {
+        tracing::error!(
+            "node.metadata[\"io.llmproxy.capture\"]: cannot combine declarative and CLI capture"
+        );
+        return None;
+    }
 
     // Captured before `snapshot` moves into `apply_snapshot` below, purely so
     // the success log line further down can still report them.
@@ -2859,7 +2933,7 @@ mod tests {
             request_records_agent_uid: None,
             request_records_agent_node: None,
             request_records_producer: None,
-            request_record_max_attempts: 64,
+            request_record_max_attempts: None,
             drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
             drain_strategy: DrainStrategyArg::Gradual,
             base_id: None,

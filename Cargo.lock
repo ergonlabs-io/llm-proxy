@@ -1853,6 +1853,7 @@ dependencies = [
  "proxy-api",
  "proxy-capture-protocol",
  "rand",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

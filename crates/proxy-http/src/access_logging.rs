@@ -455,6 +455,21 @@ impl LoggingBody {
             return;
         };
         let stream_duration = ctx.start_instant.elapsed();
+        #[cfg(unix)]
+        ctx.stream_info.borrow_mut().check_capture_gate();
+        #[cfg(unix)]
+        let lease = ctx.stream_info.borrow().metadata_lease.clone();
+        #[cfg(unix)]
+        let terminal = lease.as_ref().map(|l| l.reserve_terminal());
+        #[cfg(unix)]
+        let capture_allowed = (ctx.stream_info.borrow().metadata_enabled
+            || ctx
+                .request_record_sink
+                .as_ref()
+                .is_some_and(|s| !s.requires_admission()))
+            && terminal.as_ref().is_none_or(|r| r.is_ok());
+        #[cfg(not(unix))]
+        let capture_allowed = ctx.stream_info.borrow().metadata_enabled;
 
         // Rust note: `stream_info`'s snapshot has to be pulled out of the
         // `RefCell` and its borrow dropped before `LogContext` is built --
@@ -533,14 +548,18 @@ impl LoggingBody {
                         .as_ref()
                         .map(|cost| cost.rate_card_version.clone()),
                 ),
-                info.attempts
-                    .iter()
-                    .map(|a| a.borrow().clone())
-                    .collect::<Vec<_>>(),
+                (if capture_allowed {
+                    info.attempts
+                        .iter()
+                        .map(|a| a.borrow().clone())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }),
             )
         };
 
-        if let Some(sink) = ctx.request_record_sink.as_ref() {
+        if let Some(sink) = ctx.request_record_sink.as_ref().filter(|_| capture_allowed) {
             // Request records never use the caller's x-request-id as their
             // identity. Internal identity is pinned at request admission.
             let request_id = ctx
@@ -581,7 +600,16 @@ impl LoggingBody {
                 // admission. Do not read current versions at terminal emission.
                 routing_revision: None,
                 policy_generation: None,
-                capture_policy_version: None,
+                capture_policy_version: {
+                    #[cfg(unix)]
+                    {
+                        lease.as_ref().map(|l| l.version().to_owned())
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        None
+                    }
+                },
                 method: proxy_observability::records::bounded_field(&ctx.request.method),
                 route: proxy_observability::records::bounded_field(&ctx.request.path),
                 requested_model: requested_model
@@ -686,8 +714,27 @@ impl LoggingBody {
                 }
             }
             if record.validate(u16::MAX).is_ok() {
+                #[cfg(unix)]
+                if let Some(Ok(permit)) = terminal {
+                    // Trusted ownership identifiers are rejected, never truncated into collisions.
+                    if tenant.as_ref().is_none_or(|t| t.len() <= 128)
+                        && usage_attribution.0.as_ref().is_none_or(|k| k.len() <= 128)
+                    {
+                        let _ = permit.submit(record);
+                    } else if let Some(lease) = &lease {
+                        lease.identity_limit();
+                    }
+                } else {
+                    let _ = sink.submit(record);
+                }
+                #[cfg(not(unix))]
                 let _ = sink.submit(record);
             }
+        }
+
+        #[cfg(unix)]
+        if lease.is_some() {
+            ctx.stream_info.borrow_mut().clear_capture_state();
         }
 
         // WP-23 increment 6b: record LLM_CLIENT_TOKEN_USAGE here, at the

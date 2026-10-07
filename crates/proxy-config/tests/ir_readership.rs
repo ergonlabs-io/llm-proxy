@@ -270,6 +270,14 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   above.",
     },
     AllowlistEntry {
+        struct_name:"ConfigSnapshot",field_name:"end_user_capture",kind:EntryKind::ReadOutsideRuntimeCrates,
+        reason:"Control-side `crates/proxy/src/main.rs` validates runtime concurrency and calls CaptureSupervisor::configure at boot and SIGHUP. The supervisor consumes every policy/budget/endpoint/transport/control setting for admission, queue ownership, delivery, and emergency controls; workers consult its stable handle, not the bootstrap IR. This is a real reader outside RUNTIME_CRATES, not KnownInert.",
+    },
+    AllowlistEntry {
+        struct_name:"ConfigSnapshot",field_name:"end_user_capture_configured",kind:EntryKind::ReadOutsideRuntimeCrates,
+        reason:"Control-side `crates/proxy/src/main.rs` uses explicit namespace presence to reject mixing declarative capture (even disabled) with CLI destinations in validate/serve and SIGHUP. Presence has a mode-selection consumer even when the effective policy is None.",
+    },
+    AllowlistEntry {
         struct_name: "MetricsExportConfig",
         field_name: "otlp_endpoint",
         kind: EntryKind::ReadOutsideRuntimeCrates,

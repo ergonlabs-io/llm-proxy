@@ -692,6 +692,41 @@ pub mod instruments {
     pub const METADATA_ADMISSION_ACCEPTED: &str = "accepted";
     pub const METADATA_ADMISSION_CAPACITY_EXCEEDED: &str = "capacity_exceeded";
     pub const METADATA_ADMISSION_CLOSED: &str = "closed";
+    pub const CAPTURE_STATE_ADMISSION: Instrument = Instrument {
+        name: "llmproxy_capture_state_admission",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["outcome"],
+        buckets: None,
+    };
+    pub const CAPTURE_ACTIVE: Instrument = Instrument {
+        name: "llmproxy_capture_active_requests",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{request}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    pub const CAPTURE_STATE_BYTES: Instrument = Instrument {
+        name: "llmproxy_capture_state_reserved_bytes",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "By",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    pub const CAPTURE_EVENT_BYTES: Instrument = Instrument {
+        name: "llmproxy_capture_event_reserved_bytes",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "By",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    pub const CAPTURE_DROPS: Instrument = Instrument {
+        name: "llmproxy_capture_drops",
+        kind: InstrumentKind::Counter,
+        unit: "{record}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
 
     /// Queue occupancy measured from producer reservation to collector dequeue
     /// observation. `depth / llmproxy_metadata_queue_capacity` estimates queue
@@ -763,6 +798,11 @@ pub struct MetadataDeliveryStats {
     written: Handle,
     durable: Handle,
     write_failures: Handle,
+    state_admission: [Handle; 4],
+    active: Handle,
+    state_bytes: Handle,
+    event_bytes: Handle,
+    drops: [Handle; 6],
 }
 
 impl MetadataDeliveryStats {
@@ -789,6 +829,20 @@ impl MetadataDeliveryStats {
             written: control.resolve(&instruments::METADATA_WRITTEN, &[]),
             durable: control.resolve(&instruments::METADATA_DURABLE, &[]),
             write_failures: control.resolve(&instruments::METADATA_WRITE_FAILURES, &[]),
+            state_admission: ["accepted", "disabled", "capacity_exceeded", "closed"]
+                .map(|v| control.resolve(&instruments::CAPTURE_STATE_ADMISSION, &[("outcome", v)])),
+            active: control.resolve(&instruments::CAPTURE_ACTIVE, &[]),
+            state_bytes: control.resolve(&instruments::CAPTURE_STATE_BYTES, &[]),
+            event_bytes: control.resolve(&instruments::CAPTURE_EVENT_BYTES, &[]),
+            drops: [
+                "disabled",
+                "expired",
+                "encoded_limit",
+                "delivery_unknown",
+                "identity_limit",
+                "transport_capacity",
+            ]
+            .map(|v| control.resolve(&instruments::CAPTURE_DROPS, &[("reason", v)])),
         }
     }
 
@@ -800,6 +854,42 @@ impl MetadataDeliveryStats {
             self.queue_capacity,
             capacity.min(u64::MAX as usize) as u64,
         );
+    }
+    pub fn change_queue_capacity(&self, delta: i64) {
+        self.registry.add(WorkerId(0), self.queue_capacity, delta);
+    }
+    pub fn state_admission(&self, outcome: crate::records::SubmitResult) {
+        use crate::records::SubmitResult::*;
+        let index = match outcome {
+            Accepted => 0,
+            Disabled => 1,
+            CapacityExceeded => 2,
+            Closed => 3,
+        };
+        self.registry
+            .incr(WorkerId(0), self.state_admission[index], 1);
+    }
+    pub fn reserve_state(&self, bytes: usize) {
+        self.registry.add(WorkerId(0), self.active, 1);
+        self.registry
+            .add(WorkerId(0), self.state_bytes, bytes as i64);
+    }
+    pub fn release_state(&self, bytes: usize) {
+        self.registry.add(WorkerId(0), self.active, -1);
+        self.registry
+            .add(WorkerId(0), self.state_bytes, -(bytes as i64));
+    }
+    pub fn reserve_event(&self, bytes: usize) {
+        self.registry
+            .add(WorkerId(0), self.event_bytes, bytes as i64);
+    }
+    pub fn release_event(&self, bytes: usize) {
+        self.registry
+            .add(WorkerId(0), self.event_bytes, -(bytes as i64));
+    }
+    pub fn capture_drop(&self, reason: CaptureDrop) {
+        self.registry
+            .incr(WorkerId(0), self.drops[reason as usize], 1);
     }
 
     /// Lifecycle point: every nonblocking producer submission.
@@ -844,6 +934,16 @@ impl MetadataDeliveryStats {
     pub fn record_write_failure(&self) {
         self.registry.incr(WorkerId(0), self.write_failures, 1);
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum CaptureDrop {
+    Disabled,
+    Expired,
+    EncodedLimit,
+    DeliveryUnknown,
+    IdentityLimit,
+    TransportCapacity,
 }
 
 /// Identifies a worker thread/runtime for [`Registry::incr`]/

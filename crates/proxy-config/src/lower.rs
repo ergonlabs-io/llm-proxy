@@ -77,6 +77,16 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     // block could not express that without a flag whose false value would still
     // require the operator to write the tracing namespace at all.
     snapshot.metrics = convert_metrics_metadata(b.node.as_ref(), "node")?;
+    snapshot.end_user_capture_configured = b
+        .node
+        .as_ref()
+        .and_then(|n| n.metadata.as_ref())
+        .is_some_and(|m| m.fields.contains_key("io.llmproxy.capture"));
+    #[cfg(unix)]
+    {
+        snapshot.end_user_capture = crate::capture::convert(b.node.as_ref())?;
+    }
+    #[cfg(not(unix))]
     if b.node
         .as_ref()
         .and_then(|node| node.metadata.as_ref())

@@ -745,18 +745,38 @@ impl StreamHandler for FilterChainHandler {
             // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
             if let Some(sink) = &self.request_record_sink {
-                let mut info = stream_info.borrow_mut();
-                info.metadata_enabled = true;
-                info.metadata_attempt_limit = sink
-                    .max_attempts()
-                    .min(proxy_observability::records::MAX_ATTEMPTS);
-                info.metadata_request_id = Some(
-                    proxy_observability::trace::TraceContext::new_root(false)
-                        .trace_id
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect(),
-                );
+                #[cfg(unix)]
+                let admission = sink.try_admit();
+                #[cfg(not(unix))]
+                let admission: Result<
+                    Option<()>,
+                    proxy_observability::records::SubmitResult,
+                > = Ok(None);
+                if let Ok(lease) = admission {
+                    let mut info = stream_info.borrow_mut();
+                    info.metadata_enabled = true;
+                    info.metadata_attempt_limit = sink
+                        .max_attempts()
+                        .min(proxy_observability::records::MAX_ATTEMPTS);
+                    #[cfg(unix)]
+                    {
+                        if let Some(lease) = &lease {
+                            info.metadata_attempt_limit = lease.max_attempts();
+                        }
+                        info.metadata_lease = lease;
+                    }
+                    info.metadata_request_id = Some(
+                        proxy_observability::trace::TraceContext::new_root(false)
+                            .trace_id
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect(),
+                    );
+                }
+            }
+            #[cfg(unix)]
+            if stream_info.borrow().metadata_lease.is_some() {
+                crate::capture_cleanup::register(&stream_info);
             }
             // S10 (WP-10 increment 2b/2c): move the downstream `OnUpgrade`
             // handle (if this request asked for one) off `req` and onto the
@@ -839,7 +859,7 @@ impl StreamHandler for FilterChainHandler {
                 && self.token_stats.is_none()
                 && self.latency_stats.is_none()
                 && self.tracing.is_none()
-                && self.request_record_sink.is_none()
+                && !stream_info.borrow().metadata_enabled
             {
                 return resp;
             }
@@ -853,6 +873,10 @@ impl StreamHandler for FilterChainHandler {
                 .borrow_mut()
                 .take()
                 .unwrap_or_default();
+            let request_record_sink = self
+                .request_record_sink
+                .clone()
+                .filter(|_| stream_info.borrow().metadata_enabled);
             let log_ctx = AccessLogContext {
                 loggers: self.access_loggers.clone(),
                 stream_info,
@@ -865,7 +889,7 @@ impl StreamHandler for FilterChainHandler {
                 token_stats: self.token_stats.clone(),
                 latency_stats: self.latency_stats.clone(),
                 span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
-                request_record_sink: self.request_record_sink.clone(),
+                request_record_sink,
             };
             HttpResponseParts {
                 head: resp.head,

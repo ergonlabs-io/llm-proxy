@@ -5,11 +5,38 @@ use proxy_capture_protocol::{
 use std::{
     io::{self, Write},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::net::UnixStream;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureTransportLimits {
+    pub connect_deadline: Duration,
+    pub write_deadline: Duration,
+    pub ack_deadline: Duration,
+    pub event_deadline: Duration,
+    pub backoff_initial: Duration,
+    pub backoff_max: Duration,
+    pub max_attempts: u16,
+    pub drain_deadline: Duration,
+}
+
+impl Default for CaptureTransportLimits {
+    fn default() -> Self {
+        Self {
+            connect_deadline: Duration::from_millis(250),
+            write_deadline: Duration::from_secs(1),
+            ack_deadline: Duration::from_secs(2),
+            event_deadline: Duration::from_secs(10),
+            backoff_initial: Duration::from_millis(50),
+            backoff_max: Duration::from_secs(5),
+            max_attempts: 4,
+            drain_deadline: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTransportConfig {
     pub socket_path: PathBuf,
     pub expected_agent_uid: u32,
@@ -39,17 +66,85 @@ pub(crate) struct TransportWriter {
     config: AgentTransportConfig,
     runtime: Option<tokio::runtime::Runtime>,
     connection: Option<UnixStream>,
+    limits: CaptureTransportLimits,
+    max_encoded_record_bytes: usize,
+    event_deadline: Option<Instant>,
 }
 
 impl TransportWriter {
     pub(crate) fn new(config: AgentTransportConfig) -> io::Result<Self> {
+        Self::with_limits(
+            config,
+            CaptureTransportLimits {
+                max_attempts: 3,
+                ..Default::default()
+            },
+            proxy_capture_protocol::MAX_RECORD_BYTES,
+        )
+    }
+
+    pub(crate) fn with_limits(
+        config: AgentTransportConfig,
+        limits: CaptureTransportLimits,
+        max_encoded_record_bytes: usize,
+    ) -> io::Result<Self> {
         config.validate()?;
+        if limits.max_attempts == 0
+            || limits.backoff_initial > limits.backoff_max
+            || max_encoded_record_bytes == 0
+            || max_encoded_record_bytes > proxy_capture_protocol::MAX_RECORD_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid capture transport limits",
+            ));
+        }
         Ok(Self {
             config,
             runtime: None,
             connection: None,
+            limits,
+            max_encoded_record_bytes,
+            event_deadline: None,
         })
     }
+
+    pub(crate) fn set_event_deadline(&mut self, deadline: Instant) {
+        self.event_deadline = Some(deadline);
+    }
+}
+
+async fn bounded<T>(
+    deadline: Instant,
+    phase: Duration,
+    work: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "metadata event deadline expired",
+        ));
+    }
+    tokio::time::timeout(remaining.min(phase), work)
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "metadata transport deadline expired",
+            )
+        })?
+}
+
+fn retry_cap(limits: &CaptureTransportLimits, attempt: u16) -> Duration {
+    let mut cap = limits.backoff_initial.min(limits.backoff_max);
+    for _ in 0..attempt {
+        cap = cap.saturating_mul(2).min(limits.backoff_max);
+        if cap == limits.backoff_max {
+            break;
+        }
+    }
+    cap
 }
 
 async fn connect(config: &AgentTransportConfig) -> io::Result<UnixStream> {
@@ -82,8 +177,19 @@ async fn connect(config: &AgentTransportConfig) -> io::Result<UnixStream> {
 
 impl Write for TransportWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let started = Instant::now();
+        let deadline = self
+            .event_deadline
+            .take()
+            .or_else(|| started.checked_add(self.limits.event_deadline))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "metadata event deadline overflow",
+                )
+            })?;
         let payload = data.strip_suffix(b"\n").unwrap_or(data);
-        if payload.len() > proxy_capture_protocol::MAX_RECORD_BYTES {
+        if payload.len() > self.max_encoded_record_bytes {
             return Err(io::Error::other("encoded metadata exceeds frame limit"));
         }
         // Already bounded and serialized by the collector, never the request worker.
@@ -91,6 +197,7 @@ impl Write for TransportWriter {
             .map_err(|_| io::Error::other("invalid metadata envelope"))?;
         let config = &self.config;
         let connection = &mut self.connection;
+        let limits = &self.limits;
         if self.runtime.is_none() {
             self.runtime = Some(
                 tokio::runtime::Builder::new_current_thread()
@@ -98,15 +205,31 @@ impl Write for TransportWriter {
                     .build()?,
             );
         }
-        self.runtime.as_ref().unwrap().block_on(async {
-            for attempt in 0..3 {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| io::Error::other("metadata runtime unavailable"))?;
+        runtime.block_on(async {
+            for attempt in 0..limits.max_attempts {
+                if Instant::now() >= deadline {
+                    break;
+                }
                 let exchange = async {
                     if connection.is_none() {
-                        *connection = Some(connect(config).await?);
+                        *connection = Some(
+                            bounded(deadline, limits.connect_deadline, connect(config)).await?,
+                        );
                     }
-                    let stream = connection.as_mut().unwrap();
-                    write_frame(stream, Kind::Record, payload).await?;
-                    let frame = read_frame(stream).await?;
+                    let stream = connection
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("metadata connection unavailable"))?;
+                    bounded(
+                        deadline,
+                        limits.write_deadline,
+                        write_frame(stream, Kind::Record, payload),
+                    )
+                    .await?;
+                    let frame = bounded(deadline, limits.ack_deadline, read_frame(stream)).await?;
                     if frame.kind != Kind::Receipt {
                         return Err(io::Error::other("invalid metadata receipt"));
                     }
@@ -119,22 +242,29 @@ impl Write for TransportWriter {
                     }
                     Ok(receipt)
                 };
-                match tokio::time::timeout(Duration::from_secs(2), exchange).await {
-                    Ok(Ok(receipt))
+                match exchange.await {
+                    Ok(receipt)
                         if receipt.outcome == Outcome::Durable
                             && receipt.sequence.is_some_and(|s| s > 0) =>
                     {
                         return Ok(data.len())
                     }
-                    Ok(Ok(_)) => return Err(io::Error::other("metadata agent declined capture")),
+                    Ok(_) => return Err(io::Error::other("metadata agent declined capture")),
                     _ => {
                         *connection = None;
-                        if attempt < 2 {
+                        if attempt + 1 < limits.max_attempts {
                             // Finite reconnect jitter, on this single off-path writer only.
                             use rand::Rng;
-                            let jitter = rand::thread_rng().gen_range(0..=25);
-                            tokio::time::sleep(Duration::from_millis((25 << attempt) + jitter))
-                                .await;
+                            let nanos = rand::thread_rng()
+                                .gen_range(0..=retry_cap(limits, attempt).as_nanos());
+                            let jitter = Duration::new(
+                                (nanos / 1_000_000_000) as u64,
+                                (nanos % 1_000_000_000) as u32,
+                            );
+                            tokio::time::sleep(
+                                jitter.min(deadline.saturating_duration_since(Instant::now())),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -158,6 +288,116 @@ mod tests {
         stats::{prometheus_render, MetadataDeliveryStats, StatsControl},
     };
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn configured_handshake_and_ack_deadlines_exhaust_attempts() {
+        for handshake in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("socket");
+            let uid = UnixStream::pair().unwrap().0.peer_cred().unwrap().uid();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut streams = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    read_frame(&mut stream).await.unwrap();
+                    if !handshake {
+                        write_frame(
+                            &mut stream,
+                            Kind::Welcome,
+                            &encode(&Welcome {
+                                version: VERSION,
+                                node_id: "node".into(),
+                            })
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(read_frame(&mut stream).await.unwrap().kind, Kind::Record);
+                    }
+                    streams.push(stream);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+            let writer = tokio::task::spawn_blocking(move || {
+                let mut writer = TransportWriter::with_limits(
+                    AgentTransportConfig {
+                        socket_path: socket,
+                        expected_agent_uid: uid,
+                        expected_node_id: "node".into(),
+                        producer_id: "proxy".into(),
+                    },
+                    CaptureTransportLimits {
+                        connect_deadline: Duration::from_millis(20),
+                        ack_deadline: Duration::from_millis(20),
+                        backoff_initial: Duration::ZERO,
+                        backoff_max: Duration::ZERO,
+                        max_attempts: 2,
+                        ..Default::default()
+                    },
+                    proxy_capture_protocol::MAX_RECORD_BYTES,
+                )
+                .unwrap();
+                writer.write(&serde_json::to_vec(&record()).unwrap())
+            });
+            assert!(tokio::time::timeout(Duration::from_secs(2), writer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err());
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn expired_queue_age_and_encoded_bound_prevent_connect() {
+        let config = AgentTransportConfig {
+            socket_path: PathBuf::from("/nonexistent/capture/socket"),
+            expected_agent_uid: 0,
+            expected_node_id: "node".into(),
+            producer_id: "proxy".into(),
+        };
+        let payload = serde_json::to_vec(&record()).unwrap();
+        let mut writer =
+            TransportWriter::with_limits(config.clone(), Default::default(), payload.len() - 1)
+                .unwrap();
+        assert!(writer.write(&payload).is_err());
+        assert!(writer.runtime.is_none());
+        let mut writer =
+            TransportWriter::with_limits(config, Default::default(), payload.len()).unwrap();
+        writer.set_event_deadline(Instant::now());
+        let started = Instant::now();
+        assert!(writer.write(&payload).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(writer.event_deadline.is_none());
+    }
+
+    #[test]
+    fn exponential_backoff_saturates() {
+        let limits = CaptureTransportLimits::default();
+        assert_eq!(limits.max_attempts, 4);
+        assert_eq!(retry_cap(&limits, 0), Duration::from_millis(50));
+        assert_eq!(retry_cap(&limits, 1), Duration::from_millis(100));
+        assert_eq!(retry_cap(&limits, u16::MAX), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn event_age_caps_blocked_write() {
+        let (mut sender, _receiver) = tokio::io::duplex(1);
+        let started = Instant::now();
+        let error = bounded(
+            started + Duration::from_millis(20),
+            Duration::from_secs(1),
+            write_frame(&mut sender, Kind::Record, b"record"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[tokio::test]
     async fn forged_event_receipts_never_increment_durable_delivery() {

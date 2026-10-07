@@ -128,7 +128,7 @@ pub struct RequestRecord {
 }
 
 impl RequestRecord {
-    fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>()
             + self.attempts.capacity() * std::mem::size_of::<AttemptRecord>();
         total =
@@ -254,6 +254,14 @@ pub enum SubmitResult {
 }
 
 pub trait RequestRecordSink: Send + Sync {
+    fn requires_admission(&self) -> bool {
+        false
+    }
+    /// Legacy sinks have no admission lease. Declarative capture reserves before retention.
+    #[cfg(unix)]
+    fn try_admit(&self) -> Result<Option<Arc<crate::capture::CaptureLease>>, SubmitResult> {
+        Ok(None)
+    }
     fn submit(&self, record: RequestRecord) -> SubmitResult;
     fn max_attempts(&self) -> u16 {
         MAX_ATTEMPTS

@@ -173,6 +173,9 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         // `tests/ir_readership.rs` is what would have caught a field that was
         // named here but never read.
         metrics: None,
+        #[cfg(unix)]
+        end_user_capture: None,
+        end_user_capture_configured: false,
         // WP-20 increment 1: this fixture is a static-config snapshot, which
         // is what `None` means -- no control plane is involved.
         ads: None,
@@ -324,6 +327,9 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         tracing: None,
         // WP-51 increment 4: see the other snapshot fixture in this file.
         metrics: None,
+        #[cfg(unix)]
+        end_user_capture: None,
+        end_user_capture_configured: false,
         ads: None,
         version: SnapshotVersion(1),
     })

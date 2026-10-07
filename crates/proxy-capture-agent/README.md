@@ -70,8 +70,11 @@ operational exporters. They do not implement the broader capture-policy IR
 proposal. `--request-records-file` conflicts with agent mode; the legacy JSONL
 path and its semantics are unchanged. `--request-record-max-attempts` remains
 1–64, default 64. Capture stays off when neither destination is supplied.
-The proposed `node.metadata["io.llmproxy.capture"]` namespace is explicitly
-rejected; no simple-config capture fields or body knobs are supported.
+The separate [strict capture runtime](../../internal-docs/end-user-capture-runtime.md)
+supports `node.metadata["io.llmproxy.capture"]`, including bounded policy/IR
+consumers, SIGHUP reload, and authenticated emergency control. It cannot be
+combined with these legacy CLI destinations. No simple-config capture fields
+or body/backend knobs are supported.
 
 The proxy never connects or serializes on a request worker. One dedicated writer
 owns a persistent connection and a 1,024-event queue, with at most 64 KiB retained
@@ -81,7 +84,7 @@ readiness and never invokes a synchronous fallback. Existing per-stream caps
 are unchanged; this increment does not implement the proposal's global active
 capture-state supervisor or claim a whole-proxy memory cap.
 
-Each event has at most three transport attempts, each bounded by two seconds,
+Each legacy event has at most three transport attempts with bounded phase/event deadlines,
 with finite reconnect jitter. Exhaustion records failed/unconfirmed delivery;
 later events can reconnect. It is not proof that an ambiguous event was lost.
 Retries preserve the event ID but may append duplicates after lost ACKs. Without
@@ -133,4 +136,7 @@ Use `make tq-proxy-capture-protocol`, `make tq-proxy-capture-agent`,
 `make t1 CRATE=proxy TEST=metadata_agent`, then `make tq-changed`, `make tq`,
 `make tq-doc`, and workspace lint/dependency checks. Local socket and upstream
 tests require sandbox permission to bind isolated endpoints. Backend, transcript,
-policy reload/emergency control, and scale qualification remain separate work.
+and scale qualification remain separate work. The proxy's
+[strict capture runtime](../../internal-docs/end-user-capture-runtime.md) now
+provides policy reload and authenticated emergency control, independently of
+this agent's deployment configuration.

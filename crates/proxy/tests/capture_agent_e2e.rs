@@ -15,6 +15,331 @@ use std::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 
+#[test]
+fn declarative_validate_is_offline_and_rejects_disabled_namespace_cli_collision() {
+    let temp = tempfile::tempdir().unwrap();
+    let bootstrap = temp.path().join("proxy.yaml");
+    let capture = serde_json::json!({"version":1,"metadata":{"enabled":true},"policy":{"version":"offline"},
+        "endpoint":{"unix_socket_path":"/nonexistent/agent.sock","expected_agent_uid":1,"expected_node_id":"node","producer_id":"proxy"},
+        "emergency_control":{"unix_socket_path":"/nonexistent/control.sock","operator_uid":1}});
+    std::fs::write(
+        &bootstrap,
+        format!("node:\n  metadata:\n    io.llmproxy.capture: {capture}\n"),
+    )
+    .unwrap();
+    let output = Command::new(BIN)
+        .arg("-c")
+        .arg(&bootstrap)
+        .args(["--mode", "validate", "--concurrency", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(
+        &bootstrap,
+        "node:\n  metadata:\n    io.llmproxy.capture: {version: 1, metadata: {enabled: false}}\n",
+    )
+    .unwrap();
+    let destination = temp.path().join("records.jsonl");
+    let output = Command::new(BIN)
+        .arg("-c")
+        .arg(&bootstrap)
+        .args(["--mode", "validate", "--request-records-file"])
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("node.metadata[\"io.llmproxy.capture\"]")
+    );
+    assert!(!destination.exists());
+}
+
+fn control(path: &std::path::Path, command: serde_json::Value) -> serde_json::Value {
+    let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let bytes = serde_json::to_vec(&command).unwrap();
+    assert!(bytes.len() <= 1024);
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&bytes).unwrap();
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    let size = u32::from_be_bytes(prefix) as usize;
+    assert!((1..=1024).contains(&size));
+    let mut response = vec![0; size];
+    stream.read_exact(&mut response).unwrap();
+    serde_json::from_slice(&response).unwrap()
+}
+
+fn keepalive_get(stream: &mut TcpStream, path: &str) {
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: test.local\r\n\r\n").unwrap();
+    // Read exactly one response; never consume bytes from a later response.
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        assert!(response.len() < 16384, "oversized response headers");
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        response.push(byte[0]);
+    }
+    let headers = String::from_utf8(response).unwrap();
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("content-length: 0")),
+        "{headers}"
+    );
+    assert!(
+        !headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("connection: close")),
+        "{headers}"
+    );
+}
+
+fn declarative_bootstrap(
+    listener: u16,
+    admin: u16,
+    upstream: u16,
+    capture: &serde_json::Value,
+) -> String {
+    format!(
+        r#"
+node:
+  id: test-proxy
+  cluster: test
+  metadata:
+    "io.llmproxy.capture": {capture}
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: {admin} }}
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {listener} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: backend }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: {upstream} }}
+"#
+    )
+}
+
+#[test]
+fn declarative_capture_reload_and_emergency_gate_on_existing_keepalive() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = temp.path().join("agent.sock");
+    let control_socket = temp.path().join("control.sock");
+    let key = temp.path().join("key");
+    std::fs::write(&key, [9; 32]).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let uid = runtime.block_on(async {
+        tokio::net::UnixStream::pair()
+            .unwrap()
+            .0
+            .peer_cred()
+            .unwrap()
+            .uid()
+    });
+    let agent_config = serde_json::json!({
+        "version":1,"mode":"metadata_spool_only","socket_path":socket,"node_id":"test-node",
+        "producers":[{"producer_id":"test-proxy","uid":uid,"tenants":["default"]}],
+        "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,
+            "max_segment_bytes":1048576,"max_disk_bytes":4194304,"max_segments":8,"max_segment_age_seconds":60},
+        "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]
+    });
+    let agent = collector(serde_json::from_value(agent_config.clone()).unwrap());
+    let upstream = mock();
+    let listener = port();
+    let admin = port();
+    let bootstrap = temp.path().join("proxy.yaml");
+    let log = temp.path().join("proxy.log");
+    let mut capture = serde_json::json!({
+        "version":1,"metadata":{"enabled":true,"max_attempts":8},"policy":{"version":"first"},
+        "endpoint":{"unix_socket_path":socket,"expected_agent_uid":uid,
+            "expected_node_id":"test-node","producer_id":"test-proxy"},
+        "emergency_control":{"unix_socket_path":control_socket,"operator_uid":uid}
+    });
+    std::fs::write(
+        &bootstrap,
+        declarative_bootstrap(listener, admin, upstream.address.port(), &capture),
+    )
+    .unwrap();
+    let mut proxy = Proxy(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&bootstrap)
+            .args(["--concurrency", "1", "--drain-time-s", "0"])
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    wait(|| {
+        assert!(
+            proxy.0.try_wait().unwrap().is_none(),
+            "proxy exited before binding"
+        );
+        control_socket.exists()
+            && TcpStream::connect(("127.0.0.1", listener)).is_ok()
+            && TcpStream::connect(("127.0.0.1", admin)).is_ok()
+    });
+    let mut downstream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], listener)),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    downstream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    downstream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    keepalive_get(&mut downstream, "/first");
+    wait(|| get(admin, "/stats/prometheus").contains("envoy_llmproxy_metadata_durable 1\n"));
+
+    capture["policy"]["version"] = "second".into();
+    std::fs::write(
+        &bootstrap,
+        declarative_bootstrap(listener, admin, upstream.address.port(), &capture),
+    )
+    .unwrap();
+    assert!(Command::new("kill")
+        .args(["-HUP", &proxy.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    wait(|| {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("SIGHUP: config reload succeeded")
+            .count()
+            == 1
+    });
+    keepalive_get(&mut downstream, "/second");
+    wait(|| get(admin, "/stats/prometheus").contains("envoy_llmproxy_metadata_durable 2\n"));
+
+    let status = control(&control_socket, serde_json::json!({"command":"Status"}));
+    assert_eq!(status["disabled"], false);
+    let generation = status["generation"].as_u64().unwrap();
+    let disabled = control(
+        &control_socket,
+        serde_json::json!({"command":"Disable","expected_generation":generation}),
+    );
+    assert_eq!(disabled["disabled"], true);
+    let disabled_generation = disabled["generation"].as_u64().unwrap();
+    assert!(disabled_generation > generation);
+    let stale = control(
+        &control_socket,
+        serde_json::json!({"command":"Enable","expected_generation":generation}),
+    );
+    assert!(stale["error"].is_string(), "{stale}");
+    keepalive_get(&mut downstream, "/disabled");
+
+    capture["policy"]["version"] = "third".into();
+    std::fs::write(
+        &bootstrap,
+        declarative_bootstrap(listener, admin, upstream.address.port(), &capture),
+    )
+    .unwrap();
+    assert!(Command::new("kill")
+        .args(["-HUP", &proxy.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    wait(|| {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("SIGHUP: config reload succeeded")
+            .count()
+            == 2
+    });
+    let status = control(&control_socket, serde_json::json!({"command":"Status"}));
+    assert_eq!(status["disabled"], true);
+    assert_eq!(status["generation"], disabled_generation);
+    keepalive_get(&mut downstream, "/disabled-after-reload");
+    assert!(get(admin, "/stats/prometheus").contains("envoy_llmproxy_metadata_durable 2\n"));
+    let enabled = control(
+        &control_socket,
+        serde_json::json!({"command":"Enable","expected_generation":disabled_generation}),
+    );
+    assert_eq!(enabled["disabled"], false);
+    assert!(enabled["generation"].as_u64().unwrap() > disabled_generation);
+    keepalive_get(&mut downstream, "/third");
+    wait(|| get(admin, "/stats/prometheus").contains("envoy_llmproxy_metadata_durable 3\n"));
+    drop(downstream);
+    assert!(Command::new("kill")
+        .args(["-TERM", &proxy.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    wait(|| proxy.0.try_wait().unwrap().is_some());
+    drop(agent);
+    let agent_config: Config = serde_json::from_value(agent_config).unwrap();
+    let (active, recovery) = agent_config.load_keys().unwrap();
+    let spool = MetadataSpool::open(agent_config.spool_config(), active, recovery).unwrap();
+    let records = spool.replay(0, 64, 1048576).unwrap();
+    assert_eq!(
+        records.len(),
+        3,
+        "disabled requests must never reach the spool"
+    );
+    let records: Vec<proxy_observability::records::RequestRecord> = records
+        .iter()
+        .map(|record| serde_json::from_slice(&record.payload).unwrap())
+        .collect();
+    for (record, version) in records.iter().zip(["first", "second", "third"]) {
+        let pinned = record.capture_policy_version.as_deref().unwrap();
+        assert!(pinned.starts_with(&format!("{version}:")));
+        assert_eq!(pinned.rsplit(':').next().unwrap().len(), 64);
+        assert_eq!(record.status, Some(200));
+        assert_eq!(record.tenant_id, "default");
+        assert_eq!(record.selected_cluster.as_deref(), Some("backend"));
+        assert_eq!(record.physical_attempt_count, 1);
+    }
+}
+
 struct Proxy(Child);
 impl Drop for Proxy {
     fn drop(&mut self) {
@@ -52,9 +377,7 @@ fn mock() -> Mock {
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
                     let _ = stream.read(&mut [0; 4096]);
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5))
