@@ -1,0 +1,18 @@
+[package]
+name = "proxy-capture-spool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ring.workspace = true
+thiserror.workspace = true
+# Safe flock releases on process death; already present in Cargo.lock and MSRV 1.63.
+rustix = { version = "=1.1.4", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = { version = "=3.27.0", default-features = false }
+
+[lints]
+workspace = true

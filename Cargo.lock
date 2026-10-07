@@ -1681,6 +1681,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy-capture-spool"
+version = "0.2.0"
+dependencies = [
+ "ring",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "proxy-cluster"
 version = "0.2.0"
 dependencies = [
