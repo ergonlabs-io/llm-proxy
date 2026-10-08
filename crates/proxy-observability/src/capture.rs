@@ -1,12 +1,13 @@
 //! Stable process-wide metadata admission. No socket, serialization, or await on workers.
 use crate::{
     capture_policy::EndUserCaptureConfig,
-    capture_transport::{DeliveryOutcome, TransportSession},
+    capture_transport::{retry_cap, DeliveryAttempt, DeliveryOutcome, TransportSession},
     records::{RequestRecord, RequestRecordSink, SubmitResult},
     stats::MetadataDeliveryStats,
 };
 use arc_swap::ArcSwapOption;
 use std::{
+    collections::VecDeque,
     io::{self, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -28,6 +29,32 @@ struct Pool {
 }
 struct Destination {
     deadline: Mutex<Option<Instant>>,
+    availability: Mutex<Availability>,
+}
+#[derive(Default)]
+struct Availability {
+    retry_at: Option<Instant>,
+    probing: bool,
+}
+impl Availability {
+    fn ready(&self, now: Instant) -> bool {
+        !self.probing && self.retry_at.is_none_or(|at| now >= at)
+    }
+    fn start(&mut self) -> bool {
+        let probe = self.retry_at.is_some();
+        self.probing = probe;
+        probe
+    }
+    fn finish(&mut self, probe: bool, unavailable: bool, durable: bool, delay: Duration) {
+        if probe {
+            self.probing = false;
+        }
+        if durable && (probe || self.retry_at.is_none()) {
+            *self = Self::default();
+        } else if unavailable && (probe || self.retry_at.is_none()) {
+            self.retry_at = Some(Instant::now() + delay);
+        }
+    }
 }
 impl Destination {
     fn live(&self) -> bool {
@@ -52,9 +79,10 @@ struct Shared {
     // Packed publication keeps disabled and generation coherent.
     gate: AtomicU64,
     closed: AtomicBool,
+    delivery_closed: AtomicBool,
     changes: watch::Sender<u64>,
     stats: MetadataDeliveryStats,
-    tx: mpsc::Sender<Option<Event>>,
+    tx: mpsc::Sender<Option<Box<Event>>>,
     control: Mutex<Option<Control>>,
     instance_id: String,
 }
@@ -70,6 +98,9 @@ struct Event {
     record: RequestRecord,
     permit: CaptureTerminalPermit,
     enqueued: Instant,
+    attempts: u16,
+    ambiguous: bool,
+    retry_at: Instant,
 }
 pub struct CaptureLease {
     shared: Arc<Shared>,
@@ -124,11 +155,12 @@ impl CaptureLease {
             return Err(SubmitResult::Disabled);
         }
         let shared = &self.shared;
-        let _lock = shared
-            .pool
-            .lock
-            .try_lock()
-            .map_err(|_| SubmitResult::CapacityExceeded)?;
+        let _lock = shared.pool.lock.try_lock().map_err(|_| {
+            shared
+                .stats
+                .record_submission(SubmitResult::CapacityExceeded);
+            SubmitResult::CapacityExceeded
+        })?;
         let current = shared
             .current
             .load_full()
@@ -197,11 +229,14 @@ impl CaptureTerminalPermit {
             match shared.tx.try_reserve() {
                 Ok(slot) => {
                     shared.stats.record_enqueued();
-                    slot.send(Some(Event {
+                    slot.send(Some(Box::new(Event {
                         record,
                         permit: self,
                         enqueued: Instant::now(),
-                    }));
+                        attempts: 0,
+                        ambiguous: false,
+                        retry_at: Instant::now(),
+                    })));
                     SubmitResult::Accepted
                 }
                 Err(_) => SubmitResult::Closed,
@@ -221,7 +256,7 @@ pub struct CaptureStatus {
 }
 impl CaptureSupervisor {
     pub fn start(stats: MetadataDeliveryStats) -> io::Result<(Self, CaptureDelivery)> {
-        let (tx, rx) = mpsc::channel::<Option<Event>>(65536);
+        let (tx, rx) = mpsc::channel::<Option<Box<Event>>>(65536);
         let (changes, _) = watch::channel(0);
         let (done_tx, done) = oneshot::channel();
         let instance_id = crate::trace::TraceContext::new_root(false)
@@ -238,6 +273,7 @@ impl CaptureSupervisor {
             pool: Arc::new(Pool::default()),
             gate: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            delivery_closed: AtomicBool::new(false),
             changes,
             stats,
             tx,
@@ -249,10 +285,11 @@ impl CaptureSupervisor {
             .enable_all()
             .build()?;
         let delivery_changes = shared.changes.subscribe();
+        let delivery_owner = Arc::downgrade(&shared);
         std::thread::Builder::new()
             .name("llmproxy-capture".into())
             .spawn(move || {
-                runtime.block_on(run_delivery(rx, delivery_changes));
+                runtime.block_on(run_delivery(rx, delivery_changes, delivery_owner));
                 let _ = done_tx.send(());
             })?;
         Ok((
@@ -356,6 +393,7 @@ impl CaptureSupervisor {
                 }
                 Arc::new(Destination {
                     deadline: Mutex::new(None),
+                    availability: Mutex::new(Availability::default()),
                 })
             };
             let policy = Arc::new(Policy {
@@ -379,6 +417,9 @@ impl CaptureSupervisor {
         self.shared
             .stats
             .change_queue_capacity(new_capacity as i64 - old_capacity as i64);
+        self.shared
+            .changes
+            .send_replace(self.shared.gate.load(Ordering::Acquire));
         Ok(())
     }
     pub fn status(&self) -> CaptureStatus {
@@ -488,8 +529,12 @@ impl CaptureSupervisor {
 impl CaptureDelivery {
     pub async fn shutdown(self, deadline: Duration) -> bool {
         self.shared.closed.store(true, Ordering::Release);
+        self.shared.delivery_closed.store(true, Ordering::Release);
         self.shared.control.lock().unwrap().take();
         let _ = self.shared.tx.try_send(None);
+        self.shared
+            .changes
+            .send_replace(self.shared.gate.load(Ordering::Acquire));
         !matches!(tokio::time::timeout(deadline, self.done).await, Ok(Ok(())))
     }
 }
@@ -537,109 +582,190 @@ fn reserve_transport(event: &Event) -> TransportAdmission {
     })
 }
 
-async fn run_delivery(mut rx: mpsc::Receiver<Option<Event>>, mut changes: watch::Receiver<u64>) {
+fn retry_delay(
+    limits: &crate::capture_transport::CaptureTransportLimits,
+    attempt: u16,
+) -> Duration {
+    use rand::Rng;
+    let nanos = rand::thread_rng().gen_range(0..=retry_cap(limits, attempt).as_nanos());
+    Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
+}
+
+fn finish_event(event: Event, outcome: DeliveryOutcome) {
+    use crate::stats::CaptureDrop;
+    let stats = &event.permit.shared.stats;
+    if outcome == DeliveryOutcome::Durable {
+        stats.record_written();
+        stats.record_durable();
+    } else {
+        let reason = if event.ambiguous {
+            CaptureDrop::DeliveryUnknown
+        } else {
+            match outcome {
+                DeliveryOutcome::Rejected => CaptureDrop::AgentRejected,
+                DeliveryOutcome::Unavailable => CaptureDrop::Unavailable,
+                DeliveryOutcome::Expired => CaptureDrop::Expired,
+                DeliveryOutcome::Disabled => CaptureDrop::Disabled,
+                _ => CaptureDrop::DeliveryUnknown,
+            }
+        };
+        stats.capture_drop(reason);
+        stats.record_write_failure();
+    }
+}
+
+async fn run_delivery(
+    mut rx: mpsc::Receiver<Option<Box<Event>>>,
+    mut changes: watch::Receiver<u64>,
+    owner: Weak<Shared>,
+) {
     let mut jobs = tokio::task::JoinSet::new();
     let mut idle: Vec<(usize, Option<TransportSession>)> =
         (0..DELIVERY_SLOTS).map(|i| (i, None)).collect();
-    let mut pending: Option<Event> = None;
+    // These are the original admitted events, moved from the ingress channel.
+    // Their queue/event/byte reservations remain held; no copies or new permits.
+    let mut pending: VecDeque<Box<Event>> = VecDeque::new();
     let mut closed = false;
+    let mut watch_open = true;
     loop {
-        if let Some(event) = pending.take() {
-            use crate::stats::CaptureDrop;
-            let drop_reason = if !event.permit.live() {
-                Some(CaptureDrop::Disabled)
-            } else if event.enqueued.elapsed()
-                >= event.permit.policy.config.transport.event_deadline
-            {
-                Some(CaptureDrop::Expired)
-            } else {
-                None
-            };
-            if let Some(reason) = drop_reason {
-                event.permit.shared.stats.record_dequeued();
-                event.permit.shared.stats.capture_drop(reason);
-                continue;
-            }
-            let admission = if idle.is_empty() {
-                TransportAdmission::Busy
-            } else {
-                reserve_transport(&event)
-            };
-            match admission {
-                TransportAdmission::Ready(reservation) => {
+        if owner
+            .upgrade()
+            .is_none_or(|s| s.delivery_closed.load(Ordering::Acquire))
+        {
+            rx.close();
+        }
+        let mut wake = Instant::now() + Duration::from_secs(60);
+        // A ready healthy destination gets first use of a lower slot ceiling;
+        // an old unavailable probe cannot repeatedly take its only slot.
+        for unavailable_pass in [false, true] {
+            for _ in 0..pending.len() {
+                let event = pending.pop_front().unwrap();
+                let now = Instant::now();
+                let deadline = event.enqueued + event.permit.policy.config.transport.event_deadline;
+                let drain = *event.permit.policy.destination.deadline.lock().unwrap();
+                let deadline = drain.map_or(deadline, |d| d.min(deadline));
+                let outcome = if now >= deadline {
+                    Some(DeliveryOutcome::Expired)
+                } else if !event.permit.live() {
+                    Some(DeliveryOutcome::Disabled)
+                } else {
+                    None
+                };
+                if let Some(outcome) = outcome {
                     event.permit.shared.stats.record_dequeued();
-                    let (slot, session) = idle.pop().unwrap();
-                    jobs.spawn(async move {
-                        let session = deliver_event(event, reservation, session).await;
-                        (slot, session)
-                    });
+                    finish_event(*event, outcome);
                     continue;
                 }
-                TransportAdmission::TooLarge => {
-                    event.permit.shared.stats.record_dequeued();
-                    event
-                        .permit
-                        .shared
-                        .stats
-                        .capture_drop(CaptureDrop::TransportCapacity);
-                    continue;
+                wake = wake.min(deadline);
+                let available = {
+                    let availability = event.permit.policy.destination.availability.lock().unwrap();
+                    if !availability.probing {
+                        if let Some(at) = availability.retry_at.filter(|at| *at > now) {
+                            wake = wake.min(at);
+                        }
+                    }
+                    availability.ready(now) && availability.retry_at.is_some() == unavailable_pass
+                };
+                if event.retry_at > now {
+                    wake = wake.min(event.retry_at);
                 }
-                TransportAdmission::Busy => pending = Some(event),
+                let admission = if idle.is_empty() || !available || event.retry_at > now {
+                    TransportAdmission::Busy
+                } else {
+                    reserve_transport(&event)
+                };
+                match admission {
+                    TransportAdmission::Ready(reservation) => {
+                        let probe = event
+                            .permit
+                            .policy
+                            .destination
+                            .availability
+                            .lock()
+                            .unwrap()
+                            .start();
+                        event.permit.shared.stats.record_dequeued();
+                        let (slot, session) = idle.pop().unwrap();
+                        jobs.spawn(async move {
+                            let (session, retry) =
+                                deliver_event(event, reservation, session, probe).await;
+                            (slot, session, retry)
+                        });
+                    }
+                    TransportAdmission::TooLarge => {
+                        event.permit.shared.stats.record_dequeued();
+                        event
+                            .permit
+                            .shared
+                            .stats
+                            .capture_drop(crate::stats::CaptureDrop::TransportCapacity);
+                    }
+                    TransportAdmission::Busy => pending.push_back(event),
+                }
             }
         }
-        if closed && pending.is_none() && jobs.is_empty() {
+        if closed && pending.is_empty() && jobs.is_empty() {
             break;
         }
         tokio::select! {
             joined = jobs.join_next(), if !jobs.is_empty() => {
                 match joined {
-                    Some(Ok(slot)) => idle.push(slot),
-                    // Fail closed on an internal task panic instead of losing a slot and spinning.
+                    Some(Ok((slot, session, retry))) => {
+                        idle.push((slot, session));
+                        if let Some(event) = retry {
+                            event.permit.shared.stats.record_enqueued();
+                            pending.push_back(event);
+                        }
+                    }
                     _ => { rx.close(); break; }
                 }
             }
-            received = rx.recv(), if pending.is_none() && !closed => {
+            received = rx.recv(), if !closed => {
                 match received {
-                    Some(Some(event)) => pending = Some(event),
+                    Some(Some(event)) => pending.push_back(event),
                     Some(None) => rx.close(),
                     None => closed = true,
                 }
             }
-            changed = changes.changed() => {
-                if changed.is_err() && jobs.is_empty() && pending.is_none() { rx.close(); closed = true; }
+            changed = changes.changed(), if watch_open => {
+                if changed.is_err() { watch_open = false; rx.close(); }
             }
+            _ = tokio::time::sleep_until(wake.into()), if !pending.is_empty() => {}
         }
     }
 }
 
 async fn deliver_event(
-    event: Event,
+    mut event: Box<Event>,
     _reservation: TransportReservation,
     session: Option<TransportSession>,
-) -> Option<TransportSession> {
-    use crate::stats::CaptureDrop;
+    probe: bool,
+) -> (Option<TransportSession>, Option<Box<Event>>) {
     let config = &event.permit.policy.config;
+    let destination = event.permit.policy.destination.clone();
     let deadline = event.enqueued + config.transport.event_deadline;
-    let deadline = event
-        .permit
-        .policy
-        .destination
+    let deadline = destination
         .deadline
         .lock()
         .unwrap()
         .map_or(deadline, |d| d.min(deadline));
     // Dispatch and the first task poll can straddle disable or destination drain.
-    // Check again before cloning endpoint identity or allocating encoded output.
-    let drop_reason = if !event.permit.live() {
-        Some(CaptureDrop::Disabled)
-    } else if Instant::now() >= deadline {
-        Some(CaptureDrop::Expired)
-    } else {
-        None
-    };
-    if let Some(reason) = drop_reason {
-        event.permit.shared.stats.capture_drop(reason);
-        return session;
+    if !event.permit.live() || Instant::now() >= deadline {
+        destination
+            .availability
+            .lock()
+            .unwrap()
+            .finish(probe, false, false, Duration::ZERO);
+        let outcome = if !event.permit.live() {
+            DeliveryOutcome::Disabled
+        } else {
+            DeliveryOutcome::Expired
+        };
+        finish_event(*event, outcome);
+        return (session, None);
     }
     let mut session = session
         .filter(|s| s.matches(&config.endpoint))
@@ -649,16 +775,26 @@ async fn deliver_event(
         limit: config.metadata.max_encoded_record_bytes,
     };
     if serde_json::to_writer(&mut bytes, &event.record).is_err() {
+        destination
+            .availability
+            .lock()
+            .unwrap()
+            .finish(probe, false, false, Duration::ZERO);
         event
             .permit
             .shared
             .stats
-            .capture_drop(CaptureDrop::EncodedLimit);
+            .capture_drop(crate::stats::CaptureDrop::EncodedLimit);
         event.permit.shared.stats.record_write_failure();
-        return Some(session);
+        return (Some(session), None);
     }
-    let outcome = session
-        .deliver(
+    event.attempts += 1;
+    let DeliveryAttempt {
+        outcome,
+        unavailable,
+        retryable,
+    } = session
+        .attempt(
             &bytes.data,
             &event.record.event_id,
             &config.transport,
@@ -666,25 +802,23 @@ async fn deliver_event(
             || event.permit.live(),
         )
         .await;
-    match outcome {
-        DeliveryOutcome::Durable => {
-            event.permit.shared.stats.record_written();
-            event.permit.shared.stats.record_durable();
-        }
-        other => {
-            let reason = match other {
-                DeliveryOutcome::Rejected => CaptureDrop::AgentRejected,
-                DeliveryOutcome::Unavailable => CaptureDrop::Unavailable,
-                DeliveryOutcome::Expired => CaptureDrop::Expired,
-                DeliveryOutcome::Disabled => CaptureDrop::Disabled,
-                _ => CaptureDrop::DeliveryUnknown,
-            };
-            event.permit.shared.stats.capture_drop(reason);
-            event.permit.shared.stats.record_write_failure();
-        }
+    let delay = retry_delay(&config.transport, event.attempts - 1);
+    {
+        let mut availability = destination.availability.lock().unwrap();
+        availability.finish(
+            probe,
+            unavailable,
+            outcome == DeliveryOutcome::Durable,
+            delay,
+        );
     }
-    // Both input and serialization reservations remain owned through the ACK.
-    Some(session)
+    event.ambiguous |= outcome == DeliveryOutcome::Unknown;
+    if retryable && event.attempts < config.transport.max_attempts {
+        event.retry_at = Instant::now() + delay;
+        return (Some(session), Some(event));
+    }
+    finish_event(*event, outcome);
+    (Some(session), None)
 }
 
 struct BoundedEncoding {
@@ -818,5 +952,35 @@ impl CaptureSupervisor {
             task,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use crate::stats::{prometheus_render, StatsControl};
+
+    #[tokio::test]
+    async fn contended_terminal_reservation_records_an_explicit_capacity_decline() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::capture_tests::config(&temp);
+        let stats = StatsControl::new(1);
+        let (supervisor, delivery) =
+            CaptureSupervisor::start(MetadataDeliveryStats::resolve(&stats)).unwrap();
+        supervisor.configure(Some(config), 1).unwrap();
+        let lease = supervisor.try_admit().unwrap().unwrap();
+        {
+            let _lock = supervisor.shared.pool.lock.lock().unwrap();
+            assert!(matches!(
+                lease.reserve_terminal(),
+                Err(SubmitResult::CapacityExceeded)
+            ));
+        }
+        assert_eq!(supervisor.status().outstanding_events, 0);
+        assert_eq!(supervisor.status().retained_event_bytes, 0);
+        assert!(prometheus_render::render(&stats.registry())
+            .contains("envoy_llmproxy_metadata_admission{outcome=\"capacity_exceeded\"} 1"));
+        drop(lease);
+        assert!(!delivery.shutdown(Duration::from_secs(1)).await);
     }
 }

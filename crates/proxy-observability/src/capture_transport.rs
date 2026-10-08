@@ -137,7 +137,7 @@ async fn bounded<T>(
         })?
 }
 
-fn retry_cap(limits: &CaptureTransportLimits, attempt: u16) -> Duration {
+pub(crate) fn retry_cap(limits: &CaptureTransportLimits, attempt: u16) -> Duration {
     let mut cap = limits.backoff_initial.min(limits.backoff_max);
     for _ in 0..attempt {
         cap = cap.saturating_mul(2).min(limits.backoff_max);
@@ -175,11 +175,17 @@ async fn connect(config: &AgentTransportConfig) -> io::Result<UnixStream> {
     .await?;
     let frame = read_frame(&mut stream).await?;
     if frame.kind != Kind::Welcome {
-        return Err(io::Error::other("invalid agent handshake"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid agent handshake",
+        ));
     }
     let welcome: Welcome = decode(&frame.payload)?;
     if welcome.version != VERSION || welcome.node_id != config.expected_node_id {
-        return Err(io::Error::other("agent identity or protocol mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "agent identity or protocol mismatch",
+        ));
     }
     Ok(stream)
 }
@@ -192,6 +198,12 @@ pub(crate) enum DeliveryOutcome {
     Unavailable,
     Expired,
     Disabled,
+}
+
+pub(crate) struct DeliveryAttempt {
+    pub outcome: DeliveryOutcome,
+    pub unavailable: bool,
+    pub retryable: bool,
 }
 
 /// One reusable, authenticated connection; the supervisor owns a fixed slot pool.
@@ -209,6 +221,39 @@ impl TransportSession {
     pub(crate) fn matches(&self, config: &AgentTransportConfig) -> bool {
         self.config == *config
     }
+    /// One physical attempt; retry ownership remains with the supervisor's event.
+    pub(crate) async fn attempt(
+        &mut self,
+        payload: &[u8],
+        event_id: &str,
+        limits: &CaptureTransportLimits,
+        deadline: Instant,
+        live: impl Fn() -> bool,
+    ) -> DeliveryAttempt {
+        // Rust note: the observer must be Sync to keep this borrowed async future Send.
+        let status = std::sync::atomic::AtomicU8::new(0);
+        let mut once = limits.clone();
+        once.max_attempts = 1;
+        let outcome = deliver_observed(
+            &self.config,
+            &mut self.connection,
+            payload,
+            event_id,
+            &once,
+            deadline,
+            live,
+            &status,
+        )
+        .await;
+        let flags = status.load(std::sync::atomic::Ordering::Relaxed);
+        let (unavailable, retryable) = (flags & 1 != 0, flags & 2 != 0);
+        DeliveryAttempt {
+            outcome,
+            unavailable,
+            retryable,
+        }
+    }
+    #[cfg(test)]
     pub(crate) async fn deliver(
         &mut self,
         payload: &[u8],
@@ -238,6 +283,31 @@ async fn deliver(
     limits: &CaptureTransportLimits,
     deadline: Instant,
     live: impl Fn() -> bool,
+) -> DeliveryOutcome {
+    deliver_observed(
+        config,
+        connection,
+        payload,
+        event_id,
+        limits,
+        deadline,
+        live,
+        &std::sync::atomic::AtomicU8::new(0),
+    )
+    .await
+}
+
+// The observer separates connection/receipt failure from a terminal agent rejection.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_observed(
+    config: &AgentTransportConfig,
+    connection: &mut Option<UnixStream>,
+    payload: &[u8],
+    event_id: &str,
+    limits: &CaptureTransportLimits,
+    deadline: Instant,
+    live: impl Fn() -> bool,
+    status: &std::sync::atomic::AtomicU8,
 ) -> DeliveryOutcome {
     let mut ambiguous = false;
     for attempt in 0..limits.max_attempts {
@@ -305,7 +375,8 @@ async fn deliver(
             // The agent uses Unavailable for failed commit/publication barriers.
             // Even a matching receipt cannot prove that ciphertext was not committed.
             Ok(Some(receipt)) if receipt.outcome == Outcome::Unavailable => {
-                return DeliveryOutcome::Unknown
+                status.store(1, std::sync::atomic::Ordering::Relaxed);
+                return DeliveryOutcome::Unknown;
             }
             Ok(Some(_)) => {
                 return if ambiguous {
@@ -323,7 +394,16 @@ async fn deliver(
                     DeliveryOutcome::Expired
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    *connection = None;
+                    return if ambiguous || sent {
+                        DeliveryOutcome::Unknown
+                    } else {
+                        DeliveryOutcome::Rejected
+                    };
+                }
+                status.store(3, std::sync::atomic::Ordering::Relaxed);
                 ambiguous |= sent;
                 *connection = None;
                 if attempt + 1 < limits.max_attempts {
@@ -455,6 +535,8 @@ mod tests {
     async fn rejection_is_known_unless_a_previous_copy_lost_its_receipt() {
         for (lose_first, rejection) in [
             (false, Outcome::Full),
+            (false, Outcome::Invalid),
+            (false, Outcome::Unauthorized),
             (true, Outcome::Full),
             (false, Outcome::Unavailable),
         ] {

@@ -350,7 +350,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--rates", default="5,100")
     parser.add_argument("--skip-memory", action="store_true")
-    parser.add_argument("--only", choices=("failure-checks", "memory-stress", "queue-full"),
+    parser.add_argument("--only", choices=("failure-checks", "memory-stress", "queue-full", "pause-recovery"),
                         help="Run supplemental failure checks, or just the 4800-request capture state stress")
     parser.add_argument("--summarize", type=Path, help="Regenerate the summary from an existing completed run; no load")
     args = parser.parse_args()
@@ -376,8 +376,12 @@ def main():
     binary_hashes = {name: hashlib.sha256((BIN / name).read_bytes()).hexdigest()
                      for name in ("llm-proxy", "llm-capture-agent", "mock-upstream", "loadgen")}
     production_diff = subprocess.check_output(["git", "diff", "HEAD", "--", "crates", "Cargo.toml", "Cargo.lock"], cwd=ROOT)
+    (output / "source.diff").write_bytes(production_diff)
+    (output / "qualification-script.py").write_bytes(Path(__file__).read_bytes())
     write_json(output / "environment.json", {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                                             "production_dirty": bool(production_diff),
+                                            "production_diff_file": "source.diff",
+                                            "qualification_script_file": "qualification-script.py",
                                             "production_diff_sha256": hashlib.sha256(production_diff).hexdigest(),
                                             "qualification_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                                             "platform": platform.platform(), "machine": platform.machine(),
@@ -386,6 +390,13 @@ def main():
                                             "topology": "four proxy workers; h1 pooled downstream; h2 upstream except active-state stress; encrypted local spool"})
     print(f"Qualification output: {output}", flush=True)
     runs = []
+    if args.only == "pause-recovery":
+        for rate in rates:
+            for repetition in range(args.repeats):
+                runs.append(scenario(output, f"r{rate:g}-{repetition + 1}-pause", "pause", rate, args.duration, args.warmup))
+                write_json(output / "summary.json", summarize(runs))
+        print(json.dumps(summarize(runs), indent=2), flush=True)
+        return
     if args.only == "queue-full":
         runs.append(scenario(output, "queue-full", "absent", 250, args.duration, args.warmup))
         write_json(output / "summary.json", summarize(runs))
