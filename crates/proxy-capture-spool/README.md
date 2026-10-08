@@ -15,6 +15,10 @@ or the process exits. Existing directories must have owner-only permissions.
 - `append` reserves a monotonically increasing sequence in a durable checkpoint
   before writing pending encrypted payload. `AppendReceipt` is **not** a durable
   payload acknowledgement. Dropping the handle never commits pending payloads.
+- `append_batch` accepts up to eight borrowed payloads. One durable checkpoint
+  reserves the complete range before any encryption. Per-record size/full
+  failures may leave sequence gaps; append/write failures poison the writer.
+  Successful inner append receipts still require `commit` before a durable ACK.
 - `commit` and `seal` return `DurableReceipt` only after segment and checkpoint
   file synchronization, atomic publication, and directory synchronization.
 - `replay(after_sequence, max_records, max_bytes)` authenticates committed data

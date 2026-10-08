@@ -22,7 +22,7 @@ use tokio::{
 
 const MAX_CLIENTS: usize = 8;
 const DEADLINE: Duration = Duration::from_secs(2);
-const COMMIT_INTERVAL: Duration = Duration::from_millis(100);
+const COMMIT_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 pub struct Health {
@@ -214,7 +214,7 @@ fn writer(mut spool: MetadataSpool, mut jobs: mpsc::Receiver<Job>, node_id: &str
                 }
             }
         }
-        let mut pending = Vec::new();
+        let mut prepared = Vec::with_capacity(MAX_CLIENTS);
         let mut fatal = false;
         for job in batch {
             let mut receipt = Receipt {
@@ -289,24 +289,45 @@ fn writer(mut spool: MetadataSpool, mut jobs: mpsc::Receiver<Job>, node_id: &str
                     continue;
                 }
             };
-            match spool.append(&payload) {
+            prepared.push((job.reply, receipt, payload));
+        }
+        let payloads: Vec<&[u8]> = prepared
+            .iter()
+            .map(|(_, _, payload)| payload.as_slice())
+            .collect();
+        let appended = spool.append_batch(&payloads);
+        drop(payloads);
+        let appended = match appended {
+            Ok(results) => results,
+            Err(_) => {
+                for (reply, mut receipt, _) in prepared {
+                    receipt.outcome = Outcome::Unavailable;
+                    health.failures.fetch_add(1, Ordering::Relaxed);
+                    let _ = reply.send(receipt);
+                }
+                break;
+            }
+        };
+        let mut pending = Vec::with_capacity(MAX_CLIENTS);
+        for ((reply, mut receipt, _), appended) in prepared.into_iter().zip(appended) {
+            match appended {
                 Ok(appended) => {
                     receipt.sequence = Some(appended.sequence);
-                    pending.push((job.reply, receipt));
+                    pending.push((reply, receipt));
                 }
                 Err(Error::Full) => {
                     receipt.outcome = Outcome::Full;
                     health.rejected.fetch_add(1, Ordering::Relaxed);
-                    let _ = job.reply.send(receipt);
+                    let _ = reply.send(receipt);
                 }
                 Err(Error::RecordTooLarge) => {
                     health.rejected.fetch_add(1, Ordering::Relaxed);
-                    let _ = job.reply.send(receipt);
+                    let _ = reply.send(receipt);
                 }
                 Err(_) => {
                     receipt.outcome = Outcome::Unavailable;
                     health.failures.fetch_add(1, Ordering::Relaxed);
-                    let _ = job.reply.send(receipt);
+                    let _ = reply.send(receipt);
                     fatal = true;
                 }
             }

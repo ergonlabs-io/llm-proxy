@@ -69,10 +69,15 @@ fn crash_child() {
     let root = std::path::PathBuf::from(root);
     let stage = std::env::var(CHILD_STAGE).unwrap();
     let mut spool = open(&root);
-    let appended = spool.append(PAYLOAD).unwrap();
-    if stage != "append" {
+    let last = if stage.starts_with("batch-") {
+        let appended = spool.append_batch(&[PAYLOAD; 3]).unwrap();
+        appended.into_iter().last().unwrap().unwrap().sequence
+    } else {
+        spool.append(PAYLOAD).unwrap().sequence
+    };
+    if stage != "append" && stage != "batch-append" {
         let committed = spool.commit().unwrap();
-        assert_eq!(committed.through_sequence, appended.sequence);
+        assert_eq!(committed.through_sequence, last);
         if stage == "seal" {
             spool.seal().unwrap();
         } else if stage == "acknowledge" {
@@ -82,6 +87,28 @@ fn crash_child() {
     std::fs::write(root.join("ready"), b"ready").unwrap();
     loop {
         std::thread::park_timeout(Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn sigkill_pending_batch_never_reuses_its_reserved_sequences() {
+    let root = tempfile::tempdir().unwrap();
+    crash_at(root.path(), "batch-append");
+    let mut recovered = open(root.path());
+    assert!(recovered.replay(0, 8, 8192).unwrap().is_empty());
+    assert_eq!(recovered.append(PAYLOAD).unwrap().sequence, 4);
+}
+
+#[test]
+fn sigkill_committed_batch_replays_every_durable_record() {
+    let root = tempfile::tempdir().unwrap();
+    crash_at(root.path(), "batch-commit");
+    let recovered = open(root.path());
+    let replay = recovered.replay(0, 8, 8192).unwrap();
+    assert_eq!(replay.len(), 3);
+    for (index, record) in replay.iter().enumerate() {
+        assert_eq!(record.sequence, index as u64 + 1);
+        assert_eq!(record.payload, PAYLOAD);
     }
 }
 

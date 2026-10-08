@@ -23,6 +23,7 @@ arc-swap = { workspace = true }
 # proxy-http's request-id generation); this crate had no prior use for it.
 rand = { workspace = true }
 ring = { workspace = true }
+socket2 = { workspace = true }
 # WP-51 increment 2: SpanSink is a worker -> control mpsc handoff, the same
 # shape as the rest of this crate's stats/access-log control-side plumbing.
 # WP-51 increment 4 adds `time` for `run_metric_exporter`'s own

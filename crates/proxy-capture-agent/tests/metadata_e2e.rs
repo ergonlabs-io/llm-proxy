@@ -270,6 +270,54 @@ bounded_test!(unauthorized_tenant_never_appends, {
 });
 
 bounded_test!(
+    eight_concurrent_peers_receive_replayable_durable_receipts,
+    {
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        config.spool.max_segment_bytes = 65536;
+        let mut agent_config = fixture.config();
+        agent_config.spool.max_segment_bytes = config.spool.max_segment_bytes;
+        let agent = TaskAbortGuard::start(agent_config);
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            streams.push(fixture.connect().await);
+        }
+        // Queue all records before reading any ACK; no peer waits for another's receipt.
+        for (i, stream) in streams.iter_mut().enumerate() {
+            send(
+                stream,
+                Kind::Record,
+                &encode(&record(&format!("batch-{i}"))).unwrap(),
+            )
+            .await;
+        }
+        let mut receipts = Vec::new();
+        for (i, stream) in streams.iter_mut().enumerate() {
+            let response = frame(stream).await.unwrap();
+            assert_eq!(response.kind, Kind::Receipt);
+            let ack: Receipt = decode(&response.payload).unwrap();
+            assert_eq!(ack.outcome, Outcome::Durable);
+            assert_eq!(ack.event_id, format!("batch-{i}"));
+            receipts.push(ack);
+        }
+        drop(streams);
+        agent.stop().await;
+        let replay = fixture.replay(&config);
+        assert_eq!(replay.len(), 8);
+        for ack in receipts {
+            let stored = replay
+                .iter()
+                .find(|r| Some(r.sequence) == ack.sequence)
+                .unwrap();
+            assert_eq!(
+                decode::<RequestRecord>(&stored.payload).unwrap().event_id,
+                ack.event_id
+            );
+        }
+    }
+);
+
+bounded_test!(
     attempt_schema_and_request_ownership_must_match_the_envelope,
     {
         let fixture = Fixture::new();

@@ -41,6 +41,118 @@ fn commit_reopen_replay() {
     assert_eq!(records[1].payload, b"metadata-two");
 }
 
+#[test]
+fn batch_reserves_one_checkpoint_and_is_not_durable_until_commit() {
+    let temp = TempDir::new().unwrap();
+    let config = config(&temp);
+    let mut spool = open(config.clone());
+    let before = spool.state_persist_count;
+    let appended = spool.append_batch(&[b"one", b"two", b"three"]).unwrap();
+    assert_eq!(
+        appended
+            .into_iter()
+            .map(|r| r.unwrap().sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(spool.state_persist_count, before + 1);
+    assert!(payloads(&spool).is_empty());
+    spool.commit().unwrap();
+    drop(spool);
+    assert_eq!(
+        payloads(&open(config)),
+        vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+    );
+}
+
+#[test]
+fn lost_or_failed_batch_never_reuses_reserved_sequences() {
+    for failed in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let config = config(&temp);
+        let mut spool = open(config.clone());
+        if failed {
+            spool.fault = Some(Fault::AppendWrite);
+        }
+        let appended = spool.append_batch(&[b"one", b"two", b"three"]).unwrap();
+        if failed {
+            assert!(appended[0].is_err());
+            assert!(matches!(appended[1], Err(Error::Poisoned)));
+        }
+        drop(spool);
+        let mut spool = open(config);
+        assert!(payloads(&spool).is_empty());
+        assert_eq!(spool.append(b"replacement").unwrap().sequence, 4);
+    }
+}
+
+#[test]
+fn batch_bounds_and_per_record_full_are_explicit() {
+    let temp = TempDir::new().unwrap();
+    let mut c = config(&temp);
+    c.max_segments = 1;
+    let mut spool = open(c);
+    assert!(spool.append_batch(&[b"x".as_slice(); 9]).is_err());
+    assert_eq!(spool.stats().unwrap().next_sequence, 1);
+    assert!(spool.append_batch(&[]).unwrap().is_empty());
+    let payload = [0; 256];
+    let appended = spool.append_batch(&[payload.as_slice(); 8]).unwrap();
+    assert!(appended.iter().any(|r| matches!(r, Err(Error::Full))));
+    assert!(!spool.stats().unwrap().poisoned);
+    assert!(spool.stats().unwrap().disk_bytes <= spool.config.max_disk_bytes);
+    spool.commit().unwrap();
+    assert_eq!(spool.stats().unwrap().next_sequence, 9);
+}
+
+#[test]
+fn batch_size_rejection_preserves_replayable_sequence_gaps() {
+    let temp = TempDir::new().unwrap();
+    let config = config(&temp);
+    let mut spool = open(config.clone());
+    let oversized = [0; 257];
+    let appended = spool.append_batch(&[b"one", &oversized, b"three"]).unwrap();
+    assert_eq!(appended[0].as_ref().unwrap().sequence, 1);
+    assert!(matches!(appended[1], Err(Error::RecordTooLarge)));
+    assert_eq!(appended[2].as_ref().unwrap().sequence, 3);
+    spool.commit().unwrap();
+    drop(spool);
+    let mut spool = open(config);
+    let replay = spool.replay(0, 10, 1024).unwrap();
+    assert_eq!(
+        replay.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert_eq!(spool.append(b"next").unwrap().sequence, 4);
+}
+
+#[test]
+fn failed_batch_reservation_writes_no_ciphertext_and_poisoning_is_sticky() {
+    for fault in [Fault::CheckpointSync, Fault::CheckpointDirectorySync] {
+        let temp = TempDir::new().unwrap();
+        let config = config(&temp);
+        let mut spool = open(config.clone());
+        spool.append(b"committed").unwrap();
+        spool.commit().unwrap();
+        spool.fault = Some(fault);
+        assert!(matches!(
+            spool.append_batch(&[b"two", b"three"]),
+            Err(Error::Io(_))
+        ));
+        assert!(spool.pending.is_none());
+        assert!(matches!(
+            spool.append_batch(&[b"unsafe"]),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(spool.commit(), Err(Error::Poisoned)));
+        drop(spool);
+        let mut spool = open(config);
+        assert_eq!(payloads(&spool), vec![b"committed".to_vec()]);
+        let next = spool.append(b"recovered").unwrap().sequence;
+        // A failed rename-directory barrier may already have published the range.
+        assert!(next == 2 || next == 4);
+    }
+}
+
 fn overwrite(path: &Path, offset: u64, bytes: &[u8]) {
     let mut file = OpenOptions::new().write(true).open(path).unwrap();
     file.seek(SeekFrom::Start(offset)).unwrap();

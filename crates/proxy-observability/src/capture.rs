@@ -1,7 +1,7 @@
 //! Stable process-wide metadata admission. No socket, serialization, or await on workers.
 use crate::{
     capture_policy::EndUserCaptureConfig,
-    capture_transport::TransportWriter,
+    capture_transport::{DeliveryOutcome, TransportSession},
     records::{RequestRecord, RequestRecordSink, SubmitResult},
     stats::MetadataDeliveryStats,
 };
@@ -24,6 +24,7 @@ struct Pool {
     events: AtomicUsize,
     bytes: AtomicUsize,
     transport: AtomicUsize,
+    in_flight: AtomicUsize,
 }
 struct Destination {
     deadline: Mutex<Option<Instant>>,
@@ -220,7 +221,7 @@ pub struct CaptureStatus {
 }
 impl CaptureSupervisor {
     pub fn start(stats: MetadataDeliveryStats) -> io::Result<(Self, CaptureDelivery)> {
-        let (tx, mut rx) = mpsc::channel::<Option<Event>>(65536);
+        let (tx, rx) = mpsc::channel::<Option<Event>>(65536);
         let (changes, _) = watch::channel(0);
         let (done_tx, done) = oneshot::channel();
         let instance_id = crate::trace::TraceContext::new_root(false)
@@ -244,128 +245,14 @@ impl CaptureSupervisor {
             instance_id,
         });
         // Receiver must not hold Shared (which owns the sender), or shutdown could never close it.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let delivery_changes = shared.changes.subscribe();
         std::thread::Builder::new()
             .name("llmproxy-capture".into())
             .spawn(move || {
-                let mut writer: Option<(EndUserCaptureConfig, TransportWriter)> = None;
-                while let Some(event) = rx.blocking_recv() {
-                    let Some(event) = event else {
-                        rx.close();
-                        continue;
-                    };
-                    event.permit.shared.stats.record_dequeued();
-                    let config = &event.permit.policy.config;
-                    if !event.permit.live() {
-                        event
-                            .permit
-                            .shared
-                            .stats
-                            .capture_drop(crate::stats::CaptureDrop::Disabled);
-                        continue;
-                    }
-                    if event.enqueued.elapsed() >= config.transport.event_deadline {
-                        event
-                            .permit
-                            .shared
-                            .stats
-                            .capture_drop(crate::stats::CaptureDrop::Expired);
-                        continue;
-                    }
-                    let scratch = config.metadata.max_record_retained_bytes
-                        + config.metadata.max_encoded_record_bytes
-                        + 65536;
-                    let transport = {
-                        let shared = &event.permit.shared;
-                        let _lock = shared.pool.lock.lock().unwrap();
-                        let limit = shared
-                            .current
-                            .load_full()
-                            .map_or(config.budgets.max_transport_retained_bytes, |p| {
-                                p.config.budgets.max_transport_retained_bytes
-                            });
-                        if scratch.saturating_add(2 * 1024 * 1024) > limit {
-                            None
-                        } else {
-                            shared.pool.transport.fetch_add(scratch, Ordering::AcqRel);
-                            Some(TransportReservation {
-                                pool: shared.pool.clone(),
-                                bytes: scratch,
-                            })
-                        }
-                    };
-                    let Some(_transport) = transport else {
-                        event
-                            .permit
-                            .shared
-                            .stats
-                            .capture_drop(crate::stats::CaptureDrop::TransportCapacity);
-                        continue;
-                    };
-                    if writer.as_ref().is_none_or(|(c, _)| c != config) {
-                        writer = TransportWriter::with_limits(
-                            config.endpoint.clone(),
-                            config.transport.clone(),
-                            config.metadata.max_encoded_record_bytes,
-                        )
-                        .ok()
-                        .map(|w| (config.clone(), w));
-                    }
-                    let mut attempted_transport = false;
-                    let result = (|| -> io::Result<()> {
-                        let w = &mut writer
-                            .as_mut()
-                            .ok_or_else(|| io::Error::other("capture transport unavailable"))?
-                            .1;
-                        let deadline = event.enqueued + config.transport.event_deadline;
-                        w.set_event_deadline(
-                            event
-                                .permit
-                                .policy
-                                .destination
-                                .deadline
-                                .lock()
-                                .unwrap()
-                                .map_or(deadline, |d| d.min(deadline)),
-                        );
-                        let mut bytes = BoundedEncoding {
-                            data: Vec::with_capacity(config.metadata.max_encoded_record_bytes),
-                            limit: config.metadata.max_encoded_record_bytes,
-                        };
-                        if let Err(e) = serde_json::to_writer(&mut bytes, &event.record) {
-                            event
-                                .permit
-                                .shared
-                                .stats
-                                .capture_drop(crate::stats::CaptureDrop::EncodedLimit);
-                            return Err(io::Error::other(e));
-                        }
-                        // The gate is checked again immediately before the potentially irrevocable send.
-                        if !event.permit.live() {
-                            event
-                                .permit
-                                .shared
-                                .stats
-                                .capture_drop(crate::stats::CaptureDrop::Disabled);
-                            return Err(io::Error::other("capture disabled"));
-                        }
-                        attempted_transport = true;
-                        w.write_all(&bytes.data)
-                    })();
-                    if result.is_ok() {
-                        event.permit.shared.stats.record_written();
-                        event.permit.shared.stats.record_durable();
-                    } else {
-                        event.permit.shared.stats.record_write_failure();
-                        if attempted_transport {
-                            event
-                                .permit
-                                .shared
-                                .stats
-                                .capture_drop(crate::stats::CaptureDrop::DeliveryUnknown);
-                        }
-                    }
-                    // Permit remains charged through serialization and durable acknowledgement.
-                }
+                runtime.block_on(run_delivery(rx, delivery_changes));
                 let _ = done_tx.send(());
             })?;
         Ok((
@@ -405,6 +292,11 @@ impl CaptureSupervisor {
                     "max_queue_events",
                     p.events.load(Ordering::Acquire),
                     c.budgets.max_queue_events,
+                ),
+                (
+                    "max_in_flight_events",
+                    p.in_flight.load(Ordering::Acquire),
+                    c.budgets.max_in_flight_events,
                 ),
                 (
                     "max_queue_retained_bytes",
@@ -601,6 +493,200 @@ impl CaptureDelivery {
         !matches!(tokio::time::timeout(deadline, self.done).await, Ok(Ok(())))
     }
 }
+const DELIVERY_SLOTS: usize = 8;
+
+enum TransportAdmission {
+    Ready(TransportReservation),
+    Busy,
+    TooLarge,
+}
+fn reserve_transport(event: &Event) -> TransportAdmission {
+    let shared = &event.permit.shared;
+    let config = &event.permit.policy.config;
+    let scratch = config.metadata.max_record_retained_bytes
+        + config.metadata.max_encoded_record_bytes
+        + 65536;
+    let _lock = shared.pool.lock.lock().unwrap();
+    let current = shared.current.load_full();
+    let budgets = current
+        .as_ref()
+        .map_or(&config.budgets, |p| &p.config.budgets);
+    if scratch.saturating_add(2 * 1024 * 1024) > budgets.max_transport_retained_bytes {
+        return TransportAdmission::TooLarge;
+    }
+    if shared.pool.in_flight.load(Ordering::Acquire)
+        >= budgets
+            .max_in_flight_events
+            .min(config.budgets.max_in_flight_events)
+            .min(DELIVERY_SLOTS)
+        || shared
+            .pool
+            .transport
+            .load(Ordering::Acquire)
+            .saturating_add(scratch)
+            .saturating_add(2 * 1024 * 1024)
+            > budgets.max_transport_retained_bytes
+    {
+        return TransportAdmission::Busy;
+    }
+    shared.pool.transport.fetch_add(scratch, Ordering::AcqRel);
+    shared.pool.in_flight.fetch_add(1, Ordering::AcqRel);
+    TransportAdmission::Ready(TransportReservation {
+        pool: shared.pool.clone(),
+        bytes: scratch,
+    })
+}
+
+async fn run_delivery(mut rx: mpsc::Receiver<Option<Event>>, mut changes: watch::Receiver<u64>) {
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut idle: Vec<(usize, Option<TransportSession>)> =
+        (0..DELIVERY_SLOTS).map(|i| (i, None)).collect();
+    let mut pending: Option<Event> = None;
+    let mut closed = false;
+    loop {
+        if let Some(event) = pending.take() {
+            use crate::stats::CaptureDrop;
+            let drop_reason = if !event.permit.live() {
+                Some(CaptureDrop::Disabled)
+            } else if event.enqueued.elapsed()
+                >= event.permit.policy.config.transport.event_deadline
+            {
+                Some(CaptureDrop::Expired)
+            } else {
+                None
+            };
+            if let Some(reason) = drop_reason {
+                event.permit.shared.stats.record_dequeued();
+                event.permit.shared.stats.capture_drop(reason);
+                continue;
+            }
+            let admission = if idle.is_empty() {
+                TransportAdmission::Busy
+            } else {
+                reserve_transport(&event)
+            };
+            match admission {
+                TransportAdmission::Ready(reservation) => {
+                    event.permit.shared.stats.record_dequeued();
+                    let (slot, session) = idle.pop().unwrap();
+                    jobs.spawn(async move {
+                        let session = deliver_event(event, reservation, session).await;
+                        (slot, session)
+                    });
+                    continue;
+                }
+                TransportAdmission::TooLarge => {
+                    event.permit.shared.stats.record_dequeued();
+                    event
+                        .permit
+                        .shared
+                        .stats
+                        .capture_drop(CaptureDrop::TransportCapacity);
+                    continue;
+                }
+                TransportAdmission::Busy => pending = Some(event),
+            }
+        }
+        if closed && pending.is_none() && jobs.is_empty() {
+            break;
+        }
+        tokio::select! {
+            joined = jobs.join_next(), if !jobs.is_empty() => {
+                match joined {
+                    Some(Ok(slot)) => idle.push(slot),
+                    // Fail closed on an internal task panic instead of losing a slot and spinning.
+                    _ => { rx.close(); break; }
+                }
+            }
+            received = rx.recv(), if pending.is_none() && !closed => {
+                match received {
+                    Some(Some(event)) => pending = Some(event),
+                    Some(None) => rx.close(),
+                    None => closed = true,
+                }
+            }
+            changed = changes.changed() => {
+                if changed.is_err() && jobs.is_empty() && pending.is_none() { rx.close(); closed = true; }
+            }
+        }
+    }
+}
+
+async fn deliver_event(
+    event: Event,
+    _reservation: TransportReservation,
+    session: Option<TransportSession>,
+) -> Option<TransportSession> {
+    use crate::stats::CaptureDrop;
+    let config = &event.permit.policy.config;
+    let deadline = event.enqueued + config.transport.event_deadline;
+    let deadline = event
+        .permit
+        .policy
+        .destination
+        .deadline
+        .lock()
+        .unwrap()
+        .map_or(deadline, |d| d.min(deadline));
+    // Dispatch and the first task poll can straddle disable or destination drain.
+    // Check again before cloning endpoint identity or allocating encoded output.
+    let drop_reason = if !event.permit.live() {
+        Some(CaptureDrop::Disabled)
+    } else if Instant::now() >= deadline {
+        Some(CaptureDrop::Expired)
+    } else {
+        None
+    };
+    if let Some(reason) = drop_reason {
+        event.permit.shared.stats.capture_drop(reason);
+        return session;
+    }
+    let mut session = session
+        .filter(|s| s.matches(&config.endpoint))
+        .unwrap_or_else(|| TransportSession::new(config.endpoint.clone()));
+    let mut bytes = BoundedEncoding {
+        data: Vec::with_capacity(config.metadata.max_encoded_record_bytes),
+        limit: config.metadata.max_encoded_record_bytes,
+    };
+    if serde_json::to_writer(&mut bytes, &event.record).is_err() {
+        event
+            .permit
+            .shared
+            .stats
+            .capture_drop(CaptureDrop::EncodedLimit);
+        event.permit.shared.stats.record_write_failure();
+        return Some(session);
+    }
+    let outcome = session
+        .deliver(
+            &bytes.data,
+            &event.record.event_id,
+            &config.transport,
+            deadline,
+            || event.permit.live(),
+        )
+        .await;
+    match outcome {
+        DeliveryOutcome::Durable => {
+            event.permit.shared.stats.record_written();
+            event.permit.shared.stats.record_durable();
+        }
+        other => {
+            let reason = match other {
+                DeliveryOutcome::Rejected => CaptureDrop::AgentRejected,
+                DeliveryOutcome::Unavailable => CaptureDrop::Unavailable,
+                DeliveryOutcome::Expired => CaptureDrop::Expired,
+                DeliveryOutcome::Disabled => CaptureDrop::Disabled,
+                _ => CaptureDrop::DeliveryUnknown,
+            };
+            event.permit.shared.stats.capture_drop(reason);
+            event.permit.shared.stats.record_write_failure();
+        }
+    }
+    // Both input and serialization reservations remain owned through the ACK.
+    Some(session)
+}
+
 struct BoundedEncoding {
     data: Vec<u8>,
     limit: usize,
@@ -612,6 +698,7 @@ struct TransportReservation {
 impl Drop for TransportReservation {
     fn drop(&mut self) {
         self.pool.transport.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.pool.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 impl Write for BoundedEncoding {

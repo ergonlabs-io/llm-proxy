@@ -27,6 +27,18 @@ build: ## Debug build of every crate + the llm-proxy binary
 release: ## Optimized build of the llm-proxy binary (target/release/llm-proxy)
 	cargo build --release -p proxy
 
+.PHONY: capture-qualification-build
+capture-qualification-build: ## Build optimized proxy, local capture agent, mock upstream, and loadgen
+	cargo build --release -p proxy -p proxy-capture-agent -p mockupstream -p loadgen
+
+.PHONY: capture-qualify
+capture-qualify: capture-qualification-build ## Run finite capture latency/RSS qualification; reports under target/
+	python3 scripts/capture-qualification.py $(CAPTURE_QUALIFICATION_ARGS)
+
+.PHONY: capture-qualification-check
+capture-qualification-check: ## Check qualification reporting without starting test servers
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_capture_qualification.py
+
 .PHONY: check
 check: ## Fast type-check of the whole workspace (no codegen)
 	cargo check --workspace

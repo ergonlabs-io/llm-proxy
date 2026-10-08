@@ -109,6 +109,7 @@ impl TransportWriter {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn set_event_deadline(&mut self, deadline: Instant) {
         self.event_deadline = Some(deadline);
     }
@@ -149,6 +150,14 @@ fn retry_cap(limits: &CaptureTransportLimits, attempt: u16) -> Duration {
 
 async fn connect(config: &AgentTransportConfig) -> io::Result<UnixStream> {
     let mut stream = UnixStream::connect(&config.socket_path).await?;
+    // Bound each reusable session's kernel buffers as well as its encoded output.
+    // Linux may report twice the requested size for socket bookkeeping.
+    let socket = socket2::SockRef::from(&stream);
+    socket.set_send_buffer_size(65_536)?;
+    socket.set_recv_buffer_size(65_536)?;
+    if socket.send_buffer_size()? > 131_072 || socket.recv_buffer_size()? > 131_072 {
+        return Err(io::Error::other("metadata socket buffer exceeds bound"));
+    }
     if stream.peer_cred()?.uid() != config.expected_agent_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -173,6 +182,171 @@ async fn connect(config: &AgentTransportConfig) -> io::Result<UnixStream> {
         return Err(io::Error::other("agent identity or protocol mismatch"));
     }
     Ok(stream)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    Durable,
+    Rejected,
+    Unknown,
+    Unavailable,
+    Expired,
+    Disabled,
+}
+
+/// One reusable, authenticated connection; the supervisor owns a fixed slot pool.
+pub(crate) struct TransportSession {
+    config: AgentTransportConfig,
+    connection: Option<UnixStream>,
+}
+impl TransportSession {
+    pub(crate) fn new(config: AgentTransportConfig) -> Self {
+        Self {
+            config,
+            connection: None,
+        }
+    }
+    pub(crate) fn matches(&self, config: &AgentTransportConfig) -> bool {
+        self.config == *config
+    }
+    pub(crate) async fn deliver(
+        &mut self,
+        payload: &[u8],
+        event_id: &str,
+        limits: &CaptureTransportLimits,
+        deadline: Instant,
+        live: impl Fn() -> bool,
+    ) -> DeliveryOutcome {
+        deliver(
+            &self.config,
+            &mut self.connection,
+            payload,
+            event_id,
+            limits,
+            deadline,
+            live,
+        )
+        .await
+    }
+}
+
+async fn deliver(
+    config: &AgentTransportConfig,
+    connection: &mut Option<UnixStream>,
+    payload: &[u8],
+    event_id: &str,
+    limits: &CaptureTransportLimits,
+    deadline: Instant,
+    live: impl Fn() -> bool,
+) -> DeliveryOutcome {
+    let mut ambiguous = false;
+    for attempt in 0..limits.max_attempts {
+        if !live() {
+            return if ambiguous {
+                DeliveryOutcome::Unknown
+            } else {
+                DeliveryOutcome::Disabled
+            };
+        }
+        // Do not send a new copy when almost no receipt budget remains. This
+        // bounded guard is not a durability prediction: a sent copy can stay unknown.
+        if deadline.saturating_duration_since(Instant::now())
+            < limits.ack_deadline.min(Duration::from_millis(100))
+        {
+            return if ambiguous {
+                DeliveryOutcome::Unknown
+            } else {
+                DeliveryOutcome::Expired
+            };
+        }
+        let mut sent = false;
+        let exchange = async {
+            if connection.is_none() {
+                *connection =
+                    Some(bounded(deadline, limits.connect_deadline, connect(config)).await?);
+            }
+            // Authentication/reconnect can consume time or race emergency disable.
+            if !live()
+                || deadline.saturating_duration_since(Instant::now())
+                    < limits.ack_deadline.min(Duration::from_millis(100))
+            {
+                return Ok(None);
+            }
+            let stream = connection
+                .as_mut()
+                .ok_or_else(|| io::Error::other("metadata connection unavailable"))?;
+            sent = true;
+            bounded(
+                deadline,
+                limits.write_deadline,
+                write_frame(stream, Kind::Record, payload),
+            )
+            .await?;
+            let frame = bounded(deadline, limits.ack_deadline, read_frame(stream)).await?;
+            if frame.kind != Kind::Receipt {
+                return Err(io::Error::other("invalid metadata receipt"));
+            }
+            let receipt: Receipt = decode(&frame.payload)?;
+            if receipt.version != VERSION
+                || receipt.node_id != config.expected_node_id
+                || receipt.event_id != event_id
+                || (receipt.outcome == Outcome::Durable && !receipt.sequence.is_some_and(|s| s > 0))
+            {
+                return Err(io::Error::other(
+                    "metadata receipt identity or sequence mismatch",
+                ));
+            }
+            Ok(Some(receipt))
+        };
+        match exchange.await {
+            Ok(Some(receipt)) if receipt.outcome == Outcome::Durable => {
+                return DeliveryOutcome::Durable
+            }
+            // The agent uses Unavailable for failed commit/publication barriers.
+            // Even a matching receipt cannot prove that ciphertext was not committed.
+            Ok(Some(receipt)) if receipt.outcome == Outcome::Unavailable => {
+                return DeliveryOutcome::Unknown
+            }
+            Ok(Some(_)) => {
+                return if ambiguous {
+                    DeliveryOutcome::Unknown
+                } else {
+                    DeliveryOutcome::Rejected
+                }
+            }
+            Ok(None) => {
+                return if ambiguous {
+                    DeliveryOutcome::Unknown
+                } else if !live() {
+                    DeliveryOutcome::Disabled
+                } else {
+                    DeliveryOutcome::Expired
+                }
+            }
+            Err(_) => {
+                ambiguous |= sent;
+                *connection = None;
+                if attempt + 1 < limits.max_attempts {
+                    use rand::Rng;
+                    let nanos =
+                        rand::thread_rng().gen_range(0..=retry_cap(limits, attempt).as_nanos());
+                    let jitter = Duration::new(
+                        (nanos / 1_000_000_000) as u64,
+                        (nanos % 1_000_000_000) as u32,
+                    );
+                    tokio::time::sleep(
+                        jitter.min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    if ambiguous {
+        DeliveryOutcome::Unknown
+    } else {
+        DeliveryOutcome::Unavailable
+    }
 }
 
 impl Write for TransportWriter {
@@ -209,70 +383,21 @@ impl Write for TransportWriter {
             .runtime
             .as_ref()
             .ok_or_else(|| io::Error::other("metadata runtime unavailable"))?;
-        runtime.block_on(async {
-            for attempt in 0..limits.max_attempts {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                let exchange = async {
-                    if connection.is_none() {
-                        *connection = Some(
-                            bounded(deadline, limits.connect_deadline, connect(config)).await?,
-                        );
-                    }
-                    let stream = connection
-                        .as_mut()
-                        .ok_or_else(|| io::Error::other("metadata connection unavailable"))?;
-                    bounded(
-                        deadline,
-                        limits.write_deadline,
-                        write_frame(stream, Kind::Record, payload),
-                    )
-                    .await?;
-                    let frame = bounded(deadline, limits.ack_deadline, read_frame(stream)).await?;
-                    if frame.kind != Kind::Receipt {
-                        return Err(io::Error::other("invalid metadata receipt"));
-                    }
-                    let receipt: Receipt = decode(&frame.payload)?;
-                    if receipt.version != VERSION
-                        || receipt.node_id != config.expected_node_id
-                        || receipt.event_id != record.event_id
-                    {
-                        return Err(io::Error::other("metadata receipt identity mismatch"));
-                    }
-                    Ok(receipt)
-                };
-                match exchange.await {
-                    Ok(receipt)
-                        if receipt.outcome == Outcome::Durable
-                            && receipt.sequence.is_some_and(|s| s > 0) =>
-                    {
-                        return Ok(data.len())
-                    }
-                    Ok(_) => return Err(io::Error::other("metadata agent declined capture")),
-                    _ => {
-                        *connection = None;
-                        if attempt + 1 < limits.max_attempts {
-                            // Finite reconnect jitter, on this single off-path writer only.
-                            use rand::Rng;
-                            let nanos = rand::thread_rng()
-                                .gen_range(0..=retry_cap(limits, attempt).as_nanos());
-                            let jitter = Duration::new(
-                                (nanos / 1_000_000_000) as u64,
-                                (nanos % 1_000_000_000) as u32,
-                            );
-                            tokio::time::sleep(
-                                jitter.min(deadline.saturating_duration_since(Instant::now())),
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-            Err(io::Error::other(
+        match runtime.block_on(deliver(
+            config,
+            connection,
+            payload,
+            &record.event_id,
+            limits,
+            deadline,
+            || true,
+        )) {
+            DeliveryOutcome::Durable => Ok(data.len()),
+            DeliveryOutcome::Rejected => Err(io::Error::other("metadata agent declined capture")),
+            _ => Err(io::Error::other(
                 "metadata delivery failed or durability unknown",
-            ))
-        })
+            )),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -288,6 +413,132 @@ mod tests {
         stats::{prometheus_render, MetadataDeliveryStats, StatsControl},
     };
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn near_expiry_and_disable_prevent_even_connecting() {
+        let config = AgentTransportConfig {
+            socket_path: PathBuf::from("/nonexistent/capture/socket"),
+            expected_agent_uid: 0,
+            expected_node_id: "node".into(),
+            producer_id: "proxy".into(),
+        };
+        let mut session = TransportSession::new(config);
+        let limits = CaptureTransportLimits::default();
+        assert_eq!(
+            session
+                .deliver(
+                    b"record",
+                    "event",
+                    &limits,
+                    Instant::now() + Duration::from_millis(10),
+                    || true
+                )
+                .await,
+            DeliveryOutcome::Expired
+        );
+        assert_eq!(
+            session
+                .deliver(
+                    b"record",
+                    "event",
+                    &limits,
+                    Instant::now() + Duration::from_secs(2),
+                    || false
+                )
+                .await,
+            DeliveryOutcome::Disabled
+        );
+        assert!(session.connection.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejection_is_known_unless_a_previous_copy_lost_its_receipt() {
+        for (lose_first, rejection) in [
+            (false, Outcome::Full),
+            (true, Outcome::Full),
+            (false, Outcome::Unavailable),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("socket");
+            let uid = UnixStream::pair().unwrap().0.peer_cred().unwrap().uid();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                for attempt in 0..if lose_first { 2 } else { 1 } {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    assert_eq!(read_frame(&mut stream).await.unwrap().kind, Kind::Hello);
+                    write_frame(
+                        &mut stream,
+                        Kind::Welcome,
+                        &encode(&Welcome {
+                            version: VERSION,
+                            node_id: "node".into(),
+                        })
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    let frame = read_frame(&mut stream).await.unwrap();
+                    assert_eq!(frame.kind, Kind::Record);
+                    assert_eq!(frame.payload, b"record");
+                    if lose_first && attempt == 0 {
+                        continue;
+                    }
+                    write_frame(
+                        &mut stream,
+                        Kind::Receipt,
+                        &encode(&Receipt {
+                            version: VERSION,
+                            node_id: "node".into(),
+                            event_id: "event".into(),
+                            sequence: None,
+                            outcome: rejection,
+                        })
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let mut session = TransportSession::new(AgentTransportConfig {
+                socket_path: socket,
+                expected_agent_uid: uid,
+                expected_node_id: "node".into(),
+                producer_id: "proxy".into(),
+            });
+            let limits = CaptureTransportLimits {
+                backoff_initial: Duration::ZERO,
+                backoff_max: Duration::ZERO,
+                ..Default::default()
+            };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3),
+                session.deliver(
+                    b"record",
+                    "event",
+                    &limits,
+                    Instant::now() + Duration::from_secs(2),
+                    || true,
+                ),
+            )
+            .await
+            .unwrap();
+            let socket = socket2::SockRef::from(session.connection.as_ref().unwrap());
+            assert!(socket.send_buffer_size().unwrap() <= 131_072);
+            assert!(socket.recv_buffer_size().unwrap() <= 131_072);
+            assert_eq!(
+                outcome,
+                if lose_first || rejection == Outcome::Unavailable {
+                    DeliveryOutcome::Unknown
+                } else {
+                    DeliveryOutcome::Rejected
+                }
+            );
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn configured_handshake_and_ack_deadlines_exhaust_attempts() {

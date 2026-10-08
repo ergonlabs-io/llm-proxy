@@ -176,6 +176,7 @@ async fn dequeue_does_not_release_bytes_and_disable_discards_unsent_events() {
     let mut c = config(&temp);
     c.transport.ack_deadline = Duration::from_millis(100);
     c.transport.max_attempts = 1;
+    c.budgets.max_in_flight_events = 1;
     let listener = tokio::net::UnixListener::bind(&c.endpoint.socket_path).unwrap();
     let (ready, seen) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
@@ -270,4 +271,79 @@ async fn four_thousand_ninety_seventh_capture_is_declined_without_overbooking() 
     leases.clear();
     assert_eq!(s.status().active_requests, 0);
     assert!(!d.shutdown(Duration::from_secs(1)).await);
+}
+
+#[tokio::test]
+async fn delivery_slots_are_concurrent_capped_and_owned_through_ack() {
+    use proxy_capture_protocol::{
+        decode, encode, read_frame, write_frame, Kind, Outcome, Receipt, Welcome, VERSION,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let mut c = config(&temp);
+    c.budgets.max_in_flight_events = 2;
+    let listener = tokio::net::UnixListener::bind(&c.endpoint.socket_path).unwrap();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(4);
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let server_release = release.clone();
+    let server = tokio::spawn(async move {
+        let mut clients = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                connected = listener.accept() => {
+                    let (mut stream, _) = connected.unwrap();
+                    let seen = seen_tx.clone();
+                    let release = server_release.clone();
+                    clients.spawn(async move {
+                        read_frame(&mut stream).await.unwrap();
+                        write_frame(&mut stream, Kind::Welcome, &encode(&Welcome { version: VERSION, node_id: "node".into() }).unwrap()).await.unwrap();
+                        while let Ok(frame) = read_frame(&mut stream).await {
+                            let record: crate::records::RequestRecord = decode(&frame.payload).unwrap();
+                            seen.send(()).await.unwrap();
+                            release.acquire().await.unwrap().forget();
+                            write_frame(&mut stream, Kind::Receipt, &encode(&Receipt { version:VERSION, node_id:"node".into(), event_id:record.event_id, sequence:Some(1), outcome:Outcome::Durable }).unwrap()).await.unwrap();
+                        }
+                    });
+                }
+                _ = clients.join_next(), if !clients.is_empty() => {},
+            }
+        }
+    });
+    let (s, d, stats) = supervisor();
+    s.configure(Some(c.clone()), 1).unwrap();
+    let lease = s.try_admit().unwrap().unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            lease
+                .reserve_terminal()
+                .unwrap()
+                .submit(crate::records::tests::record()),
+            SubmitResult::Accepted
+        );
+    }
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), seen_rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(s.status().retained_event_bytes, 3 * 65536);
+    c.budgets.max_in_flight_events = 1;
+    assert!(s
+        .configure(Some(c), 1)
+        .unwrap_err()
+        .contains("max_in_flight_events"));
+    release.add_permits(3);
+    assert!(!d.shutdown(Duration::from_secs(2)).await);
+    assert_eq!(s.status().retained_event_bytes, 0);
+    assert!(
+        prometheus_render::render(&stats.registry()).contains("envoy_llmproxy_metadata_durable 3")
+    );
+    drop(lease);
+    server.abort();
+    let _ = server.await;
 }

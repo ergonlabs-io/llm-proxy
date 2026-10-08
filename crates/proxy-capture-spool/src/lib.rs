@@ -215,6 +215,8 @@ pub struct MetadataSpool {
     recovered_pending_records: u64,
     #[cfg(test)]
     fault: Option<Fault>,
+    #[cfg(test)]
+    state_persist_count: usize,
 }
 
 impl MetadataSpool {
@@ -288,6 +290,8 @@ impl MetadataSpool {
             recovered_pending_records: 0,
             #[cfg(test)]
             fault: None,
+            #[cfg(test)]
+            state_persist_count: 0,
         };
         spool.recover()?;
         Ok(spool)
@@ -296,6 +300,35 @@ impl MetadataSpool {
     /// Reserves a never-reused sequence durably, then writes a pending encrypted frame.
     /// A successful return is NOT a durability promise for this payload.
     pub fn append(&mut self, payload: &[u8]) -> Result<AppendReceipt> {
+        self.prepare_append(payload)?;
+        let sequence = self.reserve_sequences(1)?;
+        self.append_reserved(payload, sequence)
+    }
+
+    /// Reserve up to eight never-reused sequence numbers with ONE durable
+    /// checkpoint before encrypting any payload. Inner results describe each
+    /// append; Full/RecordTooLarge may leave unused sequence gaps. I/O failure
+    /// poisons the writer. No successful append is durable until commit succeeds.
+    pub fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<Vec<Result<AppendReceipt>>> {
+        self.healthy()?;
+        if payloads.len() > 8 {
+            return Err(Error::InvalidConfig("append batch exceeds eight records"));
+        }
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first = self.reserve_sequences(payloads.len() as u64)?;
+        Ok(payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                self.prepare_append(payload)?;
+                self.append_reserved(payload, first + index as u64)
+            })
+            .collect())
+    }
+
+    fn prepare_append(&mut self, payload: &[u8]) -> Result<()> {
         self.healthy()?;
         if payload.len() > self.config.max_record_bytes {
             return Err(Error::RecordTooLarge);
@@ -313,14 +346,26 @@ impl MetadataSpool {
             } else {
                 0
             };
-        self.ensure_capacity(additional + FOOTER_BYTES as u64, self.pending.is_none())?;
+        self.ensure_capacity(additional + FOOTER_BYTES as u64, self.pending.is_none())
+    }
+
+    fn reserve_sequences(&mut self, count: u64) -> Result<u64> {
         let sequence = self.state.next;
-        let next = sequence.checked_add(1).ok_or(Error::SequenceExhausted)?;
+        let next = sequence
+            .checked_add(count)
+            .ok_or(Error::SequenceExhausted)?;
         let mut reserved = self.state.clone();
         reserved.next = next;
         let result = (|| {
             self.persist_state(&reserved)?;
             self.state = reserved;
+            Ok(sequence)
+        })();
+        self.poison_on_failure(result)
+    }
+
+    fn append_reserved(&mut self, payload: &[u8], sequence: u64) -> Result<AppendReceipt> {
+        let result = (|| {
             if self.pending.is_none() {
                 let header = format::header(&self.config, self.active_key(), sequence, false);
                 let mut file = create_file(&self.path(sequence, "open"))?;
@@ -550,6 +595,10 @@ impl MetadataSpool {
         #[cfg(test)]
         self.trip(Fault::CheckpointDirectorySync)?;
         sync_directory(&self.config.directory)?;
+        #[cfg(test)]
+        {
+            self.state_persist_count += 1;
+        }
         Ok(())
     }
 

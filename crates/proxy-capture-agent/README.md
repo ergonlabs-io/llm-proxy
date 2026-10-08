@@ -100,7 +100,7 @@ outside the producer grant are declined before storage.
 
 The agent admits at most eight connections and has an eight-event writer queue.
 Each connection has one in-flight record; a semaphore also bounds tasks. The
-single spool writer commits up to eight records after at most a 100 ms grouping
+single spool writer commits up to eight records after at most a 50 ms grouping
 window. Handshakes/receipts have two-second deadlines; idle reads expire after
 30 seconds. Frame buffers, queue payloads and batching are each bounded, but
 JSON parsing/serialization and spool crypto add transient allocations. Enforce
@@ -109,8 +109,10 @@ an independently provisioned process memory/CPU limit; no measured RSS or
 
 Commit seals a segment. In spool-only mode, repeated small batches can exhaust
 the segment-count limit long before disk bytes; size the count for the intended
-finite run/outage and observe declines. Per-append sequence reservation still
-requires its own fsync. No silent eviction or fake backend acknowledgement is
+finite run/outage and observe declines. One durable checkpoint reserves the
+whole batch's sequence range before any ciphertext is written; gaps are allowed
+but sequence reuse is not. Segment and inventory commit still precede durable
+receipts. No silent eviction or fake backend acknowledgement is
 used to keep admission running. Replay/checkpoint/reclaim remain explicit
 library APIs for a future confirmed backend adapter.
 

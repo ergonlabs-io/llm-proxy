@@ -802,7 +802,7 @@ pub struct MetadataDeliveryStats {
     active: Handle,
     state_bytes: Handle,
     event_bytes: Handle,
-    drops: [Handle; 6],
+    drops: [Handle; 8],
 }
 
 impl MetadataDeliveryStats {
@@ -841,6 +841,8 @@ impl MetadataDeliveryStats {
                 "delivery_unknown",
                 "identity_limit",
                 "transport_capacity",
+                "agent_rejected",
+                "unavailable",
             ]
             .map(|v| control.resolve(&instruments::CAPTURE_DROPS, &[("reason", v)])),
         }
@@ -944,6 +946,8 @@ pub enum CaptureDrop {
     DeliveryUnknown,
     IdentityLimit,
     TransportCapacity,
+    AgentRejected,
+    Unavailable,
 }
 
 /// Identifies a worker thread/runtime for [`Registry::incr`]/
