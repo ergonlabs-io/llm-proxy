@@ -18,7 +18,8 @@
 // The generated module tree is large and machine-written; skip lints we cannot
 // fix without editing tonic/prost output. `result_large_err` fires on generated
 // gRPC clients because `tonic::Status` itself is 176 bytes — boxing it would
-// mean forking the generator.
+// mean forking the generator. `async_trait` adds `must_use` to futures already
+// marked must-use; newer Clippy versions flag this in generated service traits.
 #[allow(
     missing_docs,
     rustdoc::invalid_html_tags,
@@ -29,7 +30,8 @@
     clippy::large_enum_variant,
     clippy::enum_variant_names,
     clippy::len_without_is_empty,
-    clippy::result_large_err
+    clippy::result_large_err,
+    clippy::double_must_use
 )]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated.rs"));
