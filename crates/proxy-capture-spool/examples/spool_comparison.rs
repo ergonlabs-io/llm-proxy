@@ -1,14 +1,17 @@
-//! Isolated storage experiment. Neither backend selection nor this redb format
-//! is exposed by the production capture agent. Run through scripts/spool-comparison.py.
+//! Isolated v1 reference versus redb prototype, separate from production redb.
+//! Run through scripts/spool-comparison.py; production uses redb_retention.
 
 #[allow(dead_code)] // Fault hooks are exercised by integration tests, not this driver.
 #[path = "../tests/support/redb_spool.rs"]
 mod redb_spool;
 
-use proxy_capture_spool::{EncryptionKey, MetadataSpool, SpoolConfig};
+#[allow(dead_code)]
+#[path = "../tests/support/v1_spool.rs"]
+mod v1_spool;
 use serde_json::{json, Value};
 use std::time::Duration;
 use std::{collections::BTreeMap, error::Error, fs, path::PathBuf, time::Instant};
+use v1_spool::{EncryptionKey, MetadataSpool, SpoolConfig};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const REPLAY_BYTES: usize = 64 * 1024 * 1024;

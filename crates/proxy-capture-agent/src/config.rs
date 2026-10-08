@@ -1,12 +1,17 @@
-use proxy_capture_spool::{EncryptionKey, SpoolConfig};
+use proxy_capture_spool::{
+    EncryptionKey, SpoolConfig, DEFAULT_CACHE_BYTES, MAX_CACHE_BYTES, MIN_DISK_BYTES,
+};
 use serde::Deserialize;
 use std::{
     collections::HashSet,
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
-    time::Duration,
 };
+
+fn default_cache_bytes() -> usize {
+    DEFAULT_CACHE_BYTES
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,10 +39,9 @@ pub struct Producer {
 pub struct Spool {
     pub directory: PathBuf,
     pub max_record_bytes: usize,
-    pub max_segment_bytes: u64,
     pub max_disk_bytes: u64,
-    pub max_segments: usize,
-    pub max_segment_age_seconds: u64,
+    #[serde(default = "default_cache_bytes")]
+    pub cache_bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,10 +86,8 @@ impl Config {
             &[
                 "directory",
                 "max_record_bytes",
-                "max_segment_bytes",
                 "max_disk_bytes",
-                "max_segments",
-                "max_segment_age_seconds",
+                "cache_bytes",
             ],
             "spool",
         )?;
@@ -179,17 +181,13 @@ impl Config {
         {
             return Err(invalid("spool.max_record_bytes"));
         }
-        if self.spool.max_segments == 0 || self.spool.max_segments > 1024 {
-            return Err(invalid("spool.max_segments"));
-        }
-        if self.spool.max_segment_bytes > 67_108_864 {
-            return Err(invalid("spool.max_segment_bytes"));
-        }
-        if self.spool.max_disk_bytes > 1_099_511_627_776 {
+        if self.spool.max_disk_bytes < MIN_DISK_BYTES
+            || self.spool.max_disk_bytes > 1_099_511_627_776
+        {
             return Err(invalid("spool.max_disk_bytes"));
         }
-        if self.spool.max_segment_age_seconds == 0 || self.spool.max_segment_age_seconds > 3600 {
-            return Err(invalid("spool.max_segment_age_seconds"));
+        if self.spool.cache_bytes == 0 || self.spool.cache_bytes > MAX_CACHE_BYTES {
+            return Err(invalid("spool.cache_bytes"));
         }
         self.spool_config().validate().map_err(|_| invalid("spool"))
     }
@@ -199,10 +197,8 @@ impl Config {
             directory: self.spool.directory.clone(),
             node_id: self.node_id.clone(),
             max_record_bytes: self.spool.max_record_bytes,
-            max_segment_bytes: self.spool.max_segment_bytes,
             max_disk_bytes: self.spool.max_disk_bytes,
-            max_segments: self.spool.max_segments,
-            max_segment_age: Duration::from_secs(self.spool.max_segment_age_seconds),
+            cache_bytes: self.spool.cache_bytes,
         }
     }
 
@@ -257,18 +253,15 @@ mod tests {
     fn valid() -> serde_json::Value {
         serde_json::json!({"version":1,"mode":"metadata_spool_only","socket_path":"/private/tmp/agent.sock","node_id":"node",
             "producers":[{"producer_id":"proxy","uid":1000,"tenants":["default"]}],
-            "spool":{"directory":"/private/tmp/spool","max_record_bytes":4096,"max_segment_bytes":8192,"max_disk_bytes":65536,"max_segments":8,"max_segment_age_seconds":60},
+            "spool":{"directory":"/private/tmp/spool","max_record_bytes":4096,"max_disk_bytes":4194304},
             "active_key_id":"key","keys":[{"key_id":"key","key_file":"/private/tmp/key"}]})
     }
     #[test]
     fn numeric_bounds_and_ambiguous_grants_are_rejected() {
         let config: Config = serde_json::from_value(valid()).unwrap();
         config.validate().unwrap();
-        for (field, value) in [
-            ("max_record_bytes", 524289),
-            ("max_segments", 1025),
-            ("max_segment_age_seconds", 3601),
-        ] {
+        assert_eq!(config.spool.cache_bytes, DEFAULT_CACHE_BYTES);
+        for (field, value) in [("max_record_bytes", 524289), ("cache_bytes", 16777217)] {
             let mut input = valid();
             input["spool"][field] = value.into();
             assert!(serde_json::from_value::<Config>(input)
@@ -305,6 +298,24 @@ mod tests {
         assert!(Config::load(&path).is_err());
         std::fs::write(&path, valid().to_string()).unwrap();
         Config::load(&path).unwrap();
+    }
+    #[test]
+    fn removed_segment_fields_fail_with_full_spool_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        for field in [
+            "max_segment_bytes",
+            "max_segments",
+            "max_segment_age_seconds",
+        ] {
+            let mut input = valid();
+            input["spool"][field] = 1.into();
+            std::fs::write(&path, input.to_string()).unwrap();
+            assert!(Config::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("agent.spool.{field}")));
+        }
     }
     #[test]
     fn private_fixed_length_key_files_are_required() {

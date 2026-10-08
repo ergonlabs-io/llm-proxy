@@ -6,13 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+redb.workspace = true
 ring.workspace = true
 thiserror.workspace = true
 # Safe flock releases on process death; already present in Cargo.lock and MSRV 1.63.
 rustix = { version = "=1.1.4", features = ["fs"] }
 
 [dev-dependencies]
-redb.workspace = true
 serde_json.workspace = true
 tempfile = { version = "=3.27.0", default-features = false }
 

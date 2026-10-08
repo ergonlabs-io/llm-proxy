@@ -212,8 +212,7 @@ def scenario(output, name, state, rate, duration, warmup, memory=False):
                             "socket_path": str(runtime / "agent.sock"), "node_id": "qualification-node",
                             "producers": [{"producer_id": "qualification-proxy", "uid": os.getuid(), "tenants": ["default"]}],
                             "spool": {"directory": str(directory / "spool"), "max_record_bytes": 524288,
-                                      "max_segment_bytes": 67108864, "max_disk_bytes": 1073741824,
-                                      "max_segments": 1024, "max_segment_age_seconds": 60},
+                                      "max_disk_bytes": 1073741824, "cache_bytes": 4194304},
                             "active_key_id": "qualification-key",
                             "keys": [{"key_id": "qualification-key", "key_file": str(key)}]}
             write_json(directory / "agent.json", agent_config)
@@ -378,11 +377,22 @@ def main():
     production_diff = subprocess.check_output(["git", "diff", "HEAD", "--", "crates", "Cargo.toml", "Cargo.lock"], cwd=ROOT)
     (output / "source.diff").write_bytes(production_diff)
     (output / "qualification-script.py").write_bytes(Path(__file__).read_bytes())
+    # New modules are absent from git diff until committed; preserve exact sources.
+    source_hashes = {}
+    for name in ("Cargo.toml", "Cargo.lock", "crates/proxy-capture-spool/Cargo.toml",
+                 "crates/proxy-capture-spool/src/lib.rs", "crates/proxy-capture-spool/src/format.rs",
+                 "crates/proxy-capture-spool/src/storage.rs", "crates/proxy-capture-agent/src/config.rs"):
+        content = (ROOT / name).read_bytes()
+        destination = output / "source" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        source_hashes[name] = hashlib.sha256(content).hexdigest()
     write_json(output / "environment.json", {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                                             "production_dirty": bool(production_diff),
                                             "production_diff_file": "source.diff",
                                             "qualification_script_file": "qualification-script.py",
                                             "production_diff_sha256": hashlib.sha256(production_diff).hexdigest(),
+                                            "source_sha256": source_hashes,
                                             "qualification_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                                             "platform": platform.platform(), "machine": platform.machine(),
                                             "cpu_count": os.cpu_count(), "binary_sha256": binary_hashes,

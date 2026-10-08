@@ -13,11 +13,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use diffrig::harness::{ScratchDir, free_port, resolve_llm_proxy_bin};
+use diffrig::harness::{free_port, resolve_llm_proxy_bin, ScratchDir};
 use diffrig::upstreams::{OpenAiConfig, OpenAiUpstream};
 use loadgen::dialect::Endpoint;
 use loadgen::driver::{
-    DownstreamMode, RunConfig, Target, TransportConfig, run_closed_loop, run_open_loop,
+    run_closed_loop, run_open_loop, DownstreamMode, RunConfig, Target, TransportConfig,
 };
 
 const RATE: f64 = 5_000.0;

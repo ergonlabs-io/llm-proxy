@@ -15,10 +15,8 @@ fn open(root: &Path) -> MetadataSpool {
         directory: root.join("spool"),
         node_id: "crash-test".into(),
         max_record_bytes: 1024,
-        max_segment_bytes: 16 * 1024,
-        max_disk_bytes: 128 * 1024,
-        max_segments: 8,
-        max_segment_age: Duration::from_secs(60),
+        max_disk_bytes: 8 * 1024 * 1024,
+        cache_bytes: 1024 * 1024,
     };
     let key = EncryptionKey::new("crash-test-key", [37; 32]).unwrap();
     MetadataSpool::open(config, key, Vec::new()).unwrap()

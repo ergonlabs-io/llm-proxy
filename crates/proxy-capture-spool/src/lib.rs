@@ -1,27 +1,41 @@
-//! Bounded, encrypted metadata spool for a dedicated off-path writer.
+//! Bounded, encrypted redb metadata spool for a dedicated off-path writer.
 //!
-//! Append receipts are not durable. `commit`/`seal` publish an immutable batch
-//! and return only after segment and authenticated checkpoint durability barriers.
-//! Drop never commits. Restart discards pending batches; sequence reservations
-//! survive those losses. See README.md for filesystem and delivery assumptions.
-
+//! Append receipts are not durable. Immediate transactions reserve sequences
+//! before encryption and atomically publish encrypted records with authenticated
+//! inventory. Drop never commits pending payloads. See README.md for assumptions.
 mod format;
+mod storage;
+#[cfg(test)]
+mod testing;
 
-use format::{Descriptor, State, FOOTER_BYTES, FRAME_OVERHEAD, HEADER_BYTES};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle,
+};
 use ring::{aead, digest};
 use std::{
     cell::Cell,
     collections::BTreeMap,
     fmt,
     fs::{self, File, OpenOptions},
-    io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::Arc,
 };
+#[cfg(test)]
+use testing::{Fault, Hooks};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub const MAX_ENCRYPTION_KEYS: usize = 32;
+pub const DEFAULT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
+// redb 4.2 starts with 1 MiB usable pages plus metadata and commit headroom.
+pub const MIN_DISK_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PENDING_RECORDS: usize = 8;
+const RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
+const STATE: TableDefinition<u64, &[u8]> = TableDefinition::new("state");
+const DATABASE: &str = "capture.redb";
+const QUARANTINE: &str = "capture.redb.bad";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -53,14 +67,15 @@ pub enum Error {
     Crypto,
     #[error("spool I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("spool database failed: {0}")]
+    Storage(String),
 }
 
-/// Externally provisioned AES-256-GCM key. Never serialized or included in Debug.
+/// Externally provisioned AES-256-GCM key. Never persisted or exposed in Debug.
 pub struct EncryptionKey {
     id: String,
     key: aead::LessSafeKey,
 }
-
 impl EncryptionKey {
     pub fn new(key_id: impl Into<String>, key_bytes: [u8; 32]) -> Result<Self> {
         let id = key_id.into();
@@ -77,72 +92,46 @@ impl EncryptionKey {
         })
     }
 }
-
 impl fmt::Debug for EncryptionKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("EncryptionKey([REDACTED])")
     }
 }
 
-/// All sizes are logical file bytes; reserve includes two maximum checkpoints.
-/// Segment age rotates on the next append, never expires committed backlog.
 #[derive(Clone, Debug)]
 pub struct SpoolConfig {
     pub directory: PathBuf,
     pub node_id: String,
     pub max_record_bytes: usize,
-    pub max_segment_bytes: u64,
+    /// Logical aggregate file bytes, including database copy-on-write growth.
     pub max_disk_bytes: u64,
-    /// Includes pending, sealed, and quarantined segments.
-    pub max_segments: usize,
-    pub max_segment_age: Duration,
+    /// Database cache only; pending records and caller scratch are separate.
+    pub cache_bytes: usize,
 }
-
 impl SpoolConfig {
-    /// Validate size arithmetic and bounds without opening files.
     pub fn validate(&self) -> Result<()> {
         if self.node_id.is_empty() || self.node_id.len() > 128 {
             return Err(Error::InvalidConfig("node_id must be 1..=128 bytes"));
         }
         if self.max_record_bytes == 0
-            || self.max_record_bytes > u32::MAX as usize - FRAME_OVERHEAD
-            || self.max_segments == 0
-            || self.max_segment_age.is_zero()
+            || self.max_record_bytes > u32::MAX as usize - format::MAX_ENVELOPE_OVERHEAD
         {
             return Err(Error::InvalidConfig(
-                "record, segment count and age limits must be finite and positive",
+                "record size must be finite and positive",
             ));
         }
-        let minimum =
-            (HEADER_BYTES + FRAME_OVERHEAD + FOOTER_BYTES) as u64 + self.max_record_bytes as u64;
-        let control = self.control_reserve()?;
-        if self.max_segment_bytes < minimum
+        if self.cache_bytes == 0 || self.cache_bytes > MAX_CACHE_BYTES {
+            return Err(Error::InvalidConfig("cache_bytes must be 1..=16777216"));
+        }
+        if self.max_disk_bytes < MIN_DISK_BYTES
             || self.max_disk_bytes
-                < control
-                    .checked_add(self.max_segment_bytes)
-                    .ok_or(Error::InvalidConfig("disk limit overflow"))?
+                < self.max_record_bytes as u64 + format::MAX_ENVELOPE_OVERHEAD as u64
         {
             return Err(Error::InvalidConfig(
-                "disk/segment budgets cannot hold one maximum record and control reserve",
+                "disk budget cannot hold database metadata and a maximum record",
             ));
         }
         Ok(())
-    }
-
-    fn state_bound(&self) -> Result<usize> {
-        let payload = self
-            .max_segments
-            .checked_mul(format::DESCRIPTOR_BYTES)
-            .and_then(|n| n.checked_add(format::STATE_FIXED))
-            .ok_or(Error::InvalidConfig("checkpoint limit overflow"))?;
-        if payload > u32::MAX as usize - FRAME_OVERHEAD {
-            return Err(Error::InvalidConfig("checkpoint length exceeds wire limit"));
-        }
-        Ok(payload)
-    }
-
-    fn control_reserve(&self) -> Result<u64> {
-        Ok(2 * (self.state_bound()? + HEADER_BYTES + FRAME_OVERHEAD) as u64)
     }
 }
 
@@ -150,19 +139,15 @@ impl SpoolConfig {
 pub struct AppendReceipt {
     pub sequence: u64,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DurableReceipt {
     pub through_sequence: u64,
 }
-
-/// Owned metadata bytes. Debug deliberately does not reveal the metadata.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplayRecord {
     pub sequence: u64,
     pub payload: Vec<u8>,
 }
-
 impl fmt::Debug for ReplayRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReplayRecord")
@@ -171,103 +156,64 @@ impl fmt::Debug for ReplayRecord {
             .finish()
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpoolStats {
     pub next_sequence: u64,
     pub durable_through_sequence: u64,
     pub acknowledged_through_sequence: u64,
     pub pending_records: u64,
-    pub committed_segments: usize,
-    pub pending_segments: usize,
-    /// Physical logical file lengths including checkpoints, lock, quarantine.
+    pub retained_records: u64,
+    pub database_bytes: u64,
     pub disk_bytes: u64,
-    pub control_reserved_bytes: u64,
     pub quarantine_bytes: u64,
-    pub quarantine_segments: usize,
-    /// Valid records discarded from pending batches at this open.
-    pub recovered_pending_records: u64,
     pub poisoned: bool,
 }
 
-struct Pending {
-    file: File,
-    first: u64,
-    last: u64,
-    count: u64,
-    bytes: u64,
-    started: Instant,
-    header: [u8; HEADER_BYTES],
-    hash: digest::Context,
-}
-
-/// Single-writer, synchronous library. Call from the capture agent, never workers.
-/// The OS lock is held until Drop, including on poisoned handles.
+/// Single-writer synchronous library. Never call from request workers.
+/// The database is dropped before releasing the writer lock, including on error.
 pub struct MetadataSpool {
+    db: Database,
     config: SpoolConfig,
     keys: BTreeMap<String, EncryptionKey>,
     active_id: String,
-    state: State,
-    pending: Option<Pending>,
-    _lock: File,
-    // Rust note: Cell lets read-only replay invalidate this handle after failed authentication.
+    state: format::State,
+    hash: digest::Context,
+    pending: Vec<(u64, Vec<u8>)>,
     poisoned: Cell<bool>,
-    recovered_pending_records: u64,
     #[cfg(test)]
-    fault: Option<Fault>,
-    #[cfg(test)]
-    state_persist_count: usize,
+    hooks: Arc<Hooks>,
+    _lock: File,
 }
-
 impl MetadataSpool {
     pub fn open(
         config: SpoolConfig,
         active: EncryptionKey,
         recovery_keys: impl IntoIterator<Item = EncryptionKey>,
     ) -> Result<Self> {
+        Self::open_inner(
+            config,
+            active,
+            recovery_keys,
+            #[cfg(test)]
+            Arc::new(Hooks::default()),
+        )
+    }
+    #[cfg(test)]
+    fn open_with_hooks(
+        config: SpoolConfig,
+        active: EncryptionKey,
+        recovery_keys: impl IntoIterator<Item = EncryptionKey>,
+        hooks: Arc<Hooks>,
+    ) -> Result<Self> {
+        Self::open_inner(config, active, recovery_keys, hooks)
+    }
+    fn open_inner(
+        config: SpoolConfig,
+        active: EncryptionKey,
+        recovery_keys: impl IntoIterator<Item = EncryptionKey>,
+        #[cfg(test)] hooks: Arc<Hooks>,
+    ) -> Result<Self> {
         config.validate()?;
-        // A private directory is an ownership boundary, not an untrusted path store.
-        if !config.directory.exists() {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&config.directory)?;
-            sync_directory(
-                config
-                    .directory
-                    .parent()
-                    .ok_or(Error::InvalidConfig("directory needs a parent"))?,
-            )?;
-        }
-        if !fs::symlink_metadata(&config.directory)?
-            .file_type()
-            .is_dir()
-        {
-            return Err(Error::Corrupt);
-        }
-        if fs::metadata(&config.directory)?.permissions().mode() & 0o077 != 0 {
-            return Err(Error::InvalidConfig("spool directory must be owner-only"));
-        }
-        let lock_path = config.directory.join("writer.lock");
-        if lock_path.try_exists()? && !fs::symlink_metadata(&lock_path)?.file_type().is_file() {
-            return Err(Error::Corrupt);
-        }
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
-            |error| {
-                if error == rustix::io::Errno::WOULDBLOCK {
-                    Error::Locked
-                } else {
-                    Error::Io(error.into())
-                }
-            },
-        )?;
-        sync_directory(&config.directory)?;
         let active_id = active.id.clone();
         let mut keys = BTreeMap::new();
         keys.insert(active.id.clone(), active);
@@ -279,183 +225,266 @@ impl MetadataSpool {
                 return Err(Error::DuplicateKey);
             }
         }
+        match fs::symlink_metadata(&config.directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&config.directory)?;
+                sync_directory(
+                    config
+                        .directory
+                        .parent()
+                        .ok_or(Error::InvalidConfig("directory needs a parent"))?,
+                )?;
+            }
+            other => {
+                other?;
+            }
+        }
+        let metadata = fs::symlink_metadata(&config.directory)?;
+        if !metadata.is_dir() {
+            return Err(Error::Corrupt);
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::InvalidConfig("spool directory must be owner-only"));
+        }
+        let lock_path = config.directory.join("writer.lock");
+        // Inspect a pre-existing lock before opening it; never follow symlinks.
+        match fs::symlink_metadata(&lock_path) {
+            Ok(meta)
+                if !meta.is_file() || meta.len() != 0 || meta.permissions().mode() & 0o077 != 0 =>
+            {
+                return Err(Error::Corrupt)
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(lock_path)?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |e| {
+                if e == rustix::io::Errno::WOULDBLOCK {
+                    Error::Locked
+                } else {
+                    Error::Io(e.into())
+                }
+            },
+        )?;
+        let inventory = inventory(&config.directory)?;
+        if inventory.bytes > config.max_disk_bytes {
+            return Err(Error::Full);
+        }
+        if inventory.quarantine_bytes != 0 || config.directory.join(QUARANTINE).try_exists()? {
+            return Err(Error::Quarantined);
+        }
+        let path = config.directory.join(DATABASE);
+        let fresh = !path.try_exists()?;
+        if !fresh && inventory.database_bytes == 0 {
+            return Err(Error::Corrupt);
+        }
+        let file = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(fresh)
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(&path)?,
+        );
+        let other_bytes = inventory.bytes - inventory.database_bytes;
+        let backend = storage::Backend {
+            file,
+            cap: config.max_disk_bytes - other_bytes,
+            #[cfg(test)]
+            hooks: hooks.clone(),
+        };
+        let db = match Database::builder()
+            .set_cache_size(config.cache_bytes)
+            .create_with_backend(backend)
+            .map_err(storage_error)
+        {
+            Ok(db) => db,
+            Err(error) => {
+                if matches!(error, Error::Corrupt) {
+                    quarantine(
+                        &config.directory,
+                        #[cfg(test)]
+                        &hooks,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
         let mut spool = Self {
+            db,
             config,
             keys,
             active_id,
-            state: State::empty(),
-            pending: None,
-            _lock: lock,
+            state: format::State::empty(),
+            hash: format::inventory_hash(),
+            pending: Vec::new(),
             poisoned: Cell::new(false),
-            recovered_pending_records: 0,
             #[cfg(test)]
-            fault: None,
-            #[cfg(test)]
-            state_persist_count: 0,
+            hooks,
+            _lock: lock,
         };
-        spool.recover()?;
+        let result = (|| {
+            if fresh {
+                #[cfg(test)]
+                spool.hooks.trip(Fault::InitializeBeforeCommit)?;
+                spool.publish(&spool.state, &[], None)?;
+                #[cfg(test)]
+                spool.hooks.trip(Fault::InitializeAfterCommit)?;
+                #[cfg(test)]
+                spool.hooks.trip(Fault::InitializeDirectorySync)?;
+                sync_directory(&spool.config.directory)?;
+            }
+            let state_key = spool.recover()?;
+            // Rewrap state on key change without rewriting retained record envelopes.
+            if state_key != spool.active_id {
+                #[cfg(test)]
+                spool.hooks.trip(Fault::RewrapBeforeCommit)?;
+                spool.publish(&spool.state, &[], None)?;
+                #[cfg(test)]
+                spool.hooks.trip(Fault::RewrapAfterCommit)?;
+            }
+            // Repeat after recovery so a valid initialization lost before directory
+            // sync cannot admit new payloads until publication is durable.
+            sync_directory(&spool.config.directory)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let directory = spool.config.directory.clone();
+            #[cfg(test)]
+            let hooks = spool.hooks.clone();
+            let Self {
+                db, _lock: lock, ..
+            } = spool;
+            drop(db);
+            if matches!(error, Error::Corrupt) {
+                quarantine(
+                    &directory,
+                    #[cfg(test)]
+                    &hooks,
+                )?;
+            }
+            drop(lock);
+            return Err(error);
+        }
         Ok(spool)
     }
 
-    /// Reserves a never-reused sequence durably, then writes a pending encrypted frame.
-    /// A successful return is NOT a durability promise for this payload.
+    /// A successful append reserves a sequence, but does not acknowledge durability.
     pub fn append(&mut self, payload: &[u8]) -> Result<AppendReceipt> {
-        self.prepare_append(payload)?;
-        let sequence = self.reserve_sequences(1)?;
-        self.append_reserved(payload, sequence)
+        self.healthy()?;
+        if payload.len() > self.config.max_record_bytes {
+            return Err(Error::RecordTooLarge);
+        }
+        if self.pending.len() == MAX_PENDING_RECORDS {
+            return Err(Error::Full);
+        }
+        let first = self.reserve(1)?;
+        self.append_reserved(first, payload)
     }
-
-    /// Reserve up to eight never-reused sequence numbers with ONE durable
-    /// checkpoint before encrypting any payload. Inner results describe each
-    /// append; Full/RecordTooLarge may leave unused sequence gaps. I/O failure
-    /// poisons the writer. No successful append is durable until commit succeeds.
+    /// Reserve the complete range before encryption; per-record rejections leave gaps.
     pub fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<Vec<Result<AppendReceipt>>> {
         self.healthy()?;
-        if payloads.len() > 8 {
+        if payloads.len() > MAX_PENDING_RECORDS {
             return Err(Error::InvalidConfig("append batch exceeds eight records"));
         }
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
-        let first = self.reserve_sequences(payloads.len() as u64)?;
-        Ok(payloads
-            .iter()
-            .enumerate()
-            .map(|(index, payload)| {
-                self.prepare_append(payload)?;
-                self.append_reserved(payload, first + index as u64)
-            })
-            .collect())
-    }
-
-    fn prepare_append(&mut self, payload: &[u8]) -> Result<()> {
-        self.healthy()?;
-        if payload.len() > self.config.max_record_bytes {
-            return Err(Error::RecordTooLarge);
+        // Pending-capacity rejection is definitive: this batch cannot publish payloads.
+        if self.pending.len() + payloads.len() > MAX_PENDING_RECORDS {
+            return Err(Error::Full);
         }
-        let frame_bytes = (payload.len() + FRAME_OVERHEAD) as u64;
-        if self.pending.as_ref().is_some_and(|p| {
-            p.bytes + frame_bytes + FOOTER_BYTES as u64 > self.config.max_segment_bytes
-                || p.started.elapsed() >= self.config.max_segment_age
-        }) {
-            self.commit()?;
-        }
-        let additional = frame_bytes
-            + if self.pending.is_none() {
-                HEADER_BYTES as u64
+        let first = self.reserve(payloads.len() as u64)?;
+        let mut results = Vec::with_capacity(payloads.len());
+        for (index, payload) in payloads.iter().enumerate() {
+            if payload.len() > self.config.max_record_bytes {
+                results.push(Err(Error::RecordTooLarge));
             } else {
-                0
-            };
-        self.ensure_capacity(additional + FOOTER_BYTES as u64, self.pending.is_none())
+                results.push(Ok(self.append_reserved(first + index as u64, payload)?));
+            }
+        }
+        Ok(results)
     }
-
-    fn reserve_sequences(&mut self, count: u64) -> Result<u64> {
-        let sequence = self.state.next;
-        let next = sequence
-            .checked_add(count)
-            .ok_or(Error::SequenceExhausted)?;
-        let mut reserved = self.state.clone();
-        reserved.next = next;
+    fn reserve(&mut self, count: u64) -> Result<u64> {
+        let first = self.state.next;
+        let mut state = self.state;
+        state.next = first.checked_add(count).ok_or(Error::SequenceExhausted)?;
         let result = (|| {
-            self.persist_state(&reserved)?;
-            self.state = reserved;
-            Ok(sequence)
+            #[cfg(test)]
+            self.hooks.trip(Fault::ReserveBeforeCommit)?;
+            self.publish(&state, &[], None)?;
+            #[cfg(test)]
+            self.hooks.trip(Fault::ReserveAfterCommit)?;
+            self.state = state;
+            Ok(first)
         })();
         self.poison_on_failure(result)
     }
-
-    fn append_reserved(&mut self, payload: &[u8], sequence: u64) -> Result<AppendReceipt> {
+    fn append_reserved(&mut self, sequence: u64, payload: &[u8]) -> Result<AppendReceipt> {
         let result = (|| {
-            if self.pending.is_none() {
-                let header = format::header(&self.config, self.active_key(), sequence, false);
-                let mut file = create_file(&self.path(sequence, "open"))?;
-                file.write_all(&header)?;
-                let mut hash = digest::Context::new(&digest::SHA256);
-                hash.update(&header);
-                self.pending = Some(Pending {
-                    file,
-                    first: sequence,
-                    last: sequence,
-                    count: 0,
-                    bytes: HEADER_BYTES as u64,
-                    started: Instant::now(),
-                    header,
-                    hash,
-                });
-            }
-            let header = self.pending.as_ref().unwrap().header;
-            let frame = format::encrypt(&header, self.active_key(), 1, sequence, payload)?;
             #[cfg(test)]
-            self.trip(Fault::AppendWrite)?;
-            let pending = self.pending.as_mut().unwrap();
-            pending.file.write_all(&frame)?;
-            pending.hash.update(&frame);
-            pending.count += 1;
-            pending.last = sequence;
-            pending.bytes += frame.len() as u64;
+            self.hooks.trip(Fault::Encrypt)?;
+            let bytes = format::encrypt(
+                self.active_key(),
+                &self.config.node_id,
+                1,
+                sequence,
+                payload,
+            )?;
+            self.pending.push((sequence, bytes));
             Ok(AppendReceipt { sequence })
         })();
         self.poison_on_failure(result)
     }
-
-    /// Seals and commits the current batch, including its authenticated inventory.
-    /// No pending batch means the existing committed high-water mark is returned.
     pub fn commit(&mut self) -> Result<DurableReceipt> {
         self.healthy()?;
-        if self.pending.is_none() {
+        if self.pending.is_empty() {
             return Ok(DurableReceipt {
                 through_sequence: self.state.durable,
             });
         }
         let result = (|| {
-            let pending = self.pending.as_ref().unwrap();
-            let mut footer = Vec::with_capacity(format::FOOTER_PAYLOAD);
-            footer.extend_from_slice(&pending.count.to_le_bytes());
-            footer.extend_from_slice(&pending.last.to_le_bytes());
-            footer.extend_from_slice(pending.hash.clone().finish().as_ref());
-            let frame =
-                format::encrypt(&pending.header, self.active_key(), 2, pending.last, &footer)?;
-            let pending = self.pending.as_mut().unwrap();
-            pending.file.write_all(&frame)?;
-            pending.hash.update(&frame);
-            pending.bytes += frame.len() as u64;
+            let mut hash = self.hash.clone();
+            for (sequence, bytes) in &self.pending {
+                format::hash_record(&mut hash, *sequence, bytes);
+            }
+            let mut state = self.state;
+            state.durable = self.pending.last().unwrap().0;
+            state.count = state
+                .count
+                .checked_add(self.pending.len() as u64)
+                .ok_or(Error::Corrupt)?;
+            state.digest = hash.clone().finish().as_ref().try_into().unwrap();
             #[cfg(test)]
-            self.trip(Fault::SegmentSync)?;
-            let pending = self.pending.as_mut().unwrap();
-            pending.file.sync_all()?;
-            let descriptor = Descriptor {
-                first: pending.first,
-                last: pending.last,
-                bytes: pending.bytes,
-                hash: pending.hash.clone().finish().as_ref().try_into().unwrap(),
-            };
-            fs::rename(
-                self.path(descriptor.first, "open"),
-                self.path(descriptor.first, "seg"),
-            )?;
+            self.hooks.trip(Fault::CommitBeforeCommit)?;
+            self.publish(&state, &self.pending, None)?;
             #[cfg(test)]
-            self.trip(Fault::PublishDirectorySync)?;
-            sync_directory(&self.config.directory)?;
-            let mut committed = self.state.clone();
-            committed.durable = descriptor.last;
-            committed.segments.push(descriptor);
-            self.persist_state(&committed)?;
-            self.state = committed;
-            self.pending = None;
+            self.hooks.trip(Fault::CommitAfterCommit)?;
+            self.state = state;
+            self.hash = hash;
+            self.pending.clear();
             Ok(DurableReceipt {
-                through_sequence: self.state.durable,
+                through_sequence: state.durable,
             })
         })();
         self.poison_on_failure(result)
     }
-
+    /// Flushes pending payloads. There is no segment rotation in the redb format.
     pub fn seal(&mut self) -> Result<DurableReceipt> {
         self.commit()
     }
 
-    /// Replays only committed, unacknowledged payloads in sequence order. A record
-    /// that cannot fit max_bytes is left for the next call; no oversized result.
-    /// Bounds apply to returned plaintext bytes, including empty records' row count.
     pub fn replay(
         &self,
         after_sequence: u64,
@@ -463,51 +492,48 @@ impl MetadataSpool {
         max_bytes: usize,
     ) -> Result<Vec<ReplayRecord>> {
         self.healthy()?;
-        let result = self.replay_inner(after_sequence, max_records, max_bytes);
+        let result = (|| {
+            let after = after_sequence.max(self.state.acknowledged);
+            if max_records == 0 || max_bytes == 0 || after == u64::MAX {
+                return Ok(Vec::new());
+            }
+            let tx = self.db.begin_read().map_err(storage_error)?;
+            let table = tx.open_table(RECORDS).map_err(storage_error)?;
+            let mut records = Vec::new();
+            let mut used = 0;
+            for row in table.range(after + 1..).map_err(storage_error)? {
+                if records.len() == max_records {
+                    break;
+                }
+                let (sequence, envelope) = row.map_err(storage_error)?;
+                let sequence = sequence.value();
+                if sequence > self.state.durable || sequence >= self.state.next {
+                    return Err(Error::Corrupt);
+                }
+                let payload = format::decrypt(
+                    &self.keys,
+                    &self.config.node_id,
+                    1,
+                    sequence,
+                    envelope.value(),
+                    self.config.max_record_bytes,
+                )?;
+                if payload.len() > max_bytes - used {
+                    break;
+                }
+                used += payload.len();
+                records.push(ReplayRecord { sequence, payload });
+            }
+            Ok(records)
+        })();
         if result.is_err() {
             self.poisoned.set(true);
         }
         result
     }
 
-    fn replay_inner(
-        &self,
-        after_sequence: u64,
-        max_records: usize,
-        max_bytes: usize,
-    ) -> Result<Vec<ReplayRecord>> {
-        if max_records == 0 || max_bytes == 0 {
-            return Ok(Vec::new());
-        }
-        let after = after_sequence.max(self.state.acknowledged);
-        let mut records = Vec::new();
-        let mut used = 0;
-        let mut full = false;
-        for descriptor in &self.state.segments {
-            if descriptor.last <= after {
-                continue;
-            }
-            self.scan_segment(descriptor, |sequence, payload| {
-                if full || sequence <= after {
-                    return;
-                }
-                if records.len() == max_records || payload.len() > max_bytes - used {
-                    full = true;
-                } else {
-                    used += payload.len();
-                    records.push(ReplayRecord { sequence, payload });
-                }
-            })?;
-            if full || records.len() == max_records {
-                break;
-            }
-        }
-        Ok(records)
-    }
-
-    /// Caller must first obtain backend confirmation through this sequence.
-    /// Persist the authenticated checkpoint BEFORE deleting whole covered segments.
-    /// Partial-segment acknowledgements suppress replay but do not compact files.
+    /// Only the caller's genuine backend confirmation permits deletion.
+    /// The local-only capture agent never invokes this API.
     pub fn acknowledge(&mut self, through_sequence: u64) -> Result<()> {
         self.healthy()?;
         if through_sequence > self.state.durable {
@@ -516,49 +542,59 @@ impl MetadataSpool {
         if through_sequence <= self.state.acknowledged {
             return Ok(());
         }
-        let mut acknowledged = self.state.clone();
-        acknowledged.acknowledged = through_sequence;
-        acknowledged.segments.retain(|s| s.last > through_sequence);
         let result = (|| {
-            self.persist_state(&acknowledged)?;
-            let reclaim: Vec<u64> = self
-                .state
-                .segments
-                .iter()
-                .filter(|s| s.last <= through_sequence)
-                .map(|s| s.first)
-                .collect();
-            self.state = acknowledged;
-            #[cfg(test)]
-            self.trip(Fault::Reclaim)?;
-            for first in reclaim {
-                fs::remove_file(self.path(first, "seg"))?;
+            let mut hash = format::inventory_hash();
+            let mut count = 0u64;
+            {
+                let tx = self.db.begin_read().map_err(storage_error)?;
+                let table = tx.open_table(RECORDS).map_err(storage_error)?;
+                for row in table.range(through_sequence + 1..).map_err(storage_error)? {
+                    let (sequence, envelope) = row.map_err(storage_error)?;
+                    let sequence = sequence.value();
+                    format::decrypt(
+                        &self.keys,
+                        &self.config.node_id,
+                        1,
+                        sequence,
+                        envelope.value(),
+                        self.config.max_record_bytes,
+                    )?;
+                    format::hash_record(&mut hash, sequence, envelope.value());
+                    count = count.checked_add(1).ok_or(Error::Corrupt)?;
+                }
             }
-            sync_directory(&self.config.directory)?;
+            let mut state = self.state;
+            state.acknowledged = through_sequence;
+            state.count = count;
+            state.digest = hash.clone().finish().as_ref().try_into().unwrap();
+            #[cfg(test)]
+            self.hooks.trip(Fault::AcknowledgeBeforeCommit)?;
+            self.publish(&state, &[], Some(through_sequence))?;
+            #[cfg(test)]
+            self.hooks.trip(Fault::AcknowledgeAfterCommit)?;
+            self.state = state;
+            self.hash = hash;
             Ok(())
         })();
         self.poison_on_failure(result)
     }
-
-    /// Filesystem accounting may fail; stats surfaces it explicitly.
     pub fn stats(&self) -> Result<SpoolStats> {
-        let inventory = self.inventory()?;
+        let inventory = inventory(&self.config.directory)?;
         Ok(SpoolStats {
             next_sequence: self.state.next,
             durable_through_sequence: self.state.durable,
             acknowledged_through_sequence: self.state.acknowledged,
-            pending_records: self.pending.as_ref().map_or(0, |p| p.count),
-            committed_segments: self.state.segments.len(),
-            pending_segments: usize::from(self.pending.is_some()),
+            pending_records: self.pending.len() as u64,
+            retained_records: self.state.count,
+            database_bytes: inventory.database_bytes,
             disk_bytes: inventory.bytes,
-            control_reserved_bytes: self.config.control_reserve()?,
             quarantine_bytes: inventory.quarantine_bytes,
-            quarantine_segments: inventory.quarantine_count,
-            recovered_pending_records: self.recovered_pending_records,
             poisoned: self.poisoned.get(),
         })
     }
-
+    fn active_key(&self) -> &EncryptionKey {
+        self.keys.get(&self.active_id).unwrap()
+    }
     fn healthy(&self) -> Result<()> {
         if self.poisoned.get() {
             Err(Error::Poisoned)
@@ -566,360 +602,179 @@ impl MetadataSpool {
             Ok(())
         }
     }
-
-    fn poison_on_failure<T>(&mut self, result: Result<T>) -> Result<T> {
+    fn poison_on_failure<T>(&self, result: Result<T>) -> Result<T> {
         if result.is_err() {
             self.poisoned.set(true);
         }
         result
     }
-
-    fn active_key(&self) -> &EncryptionKey {
-        self.keys.get(&self.active_id).unwrap()
-    }
-
-    fn path(&self, first: u64, suffix: &str) -> PathBuf {
-        self.config
-            .directory
-            .join(format!("segment-{first:020}.{suffix}"))
-    }
-
-    fn persist_state(&mut self, state: &State) -> Result<()> {
-        let temporary = self.config.directory.join("checkpoint.tmp");
-        let mut file = create_file(&temporary)?;
-        format::write_state(&mut file, &self.config, self.active_key(), state)?;
-        #[cfg(test)]
-        self.trip(Fault::CheckpointSync)?;
-        file.sync_all()?;
-        fs::rename(temporary, self.config.directory.join("checkpoint"))?;
-        #[cfg(test)]
-        self.trip(Fault::CheckpointDirectorySync)?;
-        sync_directory(&self.config.directory)?;
-        #[cfg(test)]
-        {
-            self.state_persist_count += 1;
-        }
-        Ok(())
-    }
-
-    fn ensure_capacity(&self, additional: u64, new_segment: bool) -> Result<()> {
-        let inventory = self.inventory()?;
-        let segment_limit = inventory.segment_count + usize::from(new_segment);
-        let bytes = inventory
-            .segment_bytes
-            .checked_add(additional)
-            .and_then(|n| n.checked_add(self.config.control_reserve().ok()?));
-        if segment_limit > self.config.max_segments
-            || bytes.map_or(true, |n| n > self.config.max_disk_bytes)
-        {
-            return Err(Error::Full);
-        }
-        Ok(())
-    }
-
-    fn inventory(&self) -> Result<Inventory> {
-        let mut inventory = Inventory::default();
-        for entry in fs::read_dir(&self.config.directory)? {
-            let entry = entry?;
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if !metadata.file_type().is_file() {
-                return Err(Error::Corrupt);
-            }
-            let name = entry.file_name();
-            let name = name.to_str().ok_or(Error::Corrupt)?;
-            let length = metadata.len();
-            inventory.bytes = inventory.bytes.checked_add(length).ok_or(Error::Full)?;
-            if matches!(name, "writer.lock" | "checkpoint" | "checkpoint.tmp") {
-                let bound = (self.config.state_bound()? + HEADER_BYTES + FRAME_OVERHEAD) as u64;
-                if (name == "writer.lock" && length != 0) || length > bound {
-                    return Err(Error::Corrupt);
-                }
-                continue;
-            }
-            let (first, suffix) = parse_filename(name)?;
-            inventory.segment_count += 1;
-            if inventory.segment_count > self.config.max_segments {
-                return Err(Error::Full);
-            }
-            inventory.segment_bytes = inventory
-                .segment_bytes
-                .checked_add(length)
-                .ok_or(Error::Full)?;
-            if length > self.config.max_segment_bytes {
-                return Err(Error::Corrupt);
-            }
-            if suffix == "bad" {
-                inventory.quarantine_count += 1;
-                inventory.quarantine_bytes += length;
-            }
-            inventory
-                .segments
-                .push((first, suffix.to_owned(), entry.path()));
-        }
-        if inventory.bytes > self.config.max_disk_bytes {
-            return Err(Error::Full);
-        }
-        Ok(inventory)
-    }
-
-    fn recover(&mut self) -> Result<()> {
-        let inventory = self.inventory()?;
-        if inventory.quarantine_count != 0 {
-            return Err(Error::Quarantined);
-        }
-        let checkpoint_path = self.config.directory.join("checkpoint");
-        if checkpoint_path.try_exists()? {
-            let mut file = File::open(&checkpoint_path)?;
-            let length = file.metadata()?.len();
-            let (header, id, first) = format::read_header(&mut file, &self.config, true)?;
-            if first != 0 {
-                return Err(Error::Corrupt);
-            }
-            let key = format::find_key(&self.keys, &id)?;
-            let frame = format::read_frame(
-                &mut file,
-                &header,
-                key,
-                self.config.state_bound()?,
-                length
-                    .checked_sub(HEADER_BYTES as u64)
-                    .ok_or(Error::Corrupt)?,
-            )?;
-            if frame.kind != 3
-                || frame.sequence != 0
-                || length != (HEADER_BYTES + frame.encoded.len()) as u64
-            {
-                return Err(Error::Corrupt);
-            }
-            self.state = State::decode(&frame.plaintext, &self.config)?;
-        } else {
-            if !inventory.segments.is_empty() {
-                return Err(Error::Corrupt);
-            }
-            // Initial checkpoint creation may have been killed before publication.
-            let temporary = self.config.directory.join("checkpoint.tmp");
-            if temporary.try_exists()? {
-                fs::remove_file(&temporary)?;
-            }
-            self.persist_state(&State::empty())?;
-        }
-        // Verify the entire committed inventory before reclaiming anything.
-        for descriptor in &self.state.segments {
-            if let Err(error) = self.scan_segment(descriptor, |_, _| {}) {
-                if matches!(error, Error::Corrupt | Error::UnknownVersion(_)) {
-                    let source = self.path(descriptor.first, "seg");
-                    if source.try_exists()? {
-                        fs::rename(source, self.path(descriptor.first, "bad"))?;
-                        sync_directory(&self.config.directory)?;
-                    }
-                }
-                return Err(error);
-            }
-        }
-        for (first, suffix, path) in inventory.segments {
-            if suffix == "seg" && self.state.segments.iter().any(|s| s.first == first) {
-                continue;
-            }
-            if suffix == "open" && self.state.segments.iter().any(|s| s.first == first) {
-                return Err(Error::Corrupt);
-            }
-            if suffix == "seg" && first <= self.state.acknowledged {
-                // The authenticated checkpoint already covers reclamation.
-                // Do not require retired payload keys or count these as lost tails.
-                fs::remove_file(path)?;
-                continue;
-            }
-            // Unreferenced published segments are either acknowledged files left
-            // after checkpoint publication, or batches never checkpoint-committed.
-            if first <= self.state.durable && first > self.state.acknowledged {
-                return Err(Error::Corrupt);
-            }
-            self.recovered_pending_records += self.scan_pending(&path, first)?;
-            fs::remove_file(path)?;
-        }
-        let temporary = self.config.directory.join("checkpoint.tmp");
-        if temporary.try_exists()? {
-            fs::remove_file(temporary)?;
-        }
-        sync_directory(&self.config.directory)?;
-        self.ensure_capacity(0, false)?;
-        Ok(())
-    }
-
-    fn scan_pending(&self, path: &Path, expected_first: u64) -> Result<u64> {
-        let mut file = File::open(path)?;
-        let length = file.metadata()?.len();
-        if length < HEADER_BYTES as u64 {
-            return Ok(0);
-        }
-        let (header, id, first) = format::read_header(&mut file, &self.config, false)?;
-        if first != expected_first || first >= self.state.next {
-            return Err(Error::Corrupt);
-        }
-        let key = format::find_key(&self.keys, &id)?;
-        let mut remaining = length - HEADER_BYTES as u64;
-        let mut count = 0;
-        let mut previous = first - 1;
-        while remaining > 0 {
-            match format::read_frame(
-                &mut file,
-                &header,
-                key,
-                self.config.max_record_bytes.max(format::FOOTER_PAYLOAD),
-                remaining,
-            ) {
-                Ok(frame)
-                    if frame.kind == 1
-                        && frame.sequence > previous
-                        && frame.sequence < self.state.next
-                        && frame.plaintext.len() <= self.config.max_record_bytes =>
-                {
-                    remaining -= frame.encoded.len() as u64;
-                    previous = frame.sequence;
-                    count += 1;
-                }
-                Ok(_) | Err(Error::Corrupt) => break, // Only uncommitted tails may be discarded.
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(count)
-    }
-
-    fn scan_segment(
+    fn publish(
         &self,
-        descriptor: &Descriptor,
-        mut record: impl FnMut(u64, Vec<u8>),
+        state: &format::State,
+        records: &[(u64, Vec<u8>)],
+        delete_through: Option<u64>,
     ) -> Result<()> {
-        let mut file = match File::open(self.path(descriptor.first, "seg")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::Corrupt),
-            other => other?,
-        };
-        if file.metadata()?.len() != descriptor.bytes {
-            return Err(Error::Corrupt);
-        }
-        let (header, id, first) = format::read_header(&mut file, &self.config, false)?;
-        if first != descriptor.first {
-            return Err(Error::Corrupt);
-        }
-        let key = format::find_key(&self.keys, &id)?;
-        let mut hash = digest::Context::new(&digest::SHA256);
-        hash.update(&header);
-        let mut remaining = descriptor.bytes - HEADER_BYTES as u64;
-        let mut count = 0_u64;
-        let mut previous = first - 1;
-        while remaining > 0 {
-            let frame = format::read_frame(
-                &mut file,
-                &header,
-                key,
-                self.config.max_record_bytes.max(format::FOOTER_PAYLOAD),
-                remaining,
-            )?;
-            remaining -= frame.encoded.len() as u64;
-            match frame.kind {
-                1 if frame.sequence > previous
-                    && frame.sequence <= descriptor.last
-                    && frame.plaintext.len() <= self.config.max_record_bytes =>
-                {
-                    if count == 0 && frame.sequence != first {
-                        return Err(Error::Corrupt);
-                    }
-                    previous = frame.sequence;
-                    count += 1;
-                    hash.update(&frame.encoded);
-                    record(frame.sequence, frame.plaintext);
-                }
-                2 if remaining == 0
-                    && frame.plaintext.len() == format::FOOTER_PAYLOAD
-                    && count > 0
-                    && frame.sequence == descriptor.last
-                    && previous == descriptor.last =>
-                {
-                    if format::number(&frame.plaintext[..8]) != count
-                        || format::number(&frame.plaintext[8..16]) != previous
-                        || frame.plaintext[16..] != *hash.clone().finish().as_ref()
-                    {
-                        return Err(Error::Corrupt);
-                    }
-                    hash.update(&frame.encoded);
-                    if hash.finish().as_ref() != descriptor.hash {
-                        return Err(Error::Corrupt);
-                    }
-                    return Ok(());
-                }
-                _ => return Err(Error::Corrupt),
+        let envelope = format::encrypt(
+            self.active_key(),
+            &self.config.node_id,
+            0,
+            0,
+            &state.encode(&self.config.node_id),
+        )?;
+        let mut tx = self.db.begin_write().map_err(storage_error)?;
+        tx.set_durability(Durability::Immediate)
+            .map_err(storage_error)?;
+        {
+            let mut table = tx.open_table(RECORDS).map_err(storage_error)?;
+            if let Some(through) = delete_through {
+                table
+                    .retain_in(..=through, |_, _| false)
+                    .map_err(storage_error)?;
+            }
+            for (sequence, bytes) in records {
+                table
+                    .insert(*sequence, bytes.as_slice())
+                    .map_err(storage_error)?;
             }
         }
-        Err(Error::Corrupt) // A committed segment must end with an authenticated footer.
+        tx.open_table(STATE)
+            .map_err(storage_error)?
+            .insert(0, envelope.as_slice())
+            .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
+    }
+    fn recover(&mut self) -> Result<String> {
+        let tx = self.db.begin_read().map_err(storage_error)?;
+        let mut table_count = 0;
+        for table in tx.list_tables().map_err(storage_error)? {
+            if !matches!(table.name(), "records" | "state") {
+                return Err(Error::Corrupt);
+            }
+            table_count += 1;
+        }
+        if table_count != 2
+            || tx
+                .list_multimap_tables()
+                .map_err(storage_error)?
+                .next()
+                .is_some()
+        {
+            return Err(Error::Corrupt);
+        }
+        let states = tx.open_table(STATE).map_err(storage_error)?;
+        if states.len().map_err(storage_error)? != 1 {
+            return Err(Error::Corrupt);
+        }
+        let envelope = states
+            .get(0)
+            .map_err(storage_error)?
+            .ok_or(Error::Corrupt)?;
+        let state_key = format::key_id(envelope.value(), format::MAX_STATE_BYTES)?.to_owned();
+        let plain = format::decrypt(
+            &self.keys,
+            &self.config.node_id,
+            0,
+            0,
+            envelope.value(),
+            format::MAX_STATE_BYTES,
+        )?;
+        let state = format::State::decode(&plain, &self.config.node_id)?;
+        let table = tx.open_table(RECORDS).map_err(storage_error)?;
+        if table.len().map_err(storage_error)? != state.count {
+            return Err(Error::Corrupt);
+        }
+        let mut hash = format::inventory_hash();
+        let mut last = state.acknowledged;
+        let mut count = 0u64;
+        for row in table.iter().map_err(storage_error)? {
+            let (sequence, envelope) = row.map_err(storage_error)?;
+            let sequence = sequence.value();
+            if sequence <= last || sequence > state.durable || sequence >= state.next {
+                return Err(Error::Corrupt);
+            }
+            format::decrypt(
+                &self.keys,
+                &self.config.node_id,
+                1,
+                sequence,
+                envelope.value(),
+                self.config.max_record_bytes,
+            )?;
+            format::hash_record(&mut hash, sequence, envelope.value());
+            count = count.checked_add(1).ok_or(Error::Corrupt)?;
+            last = sequence;
+        }
+        if count != state.count
+            || last != state.durable
+            || hash.clone().finish().as_ref() != state.digest
+        {
+            return Err(Error::Corrupt);
+        }
+        self.state = state;
+        self.hash = hash;
+        Ok(state_key)
     }
 }
 
+fn storage_error(error: impl Into<redb::Error>) -> Error {
+    match error.into() {
+        redb::Error::Io(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Error::Corrupt
+        }
+        redb::Error::Io(e) => Error::Io(e),
+        redb::Error::Corrupted(_)
+        | redb::Error::TableDoesNotExist(_)
+        | redb::Error::TableTypeMismatch { .. }
+        | redb::Error::TableIsMultimap(_)
+        | redb::Error::TableIsNotMultimap(_) => Error::Corrupt,
+        redb::Error::UpgradeRequired(v) => Error::UnknownVersion(v as u32),
+        other => Error::Storage(other.to_string()),
+    }
+}
 #[derive(Default)]
 struct Inventory {
     bytes: u64,
-    segment_bytes: u64,
-    segment_count: usize,
+    database_bytes: u64,
     quarantine_bytes: u64,
-    quarantine_count: usize,
-    segments: Vec<(u64, String, PathBuf)>,
 }
-
-fn parse_filename(name: &str) -> Result<(u64, &str)> {
-    let (number, suffix) = name
-        .strip_prefix("segment-")
-        .ok_or(Error::Corrupt)?
-        .split_once('.')
-        .ok_or(Error::Corrupt)?;
-    if number.len() != 20
-        || !number.bytes().all(|b| b.is_ascii_digit())
-        || !matches!(suffix, "seg" | "open" | "bad")
-    {
-        return Err(Error::Corrupt);
+fn inventory(directory: &Path) -> Result<Inventory> {
+    let mut inventory = Inventory::default();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Corrupt);
+        }
+        inventory.bytes = inventory
+            .bytes
+            .checked_add(metadata.len())
+            .ok_or(Error::Full)?;
+        match entry.file_name().to_str() {
+            Some("writer.lock") if metadata.len() == 0 => {}
+            Some(DATABASE) => inventory.database_bytes = metadata.len(),
+            Some(QUARANTINE) => inventory.quarantine_bytes = metadata.len(),
+            _ => return Err(Error::Corrupt),
+        }
     }
-    let first = number.parse::<u64>().map_err(|_| Error::Corrupt)?;
-    if first == 0 {
-        return Err(Error::Corrupt);
-    }
-    Ok((first, suffix))
+    Ok(inventory)
 }
-
-fn create_file(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?)
+fn quarantine(directory: &Path, #[cfg(test)] hooks: &Hooks) -> Result<()> {
+    #[cfg(test)]
+    hooks.trip(Fault::QuarantineRename)?;
+    fs::rename(directory.join(DATABASE), directory.join(QUARANTINE))?;
+    #[cfg(test)]
+    hooks.trip(Fault::QuarantineDirectorySync)?;
+    sync_directory(directory)
 }
-
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+fn sync_directory(directory: &Path) -> Result<()> {
+    File::open(directory)?.sync_all()?;
     Ok(())
 }
-
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fault {
-    AppendWrite,
-    SegmentSync,
-    PublishDirectorySync,
-    CheckpointSync,
-    CheckpointDirectorySync,
-    Reclaim,
-}
-
-#[cfg(test)]
-impl MetadataSpool {
-    fn trip(&mut self, point: Fault) -> Result<()> {
-        if self.fault == Some(point) {
-            self.fault = None;
-            return Err(Error::Io(std::io::Error::other(
-                "injected spool I/O failure",
-            )));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
+#[path = "redb_tests.rs"]
 mod tests;

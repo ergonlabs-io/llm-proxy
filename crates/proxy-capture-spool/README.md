@@ -1,99 +1,106 @@
 # Encrypted metadata spool
 
-`proxy-capture-spool` is a synchronous Unix library for a future independently
-resourced capture agent. The [local agent](../proxy-capture-agent/README.md) now
-uses it; it is not wired into the proxy's legacy JSONL collector. It
-does not implement producer authentication, backend delivery, queries, or YAML
-configuration. Never invoke its file operations on request workers.
+`proxy-capture-spool` is a synchronous Unix library used by the independently
+resourced local capture agent. Never invoke its operations on request workers.
+It implements local durability, not backend delivery, queries, or YAML policy.
 
 ## API and receipts
 
-`MetadataSpool::open` takes `SpoolConfig`, an active `EncryptionKey`, and recovery
-keys. The private directory is single-writer locked until the handle is dropped
-or the process exits. Existing directories must have owner-only permissions.
+`MetadataSpool::open` accepts `SpoolConfig`, an active `EncryptionKey`, and up to
+31 additional recovery keys. The private directory is single-writer locked until
+the database has closed. Existing directories/files require owner-only permissions.
 
-- `append` reserves a monotonically increasing sequence in a durable checkpoint
-  before writing pending encrypted payload. `AppendReceipt` is **not** a durable
-  payload acknowledgement. Dropping the handle never commits pending payloads.
-- `append_batch` accepts up to eight borrowed payloads. One durable checkpoint
-  reserves the complete range before any encryption. Per-record size/full
-  failures may leave sequence gaps; append/write failures poison the writer.
-  Successful inner append receipts still require `commit` before a durable ACK.
-- `commit` and `seal` return `DurableReceipt` only after segment and checkpoint
-  file synchronization, atomic publication, and directory synchronization.
-- `replay(after_sequence, max_records, max_bytes)` authenticates committed data
-  and returns opaque plaintext within both bounds. A record too large for the
-  remaining window is not returned partially.
-- `acknowledge` accepts only committed sequences. Call it only after backend
-  confirmation: a durable checkpoint precedes deletion of fully covered
-  segments. Partial segments are retained, with acknowledged records suppressed.
-- `stats` reports pending/committed/quarantined storage, reservations, sequence
-  and acknowledgement watermarks, and poisoned state.
+- `append` durably reserves a monotonically increasing sequence before encrypting
+  the payload in memory. `AppendReceipt` is not a payload durability receipt.
+- `append_batch` accepts at most eight borrowed payloads and reserves the whole
+  range in one Immediate transaction. Per-record size failures leave gaps.
+  At most eight pending payloads may exist across calls; excess admission returns
+  `Full`. Drop never commits pending payloads.
+- `commit` and `seal` atomically publish encrypted records and authenticated
+  inventory in a redb Immediate transaction. Only successful completion returns
+  `DurableReceipt`. `seal` flushes; there is no segment rotation.
+- `replay(after_sequence, max_records, max_bytes)` seeks through the ordered table
+  and returns authenticated opaque plaintext within both bounds. A record too
+  large for the remaining window is not returned partially. Calls release their
+  read transaction before returning.
+- `acknowledge` accepts only sequences at or below the durable watermark, after
+  genuine backend confirmation. One Immediate transaction advances the backend
+  acknowledgement watermark, deletes covered rows, and updates inventory.
+  The LOCAL-SPOOL-ONLY agent never calls it. No unacknowledged data is evicted.
+- `stats` reports sequence watermarks, pending/retained record counts, database
+  and aggregate logical file bytes, quarantine bytes, and poisoned state.
 
-Receipts are scoped to this spool/node, not globally unique event identifiers.
-Future transport must bind receipts to authenticated producer/spool identity.
-Replay can duplicate delivery after a lost acknowledgement; backend deduplication
-requires stable event identifiers outside this library.
+Receipts are scoped to this spool/node. Transport binds them to authenticated
+producer and spool identities. Lost receipts and replay can cause duplicates;
+backend deduplication requires stable event IDs outside this library.
 
-## Format, encryption and recovery
+## Fresh format, encryption, and recovery
 
-Format version 1 uses bounded headers, numeric segment filenames, AES-256-GCM
-frames, authenticated sealed footers, and an encrypted checkpoint containing
-node identity and segment inventory/digests. Node and key identifiers are limited
-to 128 bytes. At most 32 active/recovery keys are accepted. Keys are supplied by
-deployment and are neither stored in the spool nor exposed by diagnostic output.
+The production format is application version 3, with `LMREDB03` encrypted
+envelopes in `capture.redb`. It is distinct from the v1 segmented format, the
+unimplemented v2 proposal, and the redb evaluation prototype. There is no legacy
+reader, automatic migration, downgrade, or automatic removal of old directories.
+Use a fresh spool directory. Existing empty/partial databases fail closed unless
+complete authenticated initialization survived. Unknown formats are rejected.
 
-Nonces are random 96-bit values from `ring::rand::SystemRandom`. Deployment owns
-key separation and rotation; the library does not enforce a global per-key
-invocation limit across nodes. Production-scale cryptographic qualification is
-separate work. Retain old keys while unacknowledged data or the current checkpoint
-requires them. Reclamation of already acknowledged leftover files needs no
-retired payload key.
+Payload and state envelopes use AES-256-GCM, externally supplied key IDs, and
+random 96-bit nonces from `ring::rand::SystemRandom`. Associated data binds the
+application format, node identity, state/record kind, sequence, and key ID.
+Sequence keys and database structure are visible; metadata payloads are encrypted.
+State authenticates sequence/acknowledgement watermarks, retained record count,
+and a domain-separated SHA-256 digest of the ordered ciphertext inventory.
+redb page checksums are not a substitute for application authentication.
 
-Reserved sequence numbers are never reused, even if pending records are lost.
-Recovery discards uncommitted payloads; ambiguous commit outcomes may instead
-recover committed data and cause duplicate delivery. Missing keys and unknown
-versions fail closed. Corrupt committed segments are quarantined, not silently
-skipped; quarantine requires operator recovery and still consumes capacity.
-Mutation failures and replay authentication failures poison the handle: reopen
-and recover before further use.
+Recovery streams and authenticates all retained envelopes before admissions,
+without collecting the backlog in memory. Cost grows with retained bytes.
+Missing keys and unknown versions fail closed without removing data. Corruption
+quarantines the entire database as `capture.redb.bad` after closing it while
+retaining the writer lock; operator recovery is required and bytes remain charged.
+Strict inventory rejects unexpected files, public files, and symlinks.
 
-## Resource bounds
+New records use the active key. Opening with a new active key verifies existing
+state/records using recovery keys, then durably rewraps only state. Retain old
+keys while unacknowledged envelopes use them. Key IDs and node IDs are bounded to
+128 UTF-8 bytes. Deployment owns per-key invocation limits across nodes; this
+library does not enforce a global cryptographic budget or prevent snapshot rollback.
 
-`SpoolConfig` bounds record size, segment size/count/age, and logical on-disk file
-bytes. Capacity reserves a footer and two maximum checkpoints before admission.
-Pending, committed, and quarantined files count toward limits. `Full` never evicts
-committed backlog. Logical bytes do not represent filesystem blocks: provision
-additional filesystem overhead/headroom. Do not shrink limits below backlog.
+## Failure and resource bounds
 
-Age rotation occurs on the next append, not an idle timer; explicit commit also
-seals a segment. Frequent small commits can exhaust the segment-count budget
-before the byte budget. These bounds do not expire committed records.
+Pre-publication size and pending-count rejections are definitive. Backend write,
+resize, transaction, or synchronization failures poison the writer and return
+storage errors, including growth failures at the disk ceiling. They are never
+reported as definitive `Full` rejections. No positive receipt is emitted. Recovery
+can select either atomic commit outcome; previously durable records must survive.
+Reopen before further mutation. Replay authentication failures also poison handles.
 
-For example, a caller can select 1 MiB records, 64 MiB segments, 1 GiB disk,
-32 segments, and 60-second rotation, with replay windows of 64 rows/32 MiB.
-These are caller-selected limits, not a production profile. Replay scratch can
-include three record-sized buffers plus returned payloads and allocation
-overhead. The parent agent must bound aggregate memory, queues, keys, inventory,
-serialization scratch, and concurrent replay callers separately.
+`SpoolConfig` bounds maximum record bytes, aggregate logical on-disk file bytes,
+and database cache. Segment size/count/age settings have been removed; the agent
+rejects them at their full dotted paths. Cache defaults to 4 MiB at the agent
+boundary and is bounded to 1 byte–16 MiB. The library requires at least 2 MiB of
+disk budget and space for one maximum envelope, but actual redb allocation and
+copy-on-write headroom can exhaust capacity earlier. The safe positional backend
+checks every write/resize before growth. File lengths do not measure filesystem
+blocks; deployment must provide filesystem overhead separately. No quota increase,
+compaction copy, eviction, or invented backend ACK extends a full spool.
 
-## Filesystem and performance assumptions
+Cache is not a total-process memory limit. Up to eight pending encrypted payloads,
+caller serialization, encryption/decryption scratch, transaction/page allocations,
+keys, and returned replay bytes consume separate memory. Recovery holds at most
+one decrypted record at a time. Backend acknowledgement recomputes the remaining
+inventory digest in a streaming scan; it is not on the local ingestion path.
+Deleted rows permit redb page reuse but do not promise file shrinkage.
 
-The directory and its ancestors are a trusted deployment boundary. A safe OS
-advisory lock coordinates cooperating writers, not hostile same-UID processes.
-Symlinks and unexpected inventory entries are rejected. This is Unix-only and
-assumes local filesystem support for atomic rename and file/directory sync.
+## Filesystem and verification
 
-Tests establish process-crash behavior under those assumptions, not power-loss,
-network-filesystem, volume-loss, replication, or adversarial rollback guarantees.
-Each append synchronizes its sequence reservation. Grouping payload commits
-does not amortize that per-append barrier; no throughput target is established.
-The future agent must isolate blocking file I/O and bound shutdown independently.
+The directory and ancestors are a trusted deployment boundary. Advisory locks
+coordinate cooperating writers, not hostile same-UID processes. This Unix-only
+library assumes a local filesystem supporting file/directory synchronization.
+Process-crash tests do not establish power-loss, network-filesystem, volume-loss,
+replication, or adversarial rollback guarantees.
 
-## Verification
-
-Run `make tq-proxy-capture-spool`. Coverage includes bounded replay/capacity,
-key rotation, deterministic corruption, torn pending tails, unsupported formats,
-symlinks, missing files, poisoned handles, injected synchronization/publication/
-reclamation failures, and four subprocess SIGKILL recovery scenarios. These
-tests do not substitute for filesystem qualification or agent/backend tests.
+Use `make tq-proxy-capture-spool` for production redb behavior, faults, abrupt
+termination, and the isolated prototype/reference suites. The old v1 implementation
+and unit tests remain test/example-only comparison evidence; the production
+library does not link them. New throughput and integrated qualification must use
+freshly built production redb binaries. See
+[the selected design](../../internal-docs/capture-spool-redb-design.md).

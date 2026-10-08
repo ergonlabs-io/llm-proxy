@@ -196,6 +196,8 @@ def main():
     # git diff excludes new files; preserve every experiment source explicitly.
     sources = ["crates/proxy-capture-spool/examples/spool_comparison.rs",
                "crates/proxy-capture-spool/tests/support/redb_spool.rs",
+               "crates/proxy-capture-spool/tests/support/v1_spool.rs",
+               "crates/proxy-capture-spool/tests/support/v1_format.rs",
                "crates/proxy-capture-spool/tests/redb_spool_prototype.rs"]
     source_hashes = {}
     for name in sources:
@@ -210,7 +212,7 @@ def main():
         "binary_sha256": hashlib.sha256(BIN.read_bytes()).hexdigest(), "binary": str(BIN),
         "platform": platform.platform(), "cpu_count": os.cpu_count(),
         "arguments": vars(args) | {"out": str(output)}, "redb_version": "4.2.0",
-        "notes": ["Prototype only; production spool unchanged; v2 not implemented.",
+        "notes": ["Isolated v1 reference versus redb prototype; production redb is qualified separately; v2 not implemented.",
                   "Common 1GiB logical byte cap, 512KiB record cap, eight-record batches.",
                   "v1 additionally retains 1024 segments, 64MiB segment cap, 60s age.",
                   "No batching-window/transport/proxy latency measured; storage service times only."]})

@@ -88,10 +88,8 @@ impl Fixture {
             spool: Spool {
                 directory: self.root.join("spool"),
                 max_record_bytes: 4096,
-                max_segment_bytes: 8192,
-                max_disk_bytes: 1_048_576,
-                max_segments: 16,
-                max_segment_age_seconds: 60,
+                max_disk_bytes: 4 * 1_048_576,
+                cache_bytes: 4 * 1024 * 1024,
             },
             active_key_id: "key".into(),
             keys: vec![Key {
@@ -273,11 +271,8 @@ bounded_test!(
     eight_concurrent_peers_receive_replayable_durable_receipts,
     {
         let fixture = Fixture::new();
-        let mut config = fixture.config();
-        config.spool.max_segment_bytes = 65536;
-        let mut agent_config = fixture.config();
-        agent_config.spool.max_segment_bytes = config.spool.max_segment_bytes;
-        let agent = TaskAbortGuard::start(agent_config);
+        let config = fixture.config();
+        let agent = TaskAbortGuard::start(fixture.config());
         let mut streams = Vec::new();
         for _ in 0..8 {
             streams.push(fixture.connect().await);
@@ -313,6 +308,94 @@ bounded_test!(
                 decode::<RequestRecord>(&stored.payload).unwrap().event_id,
                 ack.event_id
             );
+        }
+    }
+);
+
+fn maximum_record(event_id: &str) -> RequestRecord {
+    let mut entry = record(event_id);
+    let attempts = (0..64)
+        .map(|index| {
+            serde_json::json!({
+                "schema_version":1,"event_id":format!("{event_id}:attempt:{index}"),
+                "request_id":entry.request_id,"attempt_id":format!("attempt-{index}"),
+                "attempt_index":index,"trace_id":null,"span_id":null,"parent_span_id":null,
+                "cluster":"","provider":"","upstream_model":"","retry_reason":"",
+                "started_at":"2026-10-01T00:00:00Z","finished_at":"2026-10-01T00:00:01Z",
+                "duration_ms":1,"status":200,"termination":"complete","bytes_request":0,
+                "bytes_response":0,"usage":null,"cost":null
+            })
+        })
+        .collect::<Vec<_>>();
+    entry.attempts = serde_json::from_value(serde_json::Value::Array(attempts)).unwrap();
+    entry.attempt_count = 64;
+    entry.physical_attempt_count = 64;
+    let mut remaining = proxy_capture_protocol::MAX_RECORD_BYTES - encode(&entry).unwrap().len();
+    for attempt in &mut entry.attempts {
+        for field in [
+            &mut attempt.cluster,
+            &mut attempt.provider,
+            &mut attempt.upstream_model,
+            &mut attempt.retry_reason,
+        ] {
+            let escaped = 512.min(remaining / 6);
+            let mut value = "\u{0001}".repeat(escaped);
+            remaining -= escaped * 6;
+            let ascii = (512 - escaped).min(remaining);
+            value.push_str(&"r".repeat(ascii));
+            remaining -= ascii;
+            *field = Some(value);
+        }
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        encode(&entry).unwrap().len(),
+        proxy_capture_protocol::MAX_RECORD_BYTES
+    );
+    entry.validate(64).unwrap();
+    entry
+}
+
+bounded_test!(
+    eight_maximum_escaped_records_receive_replayable_durable_receipts,
+    {
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        config.spool.max_record_bytes = proxy_capture_protocol::MAX_RECORD_BYTES;
+        config.spool.max_disk_bytes = 32 * 1024 * 1024;
+        let agent = TaskAbortGuard::start(config);
+        let mut streams = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..8 {
+            streams.push(fixture.connect().await);
+            expected.push(maximum_record(&format!("maximum-event-{index}")));
+        }
+        for (stream, record) in streams.iter_mut().zip(&expected) {
+            send(stream, Kind::Record, &encode(record).unwrap()).await;
+        }
+        let mut receipts = Vec::new();
+        for stream in &mut streams {
+            let result: Receipt = decode(&frame(stream).await.unwrap().payload).unwrap();
+            assert_eq!(result.outcome, Outcome::Durable);
+            receipts.push(result);
+        }
+        drop(streams);
+        agent.stop().await;
+        let mut config = fixture.config();
+        config.spool.max_record_bytes = proxy_capture_protocol::MAX_RECORD_BYTES;
+        config.spool.max_disk_bytes = 32 * 1024 * 1024;
+        let (active, recovery) = config.load_keys().unwrap();
+        let spool = MetadataSpool::open(config.spool_config(), active, recovery).unwrap();
+        let replay = spool
+            .replay(0, 8, 8 * proxy_capture_protocol::MAX_RECORD_BYTES)
+            .unwrap();
+        assert_eq!(replay.len(), 8);
+        for (expected, receipt) in expected.iter().zip(receipts) {
+            let stored = replay
+                .iter()
+                .find(|row| Some(row.sequence) == receipt.sequence)
+                .unwrap();
+            assert_eq!(stored.payload, encode(expected).unwrap());
         }
     }
 );
@@ -409,24 +492,45 @@ bounded_test!(transport_rejects_wrong_agent_uid_and_node, {
 bounded_test!(full_spool_preserves_committed_payload, {
     let fixture = Fixture::new();
     let mut config = fixture.config();
-    config.spool.max_segments = 1;
+    config.spool.max_record_bytes = 65536;
+    config.spool.max_disk_bytes = 2 * 1_048_576;
     let mut reopen = fixture.config();
-    reopen.spool.max_segments = 1;
+    reopen.spool.max_record_bytes = 65536;
+    reopen.spool.max_disk_bytes = 2 * 1_048_576;
     let agent = TaskAbortGuard::start(config);
     let mut stream = fixture.connect().await;
-    let payload = encode(&record("preserved")).unwrap();
-    assert_eq!(
-        receipt(&mut stream, &payload).await.outcome,
-        Outcome::Durable
-    );
-    let ack = receipt(&mut stream, &encode(&record("full")).unwrap()).await;
-    assert_eq!(ack.outcome, Outcome::Full);
-    assert_eq!(ack.sequence, None);
+    let mut first_payload = None;
+    let mut refused = None;
+    for index in 0..4096 {
+        let mut entry = record(&format!("bounded-fill-{index}"));
+        let escaped = "\0".repeat(512);
+        entry.route = escaped.clone();
+        entry.requested_model = Some(escaped.clone());
+        entry.selected_cluster = Some(escaped.clone());
+        entry.selected_provider = Some(escaped.clone());
+        entry.selected_model = Some(escaped.clone());
+        entry.user_id = Some(escaped);
+        let payload = encode(&entry).unwrap();
+        let ack = receipt(&mut stream, &payload).await;
+        if ack.outcome == Outcome::Durable {
+            if first_payload.is_none() {
+                first_payload = Some(payload);
+            }
+        } else {
+            refused = Some(ack);
+            break;
+        }
+    }
+    let ack = refused.expect("storage should refuse a write before the bounded loop ends");
+    assert!(matches!(ack.outcome, Outcome::Full | Outcome::Unavailable));
+    if ack.outcome == Outcome::Full {
+        assert_eq!(ack.sequence, None);
+    }
     drop(stream);
     agent.stop().await;
     let replay = fixture.replay(&reopen);
-    assert_eq!(replay.len(), 1);
-    assert_eq!(replay[0].payload, payload);
+    let first_payload = first_payload.expect("at least one record should be durable");
+    assert!(replay.iter().any(|record| record.payload == first_payload));
 });
 
 bounded_test!(unknown_schema_and_body_extra_are_rejected_without_append, {
@@ -662,7 +766,7 @@ bounded_test!(
             let path = fixture.root.join("agent.json");
             let value = serde_json::json!({"version":1,"mode":"metadata_spool_only","socket_path":fixture.root.join("agent.sock"),"node_id":"node",
             "producers":[{"producer_id":"producer","uid":fixture.uid,"tenants":["default"]}],
-            "spool":{"directory":fixture.root.join("spool"),"max_record_bytes":4096,"max_segment_bytes":8192,"max_disk_bytes":1048576,"max_segments":16,"max_segment_age_seconds":60},
+            "spool":{"directory":fixture.root.join("spool"),"max_record_bytes":4096,"max_disk_bytes":4194304,"cache_bytes":4194304},
             "active_key_id":"key","keys":[{"key_id":"key","key_file":fixture.root.join("key")}]});
             std::fs::write(&path, value.to_string()).unwrap();
             let mut child = ChildGuard(

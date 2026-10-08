@@ -25,10 +25,8 @@ Prepare the socket directory with mode 0700 and provision an external, regular
   "spool": {
     "directory": "/srv/llm-capture/spool",
     "max_record_bytes": 524288,
-    "max_segment_bytes": 67108864,
     "max_disk_bytes": 4294967296,
-    "max_segments": 64,
-    "max_segment_age_seconds": 60
+    "cache_bytes": 4194304
   },
   "active_key_id": "deployment-key-1",
   "keys": [
@@ -37,15 +35,15 @@ Prepare the socket directory with mode 0700 and provision an external, regular
 }
 ```
 
-Every field is required. Unknown fields fail at their full path. Config files
+Configuration fields are required except `spool.cache_bytes`, which defaults
+to 4 MiB. Unknown fields fail at their full path. Config files
 are limited to 128 KiB; version and mode have exactly the values above. IDs are
 1–128 UTF-8 bytes; node/event IDs reject control characters so receipts fit their
 encoded control-frame bound. Grants allow at most 256 producers, unique producer IDs and
 UID mappings, and 1,024 tenant entries total (each 1–512 bytes; no wildcard).
-At most 16 deployment keys are loaded. Record size is at most 512 KiB, segments
-at most 64 MiB, total logical disk at most 1 TiB, at most 1,024 segments, and
-age 1–3,600 seconds. Spool arithmetic must also leave publication/checkpoint
-headroom. A segment-count budget is independent of a byte budget.
+At most 16 deployment keys are loaded. Record size is at most 512 KiB, total
+logical disk at most 1 TiB, and redb cache size is 1 byte–16 MiB (default 4 MiB).
+The database must have at least 2 MiB of disk budget.
 
 The agent authenticates OS peer UID plus the configured producer ID, then checks
 each record's tenant grant. The proxy authenticates agent UID and expected node
@@ -77,7 +75,7 @@ combined with these legacy CLI destinations. No simple-config capture fields
 or body/backend knobs are supported.
 
 The proxy never connects or serializes on a request worker. One dedicated writer
-owns a persistent connection and a 1,024-event queue, with at most 64 KiB retained
+owns a persistent connection and a 1,024-event queue, with at most 2 MiB retained
 per event plus channel overhead and one in-flight record. Serialization has a
 512 KiB encoded frame ceiling. Metadata failure never changes forwarding or
 readiness and never invokes a synchronous fallback. Existing per-stream caps
@@ -107,12 +105,14 @@ JSON parsing/serialization and spool crypto add transient allocations. Enforce
 an independently provisioned process memory/CPU limit; no measured RSS or
 5,000-RPS performance claim is made.
 
-Commit seals a segment. In spool-only mode, repeated small batches can exhaust
-the segment-count limit long before disk bytes; size the count for the intended
-finite run/outage and observe declines. One durable checkpoint reserves the
-whole batch's sequence range before any ciphertext is written; gaps are allowed
-but sequence reuse is not. Segment and inventory commit still precede durable
-receipts. No silent eviction or fake backend acknowledgement is
+In spool-only mode, repeated commits can exhaust the disk budget; size it for
+the intended finite run/outage and observe declines. One durable checkpoint reserves the
+whole batch's sequence range before payload encryption; gaps are allowed
+but sequence reuse is not. An Immediate transaction atomically commits records
+and authenticated inventory before durable receipts. Storage failures, including
+database growth at the disk ceiling, poison the writer and report unavailable.
+An unavailable receipt after transmission does not establish that the payload
+was rejected; recovery can find a committed record whose receipt was lost. No silent eviction or fake backend acknowledgement is
 used to keep admission running. Replay/checkpoint/reclaim remain explicit
 library APIs for a future confirmed backend adapter.
 

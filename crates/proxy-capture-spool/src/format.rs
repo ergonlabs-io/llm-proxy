@@ -1,113 +1,76 @@
-//! Version 1 wire format. All lengths are checked before allocation.
-
-use crate::{EncryptionKey, Error, Result, SpoolConfig};
+//! Application envelopes, independent of redb's page format.
+use crate::{EncryptionKey, Error, Result};
 use ring::{
-    aead,
+    aead, digest,
     rand::{SecureRandom, SystemRandom},
 };
-use std::{
-    collections::BTreeMap,
-    io::{Read, Write},
-};
+use std::collections::BTreeMap;
 
-pub(crate) const HEADER_BYTES: usize = 288;
-pub(crate) const FRAME_OVERHEAD: usize = 41; // length, kind, sequence, nonce, AEAD tag
-pub(crate) const FOOTER_PAYLOAD: usize = 48; // count, last sequence, SHA-256
-pub(crate) const FOOTER_BYTES: usize = FRAME_OVERHEAD + FOOTER_PAYLOAD;
-pub(crate) const DESCRIPTOR_BYTES: usize = 56; // first, last, length, SHA-256
-pub(crate) const STATE_FIXED: usize = 32; // next, durable, acknowledged, count
-const VERSION: u32 = 1;
-const SEGMENT_MAGIC: &[u8; 8] = b"LMSPOOL1";
-const STATE_MAGIC: &[u8; 8] = b"LMSTATE1";
-const ID_BYTES: usize = 128;
+pub(crate) const VERSION: u32 = 3;
+const MAGIC: &[u8; 8] = b"LMREDB03";
+const PREFIX_BYTES: usize = 14;
+pub(crate) const MAX_ENVELOPE_OVERHEAD: usize = PREFIX_BYTES + 128 + 12 + 16;
+pub(crate) const MAX_STATE_BYTES: usize = 8 + 4 + 2 + 128 + 32 + 32;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Descriptor {
-    pub first: u64,
-    pub last: u64,
-    pub bytes: u64,
-    pub hash: [u8; 32],
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct State {
     pub next: u64,
     pub durable: u64,
     pub acknowledged: u64,
-    pub segments: Vec<Descriptor>,
+    pub count: u64,
+    pub digest: [u8; 32],
 }
-
 impl State {
     pub fn empty() -> Self {
         Self {
             next: 1,
             durable: 0,
             acknowledged: 0,
-            segments: Vec::new(),
+            count: 0,
+            digest: inventory_hash().finish().as_ref().try_into().unwrap(),
         }
     }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(STATE_FIXED + DESCRIPTOR_BYTES * self.segments.len());
-        for n in [
-            self.next,
-            self.durable,
-            self.acknowledged,
-            self.segments.len() as u64,
-        ] {
-            out.extend_from_slice(&n.to_le_bytes());
+    pub fn encode(&self, node: &str) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(MAX_STATE_BYTES);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(node.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(node.as_bytes());
+        for n in [self.next, self.durable, self.acknowledged, self.count] {
+            bytes.extend_from_slice(&n.to_le_bytes());
         }
-        for segment in &self.segments {
-            for n in [segment.first, segment.last, segment.bytes] {
-                out.extend_from_slice(&n.to_le_bytes());
-            }
-            out.extend_from_slice(&segment.hash);
-        }
-        out
+        bytes.extend_from_slice(&self.digest);
+        bytes
     }
-
-    pub fn decode(bytes: &[u8], config: &SpoolConfig) -> Result<Self> {
-        if bytes.len() < STATE_FIXED {
+    pub fn decode(bytes: &[u8], node: &str) -> Result<Self> {
+        if bytes.len() < 14 || &bytes[..8] != MAGIC {
             return Err(Error::Corrupt);
         }
-        let count = number(&bytes[24..32]);
-        if count > config.max_segments as u64
-            || bytes.len() != STATE_FIXED + count as usize * DESCRIPTOR_BYTES
-        {
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != VERSION {
+            return Err(Error::UnknownVersion(version));
+        }
+        let length = u16::from_le_bytes(bytes[12..14].try_into().unwrap()) as usize;
+        if length == 0 || length > 128 || bytes.len() != 14 + length + 64 {
             return Err(Error::Corrupt);
         }
-        let mut state = Self {
-            next: number(&bytes[..8]),
-            durable: number(&bytes[8..16]),
-            acknowledged: number(&bytes[16..24]),
-            segments: Vec::with_capacity(count as usize),
+        if &bytes[14..14 + length] != node.as_bytes() {
+            return Err(Error::Corrupt);
+        }
+        let rest = &bytes[14 + length..];
+        let number = |start| u64::from_le_bytes(rest[start..start + 8].try_into().unwrap());
+        let state = Self {
+            next: number(0),
+            durable: number(8),
+            acknowledged: number(16),
+            count: number(24),
+            digest: rest[32..].try_into().unwrap(),
         };
-        if state.next == 0 || state.durable >= state.next || state.acknowledged > state.durable {
-            return Err(Error::Corrupt);
-        }
-        let mut previous = 0;
-        for bytes in bytes[STATE_FIXED..].chunks_exact(DESCRIPTOR_BYTES) {
-            let descriptor = Descriptor {
-                first: number(&bytes[..8]),
-                last: number(&bytes[8..16]),
-                bytes: number(&bytes[16..24]),
-                hash: bytes[24..56].try_into().unwrap(),
-            };
-            if descriptor.first == 0
-                || descriptor.first <= previous
-                || descriptor.last < descriptor.first
-                || descriptor.last > state.durable
-                || descriptor.last <= state.acknowledged
-                || descriptor.bytes < (HEADER_BYTES + FRAME_OVERHEAD + FOOTER_BYTES) as u64
-                || descriptor.bytes > config.max_segment_bytes
-            {
-                return Err(Error::Corrupt);
-            }
-            previous = descriptor.last;
-            state.segments.push(descriptor);
-        }
-        if state.durable > state.acknowledged
-            && state.segments.last().map(|s| s.last) != Some(state.durable)
+        if state.next == 0
+            || state.durable >= state.next
+            || state.acknowledged > state.durable
+            || state.count > state.durable - state.acknowledged
+            || (state.count == 0) != (state.durable == state.acknowledged)
         {
             return Err(Error::Corrupt);
         }
@@ -115,63 +78,28 @@ impl State {
     }
 }
 
-pub(crate) fn number(bytes: &[u8]) -> u64 {
-    u64::from_le_bytes(bytes.try_into().unwrap())
+pub(crate) fn inventory_hash() -> digest::Context {
+    let mut hash = digest::Context::new(&digest::SHA256);
+    hash.update(b"llmproxy-capture-redb-v3-inventory");
+    hash
 }
-
-pub(crate) fn header(
-    config: &SpoolConfig,
-    key: &EncryptionKey,
-    first: u64,
-    state: bool,
-) -> [u8; HEADER_BYTES] {
-    let mut out = [0; HEADER_BYTES];
-    out[..8].copy_from_slice(if state { STATE_MAGIC } else { SEGMENT_MAGIC });
-    out[8..12].copy_from_slice(&VERSION.to_le_bytes());
-    out[12..20].copy_from_slice(&first.to_le_bytes());
-    out[20..22].copy_from_slice(&(config.node_id.len() as u16).to_le_bytes());
-    out[22..24].copy_from_slice(&(key.id.len() as u16).to_le_bytes());
-    out[24..24 + config.node_id.len()].copy_from_slice(config.node_id.as_bytes());
-    out[152..152 + key.id.len()].copy_from_slice(key.id.as_bytes());
-    out
+pub(crate) fn hash_record(hash: &mut digest::Context, sequence: u64, envelope: &[u8]) {
+    hash.update(&sequence.to_le_bytes());
+    hash.update(&(envelope.len() as u64).to_le_bytes());
+    hash.update(envelope);
 }
-
-pub(crate) fn read_header(
-    reader: &mut impl Read,
-    config: &SpoolConfig,
-    state: bool,
-) -> Result<([u8; HEADER_BYTES], String, u64)> {
-    let mut bytes = [0; HEADER_BYTES];
-    read_exact(reader, &mut bytes)?;
-    if &bytes[..8] != if state { STATE_MAGIC } else { SEGMENT_MAGIC } {
-        return Err(Error::Corrupt);
-    }
-    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if version != VERSION {
-        return Err(Error::UnknownVersion(version));
-    }
-    let node_len = u16::from_le_bytes(bytes[20..22].try_into().unwrap()) as usize;
-    let key_len = u16::from_le_bytes(bytes[22..24].try_into().unwrap()) as usize;
-    if node_len == 0
-        || node_len > ID_BYTES
-        || key_len == 0
-        || key_len > ID_BYTES
-        || bytes[24..24 + node_len] != *config.node_id.as_bytes()
-        || bytes[24 + node_len..152].iter().any(|b| *b != 0)
-        || bytes[152 + key_len..].iter().any(|b| *b != 0)
-    {
-        return Err(Error::Corrupt);
-    }
-    let id = std::str::from_utf8(&bytes[152..152 + key_len])
-        .map_err(|_| Error::Corrupt)?
-        .to_owned();
-    let first = number(&bytes[12..20]);
-    Ok((bytes, id, first))
+fn aad(node: &str, kind: u8, sequence: u64, prefix: &[u8]) -> Vec<u8> {
+    let mut bytes = b"llmproxy-capture-redb-v3-envelope".to_vec();
+    bytes.extend_from_slice(&(node.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(node.as_bytes());
+    bytes.push(kind);
+    bytes.extend_from_slice(&sequence.to_le_bytes());
+    bytes.extend_from_slice(prefix);
+    bytes
 }
-
 pub(crate) fn encrypt(
-    header: &[u8],
     key: &EncryptionKey,
+    node: &str,
     kind: u8,
     sequence: u64,
     payload: &[u8],
@@ -180,105 +108,71 @@ pub(crate) fn encrypt(
     SystemRandom::new()
         .fill(&mut nonce)
         .map_err(|_| Error::Crypto)?;
-    let length =
-        u32::try_from(payload.len() + FRAME_OVERHEAD - 4).map_err(|_| Error::RecordTooLarge)?;
-    let mut prefix = Vec::with_capacity(25);
-    prefix.extend_from_slice(&length.to_le_bytes());
-    prefix.push(kind);
-    prefix.extend_from_slice(&sequence.to_le_bytes());
-    prefix.extend_from_slice(&nonce);
-    let mut aad = Vec::with_capacity(header.len() + prefix.len());
-    aad.extend_from_slice(header);
-    aad.extend_from_slice(&prefix);
-    let mut ciphertext = payload.to_owned();
+    let mut bytes = Vec::with_capacity(MAX_ENVELOPE_OVERHEAD + payload.len());
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(key.id.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(key.id.as_bytes());
+    bytes.extend_from_slice(&nonce);
+    let associated = aad(node, kind, sequence, &bytes);
+    let mut ciphertext = payload.to_vec();
     key.key
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(&aad),
+            aead::Aad::from(associated),
             &mut ciphertext,
         )
         .map_err(|_| Error::Crypto)?;
-    prefix.extend_from_slice(&ciphertext);
-    Ok(prefix)
+    bytes.extend_from_slice(&ciphertext);
+    Ok(bytes)
 }
 
-pub(crate) struct Frame {
-    pub kind: u8,
-    pub sequence: u64,
-    pub plaintext: Vec<u8>,
-    pub encoded: Vec<u8>,
-}
-
-pub(crate) fn read_frame(
-    reader: &mut impl Read,
-    header: &[u8],
-    key: &EncryptionKey,
-    max_payload: usize,
-    remaining: u64,
-) -> Result<Frame> {
-    let mut prefix = [0; 25];
-    if remaining < FRAME_OVERHEAD as u64 {
-        return Err(Error::Corrupt);
-    }
-    read_exact(reader, &mut prefix[..4])?;
-    let length = u32::from_le_bytes(prefix[..4].try_into().unwrap()) as u64;
-    let total = length + 4;
-    if total < FRAME_OVERHEAD as u64
-        || total > remaining
-        || total > (max_payload + FRAME_OVERHEAD) as u64
+pub(crate) fn key_id(envelope: &[u8], bound: usize) -> Result<&str> {
+    if envelope.len() < PREFIX_BYTES + 1 + 12 + 16
+        || envelope.len()
+            > bound
+                .checked_add(MAX_ENVELOPE_OVERHEAD)
+                .ok_or(Error::Corrupt)?
+        || &envelope[..8] != MAGIC
     {
         return Err(Error::Corrupt);
     }
-    read_exact(reader, &mut prefix[4..])?;
-    let mut ciphertext = vec![0; total as usize - prefix.len()];
-    read_exact(reader, &mut ciphertext)?;
-    let mut encoded = prefix.to_vec();
-    encoded.extend_from_slice(&ciphertext);
-    let mut aad = header.to_vec();
-    aad.extend_from_slice(&prefix);
-    let plaintext = key
+    let version = u32::from_le_bytes(envelope[8..12].try_into().unwrap());
+    if version != VERSION {
+        return Err(Error::UnknownVersion(version));
+    }
+    let length = u16::from_le_bytes(envelope[12..14].try_into().unwrap()) as usize;
+    let overhead = PREFIX_BYTES + length + 12 + 16;
+    if length == 0 || length > 128 || envelope.len() < overhead || envelope.len() - overhead > bound
+    {
+        return Err(Error::Corrupt);
+    }
+    std::str::from_utf8(&envelope[PREFIX_BYTES..PREFIX_BYTES + length]).map_err(|_| Error::Corrupt)
+}
+
+pub(crate) fn decrypt(
+    keys: &BTreeMap<String, EncryptionKey>,
+    node: &str,
+    kind: u8,
+    sequence: u64,
+    envelope: &[u8],
+    bound: usize,
+) -> Result<Vec<u8>> {
+    let id = key_id(envelope, bound)?;
+    let key = keys.get(id).ok_or(Error::MissingKey)?;
+    let nonce_start = PREFIX_BYTES + id.len();
+    let prefix_end = nonce_start + 12;
+    let nonce = envelope[nonce_start..prefix_end].try_into().unwrap();
+    let mut bytes = envelope[prefix_end..].to_vec();
+    let length = key
         .key
         .open_in_place(
-            aead::Nonce::assume_unique_for_key(prefix[13..25].try_into().unwrap()),
-            aead::Aad::from(&aad),
-            &mut ciphertext,
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(aad(node, kind, sequence, &envelope[..prefix_end])),
+            &mut bytes,
         )
         .map_err(|_| Error::Corrupt)?
-        .to_owned();
-    Ok(Frame {
-        kind: prefix[4],
-        sequence: number(&prefix[5..13]),
-        plaintext,
-        encoded,
-    })
-}
-
-pub(crate) fn read_exact(reader: &mut impl Read, bytes: &mut [u8]) -> Result<()> {
-    reader.read_exact(bytes).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            Error::Corrupt
-        } else {
-            Error::Io(error)
-        }
-    })
-}
-
-pub(crate) fn find_key<'a>(
-    keys: &'a BTreeMap<String, EncryptionKey>,
-    id: &str,
-) -> Result<&'a EncryptionKey> {
-    keys.get(id).ok_or(Error::MissingKey)
-}
-
-pub(crate) fn write_state(
-    writer: &mut impl Write,
-    config: &SpoolConfig,
-    key: &EncryptionKey,
-    state: &State,
-) -> Result<()> {
-    let header = header(config, key, 0, true);
-    let frame = encrypt(&header, key, 3, 0, &state.encode())?;
-    writer.write_all(&header)?;
-    writer.write_all(&frame)?;
-    Ok(())
+        .len();
+    bytes.truncate(length);
+    Ok(bytes)
 }

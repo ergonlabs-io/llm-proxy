@@ -186,7 +186,7 @@ fn declarative_capture_reload_and_emergency_gate_on_existing_keepalive() {
         "version":1,"mode":"metadata_spool_only","socket_path":socket,"node_id":"test-node",
         "producers":[{"producer_id":"test-proxy","uid":uid,"tenants":["default"]}],
         "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,
-            "max_segment_bytes":1048576,"max_disk_bytes":4194304,"max_segments":8,"max_segment_age_seconds":60},
+            "max_disk_bytes":4194304,"cache_bytes":4194304},
         "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]
     });
     let agent = collector(serde_json::from_value(agent_config.clone()).unwrap());
@@ -485,7 +485,7 @@ fn metadata_agent_outage_preserves_forwarding_and_recovery_commits_actual_record
     });
     let config = serde_json::json!({"version":1,"mode":"metadata_spool_only","socket_path":socket,"node_id":"test-node",
         "producers":[{"producer_id":"test-proxy","uid":uid,"tenants":["default"]}],
-        "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,"max_segment_bytes":1048576,"max_disk_bytes":4194304,"max_segments":8,"max_segment_age_seconds":60},
+        "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,"max_disk_bytes":4194304,"cache_bytes":4194304},
         "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]});
     let upstream = mock();
     let listener = port();
