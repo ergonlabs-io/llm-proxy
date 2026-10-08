@@ -1711,8 +1711,10 @@ dependencies = [
 name = "proxy-capture-spool"
 version = "0.2.0"
 dependencies = [
+ "redb",
  "ring",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
 ]
