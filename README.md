@@ -14,7 +14,7 @@ and cluster policy on top of it, not a parallel system.
 
 [![CI](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Version: v0.3.0](https://img.shields.io/badge/version-v0.3.0-blue.svg)
+![Version: v0.3.1](https://img.shields.io/badge/version-v0.3.1-blue.svg)
 ![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
@@ -27,8 +27,8 @@ cargo run -p proxy -- --config examples/llmproxy.yaml --mode translate  # print 
 ```
 
 > [!NOTE]
-> **The data plane serves real traffic and is covered by 1,868 tests.**
-> `v0.3.0` is the current release; dynamic configuration remains partially complete.
+> **The data plane serves real traffic; workspace qualification passed 2,335 tests.**
+> `v0.3.1` is the current release; dynamic configuration remains partially complete.
 > Interfaces still change between releases and there are no backports to earlier
 > tags. Read [What is not built yet](#what-is-not-built-yet) before you depend
 > on it — that section is deliberately specific — and
@@ -248,7 +248,7 @@ curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts
 ```
 
 The installer detects the operating system and CPU architecture and installs to
-`~/.local/bin/llm-proxy`. Set `LLM_PROXY_VERSION=v0.3.0` to pin a release or
+`~/.local/bin/llm-proxy`. Set `LLM_PROXY_VERSION=v0.3.1` to pin a release or
 `LLM_PROXY_INSTALL_DIR=/usr/local/bin` to choose another destination.
 To create the starter configuration and start the proxy immediately, append
 `--start`; it uses proxy port `53421` and admin/UI port `53422`:

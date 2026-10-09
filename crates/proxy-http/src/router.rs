@@ -4169,13 +4169,23 @@ mod tests {
                             return;
                         };
                         seen.fetch_add(1, Ordering::SeqCst);
-                        // `fetch_update` rather than load-then-store: two
-                        // streams can be in flight on one h2 connection, and
-                        // a non-atomic decrement could refuse more than
-                        // `refusals` of them.
-                        let refuse = remaining
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                            .is_ok();
+                        // Atomically claim one refusal without decrementing zero.
+                        // compare_exchange_weak also works on the declared MSRV.
+                        let mut count = remaining.load(Ordering::SeqCst);
+                        let refuse = loop {
+                            if count == 0 {
+                                break false;
+                            }
+                            match remaining.compare_exchange_weak(
+                                count,
+                                count - 1,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            ) {
+                                Ok(_) => break true,
+                                Err(observed) => count = observed,
+                            }
+                        };
                         if refuse {
                             respond.send_reset(h2::Reason::REFUSED_STREAM);
                         } else {

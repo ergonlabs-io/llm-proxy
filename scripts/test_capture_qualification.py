@@ -2,10 +2,14 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import io
 
 SPEC = importlib.util.spec_from_file_location("qualification", Path(__file__).with_name("capture-qualification.py"))
 QUALIFICATION = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFICATION)
+AGENT_SPEC = importlib.util.spec_from_file_location("agent_qualification", Path(__file__).with_name("capture-agent-qualification.py"))
+AGENT_QUALIFICATION = importlib.util.module_from_spec(AGENT_SPEC)
+AGENT_SPEC.loader.exec_module(AGENT_QUALIFICATION)
 
 
 def fixture(name, state, p99=1000, error_rate=0, rss=1024):
@@ -22,6 +26,30 @@ def fixture(name, state, p99=1000, error_rate=0, rss=1024):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_agent_control_rejects_oversized_or_mismatched_frames(self):
+        class Stream(io.BytesIO):
+            recv = io.BytesIO.read
+        for header in [b"LMC1\x04" + (1025).to_bytes(4, "big"),
+                       b"LMC1\x02" + (1).to_bytes(4, "big"), b"bad"]:
+            with self.assertRaises(RuntimeError):
+                AGENT_QUALIFICATION.receive(Stream(header), 4)
+
+    def test_cpu_time_parsing_and_warmup_exclusion(self):
+        self.assertEqual(QUALIFICATION.cpu_seconds("01:02.50"), 62.5)
+        self.assertEqual(QUALIFICATION.cpu_seconds("1-02:03:04"), 93784)
+        samples = [{"elapsed_seconds": wall, "cpu_seconds": {"proxy": cpu}}
+                   for wall, cpu in [(0, 0), (3, 100), (4, 100.5), (5, 101.5), (31, 200)]]
+        report = QUALIFICATION.cpu_summary(samples, 3, 30)
+        self.assertEqual(report["proxy"]["mean_percent"], 75)
+        self.assertEqual(report["proxy"]["peak_percent"], 100)
+
+    def test_legacy_cpu_measurements_remain_missing(self):
+        self.assertEqual(QUALIFICATION.cpu_summary(fixture("off", "off")["samples"], 3, 30), {})
+        self.assertIsNone(QUALIFICATION.summarize([fixture("off", "off"), fixture("on", "on")])
+                          ["runs"][0]["cpu_during_load"])
+        self.assertFalse(QUALIFICATION.summarize([fixture("off", "off"), fixture("on", "on")])
+                         ["all_cpu_measured"])
+
     def test_regression_over_five_percent_fails(self):
         report = QUALIFICATION.summarize([fixture("off", "off"), fixture("on", "on", p99=1051)])
         self.assertFalse(report["comparisons"][0]["ttft_from_scheduled_us"]["within_provisional_5_percent"])
@@ -33,6 +61,13 @@ class ReportingTests(unittest.TestCase):
     def test_memory_excess_does_not_pass(self):
         report = QUALIFICATION.summarize([fixture("off", "off"), fixture("on", "on", rss=1073741825)])
         self.assertFalse(report["all_proxy_peak_rss_below_1GiB"])
+
+    def test_pending_reservations_do_not_pass(self):
+        run = fixture("on", "on")
+        run["control_after"] = {"active_requests": 0, "outstanding_events": 1, "retained_event_bytes": 65536}
+        self.assertFalse(QUALIFICATION.summarize([fixture("off", "off"), run])["all_reservations_drained"])
+        run["control_after"] = {"active_requests": 0, "outstanding_events": 0, "retained_event_bytes": 0}
+        self.assertTrue(QUALIFICATION.summarize([fixture("off", "off"), run])["all_reservations_drained"])
 
     def test_delivery_coverage_is_not_http_coverage(self):
         run = fixture("on", "on")

@@ -11,6 +11,10 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-09
+
+Follow-up fixes and optional local metadata capture after v0.3.0.
+
 ### Added
 
 - OpenRouter provider defaults, cluster-owned `/v1` to `/api/v1` rewriting,
@@ -19,12 +23,6 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `scripts/import-openrouter-models.py`.
   Chat, SSE, model discovery, and credential replacement are covered by a local
   mock integration test; no live paid requests were made.
-
-## [0.3.1] - 2026-10-08
-
-Follow-up fixes and optional local metadata capture after v0.3.0.
-
-### Added
 
 - Optional bounded request and attempt metadata capture with authenticated local agent
   delivery, runtime controls, and encrypted redb storage. Durable local receipts follow
@@ -37,14 +35,27 @@ Follow-up fixes and optional local metadata capture after v0.3.0.
 
 ### Validation and limits
 
-- Workspace: 2,326 tests passed, 28 skipped; doctests: 5 passed, 1 ignored.
+- Workspace qualification: 2,335 tests passed, 28 skipped; doctests: 5 passed, 1 ignored.
   Formatting, lint, and dependency checks passed locally.
 - Production retention: 60,000 records confirmed and byte-verified after reopening,
   within a 1 GiB disk limit, plus escaped and maximum-size record cases.
-- Integrated qualification is still in progress at release preparation; see
+- Local integrated qualification completed, including CPU/RSS, failure and Disable
+  cases, maximum escaped records, and corrected absent-agent reservation draining; see
   `internal-docs/capacity/2026-10-08-capture-spool-redb-production.md` for evidence
   and explicit limits. This release does not claim 5,000 requests/second,
   100,000 concurrent streams, or completed Envoy parity.
+
+### CI fixes
+
+- Replace the deprecated atomic update in the HTTP/2 refusal test with an atomic
+  compare/exchange loop, retaining compatibility with older Rust APIs.
+- Pin Rust 1.99.0 for development, CI, and release builds. CI now runs `make ci`
+  with nextest, separate doctests, dependency checks, and black-box QA, plus the
+  capture reporter checks. This prevents local/CI toolchain drift and uses the
+  repository's bounded test configuration.
+- Align workspace package and binary versions with the v0.3.1 release tag.
+- Put accepted OpenRouter mock sockets into blocking mode before bounded reads,
+  fixing a macOS timing failure without relaxing request/response assertions.
 
 ### Operational telemetry
 

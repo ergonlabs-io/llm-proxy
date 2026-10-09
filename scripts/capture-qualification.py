@@ -172,18 +172,44 @@ def metrics(admin):
     return values
 
 
-def rss(children):
+def cpu_seconds(value):
+    """Parse ps cumulative TIME ([[days-]hours:]minutes:seconds)."""
+    days, clock = value.split("-", 1) if "-" in value else ("0", value)
+    parts = [float(part) for part in clock.split(":")]
+    if len(parts) not in (2, 3):
+        raise ValueError(f"invalid ps CPU time: {value}")
+    seconds = parts[-1] + 60 * parts[-2]
+    return int(days) * 86400 + seconds + (3600 * parts[0] if len(parts) == 3 else 0)
+
+
+def process_usage(children):
     live = [(name, child) for name, child in children if child.poll() is None]
     if not live:
-        return {}
-    output = subprocess.check_output(["ps", "-o", "pid=,rss=", "-p",
+        return {"rss_bytes": {}, "cpu_seconds": {}}
+    output = subprocess.check_output(["ps", "-o", "pid=,rss=,time=", "-p",
                                       ",".join(str(child.pid) for _, child in live)], text=True, timeout=2)
-    by_pid = {int(row.split()[0]): int(row.split()[1]) * 1024
-              for row in output.splitlines() if len(row.split()) == 2}
-    return {name: by_pid[child.pid] for name, child in live if child.pid in by_pid}
+    by_pid = {int(fields[0]): (int(fields[1]) * 1024, cpu_seconds(fields[2]))
+              for row in output.splitlines() if len(fields := row.split()) == 3}
+    return {field: {name: by_pid[child.pid][index] for name, child in live if child.pid in by_pid}
+            for index, field in enumerate(("rss_bytes", "cpu_seconds"))}
 
 
-def scenario(output, name, state, rate, duration, warmup, memory=False):
+def cpu_summary(samples, warmup, duration):
+    measured = [sample for sample in samples if warmup <= sample["elapsed_seconds"] <= duration]
+    rates = {}
+    for first, last in zip(measured, measured[1:]):
+        elapsed = last["elapsed_seconds"] - first["elapsed_seconds"]
+        if elapsed <= 0:
+            continue
+        for name, cpu in last.get("cpu_seconds", {}).items():
+            if name in first.get("cpu_seconds", {}):
+                rates.setdefault(name, []).append((max(0, cpu - first["cpu_seconds"][name]), elapsed))
+    return {name: {"mean_percent": 100 * sum(cpu for cpu, _ in values) / sum(wall for _, wall in values),
+                   "peak_percent": max(100 * cpu / wall for cpu, wall in values)}
+            for name, values in rates.items()}
+
+
+def scenario(output, name, state, rate, duration, warmup, memory=False, disable=True):
     directory = output / name
     directory.mkdir(mode=0o700)
     processes = Processes(directory)
@@ -235,7 +261,7 @@ def scenario(output, name, state, rate, duration, warmup, memory=False):
                                            "--drain-time-s", "1", "--drain-strategy", "immediate"])
         wait_for(proxy, lambda: http(admin, "/ready").strip() == "LIVE", "proxy")
         result["metrics_before"] = metrics(admin)
-        result["rss_before"] = rss(processes.children)
+        result["usage_before"] = process_usage(processes.children)
         pool_size = 6000 if memory else (512 if rate >= 200 else 128)
         load = processes.start("loadgen", [BIN / "loadgen", "--target", f"http://127.0.0.1:{listener}",
                                            "--endpoint", "chat", "--model", "qualification-default", "--rate", str(rate),
@@ -256,20 +282,32 @@ def scenario(output, name, state, rate, duration, warmup, memory=False):
                 agent.send_signal(signal.SIGCONT)
                 resumed = True
                 result["agent_resume_seconds"] = elapsed
-            if memory and capture and not disabled and elapsed >= duration + 1:
+            if memory and disable and capture and not disabled and elapsed >= duration + 1:
                 status = control(runtime / "control.sock", {"command": "Status"})
                 result["control_before_disable"] = status
                 result["control_disable"] = control(runtime / "control.sock", {
                     "command": "Disable", "expected_generation": status["generation"]})
                 result["disable_seconds"] = elapsed
                 disabled = True
-            sample = {"rss_bytes": rss(processes.children), "metrics": metrics(admin)}
+            sample = {**process_usage(processes.children), "metrics": metrics(admin)}
             sample["elapsed_seconds"] = time.monotonic() - started
             samples.append(sample)
             time.sleep(.5)
         if load.wait(timeout=2) != 0:
             raise RuntimeError(f"loadgen failed; inspect {directory / 'loadgen.log'}")
         result["loadgen"] = json.loads((directory / "loadgen.json").read_text())
+        if capture:
+            result["control_before_drain"] = control(runtime / "control.sock", {"command": "Status"})
+            drain_deadline = time.monotonic() + 12
+            while True:
+                status = control(runtime / "control.sock", {"command": "Status"})
+                if status["active_requests"] == 0 and status["outstanding_events"] == 0 and status["retained_event_bytes"] == 0:
+                    break
+                if time.monotonic() >= drain_deadline:
+                    raise TimeoutError("capture reservations did not drain within event deadline plus headroom")
+                samples.append({"elapsed_seconds": time.monotonic() - started,
+                                **process_usage(processes.children), "metrics": metrics(admin)})
+                time.sleep(.5)
         result["metrics_after"] = metrics(admin)
         if capture:
             result["control_after"] = control(runtime / "control.sock", {"command": "Status"})
@@ -277,6 +315,8 @@ def scenario(output, name, state, rate, duration, warmup, memory=False):
                                     for name, _ in processes.children}
         result["peak_metrics"] = {key: max(sample["metrics"].get(key, 0) for sample in samples)
                                   for key in result["metrics_after"]}
+        result["cpu_during_load"] = cpu_summary(samples, warmup, duration)
+        result["cpu_full_run"] = cpu_summary(samples, 0, float("inf"))
         result["spool_file_bytes"] = sum(p.stat().st_size for p in (directory / "spool").rglob("*") if p.is_file())
     finally:
         result["teardown"] = processes.close()
@@ -319,6 +359,8 @@ def summarize(runs):
                 "ttft_p99_ms": result["ttft_from_scheduled_us"]["p99"] / 1000,
                 "total_p99_ms": result["total_from_scheduled_us"]["p99"] / 1000,
                 "peak_rss_MiB": {name: count / 1048576 for name, count in run["peak_rss_bytes"].items()},
+                "cpu_during_load": run.get("cpu_during_load"),
+                "cpu_full_run": run.get("cpu_full_run"),
                 "durable": metric(run, "metadata_durable"), "durable_rps_during_load": durable_rate,
                 "durable_fraction_of_started": metric(run, "metadata_durable") / result["streams_started"],
                 "peak_active": metric(run, "capture_active_requests", peak=True),
@@ -334,9 +376,16 @@ def summarize(runs):
             "all_forwarding_error_rates_zero": all(r["loadgen"]["result"]["error_rate"] == 0 for r in runs),
             "all_proxy_peak_rss_below_1GiB": all(r["peak_rss_bytes"]["proxy"] <= 1073741824 for r in runs),
             "all_agent_peak_rss_below_256MiB": all(r["peak_rss_bytes"].get("agent", 0) <= 268435456 for r in runs),
+            "all_cpu_measured": all("proxy" in (r.get("cpu_during_load") or {})
+                                    and (r["state"] not in ("on", "pause")
+                                         or "agent" in (r.get("cpu_during_load") or {})) for r in runs),
+            "all_reservations_drained": all(r["state"] == "off" or
+                (r.get("control_after") is not None and all(r["control_after"].get(key) == 0
+                 for key in ("active_requests", "outstanding_events", "retained_event_bytes"))) for r in runs),
             "notes": ["Median of run p99s, not a pooled percentile or confidence interval.",
                       "Shared-host macOS local qualification; not a dedicated-host capacity result.",
                       "RSS sampled every 0.5s; shorter transients may be missed.",
+                      "CPU is cumulative ps TIME delta / elapsed wall time during load, excluding warmup; 100% means one core. Legacy runs have no CPU measurements.",
                       "Default metadata, one attempt; not worst-case 64-attempt or escaped-record qualification.",
                       "No oldest-backlog-age metric exists; expiration/recovery inferred from timeline and counters."]}
 
@@ -349,7 +398,9 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--rates", default="5,100")
     parser.add_argument("--skip-memory", action="store_true")
-    parser.add_argument("--only", choices=("failure-checks", "memory-stress", "queue-full", "pause-recovery"),
+    parser.add_argument("--memory-state", choices=("off", "on", "absent", "pause"), default="absent")
+    parser.add_argument("--keep-capture", action="store_true", help="Do not Disable during memory stress")
+    parser.add_argument("--only", choices=("failure-checks", "memory-stress", "memory-matrix", "queue-full", "pause-recovery"),
                         help="Run supplemental failure checks, or just the 4800-request capture state stress")
     parser.add_argument("--summarize", type=Path, help="Regenerate the summary from an existing completed run; no load")
     args = parser.parse_args()
@@ -419,8 +470,26 @@ def main():
         print(json.dumps(summarize(runs), indent=2), flush=True)
         return
     if args.only == "memory-stress":
-        runs.append(scenario(output, "active4800-absent", "absent", 400, 12, 0, memory=True))
+        runs.append(scenario(output, f"active4800-{args.memory_state}", args.memory_state, 400, 12, 0,
+                             memory=True, disable=not args.keep_capture))
         write_json(output / "summary.json", summarize(runs))
+        print(json.dumps(summarize(runs), indent=2), flush=True)
+        return
+    if args.only == "memory-matrix":
+        memory_cases = (("off", False), ("on", False), ("on", True), ("absent", False),
+                        ("absent", True), ("pause", False), ("pause", True))
+        for index, (state, disable) in enumerate(memory_cases):
+            label = "disable" if disable else "complete"
+            runs.append(scenario(output, f"active4800-{state}-{label}", state, 400, 12, 0,
+                                 memory=True, disable=disable))
+            write_json(output / "summary.json", summarize(runs))
+            if index + 1 < len(memory_cases):
+                cooldown = runs[-1]["loadgen"]["rig"]["time_wait"]["secs"] + 5
+                print(f"High-connection cooldown: {cooldown}s", flush=True)
+                while cooldown > 0:
+                    interval = min(15, cooldown)
+                    time.sleep(interval)
+                    cooldown -= interval
         print(json.dumps(summarize(runs), indent=2), flush=True)
         return
     for rate in rates:

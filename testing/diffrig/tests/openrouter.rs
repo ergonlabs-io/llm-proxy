@@ -24,6 +24,8 @@ fn openrouter_forwards_model_ids_catalog_and_streaming() {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
+            // Accepted sockets can inherit nonblocking mode on macOS.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

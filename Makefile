@@ -35,6 +35,10 @@ capture-qualification-build: ## Build optimized proxy, local capture agent, mock
 capture-qualify: capture-qualification-build ## Run finite capture latency/RSS qualification; reports under target/
 	python3 scripts/capture-qualification.py $(CAPTURE_QUALIFICATION_ARGS)
 
+.PHONY: capture-agent-qualify
+capture-agent-qualify: capture-qualification-build ## Qualify eight concurrent maximum records against the local agent
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/capture-agent-qualification.py $(CAPTURE_AGENT_QUALIFICATION_ARGS)
+
 .PHONY: capture-qualification-check
 capture-qualification-check: ## Check qualification reporting without starting test servers
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_capture_qualification.py

@@ -401,6 +401,122 @@ bounded_test!(
 );
 
 bounded_test!(
+    supervisor_delivers_eight_maximum_retained_escaped_records_and_releases_reservations,
+    {
+        use proxy_observability::{
+            capture::CaptureSupervisor,
+            capture_policy::{
+                CaptureBudgets, EndUserCaptureConfig, LocalCaptureControl, MetadataCapturePolicy,
+            },
+            capture_transport::CaptureTransportLimits,
+            stats::prometheus_render,
+        };
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        config.spool.max_record_bytes = proxy_capture_protocol::MAX_RECORD_BYTES;
+        config.spool.max_disk_bytes = 32 * 1024 * 1024;
+        let (active, recovery) = config.load_keys().unwrap();
+        let spool_config = config.spool_config();
+        let agent = TaskAbortGuard::start(config);
+        let stats = StatsControl::new(1);
+        let (supervisor, delivery) =
+            CaptureSupervisor::start(MetadataDeliveryStats::resolve(&stats)).unwrap();
+        let metadata = MetadataCapturePolicy {
+            max_attempts: 64,
+            ..MetadataCapturePolicy::default()
+        };
+        supervisor
+            .configure(
+                Some(EndUserCaptureConfig {
+                    policy_version: metadata.effective_version("qualification"),
+                    metadata,
+                    endpoint: fixture.transport(),
+                    budgets: CaptureBudgets::default(),
+                    transport: CaptureTransportLimits::default(),
+                    emergency_control: LocalCaptureControl {
+                        unix_socket_path: fixture.root.join("control.sock"),
+                        operator_uid: fixture.uid,
+                    },
+                }),
+                4,
+            )
+            .unwrap();
+        let mut expected = Vec::new();
+        for index in 0..8 {
+            let mut entry = maximum_record(&format!("supervisor-event-{index}"));
+            for attempt in &mut entry.attempts {
+                attempt.cluster = Some(String::new());
+                attempt.provider = Some(String::new());
+                attempt.upstream_model = Some(String::new());
+                attempt.retry_reason = Some(String::new());
+            }
+            // Leave room for the supervisor's pinned policy and instance identity.
+            let mut remaining = 65536 - 512 - entry.retained_bytes();
+            for attempt in &mut entry.attempts {
+                for field in [
+                    &mut attempt.cluster,
+                    &mut attempt.provider,
+                    &mut attempt.upstream_model,
+                    &mut attempt.retry_reason,
+                ] {
+                    let bytes = remaining.min(512);
+                    *field = Some("\u{0001}".repeat(bytes));
+                    remaining -= bytes;
+                }
+            }
+            assert_eq!(remaining, 0);
+            assert_eq!(entry.retained_bytes(), 65536 - 512);
+            entry.physical_attempt_count = 65;
+            entry.attempts_truncated = true;
+            assert!(entry.retained_bytes() <= 65536);
+            assert!(encode(&entry).unwrap().len() > 65536);
+            let lease = loop {
+                if let Ok(Some(lease)) = supervisor.try_admit() {
+                    break lease;
+                }
+                sleep(Duration::from_millis(1)).await;
+            };
+            let permit = loop {
+                if let Ok(permit) = lease.reserve_terminal() {
+                    break permit;
+                }
+                sleep(Duration::from_millis(1)).await;
+            };
+            assert_eq!(permit.submit(entry.clone()), SubmitResult::Accepted);
+            drop(lease);
+            expected.push(entry);
+        }
+        poll(|| {
+            prometheus_render::render(&stats.registry())
+                .contains("envoy_llmproxy_metadata_durable 8\n")
+        })
+        .await;
+        assert!(!delivery.shutdown(Duration::from_secs(5)).await);
+        assert_eq!(supervisor.status().active_requests, 0);
+        assert_eq!(supervisor.status().outstanding_events, 0);
+        assert_eq!(supervisor.status().retained_event_bytes, 0);
+        agent.stop().await;
+        let spool = MetadataSpool::open(spool_config, active, recovery).unwrap();
+        let replay = spool
+            .replay(0, 8, 8 * proxy_capture_protocol::MAX_RECORD_BYTES)
+            .unwrap();
+        assert_eq!(replay.len(), 8);
+        for mut expected in expected {
+            let stored = replay
+                .iter()
+                .map(|row| decode::<RequestRecord>(&row.payload).unwrap())
+                .find(|entry| entry.event_id == expected.event_id)
+                .unwrap();
+            expected.instance_id.clone_from(&stored.instance_id);
+            expected
+                .capture_policy_version
+                .clone_from(&stored.capture_policy_version);
+            assert_eq!(stored, expected);
+        }
+    }
+);
+
+bounded_test!(
     attempt_schema_and_request_ownership_must_match_the_envelope,
     {
         let fixture = Fixture::new();

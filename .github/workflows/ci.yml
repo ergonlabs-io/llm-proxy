@@ -11,20 +11,27 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99.0
           components: rustfmt, clippy
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: testing/qa/go.mod
+          cache-dependency-path: testing/qa/go.sum
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && cargo nextest --version
+      - name: Repository CI checks
+        run: make ci
+      - name: Capture reporter checks
+        run: make capture-qualification-check redb-retention-check
 
   # WP-26: differential rig job lands here (docker-compose: llm-proxy vs pinned
   # Envoy image digest + shared upstreams). Smoke subset on PR, full on merge queue.
