@@ -60,8 +60,7 @@ mod tests {
                     .take(8)
                     .map(|b| format!("{b:02x}"))
                     .collect::<String>();
-                let directory =
-                    std::path::PathBuf::from(format!("/private/tmp/capture-cleanup-{id}"));
+                let directory = std::path::PathBuf::from(format!("/tmp/capture-cleanup-{id}"));
                 std::fs::create_dir(&directory).unwrap();
                 std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
                     .unwrap();

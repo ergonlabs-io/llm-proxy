@@ -56,6 +56,8 @@ Follow-up fixes and optional local metadata capture after v0.3.0.
 - Align workspace package and binary versions with the v0.3.1 release tag.
 - Put accepted OpenRouter mock sockets into blocking mode before bounded reads,
   fixing a macOS timing failure without relaxing request/response assertions.
+- Use a short `/tmp` fixture path for the capture cleanup test on both Linux and
+  macOS, fixing the Linux-only missing-directory failure exposed after lint passed.
 - Patch the transitive UI build dependency `source-map-js` to 1.2.2, addressing
   GHSA-68fv-2mgg-jv7q; the clean UI build and npm audit pass.
 
