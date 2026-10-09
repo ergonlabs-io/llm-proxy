@@ -6,6 +6,10 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "providers", "routes"],
+  "anyOf": [
+    { "properties": { "routes": { "minItems": 1 } } },
+    { "required": ["models"], "properties": { "models": { "minProperties": 1 } } }
+  ],
   "properties": {
     "version": {
       "description": "Schema version. Must be 0. Future schema revisions bump this; llm-proxy refuses configs whose version it does not understand.",
@@ -30,7 +34,7 @@
       "$ref": "#/$defs/Auth"
     },
     "providers": {
-      "description": "Named upstream LLM API providers. The key is the provider name referenced by `routes` (lowercase letters, digits, hyphens). Names `openai` and `anthropic` infer their `type` and `base_url` automatically — a working OpenAI provider is just `openai: { api_key: ${OPENAI_API_KEY} }`.",
+      "description": "Named upstream LLM API providers. The key is the provider name referenced by `routes` (lowercase letters, digits, hyphens). Names `openai`, `anthropic`, and `openrouter` infer their `type` and `base_url` automatically — a working OpenAI provider is just `openai: { api_key: ${OPENAI_API_KEY} }`.",
       "type": "object",
       "minProperties": 1,
       "additionalProperties": false,
@@ -60,7 +64,7 @@
     "routes": {
       "description": "Ordered routing rules, evaluated top to bottom — the FIRST rule whose `model` pattern matches the request wins (there is no specificity reordering; put specific patterns above broad ones). Requests matching no rule and no `models` entry get a 404 with a JSON error body listing known models.",
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": { "$ref": "#/$defs/Route" }
     },
     "limits": {
@@ -191,13 +195,13 @@
       "additionalProperties": false,
       "properties": {
         "type": {
-          "description": "Provider API shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai` or `anthropic`; defaults to `openai-compatible` otherwise. `azure-openai` uses Azure's deployment URL and `api-version` query parameter. `vertex` uses Google Cloud project/location/publisher settings and an OAuth access token. `bedrock` uses an AWS region and SigV4 credential sources.",
-          "enum": ["openai", "anthropic", "openai-compatible", "azure-openai", "vertex", "bedrock"]
+          "description": "Provider API shape. `openrouter` uses OpenAI-compatible requests with cluster-owned /v1 to /api/v1 path rewriting. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai`, `anthropic`, or `openrouter`; defaults to `openai-compatible` otherwise. `azure-openai` uses Azure's deployment URL and `api-version` query parameter. `vertex` uses Google Cloud project/location/publisher settings and an OAuth access token. `bedrock` uses an AWS region and SigV4 credential sources.",
+          "enum": ["openai", "anthropic", "openai-compatible", "openrouter", "azure-openai", "vertex", "bedrock"]
         },
         "base_url": {
           "type": "string",
           "format": "uri",
-          "description": "API base URL. Required unless the provider name/type implies one (`openai` -> https://api.openai.com, `anthropic` -> https://api.anthropic.com).",
+          "description": "API base URL. Required unless the provider name/type implies one (`openai` -> https://api.openai.com, `anthropic` -> https://api.anthropic.com, `openrouter` -> https://openrouter.ai).",
           "examples": ["http://vllm.internal:8000", "https://api.together.xyz"]
         },
         "deployment": {
@@ -647,6 +651,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "catalog": { "type": "object", "description": "Public source pricing metadata exposed by the admin pricing inventory; never used as token rates." },
         "price_list_file": { "type": "string" },
         "price_list": { "$ref": "#/$defs/PriceList" }
       },
@@ -670,6 +675,8 @@
       "additionalProperties": false,
       "required": ["provider_type", "model", "tier_mode", "tiers"],
       "properties": {
+        "cached_input_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cached input remain unpriced." },
+        "cache_write_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cache creation remain unpriced." },
         "provider_type": { "type": "string", "minLength": 1 },
         "model": { "type": "string", "minLength": 1 },
         "tier_mode": { "enum": ["whole_request", "graduated"] },

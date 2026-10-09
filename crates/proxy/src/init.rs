@@ -121,10 +121,9 @@ providers:
   # anthropic:
   #   api_key: replace-with-ANTHROPIC_API_KEY
 
-  # OpenRouter (OpenAI-compatible)
+  # OpenRouter (all OpenRouter model IDs)
   # openrouter:
-  #   type: openai-compatible
-  #   base_url: https://openrouter.ai
+  #   type: openrouter
   #   api_key: replace-with-OPENROUTER_API_KEY
 
   # SpaceX AI / xAI (OpenAI-compatible)

@@ -39,7 +39,7 @@ use proxy_http::filter::{
 };
 use proxy_http::stream_info::GenAiSystem;
 use proxy_http::{LlmListCost, LlmTokenUsage};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
 use crate::usage::{extract_json_usage, Dialect, SseUsageScanner, TokenUsage};
@@ -74,6 +74,14 @@ impl PricingRegistry {
 
     pub(crate) fn snapshot_context(&self) -> Option<PricingContext> {
         self.snapshot()
+    }
+
+    /// Capture one immutable, public JSON view of the active pricing state.
+    /// Cloning the context while holding one read lock keeps the rate card,
+    /// provider mapping, and source catalog on the same registry revision.
+    pub fn json_view(&self) -> Option<PricingJsonView> {
+        let pricing = self.snapshot()?;
+        Some(PricingJsonView::from(pricing))
     }
 
     /// Seed a registry created by a preceding spend filter. Filter factories
@@ -245,6 +253,8 @@ struct FactoryWire {
     dialect: String,
     price_list: PriceListWire,
     providers: HashMap<String, String>,
+    #[serde(default)]
+    catalog: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +269,10 @@ struct PriceListWire {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PriceEntryWire {
+    #[serde(default)]
+    cached_input_unpriced: bool,
+    #[serde(default)]
+    cache_write_unpriced: bool,
     provider_type: String,
     model: String,
     tier_mode: String,
@@ -281,14 +295,96 @@ struct TierWire {
 struct PricingWire {
     price_list: PriceListWire,
     providers: HashMap<String, String>,
+    #[serde(default)]
+    catalog: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
 pub(crate) struct PricingContext {
-    list: PriceList,
+    list: Arc<PriceList>,
     /// Actual dialled cluster -> configured provider type.  A route can point
     /// at an aggregate/fallback, so this must not be inferred from dialect.
     providers: HashMap<String, String>,
+    catalog: Option<Arc<serde_json::Value>>,
+}
+
+#[derive(Serialize)]
+pub struct PricingJsonView {
+    rate_card_version: String,
+    price_list: PriceListJsonView,
+    providers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct PriceListJsonView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    effective_from: String,
+    entries: Vec<PriceEntryJsonView>,
+}
+
+#[derive(Serialize)]
+struct PriceEntryJsonView {
+    cached_input_unpriced: bool,
+    cache_write_unpriced: bool,
+    provider_type: String,
+    model: String,
+    tier_mode: &'static str,
+    tiers: Vec<TierJsonView>,
+}
+
+#[derive(Serialize)]
+struct TierJsonView {
+    up_to: Option<u64>,
+    input_nanodollars_per_token: u64,
+    cached_input_nanodollars_per_token: u64,
+    cache_write_nanodollars_per_token: u64,
+    output_nanodollars_per_token: u64,
+}
+
+impl From<PricingContext> for PricingJsonView {
+    fn from(pricing: PricingContext) -> Self {
+        let version = pricing.list.version().as_str().to_string();
+        let effective_from: chrono::DateTime<chrono::Utc> = pricing.list.effective_from().into();
+        let entries = pricing
+            .list
+            .entries()
+            .iter()
+            .map(|entry| PriceEntryJsonView {
+                cached_input_unpriced: entry.cached_input_unpriced,
+                cache_write_unpriced: entry.cache_write_unpriced,
+                provider_type: entry.provider_type.clone(),
+                model: entry.model.clone(),
+                tier_mode: match entry.tier_mode {
+                    TierMode::WholeRequest => "whole_request",
+                    TierMode::Graduated => "graduated",
+                },
+                tiers: entry
+                    .tiers
+                    .iter()
+                    .map(|tier| TierJsonView {
+                        up_to: tier.up_to,
+                        input_nanodollars_per_token: tier.input_nanodollars_per_token,
+                        cached_input_nanodollars_per_token: tier.cached_input_nanodollars_per_token,
+                        cache_write_nanodollars_per_token: tier.cache_write_nanodollars_per_token,
+                        output_nanodollars_per_token: tier.output_nanodollars_per_token,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self {
+            rate_card_version: version.clone(),
+            price_list: PriceListJsonView {
+                version: pricing.list.label().map(str::to_owned),
+                effective_from: effective_from.to_rfc3339(),
+                entries,
+            },
+            providers: pricing.providers,
+            catalog: pricing.catalog.map(|catalog| (*catalog).clone()),
+        }
+    }
 }
 
 struct ParsedFactoryConfig {
@@ -349,6 +445,8 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
             )));
         }
         entries.push(PriceEntry {
+            cached_input_unpriced: entry.cached_input_unpriced,
+            cache_write_unpriced: entry.cache_write_unpriced,
             provider_type: entry.provider_type,
             model: entry.model,
             tier_basis: TierBasis::InputTokens,
@@ -367,8 +465,13 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
         });
     }
     Ok(PricingContext {
-        list: PriceList::new(wire.price_list.version.as_deref(), effective_from, entries),
+        list: Arc::new(PriceList::new(
+            wire.price_list.version.as_deref(),
+            effective_from,
+            entries,
+        )),
         providers: wire.providers,
+        catalog: wire.catalog.map(Arc::new),
     })
 }
 
@@ -416,6 +519,7 @@ fn parse_legacy_factory_config(
     let pricing = parse_pricing(PricingWire {
         price_list: wire.price_list,
         providers: wire.providers,
+        catalog: wire.catalog,
     })?;
     Ok(ParsedFactoryConfig {
         dialect,
@@ -877,6 +981,8 @@ mod tests {
             Some("2026-09"),
             std::time::SystemTime::UNIX_EPOCH,
             vec![PriceEntry {
+                cached_input_unpriced: false,
+                cache_write_unpriced: false,
                 provider_type: "openai".into(),
                 model: "gpt-5".into(),
                 tier_basis: TierBasis::InputTokens,
@@ -892,8 +998,9 @@ mod tests {
         );
         UsageFilterInstance {
             pricing: Some(PricingContext {
-                list,
+                list: Arc::new(list),
                 providers: HashMap::from([("provider:openai".into(), "openai".into())]),
+                catalog: None,
             }),
             ..filter_for(Dialect::OpenAi)
         }
@@ -1438,5 +1545,47 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(in_flight.list.version().as_str(), first);
         assert_eq!(registry.snapshot().unwrap().list.version().as_str(), second);
+    }
+
+    #[test]
+    fn pricing_json_view_exposes_exact_active_rates_mappings_and_catalog() {
+        let registry = PricingRegistry::new(None);
+        let version = registry
+            .replace_json(
+                r#"{
+                  "price_list": {"version":"catalog-469","effective_from":"2026-10-08T12:34:56Z",
+                    "entries":[{"provider_type":"anthropic","model":"claude-sonnet","tier_mode":"graduated",
+                      "tiers":[{"up_to":200000,"input_nanodollars_per_token":3000,"cached_input_nanodollars_per_token":300,
+                        "cache_write_nanodollars_per_token":3750,"output_nanodollars_per_token":15000},
+                        {"up_to":null,"input_nanodollars_per_token":6000,"cached_input_nanodollars_per_token":600,
+                        "cache_write_nanodollars_per_token":7500,"output_nanodollars_per_token":22500}]}]},
+                  "providers":{"provider:anthropic":"anthropic"},
+                  "catalog":{"source":"public","unsupported":{"model-x":"non-integer nanodollar rate"}}
+                }"#,
+            )
+            .expect("card validates");
+
+        let value = serde_json::to_value(registry.json_view().expect("active view")).unwrap();
+        assert_eq!(value["rate_card_version"], version);
+        assert_eq!(value["price_list"]["version"], "catalog-469");
+        let replacement = registry.replace_json(&serde_json::json!({"price_list": value["price_list"], "providers": value["providers"], "catalog": value["catalog"]}).to_string()).unwrap();
+        assert_eq!(
+            replacement, version,
+            "GET/PUT must preserve the card version"
+        );
+        assert_eq!(
+            value["price_list"]["effective_from"],
+            "2026-10-08T12:34:56+00:00"
+        );
+        assert_eq!(
+            value["price_list"]["entries"][0]["tiers"][1]["output_nanodollars_per_token"],
+            22500
+        );
+        assert_eq!(value["providers"]["provider:anthropic"], "anthropic");
+        assert_eq!(value["catalog"]["source"], "public");
+        assert_eq!(
+            value["catalog"]["unsupported"]["model-x"],
+            "non-integer nanodollar rate"
+        );
     }
 }

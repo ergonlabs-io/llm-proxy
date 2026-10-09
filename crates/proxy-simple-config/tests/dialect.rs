@@ -3012,8 +3012,8 @@ models:
 
     // routes[0] is the explicit `routes:` rule; routes[1..] are the four
     // `models:` entries, in precedence order: exact, then longest prefix
-    // first, then the (empty-prefix) catch-all last.
-    assert_eq!(routes.len(), 5, "routes: {routes:#?}");
+    // first. Local catalog discovery precedes the catch-all.
+    assert_eq!(routes.len(), 6, "routes: {routes:#?}");
     let m = |i: usize| &routes[i];
     assert_eq!(
         m(1)["match"]["headers"][0]["string_match"]["exact"],
@@ -3031,11 +3031,11 @@ models:
     );
     assert_eq!(m(3)["route"]["cluster"], "provider:p-gpt");
     assert!(
-        m(4)["match"]["headers"].is_null(),
+        m(5)["match"]["headers"].is_null(),
         "the bare `*` catch-all carries no header matcher: {:?}",
-        m(4)
+        m(5)
     );
-    assert_eq!(m(4)["route"]["cluster"], "provider:p-catchall");
+    assert_eq!(m(5)["route"]["cluster"], "provider:p-catchall");
 }
 
 /// Two competing prefixes, isolated from the rest of the ladder: the
@@ -3065,10 +3065,10 @@ models:
     let routes = hcm_typed_config(&lowered.bootstrap)["route_config"]["virtual_hosts"][0]["routes"]
         .as_array()
         .expect("routes must be an array");
-    // routes[0] explicit, [1] `claude-sonnet-*`, [2] `claude-*`, [3] the
-    // synthetic 404 (neither prefix is a catch-all, so it's still appended
+    // routes[0] explicit, [1] `claude-sonnet-*`, [2] `claude-*`, [3] local
+    // catalog discovery, [4] the synthetic 404 (neither prefix is a catch-all, so it's still appended
     // -- unchanged pre-existing behavior, not this test's concern).
-    assert_eq!(routes.len(), 4, "routes: {routes:#?}");
+    assert_eq!(routes.len(), 5, "routes: {routes:#?}");
     // The longer prefix (`claude-sonnet-`) must be listed FIRST -- Envoy
     // matches first-match-wins, so list order IS precedence order here.
     assert_eq!(
@@ -3110,9 +3110,9 @@ models:
         .expect("routes must be an array");
     // exact `gpt-4o` first, bare `*` last, no synthetic 404 (the catch-all
     // already covers every remaining request).
-    assert_eq!(routes.len(), 3, "routes: {routes:#?}");
-    assert_eq!(routes[2]["route"]["cluster"], "provider:fallback");
-    assert!(routes[2]["match"]["headers"].is_null());
+    assert_eq!(routes.len(), 4, "routes: {routes:#?}");
+    assert_eq!(routes[3]["route"]["cluster"], "provider:fallback");
+    assert!(routes[3]["match"]["headers"].is_null());
     assert!(
         !routes.iter().any(|r| r["direct_response"]["status"] == 404),
         "a catch-all model entry must not leave a dead 404 backstop behind it: {routes:#?}"

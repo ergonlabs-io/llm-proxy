@@ -241,6 +241,28 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             }
         }));
     }
+    // A configured model catalog is served locally from the same immutable
+    // snapshot as routing. Wildcard patterns are routing rules, not model IDs.
+    if !config.models.is_empty() {
+        let data: Vec<Value> = config.models.keys()
+            .filter(|name| !name.contains('*'))
+            .map(|name| json!({ "id": name, "object": "model", "created": 0, "owned_by": "llm-proxy" }))
+            .collect();
+        let body = json!({ "object": "list", "data": data }).to_string();
+        let catalog_route = json!({
+            "name": "llmproxy_model_catalog",
+            "match": { "path": "/v1/models" },
+            "direct_response": { "status": 200, "body": { "inline_string": body } },
+        });
+        let index = routes
+            .iter()
+            .position(|route| {
+                route["match"]["prefix"] == "/" && route["match"]["headers"].is_null()
+            })
+            .unwrap_or(routes.len());
+        routes.insert(index, catalog_route);
+    }
+
     // WP-45: the body-rewrite filter (inserted below by
     // `needs_body_rewrite_filter`) now scans the request body and publishes
     // `MODEL_HEADER` from it before routing runs, so `routes`/`models`
@@ -366,6 +388,8 @@ fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value
         .iter()
         .map(|entry| {
             json!({
+                "cached_input_unpriced": entry.cached_input_unpriced,
+                "cache_write_unpriced": entry.cache_write_unpriced,
                 "provider_type": entry.provider_type,
                 "model": entry.model,
                 "tier_mode": match entry.tier_mode.expect("validated") {
@@ -393,6 +417,7 @@ fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value
         })
         .collect();
     json!({
+        "catalog": config.pricing.as_ref().and_then(|pricing| pricing.catalog.as_ref()),
         "price_list": {
             "version": list.version,
             "effective_from": list.effective_from,
@@ -754,6 +779,13 @@ fn lower_provider(
     });
     if let Some(template) = path_template {
         cluster["metadata"]["filter_metadata"][PATH_TEMPLATE_METADATA_KEY] = template;
+    }
+
+    if provider.effective_type(name) == ProviderType::Openrouter {
+        cluster["metadata"]["filter_metadata"][PATH_REWRITE_METADATA_KEY] = json!({
+            "match_prefix": "/v1",
+            "replacement_prefix": "/api/v1",
+        });
     }
 
     if provider.effective_type(name) == ProviderType::AzureOpenai {

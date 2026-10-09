@@ -426,6 +426,16 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
             ),
         };
     }
+    if req.method() == Method::GET {
+        let path = req.uri().path();
+        let stat_prefix = path
+            .strip_prefix("/chains/")
+            .and_then(|rest| rest.strip_suffix("/pricing"))
+            .filter(|name| !name.is_empty() && !name.contains('/'));
+        if path == "/pricing" || stat_prefix.is_some() {
+            return handle_get_pricing(factory_state, stat_prefix);
+        }
+    }
     // ---- Read endpoints: byte-for-byte the read-only increment's behavior,
     // no gate, matched on path alone (as before -- these never distinguished
     // method). ----
@@ -967,6 +977,37 @@ fn handle_set_pricing(
             &serde_json::json!({ "rate_card_version": version }),
         ),
         Err(error) => text(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+fn handle_get_pricing(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let registry = match resolve_pricing_registry(factory_state, stat_prefix) {
+        Ok(Some(registry)) => registry,
+        Ok(None) => {
+            return text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "llmproxy.usage is not initialized on this chain",
+            );
+        }
+        Err(scopes) => {
+            return text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "the unscoped pricing API cannot resolve a single usage filter chain: {}",
+                    scopes.join(", ")
+                ),
+            );
+        }
+    };
+    match registry.json_view() {
+        Some(view) => json(StatusCode::OK, &view),
+        None => text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "llmproxy.usage has no active pricing rate card",
+        ),
     }
 }
 

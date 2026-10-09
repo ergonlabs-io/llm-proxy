@@ -11,9 +11,42 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
-Follow-up work for the v0.3.0 dynamic-configuration gate.
+### Added
+
+- OpenRouter provider defaults, cluster-owned `/v1` to `/api/v1` rewriting,
+  and a loopback local example with explicit OpenRouter model entries. The
+  configured catalog is served locally at `/v1/models` and refreshed with
+  `scripts/import-openrouter-models.py`.
+  Chat, SSE, model discovery, and credential replacement are covered by a local
+  mock integration test; no live paid requests were made.
+
+## [0.3.1] - 2026-10-08
+
+Follow-up fixes and optional local metadata capture after v0.3.0.
 
 ### Added
+
+- Optional bounded request and attempt metadata capture with authenticated local agent
+  delivery, runtime controls, and encrypted redb storage. Durable local receipts follow
+  transaction sync; sequence reservations, recovery validation, key rotation, bounded
+  cursor replay, and physical disk quotas are covered by fault and process-crash tests.
+- Fresh capture spool format with no legacy migration. Removed segment settings fail
+  strict configuration validation; `cache_bytes` defaults to 4 MiB, capped at 16 MiB.
+  Metadata capture remains LOCAL-SPOOL-ONLY: no backend uploader or query service.
+- Linux amd64 and macOS arm64 release archives include the companion capture agent.
+
+### Validation and limits
+
+- Workspace: 2,326 tests passed, 28 skipped; doctests: 5 passed, 1 ignored.
+  Formatting, lint, and dependency checks passed locally.
+- Production retention: 60,000 records confirmed and byte-verified after reopening,
+  within a 1 GiB disk limit, plus escaped and maximum-size record cases.
+- Integrated qualification is still in progress at release preparation; see
+  `internal-docs/capacity/2026-10-08-capture-spool-redb-production.md` for evidence
+  and explicit limits. This release does not claim 5,000 requests/second,
+  100,000 concurrent streams, or completed Envoy parity.
+
+### Operational telemetry
 
 - **Independent OTLP metric export.** Metric export is now configurable and scheduled separately
   from trace export, per `docs/telemetry-design.md` §5.3. Envoy mode reads a new
@@ -30,8 +63,8 @@ Follow-up work for the v0.3.0 dynamic-configuration gate.
   Two new self-instruments, `llmproxy_otel_export_failures{signal="traces"|"metrics"}` and
   `llmproxy_otel_spans_dropped`, make an unreachable collector visible as a metric rather than as a
   gap in a dashboard; both series exist from the first scrape on a process with no OTLP configured
-  at all. No request bodies, request records, or other end-user telemetry is captured — that work
-  has not started.
+  at all. This operational telemetry export is separate from the optional metadata capture
+  path described below.
 
 - **Review fixes to the above (2026-10-01).** Four findings from review, all fixed: (1) config
   load could PANIC — a huge but finite `export_interval` like `1.0e100` passed the finite/positive

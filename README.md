@@ -209,6 +209,36 @@ make ci                          # fmt, clippy, tests, doctests, qa — what CI 
 make tq                          # the whole test suite via nextest
 ```
 
+### Use OpenRouter locally
+
+The OpenRouter provider forwards OpenAI-compatible chat requests requests, rewriting `/v1` to OpenRouter's `/api/v1` on the selected cluster. The
+example contains 469 model IDs imported on 2026-10-08, including vendor prefixes
+and suffixes. `/v1/models` serves those IDs locally; it does not query OpenRouter. Availability, supported
+parameters, and account permissions are determined by OpenRouter.
+
+```sh
+export OPENROUTER_API_KEY='your-openrouter-key'
+python3 scripts/import-openrouter-models.py  # optional explicit catalog refresh
+make build
+./target/debug/llm-proxy --config examples/llmproxy-openrouter.yaml
+```
+
+Point your OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Discover model
+IDs with `curl http://127.0.0.1:8080/v1/models`, then use one as the request's `model`:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+The example listens only on loopback and has no downstream authentication. The
+OpenRouter key comes from the environment and replaces downstream authorization
+on the provider cluster. Live requests use your OpenRouter account and may incur
+charges. This configuration covers OpenAI-compatible chat and streaming; other
+OpenRouter API families are not qualified by this example. See the
+[OpenRouter model API](https://openrouter.ai/docs/api/api-reference/models/get-models).
+
 ### Install a release
 
 On macOS or Linux, install the latest published binary with:
@@ -454,3 +484,15 @@ yet.
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+The OpenRouter importer installs exact token rates in
+`pricing.price_list`, and preserves all published pricing in `pricing.catalog`.
+The Pricing UI reads `GET /pricing` from the proxy, including the active version
+and explicit reasons for models without a usable token rate card. No cache rates
+are inferred and fractional nanodollars are never rounded. An unknown cache rate
+makes requests reporting that cache bucket unpriced; ordinary requests still use
+the known input/output rates. Whole-request tier overrides are imported with
+inclusive thresholds. Non-token charges remain visible but are excluded from
+token cost calculation. Restart the proxy after refreshing the import, or update its rate card through
+authenticated `PUT /pricing`. Dollar budgets still
+require tenant/user spend policies; importing prices does not create budgets.

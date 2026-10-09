@@ -38,6 +38,9 @@ pub struct Tier {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceEntry {
+    /// Unknown cache rates only prevent pricing when that bucket is used.
+    pub cached_input_unpriced: bool,
+    pub cache_write_unpriced: bool,
     pub provider_type: String,
     pub model: String,
     pub tier_basis: TierBasis,
@@ -64,6 +67,7 @@ impl std::fmt::Display for PriceListVersion {
 /// editing rates while forgetting to bump a label cannot corrupt auditability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceList {
+    label: Option<String>,
     version: PriceListVersion,
     effective_from: SystemTime,
     entries: Vec<PriceEntry>,
@@ -82,6 +86,8 @@ impl PriceList {
             bytes.push(0);
             bytes.extend_from_slice(e.model.as_bytes());
             bytes.push(0);
+            bytes.push(u8::from(e.cached_input_unpriced));
+            bytes.push(u8::from(e.cache_write_unpriced));
             bytes.push(e.tier_basis as u8);
             bytes.push(e.tier_mode as u8);
             for t in &e.tiers {
@@ -102,10 +108,15 @@ impl PriceList {
             None => hash,
         };
         Self {
+            label: label.map(str::to_owned),
             version: PriceListVersion(version),
             effective_from,
             entries,
         }
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 
     pub fn version(&self) -> &PriceListVersion {
@@ -113,6 +124,9 @@ impl PriceList {
     }
     pub fn effective_from(&self) -> SystemTime {
         self.effective_from
+    }
+    pub fn entries(&self) -> &[PriceEntry] {
+        &self.entries
     }
     pub fn lookup(&self, provider_type: &str, model: &str) -> Option<&PriceEntry> {
         self.entries
@@ -128,6 +142,10 @@ impl PriceList {
         usage: &TokenUsage,
     ) -> Option<u64> {
         self.lookup(provider_type, model)
+            .filter(|entry| {
+                !(entry.cached_input_unpriced && usage.cached_tokens > 0
+                    || entry.cache_write_unpriced && usage.cache_creation_tokens > 0)
+            })
             .map(|entry| list_cost_nanodollars(entry, usage))
     }
 }
@@ -184,7 +202,7 @@ fn all_buckets(usage: &TokenUsage, tier: &Tier) -> u64 {
 /// is inclusive, so exactly 500_000 context tokens remain in a `up_to:
 /// 500000` tier. All multiplication and addition saturates because token
 /// counts are provider-derived wire values.
-pub fn list_cost_nanodollars(entry: &PriceEntry, usage: &TokenUsage) -> u64 {
+fn list_cost_nanodollars(entry: &PriceEntry, usage: &TokenUsage) -> u64 {
     let quantity = context_tokens(usage);
     let Some(selected) = tier_for(&entry.tiers, quantity) else {
         return 0;
@@ -255,6 +273,8 @@ mod tests {
     }
     fn entry(mode: TierMode, tiers: Vec<Tier>) -> PriceEntry {
         PriceEntry {
+            cached_input_unpriced: false,
+            cache_write_unpriced: false,
             provider_type: "openai".into(),
             model: "gpt-5".into(),
             tier_basis: TierBasis::InputTokens,
@@ -327,6 +347,34 @@ mod tests {
             1_000_022
         );
     }
+    #[test]
+    fn unknown_cache_rates_never_become_free_cache_usage() {
+        let mut model = entry(TierMode::WholeRequest, vec![tier(None, 150, 0, 0, 600)]);
+        model.cached_input_unpriced = true;
+        model.cache_write_unpriced = true;
+        let list = PriceList::new(Some("test"), SystemTime::UNIX_EPOCH, vec![model.clone()]);
+        assert_eq!(
+            list.list_cost_nanodollars("openai", "gpt-5", &usage(2, 0, 0, 3)),
+            Some(2100)
+        );
+        assert_eq!(
+            list.list_cost_nanodollars("openai", "gpt-5", &usage(2, 1, 0, 3)),
+            None
+        );
+        assert_eq!(
+            list.list_cost_nanodollars("openai", "gpt-5", &usage(2, 0, 1, 3)),
+            None
+        );
+        model.cached_input_unpriced = false;
+        model.cache_write_unpriced = false;
+        let free_cache = PriceList::new(Some("test"), SystemTime::UNIX_EPOCH, vec![model]);
+        assert_ne!(list.version(), free_cache.version());
+        assert_eq!(
+            free_cache.list_cost_nanodollars("openai", "gpt-5", &usage(2, 1, 0, 3)),
+            Some(2100)
+        );
+    }
+
     #[test]
     fn unpriced_is_none_and_version_is_content_addressed() {
         let first = PriceList::new(

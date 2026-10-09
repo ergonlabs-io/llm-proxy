@@ -61,7 +61,7 @@ jobs:
         run: npm ci && npm run build
 
       - name: Build release binary
-        run: cargo build --locked --release -p proxy
+        run: cargo build --locked --release -p proxy -p proxy-capture-agent
 
       - name: Package release asset
         env:
@@ -69,8 +69,9 @@ jobs:
         run: |
           staging="$(mktemp -d)"
           cp target/release/llm-proxy "$staging/llm-proxy"
+          cp target/release/llm-capture-agent "$staging/llm-capture-agent"
           cp -R admin-ui/dist "$staging/admin-ui-dist"
-          tar -C "$staging" -czf "$ASSET_NAME" llm-proxy admin-ui-dist
+          tar -C "$staging" -czf "$ASSET_NAME" llm-proxy llm-capture-agent admin-ui-dist
           shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256"
 
       - name: Upload package

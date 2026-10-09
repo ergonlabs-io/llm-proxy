@@ -256,6 +256,8 @@ pub enum ProviderType {
     Openai,
     Anthropic,
     OpenaiCompatible,
+    /// OpenRouter serves OpenAI-shaped requests under `/api/v1`.
+    Openrouter,
     /// OpenAI-shaped API hosted on Azure. The provider requires deployment
     /// and api-version fields to build its provider-owned URL template.
     AzureOpenai,
@@ -275,6 +277,7 @@ impl ProviderType {
             ProviderType::Openai => "openai",
             ProviderType::Anthropic => "anthropic",
             ProviderType::OpenaiCompatible => "openai-compatible",
+            ProviderType::Openrouter => "openrouter",
             ProviderType::AzureOpenai => "azure-openai",
             ProviderType::Vertex => "vertex",
             ProviderType::Bedrock => "bedrock",
@@ -569,6 +572,9 @@ pub(crate) fn default_force_usage_reporting() -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pricing {
+    /// Public source metadata, carried to the admin pricing inventory.
+    #[serde(default)]
+    pub catalog: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub price_list_file: Option<String>,
     #[serde(default)]
@@ -587,6 +593,10 @@ pub struct PriceListDef {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PriceEntryDef {
+    #[serde(default)]
+    pub cached_input_unpriced: bool,
+    #[serde(default)]
+    pub cache_write_unpriced: bool,
     pub provider_type: String,
     pub model: String,
     /// Required even for a one-tier entry: a later edit adding tiers must not
@@ -787,11 +797,12 @@ impl TryFrom<String> for LimitKey {
 
 impl Provider {
     /// Effective provider type: explicit `type`, else inferred from the name
-    /// (`openai`/`anthropic`), else openai-compatible.
+    /// (`openai`/`anthropic`/`openrouter`), else openai-compatible.
     pub fn effective_type(&self, name: &str) -> ProviderType {
         self.provider_type.unwrap_or(match name {
             "openai" => ProviderType::Openai,
             "anthropic" => ProviderType::Anthropic,
+            "openrouter" => ProviderType::Openrouter,
             _ => ProviderType::OpenaiCompatible,
         })
     }
@@ -801,6 +812,7 @@ impl Provider {
         self.base_url.clone().or(match self.effective_type(name) {
             ProviderType::Openai => Some("https://api.openai.com".to_string()),
             ProviderType::Anthropic => Some("https://api.anthropic.com".to_string()),
+            ProviderType::Openrouter => Some("https://openrouter.ai".to_string()),
             // These provider types require an explicit base URL. Azure,
             // Vertex, and Bedrock use provider-specific request handling.
             ProviderType::OpenaiCompatible

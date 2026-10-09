@@ -169,16 +169,16 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                 field_path: format!("{path}.base_url"),
                 reason: format!(
                     "base_url is required for `{name}` (only providers named/typed \
-                     openai or anthropic have an implied URL)"
+                     openai, anthropic, or openrouter have an implied URL)"
                 ),
             });
         }
     }
 
-    if config.routes.is_empty() {
+    if config.routes.is_empty() && config.models.is_empty() {
         return Err(ConfigError::InvalidValue {
             field_path: "routes".to_string(),
-            reason: "at least one route is required".to_string(),
+            reason: "at least one route or model is required".to_string(),
         });
     }
     for (i, route) in config.routes.iter().enumerate() {

@@ -107,3 +107,32 @@ fn tier_selector_is_not_configurable_away_from_total_input_context() {
     };
     assert_eq!(field_path, "pricing.price_list.entries[0].tier_basis");
 }
+
+#[test]
+fn unknown_cache_rates_and_source_metadata_survive_lowering() {
+    let config = BASE.replace("pricing:\n", "pricing:\n  catalog: { source: openrouter, models: [] }\n")
+        .replace("        tier_mode: whole_request", "        cached_input_unpriced: true\n        cache_write_unpriced: true\n        tier_mode: whole_request");
+    let lowered = lower(&parse(&config)).unwrap();
+    let filters = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["http_filters"]
+        .as_array()
+        .unwrap();
+    let carrier: serde_json::Value = serde_json::from_str(
+        filters
+            .iter()
+            .find(|filter| filter["name"] == "llmproxy.usage")
+            .unwrap()["typed_config"]["pricing_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(carrier["catalog"]["source"], "openrouter");
+    assert_eq!(
+        carrier["price_list"]["entries"][0]["cached_input_unpriced"],
+        true
+    );
+    assert_eq!(
+        carrier["price_list"]["entries"][0]["cache_write_unpriced"],
+        true
+    );
+}
