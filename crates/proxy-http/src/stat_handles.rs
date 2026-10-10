@@ -264,7 +264,8 @@ impl RouterStats {
     /// that need to assert exactly how many attempts recorded a duration
     /// (e.g. that a circuit-breaker rejection added zero) -- production code
     /// reads histogram data through `proxy-admin`'s `/stats` route instead.
-    pub fn rq_time_observation_count(&self, cluster: &str) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn rq_time_observation_count(&self, cluster: &str) -> Option<u64> {
         let h = self.handles.for_cluster(cluster)?;
         Some(self.registry.histogram_snapshot(h.rq_time).count)
     }
@@ -878,14 +879,23 @@ mod tests {
     }
 
     #[test]
-    fn record_attempt_on_an_unknown_cluster_does_not_panic() {
+    fn record_attempt_on_an_unknown_cluster_bumps_nothing_and_warns_once() {
+        // Reload-race fail-soft: "openai" is known, "anthropic" is not.
         let (control, handles) = control_and_handles(&["openai"]);
         let registry = control.registry();
-        let stats = RouterStats::new(registry, handles, WorkerId(0));
+        let stats = RouterStats::new(registry.clone(), handles.clone(), WorkerId(0));
 
-        // Must not panic -- "openai" is known, "anthropic" is not.
+        stats.record_attempt("anthropic");
         stats.record_attempt("anthropic");
         stats.record_attempt_duration_ms("anthropic", 12.0);
+
+        let h = handles.for_cluster("openai").unwrap();
+        assert_eq!(registry.value(h.rq), 0);
+        assert_eq!(registry.histogram_snapshot(h.rq_time).count, 0);
+        assert!(handles.for_cluster("anthropic").is_none());
+        let warned = stats.warned_unknown_clusters.lock().unwrap();
+        assert_eq!(warned.len(), 1);
+        assert!(warned.contains("anthropic"));
     }
 
     #[test]
@@ -919,14 +929,22 @@ mod tests {
     }
 
     #[test]
-    fn record_connection_accepted_on_an_unknown_listener_does_not_panic() {
+    fn record_connection_accepted_on_an_unknown_listener_bumps_nothing_and_warns_once() {
         let control = StatsControl::new(1);
         let handles = Arc::new(DownstreamStatHandles::build(&control, ["ingress"]));
         let registry = control.registry();
-        let stats = DownstreamStats::new(registry, handles, WorkerId(0));
+        let stats = DownstreamStats::new(registry.clone(), handles.clone(), WorkerId(0));
 
-        // Must not panic -- "ingress" is known, "admin" is not.
+        // "ingress" is known, "admin" is not.
         stats.record_connection_accepted("admin");
+        stats.record_connection_accepted("admin");
+
+        let h = handles.for_listener("ingress").unwrap();
+        assert_eq!(registry.value(h.cx_total), 0);
+        assert!(handles.for_listener("admin").is_none());
+        let warned = stats.warned_unknown_listeners.lock().unwrap();
+        assert_eq!(warned.len(), 1);
+        assert!(warned.contains("admin"));
     }
 
     #[test]
@@ -996,17 +1014,26 @@ mod tests {
     }
 
     #[test]
-    fn record_usage_on_an_unknown_provider_does_not_panic() {
+    fn record_usage_on_an_unknown_provider_bumps_nothing_and_warns_once() {
         let control = StatsControl::new(1);
         let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
         let registry = control.registry();
-        let stats = GenAiTokenStats::new(registry, handles, WorkerId(0));
+        let stats = GenAiTokenStats::new(registry.clone(), handles.clone(), WorkerId(0));
 
-        // Must not panic -- "openai" is known, "anthropic" is not. Checked
-        // with a real tenant too: an unknown provider must stay silent
-        // regardless of the tenant dimension (WP-55).
+        // "openai" is known, "anthropic" is not. Checked with a real tenant
+        // too: an unknown provider must stay silent regardless of the
+        // tenant dimension (WP-55).
         stats.record_usage("anthropic", None, sample_tokens());
         stats.record_usage("anthropic", Some("acme"), sample_tokens());
+
+        let h = handles.for_provider("openai").unwrap();
+        assert_eq!(registry.value(h.input), 0);
+        assert_eq!(registry.value(h.cached), 0);
+        assert_eq!(registry.value(h.cache_creation), 0);
+        assert_eq!(registry.value(h.output), 0);
+        let warned = stats.warned_unknown_providers.lock().unwrap();
+        assert_eq!(warned.len(), 1);
+        assert!(warned.contains("anthropic"));
     }
 
     // ---- WP-55: the `tenant` dimension ------------------------------------

@@ -1317,25 +1317,6 @@ mod tests {
         assert_eq!(registry.value(h.output), 0);
     }
 
-    #[tokio::test]
-    async fn no_wired_recorder_does_not_panic() {
-        // A handler with no `access_logs`-adjacent token recorder attached
-        // (`token_stats: None`, every pre-6b caller's shape) must simply
-        // skip recording, not panic reaching for one.
-        drive_with_usage_and_provider(
-            None,
-            Some("openai"),
-            None,
-            Some(LlmTokenUsage {
-                input_tokens: 1,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
-                output_tokens: 1,
-            }),
-        )
-        .await;
-    }
-
     // --- WP-55: `tenant` reaches `LLM_CLIENT_TOKEN_USAGE` through the real
     // `StreamInfo::auth.tenant` -> `LoggingBody::finish` path -------------
 

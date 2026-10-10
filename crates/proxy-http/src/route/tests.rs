@@ -766,7 +766,10 @@ fn strip_port_variants() {
 }
 
 #[test]
-fn no_panic_on_adversarial_input() {
+fn adversarial_authority_and_path_inputs_match_literally() {
+    // Routes are matched on the raw `:path` (S1.3): no percent-decoding, no
+    // case folding of non-ASCII, and a dangling-colon authority is left
+    // as-is by `strip_port` but still reaches the `*` virtual host.
     let fx = Fixture::new(
         r#"
                   name: rt
@@ -774,17 +777,37 @@ fn no_panic_on_adversarial_input() {
                     - name: v1
                       domains: ["*"]
                       routes:
-                        - { match: { prefix: "/" }, route: { cluster: c } }
+                        - { match: { prefix: "/日本語" }, route: { cluster: jp } }
+                        - { match: { prefix: "/x" }, route: { cluster: x } }
 "#,
     );
     let hdrs = headers(&[]);
-    // Multi-byte UTF-8 path, empty authority, empty path, `%`-garbage.
-    let _ = match_route(fx.table(), &req("", "", &hdrs));
-    let _ = match_route(fx.table(), &req("h", "/日本語/path", &hdrs));
-    let _ = match_route(fx.table(), &req("h", "%%%garbage%%%", &hdrs));
-    let _ = match_route(fx.table(), &req("h:", "/x", &hdrs));
-    let _ = strip_port("h:");
-    let _ = strip_query("");
+    // `Some(cluster)` = first matching route's cluster; `None` = NoRoute.
+    let outcome = |authority: &str, path: &str| -> Option<String> {
+        match match_route(fx.table(), &req(authority, path, &hdrs)) {
+            RouteMatch::Found { route, .. } => {
+                let RouteActionIR::Forward(fwd) = &route.action else {
+                    panic!("expected forward action");
+                };
+                let ForwardTarget::Cluster(name) = &fwd.target else {
+                    panic!("expected cluster target");
+                };
+                Some(name.clone())
+            }
+            RouteMatch::NoRoute { .. } => None,
+            RouteMatch::NoVirtualHost => panic!("`*` vhost must catch {authority:?}"),
+        }
+    };
+    // Empty authority and empty path: vhost found, no prefix matches.
+    assert_eq!(outcome("", ""), None);
+    // Multi-byte UTF-8 prefix matches byte-for-byte.
+    assert_eq!(outcome("h", "/日本語/path").as_deref(), Some("jp"));
+    // `%`-garbage is not decoded, so it matches nothing.
+    assert_eq!(outcome("h", "%%%garbage%%%"), None);
+    // Percent-encoded form of a configured prefix does not match it.
+    assert_eq!(outcome("h", "/%78"), None);
+    // Trailing-colon authority still resolves the catch-all vhost.
+    assert_eq!(outcome("h:", "/x").as_deref(), Some("x"));
 }
 
 // --------------------------------------------------------- prefix_rewrite --

@@ -50,11 +50,12 @@
 //! ```
 //!
 //! **No public accessor returns a single shard's slot.** [`Registry::value`]
-//! sums; that is the only read. [`Registry::shard_values_for_debugging`]
-//! exists for tests only — the name is the friction, so a reviewer sees
-//! immediately when someone reaches for the un-summed figure. Histograms get
-//! the equivalent pair: [`Registry::histogram_snapshot`] (summed, the only
-//! read) and [`Registry::histogram_shard_snapshots_for_debugging`].
+//! sums; that is the only read. `Registry::shard_values_for_debugging` is a
+//! `#[cfg(test)]`, crate-private helper — it is not part of the API, and the
+//! name is the friction, so a reviewer sees immediately when someone reaches
+//! for the un-summed figure. Histograms get the equivalent pair:
+//! [`Registry::histogram_snapshot`] (summed, the only read) and the
+//! `#[cfg(test)]` `Registry::histogram_shard_snapshots_for_debugging`.
 //!
 //! `Relaxed` ordering, on both increment and read: these are counters, not
 //! synchronization. Nothing else is published through them, and a scrape
@@ -1099,9 +1100,9 @@ fn atomic_add_f64(atomic: &AtomicU64, delta: f64) {
 
 /// A summed-across-shards view of one histogram handle's state: the same
 /// three fields [`HistogramShard`] stores per shard, after
-/// [`Registry::histogram_snapshot`]/[`Registry::histogram_shard_snapshots_for_debugging`]
-/// have added them up (or, for the debugging accessor, left them as one
-/// shard's own figures).
+/// [`Registry::histogram_snapshot`] (or the test-only per-shard accessor) has
+/// added them up (or, for the per-shard accessor, left them as one shard's
+/// own figures).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistogramSnapshot {
     /// Non-cumulative bucket counts, `boundaries.len() + 1` entries — see
@@ -1602,8 +1603,8 @@ impl Registry {
     }
 
     /// Summed across every worker shard. **The only read.** No public
-    /// accessor returns a single shard's slot — see
-    /// [`Self::shard_values_for_debugging`] if you think you need one.
+    /// accessor returns a single shard's slot (the test-only
+    /// `shard_values_for_debugging` is `#[cfg(test)]` and crate-private).
     ///
     /// `Relaxed` load, same justification as `incr`/`add`: a scrape must not
     /// be a fence on the request path, and observing a slightly-stale value
@@ -1619,13 +1620,12 @@ impl Registry {
             .fold(0u64, u64::wrapping_add)
     }
 
-    /// Per-worker figures, **unsummed**. Exists for tests only (see the
+    /// Per-worker figures, **unsummed**. Compiled for tests only (see the
     /// module doc's "no public accessor may return a single shard's value"
     /// rule) — the ugly name is deliberate friction so a reviewer notices
-    /// immediately if production code ever reaches for this instead of
-    /// [`Self::value`]. Nothing outside `#[cfg(test)]` in this crate calls
-    /// it, and nothing outside this crate should either.
-    pub fn shard_values_for_debugging(&self, handle: Handle) -> Vec<u64> {
+    /// immediately if anyone reaches for this instead of [`Self::value`].
+    #[cfg(test)]
+    pub(crate) fn shard_values_for_debugging(&self, handle: Handle) -> Vec<u64> {
         let state = self.published.load();
         let block = handle.0 / COUNTER_BLOCK_LEN;
         let slot = handle.0 % COUNTER_BLOCK_LEN;
@@ -1702,8 +1702,8 @@ impl Registry {
     }
 
     /// Summed across every worker shard. **The only read** for histogram
-    /// data — see [`Self::histogram_shard_snapshots_for_debugging`] for the
-    /// debug-only, unsummed per-shard view. `Relaxed` loads throughout, same
+    /// data. The unsummed per-shard view, `histogram_shard_snapshots_for_debugging`,
+    /// is `#[cfg(test)]` and crate-private. `Relaxed` loads throughout, same
     /// justification as `value`.
     pub fn histogram_snapshot(&self, handle: HistogramHandle) -> HistogramSnapshot {
         let state = self.published.load();
@@ -1731,9 +1731,10 @@ impl Registry {
         }
     }
 
-    /// Per-worker snapshots, **unsummed**. Exists for tests only — same
-    /// deliberate-friction naming as [`Self::shard_values_for_debugging`].
-    pub fn histogram_shard_snapshots_for_debugging(
+    /// Per-worker snapshots, **unsummed**. Compiled for tests only — same
+    /// deliberate-friction naming as `shard_values_for_debugging`.
+    #[cfg(test)]
+    pub(crate) fn histogram_shard_snapshots_for_debugging(
         &self,
         handle: HistogramHandle,
     ) -> Vec<HistogramSnapshot> {
