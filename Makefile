@@ -179,7 +179,7 @@ endif
 # `cargo fmt --all` AND `cargo fmt -p <crate>` are both repo/crate-WIDE writes.
 # When several agents work concurrently, either one reformats other lanes'
 # in-flight uncommitted files. This has caused real losses twice (2026-07-25,
-# 2026-07-27) -- see CLAUDE.md rules 6 and 10.
+# 2026-07-27) -- see AGENTS.md "Delegation".
 
 .PHONY: lint
 lint: ## Clippy with warnings denied (what CI enforces)
@@ -226,8 +226,8 @@ validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.ya
 # docker.
 #
 # THE RISK THIS CARRIES, stated because it has already cost this project once:
-# an opt-in target is exactly the shape of `local_openai_smoke.rs`, which rule 16
-# in CLAUDE.md records as having quietly stopped running for a whole work package
+# an opt-in target is exactly the shape of `local_openai_smoke.rs`, which AGENTS.md "Coverage"
+# records as having quietly stopped running for a whole work package
 # while the suite stayed green -- an entire observability surface went untested
 # behind an `#[ignore]`. A target nobody runs is worse than no target, because it
 # reads as coverage.
@@ -363,7 +363,7 @@ deps-list: ## Same, but also print the allowlisted suppressions and their reason
 
 # ------------------------------------------------------------------- sweep --
 # WP-30 phase 3. These start real processes and bind real ports -- never run
-# them concurrently with the test suite (CLAUDE.md rule 15). The script tears
+# them concurrently with the test suite (AGENTS.md "Running The Product"). The script tears
 # down and reports a pgrep check on every exit path, including failure.
 
 .PHONY: sweep

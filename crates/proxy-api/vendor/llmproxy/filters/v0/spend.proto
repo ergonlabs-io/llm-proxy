@@ -159,7 +159,7 @@ enum Period {
 
 // One cluster's price list.
 //
-// CLAUDE.md ground rule 6 ("anything that varies per provider belongs on the
+// AGENTS.md invariant 6 ("anything that varies per provider belongs on the
 // cluster, never on the route") has a third instance here, beyond credentials
 // (WP-35 1a) and `host_rewrite_literal` (WP-35 2c): pricing. The same model
 // name can be served by two clusters at two different rates -- `gpt-4o`

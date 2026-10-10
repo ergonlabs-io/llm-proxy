@@ -263,8 +263,8 @@ impl RedisControlPlaneStore {
     /// TCP handshake on the rare non-connection error (say, a corrupted
     /// value that fails to decode) and fixes itself either way -- guessing
     /// which errors "deserve" a reconnect is exactly the kind of
-    /// classification a bug can hide inside, the same shape CLAUDE.md's
-    /// build notes describe for "acting on the obvious symptom instead of
+    /// classification a bug can hide inside, the same shape AGENTS.md "Build And Test"
+    /// describes for "acting on the obvious symptom instead of
     /// the actual cause".
     fn with_connection<T>(
         &self,
@@ -759,8 +759,8 @@ mod tests {
     //   docker rm -f llmproxy-test-redis
     //
     // Port 6390, not 6379: a fixed port is a cross-lane hazard, and 6379 is
-    // where a developer's own Redis is already likely listening (CLAUDE.md
-    // rule 15). Each test below builds its own namespace, timestamped to
+    // where a developer's own Redis is already likely listening (AGENTS.md
+    // "Running The Product"). Each test below builds its own namespace, timestamped to
     // the nanosecond, so concurrent runs never collide either.
     // ------------------------------------------------------------------
 
@@ -1090,7 +1090,7 @@ mod tests {
     // "three processes against one Redis converge on spend" and "a killed
     // process's backlog flushes on restart and the ledger self-heals".
     //
-    // WHAT THESE TWO TESTS PROVE, AND WHAT THEY DO NOT: CLAUDE.md rule 15
+    // WHAT THESE TWO TESTS PROVE, AND WHAT THEY DO NOT: AGENTS.md "Running The Product"
     // forbids a worktree-isolated agent from spawning OS processes or
     // binding ports, so "three processes" below is three `SpendAccumulator`s
     // with three DISTINCT `node_id`s sharing ONE `RedisControlPlaneStore`,
@@ -1177,7 +1177,7 @@ mod tests {
         // `next_seq` is lazily seeded from `last_flush_seq` on its own first
         // flush (see `spend.rs`), so a SHARED id still composes correctly
         // when the flushes happen one after another rather than racing --
-        // sequential in-process calls, exactly what CLAUDE.md rule 15 confines
+        // sequential in-process calls, exactly what AGENTS.md "Running The Product" confines
         // this test to, cannot reproduce the concurrent-race collision a
         // shared node id risks in real deployment. This assertion catches
         // the shared-id case anyway, by checking WHERE the sequence landed:

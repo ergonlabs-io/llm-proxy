@@ -3527,7 +3527,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // gets an empty list here, unchanged from before.
     let request_headers_to_add = convert_provider_auth_metadata(c.metadata.as_ref(), path)?;
     let provider_runtime = convert_provider_runtime_metadata(c.metadata.as_ref(), path)?;
-    // Ground rule #6's third instance (CLAUDE.md): the usage-filter dialect
+    // Ground rule #6's third instance (AGENTS.md invariant 6): the usage-filter dialect
     // is per-provider, so it rides the same `Cluster.metadata.filter_metadata`
     // smuggling channel as credentials above, under its own namespace.
     let usage_dialect = convert_usage_dialect_metadata(c.metadata.as_ref(), path)?;
@@ -4094,7 +4094,7 @@ fn convert_request_path_rewrite_metadata(
 
 /// Namespace key the `llmproxy` dialect uses to carry the usage-filter
 /// dialect through `Cluster.metadata.filter_metadata` -- ground rule #6's
-/// third instance (CLAUDE.md): the dialect is a per-provider property, so it
+/// third instance (AGENTS.md invariant 6): the dialect is a per-provider property, so it
 /// has to follow the cluster that is actually dialled, the same way
 /// [`PROVIDER_AUTH_METADATA_KEY`] carries credentials. This increment (WP-35
 /// inc 1) only populates [`ClusterConfig::usage_dialect`]; the usage filter

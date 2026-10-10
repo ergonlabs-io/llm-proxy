@@ -815,7 +815,7 @@ pub struct ClusterConfig {
     pub provider_runtime: Option<ProviderRuntimeConfig>,
     /// Which wire dialect this cluster's upstream speaks, for the usage
     /// filter's token accounting -- ground rule #6's third instance (see
-    /// `CLAUDE.md`), following credentials (`request_headers_to_add`) and
+    /// `AGENTS.md invariant 6`), following credentials (`request_headers_to_add`) and
     /// `host_rewrite_literal`. The dialect is a property of the *provider
     /// actually dialled*, not of the route that picked an aggregate; the
     /// route still carries its own `typed_per_filter_config` copy today

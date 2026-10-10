@@ -50,7 +50,7 @@ http = { workspace = true }
 # locate that binary robustly instead: it asks `cargo build` itself, via
 # `--message-format=json`, for the exact executable path it produced, rather
 # than guessing a `target/` layout that a per-worktree `CARGO_TARGET_DIR`
-# (see CLAUDE.md) could change out from under a hardcoded guess.
+# (see AGENTS.md "Delegation") could change out from under a hardcoded guess.
 serde_json = { workspace = true }
 # tests/ads_e2e.rs (WP-20 increment 5): the WP-28 puppet ADS server this
 # scripts a control plane with -- same dev-only dependency as

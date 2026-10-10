@@ -23,7 +23,7 @@
 
 [profile.default]
 # `make tq` already passes `--no-fail-fast` so a run cannot undercount by
-# stopping at the first failing crate (CLAUDE.md rule 11). Same intent here.
+# stopping at the first failing crate (AGENTS.md "Build And Test"). Same intent here.
 fail-fast = false
 
 # Report anything past 60s BY NAME, then kill it at 3 minutes.

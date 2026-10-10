@@ -675,7 +675,7 @@ fn sighup_reload_is_reflected_in_config_dump_and_clusters() {
 /// Sanity check on the ANSI stripper itself, since two tests above depend on
 /// it to find `version=N` inside colorized log output -- an instrument that
 /// lies about matching would make those tests pass for the wrong reason
-/// (see CLAUDE.md's note on validating instruments before reasoning from
+/// (see AGENTS.md "Build And Test"'s note on validating instruments before reasoning from
 /// them).
 #[test]
 fn strip_ansi_removes_sgr_codes_around_a_field() {

@@ -96,7 +96,7 @@
 //! restart-resume) would be wired to nothing while still passing its own
 //! tests.
 //! # Loud on unreadable usage, but never fail-closed -- restated from
-//! `token_limit_filter`, per CLAUDE.md rule 17
+//! `token_limit_filter`, per AGENTS.md "Fail-open controls"
 //!
 //! A request a budget actually applies to (this stream had a key AND that
 //! key had a configured budget) whose usage reads `None` at encode time is
@@ -913,7 +913,7 @@ impl HttpFilter for SpendLimitFilterInstance {
 ///
 /// - Refusing the config fails CLOSED, and metering must not start refusing
 ///   traffic -- the same call `token_limit` already made for unreadable usage
-///   (CLAUDE.md rule 17). It would also reject nearly every deployment that
+///   (AGENTS.md "Fail-open controls"). It would also reject nearly every deployment that
 ///   works today: a fully static bootstrap does not carry a node id into the
 ///   IR at all.
 /// - Passing the empty string through fails OPEN and SILENTLY, which is the

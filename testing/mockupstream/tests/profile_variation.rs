@@ -1,6 +1,6 @@
 //! End-to-end coverage for the scale-test profile extension: real HTTP
 //! requests against a real `AppState`-backed server, over an in-memory pipe
-//! (never a bound port -- see CLAUDE.md rule 15, "a worktree does not
+//! (never a bound port -- see AGENTS.md "Running The Product", "a worktree does not
 //! isolate ports"). Exercises what `frames.rs`'/`handler.rs`'s unit tests
 //! can't: that profile selection, the terminal frame, and the usage count
 //! all survive a real hyper request/response round trip, for both dialects.
@@ -55,7 +55,7 @@ async fn spawn_server(state: Arc<AppState>) -> SendRequest<Full<Bytes>> {
 /// (`mock-slow-long` alone streams up to 2000 chunks at up to 60ms apart --
 /// minutes of real wall-clock sleeping per request, by design). Running
 /// this crate's own integration tests against those would make the suite
-/// itself the next `terminate-after` casualty (CLAUDE.md rule 14). What's
+/// itself the next `terminate-after` casualty (AGENTS.md "Build And Test"). What's
 /// under test here is the *selection and accounting* logic -- "the model
 /// picks the right profile", "the reported count matches what was actually
 /// sent" -- which holds at any scale, so the override keeps the same names

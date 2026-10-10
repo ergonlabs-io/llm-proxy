@@ -15,7 +15,7 @@
 //!
 //! # NOT `local_openai_smoke.rs`, deliberately
 //!
-//! That file is `#[ignore]`d behind a local Ollama -- and CLAUDE.md rule 16
+//! That file is `#[ignore]`d behind a local Ollama -- and AGENTS.md "Coverage"
 //! records, from the last time this happened, that an `#[ignore]`d file is
 //! exactly how an entire observability surface stayed untested while 1141
 //! other tests stayed green. This drill needs no live provider (the mock
@@ -35,7 +35,7 @@
 //!
 //! Every port here (listener, admin, upstream) comes from
 //! [`diffrig::harness::free_port`] at test-run time, never a hardcoded value
-//! from `examples/*.yaml` -- CLAUDE.md rule 14 records a fixed-port test as a
+//! from `examples/*.yaml` -- AGENTS.md "Build And Test" records a fixed-port test as a
 //! real cross-suite collision, and rule 15 records that a git worktree does
 //! NOT isolate ports from a concurrently running agent on the same machine.
 //!
@@ -602,7 +602,7 @@ fn parse_json(body: &str) -> Value {
 /// 1a. The gate is wired at all: with `LLMPROXY_ADMIN_TOKEN` UNSET in the
 /// spawned process, a write endpoint returns 403 and the body names the env
 /// var an operator must set. This is the fail-CLOSED path getting its own
-/// test (CLAUDE.md rule 17) -- nothing about "admin write endpoints are
+/// test (AGENTS.md "Fail-open controls") -- nothing about "admin write endpoints are
 /// disabled" is visible anywhere else in this suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_write_endpoints_are_forbidden_when_the_token_env_var_is_unset() {
@@ -1129,7 +1129,7 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
 /// 6. Scoped vs. unscoped addressing. With TWO `llmproxy.auth`-configured
 /// filter chains live, the UNSCOPED admin API cannot tell which
 /// `ControlPlane` a write means and refuses explicitly (never guesses,
-/// CLAUDE.md rule 17's shape); the SCOPED `/chains/{stat_prefix}/...` form
+/// AGENTS.md "Fail-open controls"'s shape); the SCOPED `/chains/{stat_prefix}/...` form
 /// is always correct, addresses each chain independently, and a key minted
 /// on one chain does NOT authenticate against the other -- proving the
 /// `df0ae8c` fix (`SharedFactoryState` keyed on `(chain scope, type_url)`,

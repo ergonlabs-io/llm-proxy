@@ -38,7 +38,7 @@
 //! key listing: `key_id`, `tenant`, `revoked`, `budget`, sorted by
 //! `(tenant, key_id)`). Unset (or
 //! empty/whitespace) token means every one of these -- write OR read -- is
-//! refused with 403 -- **unset never means open** (CLAUDE.md rule 17). See
+//! refused with 403 -- **unset never means open** (AGENTS.md "Fail-open controls"). See
 //! `server.rs`'s `handle` for the full gate and its per-endpoint doc
 //! comments for request/response shapes.
 //!

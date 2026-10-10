@@ -109,7 +109,7 @@ const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
 
 /// What `/ready` should report, as decided by whoever injects the
 /// [`ReadinessProbe`] -- this crate never asks a `ClusterManager` itself
-/// (rule 2 in CLAUDE.md: generated protos and their consuming crates stay out
+/// (AGENTS.md invariant 2: generated protos and their consuming crates stay out
 /// of `proxy-admin`; the analogous discipline here is "no data-plane crate
 /// dependency", matching `proxy-xds::apply::Publish`'s seam).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -558,7 +558,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
 
     // Gate 1: is the write API enabled at all? Unset (or empty/whitespace)
     // `LLMPROXY_ADMIN_TOKEN` means "not configured", never "open" -- see
-    // CLAUDE.md rule 17 ("a security control that fails open must be
+    // AGENTS.md "Fail-open controls" ("a security control that fails open must be
     // loud"). This is the fail-CLOSED default, and it must never be
     // reachable by falling through any other branch above it.
     let Some(token) = admin_token else {
@@ -630,7 +630,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
                 );
             }
             Err(scopes) => {
-                // Loud, not a guess (CLAUDE.md rule 17's shape applied here
+                // Loud, not a guess (AGENTS.md "Fail-open controls"'s shape applied here
                 // too): picking one of several ControlPlanes at random would
                 // risk writing a key into the wrong tenant's control plane.
                 tracing::error!(

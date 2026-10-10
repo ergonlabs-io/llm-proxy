@@ -8,7 +8,7 @@
 //! pure core, and a later increment (3c-ii/iii) builds the filter that reads
 //! `typed_config`, holds a shared accumulator, and enforces a ceiling.
 //!
-//! # Keyed on `(cluster, model)`, not `model` alone — CLAUDE.md ground rule 6
+//! # Keyed on `(cluster, model)`, not `model` alone — AGENTS.md invariant 6
 //!
 //! This is the third documented instance of rule 6's hazard: a per-provider
 //! value attached to the ROUTE (or, equivalently, resolved by model name
@@ -662,7 +662,7 @@ pub struct TenantBudget {
 ///
 /// Same call budgets already make, and the same one Envoy's global rate
 /// limit filter makes with `failure_mode_deny: false`: a metering hiccup
-/// must not start refusing traffic (CLAUDE.md rule 17). Note what that buys
+/// must not start refusing traffic (AGENTS.md "Fail-open controls"). Note what that buys
 /// and what it does not -- the over-admission becomes VISIBLE
 /// ([`SpendReport::unreconciled_admissions`], and the flusher's warning),
 /// not CLOSED.
@@ -864,7 +864,7 @@ impl Inner {
     ///
     /// A load failure here must NOT lose the request it is servicing: this
     /// logs loudly and starts the bucket at zero rather than propagating an
-    /// error, per CLAUDE.md rule 17 ("a security control that fails open
+    /// error, per AGENTS.md "Fail-open controls" ("a security control that fails open
     /// must be loud") -- the same "metering must not refuse traffic"
     /// precedent `token_limit`'s missing-usage path already sets.
     fn get_or_load_bucket<'a>(
@@ -1499,7 +1499,7 @@ impl SpendAccumulator {
     /// having reached the store is the most unreconciled a replica can be;
     /// returning "unknown" for it would invite every caller to treat the
     /// worst case as the benign one, which is the fail-open-and-silent shape
-    /// CLAUDE.md rule 17 exists to stop.
+    /// AGENTS.md "Fail-open controls" exists to stop.
     ///
     /// Clock note: this is wall-clock arithmetic on [`Utc::now`], not a
     /// monotonic [`std::time::Instant`], because the value it derives from
@@ -1524,7 +1524,7 @@ impl SpendAccumulator {
     ///
     /// A tenant with no configured budget is unlimited, so admitting its
     /// request while stale is not an over-admission and must not be counted
-    /// or warned about (CLAUDE.md rule 17: "only warn where the control was
+    /// or warned about (AGENTS.md "Fail-open controls": "only warn where the control was
     /// actually meant to apply"). `spend_limit_filter` calls this on the
     /// admit path only after it has resolved a budget.
     ///
@@ -1712,7 +1712,7 @@ fn run_flusher(inner: Arc<Inner>, shutdown: Arc<ShutdownSignal>, interval: Durat
                 // Only on a FAILED tick, which is what keeps this off the
                 // healthy path entirely -- a replica flushing normally
                 // evaluates none of it, and one that is broken logs at most
-                // once per flush interval (CLAUDE.md rule 17: suppress
+                // once per flush interval (AGENTS.md "Fail-open controls": suppress
                 // repeats, or the log becomes the incident).
                 let age = inner.reconciliation_age(Utc::now());
                 if age > inner.reconciliation.bound {
@@ -1853,7 +1853,7 @@ mod tests {
     /// The rule-6 centerpiece: the SAME model priced differently on two
     /// clusters must charge each cluster's own rate, keyed on the cluster the
     /// request was actually dialled against -- never the model alone. This is
-    /// the exact hazard CLAUDE.md ground rule 6 names for credentials and
+    /// the exact hazard AGENTS.md invariant 6 names for credentials and
     /// `host_rewrite_literal`, restated for money: a lookup that ignored the
     /// cluster would bill a request the fallback served at the primary's
     /// rate.
@@ -2428,7 +2428,7 @@ mod tests {
 
     /// A `load_spend` failure on first touch of a period must not lose the
     /// request: the bucket resumes from zero (logged loudly) rather than
-    /// the accumulator refusing to record at all. Per CLAUDE.md rule 17.
+    /// the accumulator refusing to record at all. Per AGENTS.md "Fail-open controls".
     #[test]
     fn a_load_spend_failure_on_first_touch_resumes_from_zero_instead_of_losing_the_request() {
         struct AlwaysFailsLoadSpend(InMemoryControlPlaneStore);

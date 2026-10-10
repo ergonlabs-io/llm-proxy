@@ -36,7 +36,7 @@
 # exercise is supposed to measure (IMPLEMENTATION_PLAN.md: "Include the LLM
 # traffic shape, not just RPC-shaped load").
 #
-# Rule 15 of CLAUDE.md applies to this script as much as to an agent: it
+# AGENTS.md "Running The Product" applies to this script as much as to an agent: it
 # binds ports and starts long-lived processes. Do not run it concurrently
 # with the test suite, and check the teardown reported at the end.
 set -euo pipefail
@@ -109,7 +109,7 @@ MOCK_PID=""
 PROXY_PID=""
 
 # Teardown runs on every exit path, including a failed `set -e` step. The
-# `pgrep` at the end is the check CLAUDE.md rule 15 asks for by name -- a
+# `pgrep` at the end is the check AGENTS.md "Running The Product" asks for by name -- a
 # previous session left two processes holding ports because a run was killed
 # by a watchdog before it could clean up.
 cleanup() {

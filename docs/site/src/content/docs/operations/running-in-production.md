@@ -173,7 +173,7 @@ appears in the store's per-writer dedup state every time the process
 restarts. In production, always set `--service-node` to something stable per
 replica (a pod name, a hostname) — do not rely on the synthesized fallback,
 which exists so a metering detail never blocks the process from starting
-(CLAUDE.md rule 17), not as a supported production identity.
+(AGENTS.md "Fail-open controls"), not as a supported production identity.
 
 With `recovery_journal_path` configured, a stable node ID is required at load;
 the synthesized fallback is rejected for recoverable replicas.

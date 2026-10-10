@@ -81,7 +81,7 @@ see `fixture/Dockerfile`.
 ## Cadence
 
 Preserved from the Makefile's own comment above the `xds-conformance` target,
-because CLAUDE.md rule 16 records exactly this shape (`local_openai_smoke.rs`)
+because AGENTS.md "Coverage" records exactly this shape (`local_openai_smoke.rs`)
 quietly going stale for a whole work package while the suite stayed green:
 
 - run it before closing WP-20, and

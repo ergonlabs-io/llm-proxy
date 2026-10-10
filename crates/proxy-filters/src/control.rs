@@ -39,7 +39,7 @@
 //!   explain why.
 //! - **On refresh** ([`ControlPlane::rebuild`]): a *previous* good snapshot
 //!   is already published and serving traffic. A transient store blip must
-//!   not nuke it -- see CLAUDE.md rule 17 ("a security control that fails
+//!   not nuke it -- see AGENTS.md "Fail-open controls" ("a security control that fails
 //!   open must be loud"; the mirror image applies here too: a control that
 //!   fails *closed* on a blip is its own outage). `rebuild` on `Err` leaves
 //!   `published` untouched and `tracing::warn!`s loudly instead.
@@ -1627,7 +1627,7 @@ impl ControlPlane {
     /// actually be the fail-OPEN-shaped bug this split exists to prevent:
     /// every key that used to authenticate would start 401-ing the instant a
     /// store read hiccuped, silently, with no distinguishing signal from "the
-    /// key was actually revoked". See the module doc and CLAUDE.md rule 17.
+    /// key was actually revoked". See the module doc and AGENTS.md "Fail-open controls".
     ///
     /// WP-61: on success, also records the generation stamp the fresh
     /// snapshot reflects and marks `last_reconciled_at` as now -- both read
@@ -2182,7 +2182,7 @@ impl Drop for ControlPlane {
 /// [`ControlPlane::start_policy_poller`]'s doc for why it cannot hold a
 /// strong `Arc` itself.
 fn run_policy_poller(control: Weak<ControlPlane>, shutdown: Arc<PollShutdown>, interval: Duration) {
-    // CLAUDE.md rule 17: a control that degrades must be loud, but a poller
+    // AGENTS.md "Fail-open controls": a control that degrades must be loud, but a poller
     // ticking every tens of seconds must not re-warn every tick while the
     // store stays down -- that turns the log itself into the incident. These
     // two fields, private to this one thread, are the suppression state:
@@ -3802,7 +3802,7 @@ mod tests {
 
     // --- parity: redb and InMemory must produce the SAME StoredControlPlane
     //     from the same sequence of writes -- so the two impls cannot
-    //     silently diverge (see CLAUDE.md's per-provider audit rule for why
+    //     silently diverge (see AGENTS.md invariant 6 for why
     //     this project treats "two backends of the same seam quietly
     //     disagreeing" as the shape of bug worth pinning a test to).
 

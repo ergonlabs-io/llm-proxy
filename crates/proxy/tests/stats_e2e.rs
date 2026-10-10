@@ -177,7 +177,7 @@ fn post(addr: SocketAddr, path: &str, host: &str, body: &str) -> String {
 /// Kills and reaps a child process on drop -- used for the two child
 /// processes the `llm.client.token.usage` test below spawns
 /// (`mock-upstream` and `llm-proxy`), so an assertion failure partway through
-/// the test still leaves nothing running (CLAUDE.md rule 15's corollary: a
+/// the test still leaves nothing running (AGENTS.md "Running The Product"'s corollary: a
 /// hand-run process that outlives its test is a leak, not just a red test).
 struct ChildGuard(Child);
 

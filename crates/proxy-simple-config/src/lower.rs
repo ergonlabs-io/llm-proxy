@@ -691,7 +691,7 @@ fn lower_provider(
     // identical value via `host_rewrite_literal`, so this is a no-op there,
     // and one rule is simpler than two.
     headers_to_add.push(json!({ "key": "host", "value": up.host }));
-    // WP-35 increment 1 (ground rule #6's third instance, CLAUDE.md): the
+    // WP-35 increment 1 (ground rule #6's third instance, AGENTS.md invariant 6): the
     // usage-filter dialect is per-provider too, so it rides onto the CLUSTER
     // alongside credentials and `Host` above rather than staying only on the
     // route's `typed_per_filter_config` -- that route-level copy is left

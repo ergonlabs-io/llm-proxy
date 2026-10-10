@@ -8,9 +8,9 @@
 //! `#[ignore]`d: `make xds-conformance` runs this file with `--ignored`
 //! (needs docker; never part of `make ci`, see the Makefile target itself).
 //! Every test here:
-//! - builds and runs the fixture on an EPHEMERAL host port (CLAUDE.md rule
-//!   15 -- other lanes run concurrently and fixed ports collide for real);
-//! - bounds every wait with a timeout (rule 14 -- a control plane, or a
+//! - builds and runs the fixture on an EPHEMERAL host port (AGENTS.md
+//!   "Running The Product" -- other lanes run concurrently and fixed ports collide for real);
+//! - bounds every wait with a timeout (AGENTS.md "Build And Test" -- a control plane, or a
 //!   client, that never responds must fail loudly, not hang);
 //! - tears the container down via an RAII guard, so a panic mid-test still
 //!   cleans up (rule 15's docker corollary).

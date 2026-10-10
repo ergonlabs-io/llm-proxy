@@ -389,7 +389,7 @@ async fn wait_for_nack_does_not_accept_an_ack_for_the_same_nonce() {
 /// client opens stream 2, and the script resumes at the step *after*
 /// `DropStream` rather than replaying from the top.
 ///
-/// Rust note: `flavor = "multi_thread"` per CLAUDE.md rule 14 -- this test
+/// Rust note: `flavor = "multi_thread"` per AGENTS.md "Build And Test" -- this test
 /// drives two concurrent streams against the same in-process server, and a
 /// `current_thread` runtime is exactly the shape that has produced real
 /// hangs here before.
@@ -508,7 +508,7 @@ async fn drop_stream_resumes_script_on_reconnect() {
 /// `Step::Wait` delays the next response without consuming a client
 /// request. Proves the delay happens strictly before the second send, with
 /// only a generous lower-bound timing check -- never a tight one, which
-/// would be flaky (CLAUDE.md rule on timing assertions).
+/// would be flaky (AGENTS.md "Build And Test").
 #[tokio::test]
 async fn wait_delays_next_send() {
     const WAIT: Duration = Duration::from_millis(300);

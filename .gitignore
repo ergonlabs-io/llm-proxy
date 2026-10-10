@@ -1,5 +1,5 @@
 /target
-# Per-worktree CARGO_TARGET_DIR (CLAUDE.md rule 13). Not covered by `/target`,
+# Per-worktree CARGO_TARGET_DIR (AGENTS.md "Delegation"). Not covered by `/target`,
 # and a `git add -A` inside an agent worktree otherwise stages ~3600 build
 # artifacts along with the change.
 /target-agent
@@ -16,7 +16,7 @@ testing/diffrig/captures/
 # times, ADR-0003 34, internal-docs/IMPLEMENTATION_PLAN.md 30, internal-docs/envoy-divergences.md 13.
 # A `// see ADR-0004` comment pointing at a file nobody else has is worse than
 # no comment. They also had no backup: WP-45's design existed in exactly one
-# place, on one laptop, which is the same failure mode as CLAUDE.md rule 10
+# place, on one laptop, which is the same failure mode as AGENTS.md "Delegation"
 # with a different cause.
 *.md
 !README.md
@@ -28,7 +28,7 @@ testing/diffrig/captures/
 # repository is worse than none: it looks present locally and is invisible to
 # the people it exists for.
 !SECURITY.md
-!.claude/**/*.md
+!.agents/**/*.md
 !testing/corpus/fixtures/**/SOURCES.md
 # The spec the Go QA suite is written from — reviewable alongside the tests
 # that cite its case IDs.

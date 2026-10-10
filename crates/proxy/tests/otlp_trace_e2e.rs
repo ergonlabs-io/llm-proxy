@@ -16,11 +16,11 @@
 //! `#[tokio::test(flavor = "multi_thread")]`, not the default
 //! `current_thread`: the mock collector's `tonic` server task and this
 //! test's own blocking waits (`wait_for_connectable`, `TcpStream` I/O) both
-//! need to make progress concurrently -- see CLAUDE.md rule 14's account of
+//! need to make progress concurrently -- see AGENTS.md "Build And Test"'s account of
 //! exactly this hazard sinking `diffrig::mock_e2e` under a single-threaded
 //! runtime.
 //!
-//! CLAUDE.md rule 15: every spawned process is a [`ChildGuard`] (killed on
+//! AGENTS.md "Running The Product": every spawned process is a [`ChildGuard`] (killed on
 //! `Drop`, so a failing assertion partway through still leaves nothing
 //! running), ports are all ephemeral (`free_port`), and nothing here runs
 //! the binary in the foreground or skips a timeout.
@@ -113,7 +113,7 @@ fn drain_available_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
 }
 
 /// Kills and reaps a child process on drop -- see `tests/stats_e2e.rs`'s
-/// identical type for why (CLAUDE.md rule 15: a hand-run process that
+/// identical type for why (AGENTS.md "Running The Product": a hand-run process that
 /// outlives its test is a leak, not just a red test).
 struct ChildGuard(Child);
 

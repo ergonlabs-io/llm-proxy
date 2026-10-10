@@ -1450,7 +1450,7 @@ fn publish_to_workers(
 /// damage window is the microseconds between `publish` storing the snapshot
 /// and `update_from_snapshot` storing the cluster map, which it does
 /// synchronously before its per-cluster `refresh_cluster().await` loop. No
-/// black-box observer can reliably land inside it, and CLAUDE.md rule 14's
+/// black-box observer can reliably land inside it, and AGENTS.md "Build And Test"'s
 /// lesson is that an instrument which lies is worse than none.
 ///
 /// So the order is a compile-time property instead: [`install_clusters`]
@@ -2310,7 +2310,7 @@ async fn wait_for_initial_binds(
 /// Logs once, at `warn!`, the first probe call that observes the deadline
 /// has passed with clusters still warming, naming them -- never on every
 /// call. `/ready` is polled by orchestrators on a tight loop; logging on
-/// every poll would become the incident (CLAUDE.md rule 17's "keep the
+/// every poll would become the incident (AGENTS.md "Fail-open controls"'s "keep the
 /// suppression off the healthy hot path" reasoning, applied to a warning
 /// rather than a security control).
 ///
@@ -3160,8 +3160,8 @@ routes:
     // Mirrors `run_serve`'s own three-step pipeline (bootstrap node id ->
     // `effective_node` -> `SharedFactoryState::for_node`) at unit-test
     // granularity, rather than booting a whole serve to prove it -- see
-    // `effective_node`'s tests above for the same reasoning, and CLAUDE.md's
-    // rule against a test binding a port.
+    // `effective_node`'s tests above for the same reasoning, and the
+    // `AGENTS.md "Running The Product"` rule against a test binding a port.
 
     #[test]
     fn service_node_override_reaches_shared_factory_state() {

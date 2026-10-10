@@ -162,7 +162,7 @@ fn drain_available_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
 }
 
 /// Kills and reaps a child process on drop -- see `tests/stats_e2e.rs`'s
-/// identical type for why (CLAUDE.md rule 15: a hand-run process that
+/// identical type for why (AGENTS.md "Running The Product": a hand-run process that
 /// outlives its test is a leak, not just a red test).
 struct ChildGuard(Child);
 
