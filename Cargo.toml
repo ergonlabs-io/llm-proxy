@@ -188,6 +188,16 @@ debug = "line-tables-only"
 [profile.test.package.proxy-api]
 debug = 0
 
+# Third-party crates carry no debuginfo. Nobody steps into them, and panic
+# backtraces still resolve file and line for workspace crates, which keep
+# `line-tables-only` above. Added 2026-10-10 alongside `make clean-stale`,
+# when target/debug had regrown to 105G of stale per-variant artifacts.
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test.package."*"]
+debug = 0
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

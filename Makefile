@@ -198,6 +198,19 @@ ci: ## Everything CI runs: format check, lint, tests, doctests, dep audit, black
 clean: ## Remove build artifacts
 	cargo clean
 
+# Cargo never garbage-collects target/: every profile, feature, flag, or
+# toolchain variant leaves another copy of each crate behind. On 2026-10-10
+# that reached 105G in target/debug alone (~165 variants of proxy_filters).
+# `cargo sweep` deletes artifacts by age and for uninstalled toolchains, and
+# leaves target/capture-* qualification reports alone.
+SWEEP_DAYS ?= 14
+.PHONY: clean-stale
+clean-stale: ## Delete build artifacts unused for SWEEP_DAYS days (default 14); needs cargo-sweep
+	@command -v cargo-sweep >/dev/null || { echo "install with: cargo install cargo-sweep --locked"; exit 1; }
+	cargo sweep --time $(SWEEP_DAYS)
+	cargo sweep --installed
+	@du -sh target
+
 # ----------------------------------------------------------------- per crate --
 
 check-%: ## Check one crate, e.g. make check-proxy-config
