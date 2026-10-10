@@ -41,7 +41,7 @@ Follow-up fixes and optional local metadata capture after v0.3.0.
   within a 1 GiB disk limit, plus escaped and maximum-size record cases.
 - Local integrated qualification completed, including CPU/RSS, failure and Disable
   cases, maximum escaped records, and corrected absent-agent reservation draining; see
-  `internal-docs/capacity/2026-10-08-capture-spool-redb-production.md` for evidence
+  the 2026-10-08 redb production qualification (removed; recoverable with `git show 31756dc:<path>`) for evidence
   and explicit limits. This release does not claim 5,000 requests/second,
   100,000 concurrent streams, or completed Envoy parity.
 
