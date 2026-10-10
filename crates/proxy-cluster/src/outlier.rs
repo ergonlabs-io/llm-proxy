@@ -168,8 +168,7 @@ pub struct OutlierDetectionConfig {
     /// (WP-18), independent of its outlier ejection timer. S6 default: true.
     /// Envoy *does* expose this as a configurable field --
     /// `envoy.config.cluster.v3.OutlierDetection.successful_active_health_check_uneject_host`
-    /// (field 23, a `BoolValue` defaulting to true) -- this doc previously
-    /// claimed otherwise; it is modeled here purely so [`OutlierDetector`]
+    /// (field 23, a `BoolValue` defaulting to true). It is modeled here so [`OutlierDetector`]
     /// stays testable without requiring a real
     /// [`crate::health_check::HealthCheckEngine`] wired up (see
     /// [`OutlierDetector::on_active_health_check_pass`]).
@@ -521,10 +520,9 @@ impl OutlierDetector {
     /// [`OutlierDetectionConfig::uneject_on_healthy_active_hc`] says to
     /// (default true). No-op if the host wasn't outlier-ejected.
     ///
-    /// WP-19 scope note: nothing wires this to a real
-    /// [`crate::health_check::HealthCheckEngine`] yet -- that's the same
-    /// kind of follow-up as WP-19b's router integration. Tests in this file
-    /// call it directly.
+    /// Called by [`crate::health_check::HealthCheckEngine`]'s host loop on a
+    /// passing active check when the cluster configures outlier detection.
+    /// Tests in this file also call it directly.
     pub fn on_active_health_check_pass(&self, addr: SocketAddr) {
         if !self.config.uneject_on_healthy_active_hc {
             return;

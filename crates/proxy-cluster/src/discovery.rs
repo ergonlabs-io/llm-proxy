@@ -5,10 +5,9 @@
 //! at config lowering, see `proxy-config/src/lower.rs`). `STRICT_DNS` and
 //! `LOGICAL_DNS` resolve through a [`HostResolver`] and are the only variants
 //! that need re-resolution on a timer. `EDS` clusters have no self-driven
-//! discovery here at all -- their `ClusterConfig.discovery` can't even be
-//! represented in the IR yet (`lower.rs` rejects EDS clusters at proto
-//! conversion, pending WP-20/21 xDS wiring); externally-fed membership is
-//! handled at the [`crate::manager::ClusterManager`] level instead.
+//! discovery here at all; their membership is fed in externally, handled at
+//! the [`crate::manager::ClusterManager`] level (see
+//! `ClusterManager::accept_eds_update`).
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -24,15 +23,14 @@ use crate::{HealthFlags, Host};
 
 /// Envoy's default `dns_refresh_rate` for `STRICT_DNS`/`LOGICAL_DNS`
 /// clusters. TODO(WP-16+): wire `ClusterConfig.dns_refresh_rate` once the IR
-/// carries it; until then every DNS cluster uses this fixed cadence.
+/// carries it. Nothing in the workspace uses this constant yet.
 pub const DEFAULT_DNS_REFRESH_RATE: Duration = Duration::from_secs(5);
 
 /// Envoy's default `initial_fetch_timeout`: how long cluster warming (WP-21)
 /// waits for a cluster's first resolution/EDS response before proceeding
-/// with an empty host set. WP-16 only exposes the constant plus a manual
-/// "mark initialized anyway" escape hatch
-/// ([`crate::manager::ClusterManager::force_initialize`]) -- the real
-/// warming ordering lands with WP-21.
+/// with an empty host set. The caller (`proxy/src/main.rs`) applies it; the
+/// manual "mark initialized anyway" escape hatch is
+/// [`crate::manager::ClusterManager::force_initialize`].
 pub const DEFAULT_INITIAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Resolve `config`'s endpoints into a host set.

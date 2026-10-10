@@ -69,13 +69,17 @@ pub enum Outcome {
     Unavailable,
 }
 
-fn valid_length(kind: Kind, length: usize) -> bool {
-    let maximum = if kind == Kind::Record {
+// Only records may be large; every control message shares the small limit.
+fn max_payload_bytes(kind: Kind) -> usize {
+    if kind == Kind::Record {
         MAX_RECORD_BYTES
     } else {
         MAX_CONTROL_BYTES
-    };
-    length != 0 && length <= maximum
+    }
+}
+
+fn valid_length(kind: Kind, length: usize) -> bool {
+    length != 0 && length <= max_payload_bytes(kind)
 }
 
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
@@ -175,14 +179,7 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_all_kinds_and_exact_limits() {
         for kind in [Kind::Hello, Kind::Welcome, Kind::Record, Kind::Receipt] {
-            for size in [
-                1,
-                if kind == Kind::Record {
-                    MAX_RECORD_BYTES
-                } else {
-                    MAX_CONTROL_BYTES
-                },
-            ] {
+            for size in [1, max_payload_bytes(kind)] {
                 let payload = vec![42; size];
                 let (mut writer, mut reader) = tokio::io::duplex(17);
                 let (sent, received) = tokio::join!(
@@ -272,12 +269,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_writes_emit_no_header() {
         for kind in [Kind::Hello, Kind::Welcome, Kind::Record, Kind::Receipt] {
-            let maximum = if kind == Kind::Record {
-                MAX_RECORD_BYTES
-            } else {
-                MAX_CONTROL_BYTES
-            };
-            for payload in [vec![], vec![0; maximum + 1]] {
+            for payload in [vec![], vec![0; max_payload_bytes(kind) + 1]] {
                 let (mut writer, mut reader) = tokio::io::duplex(16);
                 assert_eq!(
                     write_frame(&mut writer, kind, &payload)

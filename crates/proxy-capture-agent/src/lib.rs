@@ -59,10 +59,10 @@ impl Agent {
                 "socket parent must be a private directory",
             ));
         }
-        // Never unlink an existing endpoint: it may belong to a live collector.
         let (active, recovery) = config.load_keys()?;
         let spool = MetadataSpool::open(config.spool_config(), active, recovery)
             .map_err(io::Error::other)?;
+        // Never unlink an existing endpoint: it may belong to a live collector.
         let listener = UnixListener::bind(&config.socket_path)?;
         if let Err(error) =
             std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))

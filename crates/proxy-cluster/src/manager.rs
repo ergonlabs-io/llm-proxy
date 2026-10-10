@@ -283,11 +283,8 @@ impl ManagedCluster {
                 // it resolves straight through to whichever member actually
                 // served the host (see `ClusterHandle::select_aggregate_member`)
                 // -- so `RoundRobin`/`RawTransportSocket`/`Http1` here are
-                // inert placeholders, never real answers. (This used to add
-                // "exactly like `eds()`'s defaults below"; that constructor
-                // was production-dead and was deleted 2026-09-08, leaving
-                // this arm the only one that builds a `ManagedCluster` it
-                // never resolves.) `initialized` starts `true`: there is
+                // inert placeholders, never real answers. `initialized` starts
+                // `true`: there is
                 // nothing here to resolve, and leaving it `false` would make
                 // WP-21 warming wait forever on a cluster that never runs
                 // discovery -- and, since WP-58, would 503 every request
@@ -556,11 +553,9 @@ impl ClusterManager {
         // (the `store` below hasn't happened), so nothing else can observe
         // these half-resolved `ManagedCluster`s mid-loop. `resolve_cluster`
         // is the same logic `refresh_cluster` runs (it's the extraction of
-        // that method's body -- see its own doc), so an EDS-typed
-        // cluster still isn't resolved here either
-        // (it would return empty and there'd be nothing to carry membership
-        // over from, since this cluster has no EDS delivery yet at
-        // construction time).
+        // that method's body -- see its own doc), so an EDS-typed cluster
+        // still isn't resolved here either (it would return empty, and there
+        // is no membership to carry over at construction time).
         for name in &freshly_built {
             let managed = &next[name];
             if let Err(err) = self.resolve_cluster(managed).await {
@@ -615,10 +610,10 @@ impl ClusterManager {
     /// EDS-sourced clusters, which have no self-driven resolution -- use
     /// [`Self::accept_eds_update`] for those.
     ///
-    /// Production callers re-run this on a timer
-    /// ([`discovery::DEFAULT_DNS_REFRESH_RATE`]) for DNS-discovered
-    /// clusters; tests call it directly to drive discovery deterministically
-    /// instead of waiting on a real timer.
+    /// Intended to be re-run on a timer ([`discovery::DEFAULT_DNS_REFRESH_RATE`])
+    /// for DNS-discovered clusters; no production timer calls it yet. Tests
+    /// call it directly to drive discovery deterministically instead of
+    /// waiting on a real timer.
     ///
     /// WP-59 increment 1: this method's contract is unchanged -- it still
     /// looks the cluster up by name in the CURRENTLY PUBLISHED registry and
@@ -652,12 +647,10 @@ impl ClusterManager {
         //
         // WP-21 increment 1: an EDS cluster's membership arrives through
         // [`ClusterManager::accept_eds_update`], and short-circuiting matters
-        // more sharply here. Production re-runs this on the DNS refresh
-        // timer; `discovery::resolve` returns an EMPTY host set for
-        // `DiscoveryType::Eds`, so falling through would diff the
-        // EDS-delivered membership against nothing and wipe it on the next
-        // tick. Found while adding the IR variant, not by a test -- there was
-        // no EDS delivery path to regress yet.
+        // here. A DNS refresh re-runs this; `discovery::resolve` returns an
+        // EMPTY host set for `DiscoveryType::Eds`, so falling through would
+        // diff the EDS-delivered membership against nothing and wipe it on
+        // the next refresh.
         let config = &managed.config;
         if matches!(config.kind, ClusterKind::Aggregate { .. })
             || config.discovery == DiscoveryType::Eds
@@ -2204,7 +2197,7 @@ mod tests {
     /// that loop. `#[tokio::test(flavor = "multi_thread")]` is required, not
     /// `current_thread`: a single-threaded runtime can't run the spawned
     /// reload and this test's sampling loop concurrently, so it would never
-    /// actually observe the mid-resolution window (CLAUDE.md rule 14).
+    /// actually observe the mid-resolution window (AGENTS.md "Build And Test").
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_slow_dns_cluster_does_not_empty_other_clusters_mid_reload() {
         let resolver = Arc::new(FakeResolver::new());

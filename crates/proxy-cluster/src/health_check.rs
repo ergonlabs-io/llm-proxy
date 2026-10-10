@@ -36,8 +36,7 @@ use crate::outlier::OutlierDetector;
 use crate::{HealthFlags, HealthStatus, Host};
 
 /// Envoy's documented default expected HTTP status for an HTTP health check
-/// with no explicit `expected_statuses` (S-something's health-check
-/// appendix): 200 and nothing else.
+/// with no explicit `expected_statuses`: 200 and nothing else.
 pub const DEFAULT_EXPECTED_HTTP_STATUS: u16 = 200;
 
 /// Envoy's default `no_traffic_interval`: the interval used for a host that
@@ -101,14 +100,6 @@ pub struct HealthCheckConfig {
     /// Uniform random jitter added to `interval` on every scheduling
     /// decision, to avoid every host's checks landing in lockstep.
     pub interval_jitter: Duration,
-}
-
-impl HealthCheckConfig {
-    /// Envoy's own defaults, threshold fields excepted (Envoy requires
-    /// `unhealthy_threshold`/`healthy_threshold` to be set explicitly, so
-    /// there's no single "default" for those -- callers must choose).
-    pub const ENVOY_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-    pub const ENVOY_DEFAULT_INTERVAL: Duration = Duration::from_secs(15);
 }
 
 /// A host's per-check consecutive-count state machine (Envoy's threshold
@@ -223,10 +214,9 @@ impl HealthCheckEngine {
     /// slow upstream doesn't get checked back-to-back).
     ///
     /// The loop runs until `host_set`'s last strong reference is dropped
-    /// (aside from this task's own clone) or the returned handle is aborted;
-    /// there's no separate "host removed" signal today because nothing in
-    /// this crate yet drives membership changes into a live engine (see the
-    /// module doc's IR-wiring note).
+    /// (aside from this task's own clone) or the returned handle is aborted.
+    /// `ManagedCluster::reconcile_probes` aborts the handle of a host that
+    /// leaves membership (see the module doc's IR-wiring note).
     ///
     /// `outlier_detector` is the last WP-19 gap: active HC (this module,
     /// WP-18) and outlier detection (WP-19) are otherwise independent, but a

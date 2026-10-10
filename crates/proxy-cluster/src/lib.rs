@@ -51,12 +51,10 @@ impl From<proxy_config::ir::UpstreamProtocol> for UpstreamProtocol {
     }
 }
 
-/// A host's *derived* health, as a simple two-state view. This is what
-/// [`health_check::HealthCheckEngine`]'s internal consecutive-count tracker
-/// uses (it only ever cares "did active HC just flip me") and what callers
-/// get back from [`HealthFlags::status`]. It is deliberately not the type
-/// stored on [`Host`] any more -- see [`HealthFlags`] for why a host needs
-/// two independent axes, not one enum.
+/// A simple two-state health view. [`health_check::HealthCheckEngine`]'s
+/// internal consecutive-count tracker uses it (it only ever cares "did active
+/// HC just flip me"). It is not the type stored on [`Host`] -- see
+/// [`HealthFlags`] for why a host needs two independent axes, not one enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthStatus {
     #[default]
@@ -71,9 +69,8 @@ pub enum HealthStatus {
 /// active health check (or vice versa), and either one alone is enough to
 /// make the host unusable for new traffic.
 ///
-/// Rust note: this used to be the single two-state `HealthStatus` enum
-/// directly on `Host`. A `struct` of two `bool`s (rather than a 4-variant
-/// enum) is the right shape here because the two axes are genuinely
+/// Rust note: a `struct` of two `bool`s (rather than a 4-variant enum) is the
+/// right shape here because the two axes are genuinely
 /// independent and owned by two different subsystems -- `health_check.rs`
 /// only ever touches `failed_active_hc`, `outlier.rs` only ever touches
 /// `failed_outlier_check`, and neither has to know the other's bit exists.
@@ -94,17 +91,6 @@ impl HealthFlags {
     /// across every flag it tracks.
     pub fn is_healthy(&self) -> bool {
         !self.failed_active_hc && !self.failed_outlier_check
-    }
-
-    /// The derived two-state view some older call sites still want (e.g.
-    /// [`health_check::ConsecutiveTracker`]'s own bookkeeping, which only
-    /// ever sees its own axis and has no use for the finer-grained struct).
-    pub fn status(&self) -> HealthStatus {
-        if self.is_healthy() {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unhealthy
-        }
     }
 }
 
@@ -456,8 +442,8 @@ impl CircuitBreakerState {
 }
 
 impl Default for CircuitBreakerState {
-    /// Used where no cluster config is available yet (e.g. `manager::eds()`,
-    /// which has no `ClusterConfig` to read thresholds from).
+    /// Used where no cluster config is available to read thresholds from
+    /// (test fixtures and similar callers).
     fn default() -> Self {
         Self::from_thresholds(proxy_config::ir::CircuitBreakerThresholds::ENVOY_DEFAULT)
     }
