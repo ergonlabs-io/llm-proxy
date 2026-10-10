@@ -28,7 +28,6 @@ testing/diffrig/captures/
 # repository is worse than none: it looks present locally and is invisible to
 # the people it exists for.
 !SECURITY.md
-!.agents/**/*.md
 !testing/corpus/fixtures/**/SOURCES.md
 # The spec the Go QA suite is written from — reviewable alongside the tests
 # that cite its case IDs.
@@ -56,3 +55,7 @@ admin-ui/dist/
 # as untracked noise in `git status`, and it reappears as soon as the next
 # session starts, so ignoring it beats repeatedly deleting it.
 .playwright-mcp/
+
+# Local agent tooling (agent definitions, skills, Claude Code settings).
+/.agents/
+/.claude/

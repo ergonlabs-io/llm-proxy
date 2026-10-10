@@ -189,7 +189,7 @@ need to know how the proxy works stay in `testing/diffrig`'s `mock_e2e`.
 ## How cases get here
 
 Scenarios come from the repo owner, and the `qa-analyst` agent
-(`.agents/agents/qa-analyst.md`) proposes candidates by mining milestone ship
+(`.agents/agents/qa-analyst.md`, local and not versioned) proposes candidates by mining milestone ship
 gates, commit messages, and the build board. **Every proposal is reviewed and
 approved by the owner before any test is written.** Nothing gets implemented
 off the agent's judgment alone.

@@ -146,9 +146,10 @@ global, so an agent that runs the binary is as disruptive as a test suite.
 ## Delegation
 
 Agent definitions live in `.agents/agents/` and skills in `.agents/skills/`.
-`.claude/agents` and `.claude/skills` are symlinks to them so Claude Code still
-discovers them; edit the files under `.agents/`. Use the `test-audit` skill
-whenever writing, changing, reviewing, or sweeping tests.
+Both are local and git-ignored, as is `.claude/`. On a machine that has them,
+`.claude/agents` and `.claude/skills` are symlinks to the `.agents/`
+directories so Claude Code discovers them. Use the `test-audit` skill whenever
+writing, changing, reviewing, or sweeping tests.
 
 - The orchestrator owns architecture, IR shape, Envoy semantics, tricky
   debugging, and final review.
