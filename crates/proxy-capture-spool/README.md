@@ -38,7 +38,7 @@ backend deduplication requires stable event IDs outside this library.
 
 The production format is application version 3, with `LMREDB03` encrypted
 envelopes in `capture.redb`. It is distinct from the v1 segmented format, the
-unimplemented v2 proposal, and the redb evaluation prototype. There is no legacy
+unimplemented v2 proposal, and the retired redb evaluation prototype. There is no legacy
 reader, automatic migration, downgrade, or automatic removal of old directories.
 Use a fresh spool directory. Existing empty/partial databases fail closed unless
 complete authenticated initialization survived. Unknown formats are rejected.
@@ -99,8 +99,7 @@ Process-crash tests do not establish power-loss, network-filesystem, volume-loss
 replication, or adversarial rollback guarantees.
 
 Use `make tq-proxy-capture-spool` for production redb behavior, faults, abrupt
-termination, and the isolated prototype/reference suites. The old v1 implementation
-and unit tests remain test/example-only comparison evidence; the production
-library does not link them. New throughput and integrated qualification must use
+termination. The v1-versus-redb comparison experiment was retired after redb
+was chosen; it is recoverable from git history at commit b74f604. New throughput and integrated qualification must use
 freshly built production redb binaries. See
 [the selected design](../../internal-docs/capture-spool-redb-design.md).

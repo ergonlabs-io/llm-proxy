@@ -78,11 +78,11 @@ def main():
         "binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "helpers_sha256": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                           for name in ("capture-qualification.py", "redb-retention.py", "spool-comparison.py")},
+                           for name in ("capture-qualification.py", "redb-retention.py")},
         "rounds": args.rounds, "peers": 8, "record_bytes": 524288,
         "memory_cap_bytes": 268435456, "disk_cap_bytes": 1073741824})
     (output / "qualification-script.py").write_bytes(Path(__file__).read_bytes())
-    for name in ("capture-qualification.py", "redb-retention.py", "spool-comparison.py"):
+    for name in ("capture-qualification.py", "redb-retention.py"):
         (output / name).write_bytes(Path(__file__).with_name(name).read_bytes())
     (output / "source.diff").write_bytes(subprocess.check_output(
         ["git", "diff", "HEAD", "--", "crates", "Cargo.toml", "Cargo.lock"], cwd=QUAL.ROOT))

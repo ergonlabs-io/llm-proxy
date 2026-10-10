@@ -7,7 +7,6 @@ key for later inspection. No record is acknowledged or evicted.
 """
 import argparse
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -23,10 +22,33 @@ MAX_RECORD_BYTES = 512 * 1024
 MAX_DISK_BYTES = 1024 * 1024 * 1024
 MAX_RSS_BYTES = 256 * 1024 * 1024
 BIN = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve() / "release/examples/redb_retention"
-PREVIOUS_EXPERIMENT = ROOT / "scripts/spool-comparison.py"
-SPEC = importlib.util.spec_from_file_location("previous_spool_comparison", PREVIOUS_EXPERIMENT)
-PREVIOUS = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(PREVIOUS)
+
+
+def fixture(escaped=False):
+    field = ('"\\\n' * 170)[:510] if escaped else "model-a"
+    usage = {"input_tokens": 100, "cache_read_tokens": 0, "cache_write_tokens": 0,
+             "output_tokens": 25, "completeness": "complete", "provenance": "upstream"}
+    cost = {"amount": 1500, "unit": "nanodollar", "currency": "USD",
+            "rate_card_version": "example-v1", "kind": "list"}
+    attempt = {"schema_version": 1, "event_id": "seed:attempt:terminal", "request_id": "seed",
+               "attempt_id": "seed:attempt", "attempt_index": 0, "trace_id": None,
+               "span_id": None, "parent_span_id": None, "cluster": "provider-a", "provider": "example",
+               "upstream_model": field, "started_at": "2026-10-08T12:00:00Z",
+               "finished_at": "2026-10-08T12:00:01Z", "duration_ms": 1000, "status": 200,
+               "termination": "complete", "retry_reason": None, "bytes_request": 100,
+               "bytes_response": 500, "usage": usage, "cost": cost}
+    attempts = [dict(attempt, attempt_index=n) for n in range(8 if escaped else 1)]
+    return {"schema_version": 1, "event_id": "seed:terminal", "request_id": "seed",
+            "instance_id": "comparison-instance", "started_at": "2026-10-08T12:00:00Z",
+            "finished_at": "2026-10-08T12:00:01Z", "tenant_id": "default", "user_id": None,
+            "key_id": None, "trace_id": None, "routing_revision": "example-routing-v1",
+            "policy_generation": 1, "capture_policy_version": "example-capture-v1",
+            "method": "POST", "route": "/v1/chat/completions", "requested_model": field,
+            "selected_cluster": "provider-a", "selected_provider": "example", "selected_model": field,
+            "status": 200, "termination": "complete", "error_category": None, "response_flags": [],
+            "duration_ms": 1000, "time_to_first_byte_ms": 250, "bytes_request": 100,
+            "bytes_response": 500, "usage": usage, "cost": cost, "attempt_count": len(attempts),
+            "physical_attempt_count": len(attempts), "attempts": attempts, "attempts_truncated": False}
 
 
 def write_json(path, value):
@@ -53,7 +75,7 @@ def qualified_fixture(value, index):
 def maximum_record_fixture():
     # Saturate valid bounded strings across all 64 retained attempts. A single
     # oversized route would exercise opaque storage but fail agent validation.
-    value = PREVIOUS.fixture(escaped=True)
+    value = fixture(escaped=True)
     template = value["attempts"][0]
     value["attempts"] = [dict(template, attempt_index=n) for n in range(64)]
     value["attempt_count"] = value["physical_attempt_count"] = 64
@@ -127,7 +149,6 @@ def source_snapshot(output):
         "crates/proxy-capture-spool/examples/redb_retention.rs",
         "scripts/redb-retention.py",
         "scripts/test_redb_retention.py",
-        "scripts/spool-comparison.py",
     ]
     hashes = {}
     for name in tracked:
@@ -262,8 +283,8 @@ def main():
     regular = fixtures / "regular.json"
     escaped = fixtures / "escaped.json"
     maximum = fixtures / "maximum-record.json"
-    write_json(regular, PREVIOUS.fixture())
-    write_json(escaped, PREVIOUS.fixture(escaped=True))
+    write_json(regular, fixture())
+    write_json(escaped, fixture(escaped=True))
     write_json(maximum, maximum_record_fixture())
     changed, source_hashes, status = source_snapshot(output)
     binary_hash = hashlib.sha256(BIN.read_bytes()).hexdigest()

@@ -43,14 +43,6 @@ capture-agent-qualify: capture-qualification-build ## Qualify eight concurrent m
 capture-qualification-check: ## Check qualification reporting without starting test servers
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_capture_qualification.py
 
-.PHONY: spool-comparison-build
-spool-comparison-build: ## Build isolated v1 reference/redb prototype storage experiment
-	cargo build --release -p proxy-capture-spool --example spool_comparison
-
-.PHONY: spool-comparison-check
-spool-comparison-check: ## Check storage experiment reporting without workloads
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_spool_comparison.py
-
 .PHONY: redb-retention-build
 redb-retention-build: ## Build production encrypted redb retention qualification
 	cargo build --release -p proxy-capture-spool --example redb_retention
