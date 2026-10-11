@@ -929,3 +929,114 @@ async fn operator_credential_on_a_different_header_than_the_slot_is_removed() {
             .await;
     }
 }
+
+/// Aggregate [A, B]. A holds the tenant's OpenAI key and answers 503, so the
+/// router falls back to B, which holds the tenant's Anthropic key. Each
+/// upstream must see only the credential of the member it dialled. A's
+/// operator key and B's operator key must reach neither upstream, and the
+/// fallback must not carry A's tenant key.
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_credentials_are_isolated_across_failover() {
+    // The recorder lowercases every request, so the needles are lowercase.
+    const OPERATOR_KEYS: [&str; 2] = ["operator-key-a", "operator-key-b"];
+    LocalSet::new()
+        .run_until(async {
+            let (a_addr, a_seen) = spawn_upstream(503).await;
+            let (b_addr, b_seen) = spawn_upstream(200).await;
+            let mut a = member(
+                "a",
+                a_addr,
+                "authorization",
+                Some(("openai", "authorization", "Bearer ")),
+            );
+            a.request_headers_to_add[0].value = "Bearer operator-key-A".to_string();
+            // B's operator key sits on a different header than its slot, so
+            // only the removal step keeps it off the wire.
+            let mut b = member(
+                "b",
+                b_addr,
+                "authorization",
+                Some(("anthropic", "x-api-key", "")),
+            );
+            b.request_headers_to_add[0].value = "Bearer operator-key-B".to_string();
+            let mut fixture = build(
+                vec![a, b, aggregate(&["a", "b"])],
+                "providers",
+                Some(tenant_set(vec![
+                    ("openai", Some("tenant-key-A")),
+                    ("anthropic", Some("tenant-key-B")),
+                ])),
+                Some("5xx"),
+            )
+            .await;
+            let (status, _) = send(&fixture, false).await;
+            assert_eq!(status, StatusCode::OK);
+
+            // One 503 from A, then one success from B.
+            let a_got = requests(&a_seen);
+            let b_got = requests(&b_seen);
+            assert_eq!(a_got.len(), 1, "A dialled exactly once: {a_got:?}");
+            assert_eq!(b_got.len(), 1, "B dialled exactly once: {b_got:?}");
+
+            // A carries its own tenant key and nothing from either operator
+            // or from B's tenant key.
+            assert!(
+                a_got[0].contains("authorization: bearer tenant-key-a"),
+                "A must carry its tenant key: {:?}",
+                a_got[0]
+            );
+            for needle in OPERATOR_KEYS.iter().chain(["tenant-key-b"].iter()) {
+                assert!(
+                    !a_got[0].contains(needle),
+                    "{needle} must not reach A: {:?}",
+                    a_got[0]
+                );
+            }
+
+            // B carries its own tenant key on x-api-key, no authorization
+            // header at all, and nothing from either operator or from A's
+            // tenant key.
+            assert!(
+                b_got[0].contains("x-api-key: tenant-key-b"),
+                "B must carry its tenant key: {:?}",
+                b_got[0]
+            );
+            assert!(
+                !b_got[0].contains("\r\nauthorization:"),
+                "B must not carry any authorization header (its operator key sits there): {:?}",
+                b_got[0]
+            );
+            for needle in OPERATOR_KEYS.iter().chain(["tenant-key-a"].iter()) {
+                assert!(
+                    !b_got[0].contains(needle),
+                    "{needle} must not reach B: {:?}",
+                    b_got[0]
+                );
+            }
+
+            // Each member applied its own provider's tenant credential once,
+            // and nothing else was counted.
+            let applied = instruments::TENANT_CREDENTIAL_APPLIED;
+            for provider in CREDENTIAL_PROVIDERS {
+                for outcome in CREDENTIAL_OUTCOMES {
+                    let want = u64::from(
+                        outcome == applied && (provider == "openai" || provider == "anthropic"),
+                    );
+                    assert_eq!(
+                        credential_requests(&fixture.registry, provider, outcome),
+                        want,
+                        "tenant_credential_requests({provider}, {outcome})"
+                    );
+                }
+            }
+
+            let record = only_record(&mut fixture);
+            assert_eq!(record.selected_cluster.as_deref(), Some("b"));
+            assert_eq!(record.physical_attempt_count, 2);
+            assert_eq!(record.credential_source, Some(CredentialSource::Tenant));
+            let last = record.attempts.last().expect("at least one attempt");
+            assert_eq!(last.cluster.as_deref(), Some("b"));
+            assert_eq!(last.credential_source, Some(CredentialSource::Tenant));
+        })
+        .await;
+}
