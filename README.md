@@ -445,7 +445,8 @@ examples/                 runnable configurations
 schema/                   llmproxy-v0.schema.json — normative for the dialect
 testing/                  diffrig, loadgen, mockupstream, controlplane,
                           xds-conformance, Go QA suite
-internal-docs/            implementation plan, milestones, ADRs, capacity
+internal-docs/            architecture, Envoy semantics and divergences,
+                          milestones, ADRs, capacity
 ```
 
 ## Documentation

@@ -93,12 +93,12 @@ routes:
 # did nothing would be worse. Check stderr on startup, or run `--mode validate`.
 # ---------------------------------------------------------------------------
 
-# Model catalogue (WP-49 increment 1). A client that asks for `fast` is routed
+# Model catalogue. A client that asks for `fast` is routed
 # to `providers[0]` — the name below matches against the body's model field like
-# any other route. Two parts are not active yet, and each warns with its path:
-# entries after the first (there is no preference order until WP-35), and
-# model-name rewriting (the client's `fast` is forwarded to the provider
-# unchanged instead of becoming `gpt-4o-mini`).
+# any other route. Later entries are a preference order: each retry moves to the
+# next provider, and all entries must speak the same dialect. Model-name
+# rewriting is not active yet and warns with its path (the client's `fast` is
+# forwarded to the provider unchanged instead of becoming `gpt-4o-mini`).
 models:
   # A stable client-facing name, so callers do not chase provider model IDs.
   fast:
@@ -107,11 +107,11 @@ models:
   reasoning:
     providers: [openai/o3-mini]
 
-  # Second and later entries warn today; they become a real preference order
-  # with WP-35.
+  # Tried in order: xAI is dialled only after OpenAI fails. Both speak the
+  # OpenAI dialect; an `anthropic` entry here would be a load error.
   balanced:
     providers:
-      - anthropic/claude-sonnet-4-5-20250929
+      - openai/gpt-4o
       - xai/grok-2-latest
 
 limits:

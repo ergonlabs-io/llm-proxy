@@ -30,7 +30,7 @@
       "examples": ["127.0.0.1:9901"]
     },
     "auth": {
-      "description": "Downstream authentication (WP-50): verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is the opposite axis and defaults OPEN: an authenticated tenant with no configured policy may use every model and provider. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
+      "description": "Downstream authentication: verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is the opposite axis and defaults OPEN: an authenticated tenant with no configured policy may use every model and provider. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
       "$ref": "#/$defs/Auth"
     },
     "providers": {
@@ -43,7 +43,7 @@
       }
     },
     "models": {
-      "description": "Logical model catalogue (WP-49): a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. WP-49 increment 1 is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a load-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) lands with WP-35.",
+      "description": "Logical model catalogue: a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. Today this is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a load-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) is not supported yet.",
       "default": {},
       "type": "object",
       "patternProperties": {
@@ -68,7 +68,7 @@
       "items": { "$ref": "#/$defs/Route" }
     },
     "limits": {
-      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a load-time warning naming the exact field. NOTE: limits are enforced PER PROXY INSTANCE in v0, and a fleet-wide token rate limit has no store to be enforced against. Do not read the shared `ControlPlaneStore` (WP-60..62) as covering this: it reconciles CURRENCY SPEND for the Envoy-mode `llmproxy.spend_limit` filter, holds no token-rate-limit counters, and is not reachable from this dialect at all. Two replicas each admit up to `tokens_per_minute`.",
+      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a load-time warning naming the exact field. NOTE: limits are enforced PER PROXY INSTANCE in v0, and a fleet-wide token rate limit has no store to be enforced against. Do not read the shared `ControlPlaneStore` as covering this: it reconciles CURRENCY SPEND for the Envoy-mode `llmproxy.spend_limit` filter, holds no token-rate-limit counters, and is not reachable from this dialect at all. Two replicas each admit up to `tokens_per_minute`.",
       "type": "array",
       "items": { "$ref": "#/$defs/Limit" }
     },
@@ -144,7 +144,7 @@
         },
         "hmac_secret_file": {
           "type": "string",
-          "description": "Read the HMAC secret from this file (trailing whitespace trimmed; read once at startup -- hot reload lands with WP-35)."
+          "description": "Read the HMAC secret from this file (trailing whitespace trimmed; read once at startup -- hot reload is not supported yet)."
         },
         "keys": {
           "type": "array",
@@ -221,7 +221,7 @@
         },
         "api_key_file": {
           "type": "string",
-          "description": "Read the API key from this file (trailing whitespace trimmed; read once at startup -- hot reload lands with WP-35). Preferred over `api_key` for secret managers that mount files."
+          "description": "Read the API key from this file (trailing whitespace trimmed; read once at startup -- hot reload is not supported yet). Preferred over `api_key` for secret managers that mount files."
         },
         "project": {
           "type": "string",
@@ -445,14 +445,14 @@
     },
     "ModelDef": {
       "type": "object",
-      "description": "One logical model and the providers able to serve it (WP-49).",
+      "description": "One logical model and the providers able to serve it.",
       "additionalProperties": false,
       "required": ["providers"],
       "properties": {
         "providers": {
           "type": "array",
           "minItems": 1,
-          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. WP-49 increment 1: only `providers[0]` is used to serve traffic today -- every later entry is validated at load time (a bad one still fails to load) but produces a load-time warning naming its exact path instead of being selected; choosing among them lands with WP-35.",
+          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. Only `providers[0]` is used to serve traffic today -- every later entry is validated at load time (a bad one still fails to load) but produces a load-time warning naming its exact path instead of being selected; choosing among them is not supported yet.",
           "items": {
             "oneOf": [
               { "$ref": "#/$defs/ProviderModelRef" },
@@ -476,7 +476,7 @@
         },
         "model": {
           "type": "string",
-          "description": "Upstream model ID at this provider, if different from the model's own catalogue name (e.g. Anthropic's dated model IDs, or a Vertex publisher-model path). Recorded; substituting it into the request body needs the request-body rewriter (WP-35), so this produces a load-time warning until then and the client's original model name is forwarded as-is.",
+          "description": "Upstream model ID at this provider, if different from the model's own catalogue name (e.g. Anthropic's dated model IDs, or a Vertex publisher-model path). Recorded; substituting it into the request body needs a request-body rewriter, which is not supported yet, so this produces a load-time warning until then and the client's original model name is forwarded as-is.",
           "examples": ["claude-sonnet-4-5-20250929", "moonshotai/Kimi-K2-Instruct"]
         },
         "dialect": {
@@ -549,7 +549,7 @@
         "concurrent_sessions": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session. Not enforced yet (lands with session limits, WP-37); recorded, and produces a not-enforced warning.",
+          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session. Not enforced yet; recorded, and produces a not-enforced warning.",
           "examples": [10]
         },
         "models": {
@@ -617,7 +617,7 @@
         },
         "tracing": {
           "type": "object",
-          "description": "OTLP trace export (WP-51 increment 3): config surface only -- nothing exports a span yet. Omit entirely to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.",
+          "description": "OTLP trace export: config surface only -- nothing exports a span yet. Omit entirely to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.",
           "additionalProperties": false,
           "required": ["otlp_endpoint"],
           "properties": {

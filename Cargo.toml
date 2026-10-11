@@ -52,7 +52,7 @@ hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
-# Config / protos (WP-02/WP-03)
+# Config / protos
 prost = "0.13"
 prost-types = "0.13"
 prost-reflect = { version = "0.14", features = ["serde"] }
@@ -63,7 +63,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 serde_path_to_error = "0.1"
 
-# TLS (WP-08)
+# TLS
 # Rust note: `ring` (not `aws-lc-rs`) is the crypto provider so builds don't
 # need a cmake/NASM toolchain; `logging` wires rustls into the `log` facade.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -80,14 +80,14 @@ x509-parser = "0.16"
 # pure Rust, no cmake, matching the rest of the TLS stack's toolchain choice.
 tls-parser = "0.12"
 
-# WP-50 downstream auth: HMAC-SHA256 for virtual-key verification and
+# Downstream auth: HMAC-SHA256 for virtual-key verification and
 # `constant_time::verify_slices_are_equal` for the comparison. Already compiled
 # in the tree as rustls's crypto provider, so this is a direct dependency on
 # something that was being built anyway -- and it keeps the same "no cmake/NASM
 # toolchain" property the rustls feature choice above was made for.
 ring = "0.17"
-# WP-50 increment 2a-iv (`llm-proxy --mode keygen`): base64url encoding of the
-# generated virtual key. Already compiled into the tree as a transitive
+# base64url encoding of the generated virtual key
+# (`llm-proxy --mode keygen`). Already compiled into the tree as a transitive
 # dependency (rcgen, tonic-build, ...), so this promotes an existing build
 # artifact to a direct dependency instead of adding new build cost.
 base64 = "0.22"
@@ -107,21 +107,21 @@ socket2 = "0.5"
 # proper multi-thread-friendly recording (`Recorder`/`SyncHistogram`) instead
 # of a hand-rolled percentile calculation.
 hdrhistogram = "7"
-# Access-log `%START_TIME(fmt)%` strftime rendering (WP-24).
+# Access-log `%START_TIME(fmt)%` strftime rendering.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 # Load-generator benchmarking (testing/loadgen): safe `getrlimit` wrapper so
 # the driver can log its own fd budget without an `unsafe` FFI call in our
 # code -- see `rig.rs`.
 rlimit = "0.10"
 
-# WP-50 increment 3b: the embedded, persistent-by-default `ControlPlaneStore`
+# The embedded, persistent-by-default `ControlPlaneStore`
 # (tenants/keys/policies) -- pure-Rust, ACID, single-file, no C toolchain
 # (unlike SQLite), matching the "hermetic build" property `rustls`/`ring`
-# were chosen for above. See internal-docs/IMPLEMENTATION_PLAN.md's
-# "redb data model" section.
+# were chosen for above. See ADR-0005 and ADR-0006 for the store's role
+# and data model.
 redb = "4.2"
 
-# WP-62: the Redis-backed `ControlPlaneStore` -- tier-2 identity/policy plus
+# The Redis-backed `ControlPlaneStore` -- tier-2 identity/policy plus
 # tier-3 spend counters, shared across replicas instead of embedded per
 # process (ADR-0006). **Sync connections only, no `tokio-comp`/`aio`
 # feature.** The trait this implements is synchronous by design, and

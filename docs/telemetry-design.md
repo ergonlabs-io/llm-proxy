@@ -18,7 +18,7 @@ The primary forwarding function must continue during telemetry outages. Capture 
 
 ## 2. Current implementation and integration points
 
-Inspect these paths before editing; comments describing older increments can be stale, so verify callers:
+Inspect these paths before editing; comments describing older behavior can be stale, so verify callers:
 
 - `crates/proxy-observability/src/stats.rs`: in-memory counters, gauges, and histograms.
 - `crates/proxy-admin/src/server.rs`: `/stats` and `/stats/prometheus` rendering and administrative spend APIs.
@@ -32,7 +32,7 @@ Inspect these paths before editing; comments describing older increments can be 
 - `crates/proxy-filters/src/control.rs` and `spend/recovery.rs`: control-plane state, durable aggregate spend, and recovery checkpoints. The control store deliberately excludes request history.
 - `crates/proxy-config/src/ir.rs`: configuration boundary. Other crates must consume IR, not generated Envoy configuration protos.
 
-Read Part 0, WP-23/24, WP-51, WP-54/55, relevant pricing work, and applicable S1–S10 appendices in `internal-docs/IMPLEMENTATION_PLAN.md` before implementation. Existing Envoy metrics and access-log formatting are compatibility surfaces.
+Read `AGENTS.md`, the pricing design brief, and the applicable S1–S10 sections of `internal-docs/envoy-semantics.md` before implementation. Existing Envoy metrics and access-log formatting are compatibility surfaces.
 
 ## 3. Scale assumptions and budgets
 
@@ -106,6 +106,7 @@ Resource attributes include service name/version, instance identity, environment
 - Separate metric and span scheduling/deadlines so a slow trace RPC cannot indefinitely delay metric snapshots.
 - Export metrics cumulatively using the current registry contract. An unsuccessful snapshot can be superseded by a later snapshot; interval histograms must not be cleared on failed export.
 - Span queues and batches are bounded. Export retries, if added, have bounded duration/bytes and explicit loss counters. No disk spool is required inside the proxy for operational signals.
+- Shutdown order matters. Take the final metric snapshot only after the drain has finished and the trace exporter has flushed its last batch (bounded by a budget), so the snapshot includes drain-period traffic plus the exporter's own failure and drop counts. Taking it before the drain loses drain-period traffic and adds up to one export deadline to every shutdown. Each wait is bounded, so an unreachable collector cannot hang exit; a missing final snapshot is logged and does not change the exit code.
 - Durable historical retention belongs to the operational collector/backends. This proposal does not persist the live registry across restarts.
 
 ### 5.4 Traces and service logs
@@ -315,33 +316,33 @@ On graceful shutdown stop new admissions, let forwarding drain under existing ru
 
 The agent seals and durability-commits pending segments within its own shutdown deadline. Remote upload can resume after restart. A proxy's graceful queue drain only proves delivery to the agent at the acknowledgement level actually received; do not imply durable storage from socket send success.
 
-## 14. Implementation increments and acceptance
+## 14. Implementation stages and acceptance
 
-### Increment 1: contracts and operational independence
+### Stage 1: contracts and operational independence
 
 Scope: IR/config semantics, instrument catalog, independent metric export, bounded operational trace scheduling and counters. No body capture.
 
 Acceptance: metrics export with traces disabled; scrape without OTLP; slow/failing trace export does not starve metrics; registry restart semantics documented; existing Envoy conformance remains green; strict unknown-field rejection.
 
-### Increment 2: asynchronous request records
+### Stage 2: asynchronous request records
 
 Scope: owned bounded record types, logical/attempt lifecycle events, authenticated identity wiring, independent metadata queue, asynchronous legacy sink option, local capture transport, metadata agent spool, batched index adapter.
 
 Acceptance: terminal record exactly once in-process on success/local rejection/disconnect/error; replay deduplicates visible records; fallback attribution uses actual provider; absent usage remains null; overload causes no awaited worker work; secret headers excluded; cross-tenant/user queries rejected. Complete metadata-only end-to-end delivery before adding bodies.
 
-### Increment 3: bounded text transcripts
+### Stage 3: bounded text transcripts
 
 Scope: explicit directional tee points, byte accounting, sequence/end events, content spool, compression, objects/manifests, retrieval and reconciliation.
 
 Acceptance: arbitrary chunk boundaries, transforms, SSE, partial disconnects, and failed attempts preserved correctly; content-disabled path has no body retention; large backing allocations remain bounded; missing middle/tail chunks never appear complete; object commit precedes availability; crashes at each commit boundary replay safely.
 
-### Increment 4: multimodal and retention
+### Stage 4: multimodal and retention
 
 Scope: multipart/base64 extraction, media policies, scoped object grouping, deletion/compaction, optional separately authorized URL fetch service.
 
 Acceptance: bounded malformed input handling; policy-respecting raw/normalized representations; media skipping explicit; shared objects cannot bypass user scope; deletion removes access immediately and physical data within the promised window.
 
-### Increment 5: scale and failure qualification
+### Stage 5: scale and failure qualification
 
 Scope: sustained traffic, long streams, resource isolation, controlled crashes/outages, and operational runbook.
 
@@ -369,6 +370,6 @@ Begin with the smallest relevant call site and nearby integration test. Preserve
 
 Suggested ownership: reuse `proxy-observability` for operational signals; keep end-user event/policy contracts in a narrowly scoped capture module or crate; keep transport/storage/recovery in a separate agent binary/library; keep tenant query service outside the forwarding runtime. Exact crate names are implementation decisions, not an instruction to create all crates immediately.
 
-Before coding each increment, provide: explicit touched file list, IR/API changes, resource budgets, delivery contract, migration impact, and validation command. After completing it, report changed files, measured validation, remaining limitations, and unrelated failures. Do not claim the increment complete while its integration path or failure behavior is untested.
+Before coding each stage, provide: explicit touched file list, IR/API changes, resource budgets, delivery contract, migration impact, and validation command. After completing it, report changed files, measured validation, remaining limitations, and unrelated failures. Do not claim the stage complete while its integration path or failure behavior is untested.
 
-First implementation task: deliver Increment 1 and reviewable schema/interface definitions for Increment 2. Establish independent metrics export and bounded operational behavior before enabling customer content capture. Subsequent increments must preserve the two-domain separation throughout configuration, queues, runtime scheduling, storage, access, and failure handling.
+First implementation task: deliver Stage 1 and reviewable schema/interface definitions for Stage 2. Establish independent metrics export and bounded operational behavior before enabling customer content capture. Subsequent stages must preserve the two-domain separation throughout configuration, queues, runtime scheduling, storage, access, and failure handling.

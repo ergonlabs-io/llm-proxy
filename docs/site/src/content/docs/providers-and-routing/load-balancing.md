@@ -46,9 +46,8 @@ for a raw bootstrap configuration's `lb_policy` field and for the equivalent che
 `proxy-cluster` runs at cluster-build time
 (`crates/proxy-config/src/lower.rs`'s `convert_cluster`;
 `ring_hash_is_rejected_at_build_time` and `maglev_is_rejected_at_build_time`
-in `crates/proxy-cluster/src/load_balancer.rs`). Ground rule #1 in this
-project's engineering notes forbids silently substituting one policy for
-another, so a config asking for session affinity that cannot be honored
+in `crates/proxy-cluster/src/load_balancer.rs`). The project's strict-config rule forbids silently substituting one
+policy for another, so a config asking for session affinity that cannot be honored
 fails loudly instead of serving traffic under a policy that quietly breaks
 that affinity.
 

@@ -7,7 +7,7 @@ version: 0
 listen: 0.0.0.0:8080
 admin: 127.0.0.1:9901
 
-# Downstream authentication (WP-50). Fails closed: with this block present, a
+# Downstream authentication. Fails closed: with this block present, a
 # request with no recognized key gets a 401, never admitted anonymously.
 # Uncomment to require one of the listed virtual keys on every request.
 # (hmac_secret_file here, not hmac_secret + env-var interpolation, so this

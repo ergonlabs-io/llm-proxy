@@ -43,7 +43,7 @@ per-tenant model allow-list and spend ceiling, not empty placeholder fields
 fields). Both default open: an unconfigured tenant may use every model and
 has no spend ceiling (`crates/proxy-filters/src/model_authz.rs:106-108`,
 `ModelAccess::default`; `crates/proxy-filters/src/auth.rs:233-249`, the
-`budget` field's doc on why `None` means unlimited). Two more Lane-H filters
+`budget` field's doc on why `None` means unlimited). Two more `llmproxy.*` filters
 enforce these policies, `llmproxy.model_authz` and `llmproxy.spend_limit`
 (`crates/proxy-filters/src/model_authz_filter.rs`,
 `crates/proxy-filters/src/spend_limit_filter.rs`), and an operator sets a
@@ -220,7 +220,7 @@ http_filters:
       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 ```
 
-Place `llmproxy.auth` before any other Lane-H filter in `http_filters` — see
+Place `llmproxy.auth` before any other `llmproxy.*` filter in `http_filters` — see
 "The token limiter keys on the identity the proxy assigned" above for why
 order is load-bearing, not stylistic.
 

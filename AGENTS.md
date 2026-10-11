@@ -48,6 +48,10 @@ citations when you rename one.
    usage-filter dialect. Cluster headers are applied after route transforms, so
    the selected provider wins on collisions. Assume another instance exists:
    audit anything per-provider that sits on a `RouteEntry`.
+   Test failover by asserting the negative: the fallback request must carry the
+   fallback provider's credentials and must not carry the primary's, since
+   asserting only that the right key is present also passes when both are sent
+   (`router_aggregate.rs::credential_isolation_across_failover`).
 7. Reject cross-dialect fallback chains rather than guessing how to parse them.
 8. Shared interfaces are frozen early: the IR in `ir.rs`, the filter traits,
    and other cross-crate trait signatures. Do not change them unilaterally in
@@ -148,6 +152,10 @@ integration or local-server test (for example `local_openai_smoke.rs`, which is
 `#[ignore]`d behind a local Ollama). A tolerant upstream that serves several
 protocols can hide a wrong-dialect route; prove a routing hypothesis by changing
 only the routing input.
+
+A test that fabricates a condition production never reaches proves nothing and
+makes an unreachable path look covered. When a test exists, check whether it
+drives the condition through the real path or constructs the result by hand.
 
 ## Running The Product
 

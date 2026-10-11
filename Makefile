@@ -178,8 +178,9 @@ lint: ## Clippy with warnings denied (what CI enforces)
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: ci
-ci: ## Everything CI runs: format check, lint, tests, doctests, dep audit, black-box QA
+ci: ## Everything CI runs: format check, lint, citations, tests, doctests, dep audit, black-box QA
 	cargo fmt --all --check
+	@$(MAKE) citations-check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo nextest run --workspace
 	@$(MAKE) tq-doc
@@ -360,6 +361,10 @@ docs-build: ## Production build of the docs site to docs/site/dist/
 .PHONY: deps-check
 deps-check: ## Fail if any crate declares a dependency nothing references
 	python3 scripts/check-deps.py
+
+.PHONY: citations-check
+citations-check: ## Fail if code or user docs cite work packages or planning docs (AGENTS.md "Comments")
+	python3 scripts/check-citations.py
 
 .PHONY: deps-list
 deps-list: ## Same, but also print the allowlisted suppressions and their reasons

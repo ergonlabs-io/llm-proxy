@@ -13,9 +13,9 @@ testing/diffrig/captures/
 #
 # The planning docs were local-only until 2026-08-01. That stopped being
 # tenable once the code started citing them — `git grep` counts ADR-0004 55
-# times, ADR-0003 34, internal-docs/IMPLEMENTATION_PLAN.md 30, internal-docs/envoy-divergences.md 13.
+# times, ADR-0003 34, internal-docs/envoy-divergences.md 13.
 # A `// see ADR-0004` comment pointing at a file nobody else has is worse than
-# no comment. They also had no backup: WP-45's design existed in exactly one
+# no comment. They also had no backup: one design doc existed in exactly one
 # place, on one laptop, which is the same failure mode as AGENTS.md "Delegation"
 # with a different cause.
 *.md
