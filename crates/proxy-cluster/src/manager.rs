@@ -813,6 +813,9 @@ impl ClusterHandle {
     /// [`HostPicker`] for a host from its own host set. The first member
     /// that yields a host wins.
     ///
+    /// When `ctx.credential_providers` is set (tenant mode), members without a
+    /// tenant credential slot for one of those providers are skipped too.
+    ///
     /// A member that is itself an aggregate is never followed. Nested
     /// aggregates are deliberately unsupported, and
     /// refusing to recurse makes a member cycle structurally impossible
@@ -855,6 +858,21 @@ impl ClusterHandle {
                      supported yet, skipping"
                 );
                 continue;
+            }
+            // Tenant mode (ADR-0007): a member is eligible only when it
+            // carries a tenant credential slot for a provider the tenant
+            // holds. Checked before the host pick so an ineligible member is
+            // never dialled and the next member is tried instead.
+            if let Some(providers) = &ctx.credential_providers {
+                let eligible = member
+                    .config
+                    .provider_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.tenant_credential.as_ref())
+                    .is_some_and(|slot| providers.contains(&slot.provider));
+                if !eligible {
+                    continue;
+                }
             }
             let host_set = member.host_set.load();
             if let Some(host) = member.host_picker.pick(&host_set, ctx) {
@@ -1578,6 +1596,74 @@ mod tests {
             entry.select_host(&ctx_exhausted).is_none(),
             "every member already attempted -- no host to serve"
         );
+    }
+
+    /// `cluster_config` with a tenant credential slot for `provider`.
+    fn cluster_config_with_slot(
+        name: &str,
+        endpoints: Vec<EndpointIR>,
+        provider: Option<&str>,
+    ) -> Arc<ClusterConfig> {
+        // Rust note: `ClusterConfig` is not `Clone`, but this `Arc` is the only
+        // owner, so `try_unwrap` hands back the value to mutate.
+        let mut config = Arc::try_unwrap(cluster_config(name, DiscoveryType::Static, endpoints))
+            .unwrap_or_else(|_| unreachable!("fresh Arc has one owner"));
+        config.provider_runtime =
+            provider.map(|provider| proxy_config::ir::ProviderRuntimeConfig {
+                credential: None,
+                path_template: None,
+                model_rewrites: Vec::new(),
+                tenant_credential: Some(proxy_config::ir::TenantCredentialSlot {
+                    provider: provider.to_string(),
+                    header: "authorization".to_string(),
+                    value_prefix: "Bearer ".to_string(),
+                }),
+            });
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn aggregate_in_tenant_mode_skips_members_without_a_matching_slot() {
+        let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+        let mut snapshot = HashMap::new();
+        // "a": no slot. "b": slot for a provider the tenant lacks. "c": held.
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config_with_slot("a", vec![endpoint("10.0.0.1", 80)], None),
+        );
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config_with_slot("b", vec![endpoint("10.0.0.2", 80)], Some("openai")),
+        );
+        snapshot.insert(
+            "c".to_string(),
+            cluster_config_with_slot("c", vec![endpoint("10.0.0.3", 80)], Some("anthropic")),
+        );
+        snapshot.insert(
+            "providers".to_string(),
+            aggregate_config("providers", &["a", "b", "c"]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        let entry = manager.cluster("providers").unwrap();
+
+        let ctx = LoadBalancerContext {
+            credential_providers: Some(Arc::from(vec!["anthropic".to_string()])),
+            ..LoadBalancerContext::default()
+        };
+        let sel = entry.select_host(&ctx).expect("c is eligible");
+        assert_eq!(sel.member.unwrap().name, "c");
+
+        let none_held = LoadBalancerContext {
+            credential_providers: Some(Arc::from(vec!["gemini".to_string()])),
+            ..LoadBalancerContext::default()
+        };
+        assert!(entry.select_host(&none_held).is_none());
+
+        // Platform mode (`None`) still picks the first member.
+        let sel = entry
+            .select_host(&LoadBalancerContext::default())
+            .expect("platform mode serves a");
+        assert_eq!(sel.member.unwrap().name, "a");
     }
 
     #[tokio::test]

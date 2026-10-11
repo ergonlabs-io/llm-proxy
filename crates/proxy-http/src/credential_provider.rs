@@ -50,6 +50,12 @@ pub(crate) struct StaticHeaderCredentials<'a> {
 pub(crate) struct ProviderCredentials<'a> {
     runtime: Option<&'a proxy_config::ir::ProviderRuntimeConfig>,
     headers: &'a [proxy_config::ir::HeaderMutation],
+    /// Tenant mode (ADR-0007): the cluster's slot and the tenant's secret for
+    /// it. Written last, over whatever the operator credential set.
+    tenant: Option<(
+        &'a proxy_config::ir::TenantCredentialSlot,
+        &'a crate::tenant_credentials::TenantSecret,
+    )>,
 }
 
 impl<'a> ProviderCredentials<'a> {
@@ -57,7 +63,24 @@ impl<'a> ProviderCredentials<'a> {
         runtime: Option<&'a proxy_config::ir::ProviderRuntimeConfig>,
         headers: &'a [proxy_config::ir::HeaderMutation],
     ) -> Self {
-        Self { runtime, headers }
+        Self {
+            runtime,
+            headers,
+            tenant: None,
+        }
+    }
+
+    /// Overwrite the slot's header with the tenant's secret after the
+    /// cluster's own credential has been applied. The slot lives on the
+    /// cluster, so the tenant key follows the member actually dialled
+    /// (AGENTS.md invariant 6).
+    pub(crate) fn with_tenant(
+        mut self,
+        slot: &'a proxy_config::ir::TenantCredentialSlot,
+        secret: &'a crate::tenant_credentials::TenantSecret,
+    ) -> Self {
+        self.tenant = Some((slot, secret));
+        self
     }
 }
 
@@ -71,7 +94,7 @@ impl CredentialProvider for ProviderCredentials<'_> {
             StaticHeaderCredentials::new(self.headers)
                 .apply(request, body)
                 .await?;
-            match self.runtime.and_then(|runtime| runtime.credential.as_ref()) {
+            let applied = match self.runtime.and_then(|runtime| runtime.credential.as_ref()) {
                 None => Ok(()),
                 Some(proxy_config::ir::ProviderCredential::VertexOAuth2 { access_token }) => {
                     let value = format!("Bearer {access_token}");
@@ -93,7 +116,31 @@ impl CredentialProvider for ProviderCredentials<'_> {
                     secret_access_key,
                     session_token.as_deref(),
                 ),
+            };
+            applied?;
+            if let Some((slot, secret)) = self.tenant {
+                let name = http::HeaderName::from_bytes(slot.header.as_bytes())
+                    .map_err(|_| CredentialProviderError)?;
+                let mut value = http::HeaderValue::from_str(&format!(
+                    "{}{}",
+                    slot.value_prefix,
+                    secret.expose()
+                ))
+                .map_err(|_| CredentialProviderError)?;
+                // Sensitive values are skipped by HPACK indexing and print as
+                // `Sensitive` in Debug, so the key cannot leak through either.
+                value.set_sensitive(true);
+                // ADR-0007 decision 5 and AGENTS.md invariant 6: an operator
+                // credential never accompanies a tenant credential, whatever
+                // header the slot uses. The cluster's static headers may put
+                // its key on a different header than the slot, so every
+                // supported credential header shape is cleared first.
+                for shape in ["authorization", "x-api-key", "api-key"] {
+                    request.headers.remove(shape);
+                }
+                request.headers.insert(name, value);
             }
+            Ok(())
         })
     }
 }

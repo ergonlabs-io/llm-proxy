@@ -97,6 +97,9 @@ use crate::handler::{
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, select_cluster};
 use crate::stat_handles::RouterStats;
+use crate::tenant_credentials::{
+    CredentialSource, TenantCredential, TenantCredentialSet, TenantSecret,
+};
 use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
@@ -660,12 +663,28 @@ impl RouterHandler {
         // Single host pick, no `LoadBalancerContext::attempted_clusters`
         // accumulation -- there is no second attempt to steer away from the
         // first one's pick.
-        let ctx = LoadBalancerContext::default();
-        let Some(sel) = entry.select_host(&ctx) else {
-            let mut info = dcb.stream_info();
-            info.set_response_flag(ResponseFlag::NoHealthyUpstream);
-            info.response_code_details = Some("no_healthy_upstream".to_string());
-            return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
+        let mut ctx = LoadBalancerContext::default();
+        let tenant_set: Option<Arc<TenantCredentialSet>> = dcb
+            .stream_info()
+            .tenant_credentials
+            .clone()
+            .filter(|set| !set.is_empty());
+        if let Some(set) = &tenant_set {
+            ctx.credential_providers = Some(set.providers().clone());
+        }
+        let sel = match select_host_for_request(entry.as_ref(), &mut ctx) {
+            Ok(sel) => sel,
+            Err(NoHost::Ineligible(provider)) => {
+                dcb.stream_info().response_code_details =
+                    Some("tenant_credential_missing".to_string());
+                return tenant_credential_missing_reply(provider.as_deref());
+            }
+            Err(NoHost::Unhealthy) => {
+                let mut info = dcb.stream_info();
+                info.set_response_flag(ResponseFlag::NoHealthyUpstream);
+                info.response_code_details = Some("no_healthy_upstream".to_string());
+                return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
+            }
         };
         let host = sel.host;
         // Same "the member, not the routed aggregate, owns
@@ -676,6 +695,15 @@ impl RouterHandler {
             None => (cluster_name.as_str(), entry.as_ref()),
         };
 
+        let credentials =
+            match plan_attempt_credentials(tenant_set.as_deref(), attempt_entry.provider_runtime())
+            {
+                Ok(plan) => plan,
+                Err(refusal) => {
+                    let mut info = dcb.stream_info();
+                    return credential_refusal_reply(&mut info, attempt_cluster, &refusal);
+                }
+            };
         let proto = attempt_entry.upstream_protocol();
         {
             let mut info = dcb.stream_info();
@@ -733,12 +761,20 @@ impl RouterHandler {
             requested_model.as_deref(),
             &mut attempt_head,
         );
-        if let Err(err) = ProviderCredentials::new(
+        let mut provider_credentials = ProviderCredentials::new(
             attempt_entry.provider_runtime(),
             attempt_entry.request_headers_to_add(),
-        )
-        .apply(&mut attempt_head, &self.captured_body)
-        .await
+        );
+        let source = match &credentials {
+            AttemptCredentials::Platform => CredentialSource::Platform,
+            AttemptCredentials::Tenant(slot, secret) => {
+                provider_credentials = provider_credentials.with_tenant(slot, secret);
+                CredentialSource::Tenant
+            }
+        };
+        if let Err(err) = provider_credentials
+            .apply(&mut attempt_head, &self.captured_body)
+            .await
         {
             tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
             dcb.stream_info()
@@ -748,6 +784,7 @@ impl RouterHandler {
                 "provider credential failure",
             );
         }
+        dcb.stream_info().credential_source = Some(source);
 
         // Bypass BOTH connection caches: `pool.new_stream()` dials a
         // connection this tunnel will own exclusively (see this method's
@@ -759,6 +796,9 @@ impl RouterHandler {
             let model = info.selected_model.clone();
             info.begin_attempt(attempt_cluster, &host.address.to_string(), model)
         };
+        if let Some(info) = &attempt_info {
+            info.borrow_mut().credential_source = Some(source);
+        }
         let mut attempt_guard = crate::attempt_logging::AttemptGuard(attempt_info.clone());
         let upstream_stream = match pool.new_stream().await {
             Ok(stream) => stream,
@@ -1054,6 +1094,16 @@ impl RouterHandler {
         // needs to see the first attempt's pick to skip it. `mut` because
         // the loop pushes onto it after every pick.
         let mut ctx = LoadBalancerContext::default();
+        // Tenant mode (ADR-0007): a non-empty credential set restricts
+        // aggregate member selection and forbids operator credentials.
+        let tenant_set: Option<Arc<TenantCredentialSet>> = dcb
+            .stream_info()
+            .tenant_credentials
+            .clone()
+            .filter(|set| !set.is_empty());
+        if let Some(set) = &tenant_set {
+            ctx.credential_providers = Some(set.providers().clone());
+        }
         if let Some(policy) = fwd.retry_policy.as_ref() {
             ctx.avoid_previous_hosts = policy.avoid_previous_hosts;
             ctx.host_selection_retry_max_attempts = policy.host_selection_retry_max_attempts;
@@ -1120,12 +1170,20 @@ impl RouterHandler {
                 // task; ordinary response handling retains it here.
                 let mut rq_guard = Some(rq_guard);
 
-                let Some(sel) = entry.select_host(&ctx) else {
-                    tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
-                    let mut info = dcb.stream_info();
-                    info.set_response_flag(ResponseFlag::NoHealthyUpstream);
-                    info.response_code_details = Some("no_healthy_upstream".to_string());
-                    return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
+                let sel = match select_host_for_request(entry.as_ref(), &mut ctx) {
+                    Ok(sel) => sel,
+                    Err(NoHost::Ineligible(provider)) => {
+                        dcb.stream_info().response_code_details =
+                            Some("tenant_credential_missing".to_string());
+                        return tenant_credential_missing_reply(provider.as_deref());
+                    }
+                    Err(NoHost::Unhealthy) => {
+                        tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
+                        let mut info = dcb.stream_info();
+                        info.set_response_flag(ResponseFlag::NoHealthyUpstream);
+                        info.response_code_details = Some("no_healthy_upstream".to_string());
+                        return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
+                    }
                 };
                 let host = sel.host;
                 // `entry` is the *routed* cluster (a plain cluster,
@@ -1147,6 +1205,20 @@ impl RouterHandler {
                 {
                     Some(m) => (m.name.as_str(), m.entry.as_ref()),
                     None => (cluster_name.as_str(), entry.as_ref()),
+                };
+                // Tenant mode resolves the credential before anything is
+                // dialled or counted as an attempt. An aggregate's filtered
+                // pick makes `Missing` unreachable there; it is the real
+                // check for a non-aggregate routed cluster.
+                let credentials = match plan_attempt_credentials(
+                    tenant_set.as_deref(),
+                    attempt_entry.provider_runtime(),
+                ) {
+                    Ok(plan) => plan,
+                    Err(refusal) => {
+                        let mut info = dcb.stream_info();
+                        return credential_refusal_reply(&mut info, attempt_cluster, &refusal);
+                    }
                 };
                 // Record this attempt's cluster so a retry that falls back
                 // to an aggregate skips it on the next pick (see
@@ -1433,12 +1505,20 @@ impl RouterHandler {
                 // Credentials run after every decode filter and per-attempt
                 // transform. The selected member owns its credential, so a
                 // fallback cannot sign or authorize against the primary.
-                if let Err(err) = ProviderCredentials::new(
+                let mut provider_credentials = ProviderCredentials::new(
                     attempt_entry.provider_runtime(),
                     attempt_entry.request_headers_to_add(),
-                )
-                .apply(&mut attempt_head, &attempt_body_bytes)
-                .await
+                );
+                let source = match &credentials {
+                    AttemptCredentials::Platform => CredentialSource::Platform,
+                    AttemptCredentials::Tenant(slot, secret) => {
+                        provider_credentials = provider_credentials.with_tenant(slot, secret);
+                        CredentialSource::Tenant
+                    }
+                };
+                if let Err(err) = provider_credentials
+                    .apply(&mut attempt_head, &attempt_body_bytes)
+                    .await
                 {
                     tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
                     dcb.stream_info()
@@ -1447,6 +1527,10 @@ impl RouterHandler {
                         StatusCode::SERVICE_UNAVAILABLE,
                         "provider credential failure",
                     );
+                }
+                dcb.stream_info().credential_source = Some(source);
+                if let Some(info) = &attempt_info {
+                    info.borrow_mut().credential_source = Some(source);
                 }
                 // Rust note: `body_bytes` is plain `Bytes`, cheap
                 // (refcounted) to `.clone()` fresh for every attempt --
@@ -2574,6 +2658,128 @@ fn redirect_response(redirect: &RedirectIR, head: &RequestHeaders) -> HttpRespon
         .headers
         .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     resp
+}
+
+/// What the credential step does for one attempt cluster (ADR-0007).
+enum AttemptCredentials<'a> {
+    /// Operator credential only: the request has no tenant credentials.
+    Platform,
+    /// Tenant mode: the cluster's slot and the tenant's secret for it.
+    Tenant(&'a proxy_config::ir::TenantCredentialSlot, &'a TenantSecret),
+}
+
+/// Why a tenant-mode attempt cannot be given a credential. Both refusals are
+/// final for the request: neither retries nor falls back to the operator
+/// credential.
+enum CredentialRefusal {
+    /// The cluster has no slot, or the tenant holds nothing for its provider.
+    /// Carries the slot's provider name when the cluster has one.
+    Missing(Option<String>),
+    /// The tenant holds a row for the provider that could not be decrypted.
+    Unusable(String),
+}
+
+/// Decide, before anything is dialled, which credential an attempt cluster
+/// gets. In tenant mode a cluster is never allowed to fall through to its
+/// operator credential, even when the slot is absent (AGENTS.md invariant 6,
+/// ADR-0007).
+fn plan_attempt_credentials<'a>(
+    tenant: Option<&'a TenantCredentialSet>,
+    runtime: Option<&'a proxy_config::ir::ProviderRuntimeConfig>,
+) -> Result<AttemptCredentials<'a>, CredentialRefusal> {
+    let Some(set) = tenant else {
+        return Ok(AttemptCredentials::Platform);
+    };
+    let Some(slot) = runtime.and_then(|runtime| runtime.tenant_credential.as_ref()) else {
+        return Err(CredentialRefusal::Missing(None));
+    };
+    match set.get(&slot.provider) {
+        Some(TenantCredential::Usable(secret)) => Ok(AttemptCredentials::Tenant(slot, secret)),
+        Some(TenantCredential::Unusable) => Err(CredentialRefusal::Unusable(slot.provider.clone())),
+        None => Err(CredentialRefusal::Missing(Some(slot.provider.clone()))),
+    }
+}
+
+/// Final local reply for a refused tenant credential. Never names a secret.
+fn credential_refusal_reply(
+    info: &mut crate::StreamInfo,
+    cluster: &str,
+    refusal: &CredentialRefusal,
+) -> HttpResponseParts {
+    match refusal {
+        CredentialRefusal::Missing(provider) => {
+            tracing::warn!(cluster = %cluster, provider = ?provider, "tenant has no credential slot match for the selected cluster");
+            info.response_code_details = Some("tenant_credential_missing".to_string());
+            tenant_credential_missing_reply(provider.as_deref())
+        }
+        CredentialRefusal::Unusable(provider) => {
+            tracing::warn!(cluster = %cluster, provider = %provider, "tenant credential is unusable (decryption failed); failing closed");
+            info.set_response_flag(ResponseFlag::UpstreamConnectionFailure);
+            local_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider credential failure",
+            )
+        }
+    }
+}
+
+/// `403` in the JSON error shape the config dialect's own local errors use
+/// (`{"error":{"message":..,"type":..}}`).
+fn tenant_credential_missing_reply(provider: Option<&str>) -> HttpResponseParts {
+    let message = match provider {
+        Some(provider) => format!("no tenant credential for provider {provider}"),
+        None => "no tenant credential for any provider this route can use".to_string(),
+    };
+    let body = serde_json::json!({
+        "error": { "message": message, "type": "tenant_credential_missing" }
+    })
+    .to_string();
+    let mut resp = local_reply_with_status(StatusCode::FORBIDDEN, Bytes::from(body));
+    resp.head.headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
+/// Why [`select_host_for_request`] found no host.
+enum NoHost {
+    /// Nothing healthy to dial: `503 no healthy upstream`.
+    Unhealthy,
+    /// A host exists but the tenant has no credential for it: `403`. Carries
+    /// the provider named by the first such cluster's slot, if it has one.
+    Ineligible(Option<String>),
+}
+
+/// Run host selection. In tenant mode, distinguish "no eligible cluster" from
+/// "nothing healthy": when the tenant-filtered pick finds nothing on the
+/// first attempt, probe once without the filter. A host there means the
+/// failure is eligibility, so `Err(Ineligible)`; otherwise `Err(Unhealthy)`.
+fn select_host_for_request(
+    entry: &dyn ClusterEntry,
+    ctx: &mut LoadBalancerContext,
+) -> Result<proxy_cluster::HostSelection, NoHost> {
+    if let Some(sel) = entry.select_host(ctx) {
+        return Ok(sel);
+    }
+    // On a retry the eligible members are exhausted, which is a health
+    // outcome, so only the first pick is probed.
+    if ctx.credential_providers.is_none() || !ctx.attempted_clusters.is_empty() {
+        return Err(NoHost::Unhealthy);
+    }
+    let filter = ctx.credential_providers.take();
+    let probe = entry.select_host(ctx);
+    ctx.credential_providers = filter;
+    Err(match probe {
+        None => NoHost::Unhealthy,
+        Some(sel) => NoHost::Ineligible(
+            sel.member
+                .as_ref()
+                .and_then(|m| m.entry.provider_runtime())
+                .and_then(|runtime| runtime.tenant_credential.as_ref())
+                .map(|slot| slot.provider.clone()),
+        ),
+    })
 }
 
 /// A locally-synthesized error reply (no upstream involved) with a
