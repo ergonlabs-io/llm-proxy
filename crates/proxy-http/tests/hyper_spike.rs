@@ -1,6 +1,6 @@
-//! WP-10 chunk A -- hyper 1.x capability spike.
+//! hyper 1.x capability spike.
 //!
-//! This is *not* the WP-10 codec. It is a bounded, throwaway de-risking
+//! This is *not* the codec. It is a bounded, throwaway de-risking
 //! exercise: four `#[tokio::test]`s, each proving (or disproving) one
 //! capability the real downstream/upstream HTTP codec will need, driven
 //! through the same **low-level** connection API the codec will use
@@ -9,7 +9,7 @@
 //! `hyper_util` auto server/client. Every test runs entirely in-process over
 //! a `tokio::io::duplex` pipe wrapped in `hyper_util::rt::TokioIo`.
 //!
-//! # Findings (drives the WP-10 codec design)
+//! # Findings (drives the codec design)
 //!
 //! | # | Capability                                   | Verdict            | API used                                                                                       | Caveats / fallback |
 //! |---|-----------------------------------------------|--------------------|--------------------------------------------------------------------------------------------------|---------------------|
@@ -28,7 +28,7 @@
 //! directly. Finding (f) is the one exception: **hyper has a real
 //! client-side hook for 1xx, but no server-side one at all.**
 //!
-//! **Implication for WP-10 S10 (finding g):** both the h2-server-accepts and
+//! **Implication for S10 (finding g):** both the h2-server-accepts and
 //! the h2-client-sends halves of RFC 8441 extended CONNECT are available
 //! through the same low-level API surface finding (e) already validated for
 //! h1 Upgrade, and both produce the identical `hyper::upgrade::Upgraded` type

@@ -1,4 +1,4 @@
-//! WP-12 acceptance tests for the route matching engine.
+//! Acceptance tests for the route matching engine.
 //!
 //! Fixtures build real `RouteTable`s through `proxy_config`'s YAML lowering
 //! pipeline (the same helper shape as `proxy-config/tests/ir.rs`) rather than

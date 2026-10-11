@@ -2,7 +2,7 @@
 # Vendor the pinned Envoy API protos + their proto dependencies into
 # crates/proxy-api/vendor/. The pins below mirror envoy v1.38.0's
 # api/bazel/repository_locations.bzl exactly — bump them only via a dedicated
-# proto-upgrade change (IMPLEMENTATION_PLAN.md ground rule #1).
+# proto-upgrade change (AGENTS.md invariant 9).
 set -euo pipefail
 
 ENVOY_VERSION=1.38.0

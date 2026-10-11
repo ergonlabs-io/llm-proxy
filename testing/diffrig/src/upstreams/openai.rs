@@ -507,7 +507,7 @@ struct ResponsesRequest {
 /// (with `usage.input_tokens_details.cached_tokens`), not the chat-completions
 /// `prompt_tokens`/`completion_tokens` shape that `usage.rs` currently parses.
 /// This mock renders the real wire shape rather than bending it to match
-/// `usage.rs`, since ground rule is "the mock mirrors the provider" — the gap
+/// `usage.rs`, since the mock mirrors the provider — the gap
 /// (no `Dialect` for the Responses API today) is a real one, reported to the
 /// orchestrator rather than silently patched over here.
 fn handle_responses(

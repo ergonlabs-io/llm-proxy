@@ -1,4 +1,4 @@
-//! WP-62 increment 2 -- [`RedisControlPlaneStore`], the shared, Redis-backed
+//! [`RedisControlPlaneStore`], the shared, Redis-backed
 //! [`crate::control::ControlPlaneStore`]. `internal-docs/adr/0006-shared-state-tiers.md`
 //! is normative for everything this file implements; read its §§1-2 and 7
 //! before touching [`RedisControlPlaneStore::add_spend`] or
@@ -21,7 +21,7 @@
 //! control runtime's policy poller and [`crate::spend::SpendAccumulator`]'s
 //! flusher thread do, both off the hot path (ADR-0005). This crate therefore
 //! depends on `redis` with its default (sync) transport and no
-//! `tokio-comp`/`aio` feature -- see the workspace `Cargo.toml`'s WP-62
+//! `tokio-comp`/`aio` feature -- see the workspace `Cargo.toml`'s `redis`
 //! entry. Threading an async runtime through a trait that has none would buy
 //! nothing for a connection nothing on the hot path ever holds.
 //!
@@ -195,8 +195,8 @@ fn escape_component(raw: &str) -> String {
 
 /// Persistent, shared [`ControlPlaneStore`] backed by Redis -- the
 /// multi-replica counterpart to [`crate::control::RedbControlPlaneStore`].
-/// WP-62, unblocked by WP-60 (composable spend writes) and WP-61 (the
-/// generation stamp), both of which this store's [`Self::add_spend`] and
+/// Built on composable (additive) spend writes and the policy generation
+/// stamp, both of which this store's [`Self::add_spend`] and
 /// [`Self::policy_generation`] exist to serve.
 ///
 /// # One connection, `std::sync::Mutex`-guarded, reconnected on failure
@@ -334,7 +334,7 @@ impl RedisControlPlaneStore {
     /// `hash_tag(...)` output in both `spend_key` and `seq_key` guarantees
     /// they land on the same slot no matter what the rest of each key name
     /// is. Without the braces this works today against a single node and
-    /// fails on a cluster, which is the exact deployment WP-62 exists for.
+    /// fails on a cluster, which is the exact deployment this store exists for.
     fn hash_tag(stat_prefix: &str, tenant: &str, period: &str) -> String {
         format!(
             "{}|{}|{}",
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // WP-62 increment 3's acceptance, at the `SpendAccumulator` level:
+    // Acceptance, at the `SpendAccumulator` level:
     // "three processes against one Redis converge on spend" and "a killed
     // process's backlog flushes on restart and the ledger self-heals".
     //
@@ -1134,8 +1134,7 @@ mod tests {
         let now = dt(2026, 9, 7);
         let period_key = Period::Daily.key_for(now);
 
-        // THREE DISTINCT node ids over the SAME store -- see M4 in this
-        // increment's review: sharing one node id here would not exercise
+        // THREE DISTINCT node ids over the SAME store -- sharing one node id here would not exercise
         // convergence at all, because every write past the first would be
         // deduped as a replay of that shared id's own sequence.
         let replica_a = SpendAccumulator::new(

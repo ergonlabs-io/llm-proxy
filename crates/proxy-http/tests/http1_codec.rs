@@ -1,4 +1,4 @@
-//! WP-10 chunk B -- standalone tests for the downstream HTTP/1.1 codec
+//! Standalone tests for the downstream HTTP/1.1 codec
 //! (`proxy_http::codec::serve_http1`) and the `StreamHandler` seam, driven
 //! over an in-memory `tokio::io::duplex` pipe with a hyper low-level client
 //! on the other end (mirroring the technique `tests/hyper_spike.rs`
@@ -412,8 +412,7 @@ impl StreamHandler for SlowHandler {
 }
 
 /// A handler that records whether the `HttpRequestParts` it received carried
-/// an extracted `on_upgrade` handle, then returns a fixed 200 -- S10 (WP-10
-/// increment 2a) is plumbing + detection only, so this stub doesn't touch the
+/// an extracted `on_upgrade` handle, then returns a fixed 200 -- S10 is plumbing + detection only, so this stub doesn't touch the
 /// handle itself, just proves `serve_one` threaded it through correctly.
 struct UpgradeRecordingHandler {
     // Rust note: `Rc<Cell<..>>` rather than a plain field -- `handle` takes

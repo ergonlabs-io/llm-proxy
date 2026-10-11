@@ -1,4 +1,4 @@
-//! WP-20 increment 3a/3b acceptance: the ADS gRPC request/response pump and
+//! Acceptance: the ADS gRPC request/response pump and
 //! the reconnect loop above it, run
 //! against `testing/controlplane`'s `ScriptedAds` over a real loopback
 //! socket -- the same model `testing/controlplane/tests/ads_selftest.rs`
@@ -6,7 +6,7 @@
 //!
 //! Every test here bounds every wire wait with `tokio::time::timeout` (rule
 //! 14: a hang must fail loudly, not stall) and uses ephemeral ports only
-//! (`Harness::spawn` binds `127.0.0.1:0`; rule 15).
+//! (`Harness::spawn` binds `127.0.0.1:0`; AGENTS.md "Running The Product").
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -56,7 +56,7 @@ fn always_accept() -> proxy_xds::Validator {
     Box::new(|_resp: &DiscoveryResponse| Verdict::Accept)
 }
 
-/// S8, and this increment's first acceptance bullet: "an accepted response
+/// S8, first acceptance claim: "an accepted response
 /// produces an ACK carrying that version and echoing the nonce."
 #[tokio::test(flavor = "multi_thread")]
 async fn accept_produces_an_ack_with_the_accepted_version_and_nonce() {
@@ -104,7 +104,7 @@ async fn accept_produces_an_ack_with_the_accepted_version_and_nonce() {
     harness.shutdown().await;
 }
 
-/// S8, and this increment's second acceptance bullet: "a rejected response
+/// S8, second acceptance claim: "a rejected response
 /// produces a NACK carrying the PREVIOUS acked version and the new nonce,
 /// with `error_detail` set." Scripted as accept-then-reject so "previous" is
 /// a real, non-empty version rather than the trivially-empty one before
@@ -173,7 +173,7 @@ async fn reject_produces_a_nack_with_the_previous_version_and_new_nonce() {
     harness.shutdown().await;
 }
 
-/// This increment's third acceptance bullet: "a type whose subscription has
+/// Third acceptance claim: "a type whose subscription has
 /// no names is never requested." RDS here is subscribed with an empty name
 /// set (the ordinary state before any LDS/CDS response has named anything),
 /// which `SubscriptionState::has_nothing_to_request` says renders
@@ -217,7 +217,7 @@ async fn empty_name_subscription_is_never_requested() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-20 increment 3b: reconnect, resync, and backoff.
+// Reconnect, resync, and backoff.
 // ---------------------------------------------------------------------------
 
 /// A `Reconnect` whose sleep records what it was asked to wait for and then
@@ -227,7 +227,7 @@ async fn empty_name_subscription_is_never_requested() {
 ///
 /// Returning immediately is what keeps these tests at milliseconds: the
 /// assertion is "the loop asked for 500ms", which is the real claim -- that
-/// it actually slept is `tokio::time::sleep`'s problem, not WP-20's.
+/// it actually slept is `tokio::time::sleep`'s problem.
 fn recording_reconnect(policy: BackoffPolicy) -> (Reconnect, Arc<Mutex<Vec<Duration>>>) {
     let recorded: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&recorded);
@@ -260,7 +260,7 @@ async fn wait_for_delays(delays: &Arc<Mutex<Vec<Duration>>>, want: usize) -> Vec
     }
 }
 
-/// WP-20's `reconnect-resync` acceptance scenario, and S8's reconnect rule:
+/// The `reconnect-resync` acceptance scenario, and S8's reconnect rule:
 ///
 /// > Reconnect: new stream, re-send all subscriptions with acked versions
 /// > (versions persist across streams for same server).
@@ -345,7 +345,7 @@ async fn reconnect_resends_the_acked_version_with_no_nonce() {
 
 /// The first reconnect must wait, and it must wait the policy's floor rather
 /// than nothing. A zero first delay is what turns a control plane restart
-/// into a reconnect storm (PLAN.md Part 8.5: "never NACK-storm").
+/// into a reconnect storm (`internal-docs/architecture.md` §12.2 rule 5: "never NACK-storm").
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_reconnect_waits_the_base_interval() {
     let harness = Harness::spawn(vec![
@@ -448,7 +448,7 @@ async fn backoff_grows_across_dead_streams_and_resets_after_a_response() {
 /// `response_nonce: None`, so a `run` that forgot the reset would still put a
 /// correct (nonce-free) resync request on the wire. The reset is therefore
 /// **state hygiene, not the wire guarantee** -- `last_nonce()` is public, and
-/// increment 4 reads it. A mutation removing the reset survives every
+/// callers read it. A mutation removing the reset survives every
 /// wire-level assertion in this file and fails only here.
 ///
 /// Rust note: `tokio::time::timeout` around `run` (whose return type is `!`)
@@ -514,7 +514,7 @@ async fn run_clears_the_nonce_but_keeps_the_version_across_a_reconnect() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-20 increment 4c: the Node identity on the wire.
+// The Node identity on the wire.
 // ---------------------------------------------------------------------------
 
 fn test_node() -> NodeIdentity {
@@ -526,7 +526,7 @@ fn test_node() -> NodeIdentity {
 
 /// The xDS protocol, and Envoy's own `GrpcMuxImpl`: a client sends its node
 /// identity on the FIRST request of a stream and omits it from every request
-/// after. Increment 3a built the request and never set the field at all --
+/// after. An earlier version built the request and never set the field at all --
 /// `to_proto` filled five fields and then `..Default::default()` -- so every
 /// request went out anonymous, which a control plane keying on `node.id`
 /// (go-control-plane's snapshot cache does) has no way to serve.
@@ -635,7 +635,7 @@ async fn a_reconnect_sends_the_node_again_on_the_new_stream() {
 }
 
 /// A client with no node configured sends none -- legal on the wire, and the
-/// behavior every test written before increment 4c depended on.
+/// behavior every test written before the node identity existed depended on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_with_no_node_configured_sends_none() {
     let harness = Harness::spawn(vec![Step::Send {
@@ -669,7 +669,7 @@ async fn a_client_with_no_node_configured_sends_none() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-20 increment 4d-i: the handler seam is async -- applying a response can
+// The handler seam is async -- applying a response can
 // await before its ACK goes out.
 // ---------------------------------------------------------------------------
 
@@ -701,11 +701,11 @@ impl ResponseHandler for DelayedHandler {
     }
 }
 
-/// The acceptance claim for this increment: with a handler whose future is
+/// The acceptance claim: with a handler whose future is
 /// still pending, the ACK for the response it is handling must not have
 /// reached the control plane yet. Once the gate is released, the ACK follows.
 ///
-/// Both waits are bounded (rule 14): the first is expected to time out, and
+/// Both waits are bounded (AGENTS.md "Build And Test", Hangs): the first is expected to time out, and
 /// asserting that via `Result::expect_err` on a short `tokio::time::timeout`
 /// is what turns "the ACK went out early" into a named failure rather than a
 /// pass that just got lucky on timing, and what keeps this test itself from
@@ -761,7 +761,7 @@ async fn the_ack_does_not_reach_the_wire_until_the_handler_future_resolves() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-21 increment 2b-ii: `ResponseHandler::desired_names` driving a follow-up
+// `ResponseHandler::desired_names` driving a follow-up
 // request.
 // ---------------------------------------------------------------------------
 
@@ -793,7 +793,7 @@ impl ResponseHandler for FixedNamesHandler {
     }
 }
 
-/// This increment's acceptance claim: a `SubscriptionState::set_names` change
+/// Acceptance claim: a `SubscriptionState::set_names` change
 /// -- driven here by the handler reporting a wider EDS name set once it has
 /// handled a response -- causes a follow-up `DiscoveryRequest` on the same
 /// stream, and the ACK for the response that triggered it goes out FIRST.

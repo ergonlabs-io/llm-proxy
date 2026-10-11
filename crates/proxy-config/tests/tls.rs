@@ -1,12 +1,12 @@
-//! WP-08 chunk A acceptance tests: TLS proto -> IR lowering.
+//! Acceptance tests: TLS proto -> IR lowering.
 //!
 //! Covers the full supported `DownstreamTlsContext`/`UpstreamTlsContext`
 //! surface: certificate counts, `TlsParameters` (including the
 //! direction-dependent `TLS_AUTO` defaults), cipher-suite/curve name
 //! translation, `CertificateValidationContext` (CA source + SAN matchers),
 //! and `require_client_certificate`/session-resumption passthrough. Every
-//! rejection case asserts on the offending dotted field path (ground rule
-//! #2).
+//! rejection case asserts on the offending dotted field path (AGENTS.md
+//! invariant 1).
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -511,7 +511,7 @@ fn upstream_happy_path() {
 }
 
 // --------------------------------------------------------------- case  5 --
-// WP-22 increment 2a: `tls_certificate_sds_secret_configs` lowering.
+// `tls_certificate_sds_secret_configs` lowering.
 
 #[test]
 fn sds_only_chain_lowers_with_empty_certificates() {

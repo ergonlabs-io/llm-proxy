@@ -289,7 +289,7 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
     // Anthropic-shaped response to the OpenAI usage parser, which reads no
     // usage at all, which lets the token limiter fail open (it warns now, but
     // it still admits the request uncharged) -- a quota bypass produced by a
-    // config the loader accepted. Ground rule #1: name the path and refuse.
+    // config the loader accepted. AGENTS.md invariant 1: name the path and refuse.
     for (i, route) in config.routes.iter().enumerate() {
         check_route_ref_dialect(config, &route.provider, &format!("routes[{i}].provider"))?;
         for (j, fallback) in route.fallbacks.iter().enumerate() {

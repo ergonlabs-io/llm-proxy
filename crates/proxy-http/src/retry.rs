@@ -1,4 +1,4 @@
-//! Appendix S3 — retry & hedging engine (binds WP-14).
+//! envoy-semantics.md S3 — retry & hedging engine.
 //!
 //! Pure logic only: trigger evaluation (S3.2) and fully-jittered exponential
 //! backoff (S3.3) are synchronous, allocation-free functions with randomness
@@ -243,7 +243,7 @@ impl<'a> RetryState<'a> {
         self.body_retriable && should_retry(self.policy, outcome, self.attempts_used)
     }
 
-    /// WP-24: Envoy's `URX` ("upstream retry limit exceeded") condition --
+    /// Envoy's `URX` ("upstream retry limit exceeded") condition --
     /// `outcome` is one this policy's trigger table (S3.2) WOULD have
     /// retried, but [`Self::should_retry`] just said no because the S3.1
     /// attempt budget (`policy.num_retries`) is spent. Deliberately NOT the
@@ -624,7 +624,7 @@ mod tests {
         assert!(!state.should_retry(&AttemptOutcome::ConnectFailure));
     }
 
-    // ------------------------------------------------------------- WP-24 --
+    // ---------------------------------------- response flags (`URX`) --
 
     #[test]
     fn retry_limit_exceeded_fires_only_once_the_budget_is_actually_spent() {

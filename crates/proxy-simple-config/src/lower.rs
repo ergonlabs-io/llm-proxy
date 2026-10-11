@@ -1,22 +1,50 @@
 //! Lowering: dialect -> Envoy bootstrap resources.
 //!
-//! Deterministic rules:
-//! - each provider -> one cluster `provider:<name>` (STATIC for IP hosts,
-//!   LOGICAL_DNS for hostnames), upstream TLS + SNI for https, host rewrite
-//!   and auth-header injection on the routes that target it;
-//! - `routes` -> one listener + HCM + route table; each rule matches the
-//!   `x-llmproxy-model` request header via its model glob (exact / prefix /
-//!   regex); first match wins, mirroring S1; a 404 direct response backstops
-//!   unmatched requests (unless a `*` rule exists);
-//! - LLM-safe defaults: total route timeout DISABLED (`0s` — generations are
-//!   long); idle_timeout 90s; retries only on connect-failure/reset/refused-
-//!   stream/429/5xx-before-first-byte, never after streaming starts (S3).
+//! Deterministic rules (each checked against the code below):
+//! - Each provider -> one cluster `provider:<name>` (STATIC for IP hosts,
+//!   LOGICAL_DNS for hostnames), ROUND_ROBIN, `connect_timeout` (default 5s).
+//!   https providers get upstream TLS with SNI and a validation context (the
+//!   provider's `ca_file`, else the system roots) plus a DNS-exact SAN matcher
+//!   on the host: unlike raw Envoy mode, which accepts any certificate by
+//!   default, the dialect verifies identity. `protocol: http2` adds the
+//!   cluster's HTTP/2 protocol options.
+//! - Per-provider values live on the CLUSTER, never the route (AGENTS.md
+//!   invariant 6): the credential headers (auth header, `anthropic-version`,
+//!   `extra_headers`) and `Host` ride the cluster's
+//!   `request_headers_to_add`, so the provider actually dialled supplies them
+//!   even after failover. The route also sets `host_rewrite_literal` to the
+//!   primary's host, which is a no-op for the primary and is overridden by the
+//!   cluster `Host` for a fallback member.
+//! - `routes` -> one listener + HCM + route table. Each rule matches the
+//!   `x-llmproxy-model` request header by its model glob: no `*` is exact, one
+//!   trailing `*` is a prefix, any other glob is an escaped regex, and a bare
+//!   `*` matches without a header condition. First match wins, mirroring S1.
+//!   `models:` entries then get an implicit route per name (exact > longest
+//!   prefix > `*`), and a 404 `direct_response` backstops unmatched requests
+//!   unless some rule or catalogue entry is a catch-all.
+//! - `fallbacks` (and multi-provider `models:` entries) -> an
+//!   `envoy.clusters.aggregate` cluster (`fallback:route-<i>` /
+//!   `fallback:model-<name>`) whose members are the provider clusters in listed
+//!   order; the route targets the aggregate, so each retry advances to the next
+//!   member. Fallbacks must share the primary's usage dialect (AGENTS.md
+//!   invariant 7); a mismatch is a hard error. An aggregate carries no
+//!   endpoints, TLS, protocol options, or metadata.
+//! - LLM-safe defaults: the total route `timeout` is `0s` (disabled --
+//!   generations are long) and `idle_timeout` (default 90s, per-rule override)
+//!   is the only time guard; this is a deliberate dialect-only divergence from
+//!   Envoy's 15s route default. Retries fire only on
+//!   connect-failure/refused-stream/reset or status 429/500/502/503, which
+//!   Envoy's router never applies once response bytes have streamed (S3).
+//!   `num_retries` is the rule's `retries.attempts` (default 1), raised to
+//!   members-1 so the last fallback is reachable.
+//! - Usage metering is per route: each route's `typed_per_filter_config` names
+//!   its own provider's dialect, because one listener can serve several.
 //!
 //! The result is standard Envoy config: it goes through the same strict
 //! parse, PGV validation, and IR pipeline as `-c` mode, and `--mode
-//! translate` prints it. Dialect features whose runtime lands in a later WP
-//! (fallbacks, model rewrite, limits, access logs) produce explicit
-//! warnings, never silent drops (ground rule #2).
+//! translate` prints it. Dialect features that are accepted but not yet
+//! enforced (for example model rewrite and some limits) produce explicit
+//! warnings, never silent drops (AGENTS.md invariant 1).
 
 use std::collections::HashMap;
 
@@ -690,7 +718,7 @@ fn lower_provider(
     // identical value via `host_rewrite_literal`, so this is a no-op there,
     // and one rule is simpler than two.
     headers_to_add.push(json!({ "key": "host", "value": up.host }));
-    // This is ground rule #6's third instance (AGENTS.md invariant 6): the
+    // This is another instance of AGENTS.md invariant 6: the
     // usage-filter dialect is per-provider too, so it rides onto the CLUSTER
     // alongside credentials and `Host` above rather than staying only on the
     // route's `typed_per_filter_config` -- that route-level copy is left
@@ -902,7 +930,7 @@ fn auth_header(
         (None, Some(file)) => {
             warnings.push(warning(
                 format!("providers.{name}.api_key_file"),
-                "the key file is read once at startup; hot reload lands with WP-35",
+                "the key file is read once at startup; hot reload is not supported yet",
             ));
             std::fs::read_to_string(file)
                 .map_err(|e| ConfigError::Io {
@@ -933,7 +961,7 @@ fn auth_header(
 /// fed OpenAI SSE simply finds nothing and reports `None`, but the OpenAI
 /// parser on an Anthropic body can *partially* match — which would bill a
 /// customer against a number nobody computed correctly.
-/// The single dialect this provider's CLUSTER carries, for ground rule #6's
+/// The single dialect this provider's CLUSTER carries, for AGENTS.md invariant 6's
 /// per-provider carrier.
 ///
 /// This deliberately does NOT call [`usage_dialect`] directly, and that
@@ -956,7 +984,7 @@ fn auth_header(
 ///
 /// So: every `models` entry naming this provider is consulted, and they must
 /// agree. Disagreement is a hard error with both offending paths named
-/// (ground rule #1) rather than a silent pick, because one cluster cannot
+/// (AGENTS.md invariant 1) rather than a silent pick, because one cluster cannot
 /// carry two dialects -- a provider whose endpoint really does speak both
 /// wire formats has to be declared as two providers. A provider no `models`
 /// entry references falls back to the type-derived answer, which is what the
@@ -1165,7 +1193,7 @@ fn lower_route(
     if rule.provider.model.is_some() {
         warnings.push(warning(
             format!("routes[{index}].provider"),
-            "model rewrite (`provider/model`) needs the request-body rewriter (WP-35); \
+            "model rewrite (`provider/model`) needs the request-body rewriter, which is not supported yet; \
              the original model name is forwarded for now",
         ));
     }
@@ -1188,7 +1216,7 @@ fn lower_route(
         // producing wrong billing numbers, not just a broken request. The
         // request/response translation that would make a cross-dialect
         // chain work is explicitly deferred work; failing here at
-        // config time is ground rule #1's shape, not laziness.
+        // config time is AGENTS.md invariant 1's shape, not laziness.
         if fallback_dialect != primary_dialect {
             return Err(ConfigError::InvalidValue {
                 field_path: fallback_path,
@@ -1199,7 +1227,7 @@ fn lower_route(
                      `{fallback_dialect}` upstream, and its response would be parsed for \
                      tokens by the wrong dialect's parser (silently wrong billing numbers); \
                      cross-dialect fallback needs request/response translation, which is \
-                     later WP-35 scope. Same-dialect fallbacks (e.g. openai -> an \
+                     not supported yet. Same-dialect fallbacks (e.g. openai -> an \
                      openai-compatible provider) are supported.",
                     fallback.provider
                 ),
@@ -1208,7 +1236,7 @@ fn lower_route(
         if fallback.model.is_some() {
             warnings.push(warning(
                 fallback_path,
-                "model rewrite (`provider/model`) needs the request-body rewriter (WP-35); \
+                "model rewrite (`provider/model`) needs the request-body rewriter, which is not supported yet; \
                  the original model name is forwarded for now",
             ));
         }
@@ -1270,7 +1298,7 @@ fn lower_route(
     // each retry against an aggregate pick the NEXT member, so reaching the
     // last of N members needs at least N-1 retries -- below that, a
     // configured fallback would silently never see traffic, which is
-    // ground rule #1's "accepted but not honored" shape again.
+    // AGENTS.md invariant 1's "accepted but not honored" shape again.
     let min_retries_for_failover = u32::try_from(member_count - 1).unwrap_or(u32::MAX);
     let num_retries = attempts.max(min_retries_for_failover);
     if num_retries > 0 {
@@ -1580,7 +1608,7 @@ fn lower_model(
 /// Mirrors the shape checks `proxy_filters::auth_filter::parse_digest_hex`
 /// makes on the SAME value once it reaches the proto -- duplicated rather
 /// than shared (protos, and the filter code that reads them, never cross
-/// into this crate; ground rule #2), so a malformed digest is rejected HERE,
+/// into this crate; AGENTS.md invariant 2), so a malformed digest is rejected HERE,
 /// with a dialect path (`auth.keys[i].digest`), before it ever reaches that
 /// function's proto path (`typed_config.virtual_keys[i].digest_hex`), which
 /// names a field the operator's document doesn't have.
@@ -1640,7 +1668,7 @@ fn lower_auth(
             // comment in `lower_provider`/`auth_header`.
             warnings.push(warning(
                 "auth.hmac_secret_file",
-                "the key file is read once at startup; hot reload lands with WP-35",
+                "the key file is read once at startup; hot reload is not supported yet",
             ));
             // Read once, here, purely to validate (readable, non-empty) with
             // a dialect-scoped error -- the CONTENTS are discarded, never
@@ -1680,7 +1708,7 @@ fn lower_auth(
     // Rust note: these two maps remember which earlier index first used a
     // given `id`/`digest`, so a duplicate error can name the SECOND
     // (offending) index -- same shape as `auth_filter::parse_config`'s
-    // `seen_key_ids`/`seen_digests`, kept independent per ground rule #2.
+    // `seen_key_ids`/`seen_digests`, kept independent per AGENTS.md invariant 2.
     let mut seen_ids: HashMap<&str, usize> = HashMap::new();
     let mut seen_digests: HashMap<&str, usize> = HashMap::new();
     let mut virtual_keys = Vec::with_capacity(auth.keys.len());
@@ -1731,7 +1759,7 @@ fn lower_auth(
     if auth.keys.is_empty() {
         // Legal (fail closed is the correct reading of "authentication is
         // enabled, and no credential is valid"), but almost certainly not
-        // what the operator meant -- ground rule #1's "warn, don't silently
+        // what the operator meant -- AGENTS.md invariant 1's "warn, don't silently
         // accept" shape for a value that parses fine but does nothing.
         warnings.push(warning(
             "auth.keys",
@@ -1762,7 +1790,7 @@ fn lower_auth(
 /// set. Everything else -- `global`/`client-ip` keys, any other header,
 /// `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded in
 /// the dialect but not enforced yet, and gets an explicit per-field warning
-/// naming its exact dotted path (ground rule #1: never silently drop a
+/// naming its exact dotted path (AGENTS.md invariant 1: never silently drop a
 /// field). Only the FIRST supported entry is honored -- the filter has room
 /// for exactly one budget rule -- and any later one is warned about too.
 fn lower_limits(
@@ -1778,7 +1806,7 @@ fn lower_limits(
         // one, nothing authenticates a tenant, so the limiter would silently
         // fall back to bucketing on the client-supplied `authorization`
         // header (see `token_limit_filter`'s module doc, "bucket key" table)
-        // while the config claims "per tenant". Ground rule #1: a hard
+        // while the config claims "per tenant". AGENTS.md invariant 1: a hard
         // error, not a warning -- this is a config that lies about what it
         // enforces, not merely a feature that isn't wired up yet.
         if matches!(&limit.key, LimitKey::Tenant) && config.auth.is_none() {
@@ -1831,7 +1859,7 @@ fn lower_limits(
             warnings.push(warning(
                 format!("{path}.key"),
                 format!(
-                    "{key_desc} is not enforced; the token limiter (WP-34) derives its \
+                    "{key_desc} is not enforced; the token limiter derives its \
                      bucket key from the authenticated tenant when there is one and from \
                      the `{ENFORCED_LIMIT_HEADER}` header otherwise, and has no per-key \
                      configurability, so only `key: tenant` (with `auth:` configured) and \
@@ -1888,7 +1916,7 @@ fn lower_limits(
         if limit.concurrent_sessions.is_some() {
             warnings.push(warning(
                 format!("{path}.concurrent_sessions"),
-                "not enforced; concurrent-session limits land with WP-37",
+                "not enforced; concurrent-session limits are not supported yet",
             ));
         }
         if !limit.models.is_empty() {

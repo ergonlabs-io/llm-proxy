@@ -1,8 +1,8 @@
-//! WP-10 S10 increment 1 acceptance tests: HCM `upgrade_configs` ->
-//! `Vec<UpgradeConfig>` (config surface only; the tunnel itself lands in
-//! increments 2/3). Strict-parse -> PGV -> IR pipeline, so a config that
+//! S10 acceptance tests: HCM `upgrade_configs` ->
+//! `Vec<UpgradeConfig>` (config surface only; the tunnel itself is not
+//! covered here). Strict-parse -> PGV -> IR pipeline, so a config that
 //! never sets `upgrade_configs` is completely unaffected, and every malformed
-//! shape is a hard error carrying its full dotted path (ground rule #1).
+//! shape is a hard error carrying its full dotted path (AGENTS.md invariant 1).
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};

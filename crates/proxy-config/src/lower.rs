@@ -1,10 +1,10 @@
-//! WP-05: proto -> IR conversion ("lowering").
+//! Proto -> IR conversion ("lowering").
 //!
 //! Two passes over a loaded bootstrap:
 //!
 //! 1. **Surface check** (dynamic): walk every SET field reflectively and
 //!    reject any field outside the supported surface with its full dotted
-//!    path. This is ground rule #2's teeth — a field we have not implemented
+//!    path. This is AGENTS.md invariant 1's teeth — a field we have not implemented
 //!    can never be silently ignored, and a proto upgrade that adds fields
 //!    fails loudly instead of drifting.
 //! 2. **Typed conversion**: build the [`crate::ir`] types from the typed
@@ -46,7 +46,7 @@ use crate::ir::*;
 use crate::loader::LoadedBootstrap;
 
 /// Build the immutable IR snapshot from a loaded bootstrap. This is the only
-/// door between protobuf-land and the data plane (ground rule #3).
+/// door between protobuf-land and the data plane (AGENTS.md invariant 2).
 pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, ConfigError> {
     check_supported_surface(&loaded.dynamic, &mut String::new())?;
 
@@ -68,7 +68,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         snapshot.admin = Some(SocketAddr::new(ip, port));
     }
 
-    // WP-51 increment 3: see `convert_tracing_metadata`'s doc for why this
+    // See `convert_tracing_metadata`'s doc for why this
     // reads `node.metadata` rather than a `static_resources`-adjacent field.
     snapshot.tracing = convert_tracing_metadata(b.node.as_ref(), "node")?;
     // Deliberately a SEPARATE namespace key and a separate IR field from the
@@ -98,7 +98,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         ));
     }
 
-    // WP-20 increment 1. Lowered before `static_resources` so the ADS
+    // Lowered before `static_resources` so the ADS
     // cluster-existence check below can run against the finished cluster map.
     let ads_pending = convert_dynamic_resources(b, "dynamic_resources")?;
 
@@ -118,7 +118,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         return Ok(snapshot);
     };
 
-    // WP-50 3c-ii-a: `seen_stat_prefixes` accumulates across EVERY listener in
+    // `seen_stat_prefixes` accumulates across EVERY listener in
     // this bootstrap, not just within one -- two listeners each configuring
     // `llmproxy.auth` with the same `stat_prefix` is exactly the ambiguity
     // this check exists to reject. See `check_admin_addressable_stat_prefixes`'s
@@ -154,13 +154,13 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
             ));
         }
     }
-    // WP-35 increment 2b-ii: aggregate members refer to other clusters by
+    // Aggregate members refer to other clusters by
     // name, so they can only be checked once the whole map exists -- this
     // cannot fold into the loop above, because a member may be declared
     // after the aggregate that names it.
     validate_cluster_graph(sr, &snapshot)?;
 
-    // WP-20: the proto is explicit -- "The cluster with name `cluster_name`
+    // The proto is explicit -- "The cluster with name `cluster_name`
     // must be statically defined". Checked here, once the cluster map is
     // complete, for the same reason `validate_cluster_graph` is.
     if let Some(ads) = &ads_pending {
@@ -195,7 +195,7 @@ const DYNAMIC_ENDPOINTS_TYPE: &str = "envoy.config.endpoint.v3.ClusterLoadAssign
 
 /// Lower one xDS-delivered resource `Any` into its typed proto `T`, running
 /// the SAME strict-mode surface check `build_snapshot` runs over a whole
-/// file-loaded bootstrap (ground rule #1) -- just scoped to this one
+/// file-loaded bootstrap (AGENTS.md invariant 1) -- just scoped to this one
 /// resource instead of the whole tree. `path` is the caller's dotted-path
 /// root (e.g. `cds.clusters[payments-primary]`); every error below, and every
 /// error the surface walk finds deeper inside this resource, is reported
@@ -249,8 +249,8 @@ fn lower_dynamic_any<T: prost::Message + Default>(
 /// beneath it -- the ADS client passes something like
 /// `cds.clusters[payments-primary]`, mirroring how [`build_snapshot`] passes
 /// `static_resources.clusters[{i}]` for a file-loaded one. This runs the same
-/// strict-mode surface check `build_snapshot` applies to file config (ground
-/// rule #1) over this one resource before converting anything, so an
+/// strict-mode surface check `build_snapshot` applies to file config (AGENTS.md
+/// invariant 1) over this one resource before converting anything, so an
 /// xDS-delivered `Cluster` cannot carry a field the file loader would reject
 /// and slip through just because it arrived over the wire instead.
 pub fn lower_dynamic_cluster(
@@ -295,15 +295,15 @@ pub fn lower_dynamic_route(any: &prost_types::Any, path: &str) -> Result<RouteTa
 
 /// Lower one xDS-delivered `ClusterLoadAssignment` (an EDS resource) into its
 /// endpoints. See [`lower_dynamic_cluster`] for what `path` roots and why the
-/// surface check runs here too -- an EDS response is not exempt from ground
-/// rule #1 just because it never touches a bootstrap file.
+/// surface check runs here too -- an EDS response is not exempt from AGENTS.md
+/// invariant 1 just because it never touches a bootstrap file.
 ///
 /// Returns the assignment's `cluster_name` alongside the endpoints. That
 /// field is the EDS **resource name** -- it is what an `EdsClusterConfig`
-/// subscribes to via `service_name` (WP-21 increment 1), not necessarily the
+/// subscribes to via `service_name`, not necessarily the
 /// `Cluster.name` the endpoints end up attached to (Envoy allows the two to
 /// differ so several `Cluster`s can share one EDS resource). The caller
-/// (WP-21 increment 2b) is what matches this name back to a pending
+/// is what matches this name back to a pending
 /// subscription; nothing here assumes a 1:1 mapping.
 pub fn lower_dynamic_endpoints(
     any: &prost_types::Any,
@@ -404,10 +404,10 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "metadata",
             "health_checks",
             "outlier_detection",
-            // WP-21 increment 1: EDS clusters -- see `convert_eds_cluster_config`.
+            // EDS clusters -- see `convert_eds_cluster_config`.
             "eds_cluster_config",
         ],
-        // WP-35 increment 2b-i: the only custom cluster type implemented is
+        // The only custom cluster type implemented is
         // `envoy.clusters.aggregate` (see `convert_cluster`'s
         // `ClusterDiscoveryType::ClusterType` arm).
         //
@@ -417,11 +417,11 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // delete them as dead weight: `allowed_fields` returning `None` skips
         // the field-name check entirely (see `check_supported_surface`), so
         // the day an Envoy proto bump adds a field to either message, its
-        // absence here is a silent no-op -- ground rule #1's exact failure
+        // absence here is a silent no-op -- AGENTS.md invariant 1's exact failure
         // mode, arriving with no code change of ours to blame it on.
         "envoy.config.cluster.v3.Cluster.CustomClusterType" => &["name", "typed_config"],
         "envoy.extensions.clusters.aggregate.v3.ClusterConfig" => &["clusters"],
-        // WP-21 increment 1: `service_name` maps to IR (with its
+        // `service_name` maps to IR (with its
         // default-to-cluster-name behavior); `eds_config` is walked below via
         // `check_ads_source`'s ADS-only reasoning (see
         // `convert_eds_cluster_config`). `envoy.config.core.v3.ConfigSource`
@@ -432,16 +432,16 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // through and `check_ads_source` is what actually rejects the
         // unimplemented ones by name.
         "envoy.config.cluster.v3.Cluster.EdsClusterConfig" => &["eds_config", "service_name"],
-        // WP-50 / WP-47 increment 1: the first proto this project defines
+        // The first proto this project defines
         // itself rather than borrowing from Envoy. Listed for the same
         // forward-compat reason as the two entries above -- every field is
         // mapped today, so no config can trip these -- but with one difference
         // that makes them likelier to matter: WE add the fields to this
         // message. An `llmproxy.filters.v0` field added without a matching
-        // entry here would be accepted and ignored, which is ground rule #1's
+        // entry here would be accepted and ignored, which is AGENTS.md invariant 1's
         // exact failure mode arriving from our own change rather than an Envoy
         // bump.
-        // WP-61: `store` is a `oneof` -- its members (`in_memory`,
+        // `store` is a `oneof` -- its members (`in_memory`,
         // `persistent`) appear here under their OWN field names, not under
         // the oneof's Rust-level name ("store"), because that is how
         // `check_supported_surface` walks a `oneof` (it sees whichever
@@ -474,7 +474,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "subject_claim",
         ],
         "llmproxy.filters.v0.JwtKey" => &["kid", "n", "e"],
-        // WP-47 increment 2: the owned token-budget shape.  Keep both fields
+        // The owned token-budget shape.  Keep both fields
         // here even though the factory performs the required/value checks:
         // this is the forward-compat guard that rejects a future proto field
         // until a reader is deliberately added.
@@ -500,15 +500,15 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // RateLimitSettings has unrelated xDS fields; accepting any of them
         // would claim the limiter honors a knob it never reads.
         "envoy.config.core.v3.RateLimitSettings" => &["max_tokens", "fill_rate"],
-        // WP-47 increment 3: owned usage-filter configuration. The pricing
+        // Owned usage-filter configuration. The pricing
         // payload is intentionally opaque JSON; usage_filter validates its
         // schema before building the listener factory.
         "llmproxy.filters.v0.Usage" => &["dialect", "pricing_json"],
-        // WP-47 increment 4: owned body-rewrite configuration.
+        // Owned body-rewrite configuration.
         "llmproxy.filters.v0.BodyRewrite" => &["enabled", "dialect"],
         // One-release compatibility for the old borrowed body-rewrite type.
         "envoy.config.core.v3.RuntimeFeatureFlag" => &["default_value", "runtime_key"],
-        // WP-62 increment 3: the Redis-backed shared store. `url` is an
+        // The Redis-backed shared store. `url` is an
         // `envoy.config.core.v3.DataSource`, already listed above under its
         // own entry -- same reasoning as `hmac_secret`.
         "llmproxy.filters.v0.SharedStore" => &["url", "namespace"],
@@ -516,18 +516,18 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // `filter_metadata` is understood -- see
         // `convert_provider_auth_metadata`. `typed_filter_metadata` is not
         // implemented and stays out of this list so setting it is a strict-
-        // mode error rather than a silent no-op (ground rule #1); Envoy
+        // mode error rather than a silent no-op (AGENTS.md invariant 1); Envoy
         // itself only consults it when the plain map is absent, so no config
         // that already works today needs it.
         "envoy.config.core.v3.Metadata" => &["filter_metadata"],
         // S5 circuit breakers. `per_host_thresholds` is deliberately excluded
         // (we don't model per-host limits); a config setting it is rejected
-        // by the surface walk with its dotted path (ground rule #1) rather
+        // by the surface walk with its dotted path (AGENTS.md invariant 1) rather
         // than silently ignored.
         "envoy.config.cluster.v3.CircuitBreakers" => &["thresholds"],
         // `track_remaining` and `max_connection_pools` stay out on purpose:
         // this build has neither their stats surface nor per-cluster pool
-        // cap. `retry_budget` is different: WP-14 lowers and enforces it.
+        // cap. `retry_budget` is different: it is lowered and enforced.
         "envoy.config.cluster.v3.CircuitBreakers.Thresholds" => &[
             "priority",
             "max_connections",
@@ -540,7 +540,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "budget_percent",
             "min_retry_concurrency",
         ],
-        // S6 active health checking (WP-18). `initial_jitter`,
+        // S6 active health checking. `initial_jitter`,
         // `interval_jitter_percent`, `alt_port`, `reuse_connection`,
         // `unhealthy_interval`/`unhealthy_edge_interval`/`healthy_edge_interval`,
         // `event_log_path`, `event_logger`, `event_service`,
@@ -578,7 +578,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.config.core.v3.HealthCheck.TcpHealthCheck" => &["send", "receive"],
         "envoy.config.core.v3.HealthCheck.Payload" => &["text", "binary"],
         "envoy.type.v3.Int64Range" => &["start", "end"],
-        // S6 passive outlier detection (WP-19). The local-origin split
+        // S6 passive outlier detection. The local-origin split
         // (`consecutive_local_origin_failure`,
         // `enforcing_consecutive_local_origin_failure`,
         // `enforcing_local_origin_success_rate`,
@@ -613,7 +613,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         ],
         "envoy.config.endpoint.v3.ClusterLoadAssignment" => &["cluster_name", "endpoints"],
         "envoy.config.endpoint.v3.LocalityLbEndpoints" => &["lb_endpoints", "priority"],
-        // WP-56: `metadata` lowers into `EndpointIR::metadata` -- see
+        // `metadata` lowers into `EndpointIR::metadata` -- see
         // `convert_endpoint_metadata`. `health_status` stays off this list;
         // nothing consumes EDS-reported health today, so a config setting it
         // must fail loudly rather than have the value silently dropped.
@@ -635,13 +635,13 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "use_remote_address",
             "xff_num_trusted_hops",
             "access_log",
-            // WP-51 increment 3: listed so a config setting it gets
+            // Listed so a config setting it gets
             // `convert_hcm`'s specific "not implemented, see the dialect"
             // message instead of the generic surface-check one -- see
             // `HttpConnectionManager.Tracing`'s entry just below for why the
             // rejection happens there rather than mapping anything.
             "tracing",
-            // WP-10 S10: the upgrade types this HCM will tunnel. Lowered by
+            // S10: the upgrade types this HCM will tunnel. Lowered by
             // `convert_hcm` into `HttpConnectionManagerConfig::upgrade_configs`.
             "upgrade_configs",
         ],
@@ -651,7 +651,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.extensions.filters.network.http_connection_manager.v3.Rds" => {
             &["config_source", "route_config_name"]
         }
-        // WP-10 S10: `filters` is deliberately NOT listed -- per-upgrade
+        // S10: `filters` is deliberately NOT listed -- per-upgrade
         // filter chains are unimplemented (the tunnel is transparent, S10.2
         // deferred), so a config setting them is rejected right here by the
         // surface walk with the generic "not implemented yet" message rather
@@ -687,7 +687,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         ],
         "envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute" => &["disabled", "check_settings"],
         "envoy.extensions.filters.http.ext_authz.v3.CheckSettings" => &["context_extensions"],
-        // WP-24: access logging.
+        // Access logging.
         "envoy.config.accesslog.v3.AccessLog" => &["name", "filter", "typed_config"],
         "envoy.config.accesslog.v3.AccessLogFilter" => {
             &["status_code_filter", "response_flag_filter"]
@@ -799,7 +799,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // Listed even though its only two fields (`name`, `sds_config`) are
         // both already handled explicitly -- a future proto bump that adds a
         // third field should fail loudly here rather than pass through
-        // unchecked (ground rule #1).
+        // unchecked (AGENTS.md invariant 1).
         "envoy.extensions.transport_sockets.tls.v3.SdsSecretConfig" => &["name", "sds_config"],
         "envoy.extensions.transport_sockets.tls.v3.TlsParameters" => &[
             "tls_minimum_protocol_version",
@@ -822,7 +822,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector" => {
             &["max_client_hello_size"]
         }
-        // Upstream HTTP protocol selection (S? / WP-13 h2). Only the explicit
+        // Upstream HTTP protocol selection. Only the explicit
         // HTTP/1-vs-HTTP/2 selector is implemented; ALPN auto-negotiation and
         // downstream-protocol passthrough are follow-ups.
         "envoy.extensions.upstreams.http.v3.HttpProtocolOptions" => &["explicit_http_config"],
@@ -1270,7 +1270,7 @@ fn validate_ext_authz_clusters(snapshot: &mut ConfigSnapshot) -> Result<(), Conf
 /// `Route`, `VirtualHost`, and `RouteConfiguration`) into IR
 /// [`PerFilterConfig`] entries, keyed by filter name. `path` is the dotted
 /// path of the owning `typed_per_filter_config` field itself; each entry's
-/// error path is `{path}[{name}]`, matching ground rule #1.
+/// error path is `{path}[{name}]`, matching AGENTS.md invariant 1.
 ///
 /// Rust note: the return type is a [`std::collections::BTreeMap`], not a
 /// `HashMap` -- `m`'s iteration order is unspecified (it's a `HashMap`,
@@ -1359,7 +1359,7 @@ const ROUTER_TYPE: &str = "envoy.extensions.filters.http.router.v3.Router";
 const DOWNSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
 const UPSTREAM_TLS_TYPE: &str = "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 const TLS_INSPECTOR_TYPE: &str = "envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector";
-// WP-24: access logging sinks we implement.
+// Access logging sinks we implement.
 const FILE_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.file.v3.FileAccessLog";
 const STDOUT_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.stream.v3.StdoutAccessLog";
 const STDERR_ACCESS_LOG_TYPE: &str = "envoy.extensions.access_loggers.stream.v3.StderrAccessLog";
@@ -1370,7 +1370,7 @@ const DEFAULT_CONN_BUFFER_LIMIT: u32 = 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 /// Envoy default route timeout: 15s (S4).
 const DEFAULT_ROUTE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
-/// Envoy default `HealthCheck.no_traffic_interval` (S6, WP-18): 60s.
+/// Envoy default `HealthCheck.no_traffic_interval` (S6): 60s.
 const DEFAULT_NO_TRAFFIC_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 fn convert_listener(l: &listener_v3::Listener, path: &str) -> Result<ListenerConfig, ConfigError> {
@@ -1395,7 +1395,7 @@ fn convert_listener(l: &listener_v3::Listener, path: &str) -> Result<ListenerCon
         )?);
     }
     // Envoy rejects two filter chains with byte-identical match criteria at
-    // listener creation; catching it here keeps the matcher total (WP-07).
+    // listener creation; catching it here keeps the matcher total.
     for i in 0..filter_chains.len() {
         for j in (i + 1)..filter_chains.len() {
             if filter_chains[i].match_criteria == filter_chains[j].match_criteria {
@@ -1561,10 +1561,10 @@ fn convert_filter_chain(
         ));
     }
     if fc.filters.len() > 1 {
-        // Both supported filters are terminal; non-terminal L4 filters are WP-09.
+        // Both supported filters are terminal; non-terminal L4 filters are not implemented.
         return Err(unsupported(
             format!("{path}.filters[1]"),
-            "multiple network filters are not implemented yet (WP-09)",
+            "multiple network filters are not implemented yet",
         ));
     }
     let mut filters = Vec::new();
@@ -1580,9 +1580,9 @@ fn convert_filter_chain(
     })
 }
 
-/// The full 9-criteria `FilterChainMatch` (WP-07). `address_suffix`/`suffix_len`
+/// The full 9-criteria `FilterChainMatch`. `address_suffix`/`suffix_len`
 /// remain unimplemented (Envoy itself marks them `#not-implemented-hide`) and
-/// are rejected rather than silently dropped (ground rule #2).
+/// are rejected rather than silently dropped (AGENTS.md invariant 1).
 fn convert_filter_chain_match(
     m: &listener_v3::FilterChainMatch,
     path: &str,
@@ -1862,7 +1862,7 @@ fn convert_hcm(
         // maps its type to `&[]`), so its `config` is always `None`; every
         // other filter's `typed_config` is decoded reflectively here — the
         // registry (`proxy-http::FilterRegistry`), not this lowering pass,
-        // is what actually understands the bytes (ground rule #2).
+        // is what actually understands the bytes (AGENTS.md invariant 2).
         let mut config = if is_router {
             None
         } else {
@@ -1925,12 +1925,12 @@ fn convert_hcm(
 
     check_lane_h_filter_order(&http_filters, path)?;
 
-    // WP-10: `codec_type` is a plain (non-wrapped) proto3 enum, so its
+    // `codec_type` is a plain (non-wrapped) proto3 enum, so its
     // zero-value (0 == AUTO) IS the Envoy default -- no `unwrap_or` needed,
     // unlike the `BoolValue`s just below. `HTTP3` has no IR variant at all
     // (see `CodecType`'s doc): this proxy has no QUIC listener to speak it
     // over, so accepting the value and quietly falling back to `AUTO` would
-    // be exactly the silent-drop ground rule #1 forbids -- it must error with
+    // be exactly the silent-drop AGENTS.md invariant 1 forbids -- it must error with
     // its dotted path instead.
     let codec_type = match ProtoCodecType::try_from(hcm.codec_type) {
         Ok(ProtoCodecType::Auto) => CodecType::Auto,
@@ -1964,7 +1964,7 @@ fn convert_hcm(
 
     let access_logs = convert_access_logs(&hcm.access_log, &format!("{path}.access_log"))?;
 
-    // WP-51 increment 3: `tracing.provider.typed_config` would need to
+    // `tracing.provider.typed_config` would need to
     // resolve `envoy.config.trace.v3.OpenTelemetryConfig`, which is not
     // compiled into the descriptor pool -- see the allow-list comment on
     // `HttpConnectionManager.Tracing` above for how that was confirmed.
@@ -2001,7 +2001,7 @@ fn convert_hcm(
     })
 }
 
-/// WP-10 S10: lower an HCM's `upgrade_configs`. `upgrade_type` is required and
+/// S10: lower an HCM's `upgrade_configs`. `upgrade_type` is required and
 /// stored lowercased (Envoy matches it case-insensitively); `enabled` is a
 /// `BoolValue` defaulting to true; a duplicate `upgrade_type` is a config
 /// error, as it is in Envoy. Per-upgrade `filters` are already rejected by the
@@ -2038,13 +2038,13 @@ fn convert_upgrade_configs(
     Ok(out)
 }
 
-// --------------------------------------------------- Lane-H filter ordering --
+// ------------------------------------------------- llmproxy filter ordering --
 
-// The Lane-H filter type URLs this pass knows about.
+// The llmproxy filter type URLs this pass knows about.
 //
 // Duplicated as string literals rather than imported from `proxy-filters`,
 // which is the crate that actually defines them: `proxy-filters` depends on
-// `proxy-config`, so the dependency cannot point this way (ground rule #2).
+// `proxy-config`, so the dependency cannot point this way (AGENTS.md invariant 2).
 // The canonical definitions are `proxy_filters::{auth_filter, usage_filter,
 // token_limit_filter, body_rewrite_filter, model_authz_filter}::TYPE_URL`;
 // `tests::lane_h_type_urls_match_the_filters` in `proxy-filters` pins them
@@ -2054,29 +2054,29 @@ fn convert_upgrade_configs(
 // would pin nothing.
 pub const AUTH_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
 pub const TOKEN_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
-/// One-release compatibility alias for the WP-47 token-limit migration.
+/// One-release compatibility alias for the token-limit migration.
 /// Kept public so the ordering tests pin its relationship to the filter
 /// factory just as they pin the canonical type URL.
 pub const LEGACY_TOKEN_LIMIT_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
 pub const USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
-/// One-release compatibility alias for the WP-47 usage-filter migration.
+/// One-release compatibility alias for the usage-filter migration.
 pub const LEGACY_USAGE_FILTER_TYPE: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
 pub const BODY_REWRITE_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite";
-/// One-release compatibility alias for the WP-47 body-rewrite migration.
+/// One-release compatibility alias for the body-rewrite migration.
 pub const LEGACY_BODY_REWRITE_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
 pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
 
-/// Rejects Lane-H filter chains whose order silently disables a filter.
+/// Rejects llmproxy filter chains whose order silently disables a filter.
 ///
 /// # Why this is a config error and not a doc comment
 ///
 /// Both orderings below fail *silently* when they are wrong. Nothing errors at
 /// runtime, no log line appears, and every request succeeds — the affected
 /// filter simply reads `None` out of `StreamInfo` forever and does something
-/// plausible-looking with it. That is ground rule #1's failure mode exactly
+/// plausible-looking with it. That is AGENTS.md invariant 1's failure mode exactly
 /// (a config that means one thing and does another), and the only place it can
 /// be caught is here, where the whole chain is visible at once. A filter
 /// factory sees only its own `typed_config`; `FactoryContext` carries no view
@@ -2092,7 +2092,7 @@ pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0
 ///   The limiter buckets on `StreamInfo::auth.tenant`, which the auth filter
 ///   writes. Reversed, the limiter sees `None` and falls back to bucketing on
 ///   the client's `authorization` header — which is exactly the spoofable key
-///   WP-50 removed, so the reversed order is a **security** downgrade, not a
+///   the auth filter exists to remove, so the reversed order is a **security** downgrade, not a
 ///   cosmetic one.
 /// - `llmproxy.token_limit` before `llmproxy.usage` — the limiter's *record*
 ///   is **encode**-side, and reads the usage the usage filter wrote. Because
@@ -2100,7 +2100,7 @@ pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0
 ///   **later** in config order. Reversed, every request records **zero**
 ///   tokens against its budget: the limit exists and never fires.
 ///
-/// # WP-50 increment 3a: two more decode-side rules for `llmproxy.model_authz`
+/// # Two more decode-side rules for `llmproxy.model_authz`
 ///
 /// `llmproxy.model_authz` needs BOTH the tenant `llmproxy.auth` resolves
 /// (`StreamInfo::auth.tenant`) and the model `llmproxy.body_rewrite`
@@ -2112,10 +2112,10 @@ pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0
 /// design (`proxy_filters::model_authz_filter`'s module doc) — refuses EVERY
 /// request rather than silently admitting one it can't check; still a config
 /// error, because "authorization now refuses 100% of traffic" is exactly the
-/// kind of surprise ground rule #1 exists to catch at load time instead of
+/// kind of surprise AGENTS.md invariant 1 exists to catch at load time instead of
 /// in production.
 ///
-/// # WP-50 increment 3c-iii-b: `llmproxy.spend_limit` gets the SAME two-rule
+/// # `llmproxy.spend_limit` gets the SAME two-rule
 /// shape as `llmproxy.token_limit`, for the identical reason
 ///
 /// `llmproxy.spend_limit` is decode-check + encode-record, exactly like
@@ -2147,7 +2147,7 @@ fn check_lane_h_filter_order(
     path: &str,
 ) -> Result<(), ConfigError> {
     // A duplicate exact type URL is impossible (`FilterRegistry` keys on it),
-    // but WP-47 keeps one legacy TokenLimit alias registered for a release.
+    // but one legacy TokenLimit alias stays registered for a release.
     // A chain may therefore contain one old and one canonical limiter, so
     // each ordering rule must inspect EVERY matching position rather than
     // only the first and accidentally leave one unprotected.
@@ -2265,14 +2265,13 @@ fn check_lane_h_filter_order(
     Ok(())
 }
 
-/// WP-50 3c-ii-a: rejects a duplicate HCM `stat_prefix` among chains that
+/// Rejects a duplicate HCM `stat_prefix` among chains that
 /// configure `llmproxy.auth`, across this ENTIRE listener (`seen` is shared
 /// by every listener the caller processes, not reset per-listener -- two
 /// different listeners each configuring `llmproxy.auth` under the same
 /// `stat_prefix` collide exactly the same as two chains on one listener).
 ///
-/// Deliberately narrow, per
-/// `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing follows Envoy":
+/// Deliberately narrow (addressing follows Envoy):
 /// Envoy tolerates a duplicate `stat_prefix` everywhere (it merges stats),
 /// and a duplicate among chains that register NO admin-addressable
 /// singleton must stay legal -- e.g. two `llmproxy.token_limit`-only chains
@@ -2370,7 +2369,7 @@ fn convert_access_log(e: &accesslog_v3::AccessLog, path: &str) -> Result<AccessL
             use access_log_file_v3::file_access_log::AccessLogFormat as F;
             let sfs = match file.access_log_format {
                 Some(F::LogFormat(sfs)) => Some(sfs),
-                // Ground rule #1: the deprecated `format`/`json_format`/
+                // AGENTS.md invariant 1: the deprecated `format`/`json_format`/
                 // `typed_json_format` oneof members aren't in this message's
                 // `allowed_fields` entry, so the surface check already
                 // rejects them before typed conversion runs; this arm is
@@ -2468,7 +2467,7 @@ fn convert_substitution_format(
 }
 
 /// Parse a format string, wrapping the formatter's own parse error (which
-/// knows nothing about proto field paths — ground rule #2 keeps that
+/// knows nothing about proto field paths — AGENTS.md invariant 2 keeps that
 /// knowledge in `proxy-config`) into a [`ConfigError`] naming the field.
 fn parse_fmt(s: &str, path: &str) -> Result<FormatString, ConfigError> {
     parse_format(s).map_err(|e| unsupported(path, e.to_string()))
@@ -2597,7 +2596,7 @@ fn convert_downstream_tls(
 
     // Divergence #5 (internal-docs/envoy-divergences.md): Envoy's own proto
     // comment says `tls_certificate_sds_secret_configs` "is ignored" when
-    // `tls_certificates` is set. Ground rule #1 forbids silently ignoring a
+    // `tls_certificates` is set. AGENTS.md invariant 1 forbids silently ignoring a
     // set field, so we reject the mixed case by path instead.
     match (certificates.is_empty(), certificate_sds_names.is_empty()) {
         (false, false) => {
@@ -2630,7 +2629,7 @@ fn convert_downstream_tls(
     // Rust note: `session_ticket_keys_type` is a proto oneof, so its Rust
     // shape is `Option<enum>` — one variant per oneof member. Only the
     // stateless-resumption bool is supported; the other members are secret
-    // material we don't handle yet (WP-22).
+    // material we don't handle yet.
     use tls_v3::downstream_tls_context::SessionTicketKeysType;
     let disable_stateless_session_resumption = match &ctx.session_ticket_keys_type {
         None => false,
@@ -2638,13 +2637,13 @@ fn convert_downstream_tls(
         Some(SessionTicketKeysType::SessionTicketKeys(_)) => {
             return Err(unsupported(
                 format!("{cfg_path}.session_ticket_keys"),
-                "explicit session ticket keys are not implemented yet (WP-22)",
+                "explicit session ticket keys are not implemented yet",
             ))
         }
         Some(SessionTicketKeysType::SessionTicketKeysSdsSecretConfig(_)) => {
             return Err(unsupported(
                 format!("{cfg_path}.session_ticket_keys_sds_secret_config"),
-                "SDS-delivered session ticket keys are not implemented yet (WP-22)",
+                "SDS-delivered session ticket keys are not implemented yet",
             ))
         }
     };
@@ -2810,12 +2809,12 @@ fn convert_tls_certificate(
 
 /// Downstream: 1 or 2 certificates (one per key type — RSA and ECDSA — like
 /// Envoy/BoringSSL). Which entry is which key type is resolved when the
-/// rustls socket loads the keys (WP-08 chunk B), not here.
+/// rustls socket loads the keys, not here.
 ///
 /// Callers only invoke this for a non-empty slice; the "must be non-empty"
 /// half of the invariant lives in `convert_downstream_tls`, alongside the
 /// `tls_certificate_sds_secret_configs` mutual-exclusion check it shares a
-/// path with (WP-22 increment 2a).
+/// path with.
 fn convert_downstream_certificates(
     certs: &[tls_v3::TlsCertificate],
     path: &str,
@@ -2834,7 +2833,7 @@ fn convert_downstream_certificates(
 }
 
 /// `tls_certificate_sds_secret_configs` -> secret names the SDS subscription
-/// will request (WP-22 increment 2a). Each entry must carry an ADS
+/// will request. Each entry must carry an ADS
 /// `sds_config`; a name-only entry means "look this up in
 /// `static_resources.secrets`", which is refused below rather than resolved
 /// to nothing -- see the doc on `DownstreamTlsSpec::certificate_sds_names`.
@@ -2873,7 +2872,7 @@ fn convert_certificate_sds_configs(
                 sds_config_path,
                 "a name-only SdsSecretConfig resolves against static_resources.secrets, \
                  whose TlsSecret is still a stub carrying only a name, so there is nothing \
-                 to resolve to yet (WP-22, a later increment)",
+                 to resolve to yet",
             ));
         }
         if source
@@ -2910,18 +2909,18 @@ fn convert_upstream_certificate(
 
 // --------------------------------------------------------- dynamic (xDS) --
 
-/// Lower bootstrap `dynamic_resources` into [`AdsConfig`] (WP-20 increment 1).
+/// Lower bootstrap `dynamic_resources` into [`AdsConfig`].
 ///
 /// **This widens a deliberate refusal, it does not fix a silent drop.** Before
 /// this increment `Bootstrap`'s allowed-field list named only
 /// `node`/`admin`/`static_resources`, so a config carrying `dynamic_resources`
-/// failed strict-mode validation by name -- ground rule #1 working correctly.
+/// failed strict-mode validation by name -- AGENTS.md invariant 1 working correctly.
 ///
 /// v1 accepts a narrow surface and refuses everything else with its full
 /// dotted path: `api_type: GRPC`, `transport_api_version: V3`, and exactly one
 /// `grpc_services` entry using `envoy_grpc` when an ADS source is selected.
 /// Per-type LDS/CDS filesystem sources are also supported; `eds_config` needs
-/// an IR discovery variant that WP-21 owns.
+/// an IR discovery variant that does not exist.
 fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConfig>, ConfigError> {
     let Some(dr) = &b.dynamic_resources else {
         return Ok(None);
@@ -3006,7 +3005,7 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
         }));
     }
 
-    // EDS is WP-21's: the IR has no `Eds` discovery variant to lower into, and
+    // EDS is not lowered here: the IR has no `Eds` discovery variant to lower into, and
     // inventing one here would put the warming semantics in the wrong package.
     if !lds && !cds {
         return Err(invalid(
@@ -3206,7 +3205,7 @@ fn convert_api_config_source(
     // accessor that maps an unknown value to the default; matching on the
     // accessor keeps every named variant explicit (no `_ =>` fallthrough), so
     // adding a variant upstream is a compile error rather than a silent
-    // acceptance -- ground rule #1 applied to enums.
+    // acceptance -- AGENTS.md invariant 1 applied to enums.
     let protocol = match api.api_type() {
         ApiType::Grpc => crate::ir::AdsProtocol::Sotw,
         ApiType::DeltaGrpc => crate::ir::AdsProtocol::Delta,
@@ -3358,16 +3357,16 @@ fn convert_validation_context(
         )),
         Some(ValidationContextType::CombinedValidationContext(_)) => Err(unsupported(
             format!("{common_path}.combined_validation_context"),
-            "combined (static + SDS) validation contexts are not implemented yet (WP-22)",
+            "combined (static + SDS) validation contexts are not implemented yet",
         )),
         Some(ValidationContextType::ValidationContextCertificateProvider(_)) => Err(unsupported(
             format!("{common_path}.validation_context_certificate_provider"),
-            "certificate-provider validation contexts are not implemented (WP-22)",
+            "certificate-provider validation contexts are not implemented",
         )),
         Some(ValidationContextType::ValidationContextCertificateProviderInstance(_)) => {
             Err(unsupported(
                 format!("{common_path}.validation_context_certificate_provider_instance"),
-                "certificate-provider validation contexts are not implemented (WP-22)",
+                "certificate-provider validation contexts are not implemented",
             ))
         }
     }
@@ -3390,7 +3389,7 @@ fn convert_validation_context_sds_config(
             sds_config_path,
             "a name-only SdsSecretConfig resolves against static_resources.secrets, \
              whose TlsSecret is still a stub carrying only a name, so there is nothing \
-             to resolve to yet (WP-22, a later increment)",
+             to resolve to yet",
         ));
     }
     if source
@@ -3476,7 +3475,7 @@ fn convert_san_matcher(
 
 /// `envoy.type.matcher.v3.StringMatcher` -> IR. `ignore_case` only makes
 /// sense for exact/prefix/suffix/contains (the proto doc says as much);
-/// combining it with `safe_regex` is meaningless, so — per ground rule #2 —
+/// combining it with `safe_regex` is meaningless, so — per AGENTS.md invariant 1 —
 /// it's rejected rather than silently ignored.
 fn convert_string_matcher(
     sm: &matcher_v3::StringMatcher,
@@ -3615,7 +3614,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
             let agg: aggregate_cluster_v3::ClusterConfig = decode_any(any, &cfg_path)?;
             // Belt and suspenders: the proto's own `repeated.min_items = 1`
             // PGV annotation on `clusters` already rejects this during
-            // `parse_bootstrap` (`validate::validate_message`, WP-04), before
+            // `parse_bootstrap` (`validate::validate_message`), before
             // `convert_cluster` ever runs, so this arm is unreachable through
             // the normal `parse_bootstrap` -> `build_snapshot` pipeline today.
             // It stays because `build_snapshot`'s own doc only promises it is
@@ -3643,7 +3642,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     };
     let is_aggregate = matches!(kind, ClusterKind::Aggregate { .. });
 
-    // WP-21 increment 1: `eds_cluster_config`'s shape and defaulting, only
+    // `eds_cluster_config`'s shape and defaulting, only
     // consulted for the `Eds` arm just above -- see `convert_eds_cluster_config`.
     let eds = match discovery {
         DiscoveryType::Eds => Some(convert_eds_cluster_config(c, path)?),
@@ -3656,7 +3655,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         Ok(ProtoLb::Random) => LbPolicy::Random,
         Ok(ProtoLb::ClusterProvided) => LbPolicy::ClusterProvided,
         // RING_HASH / MAGLEV: the `LbPolicy` variants exist so the IR can
-        // model them, but WP-17 deliberately does not implement them yet --
+        // model them, but we deliberately do not implement them yet --
         // a consistent-hash that isn't bit-identical to Envoy's silently
         // breaks session affinity across a mixed fleet, so it needs an Envoy
         // differential harness first. Reject at *config* time rather than at
@@ -3664,12 +3663,12 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         // cluster, but that error surfaces after startup, leaving the cluster
         // simply absent and every request to it answered 503 with no
         // explanation. Failing here means `make validate` and startup say
-        // exactly what is wrong, with the full dotted path (ground rule #1).
+        // exactly what is wrong, with the full dotted path (AGENTS.md invariant 1).
         Ok(policy @ (ProtoLb::RingHash | ProtoLb::Maglev)) => {
             return Err(unsupported(
                 format!("{path}.lb_policy"),
                 format!(
-                    "{} load balancing is not implemented yet (WP-17 follow-up: it requires \
+                    "{} load balancing is not implemented yet (it requires \
                      bit-exact parity with Envoy's hashing, verified by a differential test, \
                      or session affinity breaks across a mixed fleet)",
                     policy.as_str_name()
@@ -3711,7 +3710,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
 
     // Everything below is inert on an aggregate cluster: the member that
     // actually serves a request supplies its own endpoints, TLS, upstream
-    // protocol, and (for the dialect) credentials -- ground rule #1 forbids
+    // protocol, and (for the dialect) credentials -- AGENTS.md invariant 1 forbids
     // silently accepting-and-ignoring any of them, so each is a hard error
     // naming its own dotted path rather than a silent no-op.
     if is_aggregate {
@@ -3752,7 +3751,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // `load_assignment` (no locality carries any `lb_endpoints`) is harmless
     // and left alone, since it lowers to the same empty `endpoints` an EDS
     // cluster needs anyway. A non-empty one is rejected: its hosts would be
-    // silently ignored in favour of the EDS-delivered set, ground rule #1's
+    // silently ignored in favour of the EDS-delivered set, AGENTS.md invariant 1's
     // exact shape.
     if discovery == DiscoveryType::Eds {
         let has_any_endpoint = c.load_assignment.as_ref().is_some_and(|la| {
@@ -3801,12 +3800,12 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // gets an empty list here, unchanged from before.
     let request_headers_to_add = convert_provider_auth_metadata(c.metadata.as_ref(), path)?;
     let provider_runtime = convert_provider_runtime_metadata(c.metadata.as_ref(), path)?;
-    // Ground rule #6's third instance (AGENTS.md invariant 6): the usage-filter dialect
+    // A known instance of AGENTS.md invariant 6: the usage-filter dialect
     // is per-provider, so it rides the same `Cluster.metadata.filter_metadata`
     // smuggling channel as credentials above, under its own namespace.
     let usage_dialect = convert_usage_dialect_metadata(c.metadata.as_ref(), path)?;
     let request_path_rewrite = convert_request_path_rewrite_metadata(c.metadata.as_ref(), path)?;
-    // S6 active health checking (WP-18): meaningful on an aggregate too, in
+    // S6 active health checking: meaningful on an aggregate too, in
     // principle, but Envoy runs health checks against a cluster's own hosts
     // -- an aggregate has none -- so `c.health_checks` on one is inert the
     // same way `load_assignment` is, and gets the same treatment below.
@@ -3818,7 +3817,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         ));
     }
     let health_check = convert_health_check(&c.health_checks, path)?;
-    // S6 passive outlier detection (WP-19): same aggregate reasoning as
+    // S6 passive outlier detection: same aggregate reasoning as
     // `health_checks` just above -- ejection acts on a cluster's own hosts,
     // and an aggregate has none, so an `outlier_detection` block on one is
     // inert and rejected rather than silently ignored.
@@ -3857,7 +3856,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
 /// `Cluster.eds_cluster_config` -> IR, called only for the `Eds` arm of
 /// `convert_cluster`'s discovery match. Envoy requires this block to be set
 /// on an EDS cluster, requires its `eds_config` to be set, and this project
-/// has exactly one transport that can deliver it: WP-20's ADS client -- a
+/// has exactly one transport that can deliver it: the ADS client -- a
 /// `path_config_source`, `api_config_source`, or `self` source is a
 /// different delivery mechanism we do not implement.
 fn convert_eds_cluster_config(
@@ -3906,7 +3905,7 @@ fn convert_eds_cluster_config(
     Ok(EdsClusterConfig { service_name })
 }
 
-/// WP-35 increment 2b-ii: a cross-cluster post-pass over the assembled
+/// A cross-cluster post-pass over the assembled
 /// cluster map, checking that every aggregate's members are wired correctly.
 /// It cannot run inside `build_snapshot`'s per-cluster loop -- a member
 /// cluster may be declared *after* the aggregate that names it, and
@@ -3926,7 +3925,7 @@ fn convert_eds_cluster_config(
 ///   since `LoadBalancerContext::attempted_clusters` skips a cluster already
 ///   tried this request
 ///
-/// Ground rule #1's shape exactly: each of these degrades into a silent
+/// AGENTS.md invariant 1's shape exactly: each of these degrades into a silent
 /// runtime no-op (a 503 with no explanation, or a fallback that never
 /// receives traffic) instead of a config-time error, unless caught here.
 ///
@@ -4005,7 +4004,7 @@ const PATH_TEMPLATE_METADATA_KEY: &str = "io.llmproxy.path_template";
 ///
 /// `google.protobuf.Struct` is opaque to the reflective surface walk (it is
 /// a well-known type, so `check_supported_surface` stops recursing at its
-/// boundary), so ground rule #1's "every field maps or errors" guarantee has
+/// boundary), so AGENTS.md invariant 1's "every field maps or errors" guarantee has
 /// to be re-implemented by hand here for this one namespace: any shape that
 /// isn't exactly the one above -- wrong types, missing `key`/`value`,
 /// unrecognized sub-keys -- is a hard error with its full dotted path, never
@@ -4367,13 +4366,13 @@ fn convert_request_path_rewrite_metadata(
 }
 
 /// Namespace key the `llmproxy` dialect uses to carry the usage-filter
-/// dialect through `Cluster.metadata.filter_metadata` -- ground rule #6's
-/// third instance (AGENTS.md invariant 6): the dialect is a per-provider property, so it
+/// dialect through `Cluster.metadata.filter_metadata` -- a known instance of
+/// AGENTS.md invariant 6: the dialect is a per-provider property, so it
 /// has to follow the cluster that is actually dialled, the same way
-/// [`PROVIDER_AUTH_METADATA_KEY`] carries credentials. This increment (WP-35
-/// inc 1) only populates [`ClusterConfig::usage_dialect`]; the usage filter
-/// itself still reads the route-level `typed_per_filter_config` copy until a
-/// later increment plumbs the cluster value through to it.
+/// [`PROVIDER_AUTH_METADATA_KEY`] carries credentials. This key only
+/// populates [`ClusterConfig::usage_dialect`]; the usage filter itself still
+/// reads the route-level `typed_per_filter_config` copy until the cluster
+/// value is plumbed through to it.
 const USAGE_DIALECT_METADATA_KEY: &str = "io.llmproxy.usage";
 
 /// Namespace for the route-level strict streaming assertion.  Route metadata
@@ -4428,7 +4427,7 @@ fn convert_streaming_strict_metadata(
 ///
 /// Same re-implementation-by-hand rationale as
 /// [`convert_provider_auth_metadata`]: `google.protobuf.Struct` is opaque to
-/// the reflective surface walk, so ground rule #1 has to be enforced here
+/// the reflective surface walk, so AGENTS.md invariant 1 has to be enforced here
 /// directly -- an unrecognized `dialect` value, a missing `dialect` key, or
 /// any unexpected key in the namespace is a hard error with its full dotted
 /// path, never a silent skip. Any *other* `filter_metadata` namespace
@@ -4495,7 +4494,7 @@ const TRACING_METADATA_KEY: &str = "io.llmproxy.tracing";
 /// re-implementation-by-hand pattern as
 /// `convert_provider_auth_metadata`/`convert_usage_dialect_metadata`:
 /// `google.protobuf.Struct` is opaque to the reflective surface walk, so
-/// ground rule #1 has to be enforced here directly, and any error names its
+/// AGENTS.md invariant 1 has to be enforced here directly, and any error names its
 /// full dotted path rather than a silent skip. A real Envoy config's
 /// `node.metadata` may carry anything else under any other key; only this
 /// one namespace is ever inspected, and nothing else there is touched.
@@ -4673,7 +4672,7 @@ const DEFAULT_TRACING_EXPORT_DEADLINE: StdDuration = StdDuration::from_secs(5);
 /// export_deadline: <seconds> (optional, default 10) }`.
 ///
 /// Structurally a sibling of [`convert_tracing_metadata`] -- same opaque
-/// `google.protobuf.Struct` walk, same ground-rule-#1 enforcement, same
+/// `google.protobuf.Struct` walk, same AGENTS.md invariant 1 enforcement, same
 /// deterministic (sorted) unknown-key reporting -- with two additions the
 /// tracing block has no reason to make:
 ///
@@ -4870,7 +4869,7 @@ const HTTP_PROTOCOL_OPTIONS_TYPE: &str = "envoy.extensions.upstreams.http.v3.Htt
 /// name; we only implement the one entry that selects HTTP/1 vs HTTP/2
 /// (`envoy.extensions.upstreams.http.v3.HttpProtocolOptions`), so any other
 /// key -- or any of that message's fields we don't model -- is rejected with
-/// its full dotted path (ground rule #1) rather than silently ignored.
+/// its full dotted path (AGENTS.md invariant 1) rather than silently ignored.
 fn convert_upstream_protocol(
     opts: &std::collections::HashMap<String, prost_types::Any>,
     path: &str,
@@ -5225,7 +5224,7 @@ fn convert_tcp_health_check(
 /// `Payload.text` is HEX-ENCODED (Envoy's own doc: `"000000FF"` decodes to
 /// four bytes), never raw text; `Payload.binary` is already raw bytes.
 /// Getting this backwards silently changes what a TCP health check sends or
-/// matches without any error -- exactly ground rule #1's failure mode.
+/// matches without any error -- exactly AGENTS.md invariant 1's failure mode.
 fn convert_payload(
     payload: &core_v3::health_check::Payload,
     path: &str,
@@ -5291,7 +5290,7 @@ fn convert_outlier_detection(
     // doc and `OutlierDetectionConfig::split_external_local_origin_errors`.
     // `true` would need a whole separate local-origin failure axis the
     // detector folds into the 5xx path instead, so it is rejected rather
-    // than accepted-and-ignored (ground rule #1).
+    // than accepted-and-ignored (AGENTS.md invariant 1).
     if od.split_external_local_origin_errors {
         return Err(unsupported(
             format!("{od_path}.split_external_local_origin_errors"),
@@ -5413,7 +5412,7 @@ const ENDPOINT_METADATA_KEY: &str = "io.llmproxy.endpoint";
 /// Envoy's own LB subset-routing selector, and this proxy implements no
 /// subset routing, so silently accepting it into a map nothing routes on
 /// would leave an operator's exclusion list installed but never enforced --
-/// ground rule #1's exact failure mode. Any third namespace gets the same
+/// AGENTS.md invariant 1's exact failure mode. Any third namespace gets the same
 /// refusal with a plainer "unknown namespace" message.
 fn convert_endpoint_metadata(
     metadata: Option<&core_v3::Metadata>,
@@ -5501,7 +5500,7 @@ fn convert_endpoint(
     // `discovery::static_hosts` -- and that does no name resolution either.
     // Accepting a name here would not make it work; it would only move the
     // failure from a config-time error carrying a dotted path to a per-update
-    // runtime `io::Error` on every EDS push, which is ground rule #1's exact
+    // runtime `io::Error` on every EDS push, which is AGENTS.md invariant 1's exact
     // shape. Envoy's EDS wire format does permit a hostname, so this is a
     // limitation of what we can currently do with one, and the message says
     // so rather than claiming the wire format forbids it.
@@ -5570,7 +5569,7 @@ fn convert_upstream_tls(
     if validation_sds_name.is_some() {
         return Err(unsupported(
             format!("{common_path}.validation_context_sds_secret_config"),
-            "SDS-delivered validation contexts are implemented only for downstream TLS (WP-22)",
+            "SDS-delivered validation contexts are implemented only for downstream TLS",
         ));
     }
 
@@ -6058,17 +6057,17 @@ fn convert_retry_policy(
 
     let retry_on = RetryOn::parse(&rp.retry_on);
 
-    // Ground rule #1. `envoy-ratelimited` retries when the response carries
+    // AGENTS.md invariant 1. `envoy-ratelimited` retries when the response carries
     // `x-envoy-ratelimited`, a header only a rate-limit filter sets -- and no
-    // such filter exists yet (WP-31/WP-32), so nothing can ever produce the
+    // such filter exists yet, so nothing can ever produce the
     // condition. Accepting the token would mean a config that reads as "retry
     // rate-limited responses" and never retries anything.
     if retry_on.envoy_ratelimited {
         return Err(unsupported(
             format!("{path}.retry_on"),
             "the `envoy-ratelimited` retry trigger is not implemented yet (it fires on the \
-             `x-envoy-ratelimited` response header, which no filter sets until WP-31/WP-32 \
-             land the rate-limit filters)",
+             `x-envoy-ratelimited` response header, which no filter sets, because no rate-limit \
+             filter exists yet)",
         ));
     }
 

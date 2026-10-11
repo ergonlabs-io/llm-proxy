@@ -28,7 +28,7 @@ use diffrig::replay::{replay_managed, replay_scenario, ManagedReplayConfig};
 use diffrig::scenario::load_scenario_file;
 
 #[derive(Parser)]
-#[command(name = "diffrig", about = "WP-26 differential test rig")]
+#[command(name = "diffrig", about = "differential test rig")]
 struct Args {
     #[command(subcommand)]
     command: DiffrigCommand,

@@ -1,4 +1,4 @@
-//! WP-13 h2: `typed_extension_protocol_options` -> IR `UpstreamProtocol`
+//! `typed_extension_protocol_options` -> IR `UpstreamProtocol`
 //! acceptance tests. Covers HTTP/1 (explicit and default-absent), HTTP/2,
 //! and rejection of every unsupported shape the config could take:
 //! HTTP/3, `use_downstream_protocol_config`, an unknown map key, and tuning

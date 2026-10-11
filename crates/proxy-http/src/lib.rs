@@ -1,26 +1,21 @@
-//! HTTP data plane (Lane C).
+//! HTTP data plane.
 //!
-//! Work packages (see internal-docs/IMPLEMENTATION_PLAN.md):
-//! - WP-10: h1/h2 codec integration (downstream + upstream), including WebSocket
-//!   upgrades: 101 tunnel mode and h2 extended CONNECT translation (Appendix S10).
-//!   Chunk A ([`hyper_spike` test](../tests/hyper_spike.rs)) de-risked the
-//!   hyper 1.x low-level `conn` API; chunk B ([`codec`], [`handler`]) is the
-//!   standalone downstream HTTP/1.1 codec and the provisional `StreamHandler`
-//!   seam it hands requests to. h2 downstream, HTTP upgrades (S10), the
-//!   upstream codec, and wiring the codec into `proxy-core`'s listener are
-//!   later chunks.
-//! - WP-11: HTTP filter manager — implements the S2 iteration state machine
-//!   exactly, driving the API in [`filter`]; will implement/refine the
-//!   `StreamHandler` seam from chunk B; upgraded streams keep flowing
-//!   through the filter chain as data (S10.2).
-//! - WP-12: route table + matching engine (Appendix S1).
-//! - WP-13: router filter + upstream request lifecycle (Appendices S4, S9).
-//!   [`headers`] implements the S9 header-sanitization functions this WP
-//!   will call.
-//! - WP-14: retry & hedging engine (Appendix S3).
+//! - Codec ([`codec`], [`handler`]): downstream and upstream h1/h2, including
+//!   WebSocket upgrades (101 tunnel mode and h2 extended CONNECT translation,
+//!   envoy-semantics.md S10). The `StreamHandler` seam is what the codec hands
+//!   each request to; `tests/hyper_spike.rs` records the hyper 1.x
+//!   capability findings the codec design rests on.
+//! - Filter manager ([`filter_manager`]): implements the S2 iteration state
+//!   machine exactly, driving the API in [`filter`]; upgraded streams keep
+//!   flowing through the filter chain as data (S10.2).
+//! - Route table and matching engine ([`route`], envoy-semantics.md S1).
+//! - Router filter and upstream request lifecycle ([`router`],
+//!   envoy-semantics.md S4, S9). [`headers`] implements the S9
+//!   header-sanitization functions the router calls.
+//! - Retry and hedging engine ([`retry`], envoy-semantics.md S3).
 //!
-//! The [`filter`] module is the frozen shared surface consumed by WP-31/32
-//! filters and Lane H (ground rule #4).
+//! The [`filter`] module is the frozen shared surface consumed by the other
+//! HTTP filters (AGENTS.md invariant 8).
 
 pub mod access_logging;
 mod attempt_logging;

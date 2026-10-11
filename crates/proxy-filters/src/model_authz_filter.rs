@@ -1,9 +1,8 @@
-//! WP-50 increment 3a — wires [`crate::model_authz`]'s `ModelAccess`/
+//! Wires [`crate::model_authz`]'s `ModelAccess`/
 //! `ModelPattern` matcher into a real decode-path `HttpFilter`:
-//! `llmproxy.model_authz`. See `internal-docs/IMPLEMENTATION_PLAN.md`'s
-//! "3a" and "The load-bearing seam" sections, which are normative here.
+//! `llmproxy.model_authz`.
 //!
-//! # Decode-path only, and it must run LAST among the Lane-H filters it needs
+//! # Decode-path only, and it must run LAST among the LLM-layer filters it needs
 //!
 //! This filter needs two facts that only exist once two OTHER decode-path
 //! filters have already run: `StreamInfo::auth.tenant` (written by
@@ -36,7 +35,7 @@
 //!
 //! Get the config order backwards and this filter reads `None` for the
 //! tenant and refuses EVERY request (see the next section), which is at
-//! least loud, unlike the two existing Lane-H ordering traps this one joins
+//! least loud, unlike the two existing LLM-layer ordering traps this one joins
 //! (`token_limit_filter`'s module doc).
 //!
 //! # Fail closed on missing inputs; OPEN on an unconfigured tenant
@@ -44,7 +43,7 @@
 //! Two ways this filter refuses a request, both with the SAME wire response
 //! and the SAME generic `%RESPONSE_CODE_DETAILS%` (`model_not_permitted` --
 //! never naming which applied, and never rendering a policy's contents or a
-//! tenant's allow-list, per the design brief):
+//! tenant's allow-list):
 //!
 //! 1. **No authenticated tenant** (`StreamInfo::auth.tenant` is `None`) -- an
 //!    unauthenticated stream cannot be authorized against a per-tenant
@@ -60,11 +59,10 @@
 //! ordinary denial sharing the same treatment.
 //!
 //! **An authenticated tenant ABSENT from the snapshot's `policies` is
-//! ALLOWED**, not refused -- this is WP-50 increment 3b-iv's reversal of
-//! this filter's original (3a) case 3, an owner decision recorded in
-//! `internal-docs/IMPLEMENTATION_PLAN.md`. Authorization
+//! ALLOWED**, not refused -- this reverses the filter's
+//! original behavior (refuse), an owner decision. Authorization
 //! defaults OPEN (`ModelAccess::default()` is `All`; see
-//! `crate::model_authz::ModelAccess`'s doc), and as of this increment that
+//! `crate::model_authz::ModelAccess`'s doc), and that
 //! default applies uniformly whether the tenant is missing because this
 //! filter is absent from the chain OR because it is present but nothing
 //! ever wrote a policy for that tenant -- the two are no longer
@@ -83,7 +81,7 @@
 //!
 //! # Reads the `ControlPlaneSnapshot`, not its own `typed_config`
 //!
-//! As of WP-50 increment 3b-iv, this filter no longer enforces the policy
+//! This filter does not enforce the policy
 //! map `typed_config.policies` parses to directly. Instead
 //! [`ModelAuthzFilterFactory::create`] resolves the SAME
 //! `crate::control::ControlPlane` singleton `llmproxy.auth`'s factory
@@ -96,9 +94,8 @@
 //! published `Arc<ArcSwap<ControlPlaneSnapshot>>` for the request-time
 //! lookup below. This is what makes admin `PUT /tenants/{id}/policy`
 //! (which writes to the SAME `ControlPlane` and republishes) take effect on
-//! this filter's very next request, with no reload -- before this
-//! increment the admin endpoint had no path to this filter at all. See the
-//! design brief's "Why" section.
+//! this filter's very next request, with no reload -- an admin endpoint with its own
+//! store would have had no path to this filter at all.
 //!
 //! `proxy_config`'s lowering requires `llmproxy.auth` BEFORE
 //! `llmproxy.model_authz` in a listener's `http_filters` list (the same
@@ -107,10 +104,9 @@
 //! time this filter's `create` runs, `llmproxy.auth`'s factory has already
 //! registered the singleton earlier in the SAME per-worker build. `None`
 //! here is therefore always a config error, not a race: `model_authz`
-//! configured without `llmproxy.auth` anywhere in the chain. Before this
-//! increment that combination was legal and silently denied every request
+//! configured without `llmproxy.auth` anywhere in the chain. That combination used to be legal and silently denied every request
 //! (case 1 above, no tenant ever gets set); an explicit load-time error is
-//! strictly better and is what ground rule #1 asks for.
+//! strictly better and is what AGENTS.md invariant 1 asks for.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -172,7 +168,7 @@ fn validate_pattern(raw: &str, field_path: &str) -> Result<(), ConfigError> {
 
 /// Reads one `TenantModelPolicy.access` oneof into a [`ModelAccess`]. Strict
 /// mode: an unset oneof (neither `all` nor `only` present) is a config error
-/// naming its own dotted path -- ground rule #1 applies to a oneof exactly
+/// naming its own dotted path -- AGENTS.md invariant 1 applies to a oneof exactly
 /// as it does to any other field, and this is also the exact case the design
 /// brief warns about: the ONLY thing this function must never do on a
 /// malformed/unset `access` is return `Ok(ModelAccess::All)`, because that
@@ -221,8 +217,8 @@ fn parse_model_access(
         )),
         // A proto3 oneof cannot have two branches set simultaneously through
         // the reflection API used to build this message (setting one clears
-        // the other) -- this arm is unreachable in practice, but per ground
-        // rule #1's "error, never silently pick one" convention (see
+        // the other) -- this arm is unreachable in practice, but per
+        // AGENTS.md invariant 1's "error, never silently pick one" convention (see
         // `convert_access_log`'s identical treatment of a deprecated oneof
         // member in `proxy-config/src/lower.rs`), it is a loud error rather
         // than a panic or an arbitrary pick.
@@ -234,13 +230,13 @@ fn parse_model_access(
 }
 
 /// Reads `typed_config` (an `llmproxy.filters.v0.ModelAuthz`) into a
-/// tenant -> policy map. As of WP-50 increment 3b-iv this is BOOTSTRAP data
+/// tenant -> policy map. This is BOOTSTRAP data
 /// -- [`ModelAuthzFilterFactory::create`] passes the result to
 /// `ControlPlane::seed_bootstrap_policies`, not to this filter's own
 /// enforcement path, which reads the published `ControlPlaneSnapshot`
 /// instead (see the module doc). Strict mode still applies exactly as
 /// before: every field either maps in or errors with its dotted path
-/// (ground rule #1).
+/// (AGENTS.md invariant 1).
 ///
 /// # Absence vs. failure, restated for this function specifically
 ///
@@ -319,7 +315,7 @@ pub fn parse_config(config: &DynamicMessage) -> Result<TenantPolicyMap, ConfigEr
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override --
-/// this increment has no per-route config; the trait default
+/// this filter has no per-route config; the trait default
 /// (`ConfigError::Unimplemented`) is correct.
 #[derive(Default)]
 pub struct ModelAuthzFilterFactory;
@@ -340,7 +336,7 @@ impl HttpFilterFactory for ModelAuthzFilterFactory {
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
         let policies = parse_config(config)?;
 
-        // WP-50 increment 3b-iv: resolve the SAME `ControlPlane` singleton
+        // Resolve the SAME `ControlPlane` singleton
         // `llmproxy.auth`'s factory registers -- see the module doc's "Reads
         // the ControlPlaneSnapshot" section for why this is `ctx.get` (never
         // `get_or_try_init`: this filter has none of a fresh `ControlPlane`'s
@@ -494,8 +490,7 @@ impl ModelAuthzFilterInstance {
             Some(policy) => policy.model_access.permits(&model),
             // No policy configured for this tenant in the published
             // snapshot -- `ModelAccess::default()` is `All`, so this falls
-            // out to the OPEN default rather than a denial. This is WP-50
-            // 3b-iv's reversal of the original case 3 (see the module doc);
+            // out to the OPEN default rather than a denial. XX (see the module doc);
             // the `None` arm is written out explicitly, not folded into
             // `is_some_and`, so which way "absent" falls is visible without
             // reconstructing combinator semantics.
@@ -1118,7 +1113,7 @@ mod tests {
         assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
     }
 
-    // --- WP-50 3b-iv: an authenticated tenant absent from the snapshot is
+    // --- an authenticated tenant absent from the snapshot is
     //     ALLOWED -- the reversal of 3a's case 3. Mutation pin 1: flipping
     //     the `None` arm in `decode_headers` to `false` must red this test.
 
@@ -1133,7 +1128,7 @@ mod tests {
         assert!(
             cb.local_reply.is_none(),
             "a tenant absent from the published snapshot must be ALLOWED -- authorization \
-             defaults OPEN, and WP-50 increment 3b-iv reverses 3a's case 3 (see the module \
+             defaults OPEN, and this reverses the original refuse behavior (see the module \
              doc's \"Fail closed on missing inputs; OPEN on an unconfigured tenant\" section)"
         );
     }
@@ -1232,7 +1227,7 @@ mod tests {
         decode_request(&mut *filter, &mut cb);
         let reply = cb.local_reply.expect(
             "an admin PUT /tenants/{id}/policy must change enforcement on the very next \
-             request, with no reload -- this is the increment's reason to exist",
+             request, with no reload -- this is the reason the filter reads the snapshot",
         );
         assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
     }

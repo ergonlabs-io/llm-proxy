@@ -1,4 +1,4 @@
-//! WP-22 increment 2b: the seam that maps an SDS secret NAME to the
+//! The seam that maps an SDS secret NAME to the
 //! [`DownstreamTlsFactory`] instances that named it, so an accepted secret
 //! (`ResourceApplier`'s `PublishSecrets` sink, `crates/proxy-xds/src/apply.rs`)
 //! actually reaches a serving TLS chain instead of stopping at the sink.

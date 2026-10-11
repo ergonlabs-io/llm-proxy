@@ -31,8 +31,7 @@ talks to in production.
 ## What this does NOT check
 
 - **LDS, RDS, EDS, or SDS.** The fixture serves one CDS resource. LDS, RDS and SDS are
-  outside its scope, and EDS is explicitly deferred (see
-  `internal-docs/IMPLEMENTATION_PLAN.md`).
+  outside its scope, and EDS is explicitly deferred.
 - **Reconnect, resync, or backoff** (`AdsClient::run`). This fixture
   drives exactly one stream via `AdsClient::run_once`; it does not drop the
   connection or assert on `Reconnect`'s jittered delay.

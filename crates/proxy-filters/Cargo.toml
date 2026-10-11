@@ -5,46 +5,46 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# WP-50 increment 3b-i: the `ControlPlane` publishes an immutable snapshot
+# The `ControlPlane` publishes an immutable snapshot
 # workers `load()` lock-free -- the same crate `proxy-core::WorkerConfigHandle`
-# and WP-23's `StatHandles` already use for this exact shape.
+# and `StatHandles` already use for this exact shape.
 arc-swap = { workspace = true }
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
-# WP-24: `ResponseFlag` (`%RESPONSE_FLAGS%`) -- `token_limit_filter` sets `RL`
+# `ResponseFlag` (`%RESPONSE_FLAGS%`) -- `token_limit_filter` sets `RL`
 # on its own 429 path, same as `proxy-http::router` does for its own flags.
 proxy-observability = { workspace = true }
-# WP-34 (Lane H): usage/token extraction from provider responses.
+# Usage/token extraction from provider responses.
 bytes = { workspace = true }
 http = { workspace = true }
 prost-reflect = { workspace = true }
-# WP-50 increment 2a: virtual-key authentication (HMAC-SHA256 + constant-time
-# compare). See internal-docs/IMPLEMENTATION_PLAN.md for why a keyed cryptographic
-# hash and NOT `token_limit_filter::hash_credential`'s FNV-1a.
+# Virtual-key authentication (HMAC-SHA256 + constant-time
+# compare). A keyed cryptographic
+# hash, NOT `token_limit_filter::hash_credential`'s FNV-1a.
 ring = { workspace = true }
-# WP-50 increment 3b-ii: `auth::generate_plaintext_key` -- the single shared
+# `auth::generate_plaintext_key` -- the single shared
 # virtual-key generator, moved here from `crates/proxy/src/keygen.rs` so
 # `ControlPlane::mint_key` can call it too.
 base64 = { workspace = true }
-# WP-50 increment 3b: the embedded persistent `ControlPlaneStore` -- see
+# The embedded persistent `ControlPlaneStore` -- see
 # `control.rs`'s `RedbControlPlaneStore`. `serde` (for `Serialize`/
 # `Deserialize` derives on its row types) rides along with it; `serde_json`
 # below was already a dependency and does the actual encoding.
 redb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# WP-62: `RedbControlPlaneStore`'s Redis-backed sibling -- see
+# `RedbControlPlaneStore`'s Redis-backed sibling -- see
 # `control_redis.rs`'s module doc for the key layout and why `add_spend`
 # needs a Lua script rather than a pipeline.
 redis = { workspace = true }
-# WP-34: warns loudly (rather than failing closed) when a budget applies to a
+# Warns loudly (rather than failing closed) when a budget applies to a
 # request but usage could not be read -- see `token_limit_filter`'s module doc.
 tracing = { workspace = true }
-# WP-50 increment 3c-ii-b: UTC calendar-aligned spend periods
+# UTC calendar-aligned spend periods
 # (`spend::Period::key_for`) -- `proxy-cluster`/`proxy-observability` already
 # depend on this for the same reason (wall-clock rendering).
 chrono = { workspace = true }
-# WP-50 increment 2c-i: JWT verification against a statically configured
+# JWT verification against a statically configured
 # JWKS. Pinned to the 9.x line (not the current 11.x) specifically because
 # 9.x's default (and only, pre-backend-split) crypto backend is `ring` 0.17 --
 # the exact version this workspace already pins for rustls -- so this adds no
@@ -57,16 +57,16 @@ chrono = { workspace = true }
 # (`DecodingKey::from_rsa_raw_components`), never from a PEM file, so
 # `pem`/`simple_asn1` would be dead weight.
 jsonwebtoken = { version = "9", default-features = false }
-# WP-61: jitters the policy-poller's interval so N replicas observing the
+# Jitters the policy-poller's interval so N replicas observing the
 # same generation bump do not all rebuild at once -- see
 # `control.rs::ControlPlane::start_policy_poller`, modeled on
 # `proxy-cluster::health_check`'s `next_delay`.
 rand = { workspace = true }
-# WP-31 CORS: Envoy StringMatcher supports safe_regex alongside the scalar
+# CORS: Envoy StringMatcher supports safe_regex alongside the scalar
 # matchers, so accepting its config without compiling it would be a silent
 # partial implementation.
 regex = { workspace = true }
-# WP-50 increment 2c-iv: OIDC discovery + background JWKS refresh. All
+# OIDC discovery + background JWKS refresh. All
 # network crates here were already in the tree (hyper, tokio-rustls, rustls,
 # rustls-pemfile, rustls-native-certs) -- this adds edges, not new crates, and
 # stays on the workspace's `ring` crypto provider (see `jwt_auth`'s own note
@@ -82,9 +82,9 @@ rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
 proxy-api = { workspace = true }
-# WP-50 increment 2c-i tests: generates a fresh RSA keypair per test run to
-# sign hand-built JWTs -- see the design brief's "never commit a private key,
-# even a test one" and `proxy-core/tests/tls.rs`'s `RSA_TEST_KEY_PEM`, which
+# I tests: generates a fresh RSA keypair per test run to
+# sign hand-built JWTs -- never commit a private key,
+# even a test one, and `proxy-core/tests/tls.rs`'s `RSA_TEST_KEY_PEM`, which
 # had to embed one because `ring`/`rcgen` can SIGN with RSA but cannot
 # GENERATE an RSA keypair (RSA key generation is out of `ring`'s scope). `rsa`
 # (pure Rust, RustCrypto) is used ONLY for key generation and exporting
@@ -95,12 +95,12 @@ proxy-api = { workspace = true }
 # TEST_KEY_PEM); key GENERATION is no longer used, because 2048-bit RSA keygen
 # per nextest process took the workspace suite from ~23s to 60.7s.
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
-# WP-50 increment 2c-iv tests: generates a localhost TLS cert at test time so
+# Iv tests: generates a localhost TLS cert at test time so
 # the mock OIDC server speaks real HTTPS with no committed key material.
 rcgen = { workspace = true }
 
 [features]
-# Each non-core filter lands behind a feature flag (default-on set decided in WP-31).
+# Each non-core filter lands behind a feature flag.
 default = []
 
 [lints]

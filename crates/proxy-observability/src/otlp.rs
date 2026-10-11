@@ -3,7 +3,7 @@
 //! ships batches of [`FinishedSpan`] to a real collector.
 //!
 //! This is the one module in the data-plane-adjacent crates that names a
-//! generated OTLP proto (`proxy_api::opentelemetry`). Ground rule #2
+//! generated OTLP proto (`proxy_api::opentelemetry`). AGENTS.md invariant 2
 //! ("protos never escape `proxy-config`/`proxy-xds`") is about *Envoy
 //! config* protos never reaching request-handling code -- see `ir.rs`'s own
 //! module doc for why that boundary matters (strict-mode field coverage,

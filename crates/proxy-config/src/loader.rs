@@ -1,12 +1,12 @@
-//! WP-03: bootstrap loading — Envoy config files into typed protos.
+//! Bootstrap loading — Envoy config files into typed protos.
 //!
 //! Pipeline (ADR-0002): bytes -> (YAML|JSON) -> `serde_json::Value` ->
 //! prost-reflect proto3-JSON deserialize against the embedded Envoy descriptor
 //! pool (unknown fields denied) -> typed [`Bootstrap`]. `.pb` files decode the
-//! protobuf directly. The same pipeline will serve xDS resources (WP-20), which
+//! protobuf directly. The same pipeline will serve xDS resources, which
 //! arrive as protobuf `Any` rather than files.
 //!
-//! Error quality is a product feature here (PLAN.md Part 7.1): every failure
+//! Error quality is a product feature here (`internal-docs/architecture.md` §12.1 rule 1): every failure
 //! carries the full dotted field path, produced by threading the deserializer
 //! through `serde_path_to_error`.
 
@@ -52,7 +52,7 @@ impl ConfigFormat {
     }
 }
 
-/// A successfully loaded bootstrap: the typed message for WP-05 IR conversion,
+/// A successfully loaded bootstrap: the typed message for IR conversion,
 /// the dynamic (reflective) view for validation/config_dump, and any
 /// permissive-mode warnings.
 #[derive(Debug)]
@@ -108,7 +108,7 @@ pub fn parse_bootstrap(
 fn bootstrap_descriptor() -> MessageDescriptor {
     proxy_api::descriptor_pool()
         .get_message_by_name(BOOTSTRAP_TYPE)
-        .expect("Bootstrap is always in the embedded descriptor pool (WP-02 test)")
+        .expect("Bootstrap is always in the embedded descriptor pool")
 }
 
 fn transcode(dynamic: &DynamicMessage) -> Result<Bootstrap, ConfigError> {
@@ -121,7 +121,7 @@ fn transcode(dynamic: &DynamicMessage) -> Result<Bootstrap, ConfigError> {
 /// unknown fields are stripped one at a time (strict parse -> on unknown-field
 /// error, remove that node, record a warning, retry) so we can report *exactly*
 /// which fields were ignored — prost-reflect's lenient mode would drop them
-/// silently, which ground rule #2 forbids.
+/// silently, which AGENTS.md invariant 1 forbids.
 fn parse_json_value(
     mut value: serde_json::Value,
     mode: StrictMode,
@@ -139,7 +139,7 @@ fn parse_json_value(
 
         match DynamicMessage::deserialize_with_options(desc.clone(), traced, &options) {
             Ok(dynamic) => {
-                // WP-04: parsing proved the fields exist; validation proves the
+                // Parsing proved the fields exist; validation proves the
                 // values satisfy Envoy's PGV constraints. Both modes enforce it
                 // — permissive only relaxes UNKNOWN fields, never bad values.
                 crate::validate::validate_message(&dynamic)?;

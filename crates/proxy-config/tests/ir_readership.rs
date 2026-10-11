@@ -1,9 +1,9 @@
-//! WP-39: a CI guard against "IR field lowered but never read".
+//! A CI guard against "IR field lowered but never read".
 //!
 //! Motivation (read before touching the allowlist): `RouteEntry.request_headers_to_add`
 //! was lowered correctly by both config front-ends and read by no runtime code at
 //! all — it's how the config dialect injects provider API keys, so every request
-//! reached its provider with no credentials. Strict mode (ground rule #1) could not
+//! reached its provider with no credentials. Strict mode (AGENTS.md invariant 1) could not
 //! catch this: it only proves a config field maps *into* the IR, not that the IR
 //! field is then *consumed*. This test closes that gap on the other side of the
 //! seam by grepping the runtime crates for a read of every `pub` IR field.
@@ -21,19 +21,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Runtime crates that consume the IR. `proxy-config` itself is deliberately
-/// excluded — ground rule #2 says the data plane consumes the IR, and a field
+/// excluded — AGENTS.md invariant 2 says the data plane consumes the IR, and a field
 /// read only inside `proxy-config` (e.g. by `RouteTable::new`'s precomputed
 /// index) does not prove anything runs on it at request time.
 ///
 /// **`proxy-admin` is excluded for the same reason, and the reason is worth
 /// stating because it was NOT excluded originally.** It was listed here while
-/// it was an empty stub, where the choice cost nothing. Once WP-50 landed
+/// it was an empty stub, where the choice cost nothing. Once `proxy-admin` gained
 /// `/config_dump`, that stopped being true: the dump renders IR fields for
 /// display, so every field it touches acquires a `.field` reference and would
 /// silently satisfy this guard. `HttpConnectionManagerConfig.stat_prefix` is
 /// what caught it — the dump rendered it and the staleness check immediately
 /// declared its allowlist entry obsolete, even though nothing yet *acts* on
-/// the field (that is still WP-23).
+/// the field (that is still outstanding).
 ///
 /// Displaying a field is not acting on it. This guard exists to catch the
 /// `request_headers_to_add` class of bug — lowered, validated, and then read
@@ -105,20 +105,19 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
-    // --- WP-20 increment 1: the ADS config surface, lowered but not yet
-    //     consumed. One of the original five has left: `AdsConfig.node`
-    //     reached the wire with increment 4c -- the increment that noticed
-    //     this entry's own reason had been wrong since 3a. That is worth
+    // --- The ADS config surface, lowered but not yet consumed. One of the
+    //     original five has left: `AdsConfig.node` now reaches the wire, and
+    //     the change that noticed found this entry's own reason had been
+    //     wrong for a while. That is worth
     //     remembering, because this file could not have caught it: an unset
     //     field is inert either way, so the list stayed green while every
     //     DiscoveryRequest went out anonymous. The four below are genuinely
-    //     still inert; each says what will read it, corrected 2026-09-05 to
-    //     name the increment that actually will.
+    //     still inert; each says what will read it.
     AllowlistEntry {
         struct_name: "AdsConfig",
         field_name: "initial_fetch_timeout",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-21: crates/proxy/src/main.rs::run_serve reads this field \
+        reason: "crates/proxy/src/main.rs::run_serve reads this field \
                  when building its readiness probe, so an ADS-backed \
                  ConfigSource timeout releases /ready without force-initializing \
                  a cluster. `proxy` is control-side and outside RUNTIME_CRATES.",
@@ -127,13 +126,13 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "AdsConfig",
         field_name: "lds_source",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-22: crates/proxy/src/main.rs owns mixed ADS/filesystem source startup; this control-plane reader is outside RUNTIME_CRATES.",
+        reason: "crates/proxy/src/main.rs owns mixed ADS/filesystem source startup; this control-plane reader is outside RUNTIME_CRATES.",
     },
     AllowlistEntry {
         struct_name: "AdsConfig",
         field_name: "cds_source",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-22: crates/proxy/src/main.rs owns mixed ADS/filesystem source startup; this control-plane reader is outside RUNTIME_CRATES.",
+        reason: "crates/proxy/src/main.rs owns mixed ADS/filesystem source startup; this control-plane reader is outside RUNTIME_CRATES.",
     },
     AllowlistEntry {
         struct_name: "VirtualHostIR",
@@ -167,9 +166,9 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         field_name: "stat_prefix",
         kind: EntryKind::KnownInertNameCollision,
         reason: "Same stats gap as HttpConnectionManagerConfig.stat_prefix \
-                  (WP-23 outstanding for the TCP proxy's own copy of the \
+                  (still outstanding for the TCP proxy's own copy of the \
                   field) — still genuinely inert on THIS struct. Reclassified \
-                  from KnownInert in WP-50 3c-ii-a: `HttpConnectionManagerConfig`'s \
+                  from KnownInert because `HttpConnectionManagerConfig`'s \
                   own `stat_prefix` (a DIFFERENT field on a different struct) \
                   now has a real runtime reader (`build_hcm_handler`, \
                   `proxy-core`), and `proxy_http::filter::FactoryContext` \
@@ -184,9 +183,9 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "RetryOn",
         field_name: "envoy_ratelimited",
         kind: EntryKind::KnownInert,
-        reason: "WP-14: lowering rejects `retry_on: envoy-ratelimited` \
+        reason: "Lowering rejects `retry_on: envoy-ratelimited` \
                   outright (crates/proxy-config/src/lower.rs) because no \
-                  filter sets `x-envoy-ratelimited` until WP-31/WP-32, so the \
+                  filter sets `x-envoy-ratelimited` (no rate-limit filter exists), so the \
                   field can only ever be `false` in the IR, and retry.rs's \
                   outcome classifier never consults it.",
     },
@@ -201,8 +200,8 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   RUNTIME_CRATES, so the scan cannot see either. **The previous reason \
                   here was false and had been for a long time** -- it said `proxy-admin` \
                   was a stub whose `src/lib.rs` did not bind the address, written when \
-                  that was true and never revisited; the crate is 1917 lines and WP-50 \
-                  shipped the surface. Corrected 2026-09-08. It stayed green throughout, \
+                  that was true and never revisited; the crate is 1917 lines and \
+                  ships the surface. Corrected 2026-09-08. It stayed green throughout, \
                   which is the point of this entry kind: a KnownInert entry whose field \
                   gained a CONTROL-side reader can never go stale on its own.",
     },
@@ -210,10 +209,9 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "ConfigSnapshot",
         field_name: "secrets",
         kind: EntryKind::KnownInertNameCollision,
-        reason: "WP-08/WP-22: no runtime code looks up a TlsSecret by name \
+        reason: "No runtime code looks up a TlsSecret by name \
                   yet (SDS-delivered secrets aren't consulted anywhere outside \
-                  proxy-config); TlsSecret's own doc comment already names \
-                  these WPs. Recorded as a NAME COLLISION since WP-22 increment 1: \
+                  proxy-config). Recorded as a NAME COLLISION: \
                   `ResourceApplier` in `crates/proxy-xds/src/apply.rs` gained its own \
                   `secrets` field (a `SotwSet` of SDS-delivered `DynamicSecret`s), and \
                   `has_reader` matches on field name alone, so this reads as covered \
@@ -226,7 +224,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "TracingConfig",
         field_name: "otlp_endpoint",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-51 increment 3a: the OTLP exporter that reads this field \
+        reason: "The OTLP exporter that reads this field \
                   (`proxy_observability::otlp::run_trace_exporter`, called from \
                   `crates/proxy/src/main.rs`'s `run_serve`) lives on the \
                   control side, in `proxy-observability`/`proxy` -- neither is \
@@ -241,7 +239,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   at all -- this is a known limitation of the text-based scan, \
                   not a second inert field.",
     },
-    // --- WP-51 increment 4: OTLP metric export. Same shape as the two
+    // --- OTLP metric export. Same shape as the two
     //     `TracingConfig` entries above -- the reader is
     //     `proxy_observability::otlp::run_metric_exporter`, spawned from
     //     `crates/proxy/src/main.rs`'s `run_serve` and running on the control
@@ -262,7 +260,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "ConfigSnapshot",
         field_name: "metrics",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-51 increment 4: read at `crates/proxy/src/main.rs`'s \
+        reason: "Read at `crates/proxy/src/main.rs`'s \
                   `run_serve` (`snapshot.metrics.as_ref()`), which decides whether to spawn \
                   `proxy_observability::otlp::run_metric_exporter` at all. Control-side \
                   bootstrap wiring, outside RUNTIME_CRATES for the same reason \
@@ -281,7 +279,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "MetricsExportConfig",
         field_name: "otlp_endpoint",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-51 increment 4: passed to \
+        reason: "Passed to \
                   `proxy_observability::otlp::run_metric_exporter` as the OTLP endpoint, \
                   which builds its own lazy `tonic` `Endpoint` from it. The trace path's \
                   equivalent reader is `otlp::run_trace_exporter`; both are control-side.",
@@ -290,7 +288,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "MetricsExportConfig",
         field_name: "export_interval",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-51 increment 4: passed to \
+        reason: "Passed to \
                   `proxy_observability::otlp::run_metric_exporter` as its \
                   `tokio::time::interval` period. Independent of the trace exporter's fixed \
                   5s batch interval by design (`docs/telemetry-design.md` §5.3, separate \
@@ -300,7 +298,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "MetricsExportConfig",
         field_name: "export_deadline",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-51 increment 4: passed to \
+        reason: "Passed to \
                   `proxy_observability::otlp::run_metric_exporter` and applied as the \
                   `tokio::time::timeout` around each export RPC. Bounds a collector that \
                   accepts a connection and then stops responding; the trace exporter has no \
@@ -310,7 +308,7 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         struct_name: "TracingConfig",
         field_name: "export_deadline",
         kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "WP-51 increment 4 review round: passed to \
+        reason: "Passed to \
                   `proxy_observability::otlp::run_trace_exporter` as the per-batch export RPC \
                   deadline, closing the gap the `MetricsExportConfig.export_deadline` entry \
                   above used to call out -- a collector that accepts a trace connection and \
@@ -325,8 +323,8 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         reason: "Same as `otlp_endpoint` immediately above: read by \
                   `proxy_observability::otlp::build_resource`, which \
                   `run_trace_exporter` calls -- control-side, outside RUNTIME_CRATES. \
-                  Reclassified from KnownInert to KnownInertNameCollision by \
-                  WP-21 increment 2b-ii: `EdsClusterConfig.service_name` is a \
+                  Reclassified from KnownInert to KnownInertNameCollision because \
+                  `EdsClusterConfig.service_name` is a \
                   different field with the same name, and \
                   `proxy-xds/src/apply.rs::eds_resource_names` now reads it \
                   (`eds.service_name`), which the text scan cannot tell apart \
@@ -529,7 +527,7 @@ fn every_ir_field_has_a_runtime_reader() {
             "IR field(s) are lowered into ir.rs but have no reader in any runtime \
              crate (proxy-http/proxy-core/proxy-cluster/proxy-filters/proxy-admin/proxy-xds).\n\
              Either wire up the runtime code that consumes the field, or — if this \
-             is a genuine false positive or a known-inert field with an owning WP —\n\
+             is a genuine false positive or a known-inert field with a named owner —\n\
              add a reasoned entry to ALLOWLIST in crates/proxy-config/tests/ir_readership.rs.\n\n\
              Unread fields:\n",
         );
@@ -583,7 +581,7 @@ fn allowlist_has_no_stale_entries() {
         // Only plain `KnownInert` and `ReadOutsideRuntimeCrates` entries
         // should start failing this assertion (proving they're stale) the
         // moment a reader appears inside the runtime crates -- for the
-        // former because its owning WP wired one up, for the latter because
+        // former because its owner wired one up, for the latter because
         // the data plane now reads what only the control side read before,
         // which means the exemption is no longer needed at all.
         if entry.kind == EntryKind::ConsumedInternally

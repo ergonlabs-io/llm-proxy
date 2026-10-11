@@ -1,4 +1,4 @@
-//! S10.2 (WP-10/11 h2 tunnel) acceptance tests: h2<->h2 WebSocket tunneling
+//! S10.2 acceptance tests: h2<->h2 WebSocket tunneling
 //! via RFC 8441 extended CONNECT -- TRANSPARENT, same-protocol only. Sibling
 //! of `router_upgrade_e2e.rs` (the h1<->h1 tunnel); see that file's own doc
 //! for the general shape these tests follow.
@@ -15,8 +15,8 @@
 //! of a bare `service_fn`/hand-rolled client.
 //!
 //! The other two tests prove S10.2's cross-protocol REJECTION (transparent,
-//! same-protocol only -- cross bridging is deliberately out of scope this
-//! increment): an h2 downstream CONNECT routed to an h1-upstream cluster,
+//! same-protocol only -- cross bridging is deliberately out of scope):
+//! an h2 downstream CONNECT routed to an h1-upstream cluster,
 //! and the symmetric h1 downstream Upgrade routed to an h2-upstream cluster,
 //! both `502` with no tunnel and, like `router_upgrade_e2e.rs`'s 403 test,
 //! no dial at all -- proving the rejection happens before `pool.new_stream()`
@@ -367,7 +367,7 @@ async fn h2_websocket_tunnel_echoes_bytes_end_to_end() {
             // REAL codec, in the background -- same shape
             // `router_upgrade_e2e.rs`'s own h1 test uses, `serve_http2`
             // instead of `serve_http1`. `serve_http2`'s own
-            // `.enable_connect_protocol()` (this increment) is what lets an
+            // `.enable_connect_protocol()` is what lets an
             // extended CONNECT reach this connection at all.
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

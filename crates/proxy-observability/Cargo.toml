@@ -37,8 +37,8 @@ tokio = { workspace = true, features = ["sync", "time"] }
 # comment on why these cross out of `proxy-api` at all: a hand-rolled
 # exporter over the plain generated types, not the opentelemetry SDK, whose
 # Send+Sync async providers fight the !Send data plane, ADR-0003), `tonic`
-# for the client transport this control-side-only module drives. Ground rule
-# #2 ("protos never escape proxy-config/proxy-xds") is about ENVOY config
+# for the client transport this control-side-only module drives. AGENTS.md
+# invariant 2 ("protos never escape proxy-config/proxy-xds") is about ENVOY config
 # protos reaching the data plane; this is an outbound telemetry sink the
 # control runtime alone drives (see `otlp::run_exporter`'s doc), a different
 # protocol serving a different rule.

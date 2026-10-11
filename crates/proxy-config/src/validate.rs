@@ -1,4 +1,4 @@
-//! WP-04: PGV (protoc-gen-validate) validation engine.
+//! PGV (protoc-gen-validate) validation engine.
 //!
 //! Envoy's protos carry constraint annotations — `validate.rules` on fields
 //! (e.g. `connect_timeout` must be `> 0s`, `port_value <= 65535`, `stat_prefix`
@@ -7,7 +7,7 @@
 //! same annotations at runtime, reading them out of the embedded descriptor
 //! pool — one engine covering every message type, no codegen step.
 //!
-//! Runs on every config entry point: bootstrap files after WP-03 parsing, and
+//! Runs on every config entry point: bootstrap files after parsing, and
 //! (later) every xDS resource before ACK — a failure here becomes a NACK.
 //!
 //! Supported rule subset (the ones Envoy actually uses on our surface):
@@ -18,7 +18,7 @@
 //! `repeated.{min_items,max_items}`, `enum.defined_only`. Wrapper types
 //! (`google.protobuf.UInt32Value` etc.) are unwrapped so scalar rules apply to
 //! the wrapped value. Unsupported rule kinds are skipped, never mis-enforced —
-//! meaning we can only be *more permissive* than Envoy, never less; the WP-26
+//! meaning we can only be *more permissive* than Envoy, never less; the
 //! diff rig is what shrinks that gap over time.
 
 use std::sync::OnceLock;
@@ -286,7 +286,7 @@ fn recurse_into(
 
 /// Unpack a `google.protobuf.Any` by type URL against the descriptor pool and
 /// validate the inner message. The path continues through the Any field name,
-/// matching how the WP-03 loader reports paths inside `typed_config`.
+/// matching how the loader reports paths inside `typed_config`.
 fn walk_any(any: &DynamicMessage, path: &mut PathBuf) -> Result<(), ConfigError> {
     let desc = any.descriptor();
     let type_url_field = desc.get_field_by_name("type_url").expect("Any.type_url");

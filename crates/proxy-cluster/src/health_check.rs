@@ -49,7 +49,7 @@ pub const DEFAULT_EXPECTED_HTTP_STATUS: u16 = 200;
 /// since-last-check-count), and wiring it correctly is the router/pool's
 /// job, not this one. Every check loop here always sleeps
 /// `interval` (+ jitter). Getting `no_traffic_interval` right without a real
-/// traffic signal would mean guessing, which ground rule #1's spirit
+/// traffic signal would mean guessing, which AGENTS.md invariant 1's spirit
 /// (no silent approximations) argues against -- better to leave it unwired
 /// and documented than to fake the behavior.
 pub const DEFAULT_NO_TRAFFIC_INTERVAL: Duration = Duration::from_secs(60);
@@ -74,7 +74,7 @@ pub enum HealthCheckKind {
     Tcp { send: Vec<u8>, expect: Vec<u8> },
     // TODO (out of scope here): `grpc.health.v1.Health/Check`.
     // Deliberately not a variant yet -- a stub that always reports healthy
-    // would be worse than refusing the config outright (ground rule #1), and
+    // would be worse than refusing the config outright (AGENTS.md invariant 1), and
     // a real implementation needs an h2 client call, which this crate's pool
     // doesn't expose as a reusable primitive today. Building a cluster whose
     // config asks for a gRPC health check must be rejected at construction,
@@ -177,7 +177,7 @@ impl HealthCheckEngine {
     /// module doc's wiring plan, now that `ClusterConfig::health_check`
     /// exists. This is the one place `proxy_config::ir::HealthCheckIR`/
     /// `HealthCheckKindIR` convert to this module's own
-    /// `HealthCheckConfig`/`HealthCheckKind` -- ground rule #2 keeps the IR
+    /// `HealthCheckConfig`/`HealthCheckKind` -- AGENTS.md invariant 2 keeps the IR
     /// types from leaking any further than this call site.
     pub fn from_ir(ir: &proxy_config::ir::HealthCheckIR) -> Arc<Self> {
         let config = HealthCheckConfig {

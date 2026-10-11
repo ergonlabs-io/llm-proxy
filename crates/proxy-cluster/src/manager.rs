@@ -217,7 +217,7 @@ impl ManagedCluster {
     /// an `Endpoints` cluster gets a real load balancer and transport socket
     /// (failing if `config.lb_policy` isn't implemented yet -- `RING_HASH`/
     /// `MAGLEV`, see [`load_balancer::build`] -- or if `config.transport_socket`
-    /// doesn't build; ground rule #1 forbids silently substituting another
+    /// doesn't build; AGENTS.md invariant 1 forbids silently substituting another
     /// policy or downgrading to plaintext); an `Aggregate` cluster has no
     /// hosts, load balancer, or transport socket of its own to build at all
     /// (see the aggregate arm below).
@@ -503,7 +503,7 @@ impl ClusterManager {
     ///
     /// A cluster whose `lb_policy` isn't implemented (`RING_HASH`/`MAGLEV`)
     /// is rejected rather than silently substituted with another
-    /// policy (ground rule #1): it's left out of the resulting cluster set
+    /// policy (AGENTS.md invariant 1): it's left out of the resulting cluster set
     /// entirely and its name+error is returned here so the caller can
     /// surface it (e.g. as a config error) instead of it disappearing
     /// silently.
@@ -852,7 +852,7 @@ impl ClusterHandle {
                 tracing::warn!(
                     cluster = %name,
                     "aggregate member is itself an aggregate cluster; nested aggregates are not \
-                     supported (WP-35 increment 2a), skipping"
+                     supported yet, skipping"
                 );
                 continue;
             }
@@ -931,7 +931,7 @@ impl ClusterEntry for ClusterHandle {
     fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation] {
         // An aggregate's own `request_headers_to_add` is never read here: the
         // router calls this on the *member's* entry
-        // (`HostSelection::member`), not the aggregate's. Ground rule #6 --
+        // (`HostSelection::member`), not the aggregate's. AGENTS.md invariant 6 --
         // anything per-provider belongs on the cluster that is actually
         // dialled -- is the reason that matters.
         &self.managed.config.request_headers_to_add

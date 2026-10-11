@@ -1,7 +1,7 @@
-//! WP-04 acceptance tests: PGV constraint enforcement with exact field paths.
+//! Acceptance tests: PGV constraint enforcement with exact field paths.
 //!
 //! Each case is a config Envoy itself rejects (constraints read from the
-//! `validate.rules` annotations in the pinned protos). The WP-26 diff rig will
+//! `validate.rules` annotations in the pinned protos). The diff rig will
 //! later assert our messages against real Envoy's, byte for byte where possible.
 
 use proxy_config::{parse_bootstrap, ConfigError, ConfigFormat, StrictMode};

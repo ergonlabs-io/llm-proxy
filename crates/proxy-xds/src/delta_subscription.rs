@@ -1,9 +1,19 @@
-//! WP-22 delta xDS subscription bookkeeping.
+//! Delta xDS subscription bookkeeping.
 //!
 //! Delta responses version resources independently. Reconnect state is
 //! therefore a resource-name-to-version map, not SotW's one version per type.
 //! This module stays free of protobuf and transport code so ACK/NACK,
 //! subscribe/unsubscribe, and reconnect rules can be tested directly.
+//!
+//! Rules:
+//! - Accepted responses install every supplied version and removal at once; a
+//!   rejected one changes only the nonce (the NACK echoes it).
+//! - Resource versions persist across reconnects (sent as
+//!   `initial_resource_versions`); the nonce never does.
+//! - Subscription changes (`set_names`) are not ACKs: they carry only the
+//!   subscribe/unsubscribe difference and no response nonce.
+//! - An empty named subscription would look like a wildcard on the wire, so
+//!   the transport must not send it ([`DeltaSubscriptionState::has_nothing_to_request`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,7 +1,7 @@
-//! WP-35 increment 2b-i: `cluster_type` (`envoy.clusters.aggregate`) -> IR
+//! `cluster_type` (`envoy.clusters.aggregate`) -> IR
 //! `ClusterKind::Aggregate` lowering. Covers the happy path (member order is
 //! preserved -- it's the failover order), the regression that a plain
-//! endpoints cluster is unaffected, and every rejection ground rule #1
+//! endpoints cluster is unaffected, and every rejection AGENTS.md invariant 1
 //! requires: the `lb_policy: CLUSTER_PROVIDED` requirement in both
 //! directions, the four fields that are inert-and-therefore-forbidden on an
 //! aggregate, the unsupported custom cluster type name, the empty member
@@ -20,7 +20,7 @@ fn err_path(err: &ConfigError) -> &str {
         ConfigError::UnsupportedField { field_path, .. } => field_path,
         ConfigError::InvalidValue { field_path, .. } => field_path,
         ConfigError::UnknownTypeUrl { field_path, .. } => field_path,
-        // `empty_member_list_is_rejected`: the WP-04 PGV validator enforces
+        // `empty_member_list_is_rejected`: the PGV validator enforces
         // `envoy.extensions.clusters.aggregate.v3.ClusterConfig.clusters`'s
         // `repeated.min_items = 1` rule during `parse_bootstrap`, before
         // `convert_cluster`'s own belt-and-suspenders check (kept for
@@ -394,7 +394,7 @@ fn unknown_field_inside_aggregate_typed_config_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-35 increment 2b-ii: `validate_cluster_graph`, the cross-cluster post-pass
+// `validate_cluster_graph`, the cross-cluster post-pass
 // that checks an aggregate's members once the whole cluster map exists.
 // `err_path` above already covers `InvalidValue`, which is what every check
 // here returns.

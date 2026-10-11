@@ -1,12 +1,12 @@
-//! WP-20 increment 1 acceptance tests: the ADS config surface, and nothing
-//! else. No client, no gRPC, no networking -- this increment only teaches the
+//! Acceptance tests: the ADS config surface, and nothing
+//! else. No client, no gRPC, no networking -- this only teaches the
 //! loader to accept a bootstrap that points at a control plane, and to refuse
 //! every part of that surface it does not implement with a full dotted path.
 //!
 //! **The refusals are the substance of this file, not an afterthought.** Before
 //! this increment, `dynamic_resources` was a strict-mode hard error by name,
 //! because `Bootstrap`'s allowed-field list contained only
-//! `node`/`admin`/`static_resources` -- ground rule #1 working correctly. The
+//! `node`/`admin`/`static_resources` -- AGENTS.md invariant 1 working correctly. The
 //! risk in widening that list is trading one honest refusal for several silent
 //! drops, so every unimplemented member below has its own test asserting the
 //! exact path an operator will see.
@@ -340,7 +340,7 @@ fn a_non_ads_per_type_source_is_refused() {
     );
 }
 
-/// EDS needs an IR discovery variant that does not exist; WP-21 owns adding it.
+/// EDS needs an IR discovery variant that does not exist.
 #[test]
 fn a_missing_filesystem_source_is_refused_by_full_path() {
     let yaml = with_ads(
@@ -454,7 +454,7 @@ dynamic_resources:
     );
 }
 
-/// Reached before our own check: the PGV validation engine (WP-04) already
+/// Reached before our own check: the PGV validation engine already
 /// enforces `min_len: 1` on this field from the proto's own constraints, so it
 /// fires first and with a different `ConfigError` variant. Asserted on the
 /// rendered message rather than the variant, because which layer refuses is an

@@ -132,7 +132,7 @@ static_resources:
 }
 
 /// `track_remaining` is not on the supported surface: rejected with a path
-/// that names the offending field, not silently dropped (ground rule #1).
+/// that names the offending field, not silently dropped (AGENTS.md invariant 1).
 #[test]
 fn unsupported_nested_field_rejected_with_path() {
     let yaml = r#"

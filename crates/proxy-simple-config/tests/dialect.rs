@@ -278,7 +278,7 @@ routes:
 }
 
 /// An unknown `protocol` value is a load error naming the full dotted path
-/// (ground rule #1) -- never a silent fallback to `http1`.
+/// (AGENTS.md invariant 1) -- never a silent fallback to `http1`.
 #[test]
 fn provider_protocol_bad_value_errors_with_path() {
     let err = parse(
@@ -972,7 +972,7 @@ observability:
     );
 }
 
-/// Ground rule #1: a missing `otlp_endpoint` is a hard error naming the exact
+/// AGENTS.md invariant 1: a missing `otlp_endpoint` is a hard error naming the exact
 /// field, not a silently-off tracing block -- the operator wrote
 /// `observability.tracing`, so something must have been meant by it.
 #[test]
@@ -1214,7 +1214,7 @@ observability:
     assert_eq!(metrics.export_deadline, std::time::Duration::from_secs(10));
 }
 
-/// Ground rule #1: a `metrics` block with no `otlp_endpoint` is a hard error
+/// AGENTS.md invariant 1: a `metrics` block with no `otlp_endpoint` is a hard error
 /// with the operator-facing dialect path -- not a silently-disabled block.
 #[test]
 fn metrics_block_without_otlp_endpoint_is_a_hard_error() {
@@ -1552,7 +1552,7 @@ observability:
             "route {i} must not disable the filter"
         );
 
-        // The IR leaves the config undecoded (ground rule #2), so read the
+        // The IR leaves the config undecoded (AGENTS.md invariant 2), so read the
         // dialect back the way the filter's own `parse_per_route` does.
         let msg = per_filter
             .config
@@ -1801,7 +1801,7 @@ routes:
             proxy_filters::body_rewrite_filter::TYPE_URL
         );
 
-        // Ground rule #2: the IR leaves the config undecoded, so read the
+        // AGENTS.md invariant 2: the IR leaves the config undecoded, so read the
         // dialect back the way the filter's own `parse_per_route` does --
         // `BodyRewrite.dialect` carries it.
         let msg = per_filter
@@ -3260,7 +3260,7 @@ models:
 /// into `ClusterConfig::request_headers_to_add`. The two crates agree on that
 /// namespace string only by convention -- each holds its own
 /// `PROVIDER_AUTH_METADATA_KEY` constant, and protos never cross the
-/// `proxy-config` boundary (ground rule #2), so there is no shared Rust type
+/// `proxy-config` boundary (AGENTS.md invariant 2), so there is no shared Rust type
 /// to pin them together.
 ///
 /// Every other test on either side asserts against the *literal* string, so
@@ -3599,7 +3599,7 @@ mod body_routing_e2e {
     }
 }
 
-// Ground rule #6's third instance: the usage dialect on the CLUSTER.
+// another instance of AGENTS.md invariant 6: the usage dialect on the CLUSTER.
 
 /// The regression test for the defect this carrier was introduced with: the
 /// route-level copy resolves through `resolved_dialect` (which honours an
@@ -3677,7 +3677,7 @@ routes:
 
 /// One cluster cannot carry two dialects, so two `models` entries that
 /// resolve the same provider differently is a hard load error naming both
-/// paths (ground rule #1) rather than a silent pick of whichever the walk
+/// paths (AGENTS.md invariant 1) rather than a silent pick of whichever the walk
 /// reached first.
 #[test]
 fn two_model_entries_disagreeing_on_a_providers_dialect_is_a_hard_error() {
@@ -3740,7 +3740,7 @@ fn both_dialect_carriers_agree_on_the_example_config() {
             .as_str()
             .expect("every route carries a usage dialect");
 
-        // A route targeting an aggregate is the case ground rule #6 is
+        // A route targeting an aggregate is the case AGENTS.md invariant 6 is
         // actually about: the route picks the aggregate, but the MEMBER is
         // what gets dialled, so every member must agree with the route's
         // dialect -- otherwise failover silently meters the fallback with
@@ -3790,7 +3790,7 @@ fn both_dialect_carriers_agree_on_the_example_config() {
 // wrong the day those types become loadable, and what it produces is not a
 // loud failure. The OpenAI usage parser finds no usage object in an
 // Anthropic-shaped response, `StreamInfo::llm.usage` stays `None`, and the
-// token limiter fails open -- it warns now (ground rule 17) but still admits
+// token limiter fails open -- it warns now (AGENTS.md "Fail-open controls") but still admits
 // the request uncharged. This is the check that has to exist before either
 // type ships, not after.
 

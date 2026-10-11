@@ -1,9 +1,8 @@
-//! WP-50 increment 2c-iv — OIDC discovery + background JWKS refresh.
+//! OIDC discovery + background JWKS refresh.
 //!
 //! [`crate::jwt_auth::JwtAuthenticator`] verifies against a cached key set;
 //! this module is what keeps that cache fresh without ever touching the
-//! request path. Shape, per the design brief's "OIDC fits this without
-//! reshaping it" section:
+//! request path. Shape (OIDC fits the static-JWKS design without reshaping it):
 //!
 //! ```text
 //! refresher thread (one per discovery-configured provider)
@@ -32,7 +31,7 @@
 //! a self-inflicted outage). A snapshot older than
 //! [`STALE_AFTER_MISSED`] consecutive missed intervals is refused outright
 //! ([`crate::auth::AuthError::JwtJwksStale`]) -- the same bounded-staleness
-//! rule the design brief states for credential snapshots: serving
+//! rule that applies to credential snapshots: serving
 //! indefinitely old keys turns a rotation into silent acceptance.
 //!
 //! # TLS

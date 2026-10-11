@@ -1,4 +1,4 @@
-//! Appendix S9 conformance tests for [`super`].
+//! envoy-semantics.md S9 conformance tests for [`super`].
 
 use super::*;
 use http::{HeaderMap, HeaderName, HeaderValue};

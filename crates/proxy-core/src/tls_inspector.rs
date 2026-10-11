@@ -1,8 +1,8 @@
-//! `tls_inspector` listener filter (WP-08 chunk C2): peeks the TLS
+//! `tls_inspector` listener filter: peeks the TLS
 //! ClientHello off an accepted connection *without consuming it* and extracts
 //! SNI + ALPN so filter-chain matching (`crate::filter_chain`) can key on
 //! `server_names`/`application_protocols`/`transport_protocol`. Does not
-//! terminate TLS -- the real handshake (or the stub handler, until WP-09/C3)
+//! terminate TLS -- the real handshake (or the terminal filter)
 //! still sees every byte, undisturbed.
 
 use std::time::Duration;
@@ -19,7 +19,7 @@ const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 0x16;
 /// Wall-clock bound on the whole inspect operation. Envoy's
 /// `listener_filters_timeout` defaults to 15s; that's too slow for tests and
 /// still a reasonable production bound, so we use a shorter default here.
-// TODO(WP-08): honor `listener_filters_timeout` once that field exists on
+// TODO: honor `listener_filters_timeout` once that field exists on
 // `ListenerConfig`'s IR; today every listener gets this fixed timeout.
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
 

@@ -1,4 +1,4 @@
-//! WP-22 increment 1: decoding an SDS-delivered
+//! Decoding an SDS-delivered
 //! `envoy.extensions.transport_sockets.tls.v3.Secret` resource.
 //!
 //! [`DynamicSecret`] is shared configuration IR in `proxy-config`, not xDS
@@ -6,11 +6,11 @@
 //! serving layer consumes it. That separation keeps `proxy-core` independent
 //! from the discovery transport.
 //!
-//! # Ground rule #1, applied to `Secret`
+//! # Strict mode (AGENTS.md invariant 1), applied to `Secret`
 //!
 //! Every field this message (and the messages it nests) can carry either
 //! lowers into [`DynamicSecret`] or is refused with its full dotted path --
-//! never silently dropped. Concretely, this increment supports exactly:
+//! never silently dropped. Concretely, this module supports exactly:
 //! - `tls_certificate.certificate_chain` / `.private_key`, each an
 //!   `inline_bytes` or `inline_string` [`DataSource`] -- nothing else in
 //!   `TlsCertificate` (`pkcs12`, `watched_directory`, `private_key_provider`,
@@ -40,7 +40,7 @@ use proxy_config::ConfigError;
 /// Build a [`ConfigError::UnsupportedField`] -- the same variant
 /// `proxy-config`'s own `lower.rs` raises for a field outside its allowlist,
 /// reused here rather than inventing a parallel error shape for the same
-/// idea (ground rule #1's dotted-path requirement applies identically to a
+/// idea (AGENTS.md invariant 1's dotted-path requirement applies identically to a
 /// dynamically-delivered resource).
 fn unsupported(path: impl Into<String>, reason: impl Into<String>) -> ConfigError {
     ConfigError::UnsupportedField {

@@ -165,7 +165,7 @@ fn spawn_live_proxy(
 /// Dialect config: one real `openai` provider plus a `limits:` block bucketed
 /// on the client's own `authorization` header, budget `10`. No `auth:` block
 /// -- the header here is only the limiter's bucket key, not a credential; the
-/// real provider credential is injected by the cluster (ground rule #6), so
+/// real provider credential is injected by the cluster (AGENTS.md invariant 6), so
 /// whatever the client puts in `authorization` never reaches OpenAI.
 fn token_budget_config(listener_port: u16) -> String {
     format!(
@@ -305,7 +305,7 @@ routes:
 ///   the proxy had forwarded the client's virtual key (`llmp_...`, never a
 ///   valid OpenAI credential) upstream instead of substituting the real
 ///   provider key, OpenAI would reject it outright. A real 200 is only
-///   obtainable if ground rule #6's swap actually happened on this request.
+///   obtainable if AGENTS.md invariant 6's swap actually happened on this request.
 /// - an unknown `llmp_`-prefixed key returns 401. This case makes no upstream
 ///   call at all -- the auth filter runs and refuses the request before
 ///   routing ever selects a cluster to dial -- which is why running this

@@ -272,7 +272,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         cluster_manager.force_initialize(name);
     }
 
-    // WP-23 increment 6a: `crates/proxy/src/main.rs` builds this once, at
+    // `crates/proxy/src/main.rs` builds this once, at
     // boot, from the real config snapshot's cluster names -- mirrored here
     // rather than skipped, since `initial_bind` now requires it to build
     // `RouterFilterFactory`.
@@ -287,7 +287,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         WorkerId(0),
     ));
 
-    // WP-23 increment 6b: `DownstreamStats`/`GenAiTokenStats` counterparts to
+    // `DownstreamStats`/`GenAiTokenStats` counterparts to
     // `router_stats` above -- `initial_bind` now requires both too, mirroring
     // `crates/proxy/src/main.rs`'s `worker_main`.
     let downstream_handles = Arc::new(DownstreamStatHandles::build(

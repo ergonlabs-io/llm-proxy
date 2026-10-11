@@ -1,10 +1,10 @@
 //! Drain state machine, per-worker connection registry, and control/worker
-//! coordination for graceful shutdown (WP-06 chunk B).
+//! coordination for graceful shutdown.
 //!
 //! Drain semantics follow Envoy v1.38 (`--drain-time-s`, `--drain-strategy`):
 //! during a drain window connections are progressively encouraged to close on
 //! request completion (`Connection: close` on HTTP/1, `GOAWAY` on HTTP/2).
-//! Those protocol nudges are later work packages (WP-10/11); this module only
+//! Those protocol nudges live in the HTTP codecs; this module only
 //! builds the seam they consult (`DrainState::drain_close_probability`) plus
 //! the registry and coordination machinery around it.
 
@@ -58,7 +58,7 @@ pub enum DrainState {
 
 impl DrainState {
     /// The probability that an in-flight response should be closed (rather
-    /// than kept alive) at `now`. This is the seam HTTP codecs (WP-10/11)
+    /// than kept alive) at `now`. This is the seam HTTP codecs
     /// will consult per-response.
     ///
     /// Deliberately a pure function of `now` -- no RNG here -- so tests (and
@@ -316,7 +316,7 @@ pub async fn drain_worker(
 /// Control-side convenience: sequences a full graceful shutdown --
 /// `start_drain` -> `wait_drained` -> `shutdown` -> `join`.
 ///
-/// SIGTERM/CLI wiring that calls this is chunk C's job; this function is
+/// SIGTERM/CLI wiring that calls this lives in the binary; this function is
 /// triggered programmatically.
 pub async fn graceful_shutdown(
     mut publisher: crate::runtime::ConfigPublisher,

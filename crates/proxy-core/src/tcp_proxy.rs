@@ -1,11 +1,11 @@
-//! `tcp_proxy` network filter runtime (WP-09): the first terminal L4 filter.
+//! `tcp_proxy` network filter runtime: the first terminal L4 filter.
 //! Given a matched downstream connection and its `TcpProxyConfig`, resolves
 //! an upstream endpoint, connects, and pumps bytes bidirectionally until
 //! either side closes, the connection idles out, or a drain shutdown fires.
 //!
 //! Cluster/endpoint resolution here is deliberately minimal (v1): "first
 //! `priority == 0` endpoint" is a placeholder for the real load-balancing and
-//! cluster-manager machinery landing in WP-16/WP-17.
+//! cluster-manager machinery in `proxy-cluster`.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -37,7 +37,7 @@ pub struct TcpProxyParams {
 /// order. `None` covers both "cluster missing" and "no priority-0 endpoints"
 /// -- both are treated the same way by the caller (fail the connection).
 ///
-/// TODO(WP-17): real load balancing (round robin / least request / ring hash
+/// TODO: real load balancing (round robin / least request / ring hash
 /// / random / maglev per `LbPolicy`); this always picks the same endpoint.
 fn resolve_target(snapshot: &ConfigSnapshot, cluster: &str) -> Option<(String, u16, Duration)> {
     let cluster_ir = snapshot.clusters.get(cluster)?;
@@ -57,7 +57,7 @@ fn resolve_target(snapshot: &ConfigSnapshot, cluster: &str) -> Option<(String, u
 /// resolves both IP literals (STATIC clusters) and DNS names
 /// (STRICT_DNS/LOGICAL_DNS) through the system resolver -- so this connects
 /// to DNS-named endpoints too, even though the full StrictDns
-/// expansion/re-resolution semantics are WP-16's job, not this one's.
+/// expansion/re-resolution semantics belong to `proxy-cluster`, not this function.
 async fn connect_upstream(
     host: &str,
     port: u16,

@@ -1,9 +1,9 @@
-//! WP-34 increment 1 — the token budget limiter, as a pure library.
+//! The token budget limiter, as a pure library.
 //!
 //! This module answers one question: **is the next request allowed against a
 //! configured token budget, and if not, when will it be?** It does not touch
-//! `HttpFilter`, config/IR, or response generation — those are later
-//! increments (see `IMPLEMENTATION_PLAN.md`'s WP-34 entry). This increment is
+//! `HttpFilter`, config/IR, or response generation — those live in
+//! `token_limit_filter`. This module is
 //! the [`BudgetStore`] trait, its in-process implementation, and the types
 //! around it.
 //!
@@ -51,9 +51,9 @@
 //!
 //! # `BudgetStore` is a seam, not a promise of two implementations today
 //!
-//! [`InProcessBudgetStore`] is the only implementation built in this
-//! increment (and, per the product decision behind WP-34 increment 2, stays
-//! the *default* even once a remote one exists): one rule, tracked per key,
+//! [`InProcessBudgetStore`] is the only implementation built so far
+//! (and, by product decision, stays the *default* even once a remote one
+//! exists): one rule, tracked per key,
 //! shared by every worker in this process. The trait exists so a Redis-backed
 //! (or otherwise control-plane-aggregated) store can land later behind the
 //! same interface without callers changing — that store is explicitly **not**
@@ -68,8 +68,8 @@
 //! When that implementation lands, the filter calling this trait
 //! (`crate::token_limit_filter`) will have to hold the stream with S2
 //! `StopIteration` from `decode_headers` and resume via `continue_decoding()`
-//! once the answer arrives — the same shape WP-32's `ext_authz` / gRPC RLS
-//! filters already need for their own out-of-process calls. Three things fall
+//! once the answer arrives — the same shape `ext_authz` / gRPC RLS
+//! filters need for their own out-of-process calls. Three things fall
 //! out of that:
 //!
 //! 1. **Fallibility has to exist from day one, not be retrofitted.**
@@ -93,7 +93,7 @@
 //!    not transmissible over a wire. A remote store is its own time
 //!    authority and may ignore the parameter entirely (using its own clock
 //!    to decide window rollover instead). This is not redesigned here — that
-//!    is a bigger refactor than this increment warrants — but it is named
+//!    is a bigger refactor than warranted — but it is named
 //!    rather than left to be rediscovered when the remote implementation
 //!    lands.
 //!
@@ -119,11 +119,9 @@ use crate::usage::TokenUsage;
 /// `from_descriptors(&[("route", ..), ("tenant", ..)])` -- enough for
 /// [`InProcessBudgetStore`]'s `Mutex<HashMap<LimitKey, Window>>` to compare
 /// keys, but with no way back out to "which route" or "which tenant" short of
-/// parsing a separator format that existed only by accident. WP-54's
+/// parsing a separator format that existed only by accident. The
 /// per-tenant usage query needs exactly that (enumerating a tenant's keys
-/// across routes), so this is now a struct with named fields -- see
-/// `IMPLEMENTATION_PLAN.md`'s WP-54 entry ("Decision needed before
-/// implementing") for the fuller reasoning. The struct also does something
+/// across routes), so this is now a struct with named fields -- The struct also does something
 /// the flattened string could not: it makes "a credential was hashed before
 /// it became part of a key" a property [`LimitSubject::Credential`] enforces
 /// by only ever holding a [`CredentialDigest`], not a comment resting on every
@@ -142,7 +140,7 @@ pub struct LimitKey {
 /// for why that separation is a security property, not a preference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LimitSubject {
-    /// An identity the proxy itself assigned (WP-50 virtual keys).
+    /// An identity the proxy itself assigned (virtual keys).
     Tenant(String),
     /// No auth filter authenticated the stream, so the bucket is keyed on a
     /// digest of the credential the caller presented. See
@@ -185,7 +183,7 @@ impl LimitKey {
     }
 
     /// Whether this key is a [`LimitSubject::Tenant`] matching `tenant`
-    /// exactly -- the shape a later increment's per-tenant usage query needs
+    /// exactly -- the shape the per-tenant usage query needs
     /// (enumerating every key belonging to one tenant, across routes)
     /// without building that query here.
     pub fn is_for_tenant(&self, tenant: &str) -> bool {
@@ -310,9 +308,8 @@ pub struct LimitRule {
 ///
 /// Both variants carry the same "how does this look to the caller" shape a
 /// provider-style rate limiter publishes (`limit` / `remaining` /
-/// `reset_after`), plus `retry_after` on `Deny` — this increment does not
-/// build the HTTP header mapping, but the fields are named to make that
-/// mapping mechanical when a later increment adds it.
+/// `reset_after`), plus `retry_after` on `Deny` — the HTTP header mapping lives in the filter, and the fields are named to make that
+/// mapping mechanical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitDecision {
     Allow {
@@ -353,8 +350,8 @@ impl std::fmt::Display for BudgetUnavailable {
 
 impl std::error::Error for BudgetUnavailable {}
 
-/// One [`LimitKey`]'s current-window standing, shaped for WP-54's `GET
-/// /v1/usage` — see [`BudgetStore::usage_for_tenant`].
+/// One [`LimitKey`]'s current-window standing, shaped for the `GET
+/// /v1/usage` endpoint — see [`BudgetStore::usage_for_tenant`].
 ///
 /// This is a read-only *rendering* of the same numbers [`LimitDecision::Allow`]
 /// already carries; it deliberately does NOT hold a [`LimitKey`] or anything
@@ -421,7 +418,7 @@ pub trait BudgetStore: Send + Sync {
     fn record(&self, key: &LimitKey, usage: &TokenUsage, weight: f64, now: Instant);
 
     /// Every current-window budget belonging to `tenant`, across all routes
-    /// — the query WP-54's `GET /v1/usage` needs and neither `check` nor
+    /// — the query `GET /v1/usage` needs and neither `check` nor
     /// `record` can answer alone (both take a single, already-known
     /// [`LimitKey`]; this instead enumerates every key for one tenant).
     ///
@@ -455,13 +452,12 @@ struct Window {
     used: u64,
 }
 
-/// The only [`BudgetStore`] implementation in this increment (and, per the
-/// product decision behind WP-34 increment 2, the deployment default even
-/// once a remote one exists): a single [`LimitRule`], tracked per
+/// The only [`BudgetStore`] implementation (and, by
+/// product decision, the deployment default even once a remote one exists): a single [`LimitRule`], tracked per
 /// [`LimitKey`], shared by every worker in this process.
 ///
 /// Rust note: interior mutability here is a `Mutex`, not a `RefCell` — and
-/// that is a **reversal** from increment 1, which chose `RefCell` by citing
+/// an earlier version chose `RefCell` by citing
 /// ADR-0003's worker-local `!Send` data plane. That reasoning is correct for
 /// *per-stream* state (a filter instance, `StreamInfo`, ...), which really
 /// does live and die on one worker's thread. It is wrong for a budget: a
@@ -703,7 +699,7 @@ mod tests {
 
     /// A request already "in flight" (its usage recorded after the budget is
     /// already exhausted by other concurrent requests) must not be rejected,
-    /// erred, or truncated by `record` -- the plan's central semantic:
+    /// erred, or truncated by `record` -- the central semantic:
     /// over-limit rejects the *next* request, never an in-flight one.
     #[test]
     fn record_never_errors_or_signals_truncation_even_when_already_over_budget() {
@@ -986,10 +982,10 @@ mod tests {
         );
     }
 
-    // ---- usage_for_tenant (WP-54 increment 2) ------------------------------
+    // ---- usage_for_tenant ------------------------------
 
     /// A tenant with budgets on more than one route gets all of them back,
-    /// sorted by route -- the multi-route case increment 1's `LimitKey`
+    /// sorted by route -- the multi-route case the `LimitKey`
     /// struct exists specifically to make answerable.
     #[test]
     fn usage_for_tenant_reports_every_route_the_tenant_has_a_budget_on() {

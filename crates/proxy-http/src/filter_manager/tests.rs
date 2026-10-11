@@ -1,5 +1,5 @@
-//! WP-11 chunk 1 tests: the S2 mechanics this chunk implements. The exhaustive
-//! status-matrix conformance suite is chunk 2; these pin the engine's spine —
+//! Tests for the S2 mechanics. The exhaustive status-matrix conformance
+//! suite lives further down; these pin the engine's spine —
 //! ordering (S2.1), the header-hold gotcha (S2.2), data statuses (S2.3),
 //! trailers (S2.4), the buffer APIs (S2.7), and overflow → 413/500.
 
@@ -101,19 +101,19 @@ struct ProbeFilter {
     /// `decode_headers`, so a test can assert a mutation made by an EARLIER
     /// async filter (during its resumption) is visible here.
     seen_decode_headers: Option<Rc<RefCell<Option<HeaderMap>>>>,
-    /// WP-11 chunk 4 (I3) test hook: if set, `decode_headers` stashes
+    /// Test hook: if set, `decode_headers` stashes
     /// `cb.continue_handle()` here so a test can call `continue_decoding()`
     /// on it from OUTSIDE callback context — the whole point of the
     /// out-of-band-continue case.
     stash_decode_continue_handle: Option<Rc<RefCell<Option<DecodeContinueHandle>>>>,
-    /// WP-11 chunk 4 (design A) test hook: if set (with
+    /// Test hook: if set (with
     /// `stash_decode_continue_handle`), `decode_headers` also calls
     /// `continue_decoding()` on the handle SYNCHRONOUSLY, before returning —
     /// i.e. before the driver has any chance to reach `wait_for_decode_resume`.
     /// Pins the "permit stored before park" half of the `Notify` contract
     /// deterministically, with no scheduler-timing dependence.
     fire_continue_handle_immediately: bool,
-    /// WP-11 chunk 4 (design C) test hook: bytes appended via
+    /// Test hook: bytes appended via
     /// `add_decoded_data` from `decode_data` (mirrors `add_decoded`, which
     /// only fires from `decode_headers` — needed to trigger a
     /// `StopIterationAndWatermark` overflow, since that status only exists
@@ -543,7 +543,7 @@ async fn run_chain(
 }
 
 /// Like [`run_chain`], but also returns the decode direction's high-watermark
-/// signal (WP-11 chunk 4, design C) -- cloned out of `ChainCtx` before it
+/// signal -- cloned out of `ChainCtx` before it
 /// moves into `FilterManager`, the same escape-hatch pattern
 /// `ChainCtx::request_headers_snapshot` already uses (see that field's doc):
 /// `ChainCtx` is gone by the time `run()` returns, so anything a caller needs
@@ -715,7 +715,7 @@ fn stop_iteration_on_headers_still_delivers_data_to_that_filter_and_resumes() {
 /// S2.2/S2.3: a filter that holds headers and never continues stops everything
 /// past it — later filters see neither headers nor data.
 ///
-/// WP-11 chunk 4 (design B): an unresumed `StopAllIterationAndBuffer` hold
+/// An unresumed `StopAllIterationAndBuffer` hold
 /// now genuinely stalls the stream rather than falling through (see
 /// `stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal`,
 /// which pins that half too), so `run_chain(..).await` here never completes
@@ -1069,7 +1069,7 @@ fn a_second_local_reply_is_ignored() {
     );
 }
 
-// --- WP-11 chunk 2: S2 conformance suite (systematic fan-out) -------------
+// --- S2 conformance suite (systematic fan-out) -------------
 
 /// S2.1 (G1): with THREE filters present in both chains, decode runs config
 /// order, encode runs reverse config order, and `on_destroy` fires in reverse
@@ -1332,7 +1332,7 @@ fn stop_all_iteration_and_buffer_encode_overflow_yields_500() {
 /// `StopKind::StopAll`. Setting `decode_data_status` here isolates THIS
 /// case's specific claim (terminal must not run) from that separate gap.
 ///
-/// NOW REAL (WP-11 chunk 4, design B): an unresumed `StopAllIterationAndBuffer`
+/// NOW REAL: an unresumed `StopAllIterationAndBuffer`
 /// hold genuinely stalls the stream instead of falling through — `drive_decode`
 /// parks on `wait_for_decode_resume` once every synchronous and
 /// async avenue has declined, and nothing here ever resumes it, so
@@ -1358,8 +1358,7 @@ fn stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal() {
         .await;
         assert!(
             result.is_err(),
-            "an unresumed StopAll hold must stall the stream, not complete it \
-             (WP-11 chunk 4, design B)"
+            "an unresumed StopAll hold must stall the stream, not complete it"
         );
 
         let entries = log.borrow().clone();
@@ -1380,7 +1379,7 @@ fn stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal() {
 /// frame must not slip past a StopAll'd filter to a subsequent filter. Same
 /// `decode_data_status` isolation as G5 above (see its doc comment).
 ///
-/// WP-11 chunk 4 (design B): this is also a never-resumed StopAll hold, so
+/// This is also a never-resumed StopAll hold, so
 /// it now genuinely stalls (see
 /// `stop_all_iteration_and_buffer_blocks_subsequent_filters_and_terminal`
 /// for the dedicated test of that half); bounded with `tokio::time::timeout`
@@ -1734,7 +1733,7 @@ fn local_reply_encoder_chain_runs_from_the_correct_position() {
     });
 }
 
-// --- IGNORE cases: WP-11 chunk 4 gaps, written as the target spec ----------
+// --- IGNORE cases: known gaps, written as the target spec ----------
 
 /// A filter that returns `ContinueAndDontEndStream` from `decode_headers` and
 /// supplies the body itself, out of band, exactly as S2.2 (I1) requires.
@@ -2008,7 +2007,7 @@ fn encode_continue_and_dont_end_stream_forwards_headers_with_end_stream_false() 
 /// out-of-band `continue_decoding()` should release the buffered
 /// headers+data+trailers to subsequent filters in order.
 ///
-/// NOW REAL (WP-11 chunk 4, design A/B): `cb.continue_handle()` gives `a` a
+/// NOW REAL: `cb.continue_handle()` gives `a` a
 /// [`DecodeContinueHandle`] it stashes in `handle_slot`, OUTLIVING the
 /// `decode_headers`/`decode_data` callbacks that produced it. `a`'s own
 /// `decode_data` is set to a never-continuing `StopIterationAndBuffer` (like
@@ -2069,7 +2068,7 @@ fn stop_all_iteration_and_buffer_resumes_via_out_of_band_continue() {
     }));
 }
 
-/// WP-11 chunk 4 (design A): the `Notify`-backed permit must not be lost when
+/// The `Notify`-backed permit must not be lost when
 /// `continue_decoding()` is called BEFORE the driver ever parks — see
 /// [`DecodeContinueHandle`]'s doc for why `Notify::notify_one` specifically
 /// (not a plain flag) is what makes that safe. Pinned deterministically, no
@@ -2111,7 +2110,7 @@ fn decode_continue_handle_notify_before_park_is_not_lost() {
 /// record a high-watermark signal instead of erroring (distinct from G11,
 /// which only checks bytes).
 ///
-/// NOW REAL (WP-11 chunk 4, design C): decode stays fully buffered (module
+/// NOW REAL: decode stays fully buffered (module
 /// doc), so there is no read to disable — the only overflow that can happen
 /// is a filter's own `add_decoded_data` exceeding `buffer_limit`, exactly
 /// what this configures from `decode_data` (there is no `StopIterationAndWatermark`
@@ -2151,7 +2150,7 @@ fn stop_iteration_and_watermark_applies_backpressure_on_overflow() {
 /// S2.2 (I5): `StopAllIterationAndWatermark` — block plus backpressure on
 /// overflow (no 413/500).
 ///
-/// NOW REAL (WP-11 chunk 4, design C): same contract as the plain-data case
+/// NOW REAL: same contract as the plain-data case
 /// above, but the watermark status is on `decode_headers` instead, and
 /// `decode_data_status` is ALSO set to a watermark variant so the SAME
 /// buffer is judged consistently at both overflow-check sites (the known,
@@ -2193,7 +2192,7 @@ fn stop_all_iteration_and_watermark_applies_backpressure_on_overflow() {
 /// later `encode_data`. There is no 1xx flow through this harness at all
 /// today — `encode_1xx_headers` is never called anywhere in `filter_manager.rs`.
 #[test]
-#[ignore = "WP-11 chunk 4: 1xx (S2.6) — BLOCKED on hyper. The hyper_spike.rs \
+#[ignore = "1xx (S2.6) — BLOCKED on hyper. The hyper_spike.rs \
             finding (f) proved (expect_err) that hyper's low-level h1 SERVER \
             hard-rejects a 1xx from a service_fn (substitutes 500, errors \
             'response has 1xx status code, not supported by server'), so the \
@@ -2260,7 +2259,7 @@ fn inject_encoded_data_to_filter_chain_delivers_to_subsequent_filters() {
     assert!(frame.end_stream);
 }
 
-// --- WP-11 chunk 4: full driver-level injection semantics (S2.7) ----------
+// --- Full driver-level injection semantics (S2.7) ----------
 
 /// S2.7: injected data must reach filters strictly AFTER the injecting one,
 /// and must NOT be delivered back to the injector itself — the core semantic
@@ -2624,7 +2623,7 @@ fn clear_route_cache_forces_re_resolution_after_a_path_rewrite() {
     });
 }
 
-// --- ADR-0004 step 4 increment 2: resolved `typed_per_filter_config` -------
+// --- ADR-0004: resolved `typed_per_filter_config` -------
 //
 // These tests exercise `build_per_route_table` (the HCM-build-time
 // resolution + validation) and `DecoderCallbacks::per_route_config` (the
@@ -3152,7 +3151,7 @@ fn per_route_config_unsupported_filter_is_a_build_error_unless_optional() {
 /// config" -- NOT "ignore any error". A filter that supports per-route config
 /// and rejects the one it was given must still fail the build, or a typo'd
 /// override on an optional entry would be silently dropped on a filter that
-/// would have honored a correct one (ground rule #1).
+/// would have honored a correct one (AGENTS.md invariant 1).
 #[test]
 fn is_optional_does_not_swallow_a_supported_filters_rejection() {
     let names = vec!["configured-filter".to_string()];
@@ -3568,7 +3567,7 @@ fn use_remote_address_false_leaves_xff_and_proto_untouched() {
 // does after `FilterManager::run` returns.
 
 /// An encode filter that stamps `StreamInfo::llm.usage` only on the
-/// end-of-stream `encode_data` callback -- mirrors what the real WP-33/34
+/// end-of-stream `encode_data` callback -- mirrors what the real
 /// usage filter does once it has observed the whole streamed response. If
 /// `LoggingBody` were still nested INSIDE the encode chain (the bug this
 /// relocation fixes), it would already have rendered its line before this
@@ -3991,10 +3990,10 @@ fn a_filter_that_always_reports_pending_work_fails_closed_instead_of_hanging() {
     });
 }
 
-// --- WP-45 increment 2a: `DecoderCallbacks::modify_decoded_headers` --------
+// --- `DecoderCallbacks::modify_decoded_headers` --------
 //
 // The motivating bug: a decode filter that splices bytes into the request
-// body (WP-45's actual body-rewrite work, a separate increment) makes the
+// body (a body-rewrite filter) makes the
 // body longer, so `content-length` must be recomputed before the request
 // reaches the terminal/upstream. These tests pin the SEAM only -- that a
 // filter can reach request headers that have not yet been forwarded, from
@@ -4050,7 +4049,7 @@ impl HttpFilter for HeaderMutatingFilter {
 /// Run `filters` over `req` with a [`RecordingTerminal`] wired to capture the
 /// request headers it observed, so a test can assert on what the
 /// terminal/upstream actually sees rather than a local copy — mirrors
-/// [`run_chain_req_with_route_table`] but for this increment's need
+/// [`run_chain_req_with_route_table`] but for this need
 /// (`RecordingTerminal::seen_headers`, not a route table).
 async fn run_chain_req_capturing_headers(
     filters: Vec<Box<dyn HttpFilter>>,
@@ -4083,19 +4082,19 @@ async fn run_chain_req_capturing_headers(
     (status, headers)
 }
 
-/// PROBE (WP-45 increment 2b): a filter mutating BOTH a direct parameter AND
+/// PROBE: a filter mutating BOTH a direct parameter AND
 /// `modify_decoded_headers` in the same callback must keep both mutations.
 ///
-/// Increment 2a's version of this probe ran from `decode_headers`, mutating
+/// An earlier version of this probe ran from `decode_headers`, mutating
 /// the `headers` parameter directly AND via the seam in the same call --
-/// that reproduced the data-loss bug this increment fixes (a stale
-/// pre-callback clone spliced back over the direct mutation). Increment 2b's
+/// that reproduced the data-loss bug (a stale
+/// pre-callback clone spliced back over the direct mutation). The
 /// fix for `decode_headers` specifically is to make the seam a documented
 /// no-op there (see [`DecoderCallbacks::modify_decoded_headers`]'s doc) --
 /// `decode_headers` already has direct `&mut RequestHeaders` access and
 /// Rust's aliasing rules mean the seam genuinely cannot also hold a live
 /// borrow of that same value at the same time. So this probe now runs from
-/// `decode_data`, WP-45's actual load-bearing case: it directly mutates its
+/// `decode_data`, the load-bearing case: it directly mutates its
 /// own `data: &mut Bytes` parameter (the one direct-mutation path
 /// `decode_data` has) AND calls `modify_decoded_headers` (now a real,
 /// clone-free borrow of the head -- see the trait doc) in the same
@@ -4160,15 +4159,15 @@ fn probe_direct_and_seam_mutations_coexist() {
     });
 }
 
-/// WP-45 increment 2b fallback: `modify_decoded_headers` called from
+/// Fallback: `modify_decoded_headers` called from
 /// `decode_headers` itself is a documented no-op (`false`, no mutation) --
 /// see [`DecoderCallbacks::modify_decoded_headers`]'s doc for why. A
 /// `decode_headers` filter already has direct `&mut RequestHeaders` access
 /// through its own parameter; giving the seam a second live borrow of that
 /// same value at the same time is impossible in safe Rust, and the
-/// clone-based workaround increment 2a used is exactly what caused the
+/// clone-based workaround an earlier design used is exactly what caused the
 /// data-loss bug `probe_direct_and_seam_mutations_coexist` guards. (Before
-/// this increment, this test asserted the opposite -- that the seam DID
+/// that fix, this test asserted the opposite -- that the seam DID
 /// reach the terminal from `decode_headers` -- which is what the clone/
 /// splice-back mechanism enabled at the cost of that bug.)
 #[test]
@@ -4203,12 +4202,12 @@ fn modify_decoded_headers_from_decode_headers_is_a_documented_no_op() {
     });
 }
 
-/// Load-bearing test for the whole increment: a filter that calls
-/// `modify_decoded_headers` from `decode_data` (WP-45's actual case -- the
+/// Load-bearing test for the whole seam: a filter that calls
+/// `modify_decoded_headers` from `decode_data` (the real use case -- the
 /// decision to inject body bytes, and so the need to fix up
 /// `content-length`, is only made once body bytes have been scanned) ALSO
 /// reaches the terminal. If only the `decode_headers` case worked, this seam
-/// would be useless for WP-45.
+/// would be useless for its real use case.
 #[test]
 fn modify_decoded_headers_from_decode_data_reaches_the_terminal() {
     block_on(async {
@@ -4240,7 +4239,7 @@ fn modify_decoded_headers_from_decode_data_reaches_the_terminal() {
 
 /// The motivating use: adding, replacing, and removing a header from
 /// `decode_data` all take effect at the terminal -- specifically pinning
-/// replacing `content-length` with a LARGER value (WP-45's actual need, once
+/// replacing `content-length` with a LARGER value (the real need, once
 /// it splices bytes into the body).
 #[test]
 fn modify_decoded_headers_add_replace_and_remove_all_take_effect() {
@@ -4300,7 +4299,7 @@ fn modify_decoded_headers_add_replace_and_remove_all_take_effect() {
 }
 
 /// A filter that never calls `modify_decoded_headers` sees byte-identical
-/// behavior to before this increment -- the seam is pure opt-in.
+/// behavior to before the seam existed -- the seam is pure opt-in.
 #[test]
 fn a_filter_that_never_calls_modify_decoded_headers_is_unaffected() {
     block_on(async {
@@ -4420,8 +4419,7 @@ fn modify_decoded_headers_is_a_no_op_once_headers_are_forwarded() {
 //
 // `FilterChainHandler::handle` wraps the response in `LoggingBody`, and
 // `LoggingBody::finish` does two independent jobs at end-of-stream: it renders
-// access-log lines, and it records LLM_CLIENT_TOKEN_USAGE (WP-23 increment
-// 6b). The wrap used to be gated on `access_loggers.is_empty()` alone, so a
+// access-log lines, and it records LLM_CLIENT_TOKEN_USAGE. The wrap used to be gated on `access_loggers.is_empty()` alone, so a
 // listener that configured `llmproxy.usage` for token metrics but no
 // `access_log` silently recorded nothing -- the instrument was wired end to
 // end and then skipped by the one branch that decides whether anything runs.
@@ -4429,11 +4427,11 @@ fn modify_decoded_headers_is_a_no_op_once_headers_are_forwarded() {
 // This is the same shape as every other defect in that batch: a declared
 // capability with no producer. It needs a test that switches token stats on
 // and access logs OFF, because a suite that never configures that combination
-// cannot regress it (ground rule 16).
+// cannot regress it (AGENTS.md "Coverage").
 
 /// Stamps both the usage AND the dialled cluster at end-of-stream --
 /// `record_usage` needs a provider name, and it comes from
-/// `StreamInfo::upstream_cluster` (ground rule #6: the member actually
+/// `StreamInfo::upstream_cluster` (AGENTS.md invariant 6: the member actually
 /// dialled, not the routed name).
 struct StampsUsageAndClusterFilter;
 

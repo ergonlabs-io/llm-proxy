@@ -1,19 +1,16 @@
-//! WP-50 increment 2a-i — the downstream-authentication core.
+//! The downstream-authentication core.
 //!
 //! **Library only.** This module resolves an inbound request's credential to
 //! a [`Principal`] (or refuses it); it is not wired into an `HttpFilter`
-//! here, and the token limiter is not yet re-keyed onto `Principal.tenant` --
-//! both are a separate increment. See `internal-docs/IMPLEMENTATION_PLAN.md`,
-//! which is normative and agreed with the repo owner; this module implements
-//! its increment 2a ("virtual keys, in-memory") exactly as scoped there.
+//! here (`auth_filter` does that). Scope is virtual keys, held in memory or
+//! in the `ControlPlane` snapshot.
 //!
 //! # Why an `Authenticator` trait, not "the virtual-key filter"
 //!
-//! The owner intends OIDC/JWT as a second credential kind later (increment
-//! 2c). So [`Authenticator`] is deliberately a trait with one implementation
-//! today ([`VirtualKeyAuthenticator`]) rather than a concrete type baked into
-//! a filter -- a future `JwtAuthenticator` is meant to slot in beside it
-//! without reshaping anything above.
+//! OIDC/JWT is a second credential kind, so [`Authenticator`] is deliberately a
+//! trait ([`VirtualKeyAuthenticator`] and `JwtAuthenticator` implement it)
+//! rather than a concrete type baked into a filter -- a new credential kind
+//! slots in beside the existing ones without reshaping anything above.
 //!
 //! # `NoCredential` vs `Rejected`: the load-bearing distinction
 //!
@@ -46,11 +43,11 @@
 //! *non-adversarial* input -- it offers neither preimage resistance nor a
 //! constant-time comparison, both of which this module requires. Both
 //! functions are spelled "hash a credential"; that they solve different
-//! problems is exactly the trap the design brief calls out.
+//! problems is exactly the trap to avoid.
 //!
 //! # Constant-time comparison: `ring::hmac::verify`, not `constant_time::verify_slices_are_equal`
 //!
-//! The design brief calls for `ring::constant_time::verify_slices_are_equal`.
+//! The obvious choice would be `ring::constant_time::verify_slices_are_equal`.
 //! In the `ring` version this workspace pins (0.17.14), that function has
 //! been deprecated with the note "Internal function not intended for
 //! external use with **no promises regarding side channels**" -- i.e. `ring`
@@ -99,8 +96,7 @@
 //! is `#[derive(Debug)]`d on a type that could carry a plaintext key, a
 //! digest, or the HMAC secret) so that a stray `tracing::debug!(?principal)`
 //! or similar can never become a leak channel. `tenant`/`key_id` are
-//! identifiers, not secrets -- the design brief explicitly wants them
-//! nameable in audit logs -- so only the fields that touch key material are
+//! identifiers, not secrets -- they must stay nameable in audit logs -- so only the fields that touch key material are
 //! actually redacted; the rest are still hand-written, on purpose, so a
 //! future field addition to one of these types has to make the same call
 //! explicitly rather than inherit it from `#[derive]`.
@@ -120,14 +116,12 @@ use crate::control::ControlPlaneSnapshot;
 /// simply not a credential this authenticator understands -- see
 /// [`AuthOutcome::NoCredential`].
 ///
-/// `pub(crate)`, not private: [`crate::jwt_auth::JwtAuthenticator`] (WP-50
-/// increment 2c-i) parses the same `Bearer ` scheme over the same header --
+/// `pub(crate)`, not private: [`crate::jwt_auth::JwtAuthenticator`] parses the same `Bearer ` scheme over the same header --
 /// sharing the constant means the two authenticators cannot silently drift
 /// on it.
 pub(crate) const BEARER_PREFIX: &str = "Bearer ";
 
-/// Printable prefix every virtual key carries -- see the design brief's "Key
-/// format" section: greppable in incident response, revocable by prefix
+/// Printable prefix every virtual key carries -- greppable in incident response, revocable by prefix
 /// scan, and distinguishable from a provider key pasted into the wrong
 /// field. A `Bearer` value without this prefix is assumed to belong to a
 /// later authenticator (e.g. a JWT) rather than being a malformed virtual
@@ -196,7 +190,7 @@ impl fmt::Debug for KeyId {
 
 /// Per-tenant authorization policy.
 ///
-/// WP-50 increment 3a adds the first field, [`Self::model_access`] --
+/// Its first field is [`Self::model_access`] --
 /// exactly the shape this doc predicted before any field existed, carried by
 /// [`Principal`] behind an `Arc`, so that adding it was a change to this one
 /// struct rather than a signature change through every call site that
@@ -217,7 +211,7 @@ impl fmt::Debug for KeyId {
 /// "No policy configured" and "a configured policy that failed to load" must
 /// **not** produce the same value. The first is this `Default` and grants
 /// everything; the second is a config error and must fail loudly with its
-/// dotted path (ground rule #1), because silently substituting the permissive
+/// dotted path (AGENTS.md invariant 1), because silently substituting the permissive
 /// default for a policy the operator *wrote* would turn a typo into a
 /// privilege escalation. [`crate::model_authz_filter::parse_config`] is the
 /// one place that loads this struct's `model_access` field from configuration,
@@ -230,13 +224,13 @@ pub struct TenantPolicy {
     /// whose emptiness would have to be interpreted as either "everything" or
     /// "nothing".
     pub model_access: crate::model_authz::ModelAccess,
-    /// This tenant's spend ceiling, if any (WP-50 increment 3c-iii-a). See
+    /// This tenant's spend ceiling, if any. See
     /// [`crate::spend::TenantBudget`]'s doc for the full reasoning; in short:
     ///
     /// **`None` means unlimited, and that is the deliberate default** -- the
     /// exact same reasoning as [`crate::model_authz::ModelAccess::default`]:
     /// a budget is an opt-in ceiling, not a default-deny, so an operator
-    /// enabling the (separate, 3c-iii-b) enforcement filter must not have it
+    /// enabling the (separate) spend enforcement filter must not have it
     /// silently deny every tenant's very first request. Restriction is
     /// opt-in: an operator sets a ceiling when they want one.
     ///
@@ -244,9 +238,8 @@ pub struct TenantPolicy {
     /// different fact from a configured ceiling of zero.** `Some(TenantBudget
     /// { max_micros: MicroUsd::from_micros(0), .. })` is a real, legitimate,
     /// deliberate policy -- deny every priced request this period -- exactly
-    /// like `ModelAccess::Only(vec![])` denying every model. This increment
-    /// (storage and admin CRUD only) is careful to keep the two
-    /// distinguishable end to end; see [`crate::control::ControlPlane::set_budget`]
+    /// like `ModelAccess::Only(vec![])` denying every model. Storage and admin
+    /// CRUD keep the two distinguishable end to end; see [`crate::control::ControlPlane::set_budget`]
     /// and its store methods.
     pub budget: Option<crate::spend::TenantBudget>,
 }
@@ -271,7 +264,7 @@ pub struct Principal {
     pub tenant: TenantId,
     /// WHICH credential authenticated -- see [`KeyId`]'s doc.
     pub key_id: KeyId,
-    /// Model allow-lists, budgets, quotas (increment 3; empty today). An
+    /// Model allow-lists and budgets. An
     /// `Arc` so the hot path clones a pointer, and so a future policy change
     /// is a snapshot swap rather than a per-request lookup.
     pub policy: Arc<TenantPolicy>,
@@ -302,11 +295,11 @@ pub enum AuthError {
     /// that record is marked `revoked`.
     RevokedKey,
 
-    // -- WP-50 increment 2c-i: `crate::jwt_auth::JwtAuthenticator`'s
+    // -- `crate::jwt_auth::JwtAuthenticator`'s
     // rejection reasons. Added here (not on a separate error type) for the
     // same reason `UnknownKey`/`RevokedKey` already share this enum: both
-    // authenticators feed the same `AuthOutcome::Rejected`, and the design
-    // brief's "nothing above [`Authenticator`] changes" promise covers this
+    // authenticators feed the same `AuthOutcome::Rejected`, and the "nothing above [`Authenticator`] changes"
+    // promise covers this
     // enum too -- it is part of the seam, not part of one implementation.
     /// The bearer value was not a well-formed JWT: not three
     /// `.`-separated segments, invalid base64, or a segment that did not
@@ -342,8 +335,8 @@ pub enum AuthError {
     /// contain it (including a token with no `aud` claim at all).
     JwtAudienceMismatch,
     /// The token verified, but the configured tenant claim was absent or was
-    /// not a non-empty string. Never defaulted -- see the design brief's
-    /// "missing tenant claim is Rejected, never a default tenant".
+    /// not a non-empty string. Never defaulted: a missing tenant claim is
+    /// Rejected, never mapped to a default tenant.
     JwtMissingTenantClaim,
     /// The token verified and carried the configured tenant claim, but that
     /// claim's value appears in no configured `tenant_values` map entry, so
@@ -490,7 +483,7 @@ pub fn digest_bytes(secret: &HmacSecret, plaintext_key: &str) -> [u8; 32] {
 /// This is the ONE place in the codebase a digest is derived from a
 /// plaintext key: [`KeySet::insert`] below calls this directly (rather than
 /// duplicating the HMAC-and-hex-encode), and so does `llm-proxy --mode
-/// keygen` (`crates/proxy/src/keygen.rs`, WP-50 increment 2a-iv) -- the tool
+/// keygen` (`crates/proxy/src/keygen.rs`) -- the tool
 /// that GENERATES a key and the code path that later loads a [`KeySet`] to
 /// VERIFY one both call this exact function, so they cannot drift apart.
 /// `HmacSecret`'s inner `ring::hmac::Key` is private to this module, which is
@@ -538,7 +531,7 @@ pub fn generate_plaintext_key(rng: &ring::rand::SystemRandom) -> String {
 /// Reverses [`digest_hex`]'s formatting. Private and infallible-by-panic
 /// rather than returning a `Result`: unlike `auth_filter::parse_digest_hex`
 /// (which validates untrusted config text character by character and must
-/// name a dotted field path on failure, ground rule #1), the only strings
+/// name a dotted field path on failure, AGENTS.md invariant 1), the only strings
 /// this is ever handed are ones [`digest_hex`] just produced a few lines
 /// above, so there is nothing external to validate.
 fn decode_hex_digest(hex: &str) -> Vec<u8> {
@@ -775,10 +768,8 @@ impl Authenticator for VirtualKeyAuthenticator {
 }
 
 /// Walks a sequence of [`Authenticator`]s and produces one [`AuthOutcome`]
-/// for a request -- the seam the design brief's "authenticator is a trait"
-/// section names: today this chain holds exactly one
-/// [`VirtualKeyAuthenticator`], and a future `JwtAuthenticator` (increment
-/// 2c) is meant to slot in beside it without this type, or anything above
+/// for a request -- the seam that lets a new credential
+/// kind slot in beside the existing ones without this type, or anything above
 /// it, changing shape.
 ///
 /// Rust note: `Vec<Box<dyn Authenticator>>` -- a trait object per entry,

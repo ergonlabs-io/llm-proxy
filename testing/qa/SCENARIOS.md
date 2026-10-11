@@ -34,7 +34,7 @@ in the way:
 1. ~~**The `llmproxy` dialect never wires `observability.access_logs` into the
    generated Envoy config.**~~ **FIXED** — commit _"Emit access logs from the
    llmproxy dialect"_. `crates/proxy-simple-config/src/lower.rs` used to emit
-   only a warning (_"access logging is recorded but not emitted yet (WP-24)"_)
+   only a warning (_"access logging is recorded but not emitted yet"_)
    and never add an `access_log` entry to the HCM. That warning was **stale**:
    Access logging had landed and worked fully in Envoy mode; only the
    dialect lowering was missing, so a proxy configured the way users actually
@@ -47,7 +47,6 @@ in the way:
    the router in the dialect's chain, and each route carries a
    `typed_per_filter_config` override naming its own provider's dialect — which
    is what lets one proxy meter OpenAI and Anthropic correctly from one config.
-   See `internal-docs/IMPLEMENTATION_PLAN.md`.
 
 Gap 1 was not anticipated by the code review that produced the usage-filter brief —
 an independently written black-box test found it from the outside. That is the
@@ -200,9 +199,8 @@ off the agent's judgment alone.
 
 ### QA-1 — Per-route token counts are correct for both providers, from one proxy and one config
 
-**Why:** this is v0.1.0's per-route dialect claim and the acceptance criterion
-in `internal-docs/IMPLEMENTATION_PLAN.md`. A per-listener dialect physically cannot pass
-it, which is what makes it proof rather than coverage.
+**Why:** this is v0.1.0's per-route dialect claim and its acceptance criterion.
+A per-listener dialect physically cannot pass it, which is what makes it proof rather than coverage.
 
 **Config:** `llmproxy` dialect, two providers, two routes — `gpt-*` → openai,
 `claude-*` → anthropic; access logs to a file, JSON format, including the four
@@ -221,7 +219,7 @@ a crossed-wires bug cannot pass.
 
 ### QA-2 — A bad config fails at load, names the offending field, and exits nonzero
 
-**Why:** ground rule #1 — silently ignoring a config field is a P0. Strict mode
+**Why:** AGENTS.md invariant 1 — silently ignoring a config field is a P0. Strict mode
 is a user-facing feature, and its error quality is the whole point.
 
 **Config:** one with an unsupported/misspelled field.

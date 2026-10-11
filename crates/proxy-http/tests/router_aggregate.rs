@@ -1,4 +1,4 @@
-//! WP-35 increment 2a: the aggregate cluster (`ClusterKind::Aggregate`) as a
+//! The aggregate cluster (`ClusterKind::Aggregate`) as a
 //! provider-fallback target. This file exists for exactly one guarantee --
 //! **credential isolation across failover**: a request that falls over from
 //! provider `"a"` to provider `"b"` must carry `"b"`'s credentials, and
@@ -61,7 +61,7 @@ fn fast_backoff() -> RetryBackOff {
     }
 }
 
-/// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved for
+/// A fresh, single-worker [`RouterStats`] resolved for
 /// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
 /// mirroring how `crates/proxy/src/main.rs` builds the real one from the
 /// boot config snapshot's cluster names.
@@ -88,7 +88,7 @@ fn retry_policy(retry_on: &str, num_retries: u32) -> RetryPolicyIR {
 /// `connect-failure` -- already a retriable trigger under today's retry
 /// engine (S3.2), so this test needs no retry-predicate changes: `"a"`'s
 /// closed port fails the connect, the existing retry loop reacts, and the
-/// aggregate (WP-35 increment 2a's own logic) is what decides where the
+/// aggregate (the aggregate's own logic) is what decides where the
 /// retried attempt goes.
 fn forward_to_providers() -> ForwardAction {
     ForwardAction {
@@ -118,7 +118,7 @@ fn mutation(key: &str, value: &str, action: HeaderAppendAction) -> HeaderMutatio
 }
 
 /// A STATIC, single-endpoint `Endpoints` cluster carrying `mutations` as its
-/// own `request_headers_to_add` -- the WP-35 increment 1a credential
+/// own `request_headers_to_add` -- the per-cluster credential
 /// mechanism this test relies on to tell `"a"`'s and `"b"`'s attempts apart.
 fn member_cluster(name: &str, addr: SocketAddr, mutations: Vec<HeaderMutation>) -> ClusterConfig {
     ClusterConfig {
@@ -358,7 +358,7 @@ async fn spawn_reflecting_upstream() -> (SocketAddr, oneshot::Receiver<String>) 
     (addr, rx)
 }
 
-/// The load-bearing WP-35 guarantee this whole increment exists for: a
+/// The load-bearing guarantee this whole file exists for: a
 /// request that fails over from `"a"` (closed port, connect failure) to
 /// `"b"` (live) must carry `"b"`'s credentials -- and `"a"`'s must not
 /// appear anywhere in what `"b"` received. Asserting only that `"b"`'s key

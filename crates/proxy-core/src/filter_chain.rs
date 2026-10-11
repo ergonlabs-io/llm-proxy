@@ -1,4 +1,4 @@
-//! Pure filter-chain matching algorithm (WP-07 chunk B). Given a listener's
+//! Pure filter-chain matching algorithm. Given a listener's
 //! `filter_chains` and the properties of an accepted connection, picks the one
 //! Envoy's `FilterChainManager` would pick. No sockets, no async — this module
 //! is a function of its inputs, which is what makes it property-testable.
@@ -12,16 +12,16 @@ pub struct ConnectionProperties {
     /// Local address of the accepted socket.
     pub destination_addr: SocketAddr,
     /// Downstream source; equals `direct_source_addr` until `proxy_protocol`
-    /// (WP-08) rewrites it from the PROXY header.
+    /// rewrites it from the PROXY header.
     pub source_addr: SocketAddr,
     /// The physically connected peer (never rewritten by `proxy_protocol`).
     pub direct_source_addr: SocketAddr,
-    /// SNI, populated by the `tls_inspector` listener filter (WP-08); `None`
+    /// SNI, populated by the `tls_inspector` listener filter; `None`
     /// until then.
     pub server_name: Option<String>,
     /// e.g. "raw_buffer" or "tls"; "raw_buffer" until `tls_inspector` lands.
     pub transport_protocol: String,
-    /// ALPN, populated by `tls_inspector` (WP-08); empty until then.
+    /// ALPN, populated by `tls_inspector`; empty until then.
     pub application_protocols: Vec<String>,
 }
 

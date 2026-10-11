@@ -1,6 +1,6 @@
-//! Certificate loading + the hot-swappable downstream cert resolver (WP-08).
+//! Certificate loading + the hot-swappable downstream cert resolver.
 //!
-//! `SwapCertResolver` is the seam SDS (WP-22) will drive: `DownstreamTlsFactory`
+//! `SwapCertResolver` is the seam SDS will drive: `DownstreamTlsFactory`
 //! builds one `rustls::ServerConfig` up front, but the certificates it serves
 //! can be replaced afterwards by swapping the `ArcSwap<CertSet>` underneath
 //! it -- no rebuild, no dropped connections.
@@ -27,7 +27,7 @@ pub(super) struct CertSet {
 }
 
 /// Read a [`DataSourceIR`] into bytes. `context` names the field for error
-/// messages (ground rule #1: never fail silently/anonymously).
+/// messages (AGENTS.md invariant 1: never fail silently/anonymously).
 pub(super) fn read_data_source(
     source: &DataSourceIR,
     context: &str,

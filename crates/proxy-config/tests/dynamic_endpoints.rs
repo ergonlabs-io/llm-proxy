@@ -1,8 +1,8 @@
-//! WP-21 increment 2a acceptance tests: lowering ONE xDS-delivered
+//! Acceptance tests: lowering ONE xDS-delivered
 //! `ClusterLoadAssignment` (an EDS resource) into endpoint IR.
 //!
 //! This is the config half of EDS only -- nothing here subscribes to EDS or
-//! feeds a cluster manager (that is increment 2b). Mirrors
+//! feeds a cluster manager. Mirrors
 //! `dynamic_lower.rs`'s fixture idiom: build the proto by hand, encode it
 //! into an `Any` (the shape an ADS `DiscoveryResponse.resources` entry
 //! carries on the wire), and lower it directly -- there is no bootstrap file
@@ -11,7 +11,7 @@
 //! **The strict-mode test is the point of this file, not a nice-to-have.**
 //! `lower_dynamic_endpoints` runs the same `check_supported_surface` pass
 //! `build_snapshot` runs over a whole file-loaded bootstrap; a `Cluster`
-//! LoadAssignment delivered over EDS gets none of ground rule #1's
+//! LoadAssignment delivered over EDS gets none of AGENTS.md invariant 1's
 //! protection unless this function puts it there too.
 
 use prost::Message;
@@ -56,7 +56,7 @@ fn lb_endpoint(host: &str, port: u32) -> endpoint_v3::LbEndpoint {
 }
 
 /// Same as [`lb_endpoint`], with `metadata.filter_metadata[namespace]` set
-/// to the given single string field. Used by the WP-56 metadata tests below.
+/// to the given single string field. Used by the metadata tests below.
 fn lb_endpoint_with_metadata(
     host: &str,
     port: u32,
@@ -293,9 +293,9 @@ fn an_eds_endpoint_with_a_hostname_instead_of_a_literal_ip_is_refused() {
     );
 }
 
-// -------------------------------------------------------------- WP-56: metadata --
+// ------------------------------------------------------------------ metadata --
 
-/// The EDS half of WP-56: an EDS-delivered `LbEndpoint.metadata` under the
+/// The EDS half of endpoint-metadata lowering: an EDS-delivered `LbEndpoint.metadata` under the
 /// `io.llmproxy.endpoint` namespace lowers into `EndpointIR::metadata` the
 /// same way the static `load_assignment` path does (see
 /// `endpoint_metadata.rs` for that half) -- this is the whole point for the
@@ -326,7 +326,7 @@ fn an_eds_delivered_endpoints_metadata_lowers_into_endpoint_ir() {
 }
 
 /// `envoy.lb` on an EDS-delivered endpoint is refused exactly as it is on a
-/// bootstrap-loaded one -- EDS gets no exemption from ground rule #1.
+/// bootstrap-loaded one -- EDS gets no exemption from AGENTS.md invariant 1.
 #[test]
 fn an_eds_delivered_endpoints_envoy_lb_metadata_is_refused() {
     let la = assignment(

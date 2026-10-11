@@ -1,4 +1,4 @@
-//! WP-23 increment 6a: the router-side half of wiring the stats registry to
+//! The router-side half of wiring the stats registry to
 //! real traffic. This module owns exactly two things: a per-cluster lookup
 //! table of pre-resolved [`Handle`]/[`HistogramHandle`]s
 //! ([`StatHandles`]/[`ClusterStatHandles`]), and a thin, panic-free recording
@@ -11,7 +11,7 @@
 //! `proxy_observability::stats::Registry` (the hot-path type every worker
 //! holds as `Arc<Registry>`) deliberately has no public `resolve` -- only
 //! [`proxy_observability::stats::StatsControl`] can grow the registry (see
-//! that module's "Increment 5" doc section). [`StatHandles::build`] is the
+//! that module's docs). [`StatHandles::build`] is the
 //! one call site in the whole data plane that touches `StatsControl`: it
 //! runs once, in `crates/proxy/src/main.rs`, against the boot-time config
 //! snapshot's cluster names, and the resulting table is hands out as
@@ -35,7 +35,7 @@
 //! [`RouterStats::warn_unknown_cluster_once`]) so the gap stays visible
 //! without spamming a line per request.
 //!
-//! # WP-23 increment 6b: the other two instruments
+//! # The other two instruments
 //!
 //! [`DownstreamStatHandles`]/[`DownstreamStats`] and
 //! [`TokenUsageStatHandles`]/[`GenAiTokenStats`] mirror
@@ -48,7 +48,7 @@
 //! different: a single instrument keyed by listener name for the first, and
 //! four handles per provider (one per token bucket) for the second.
 //!
-//! # WP-55: `tenant` is the one attribute this file resolves OFF the boot
+//! # `tenant` is the one attribute this file resolves OFF the boot
 //! control side
 //!
 //! Every other resolve in this module happens once, at boot (or on a SIGHUP
@@ -435,7 +435,7 @@ impl DownstreamStats {
 /// hands back the sentinel-tenant ("no authenticated caller") set;
 /// [`GenAiTokenStats::record_usage`] builds the real-tenant equivalent
 /// per call, via [`Registry::resolve_capped`] -- see that method's doc and
-/// the module doc's WP-55 section for why this one attribute can't be
+/// the module doc's `tenant` section for why this one attribute can't be
 /// pre-resolved at boot the way the other two are.
 #[derive(Debug, Clone, Copy)]
 pub struct TokenUsageHandles {
@@ -446,13 +446,13 @@ pub struct TokenUsageHandles {
 }
 
 /// Provider (= cluster) name -> [`TokenUsageHandles`] resolved for
-/// [`instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT`] (WP-55: the one tenant
+/// [`instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT`] (the one tenant
 /// value known ahead of time, for unauthenticated traffic), mirroring
 /// [`StatHandles`]'s `by_cluster` table shape and cadence exactly -- see that
 /// struct's doc. Also doubles as the "is this a known provider at all" gate
 /// [`GenAiTokenStats::record_usage`] checks before resolving anything
 /// tenant-specific -- an unresolved provider must stay a no-op regardless of
-/// tenant, same as before WP-55.
+/// tenant.
 pub struct TokenUsageStatHandles {
     by_provider: ArcSwap<HashMap<String, TokenUsageHandles>>,
 }
@@ -460,8 +460,8 @@ pub struct TokenUsageStatHandles {
 impl TokenUsageStatHandles {
     /// Resolves the sentinel-tenant `llm.client.token.usage` series for
     /// every name in `provider_names` (the boot snapshot's cluster names --
-    /// any cluster can be the member a request actually dials, ground rule
-    /// #6) against `control`. Called once, at boot.
+    /// any cluster can be the member a request actually dials,
+    /// AGENTS.md invariant 6) against `control`. Called once, at boot.
     pub fn build<'a>(
         control: &StatsControl,
         provider_names: impl IntoIterator<Item = &'a str>,
@@ -645,10 +645,10 @@ impl GenAiTokenStats {
     /// `LlmTokens` being entirely absent; see the call site in
     /// `access_logging::LoggingBody::finish`, which only calls this when
     /// usage IS present at all). `provider` must be the cluster actually
-    /// dialled, never the routed cluster name -- see ground rule #6. A
+    /// dialled, never the routed cluster name -- see AGENTS.md invariant 6. A
     /// no-op, not a panic, for an unresolved provider -- checked BEFORE
     /// `tenant` is even looked at, so an unknown provider stays silent
-    /// regardless of tenant, same as before WP-55.
+    /// regardless of tenant.
     ///
     /// `tenant` is `StreamInfo::auth.tenant` verbatim (see
     /// `access_logging::LoggingBody::finish`'s call site), never a
@@ -656,9 +656,9 @@ impl GenAiTokenStats {
     /// `AuthInfo::tenant` is a plain `Option<String>`, the identifier the
     /// auth filter resolved, not the credential that resolved it. `None`
     /// uses the pre-resolved sentinel-tenant handles
-    /// (`self.handles.for_provider`, WP-55's boot-resolved fast path);
+    /// (`self.handles.for_provider`, the boot-resolved fast path);
     /// `Some` resolves per call, capped, via
-    /// [`Registry::resolve_capped`] -- see the module doc's WP-55 section
+    /// [`Registry::resolve_capped`] -- see the module doc's `tenant` section
     /// for why this ONE attribute can't be pre-resolved at boot.
     pub fn record_usage(&self, provider: &str, tenant: Option<&str>, tokens: LlmTokens) {
         let Some(no_tenant) = self.handles.for_provider(provider) else {
@@ -676,7 +676,7 @@ impl GenAiTokenStats {
             .incr(self.worker, h.cache_creation, tokens.cache_creation);
     }
 
-    /// WP-55: the dynamic half of tenant resolution -- called once per
+    /// The dynamic half of tenant resolution -- called once per
     /// [`Self::record_usage`] when `tenant` is `Some`, never cached across
     /// calls in THIS type (there is nothing here to cache: `Registry`'s own
     /// dedup map, behind `resolve_capped`, already makes a repeat call for
@@ -912,7 +912,7 @@ mod tests {
         assert_eq!(snapshot.sum, 42.0);
     }
 
-    // ---- WP-23 increment 6b: DownstreamStats -----------------------------
+    // ---- DownstreamStats -----------------------------
 
     #[test]
     fn record_connection_accepted_increments_the_resolved_counter() {
@@ -968,7 +968,7 @@ mod tests {
         );
     }
 
-    // ---- WP-23 increment 6b: GenAiTokenStats ------------------------------
+    // ---- GenAiTokenStats ------------------------------
 
     fn sample_tokens() -> LlmTokens {
         LlmTokens {
@@ -1022,7 +1022,7 @@ mod tests {
 
         // "openai" is known, "anthropic" is not. Checked with a real tenant
         // too: an unknown provider must stay silent regardless of the
-        // tenant dimension (WP-55).
+        // tenant dimension.
         stats.record_usage("anthropic", None, sample_tokens());
         stats.record_usage("anthropic", Some("acme"), sample_tokens());
 
@@ -1036,7 +1036,7 @@ mod tests {
         assert!(warned.contains("anthropic"));
     }
 
-    // ---- WP-55: the `tenant` dimension ------------------------------------
+    // ---- the `tenant` dimension ------------------------------------
 
     #[test]
     fn a_known_tenant_gets_its_own_series_carrying_its_own_id() {
@@ -1118,7 +1118,7 @@ mod tests {
         // Requirement 2: usage is not skipped just because there was no
         // authenticated caller -- it lands on the boot-resolved sentinel
         // series (`for_provider`'s own handles), same place it landed before
-        // WP-55 added the dimension.
+        // the tenant dimension existed.
         let control = StatsControl::new(1);
         let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
         let registry = control.registry();

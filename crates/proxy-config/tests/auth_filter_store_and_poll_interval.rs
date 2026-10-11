@@ -1,4 +1,4 @@
-//! WP-61: `llmproxy.filters.v0.Authentication`'s `store` oneof
+//! `llmproxy.filters.v0.Authentication`'s `store` oneof
 //! (`in_memory`/`persistent`) and its new `poll_interval_seconds` field, both
 //! through the real strict-parse -> surface-walk -> IR pipeline.
 //!

@@ -1,9 +1,7 @@
-//! WP-50 increment 3 end-to-end acceptance drill for the admin WRITE API --
-//! closes the coverage gap the plan names explicitly (`IMPLEMENTATION_PLAN.md`'s
-//! WP-50 status block, "Open, honestly, not done": **"The admin API has never
-//! run against the real binary. Nothing outside unit tests sets
-//! `LLMPROXY_ADMIN_TOKEN`"**). Four of the five defects found in the
-//! increment-3 window (`SharedFactoryState` keyed on `type_url` alone, a
+//! End-to-end acceptance drill for the admin WRITE API -- closes the coverage
+//! gap that the admin API had never run against the real binary (nothing
+//! outside unit tests set `LLMPROXY_ADMIN_TOKEN`). Four of the five defects
+//! found when it was first wired (`SharedFactoryState` keyed on `type_url` alone, a
 //! per-worker token-limit store, and two more) were wiring bugs a unit test
 //! against a `TestCallbacks`/in-process double could not see, because they
 //! only exist once a real binary boots real workers around a real socket.
@@ -108,7 +106,7 @@ const ADMIN_TOKEN: &str = "wp-50-admin-e2e-bearer-token-never-reused-elsewhere";
 const WRONG_ADMIN_TOKEN: &str = "wp-50-admin-e2e-WRONG-bearer-token";
 
 /// The credential the CLUSTER injects via `io.llmproxy.provider_auth`
-/// metadata (ground rule #6: per-provider credentials belong on the cluster,
+/// metadata (AGENTS.md invariant 6: per-provider credentials belong on the cluster,
 /// never the route) -- restated from `auth_e2e.rs`.
 const PROVIDER_KEY: &str = "sk-real-provider-credential-admin-e2e";
 
@@ -837,7 +835,7 @@ async fn revoking_a_key_takes_effect_on_the_very_next_request() {
 
 /// 4. `PUT /tenants/{id}/policy` changes model authorization for the VERY
 /// NEXT request, with no reload. Sends the same (denied) model twice --
-/// once before the policy write (permitted, WP-50 3b-iv's default-open
+/// once before the policy write (permitted, the default-open
 /// baseline) and once after (refused) -- then confirms the allowed model
 /// still passes under the new, restrictive policy.
 ///
@@ -919,7 +917,7 @@ async fn a_tenant_policy_write_changes_model_authorization_live() {
     let header_pairs: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
 
     // Baseline: no policy configured yet, so a tenant is permitted every
-    // model (WP-50 3b-iv's default-open reversal) -- including the one the
+    // model (authorization defaults open) -- including the one the
     // policy write below is about to deny. Asserting this first is what
     // proves the LATER denial is caused by the write, not by something else
     // about this model name.

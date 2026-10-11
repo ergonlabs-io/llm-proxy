@@ -1,8 +1,8 @@
-//! WP-10 chunk B -- the `StreamHandler` seam: the boundary between the
+//! The `StreamHandler` seam: the boundary between the
 //! downstream HTTP codec ([`crate::codec`]) and whatever produces a response
-//! for a request. This is **provisional**: WP-11's filter manager will
-//! implement (and likely refine) this trait behind the S2 iteration state
-//! machine described in internal-docs/IMPLEMENTATION_PLAN.md. Until then, [`stub`] provides
+//! for a request. This is **provisional**: the filter manager
+//! implements (and may still refine) this trait behind the S2 iteration state
+//! machine (envoy-semantics.md S2). [`stub`] provides
 //! two concrete handlers ([`stub::FixedResponseHandler`],
 //! [`stub::EchoHandler`]) that exercise the seam end-to-end for the codec's
 //! own tests.
@@ -31,7 +31,7 @@ pub enum BodyError {
 /// and a final optional trailers frame, per the `http_body` model. Boxing
 /// (rather than naming a concrete type) is what lets this module -- and
 /// [`StreamHandler`] implementors -- stay decoupled from hyper's `Incoming`
-/// body type (ground rule-adjacent: the codec is the only place that talks
+/// body type (AGENTS.md invariant 2 in spirit: the codec is the only place that talks
 /// hyper).
 ///
 /// Deliberately **not** `Send` (ADR-0003: the data plane never hops threads).
@@ -39,10 +39,10 @@ pub enum BodyError {
 /// `UnsyncBoxBody` variant still requires `Send` -- so neither can hold `!Send`
 /// per-stream filter state (e.g. a `Box<dyn HttpFilter>` owning `Rc`/`RefCell`)
 /// inside a streaming body, which is exactly what streaming a response through
-/// the filter chain needs (WP-11). This hand-rolled alias drops both bounds;
+/// the filter chain needs. This hand-rolled alias drops both bounds;
 /// hyper's http1 server only requires `B: Body + 'static`, not `B: Send`.
 ///
-/// NOTE(WP-10 h2 chunk): this was verified against hyper's **http1** server
+/// NOTE: this was verified against hyper's **http1** server
 /// bounds. Re-check the http2 path's bounds before wiring h2 downstream -- if
 /// it demands `B: Send`, the streaming filter pump needs a different shape
 /// (a spawn_local'd pump owning the filters, feeding a channel-backed body).
@@ -77,11 +77,11 @@ pub struct HttpRequestParts {
     pub head: RequestHeaders,
     pub body: StreamBody,
     pub downstream: DownstreamInfo,
-    /// S10 (WP-10): the downstream connection's pending HTTP upgrade, if this
+    /// S10: the downstream connection's pending HTTP upgrade, if this
     /// request asked for one (`Upgrade` + `Connection: upgrade`). Extracted by
     /// `codec::serve_one` via `hyper::upgrade::on` before the request body is
-    /// taken, and carried here so the router (increment 2b) can pair it with
-    /// the upstream's own `OnUpgrade` and tunnel between them (increment 2c).
+    /// taken, and carried here so the router can pair it with
+    /// the upstream's own `OnUpgrade` and tunnel between them.
     /// `None` for a normal request, and for every internally-synthesised
     /// request (a router's upstream request has no downstream upgrade).
     pub on_upgrade: Option<hyper::upgrade::OnUpgrade>,
@@ -118,7 +118,7 @@ impl DownstreamInfo {
 pub struct HttpResponseParts {
     pub head: ResponseHeaders,
     pub body: StreamBody,
-    /// S10 (WP-10 increment 2b/2c): set only by the router's own `101`
+    /// S10: set only by the router's own `101`
     /// path (`router::RouterHandler::handle_upgrade`) once the upstream has
     /// answered `101` -- every other constructor of this struct sets `None`.
     /// `codec::serve_one` is the one place this is read: it must be pulled
@@ -187,7 +187,7 @@ pub trait StreamHandler {
 
 pub mod stub {
     //! Concrete [`super::StreamHandler`]s used to smoke-test the codec
-    //! end-to-end (real routing/filtering is WP-11/12/13). These are plain
+    //! end-to-end (real routing/filtering lives in the filter manager and router). These are plain
     //! fixtures, not test-only mocks -- kept here (rather than under
     //! `#[cfg(test)]`) so other crates can reuse them too.
 
@@ -282,7 +282,7 @@ mod tests {
     /// test in the workspace, while silently making streaming a response
     /// through the (`!Send`, ADR-0003) filter chain impossible to express.
     /// Here `Rc` stands in for the per-stream filter state a streaming body
-    /// will own in WP-11 chunk 3.
+    /// owns.
     #[test]
     fn stream_body_can_hold_non_send_state() {
         let not_send: Rc<u8> = Rc::new(7);

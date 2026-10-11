@@ -165,7 +165,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         secrets: HashMap::new(),
         admin: Some("127.0.0.1:9901".parse().unwrap()),
         tracing: None,
-        // WP-51 increment 4: metric export is a separate IR field from trace
+        // Metric export is a separate IR field from trace
         // export precisely so the two are independently configurable; these
         // admin-server fixtures exercise neither, and a snapshot literal is
         // exhaustive by design, so a new root field has to be named here. This
@@ -177,7 +177,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         #[cfg(unix)]
         end_user_capture: None,
         end_user_capture_configured: false,
-        // WP-20 increment 1: this fixture is a static-config snapshot, which
+        // This fixture is a static-config snapshot, which
         // is what `None` means -- no control plane is involved.
         ads: None,
         version: SnapshotVersion(1),
@@ -327,7 +327,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         secrets: HashMap::new(),
         admin: None,
         tracing: None,
-        // WP-51 increment 4: see the other snapshot fixture in this file.
+        // See the other snapshot fixture in this file.
         metrics: None,
         #[cfg(unix)]
         end_user_capture: None,
@@ -337,7 +337,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
     })
 }
 
-/// Starts an admin server on port 0 over `snapshot`, with no WP-23 stats
+/// Starts an admin server on port 0 over `snapshot`, with no stats
 /// registry wired -- the default for every test that isn't specifically
 /// about `/stats`. See [`start_with_registry`] for the `/stats`-focused
 /// tests. Returns the server (kept alive for the caller) and its bound
@@ -346,7 +346,7 @@ async fn start(snapshot: Arc<ConfigSnapshot>) -> (AdminServer, SocketAddr) {
     start_with_registry(snapshot, None).await
 }
 
-/// [`start`], but with an explicit (possibly `Some`) WP-23 stats registry --
+/// [`start`], but with an explicit (possibly `Some`) stats registry --
 /// what `/stats`'s own tests need to exercise both the wired and unwired
 /// cases. No `SharedFactoryState` singleton and no admin token -- what every
 /// read-only test needs, and (see test 10 in this file) also what proves
@@ -364,8 +364,8 @@ async fn start_with_registry(
     .await
 }
 
-/// [`start`], but with an explicit [`ReadinessProbe`] -- what WP-21 increment
-/// 3's `/ready` tests need. No registry, no `SharedFactoryState`, no admin
+/// [`start`], but with an explicit [`ReadinessProbe`] -- what the `/ready` tests
+/// need. No registry, no `SharedFactoryState`, no admin
 /// token: the same "only the one thing this test is about" shape as
 /// [`start_with_registry`].
 async fn start_with_readiness(
@@ -386,7 +386,7 @@ async fn start_with_readiness(
 /// test needs to supply a real `ControlPlane` (via `factory_state`) and/or a
 /// bearer token. Kept as its own (unchanged-signature) function rather than
 /// adding a fifth parameter here, so the ~30 existing call sites that predate
-/// WP-21 increment 3 don't all need touching for a param none of them cares
+/// the readiness parameter don't all need touching for a param none of them cares
 /// about -- see [`start_full_with_readiness`] for the one that does.
 async fn start_full(
     snapshot: Arc<ConfigSnapshot>,
@@ -458,7 +458,7 @@ async fn start_with_cluster_state(
 }
 
 /// Registers a real [`ControlPlane`] into `factory_state` under
-/// `(scope, auth_filter::TYPE_URL)` AND, since WP-50 3c-ii-a, the matching
+/// `(scope, auth_filter::TYPE_URL)` AND the matching
 /// `(stat_prefix, auth_filter::TYPE_URL)` name-index slot -- the exact shape
 /// a worker's `AuthFilterFactory::create` produces for a real `llmproxy.auth`
 /// filter (see that factory's own doc for the `get_or_try_init` singleton
@@ -507,7 +507,7 @@ fn factory_state_with_control_plane() -> (
 
 /// Registers a real [`SpendAccumulator`] into `factory_state` under
 /// `(scope, spend_limit_filter::TYPE_URL)` and its `stat_prefix` name index
-/// -- WP-50 3c-iv's stand-in for what `SpendLimitFilterFactory::create`
+/// -- the stand-in for what `SpendLimitFilterFactory::create`
 /// registers in production. Wraps the accumulator in
 /// [`SharedSpendLimitState::for_test`], the SAME wrapper type production
 /// registers (see that constructor's own doc for why a bare
@@ -578,8 +578,8 @@ fn factory_state_with_control_plane_and_spend(
 /// register a SECOND, different scope.
 const TEST_CHAIN_SCOPE: &str = "listener 'test' filter_chains[0]";
 
-/// The `stat_prefix` matching [`TEST_CHAIN_SCOPE`]'s registration -- WP-50
-/// 3c-ii-a's external name for the same chain.
+/// The `stat_prefix` matching [`TEST_CHAIN_SCOPE`]'s registration -- the
+/// external name for the same chain.
 const TEST_CHAIN_STAT_PREFIX: &str = "test-chain";
 
 /// A [`VirtualKeyAuthenticator`] over `handle`, built with the same
@@ -687,7 +687,7 @@ async fn ready_returns_live() {
     assert_eq!(body, "LIVE");
 }
 
-/// WP-21 increment 3: no probe wired keeps the pre-existing behavior --
+/// No probe wired keeps the pre-existing behavior --
 /// `200 "LIVE"` -- rather than inventing a new failure mode for a caller
 /// (like [`start`]/[`ready_returns_live`] above) that never had a
 /// `ClusterManager` to ask. This test asserts the SAME thing via the
@@ -879,7 +879,7 @@ async fn unknown_path_is_404_and_names_available_endpoints() {
     assert!(body.contains("/server_info"));
 }
 
-/// When this admin server instance was never handed a WP-23 stats registry
+/// When this admin server instance was never handed a stats registry
 /// (`start`'s default -- most tests in this file don't care about `/stats`),
 /// the route must 404 honestly rather than fabricate an empty `200`: an
 /// operator who trusts an empty `/stats` believes there is no traffic. Also
@@ -890,10 +890,10 @@ async fn stats_is_404_when_no_registry_is_wired() {
     let (_server, addr) = start(snapshot_with_secret()).await;
     let (status, body) = get(addr, "/stats").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body.contains("WP-23"));
+    assert!(body.contains("stats registry"));
 }
 
-/// WP-23 increment 3: once a registry *is* wired, `/stats` renders it --
+/// Once a registry *is* wired, `/stats` renders it --
 /// `200`, with the Envoy-named, `name: value` body `envoy_render::render`
 /// produces.
 #[tokio::test]
@@ -931,17 +931,17 @@ async fn stats_body_is_the_summed_value_across_workers() {
     );
 }
 
-/// WP-23 increment 4: same honest-404 rule as `/stats` itself when no
+/// Same honest-404 rule as `/stats` itself when no
 /// registry is wired.
 #[tokio::test]
 async fn stats_prometheus_is_404_when_no_registry_is_wired() {
     let (_server, addr) = start(snapshot_with_secret()).await;
     let (status, body) = get(addr, "/stats/prometheus").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body.contains("WP-23"));
+    assert!(body.contains("stats registry"));
 }
 
-/// WP-23 increment 4: once a registry is wired, `/stats/prometheus` renders
+/// Once a registry is wired, `/stats/prometheus` renders
 /// Prometheus text exposition format with the confirmed `envoy_`-prefixed
 /// name, and the response's `content-type` must be exactly
 /// `prometheus_render::CONTENT_TYPE` -- tying the two together so they can't
@@ -997,9 +997,9 @@ async fn mutating_endpoints_are_404() {
     }
 }
 
-// --- WP-50 increment 3b-ii, W4: the admin write API + bearer gate ---------
+// --- The admin write API + bearer gate ------------------------------------
 
-/// Rule 17: the fail-CLOSED path gets its own test. `LLMPROXY_ADMIN_TOKEN`
+/// AGENTS.md "Fail-open controls": the fail-CLOSED path gets its own test. `LLMPROXY_ADMIN_TOKEN`
 /// unset (here: `serve`'s `admin_token` is `None`) must refuse the write
 /// with 403 -- and, just as important, must not have minted anything: a
 /// gate that logs a refusal but performs the write anyway is not a gate.
@@ -1170,7 +1170,7 @@ async fn write_with_two_registered_control_planes_is_an_explicit_error_not_a_gue
     );
 }
 
-/// **WP-50 3c-ii-a's centrepiece.** Two chains, distinct `stat_prefix`es,
+/// **The scoped-route centrepiece.** Two chains, distinct `stat_prefix`es,
 /// each with its OWN `ControlPlane` -- exactly the shape `resolve_control_plane`
 /// (the unscoped path) refuses to guess between. Minting through
 /// `/chains/chain-a/keys` must land in chain a's `ControlPlane` and be
@@ -1565,7 +1565,7 @@ async fn put_policy_deny_overrides_allow_and_is_visible_in_snapshot() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-// --- PUT /tenants/{id}/budget (WP-50 increment 3c-iii-a) --------------------
+// --- PUT /tenants/{id}/budget -----------------------------------------------
 
 /// Sets a budget, reads it back through the published snapshot, then clears
 /// it (`{"budget": null}`) and confirms it is gone -- the round trip for
@@ -1907,7 +1907,7 @@ async fn scoped_put_budget_with_unknown_stat_prefix_is_404() {
     );
 }
 
-// --- GET /tenants/{id}/spend (WP-50 increment 3c-iv) ------------------------
+// --- GET /tenants/{id}/spend ------------------------------------------------
 //
 // A READ, gated exactly like a write -- see `lib.rs`'s module doc for why.
 // These tests exercise the SAME three gates the write-API tests above do,
@@ -2036,8 +2036,8 @@ async fn spend_read_on_a_tenant_that_never_spent_is_zeros_not_an_error() {
     assert_eq!(value["remaining_micro_usd"], serde_json::Value::Null);
 }
 
-/// The spend read carries this replica's reconciliation state (WP-62,
-/// ADR-0006 §5). Filters hold no handle to the stats registry, so this
+/// The spend read carries this replica's reconciliation state (ADR-0006
+/// §5). Filters hold no handle to the stats registry, so this
 /// endpoint IS the surface for `spend_reconciliation_age_seconds` and the
 /// count of admissions made while stale -- if these keys are missing, the
 /// numbers exist nowhere an operator can reach them, and a spend figure
@@ -2195,8 +2195,8 @@ async fn spend_read_on_a_budgeted_tenant_reports_remaining_and_saturates_at_zero
 }
 
 /// Unpriced requests are reported: the count AND the distinct `(cluster,
-/// model)` pairs -- the design brief's discoverability requirement (an
-/// unconfigured price costs zero, but the gap must stay visible).
+/// model)` pairs -- discoverability matters (an unconfigured price costs
+/// zero, but the gap must stay visible).
 #[tokio::test]
 async fn spend_read_reports_unpriced_requests_and_pairs() {
     let (factory_state, _handle, accumulator) =
@@ -2347,7 +2347,7 @@ async fn scoped_spend_read_with_unknown_stat_prefix_is_404() {
 
 /// READ endpoints stay unaffected by the write API's gate: with NO admin
 /// token configured at all, `/ready` and `/config_dump` behave exactly as
-/// the read-only increment's own tests already prove.
+/// the read-only tests already prove.
 #[tokio::test]
 async fn reads_work_with_no_admin_token_configured() {
     let (_server, addr) = start_full(
@@ -2368,7 +2368,7 @@ async fn reads_work_with_no_admin_token_configured() {
 }
 
 /// Malformed JSON, an unknown field, and a missing/empty required string all
-/// answer 400, matching ground rule #1 (a silently ignored field is a P0 in
+/// answer 400, matching AGENTS.md invariant 1 (a silently ignored field is a P0 in
 /// a security-write API too).
 #[tokio::test]
 async fn bad_bodies_are_400() {

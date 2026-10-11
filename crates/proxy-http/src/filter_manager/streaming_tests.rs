@@ -1,4 +1,4 @@
-//! WP-11 chunk 3 tests: the streaming encode path. Chunk 1's `tests.rs` pins
+//! Tests for the streaming encode path. Chunk 1's `tests.rs` pins
 //! the decode-side (still buffered) mechanics; these pin the encode-side
 //! [`StreamingEncoder`] state machine — frame-by-frame delivery, reverse
 //! config order, buffering/release, trailers-behind-data (S2.4), buffer
@@ -922,8 +922,7 @@ impl HttpFilter for ResumeWithExtra {
 
 /// S2.5: `send_local_reply` called after response headers have already been
 /// forwarded cannot synthesize a new response (Envoy resets the stream
-/// instead). We have no reset primitive through the body seam yet (TODO
-/// WP-11 chunk 4), so the best available approximation is: don't silently
+/// instead). We have no reset primitive through the body seam yet (TODO), so the best available approximation is: don't silently
 /// ignore the call, terminate the response body with a `BodyError`. This
 /// test drives `DecoderCallbacksAdapter`/`StreamingEncoder` directly (rather
 /// than through a full `run()`) because there is no reachable path in `run()`
@@ -978,7 +977,7 @@ fn local_reply_after_response_headers_forwarded_terminates_the_stream() {
         match err {
             // The CORRECT Envoy behavior is a stream RESET, not a body error
             // -- pinned here as the current best-effort approximation until
-            // WP-11 chunk 4 plumbs a real reset primitive through the seam.
+            // a real reset primitive is plumbed through the seam.
             BodyError::Upstream(_) => {}
             other => panic!("expected BodyError::Upstream, got {other:?}"),
         }

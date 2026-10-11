@@ -1,6 +1,6 @@
-//! Transport socket abstraction (WP-08): raw TCP and TLS (rustls), selected by
+//! Transport socket abstraction: raw TCP and TLS (rustls), selected by
 //! filter-chain match. SDS-driven cert rotation swaps the resolver behind an
-//! `ArcSwap` without touching established connections (WP-22).
+//! `ArcSwap` without touching established connections.
 
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -13,7 +13,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncIo for T {}
 pub type BoxedIo = Box<dyn AsyncIo>;
 
 /// Upstream TLS parameters resolved from the cluster's `UpstreamTlsContext` IR.
-/// TODO(WP-08): SNI override, ALPN, validation context, client cert.
+/// TODO: SNI override, ALPN, validation context, client cert.
 #[derive(Debug, Default)]
 pub struct UpstreamTlsCtx {}
 

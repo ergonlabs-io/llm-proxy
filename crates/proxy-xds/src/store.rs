@@ -1,10 +1,12 @@
-//! WP-20 increment 4a: SotW resource-set semantics (S8).
+//! SotW resource-set semantics (S8).
 //!
-//! **Pure logic. No protobuf, no I/O, no `proxy-config` edge.** Increment 2
-//! isolated the ACK/NACK state machine because S8 conformance is testable
-//! without a socket; this module is the same move for the other half of S8
-//! that PLAN.md calls "the single likeliest place to write a plausible bug":
-//! what a response's resource list actually *does* to the set already held.
+//! **Pure logic. No protobuf, no I/O, no `proxy-config` edge.**
+//! `subscription.rs` isolates the ACK/NACK state machine because S8
+//! conformance is testable without a socket; this module is the same move for
+//! the subtle half of S8 (`internal-docs/envoy-semantics.md` S8): LDS/CDS
+//! responses are the complete set (absence = removal), EDS/RDS are per-name
+//! (absence != removal). It decides what a response's resource list actually
+//! *does* to the set already held.
 //!
 //! # The rule this encodes, quoting S8
 //!
@@ -29,7 +31,7 @@
 //!    removed via the CDS API."
 //! 4. **`unchanged` vs `updated`.** A name already present whose value
 //!    compares equal is `unchanged`, not `updated` -- a resource that did not
-//!    change must not churn, which is what makes increment 4b's
+//!    change must not churn, which is what makes the
 //!    make-before-break swap cheap.
 //! 5. **A duplicate name within one response is an error, and nothing is
 //!    applied.** All-or-nothing, the same shape as S8's "discard entire
@@ -37,13 +39,13 @@
 //!    names in a CDS response (issues #3214, #3987); refusing loudly is the
 //!    deliberate improvement here.
 //!
-//! # Ordering is increment 4b's job, not this module's
+//! # Ordering is the caller's job, not this module's
 //!
 //! S8's apply ordering is `CDS -> EDS -> LDS -> RDS -> removes`: a caller
 //! sequencing from an [`ApplyOutcome`] must apply `added`/`updated` before
 //! `removed`, so a resource in flight between two types is never dropped by a
 //! removal that runs first. This module does not sequence anything -- it only
-//! produces the outcome that increment 4b sequences from.
+//! produces the outcome that `apply.rs` sequences from.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -169,7 +171,7 @@ impl<T> SotwSet<T> {
     /// Discard the named dynamic entries as though `apply` had never stored
     /// them. A name not currently held is a silent no-op.
     ///
-    /// WP-21 increment 2b-ii (`apply.rs`'s EDS path) is the reason this
+    /// `apply.rs`'s EDS and SDS paths are the reason this
     /// exists: `apply` records a resource in the store BEFORE its caller gets
     /// a chance to hand it to a downstream sink, so a sink that then fails
     /// leaves the store believing the resource is installed. Left alone, an
@@ -683,7 +685,7 @@ mod tests {
         assert!(!s.is_empty());
     }
 
-    // --- WP-21 increment 2b-ii: `forget` -----------------------------------
+    // --- `forget` -----------------------------------
 
     #[test]
     fn forgetting_a_name_makes_a_later_identical_apply_report_it_added_again() {

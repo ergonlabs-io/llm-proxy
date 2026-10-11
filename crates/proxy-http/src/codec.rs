@@ -1,4 +1,4 @@
-//! WP-10 chunk B -- the downstream HTTP/1.1 codec: drives one accepted
+//! The downstream HTTP/1.1 codec: drives one accepted
 //! connection as HTTP/1.1, converting each request into
 //! [`crate::handler::HttpRequestParts`], handing it to a
 //! [`crate::handler::StreamHandler`], and streaming the returned
@@ -8,8 +8,8 @@
 //!
 //! Scope: downstream h1 and h2 (`serve_http1`/`serve_http2`), plus the
 //! upstream (proxy-to-origin) h1/h2 codecs (`send_upstream_http1`/
-//! `send_upstream_http2`). HTTP upgrades (Appendix S10) are a later WP-10/11
-//! chunk. `serve_http2` itself is transport-agnostic -- HTTP/2 framing (and
+//! `send_upstream_http2`). HTTP upgrades (envoy-semantics.md S10) are layered on
+//! top of these (see `serve_one`'s upgrade path). `serve_http2` itself is transport-agnostic -- HTTP/2 framing (and
 //! its client connection preface, RFC 9113 S3.4) is identical whether the
 //! bytes arrived over an ALPN-negotiated TLS stream or plaintext "prior
 //! knowledge" h2c, so this module needed no change to serve the latter; it's
@@ -61,7 +61,7 @@ pub enum CodecError {
 /// occurs.
 ///
 /// Generic over `IO` so this same function serves both plaintext
-/// `TcpStream`s and (once WP-08's TLS termination is wired to HTTP
+/// `TcpStream`s and (once TLS termination is wired to HTTP
 /// listeners) TLS-terminated streams.
 ///
 /// `shutdown` is the drain signal (mirrors `proxy-core`'s
@@ -79,7 +79,7 @@ pub async fn serve_http1<IO>(
     downstream: DownstreamInfo,
 ) -> Result<(), CodecError>
 where
-    // Rust note: `Send` here is a new addition (S10, WP-10 increment 2a),
+    // Rust note: `Send` here is a new addition (S10),
     // required by hyper's own `Connection::with_upgrades` bound below -- NOT
     // a reversal of ADR-0003's "the data plane never hops threads" (that's
     // about the `!Send` service/body/filter state this function's `handler`
@@ -192,7 +192,7 @@ where
     });
 
     let mut builder = hyper::server::conn::http2::Builder::new(LocalExec);
-    // S10.2 (WP-10/11 h2 tunnel): the ONLY opt-in an h2 server needs to
+    // S10.2: the ONLY opt-in an h2 server needs to
     // accept an RFC 8441 extended CONNECT at all -- unlike h1's
     // `.with_upgrades()`, there is no separate per-connection "allow
     // upgrades" builder method; this alone advertises
@@ -405,7 +405,7 @@ where
 }
 
 /// Send one HTTP/1.1 request upstream as an **Upgrade** -- the client-side
-/// half of the S10 tunnel (WP-10 increment 2b/2c). Like [`send_upstream_http1`]
+/// half of the S10 tunnel. Like [`send_upstream_http1`]
 /// (builds a client `Connection` from scratch, sends `req`, returns head-first
 /// with a streaming body) with two differences: the `Connection` is built
 /// with `.with_upgrades()` (spike finding (e): required on the CLIENT side
@@ -507,7 +507,7 @@ where
 /// Handshake a fresh HTTP/1.1 client connection over `io` and spawn its
 /// connection-driving task, returning the request sender AND that task's
 /// `JoinHandle` -- the "dial" half of what `send_upstream_http1` does in one
-/// shot, split out (WP-15 slice B) so `crate::upstream_pool::H1ConnCache` can
+/// shot, split out so `crate::upstream_pool::H1ConnCache` can
 /// hold a handshaken connection alive **between** requests, handing the very
 /// same connection to the next lease instead of every request handshaking
 /// (and tearing down) its own. h1 has no multiplexing, so unlike
@@ -593,8 +593,7 @@ where
 
 /// Handshake a fresh HTTP/2 client connection over `io` and spawn its
 /// connection-driving task, returning the request sender -- the "dial" half
-/// of what `send_upstream_http2` used to do in one shot, split out (WP-15
-/// slice A) so `crate::upstream_pool::UpstreamConnCache` can handshake once
+/// of what `send_upstream_http2` used to do in one shot, split out so `crate::upstream_pool::UpstreamConnCache` can handshake once
 /// per `ConnKey` and hand clones of the resulting sender to many requests,
 /// instead of every request handshaking its own connection.
 ///
@@ -704,7 +703,7 @@ pub async fn send_on_http2(
 /// Send one request upstream over `io` as HTTP/2 and return the response,
 /// head-first with a streaming body -- the h2 mirror of
 /// `send_upstream_http1`. Dial-then-send in one call, composed from
-/// `handshake_upstream_http2` + `send_on_http2` (WP-15 slice A); kept for
+/// `handshake_upstream_http2` + `send_on_http2`; kept for
 /// callers (and the existing standalone tests) that don't need connection
 /// reuse. The router's real forwarding path calls the two split functions
 /// directly through `crate::upstream_pool::UpstreamConnCache` instead, so a
@@ -890,7 +889,7 @@ async fn serve_one(
     // `req`, taking the `Extensions` (and any `OnUpgrade`/`hyper::ext::
     // Protocol` inside them) with it.
     //
-    // S10.2 (WP-10/11 h2 tunnel): a SECOND, distinct way a request can ask
+    // S10.2: a SECOND, distinct way a request can ask
     // for an upgrade, alongside the h1 `request_wants_upgrade` check above --
     // an h2 RFC 8441 extended CONNECT. h2 has no `Upgrade`/`Connection`
     // headers at all (h1's hop-by-hop mechanism has no h2 analog); instead
@@ -945,7 +944,7 @@ async fn serve_one(
         })
         .await;
 
-    // S10 (WP-10 increment 2b/2c): the router's `101` path is the only
+    // S10: the router's `101` path is the only
     // producer of `response.upgrade` -- every other response leaves it
     // `None`. Pull it out (`Option::take`, leaving `None` behind) BEFORE
     // handing `response` to `build_response` below, which only knows about
@@ -985,7 +984,7 @@ async fn serve_one(
 /// doc for the tear-down semantics it drives.
 const WEBSOCKET_TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// S10 (WP-10 increment 2b/2c): await both halves of an established upgrade
+/// S10: await both halves of an established upgrade
 /// handshake and copy raw bytes between them until either side closes --
 /// the actual WebSocket-agnostic tunnel `serve_one` exists to set up. Spawned
 /// (never awaited inline) by `serve_one`; see its Rust note for why.

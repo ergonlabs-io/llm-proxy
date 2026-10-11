@@ -13,8 +13,7 @@
 //! the single injection point for "how do I turn an `UpstreamTlsSpec` into a
 //! working TLS originator".
 //!
-//! This also matches the plan's `TransportSocketFactory` seam
-//! (IMPLEMENTATION_PLAN §1.1) and Envoy's own layering, where transport
+//! This also matches Envoy's own layering, where transport
 //! sockets sit *below* clusters.
 
 use std::io;
@@ -81,7 +80,7 @@ pub type TransportSocketBuilder = Arc<
 /// configures upstream TLS is **rejected** rather than silently downgraded to
 /// cleartext.
 ///
-/// That refusal is the point. Ground rule #1 says a configured field must
+/// That refusal is the point. AGENTS.md invariant 1 says a configured field must
 /// never be silently ignored, and "you asked for TLS, you got plaintext to
 /// port 443" is the worst possible way to ignore one. Production installs the
 /// real builder from `proxy-core`; this fallback exists so `proxy-cluster`'s

@@ -1,24 +1,20 @@
-//! WP-50 increment 3b-i — the control-plane store seam, its published
+//! The control-plane store seam, its published
 //! snapshot, and `ControlPlane`, the type that turns one into the other.
 //!
-//! **Normative:** `internal-docs/IMPLEMENTATION_PLAN.md`, sections
-//! "the seam", "`ControlPlaneStore` trait", and "Snapshot rebuild + bootstrap
-//! merge". This module implements exactly the 3b-i slice that brief scopes:
-//! the trait, an in-memory store, the published snapshot, and rewiring
-//! [`crate::auth::VirtualKeyAuthenticator`] onto it. **No `redb`** (3b-ii),
-//! **no admin write API** (3b-ii), **no `model_authz_filter` migration**
-//! (still reads its own `typed_config` this increment) — see the brief's
-//! "sub-increments" section for the full split.
+//! Implements the `ControlPlaneStore` trait seam, an in-memory and a `redb`
+//! store (Redis lives in `control_redis`), the published snapshot, the admin
+//! write methods on [`ControlPlane`], and the rewiring of
+//! [`crate::auth::VirtualKeyAuthenticator`] onto the snapshot.
 //!
 //! # The seam, restated for this crate
 //!
 //! ```text
-//!                     admin write (mint/revoke/CRUD) -- NOT built yet (3b-ii)
+//!                     admin write (mint/revoke/CRUD)
 //!                                    │  rebuild + swap
 //! store.load() ──▶ ControlPlane ──publish──▶ Arc<ArcSwap<ControlPlaneSnapshot>>
 //!  (control-side)   (owns store,                     ▲
 //!                  HMAC secret, bootstrap)    lock-free load
-//!                                              auth filter (this increment)
+//!                                              auth filter
 //! ```
 //!
 //! [`ControlPlane`] owns the [`ControlPlaneStore`], the operator's HMAC
@@ -57,7 +53,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::auth::{HmacSecret, KeyId, KeyRecord, KeySet, TenantId, TenantPolicy};
 use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
-// WP-50 increment 3c-ii-b: spend rows are keyed by a `PeriodKey`, which
+// Spend rows are keyed by a `PeriodKey`, which
 // `spend.rs` owns (it also owns the calendar-alignment logic that produces
 // one) -- `control.rs` only stores and retrieves values already computed
 // there. See `spend.rs`'s module doc for why the boundary is drawn there.
@@ -106,7 +102,7 @@ pub struct StoredControlPlane {
     pub tenants: Vec<TenantId>,
     pub keys: Vec<StoredKey>,
     pub policies: HashMap<TenantId, ModelAccess>,
-    // WP-50 increment 3c-iii-a: a tenant's budget, keyed independently of
+    // A tenant's budget, keyed independently of
     // `policies` above -- a tenant can have a stored `ModelAccess`, a stored
     // `TenantBudget`, both, or neither, and [`ControlPlane::merge`] combines
     // them by tenant rather than assuming one row implies the other. See
@@ -144,10 +140,9 @@ fn validate_key_update(previous: &StoredKey, next: &StoredKey) -> Result<(), Sto
 
 /// Why a [`ControlPlaneStore`] call failed.
 ///
-/// Deliberately small in this increment (`InMemoryControlPlaneStore`'s writes
-/// are infallible; only a test double's `load` ever returns this). A future
-/// `redb` implementation (3b-ii) is expected to widen this with e.g. an I/O
-/// variant, but the two call sites that interpret it -- [`ControlPlane::new`]
+/// Deliberately small (`InMemoryControlPlaneStore`'s writes
+/// are infallible; the `redb` and Redis stores map their I/O errors onto it),
+/// because the two call sites that interpret it -- [`ControlPlane::new`]
 /// (hard error) and [`ControlPlane::rebuild`] (log and keep serving) -- do
 /// not need to distinguish reasons, only "it failed".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +233,7 @@ pub struct FlushToken<'a> {
 /// access logs and the usage filter -- and is never written into this store.
 /// ADR-0006 §7 puts this sentence in the trait's own doc rather than only in
 /// a backlog note, because the trait is what the next person reads, and
-/// WP-55's card named the exact moment the pressure would arrive:
+/// The moment the pressure would arrive is easy to predict:
 ///
 /// > the day a shared store arrives for rate limiting, writing usage history
 /// > into it will be tempting because the dependency is already there -- that
@@ -253,7 +248,7 @@ pub trait ControlPlaneStore: Send + Sync {
     fn load(&self) -> Result<StoredControlPlane, StoreError>;
 
     /// A monotonic counter bumped by every TIER-2 write -- tenants, keys,
-    /// policies, budgets -- and NEVER by a spend write (WP-61, ADR-0006 §3).
+    /// policies, budgets -- and NEVER by a spend write (ADR-0006 §3).
     /// [`ControlPlane`]'s poller reads only this value on every tick and does
     /// the full [`Self::load`] + republish ONLY when it has moved, which is
     /// what lets N replicas notice a revocation without every replica
@@ -294,8 +289,8 @@ pub trait ControlPlaneStore: Send + Sync {
     /// poller to notice.
     fn policy_generation(&self) -> Result<u64, StoreError>;
 
-    // Writes. The data plane never calls any of these -- only a future admin
-    // API (3b-ii) does, off the request path.
+    // Writes. The data plane never calls any of these -- only the admin
+    // API does, off the request path.
     fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
     fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
     /// Creates or rotates a stable key atomically. Ownership is immutable;
@@ -308,7 +303,7 @@ pub trait ControlPlaneStore: Send + Sync {
     fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError>;
     fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError>;
 
-    /// Sets or clears `tenant`'s spend budget (WP-50 increment 3c-iii-a).
+    /// Sets or clears `tenant`'s spend budget.
     /// `Some(budget)` replaces whatever was stored; `None` clears it,
     /// reverting the tenant to unlimited -- see [`TenantBudget`]'s doc for
     /// why an absent budget must never be confused with a configured
@@ -320,13 +315,11 @@ pub trait ControlPlaneStore: Send + Sync {
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError>;
 
-    // WP-50 increment 3c-ii-b: spend rows, keyed `(stat_prefix, tenant,
+    // Spend rows, keyed `(stat_prefix, tenant,
     // period)`. `stat_prefix` is a plain `&str` (not this crate's
-    // `TenantId`/`KeyId` newtypes) because it names a FILTER CHAIN, per the
-    // "external name" split in `internal-docs/IMPLEMENTATION_PLAN.md`'s
-    // "RESOLVED -- addressing follows Envoy" section -- the same
-    // operator-chosen `stat_prefix` A1 already uses to address a chain from
-    // the admin server.
+    // `TenantId`/`KeyId` newtypes) because it names a FILTER CHAIN by its
+    // external, Envoy-style name -- the same operator-chosen `stat_prefix`
+    // the admin server uses to address a chain.
     /// Adds `delta_micros` to the spend total for `(stat_prefix, tenant,
     /// period)` and returns the **new authoritative total**. ADR-0006 §2,
     /// which is normative for this method.
@@ -458,8 +451,7 @@ pub struct ControlPlaneSnapshot {
     pub key_tenants: HashMap<KeyId, TenantId>,
 }
 
-/// In-memory [`ControlPlaneStore`]. The whole of 3b-i's storage engine --
-/// `redb` is 3b-ii. Backed by a `Mutex` because the trait's write methods
+/// In-memory [`ControlPlaneStore`]. Backed by a `Mutex` because the trait's write methods
 /// take `&self` (so a `Box<dyn ControlPlaneStore>` can be shared without the
 /// caller synchronizing), not `&mut self`.
 ///
@@ -475,21 +467,21 @@ struct InMemoryState {
     tenants: Vec<TenantId>,
     keys: HashMap<KeyId, StoredKey>,
     policies: HashMap<TenantId, ModelAccess>,
-    // WP-50 increment 3c-iii-a: independent of `policies` above -- see
+    // Independent of `policies` above -- see
     // `StoredControlPlane::budgets`'s doc.
     budgets: HashMap<TenantId, TenantBudget>,
-    // WP-50 increment 3c-ii-b: keyed on the full `(stat_prefix, tenant,
+    // Keyed on the full `(stat_prefix, tenant,
     // period)` triple as one tuple key -- there is no `load()`-style
     // wholesale read for spend (each row is read/written independently by
     // its own key), so this needs no separate reverse index the way
     // `keys_by_tenant` does for `keys`.
     spend: HashMap<(String, TenantId, PeriodKey), u64>,
-    // WP-60: the highest flush sequence accepted for each (row, writer). One
+    // The highest flush sequence accepted for each (row, writer). One
     // `u64` per writer per row, not a set of every token ever seen -- see
     // `FlushToken`'s doc for why "highest accepted wins" is the whole dedup
     // policy. `overwrite_spend` does NOT touch this map.
     spend_seq: HashMap<SpendWriter, u64>,
-    // WP-61: bumped by every tier-2 write below, under this SAME mutex
+    // Bumped by every tier-2 write below, under this SAME mutex
     // acquisition -- see `ControlPlaneStore::policy_generation`'s doc for why
     // a spend write (`add_spend` above) must never touch this field.
     generation: u64,
@@ -747,8 +739,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
 
 // --- redb tables -----------------------------------------------------------
 //
-// See the design brief's "redb data model" section, which this follows
-// exactly: one table per concept, plus the explicit `keys_by_tenant` reverse
+// One table per concept, plus the explicit `keys_by_tenant` reverse
 // index redb does not provide for free (it has no secondary indexes).
 //
 // Rust note: a `TableDefinition` is just a name plus a `K`/`V` type marker --
@@ -758,12 +749,12 @@ const TENANTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant
 const KEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keys");
 const KEYS_BY_TENANT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keys_by_tenant");
 const POLICIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("policies");
-// WP-50 increment 3c-iii-a: a tenant's budget, JSON-encoded like every other
+// A tenant's budget, JSON-encoded like every other
 // table here -- see `EncodedTenantBudget`'s doc. Independent of
 // `POLICIES_TABLE`: a tenant may have a row in one, the other, both, or
 // neither.
 const BUDGETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("budgets");
-// WP-50 increment 3c-ii-b: a spend row's key is the 3-part
+// A spend row's key is the 3-part
 // `(stat_prefix, tenant, period)` tuple, not a single `&str` like every
 // table above -- `redb::Key` has a native impl for tuples of `Key` types
 // (see `tuple_types.rs` upstream), so this uses that directly rather than
@@ -773,13 +764,13 @@ const BUDGETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("budget
 // impl, so encoding a bare integer through `serde_json` would only add an
 // allocation and a round trip for no benefit.
 const SPEND_TABLE: TableDefinition<(&str, &str, &str), u64> = TableDefinition::new("spend");
-// WP-60: the redb twin of `InMemoryState::spend_seq`. Keyed on the spend row
+// The redb twin of `InMemoryState::spend_seq`. Keyed on the spend row
 // PLUS the writing node -- a key without the node id makes two replicas share
 // one sequence space and silently drop each other's flushes. See
 // `FlushToken`'s doc.
 const SPEND_SEQ_TABLE: TableDefinition<(&str, &str, &str, &str), u64> =
     TableDefinition::new("spend_seq");
-// WP-61: a single row, keyed `"policy"`, holding the tier-2 generation
+// A single row, keyed `"policy"`, holding the tier-2 generation
 // counter -- see `ControlPlaneStore::policy_generation`'s doc. A dedicated
 // table (rather than a row inside, say, `TENANTS_TABLE`) so bumping it is one
 // `insert` regardless of which of the six tier-2 tables the accompanying
@@ -824,7 +815,7 @@ pub(crate) struct EncodedKeyRow {
 
 /// [`ModelAccess`] as `serde_json` sees it. A local mirror rather than
 /// `#[derive(Serialize, Deserialize)]` on `ModelAccess` itself -- that type
-/// lives in `model_authz.rs`, which this increment's scope does not touch,
+/// lives in `model_authz.rs`, which this type has no reason to touch,
 /// and giving it a serde impl would be a public-API decision belonging to
 /// that module's owner, not something to smuggle in via this store.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -870,7 +861,7 @@ impl From<EncodedModelAccess> for ModelAccess {
 /// [`crate::spend::Period`] as `serde_json` sees it. A local mirror, not a
 /// `serde` derive on `Period` itself -- same reasoning as
 /// [`EncodedModelAccess`]'s doc: `Period` lives in `spend.rs`, which this
-/// increment's scope does not otherwise need to touch for a serde impl.
+/// store has no other reason to touch for a serde impl.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) enum EncodedPeriod {
     Daily,
@@ -963,15 +954,15 @@ pub(crate) fn store_err(err: impl std::fmt::Display) -> StoreError {
 }
 
 /// Persistent, embedded [`ControlPlaneStore`] backed by `redb` -- the
-/// production default (see the design brief's "Engine: redb" decision):
-/// pure-Rust, ACID, single-file, no C toolchain, unlike SQLite.
+/// production default (chosen because it is
+/// pure-Rust, ACID, single-file, no C toolchain, unlike SQLite).
 ///
 /// # Transaction model: one write txn per method, one read txn per `load()`
 ///
 /// Rust note: every write method (`create_tenant`, `put_key`, ...) opens its
 /// own `redb::WriteTransaction`, mutates one or more tables, and commits --
-/// see the design brief's "Distributed readiness" requirement 3 ("isolate
-/// EACH store call to one function"), which this satisfies literally: there
+/// isolating EACH store call to one function keeps a future
+/// distributed backend a drop-in, and this satisfies that literally: there
 /// is exactly one `begin_write`/`commit` pair per trait method, no method
 /// calls another. `load()` instead opens a single `redb::ReadTransaction`
 /// and reads all four tables from it, so a rebuild sees one consistent
@@ -990,8 +981,7 @@ pub struct RedbControlPlaneStore {
 impl RedbControlPlaneStore {
     /// Opens (creating if absent) a `redb` database file at `path` -- the
     /// production constructor. The proxy's default is this store, with no
-    /// external datastore configured (see the design brief's 3b-ii
-    /// acceptance criteria).
+    /// external datastore configured.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let db = Database::create(path).map_err(store_err)?;
         Self::from_database(db)
@@ -1016,9 +1006,8 @@ impl RedbControlPlaneStore {
         Ok(store)
     }
 
-    /// Creates all tables if they do not already exist -- seven as of WP-60
-    /// (the doc used to say "all four"; `SPEND_TABLE`, `GENERATION_TABLE`
-    /// and `SPEND_SEQ_TABLE` are the three that arrived since).
+    /// Creates all tables if they do not already exist -- seven (`SPEND_TABLE`,
+    /// `GENERATION_TABLE` and `SPEND_SEQ_TABLE` are the most recent three).
     ///
     /// Rust note: this runs a WRITE transaction even though it inserts no
     /// rows -- `WriteTransaction::open_table` is the only `redb` API that
@@ -1061,8 +1050,7 @@ impl RedbControlPlaneStore {
     /// The `keys_by_tenant` reverse index, read directly. Not part of
     /// [`ControlPlaneStore`] -- that trait's `load()` already returns every
     /// key in one call, which is all a snapshot rebuild needs. This exists
-    /// for the future `GET /tenants/{id}/keys` admin endpoint (3b-ii, see
-    /// the design brief) that needs a single tenant's key ids without
+    /// for the future `GET /tenants/{id}/keys` admin endpoint that needs a single tenant's key ids without
     /// paying for a whole-store read.
     pub fn keys_by_tenant(&self, tenant: &TenantId) -> Result<Vec<KeyId>, StoreError> {
         let txn = self.db.begin_read().map_err(store_err)?;
@@ -1538,13 +1526,13 @@ pub struct ControlPlane {
     secret: HmacSecret,
     bootstrap_keys: KeySet,
     published: Arc<ArcSwap<ControlPlaneSnapshot>>,
-    /// WP-61: the `policy_generation` stamp the currently-published snapshot
+    /// The `policy_generation` stamp the currently-published snapshot
     /// reflects. `None` means "unknown" -- a stamp read that failed at boot,
     /// or a store whose `policy_generation` errored -- which forces the next
     /// poll to rebuild rather than risk comparing against a stale or
     /// meaningless number. See [`Self::poll_once`].
     last_generation: Mutex<Option<u64>>,
-    /// WP-61: when a poll (or a `rebuild()`) last SUCCEEDED. See
+    /// When a poll (or a `rebuild()`) last SUCCEEDED. See
     /// [`Self::snapshot_age`].
     last_reconciled_at: Mutex<Instant>,
     poller: Mutex<Option<PolicyPoller>>,
@@ -1565,7 +1553,7 @@ impl ControlPlane {
         bootstrap_keys: KeySet,
     ) -> Result<Self, StoreError> {
         let store: Arc<dyn ControlPlaneStore> = Arc::from(store);
-        // WP-61: read the generation stamp BEFORE `load()`, not after.
+        // Read the generation stamp BEFORE `load()`, not after.
         //
         // Rust note: this ordering is load-bearing, not incidental. If a
         // concurrent admin write lands between the two reads, reading the
@@ -1629,7 +1617,7 @@ impl ControlPlane {
     /// store read hiccuped, silently, with no distinguishing signal from "the
     /// key was actually revoked". See the module doc and AGENTS.md "Fail-open controls".
     ///
-    /// WP-61: on success, also records the generation stamp the fresh
+    /// On success, also records the generation stamp the fresh
     /// snapshot reflects and marks `last_reconciled_at` as now -- both read
     /// BEFORE `load()`, for the same reason [`Self::new`]'s doc explains.
     /// `Err` leaves both untouched, exactly like `published`: a failed
@@ -1659,7 +1647,7 @@ impl ControlPlane {
         }
     }
 
-    /// WP-61's replica-to-replica propagation step: reads ONLY the
+    /// Replica-to-replica propagation step: reads ONLY the
     /// generation stamp, and does the full `load()` + republish (identical to
     /// [`Self::rebuild`]) ONLY if it moved since the last successful poll or
     /// rebuild. Returns `Ok(true)` if a rebuild happened, `Ok(false)` if the
@@ -1705,10 +1693,11 @@ impl ControlPlane {
     /// How long since this replica's snapshot was last confirmed to match
     /// the store -- either a successful [`Self::poll_once`] (moved or not)
     /// or [`Self::rebuild`]. This is the raw number; the Prometheus
-    /// `spend_reconciliation_age_seconds` gauge (ADR-0006 §5) that exports it
-    /// lands with WP-62 -- this accessor, plus the policy poller's own
-    /// staleness warning (see [`Self::start_policy_poller`]), is WP-61's half
-    /// of that observability requirement.
+    /// `spend_reconciliation_age_seconds` value (ADR-0006 §5) that exports it
+    /// is surfaced through the admin API -- this accessor, plus the
+    /// policy poller's own staleness warning (see
+    /// [`Self::start_policy_poller`]), is the replica-side half of that
+    /// observability requirement.
     pub fn snapshot_age(&self) -> Duration {
         self.last_reconciled_at
             .lock()
@@ -1809,7 +1798,7 @@ impl ControlPlane {
     /// which must persist spend into the very store the operator configured
     /// (`typed_config.store` on `llmproxy.auth` -- in-memory or a redb file),
     /// not a private one of its own. Handing back a fresh
-    /// `InMemoryControlPlaneStore` instead would leave 3c-ii-b's whole
+    /// `InMemoryControlPlaneStore` instead would leave the whole spend
     /// persistence path -- `add_spend`/`load_spend` on redb, additive writes,
     /// restart-resume -- wired to nothing, and a monthly ceiling would reset
     /// to zero on every process restart: a budget an operator could escape by
@@ -1818,11 +1807,11 @@ impl ControlPlane {
         Arc::clone(&self.store)
     }
 
-    /// The HMAC secret this control plane was built with. Unused by 3b-i's
+    /// The HMAC secret this control plane was built with. Unused by the
     /// data-plane path (the authenticator keeps its own copy -- see
     /// `auth_filter::AuthFilterFactory::create`'s doc for why two independent
     /// `HmacSecret`s exist rather than one shared); this accessor exists for
-    /// 3b-ii's key-minting endpoint, which needs the same secret to compute a
+    /// the key-minting endpoint, which needs the same secret to compute a
     /// digest a minted key will actually authenticate against.
     pub fn secret(&self) -> &HmacSecret {
         &self.secret
@@ -1933,10 +1922,10 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Sets or clears `tenant`'s spend budget, then republishes (WP-50
-    /// increment 3c-iii-a) -- store-then-`rebuild()`, exactly like
+    /// Sets or clears `tenant`'s spend budget, then republishes --
+    /// store-then-`rebuild()`, exactly like
     /// [`Self::set_policy`], so a budget change reaches every worker's
-    /// `VirtualKeyAuthenticator` (and, later, 3c-iii-b's enforcement filter)
+    /// `VirtualKeyAuthenticator` (and the spend enforcement filter)
     /// on the next request rather than the next unrelated rebuild.
     /// `Some(budget)` sets it; `None` clears it, reverting the tenant to
     /// unlimited -- see [`crate::spend::TenantBudget`]'s doc.
@@ -1972,9 +1961,8 @@ impl ControlPlane {
     /// and rationale as [`Self::merge`]'s bootstrap-KEY merge: the store is
     /// authoritative (an admin `PUT /tenants/{id}/policy` must never be
     /// silently reverted by a static config value), and a collision is
-    /// logged by TENANT ID ONLY -- never a policy's contents. See WP-50
-    /// increment 3b-iv's design brief, "`typed_config.policies` stays, as
-    /// BOOTSTRAP".
+    /// logged by TENANT ID ONLY -- never a policy's contents. `typed_config.policies` stays, as
+    /// BOOTSTRAP data.
     ///
     /// # Idempotence is required, not incidental
     ///
@@ -2040,9 +2028,7 @@ impl ControlPlane {
     }
 
     /// Bootstrap keys layered under the store's, then the store's layered on
-    /// top -- on a `key_id` collision the store wins. See the design brief's
-    /// "Snapshot rebuild + bootstrap merge" section, which this implements
-    /// exactly.
+    /// top -- on a `key_id` collision the store wins.
     fn merge(bootstrap_keys: &KeySet, loaded: StoredControlPlane) -> ControlPlaneSnapshot {
         // Rust note: keyed by `KeyId`, not by digest -- `KeySet` itself is
         // digest-keyed (see its doc for why), which is exactly the wrong
@@ -2072,8 +2058,8 @@ impl ControlPlane {
             key_tenants.insert(stored.key_id.clone(), stored.tenant.clone());
             if by_key_id.contains_key(&stored.key_id) {
                 // Names ONLY the key_id -- never a digest or any key
-                // material. See `StoredKey`'s Debug and the design brief's
-                // collision-log rule.
+                // material. See `StoredKey`'s Debug: a collision
+                // log never renders key material.
                 tracing::warn!(
                     key_id = stored.key_id.as_str(),
                     "control-plane store key_id collides with a config bootstrap key; \
@@ -2098,7 +2084,7 @@ impl ControlPlane {
             keys.insert_digest(digest, record);
         }
 
-        // 3b-i populates `policies` from the store only -- there is no
+        // `policies` is populated from the store only -- there is no
         // config-bootstrap policy source yet (bootstrap virtual keys carry no
         // `ModelAccess`), so there is nothing to layer under it. A tenant
         // absent here simply falls back to `TenantPolicy::default()`
@@ -2106,7 +2092,7 @@ impl ControlPlane {
         // does today via `model_authz_filter`'s own `typed_config`, which
         // this snapshot does not yet replace.
         //
-        // WP-50 increment 3c-iii-a: `loaded.budgets` is a SEPARATE store
+        // `loaded.budgets` is a SEPARATE store
         // table from `loaded.policies` (see `StoredControlPlane::budgets`'s
         // doc) -- a tenant can have a `ModelAccess` row, a `TenantBudget`
         // row, both, or neither, entirely independently, because
@@ -2399,7 +2385,7 @@ mod tests {
     /// A store whose `load` can be toggled to fail on command, via a shared
     /// flag the test keeps a handle to -- proves the fail-closed REFRESH path
     /// (as opposed to boot, which `FailingStore` below covers). Also counts
-    /// `load()` calls (WP-61: `load_calls`, `Arc<AtomicUsize>` so a test keeps
+    /// `load()` calls (`load_calls`, `Arc<AtomicUsize>` so a test keeps
     /// a handle after the store moves into a `ControlPlane`) -- used by
     /// `a_generation_that_has_not_moved_does_no_load_work` to prove
     /// `poll_once` skips `load()` entirely when the stamp is unchanged, per
@@ -2822,7 +2808,7 @@ mod tests {
         }
     }
 
-    // --- ControlPlane write methods (WP-50 increment 3b-ii, part B) ---------
+    // --- ControlPlane write methods ---------
 
     // --- mint_key produces a key that authenticates
 
@@ -2983,7 +2969,7 @@ mod tests {
         assert!(!snapshot.policies.contains_key("tenant-a"));
     }
 
-    // --- seed_bootstrap_policies (WP-50 increment 3b-iv) ---------------------
+    // --- seed_bootstrap_policies ---------------------
 
     #[test]
     fn seed_bootstrap_policies_writes_a_new_tenant_and_republishes() {
@@ -3109,7 +3095,7 @@ mod tests {
         );
     }
 
-    // --- ControlPlane::set_budget / TenantBudget storage (WP-50 increment 3c-iii-a) ---
+    // --- ControlPlane::set_budget / TenantBudget storage ---
 
     /// `None` round-trips as unlimited (no `TenantPolicy` at all -- the
     /// tenant falls back to `TenantPolicy::default()`, `budget: None`), and
@@ -3505,7 +3491,7 @@ mod tests {
         );
     }
 
-    // --- RedbControlPlaneStore (WP-50 increment 3b) --------------------------
+    // --- RedbControlPlaneStore --------------------------
 
     /// `std::process::id()` + a nanosecond timestamp for uniqueness -- the
     /// same convention `crates/proxy/src/main.rs`'s `write_temp` uses, for
@@ -3555,7 +3541,7 @@ mod tests {
         b_policies.sort_by_key(|(t, _)| *t);
         assert_eq!(a_policies, b_policies, "policies must match");
 
-        // WP-50 increment 3c-iii-a.
+        // A.
         let mut a_budgets: Vec<(&str, &TenantBudget)> =
             a.budgets.iter().map(|(t, b)| (t.as_str(), b)).collect();
         let mut b_budgets: Vec<(&str, &TenantBudget)> =
@@ -3666,7 +3652,7 @@ mod tests {
     }
 
     // --- redb: set_budget then load() returns it; None clears it; parity
-    //     with InMemory; persistence across reopen (WP-50 increment 3c-iii-a)
+    //     with InMemory; persistence across reopen
 
     #[test]
     fn redb_set_budget_then_load_returns_it_and_none_clears_it() {
@@ -3838,7 +3824,7 @@ mod tests {
                     &ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
                 )
                 .unwrap();
-            // WP-50 increment 3c-iii-a: a budget IS part of `StoredControlPlane`
+            // A budget IS part of `StoredControlPlane`
             // (unlike spend rows below), so it is compared through
             // `assert_stored_control_planes_match` like `keys`/`policies`.
             store
@@ -3850,7 +3836,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            // WP-50 increment 3c-ii-b: spend rows, keyed `(stat_prefix,
+            // Spend rows, keyed `(stat_prefix,
             // tenant, period)`, are not part of `StoredControlPlane` (there
             // is no wholesale `load()` for them -- see the trait doc), so
             // they are checked directly against BOTH stores below rather
@@ -3953,7 +3939,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    // --- WP-61: policy propagation by version-stamp polling ------------------
+    // --- policy propagation by version-stamp polling ------------------
 
     // --- the acceptance criterion itself: two `ControlPlane`s over one store,
     //     one revokes, the other picks it up via `poll_once` -- no shared
@@ -4342,7 +4328,7 @@ mod tests {
         }
     }
 
-    // --- WP-60: additive spend, and the dedup that makes it at-most-once ----
+    // --- additive spend, and the dedup that makes it at-most-once ----
     //
     // These test the STORE's half of the contract. The accumulator's half
     // (adopting the returned total, retrying under the same sequence) is in

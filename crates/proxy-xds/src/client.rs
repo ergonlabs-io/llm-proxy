@@ -1,34 +1,32 @@
-//! WP-20 increments 3a and 3b: the ADS gRPC request/response pump, and the
-//! reconnect loop that keeps re-establishing it.
+//! The ADS gRPC request/response pump, and the reconnect loop that keeps
+//! re-establishing it.
 //!
 //! This module owns exactly one thing: driving a single
 //! `StreamAggregatedResources` bidi stream so that
 //! [`crate::subscription::SubscriptionState`] sees every response and its
 //! returned [`crate::subscription::Request`] reaches the wire. Everything
-//! else is deliberately out of this increment's scope:
+//! else is deliberately out of scope:
 //!
 //! - **Deciding a response's verdict, and applying it, is injected -- not
 //!   implemented here.** [`ResponseHandler`] is the seam a caller supplies;
 //!   [`FnHandler`] adapts a plain synchronous [`Validator`] closure to it for
 //!   callers (mostly this crate's own tests) with nothing to await. Real
-//!   validation and applying (WP-03/04 field-path errors against the IR, and
-//!   `apply.rs`'s `ResourceApplier`) is increment 4's job; pulling
-//!   `proxy-config` in HERE would make every transport test a config test,
-//!   and this crate's whole point (per its own `Cargo.toml` comment) is
-//!   staying free of that edge until then.
+//!   validation and applying (field-path errors against the IR, in
+//!   `apply.rs`'s `ResourceApplier`) is that implementor's job; pulling
+//!   `proxy-config` in HERE would make every transport test a config test.
 //! - **The response's `resources` field is never read by this module** --
 //!   only `type_url`, `version_info` and `nonce`, which is all
 //!   [`SubscriptionState::on_response`] needs. Whatever `handler.handle`
 //!   returns is the only thing that ever looks at `resources`.
 //!
-//! Increment 3b added the layer above the pump: [`AdsClient::run`] reconnects
+//! The layer above the pump: [`AdsClient::run`] reconnects
 //! forever with a jittered backoff, calling
 //! [`SubscriptionState::reset_stream`] before each new stream so S8's
 //! "versions persist across streams, nonces do not" holds on the wire.
 //! [`AdsClient::run_once`] still drives exactly ONE stream and still resets
 //! nothing -- everything about reconnecting lives in `run`.
 //!
-//! Increment 4d-i made the handler seam async: [`ResponseHandler::handle`]
+//! The handler seam is async: [`ResponseHandler::handle`]
 //! returns a future, so applying a response -- which does real I/O, e.g.
 //! `crates/proxy/src/main.rs::reload`'s
 //! `ClusterManager::update_from_snapshot` resolving DNS per cluster -- can
@@ -58,7 +56,7 @@ use crate::subscription::{Request, SubscriptionState, Verdict};
 /// only one operation and no state a trait would let a caller name that a
 /// closure's captures cannot already hold, so a trait would be ceremony
 /// around a closure. `FnMut` (not `Fn`) because a real validator will want
-/// to accumulate state across calls (e.g. increment 4's IR builder); `Send`
+/// to accumulate state across calls (e.g. an IR builder); `Send`
 /// because it runs inside a `tokio::spawn`-able future.
 pub type Validator = Box<dyn FnMut(&DiscoveryResponse) -> Verdict + Send>;
 
@@ -83,8 +81,7 @@ pub trait ResponseHandler: Send {
 
     /// The resource names this handler currently wants subscribed for
     /// `type_url`, if it derives one at all. `None` means "this handler has
-    /// no opinion for this type" -- WP-21 increment 2b-ii's addition, for
-    /// EDS: `ResourceApplier` computes its EDS name set from whatever
+    /// no opinion for this type". This exists for EDS: `ResourceApplier` computes its EDS name set from whatever
     /// clusters it currently holds (see its own `eds_resource_names`), and
     /// `run_once` below is what turns a change in that set into a follow-up
     /// `DiscoveryRequest` on the wire.
@@ -115,8 +112,8 @@ impl ResponseHandler for FnHandler {
 
 /// Errors from pumping ONE ADS stream. [`AdsClient::run_once`] never retries;
 /// [`AdsClient::run`] treats every one of these as "that stream ended", logs
-/// it, and reconnects after a backoff (PLAN.md Part 8.5: keep serving
-/// last-good config, never shed state).
+/// it, and reconnects after a backoff (`internal-docs/architecture.md` §12.2 rule 5:
+/// keep serving last-good config, never shed state).
 #[derive(Debug, thiserror::Error)]
 pub enum AdsError {
     /// The stream itself failed (transport error, or the server closed it
@@ -288,7 +285,7 @@ impl AdsClient {
 
     /// Reconnects forever: reset per-stream state, pump one stream, log why
     /// it ended, wait a jittered backoff, repeat. Never returns -- there is
-    /// no stream-ending condition WP-20 treats as fatal, because giving up on
+    /// no stream-ending condition treated as fatal, because giving up on
     /// xDS means never picking up config again while the process keeps
     /// serving the last-good one.
     ///
@@ -424,7 +421,7 @@ impl AdsClient {
             // rather than an initial request.
             node_pending = None;
 
-            // WP-21 increment 2b-ii: this response may have changed what a
+            // This response may have changed what a
             // name-based subscription (EDS today) wants. The ACK/NACK above
             // MUST go out first -- it answers the response that just
             // arrived, on THIS response's nonce, and must not be reordered

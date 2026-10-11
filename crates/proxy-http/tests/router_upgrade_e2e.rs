@@ -1,4 +1,4 @@
-//! S10 (WP-10 increment 2b/2c) acceptance tests: the HTTP/1.1 WebSocket
+//! S10 acceptance tests: the HTTP/1.1 WebSocket
 //! TUNNEL, end to end through the real router.
 //!
 //! `websocket_upgrade_tunnel_echoes_bytes_end_to_end` is the core proof and
@@ -291,9 +291,8 @@ async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
             // REAL codec, in the background -- same shape
             // `tests/hyper_spike.rs` finding (e) uses for its server half,
             // just through the actual proxy stack instead of a bare
-            // `service_fn`. `serve_http1`'s own `.with_upgrades()` (already
-            // landed, S10 increment 2a) is what lets the eventual `101`
-            // response's `OnUpgrade` resolve at all.
+            // `service_fn`. `serve_http1`'s own `.with_upgrades()` (S10) is what lets
+            // the eventual `101` response's `OnUpgrade` resolve at all.
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             tokio::task::spawn_local(async move {

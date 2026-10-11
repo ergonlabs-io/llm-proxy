@@ -1,14 +1,15 @@
-//! xDS client (Lane E).
+//! xDS client.
 //!
-//! Work packages (see IMPLEMENTATION_PLAN.md):
-//! - WP-20: ADS gRPC client (SotW), per-type subscription state machines,
-//!   ACK/NACK + version/nonce bookkeeping (Appendix S8).
-//! - WP-21: warming, update ordering, make-before-break listener/cluster swaps.
-//! - WP-22: SDS, delta xDS, and the filesystem xDS transport (PLAN.md Part 9.1 —
-//!   the subscription layer is transport-agnostic: gRPC | file-watch behind one trait).
+//! - ADS gRPC client (SotW), per-type subscription state machines, ACK/NACK
+//!   and version/nonce bookkeeping (`internal-docs/envoy-semantics.md` S8).
+//! - Warming, update ordering, make-before-break listener/cluster swaps.
+//! - SDS, delta xDS, and the filesystem xDS transport
+//!   (`internal-docs/architecture.md` §12.3 rule 1: the subscription layer is
+//!   transport-agnostic, gRPC or file-watch behind one trait).
 //!
-//! Scale rule (PLAN.md Part 8.5): on any xDS failure keep serving last-good
-//! config with backoff — never NACK-storm, never shed state.
+//! Scale rule (`internal-docs/architecture.md` §12.2 rule 5): on any xDS
+//! failure keep serving last-good config with backoff -- never NACK-storm,
+//! never shed state.
 
 pub mod apply;
 pub mod authorization;

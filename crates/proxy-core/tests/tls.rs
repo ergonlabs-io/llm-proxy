@@ -1,4 +1,4 @@
-//! Integration tests for `proxy_core::tls` (WP-08 chunk B1): downstream and
+//! Integration tests for `proxy_core::tls`: downstream and
 //! upstream rustls factories built straight from the IR, handshaking over
 //! `tokio::io::duplex` pipes (no real sockets needed since both factories'
 //! `wrap` are generic over `AsyncRead + AsyncWrite`).
@@ -17,8 +17,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // A pre-generated (via `openssl genpkey`) 2048-bit RSA key, PKCS#8 PEM --
 // rcgen/ring can *sign* with RSA but (without the `aws-lc-rs` backend, which
-// needs a cmake toolchain we're deliberately avoiding -- see the WP-08 task
-// notes) can't *generate* RSA keys, so the dual-cert test embeds one.
+// needs a cmake toolchain we're deliberately avoiding -- see the
+// workspace Cargo.toml) can't *generate* RSA keys, so the dual-cert test embeds one.
 const RSA_TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCTqRdE9Hfk0JVI
 xm1L0/pCnijfoIVFq2Eab+f6alpA9yGbFAk6hI8v2lPmeH+77UuMVv+6PaL3tfQp
@@ -509,7 +509,7 @@ async fn hot_reload_serves_new_certificate() {
     assert_eq!(peer, cert_b.der().as_ref());
 }
 
-// --------------------------------------------------- SAN matchers (chunk B2) --
+// --------------------------------------------------- SAN matchers (SAN matching) --
 
 /// Build a downstream (mTLS) + upstream pair whose *upstream* validation
 /// context carries `san_matchers`, and run one handshake -- the shared
@@ -849,12 +849,11 @@ fn factories_are_send_sync() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-22 increment 2a: an SDS-named chain binds with an empty cert set.
+// An SDS-named chain binds with an empty cert set.
 
 /// The whole point of the empty build: the listener comes up, accepts the TCP
 /// connection, and fails the handshake -- it never serves in the clear, and it
-/// never refuses to start. `update_certificates` (the SDS delivery path, wired
-/// in increment 2b) then makes the same factory serve without a rebuild.
+/// never refuses to start. `update_certificates` (the SDS delivery path) then makes the same factory serve without a rebuild.
 #[tokio::test]
 async fn an_sds_named_chain_builds_empty_then_serves_after_delivery() {
     let ca = mint_ca("test CA");
@@ -933,7 +932,7 @@ fn a_spec_with_neither_certificates_nor_sds_names_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-22 increment 2b: `SdsSecretRegistry` -- the seam that maps a published
+// `SdsSecretRegistry` -- the seam that maps a published
 // SDS secret NAME back to the `DownstreamTlsFactory` instances that named it.
 // See `crates/proxy-core/src/tls/secret_registry.rs`'s module doc for the two
 // orderings these tests pin independently.
@@ -1013,7 +1012,7 @@ async fn publish_then_serve() {
     assert_eq!(&buf, b"ping");
 }
 
-/// WP-22 acceptance: rotating an SDS certificate while new TLS connections
+/// Rotating an SDS certificate while new TLS connections
 /// are continuously handshaking must not expose an empty or partially-built
 /// resolver. Every connection sees either the complete old certificate or the
 /// complete new certificate, and the new certificate becomes observable

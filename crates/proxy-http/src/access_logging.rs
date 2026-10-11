@@ -1,4 +1,4 @@
-//! WP-24 chunk 3 (relocated): turns the parsed `AccessLogIR`/`FormatString`
+//! Turns the parsed `AccessLogIR`/`FormatString`
 //! (`proxy_observability::access_log`/`sink`) into real per-request log
 //! lines. Originally lived under `router::logging` and was invoked from
 //! `RouterHandler::handle_and_log` -- moved up to be a peer of
@@ -9,7 +9,7 @@
 //! moment the router's own body hit end-of-stream -- which is BEFORE the
 //! encode filter chain has had a chance to run its own end-of-stream
 //! callback. An encode filter that records something at stream end (the
-//! WP-33/34 usage filter, notably) was therefore invisible to access logs.
+//! usage filter, notably) was therefore invisible to access logs.
 //!
 //! `FilterChainHandler::handle` now wraps the OUTERMOST response body --
 //! i.e. `LoggingBody(StreamingEncoder(router's response))`, not
@@ -86,7 +86,7 @@ impl AccessLoggerRuntime {
             .collect()
     }
 
-    /// Ground rule #1 note: every `AccessLogFilterIR` variant is matched
+    /// AGENTS.md invariant 1 note: every `AccessLogFilterIR` variant is matched
     /// explicitly here, same as `proxy_observability::sink::build_sink`
     /// matches every `AccessLogSink` variant -- a new filter kind is a
     /// compile error here, not a silent "always log" default.
@@ -138,7 +138,7 @@ impl AccessLoggerRuntime {
 /// this IR doesn't carry -- `AccessLogFormat::Json` is
 /// `Vec<(String, FormatString)>`, always string-typed -- so every value
 /// renders as a JSON string here, never a bare number/bool/object. That's a
-/// known, disclosed gap (ground rule #1), not a silent one: nothing in the
+/// known, disclosed gap (AGENTS.md invariant 1), not a silent one: nothing in the
 /// IR asks for a typed value today, so there's nothing to drop.
 fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> String {
     let mut out = String::from("{");
@@ -251,7 +251,7 @@ pub(crate) struct AccessLogContext {
     pub(crate) response_headers: HeaderMap,
     pub(crate) response_code: u16,
     pub(crate) downstream_remote_address: String,
-    /// WP-23 increment 6b: this stream's `llm.client.token.usage`
+    /// This stream's `llm.client.token.usage`
     /// recorder, if the HCM has one wired (`FilterChainHandler::with_token_stats`)
     /// -- `None` on any handler nothing attached one to (every pre-existing
     /// caller, and any HCM `proxy-core` never resolved provider handles
@@ -260,7 +260,7 @@ pub(crate) struct AccessLogContext {
     /// OTel GenAI TTFT/TPOT recorder. Like token stats, it runs at stream end
     /// even when no access log destination is configured.
     pub(crate) latency_stats: Option<Arc<GenAiLatencyStats>>,
-    /// WP-51 increment 2: this stream's span sink, if the HCM has one wired
+    /// This stream's span sink, if the HCM has one wired
     /// (`FilterChainHandler::with_tracing`) -- `None` on any handler tracing
     /// is off for. [`LoggingBody::finish`] emits the SERVER span through
     /// this, using `stream_info.trace` (set at stream start, `None` when
@@ -278,7 +278,7 @@ pub(crate) struct AccessLogContext {
 /// rendered and written per configured logger, using the *final* byte count
 /// and a duration covering the whole stream.
 ///
-/// This is the seam WP-24 chunk 3 exists for: logging when *response
+/// This is the seam access logging needs: logging when *response
 /// headers* are produced (the naive place to hook) is wrong for every
 /// streamed LLM response -- the body (the actual tokens) is what takes the
 /// time and carries the bytes; headers arrive almost immediately. Wrapping
@@ -307,7 +307,7 @@ pub(crate) struct AccessLogContext {
 /// `StreamingEncoder(LoggingBody(...))` nesting renders the log line the
 /// moment the router's body ends, before the encode filter chain's own
 /// end-of-stream callback has run, which makes anything an encode filter
-/// records at stream end (e.g. the WP-33/34 usage filter's token counts)
+/// records at stream end (e.g. the usage filter's token counts)
 /// invisible to the log. `LoggingBody(StreamingEncoder(...))` fixes that by
 /// only ever observing end-of-stream *after* the whole encode chain -- and
 /// its own end-of-stream flush -- has already run.
@@ -356,9 +356,9 @@ impl LoggingBody {
     /// dispatcher stops polling the response body the moment it has written
     /// exactly `content-length` bytes, so `poll_frame` never gets the
     /// terminal `None` this body's clean-end path (below) waits for.
-    /// `StreamingEncoder`'s own version of this fix (WP-24-adjacent, already
-    /// in place) solves that problem for the ENCODE FILTER CHAIN -- it makes
-    /// sure an encode filter's end-of-stream logic (e.g. the WP-33 usage
+    /// `StreamingEncoder`'s own version of this fix (already in
+    /// place) solves that problem for the ENCODE FILTER CHAIN -- it makes
+    /// sure an encode filter's end-of-stream logic (e.g. the usage
     /// filter's token-usage write) still runs. It does nothing for
     /// `LoggingBody`, which wraps `StreamingEncoder` from the OUTSIDE and is
     /// what hyper's write dispatcher actually holds: without this, a
@@ -505,7 +505,7 @@ impl LoggingBody {
                     info.is_local_reply,
                 ));
             }
-            // WP-33: `LlmTokenUsage` -> `LlmTokens` field-for-field --
+            // `LlmTokenUsage` -> `LlmTokens` field-for-field --
             // `proxy-observability` can't name `proxy_http::LlmTokenUsage`
             // (crate layering runs the other way), so this is the boundary
             // conversion; note this is a `Option<LlmTokenUsage>`, not a
@@ -532,11 +532,11 @@ impl LoggingBody {
                 info.llm.time_to_first_body_byte,
                 info.requested_model.clone(),
                 info.trace,
-                // WP-55: the SAME `AuthInfo::tenant` the auth filter wrote,
+                // The SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
                 // time below -- see this destructuring's own doc above.
                 info.auth.tenant.clone(),
-                // WP-58: `%RESPONSE_CODE_DETAILS%` -- cloned out alongside
+                // `%RESPONSE_CODE_DETAILS%` -- cloned out alongside
                 // everything else `LogContext` borrows, same reasoning as
                 // this destructure's own doc above.
                 info.response_code_details.clone(),
@@ -737,17 +737,17 @@ impl LoggingBody {
             ctx.stream_info.borrow_mut().clear_capture_state();
         }
 
-        // WP-23 increment 6b: record LLM_CLIENT_TOKEN_USAGE here, at the
+        // Record LLM_CLIENT_TOKEN_USAGE here, at the
         // same "stream has ended, exactly once" point access logging itself
         // uses. `provider` is the cluster ACTUALLY DIALLED
-        // (`upstream_cluster`), never the routed cluster name -- ground rule
-        // #6: on a fallback the two differ, and the member that served the
+        // (`upstream_cluster`), never the routed cluster name -- AGENTS.md
+        // invariant 6: on a fallback the two differ, and the member that served the
         // request is the one whose tokens these are. A stream with no usage
         // reported (`llm_tokens: None`) records nothing at all -- "no usage
         // was reported" and "zero tokens were used" are different facts, and
         // recording a zero here would silently corrupt any rate computed
         // from this series. `tenant` is `StreamInfo::auth.tenant` verbatim
-        // (WP-55) -- `None` (no authenticated caller) still records, under
+        // -- `None` (no authenticated caller) still records, under
         // `GenAiTokenStats::record_usage`'s no-tenant sentinel; see that
         // method's doc for why unauthenticated usage is a naming decision,
         // not a skip.
@@ -785,7 +785,7 @@ impl LoggingBody {
             }
         }
 
-        // WP-51 increment 2: emit the SERVER span here -- the same
+        // Emit the SERVER span here -- the same
         // "stream has ended, exactly once" point the two instruments above
         // use. `trace` is `None` whenever tracing is off; `span_ctx.sampled`
         // is `false` for an unsampled root this stream's own head-sampling
@@ -1032,7 +1032,7 @@ mod tests {
 
     /// Drives one `LoggingBody` (a response body plus its populated
     /// `StreamInfo::llm`) to completion and returns the single rendered
-    /// line, proving the WP-33 token/TTFT operators reach the real access
+    /// line, proving the token/TTFT operators reach the real access
     /// log through the same path as `bytes_sent` -- not just through
     /// `access_log::render` in isolation.
     async fn render_one(llm: crate::stream_info::LlmStats) -> String {
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     /// Same as [`render_one`], but with a caller-supplied format string --
-    /// used by the WP-46 tests below to exercise `%LLM_TPOT%`/
+    /// used by the TPOT/max-stall tests below to exercise `%LLM_TPOT%`/
     /// `%LLM_MAX_STALL%`/`%LLM_RESPONSE_CHUNKS%` end-to-end (`StreamInfo` ->
     /// `AccessLogContext` -> the rendered line), not from a hand-built
     /// `LogContext`.
@@ -1115,7 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn absent_llm_stats_render_dash_not_zero() {
-        // WP-33: a stream that never populated `StreamInfo::llm` (a non-LLM
+        // A stream that never populated `StreamInfo::llm` (a non-LLM
         // route, or a provider response with no usage) must log `-`, not a
         // confident-looking `0` -- these numbers feed billing.
         assert_eq!(
@@ -1219,7 +1219,7 @@ mod tests {
         assert!(records.try_recv().is_err());
     }
 
-    // --- WP-23 increment 6b: llm token-usage recording plumbing -----------
+    // --- llm token-usage recording plumbing -------------------------------
     //
     // These prove `LoggingBody::finish` actually calls into a wired
     // `GenAiTokenStats` with the right provider and per-bucket values -- not
@@ -1254,7 +1254,7 @@ mod tests {
     /// Drives a `LoggingBody` seeded with `usage`/`upstream_cluster`/`tenant`
     /// and a wired `token_stats` to completion (`finish()` via clean
     /// end-of-stream). `tenant` seeds `StreamInfo::auth.tenant` -- the SAME
-    /// field the real auth filter writes (WP-55) -- exercised by this test
+    /// field the real auth filter writes -- exercised by this test
     /// module going through the real `LoggingBody::finish` path, not a
     /// direct `GenAiTokenStats::record_usage` call.
     async fn drive_with_usage_and_provider(
@@ -1317,7 +1317,7 @@ mod tests {
         assert_eq!(registry.value(h.output), 0);
     }
 
-    // --- WP-55: `tenant` reaches `LLM_CLIENT_TOKEN_USAGE` through the real
+    // --- `tenant` reaches `LLM_CLIENT_TOKEN_USAGE` through the real
     // `StreamInfo::auth.tenant` -> `LoggingBody::finish` path -------------
 
     #[tokio::test]
@@ -1451,12 +1451,12 @@ mod tests {
         );
     }
 
-    // --- WP-46: TPOT / max-stall / response-chunks plumbing ---------------
+    // --- TPOT / max-stall / response-chunks plumbing ---------------
     //
     // These drive the real `StreamInfo` -> `AccessLogContext` -> `LoggingBody`
     // path (via `render_one_fmt`), not a hand-built `LogContext` -- the
     // plumbing from `StreamInfo::llm` through to `LogContext` is exactly the
-    // part WP-46 adds, so it's the part worth exercising end-to-end.
+    // part TPOT/max-stall adds, so it's the part worth exercising end-to-end.
 
     #[tokio::test]
     async fn llm_max_stall_and_response_chunks_reach_the_rendered_line() {
@@ -1491,7 +1491,7 @@ mod tests {
         // end-of-stream, so this only proves the plumbing (usage, ttft, and
         // duration all reach `%LLM_TPOT%` through the real path) -- the exact
         // formula is proven precisely, against a scripted `LogContext`, in
-        // `proxy_observability::access_log`'s own WP-46 tests.
+        // `proxy_observability::access_log`'s own tests.
         let llm = crate::stream_info::LlmStats {
             usage: Some(LlmTokenUsage {
                 input_tokens: 1,

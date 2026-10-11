@@ -178,7 +178,7 @@ fn hmac_secret_file_lowers_to_filename_and_warns_and_a_missing_file_errors() {
             .iter()
             .any(|w| w.field_path == "auth.hmac_secret_file"
                 && w.message
-                    == "the key file is read once at startup; hot reload lands with WP-35"),
+                    == "the key file is read once at startup; hot reload is not supported yet"),
         "expected the api_key_file-style warning (same wording), got: {:?}",
         lowered.warnings
     );

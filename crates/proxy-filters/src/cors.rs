@@ -235,7 +235,7 @@ fn parse_matcher(config: &DynamicMessage, index: usize) -> Result<OriginMatcher,
 fn reject_runtime_fraction(config: &DynamicMessage, field: &str) -> Result<(), ConfigError> {
     if config.has_field_by_name(field) {
         // This is a deliberate load error, never an ignored rollout knob.
-        // WP-31's core policy behavior is deterministic; implementing Envoy
+        // The core CORS policy behavior is deterministic; implementing Envoy
         // runtime-key lookup needs the runtime subsystem, not a fake local RNG.
         return Err(ConfigError::Unimplemented {
             field_path: format!("typed_config.{field}"),

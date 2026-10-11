@@ -1,4 +1,4 @@
-//! WP-22 delta ADS transport acceptance over real loopback gRPC.
+//! Delta ADS transport acceptance over real loopback gRPC.
 
 use std::time::Duration;
 

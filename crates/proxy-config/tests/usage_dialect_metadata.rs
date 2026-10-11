@@ -1,5 +1,5 @@
-//! WP-35: `Cluster.metadata.filter_metadata["io.llmproxy.usage"]` ->
-//! `ClusterConfig.usage_dialect`. Ground rule #6's third instance, and the
+//! `Cluster.metadata.filter_metadata["io.llmproxy.usage"]` ->
+//! `ClusterConfig.usage_dialect`. A known instance of AGENTS.md invariant 6, and the
 //! exact sibling of `provider_auth_metadata.rs`: the usage dialect is a
 //! property of the provider actually dialled, so it has to ride the cluster
 //! rather than the route, and Envoy has no proto field for it -- hence the
@@ -8,7 +8,7 @@
 //! Everything here is the strict-parse -> PGV -> IR pipeline a hand-written
 //! Envoy config goes through, so a config that never sets this namespace
 //! must be completely unaffected. Every malformed shape is a hard error
-//! carrying its full dotted path (ground rule #1), never a silent skip.
+//! carrying its full dotted path (AGENTS.md invariant 1), never a silent skip.
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -101,7 +101,7 @@ static_resources:
     );
 }
 
-/// Ground rule #1: an unrecognized value is a hard error naming the exact
+/// AGENTS.md invariant 1: an unrecognized value is a hard error naming the exact
 /// field, not a fallback to openai. A silent fallback here is the
 /// wrong-billing bug this whole carrier exists to prevent, just relocated
 /// into the loader.
@@ -164,7 +164,7 @@ static_resources:
 
 /// An unknown key *inside* this namespace is a hard error too. The
 /// reflective surface walk cannot see into a `Struct`, so this is the only
-/// place ground rule #1 can be enforced for it -- a typo'd `dialects:` must
+/// place AGENTS.md invariant 1 can be enforced for it -- a typo'd `dialects:` must
 /// not load as "no dialect configured".
 #[test]
 fn an_unknown_key_under_the_usage_namespace_is_a_hard_error() {
@@ -185,7 +185,7 @@ static_resources:
     );
 }
 
-/// Ground rule #6, stated as a load error: the dialect must sit on the
+/// AGENTS.md invariant 6, stated as a load error: the dialect must sit on the
 /// member that actually serves the request, never on the aggregate that
 /// merely selects one. An aggregate rejects `metadata` outright, so a
 /// dialect placed there cannot silently do nothing.

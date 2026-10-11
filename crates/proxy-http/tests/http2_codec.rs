@@ -1,4 +1,4 @@
-//! WP-10 h2 chunk -- standalone tests for the downstream HTTP/2 codec
+//! Standalone tests for the downstream HTTP/2 codec
 //! (`proxy_http::codec::serve_http2`), mirroring `tests/http1_codec.rs`'s
 //! shape and harness (in-memory `tokio::io::duplex` pipe, a hyper low-level
 //! client on the other end, `#[tokio::test]`-free `run_local` + `#[test]`

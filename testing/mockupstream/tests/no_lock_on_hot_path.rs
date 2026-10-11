@@ -1,4 +1,4 @@
-//! Structural sanity check for the crate doc's ground rule ("no `Mutex` on
+//! Structural sanity check for the crate doc's rule ("no `Mutex` on
 //! the request path"), which the scale-test profile extension must not
 //! quietly break by giving profile lookup or RNG state a shared, lockable
 //! home.

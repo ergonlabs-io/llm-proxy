@@ -1,4 +1,4 @@
-//! WP-14 wiring: `RouterHandler` (S3) actually issuing retried attempts.
+//! `RouterHandler` (S3) actually issuing retried attempts.
 //! Standalone (not `router.rs`'s own `#[cfg(test)]` module) because it needs
 //! upstreams that count/queue multiple requests, which the existing router
 //! tests' one-shot helpers don't need.
@@ -96,7 +96,7 @@ fn prefix_matcher(prefix: &str) -> RouteMatcher {
     }
 }
 
-/// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved for
+/// A fresh, single-worker [`RouterStats`] resolved for
 /// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
 /// mirroring how `crates/proxy/src/main.rs` builds the real one from the
 /// boot config snapshot's cluster names.
@@ -246,7 +246,7 @@ fn text_logger(path: &Path, format: &str) -> AccessLogIR {
 }
 
 /// Like [`build_router`], but resolving `access_logs` into live sinks
-/// (mirrors `router_access_log.rs`'s `build_router`) -- what the WP-24 `URX`
+/// (mirrors `router_access_log.rs`'s `build_router`) -- what the `URX`
 /// test below needs to observe the rendered `%RESPONSE_FLAGS%` line, not
 /// just the response the router returns.
 async fn build_router_with_access_logs(
@@ -586,14 +586,14 @@ async fn metadata_exhausted_retry_flags_and_body_user_are_not_identity() {
         .await;
 }
 
-/// WP-23 increment 6a: a retried request is TWO upstream attempts against
+/// A retried request is TWO upstream attempts against
 /// the same cluster, so `upstream_rq` must count 2, not 1 -- Envoy's
 /// `upstream_rq_total` counts requests issued to a cluster, not downstream
 /// requests, and undercounting a retry as one attempt would make the retry
 /// rate invisible. Asserted against the *rendered* `/stats` text
 /// (`proxy_observability::stats::envoy_render::render`), not just
 /// `Registry::value`, so this fails if the renderer ever stops seeing what
-/// the router records -- see the WP-23 increment 6a task brief.
+/// the router records.
 #[tokio::test(flavor = "current_thread")]
 async fn a_retried_request_counts_twice_against_upstream_rq() {
     LocalSet::new()
@@ -666,7 +666,7 @@ async fn retry_budget_blocks_an_ordinary_retry_over_a_real_socket() {
         .await;
 }
 
-/// WP-24: the response flag half of
+/// The response flag half of
 /// [`retries_stop_at_num_retries_and_return_the_last_failure`] above -- once
 /// the retry budget (S3.1) is spent AND the final attempt is still a
 /// triggering outcome, `%RESPONSE_FLAGS%` must render `URX`. A plain
@@ -1526,9 +1526,9 @@ async fn the_replayed_request_carries_the_same_body_as_the_original() {
         .await;
 }
 
-// ------------------------------------------------------------ WP-13 --
+// ----------------------------------------------- attempt-count headers --
 
-/// Like [`build_router`], but sets the route's WP-13
+/// Like [`build_router`], but sets the route's
 /// `include_request_attempt_count`/`include_attempt_count_in_response`
 /// flags (`RouteEntry`'s own doc explains the denormalization) -- kept as
 /// its own helper, rather than a parameter threaded through `build_router`
@@ -1608,7 +1608,7 @@ async fn build_router_with_attempt_count_flags(
 }
 
 /// Like [`spawn_upstream_fails_then_succeeds`], but records each accepted
-/// request's raw header text (not just its body) -- what the WP-13
+/// request's raw header text (not just its body) -- what the
 /// "increments on retry" test needs, to see what each individual attempt
 /// actually carried on the wire, in order.
 async fn spawn_upstream_fails_then_succeeds_capturing_headers(

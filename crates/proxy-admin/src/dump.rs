@@ -31,7 +31,7 @@ pub struct ConfigDump {
     pub admin: Option<String>,
     pub listeners: Vec<ListenerDump>,
     pub clusters: Vec<ClusterDump>,
-    /// RDS-delivered route tables (WP-21); tables inlined in an HTTP
+    /// RDS-delivered route tables; tables inlined in an HTTP
     /// connection manager are nested under that listener's filter chain
     /// instead (`ConfigSnapshot.routes` doc, `ir.rs`).
     pub routes: Vec<RouteTableDump>,
@@ -222,7 +222,7 @@ pub struct RouteDump {
     pub case_sensitive: bool,
     pub action: RouteActionDump,
     /// Header **names** the router adds/appends on match -- this is exactly
-    /// how provider API keys reach the upstream (see WP-34/WP-50 history).
+    /// how provider API keys reach the upstream.
     /// Every value renders as `"[redacted]"` unconditionally, regardless of
     /// header name: this list is credential-shaped by construction, not by
     /// name-matching, so there is no name pattern to keep in sync.
@@ -334,7 +334,7 @@ impl RouteActionDump {
 #[serde(tag = "type", content = "value")]
 pub enum ForwardTargetDump {
     Cluster(String),
-    /// Header name the router reads the cluster from at request time (WP-35
+    /// Header name the router reads the cluster from at request time (the
     /// model router) -- not the runtime value of that header.
     ClusterHeader(String),
     /// (cluster, cumulative weight) pairs, as precomputed on the IR.

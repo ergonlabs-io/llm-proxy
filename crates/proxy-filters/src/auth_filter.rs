@@ -1,16 +1,13 @@
-//! WP-50 increment 2a-ii, part 1 — wires the [`crate::auth`] core into a real
+//! Wires the [`crate::auth`] core into a real
 //! `HttpFilter`.
 //!
 //! **Library only** in `auth.rs`; this module is the seam that actually sits
-//! in the decode path. See `internal-docs/IMPLEMENTATION_PLAN.md` (normative,
-//! agreed with the repo owner) for the full design; this file implements the
-//! filter half of increment 2a ("virtual keys, in-memory") exactly as scoped
-//! there.
+//! in the decode path. The core's design rationale lives in its module doc.
 //!
 //! # Config: a vendored proto, not a borrowed Envoy message
 //!
 //! `llmproxy.filters.v0.Authentication` (`proxy-api/vendor/llmproxy/filters/v0/auth.proto`)
-//! is the first Lane-H proto vendored for its own sake — see that file's
+//! is the first LLM-layer proto vendored for its own sake — see that file's
 //! header comment for why the earlier "borrow an unrelated Envoy message
 //! whose field names happen to fit" convention (`usage_filter`,
 //! `body_rewrite_filter`, `token_limit_filter`) does not extend to
@@ -210,7 +207,7 @@ fn parse_digest_hex(raw: &str, index: usize) -> Result<Vec<u8>, ConfigError> {
 enum StoreSpec {
     InMemory,
     Persistent(String),
-    /// WP-62 increment 3: the Redis-backed shared store. `url` may embed a
+    /// The Redis-backed shared store. `url` may embed a
     /// Redis password (`redis://:password@host:6379/0`) -- see the hand-
     /// written [`std::fmt::Debug`] impl below for why this variant does
     /// NOT derive it.
@@ -330,13 +327,12 @@ fn parse_poll_interval(config: &DynamicMessage) -> Duration {
 }
 
 /// [`parse_config`]'s return value -- a named struct rather than a growing
-/// tuple, purely to keep clippy's `type_complexity` quiet as WP-61 added a
-/// fourth field; see each field's doc (mirroring [`parse_config`]'s own) for
+/// tuple, purely to keep clippy's `type_complexity` quiet now that there are
+/// several fields; see each field's doc (mirroring [`parse_config`]'s own) for
 /// why every one of these crosses this boundary in this particular shape.
 #[derive(Debug)]
 struct AuthConfig {
-    /// Raw secret **bytes**, not an [`HmacSecret`] -- as of WP-50 increment
-    /// 3b-i, [`AuthFilterFactory::create`] needs TWO independent
+    /// Raw secret **bytes**, not an [`HmacSecret`] -- [`AuthFilterFactory::create`] needs TWO independent
     /// `HmacSecret`s from the same bytes (one for the request-time
     /// authenticator, one retained by [`crate::control::ControlPlane`] for a
     /// future key-mint endpoint), and `HmacSecret` deliberately has no
@@ -346,10 +342,10 @@ struct AuthConfig {
     secret_bytes: Vec<u8>,
     bootstrap_keys: KeySet,
     store_spec: StoreSpec,
-    /// WP-61: how often the policy poller re-checks the store's generation
+    /// How often the policy poller re-checks the store's generation
     /// stamp -- see [`parse_poll_interval`].
     poll_interval: Duration,
-    /// WP-50 increment 2c-ii: one entry per `typed_config.jwt_providers[i]`,
+    /// One entry per `typed_config.jwt_providers[i]`,
     /// in config order. Each becomes one `JwtAuthenticator` appended to the
     /// chain after the virtual-key authenticator.
     jwt_providers: Vec<JwtProviderConfig>,
@@ -417,7 +413,7 @@ fn parse_jwk_component(raw: &str, field_path: &str) -> Result<Vec<u8>, ConfigErr
 
 /// Reads `typed_config.jwt_providers` into per-provider configs. Absent and
 /// empty are both legal and mean "no JWT accepted". Strict mode: every field
-/// either maps in or errors with its dotted path (ground rule #1).
+/// either maps in or errors with its dotted path (AGENTS.md invariant 1).
 fn parse_jwt_providers(config: &DynamicMessage) -> Result<Vec<JwtProviderConfig>, ConfigError> {
     let providers: Vec<prost_reflect::Value> = config
         .get_field_by_name("jwt_providers")
@@ -634,7 +630,7 @@ fn parse_tenant_values(
 /// Reads `typed_config` (an `llmproxy.filters.v0.Authentication`) into the
 /// secret bytes + bootstrap key set + store selection + poll interval the
 /// filter needs at request time. Strict mode: every field either maps in or
-/// errors with its dotted path (ground rule #1).
+/// errors with its dotted path (AGENTS.md invariant 1).
 fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     let secret_bytes = parse_hmac_secret(config)?;
     let store_spec = parse_store(config)?;
@@ -644,7 +640,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     // Rust note: `HashMap<String, usize>` / `HashMap<Vec<u8>, usize>` remember
     // which earlier index first used a given `key_id`/digest, so the
     // duplicate error can name the SECOND (offending) index precisely, per
-    // the design brief's dedup rule.
+    // the duplicate-detection rule.
     let mut seen_key_ids: HashMap<String, usize> = HashMap::new();
     let mut seen_digests: HashMap<Vec<u8>, usize> = HashMap::new();
 
@@ -736,7 +732,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override —
-/// this increment has no per-route config; the trait default
+/// this filter has no per-route config; the trait default
 /// (`ConfigError::Unimplemented`) is correct.
 #[derive(Default)]
 pub struct AuthFilterFactory;
@@ -763,7 +759,7 @@ impl HttpFilterFactory for AuthFilterFactory {
             jwt_providers,
         } = parse_config(config)?;
 
-        // WP-50 increment 2c-iv: one shared JWKS snapshot per JWT provider,
+        // One shared JWKS snapshot per JWT provider,
         // built here (outside the singleton closure) so every worker's
         // authenticator loads the same `Arc`. Static providers seed once and
         // never change; discovery providers seed (possibly empty) and are
@@ -805,7 +801,7 @@ impl HttpFilterFactory for AuthFilterFactory {
             jwt_validations.push(validation);
         }
 
-        // WP-50 increment 3b-ii, part B: the `ControlPlane` is now the ONE
+        // The `ControlPlane` is now the ONE
         // per-serve instance shared across every worker BUILDING THIS SAME
         // CHAIN, resolved through `ctx.get_or_try_init` (`FactoryContext`'s
         // thin wrapper over `SharedFactoryState`, keyed on `(ctx.scope, this
@@ -819,7 +815,7 @@ impl HttpFilterFactory for AuthFilterFactory {
         // invisible to every other. The closure below runs only on the FIRST
         // worker for this chain's `(scope, type_url)`; every later worker's `create` call
         // reads the same `Arc<ControlPlane>` back out instead of rebuilding
-        // it. WP-50 increment 3b-ii, part W3: the store itself is now
+        // it. The store itself is
         // SELECTABLE (`typed_config.store`) and is built inside this closure
         // for exactly that reason -- a `persistent` store opens a `redb` file
         // that takes a file lock, so it must be opened once for the whole
@@ -907,7 +903,7 @@ impl HttpFilterFactory for AuthFilterFactory {
                         format!("control-plane snapshot could not be built: {e}"),
                     )
                 })?;
-                // WP-61: start the policy poller HERE, not in `main.rs` --
+                // Start the policy poller HERE, not in `main.rs` --
                 // `main.rs` never holds a `ControlPlane` handle at all (this
                 // `get_or_try_init` closure is the one place a fresh
                 // `ControlPlane` gets built, per (scope, TYPE_URL) singleton,
@@ -1025,7 +1021,7 @@ impl HttpFilter for AuthFilterInstance {
                 self.deny(cb, "auth_revoked_key");
                 FilterHeadersStatus::Continue
             }
-            // WP-50 increment 2c-i: `crate::jwt_auth::JwtAuthenticator`'s
+            // `crate::jwt_auth::JwtAuthenticator`'s
             // rejection reasons. No `JwtAuthenticator` is pushed onto this
             // filter's chain yet (that wiring is 2c-ii), so these arms are
             // unreachable today -- they exist only because `AuthError` is
@@ -1261,7 +1257,7 @@ mod tests {
 
     // --- config parsing ---------------------------------------------------------
 
-    // WP-61: the poll interval is the revocation bound, so pin both ends of
+    // The poll interval is the revocation bound, so pin both ends of
     // it -- the unset/`0` default AND an explicit value. `48 * 1.25 == 60`
     // is the owner's stated "a revoked key stops working within 60 seconds";
     // if the default here ever moves, that sentence moves with it.
@@ -1970,7 +1966,7 @@ mod tests {
             Some(&HeaderValue::from_static("Bearer llmp_good-key")),
             "the client credential must still be present -- replacing it with the \
              provider credential is the cluster's request_headers_to_add, which runs \
-             later (ground rule #6)"
+             later (AGENTS.md invariant 6)"
         );
         let info = cb.stream_info.borrow();
         assert_eq!(info.auth.tenant.as_deref(), Some("tenant-a"));
@@ -2016,7 +2012,7 @@ mod tests {
         }
     }
 
-    // 19: WP-50 increment 3b-ii part B -- the shared-singleton property.
+    // 19: the shared-singleton property.
     // `create` resolves ONE `ControlPlane` through `ctx.get_or_try_init`, a write
     // through it is visible to what the factory wired, and a SECOND `create`
     // over the same `ctx` does not build a second instance.
@@ -2079,7 +2075,7 @@ mod tests {
         }
     }
 
-    // --- WP-50 increment 3b-ii, part W3: store selection -----------------------
+    // --- store selection -----------------------
 
     // 20: the oneof left UNSET builds successfully -- back-compat, this is
     // what every config written before `store` existed still does.
@@ -2224,7 +2220,7 @@ mod tests {
         }
     }
 
-    // --- WP-62 increment 3: the `shared` (Redis) store -------------------------
+    // --- the `shared` (Redis) store -------------------------
 
     // 27: an inline-string url parses to `StoreSpec::Shared` with no namespace.
     #[test]
@@ -2478,7 +2474,7 @@ mod tests {
         );
     }
 
-    // --- JWT wiring: WP-50 increment 2c-ii ------------------------------------
+    // --- JWT wiring ------------------------------------
     //
     // These tests prove the `jwt_providers` config surface parses into live
     // chain entries: a valid token authenticates end to end through the real
@@ -2740,8 +2736,8 @@ mod tests {
         assert_eq!(reply.details, "auth_unknown_key");
     }
 
-    // 2c-ii/4: config validation -- every malformed jwt_providers entry fails
-    // with its dotted path, never silently ignored (ground rule #1).
+    // config validation -- every malformed jwt_providers entry fails
+    // with its dotted path, never silently ignored (AGENTS.md invariant 1).
     #[test]
     fn malformed_jwt_provider_entries_are_rejected_with_dotted_paths() {
         let key = jwt_test_key();

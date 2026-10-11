@@ -1,4 +1,4 @@
-//! Versioned, four-bucket list pricing for LLM requests (WP-53).
+//! Versioned, four-bucket list pricing for LLM requests.
 //!
 //! This is deliberately a rate-card library: it computes an immutable
 //! request-time list price but does not enforce a budget.  Money stays in

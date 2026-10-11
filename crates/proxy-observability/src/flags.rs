@@ -208,7 +208,7 @@ impl ResponseFlag {
     /// `ResponseFlagFilter.flags`. `None` for a code Envoy
     /// defines but we don't model as a distinct flag yet (e.g. `DI`, `FI`);
     /// the lowering pass turns that into a strict-mode config error rather
-    /// than silently dropping the filter entry (ground rule #1).
+    /// than silently dropping the filter entry (AGENTS.md invariant 1).
     pub fn from_code(code: &str) -> Option<Self> {
         Some(match code {
             "UH" => Self::NoHealthyUpstream,

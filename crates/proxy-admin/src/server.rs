@@ -1,5 +1,5 @@
 //! The admin HTTP server: binds a socket (control runtime, ADR-0003) and
-//! answers the read-only endpoints, plus (WP-50 increment 3b-ii, W4) a
+//! answers the read-only endpoints, plus a
 //! bearer-gated write API for the control plane, over real hyper
 //! connections.
 //!
@@ -82,7 +82,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}",
     "/tenants/{id}/policy",
     "/tenants/{id}/budget",
-    // WP-50 increment 3c-iv: a READ, but gated like a write -- see
+    // A READ, but gated like a write -- see
     // `handle`'s route table and `lib.rs`'s module doc for why.
     "/tenants/{id}/spend",
     "/chains/{stat_prefix}/keys",
@@ -120,7 +120,7 @@ pub enum Readiness {
     /// deadline (if any) has not passed: `/ready` returns `503
     /// "INITIALIZING"`. `warming` names the still-unresolved clusters, for
     /// logging by whoever built the probe -- this module does not log it
-    /// itself (WP-21 increment 3's spec: `/ready` is polled on a tight loop
+    /// itself (`/ready` is polled on a tight loop
     /// by orchestrators, so logging on every call would become the
     /// incident; the one-shot "deadline expired" warning belongs to the
     /// probe's owner, `crates/proxy/src/main.rs`, which knows when the
@@ -139,7 +139,7 @@ pub enum Readiness {
 ///
 /// This crate never depends on `proxy-cluster` to build one -- see this
 /// module's doc and [`Readiness`]'s doc for why. When `serve` is called with
-/// `None` (no probe wired), `/ready` keeps its pre-WP-21 behavior, `200
+/// `None` (no probe wired), `/ready` keeps its default behavior, `200
 /// "LIVE"` unconditionally, rather than inventing a new failure mode for
 /// callers (mostly tests) that never had a `ClusterManager` to ask.
 pub type ReadinessProbe = Arc<dyn Fn() -> Readiness + Send + Sync>;
@@ -163,7 +163,7 @@ pub enum AdminError {
 
 /// A running admin server. Dropping this does not stop the server -- see
 /// [`AdminServer::abort`] -- so callers that care about shutdown (none do
-/// yet in this read-only increment) must call it explicitly.
+/// yet) must call it explicitly.
 pub struct AdminServer {
     local_addr: SocketAddr,
     accept_task: JoinHandle<()>,
@@ -326,7 +326,7 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
 /// `config` is read (never owned) per request via `load()` -- an `Arc`
 /// clone of whatever the control side last published, per ADR-0005's
 /// "control computes, workers read" split applied to this reader too.
-/// `registry` is the WP-23 stats registry, `Some` once a caller has one to
+/// `registry` is the stats registry, `Some` once a caller has one to
 /// offer -- see `/stats`'s route in [`handle`] for what happens when it
 /// doesn't. `started_at` backs `/server_info`'s uptime. `factory_state` is
 /// the per-serve [`SharedFactoryState`] a worker's `AuthFilterFactory`
@@ -335,9 +335,9 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
 /// it at startup. `admin_token` gates every WRITE endpoint (`/keys`,
 /// `/tenants`, ...); see [`normalize_admin_token`] and [`handle`]'s gate for
 /// the fail-closed semantics -- READ endpoints are unaffected by it.
-/// `readiness` (WP-21 increment 3) answers `/ready`; see [`ReadinessProbe`]'s
+/// `readiness` answers `/ready`; see [`ReadinessProbe`]'s
 /// doc for why it is an injected closure and what `None` means.
-/// `cluster_state` (WP-57) supplies the current host sets for `/clusters`.
+/// `cluster_state` supplies the current host sets for `/clusters`.
 /// Passing `None` preserves the standalone config-only view used by older
 /// embedders and tests; the shipped binary always passes the real provider.
 ///
@@ -436,11 +436,11 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
             return handle_get_pricing(factory_state, stat_prefix);
         }
     }
-    // ---- Read endpoints: byte-for-byte the read-only increment's behavior,
+    // ---- Read endpoints: unchanged by the write API,
     // no gate, matched on path alone (as before -- these never distinguished
     // method). ----
     match req.uri().path() {
-        // WP-21 increment 3: no probe wired keeps the pre-existing
+        // No probe wired keeps the pre-existing
         // unconditional `200 "LIVE"` -- see `ReadinessProbe`'s doc for why
         // that is a deliberate "no new failure mode" default rather than an
         // invented one for callers (mostly tests) with no `ClusterManager`
@@ -493,7 +493,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
                 },
             );
         }
-        // WP-23 increment 3: rendering is `envoy_render::render`, which only
+        // Rendering is `envoy_render::render`, which only
         // reads atomics already resolved/incremented elsewhere and formats
         // a string -- no I/O, no blocking, safe on this request path (see
         // `envoy_render::render`'s own doc). When no registry has been
@@ -506,18 +506,18 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
                 Some(registry) => text(StatusCode::OK, &envoy_render::render(registry)),
                 None => text(
                     StatusCode::NOT_FOUND,
-                    "the stats registry (WP-23) is not configured for this admin server instance; \
+                    "the stats registry is not configured for this admin server instance; \
                      this proxy does not fake an empty /stats",
                 ),
             };
         }
-        // WP-23 increment 4: same shape as `/stats` above.
+        // Same shape as `/stats` above.
         "/stats/prometheus" => {
             return match registry {
                 Some(registry) => text(StatusCode::OK, &prometheus_render::render(registry)),
                 None => text(
                     StatusCode::NOT_FOUND,
-                    "the stats registry (WP-23) is not configured for this admin server instance; \
+                    "the stats registry is not configured for this admin server instance; \
                      this proxy does not fake an empty /stats/prometheus",
                 ),
             };
@@ -525,8 +525,8 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         _ => {}
     }
 
-    // ---- Write endpoints (WP-50 3b-ii W4), PLUS two gated reads: WP-50
-    // 3c-iv's `.../spend`, and `GET .../keys` (the key listing). All are
+    // ---- Write endpoints, PLUS two gated reads: `.../spend`, and
+    // `GET .../keys` (the key listing). All are
     // resolved per request through the SAME three gates. A GET on either
     // renders data an unauthenticated caller has no business reading --
     // per-tenant spend, or the tenant/key inventory -- unlike every endpoint
@@ -589,16 +589,16 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
     // Gate 3: does the control plane exist, and is it unambiguous which one
     // this write means?
     //
-    // WP-50 3c-ii-a: a SCOPED route (`route.stat_prefix()` is `Some`) names
+    // A SCOPED route (`route.stat_prefix()` is `Some`) names
     // exactly which chain it means, so it resolves through
     // `SharedFactoryState::get_by_name` -- no ambiguity is possible there
-    // (Lane H's lowering check rejects a duplicate `stat_prefix` among
+    // (the lowering check rejects a duplicate `stat_prefix` among
     // `llmproxy.auth`-configuring chains before this server ever runs), and
     // an unknown name is a 404, not a 503: it names an operator error
     // (typo'd or never-configured `stat_prefix`), not a boot race.
     //
     // An UNSCOPED route falls back to `resolve_control_plane`
-    // (`get_across_scopes`) exactly as it did before this increment -- kept
+    // (`get_across_scopes`) exactly as it did before scoped routes existed -- kept
     // as a convenience for the single-chain case; see that function's doc
     // for the two 503 situations it does not need to tell apart, and for the
     // third case below (more than one `llmproxy.auth`-configured chain) that
@@ -701,12 +701,12 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
 /// answer 405 rather than falling through to the generic 404 an unrecognized
 /// path gets.
 ///
-/// WP-50 3c-ii-a added the `Scoped*` variants (`/chains/{stat_prefix}/...`)
-/// alongside the original unscoped ones rather than replacing them --
+/// The `Scoped*` variants (`/chains/{stat_prefix}/...`) sit alongside the
+/// original unscoped ones rather than replacing them --
 /// [`Self::stat_prefix`] is the single place that tells the two families
 /// apart for [`handle`]'s control-plane resolution gate.
 ///
-/// WP-50 3c-iv added `TenantSpend`/`ScopedTenantSpend` -- a GET, despite the
+/// `TenantSpend`/`ScopedTenantSpend` are a GET, despite the
 /// type's name. It shares this type (rather than getting a parallel
 /// `ReadRoute` enum) precisely because it needs the exact same gate and the
 /// exact same scoped/unscoped `ControlPlane` resolution every other variant
@@ -730,9 +730,7 @@ enum WriteRoute<'a> {
     Tenants,
     TenantById(&'a str),
     TenantPolicy(&'a str),
-    // WP-50 increment 3c-iii-a.
     TenantBudget(&'a str),
-    // WP-50 increment 3c-iv.
     TenantSpend(&'a str),
     /// `GET /chains/{stat_prefix}/keys` -- the scoped listing.
     ScopedKeyList(&'a str),
@@ -774,7 +772,7 @@ impl<'a> WriteRoute<'a> {
     /// `Some(stat_prefix)` for a `/chains/{stat_prefix}/...` route, `None`
     /// for an unscoped one -- `handle`'s single branch point between
     /// `get_by_name` (scoped, always-correct) and `get_across_scopes`
-    /// (unscoped, the W4 convenience alias).
+    /// (unscoped, the convenience alias).
     fn stat_prefix(&self) -> Option<&'a str> {
         match self {
             WriteRoute::KeyList
@@ -840,11 +838,10 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
-        // WP-50 3c-iii-a.
         ["tenants", id, "budget"] => Some(WriteRoute::TenantBudget(id)),
-        // WP-50 3c-iv: a GET, gated like a write -- see `WriteRoute`'s doc.
+        // A GET, gated like a write -- see `WriteRoute`'s doc.
         ["tenants", id, "spend"] => Some(WriteRoute::TenantSpend(id)),
-        // WP-50 3c-ii-a: the scoped forms, addressed by the chain's
+        // The scoped forms, addressed by the chain's
         // operator-chosen `stat_prefix` -- see `WriteRoute`'s doc.
         ["chains", stat_prefix, "keys"] if *method == Method::GET => {
             Some(WriteRoute::ScopedKeyList(stat_prefix))
@@ -864,11 +861,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["chains", stat_prefix, "tenants", id, "policy"] => {
             Some(WriteRoute::ScopedTenantPolicy(stat_prefix, id))
         }
-        // WP-50 3c-iii-a.
         ["chains", stat_prefix, "tenants", id, "budget"] => {
             Some(WriteRoute::ScopedTenantBudget(stat_prefix, id))
         }
-        // WP-50 3c-iv.
         ["chains", stat_prefix, "tenants", id, "spend"] => {
             Some(WriteRoute::ScopedTenantSpend(stat_prefix, id))
         }
@@ -919,11 +914,11 @@ fn resolve_control_plane(
 
 /// Resolves the [`ControlPlane`] registered under the chain named
 /// `stat_prefix` -- the scoped (`/chains/{stat_prefix}/...`) counterpart of
-/// [`resolve_control_plane`], added in WP-50 3c-ii-a. `None` means no chain
+/// [`resolve_control_plane`]. `None` means no chain
 /// by that name has registered an `llmproxy.auth` control plane, which
 /// [`handle`] reports as 404: unlike the unscoped path, there is no
 /// ambiguity to report here (`get_by_name` cannot find two chains at once,
-/// since `proxy-config`'s Lane H lowering rejects a duplicate `stat_prefix`
+/// since `proxy-config`'s lowering rejects a duplicate `stat_prefix`
 /// among `llmproxy.auth`-configuring chains before this server ever starts),
 /// so a caller-facing 404 naming the unknown `stat_prefix` is honest: either
 /// it was typo'd, or that chain's worker has not finished building its
@@ -1012,7 +1007,7 @@ fn handle_get_pricing(
 }
 
 /// Resolves the [`SpendAccumulator`] singleton `llmproxy.spend_limit`
-/// registers, ACROSS EVERY CHAIN'S SCOPE -- the WP-50 3c-iv counterpart of
+/// registers, ACROSS EVERY CHAIN'S SCOPE -- the counterpart of
 /// [`resolve_control_plane`], for the unscoped `GET /tenants/{id}/spend`
 /// alias.
 ///
@@ -1182,7 +1177,7 @@ fn unknown_endpoint(path: &str) -> Response<Full<Bytes>> {
 
 /// Parses a JSON request body into `T`, rejecting any unknown field (every
 /// request struct in this module carries `#[serde(deny_unknown_fields)]` --
-/// see ground rule #1: a silently ignored field in a security-write API is
+/// see AGENTS.md invariant 1: a silently ignored field in a security-write API is
 /// the same class of bug as a silently ignored config field) and mapping
 /// any parse failure to 400. The error `Display` from `serde_json` names
 /// only the JSON shape problem (missing/wrong-typed field, unknown field,
@@ -1254,7 +1249,7 @@ struct SetPolicyRequest {
     deny: Vec<String>,
 }
 
-/// `PUT /tenants/{id}/budget`'s body (WP-50 increment 3c-iii-a).
+/// `PUT /tenants/{id}/budget`'s body.
 ///
 /// # Shape: one optional field expresses both "set" and "clear" unambiguously
 ///
@@ -1517,7 +1512,7 @@ fn handle_set_policy(
     }
 }
 
-/// `PUT /tenants/{id}/budget` (WP-50 increment 3c-iii-a). `{"budget": null}`
+/// `PUT /tenants/{id}/budget`. `{"budget": null}`
 /// clears the tenant's ceiling (reverts to unlimited); `{"budget": {...}}`
 /// sets it, parsing `max_usd` with [`parse_micro_usd`] -- the SAME parser a
 /// configured price uses -- so a malformed decimal string is a 400 naming
@@ -1669,7 +1664,7 @@ fn handle_get_key_spend_route(
     handle_get_key_spend(control_plane, accumulator, key_id)
 }
 
-/// `GET /tenants/{id}/spend` (and its scoped form) -- WP-50 increment 3c-iv.
+/// `GET /tenants/{id}/spend` (and its scoped form).
 ///
 /// Reads TWO singletons, both of which can legitimately be missing on a
 /// live, otherwise-healthy chain:
@@ -1758,7 +1753,7 @@ fn handle_get_spend(
             "journal_checkpoint_at": report.journal_checkpoint_at.map(|dt| dt.to_rfc3339()),
             "journal_pending_micro_usd": report.journal_pending_micro_usd,
             "journal_pending_rows": report.journal_pending_rows,
-            // WP-62 / ADR-0006 §5. `last_flush_at` alone answers "when",
+            // ADR-0006 §5. `last_flush_at` alone answers "when",
             // which forces every reader to do the subtraction and to know
             // what bound this deployment configured; these three answer
             // "is this replica's number trustworthy right now", which is

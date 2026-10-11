@@ -10,7 +10,7 @@ import (
 )
 
 // QA-2: a bad config fails at load, names the offending field, and exits
-// nonzero (SCENARIOS.md — ground rule #1: silently ignoring a config field
+// nonzero (SCENARIOS.md — AGENTS.md invariant 1: silently ignoring a config field
 // is a P0; strict mode's error quality is the whole product claim).
 //
 // This asserts on the FULL DOTTED FIELD PATH appearing in stderr, not merely

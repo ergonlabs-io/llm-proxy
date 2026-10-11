@@ -6,8 +6,6 @@
 // compiled Envoy message shapes, and it feeds a subsystem whose entire job is
 // to be right about money -- not something to carry as an unvalidated JSON
 // blob inside a borrowed field.
-//
-// See `internal-docs/IMPLEMENTATION_PLAN.md`, normative for this file.
 
 syntax = "proto3";
 
@@ -160,7 +158,7 @@ enum Period {
 // One cluster's price list.
 //
 // AGENTS.md invariant 6 ("anything that varies per provider belongs on the
-// cluster, never on the route") has a third instance here, beyond credentials
+// cluster, never on the route") has another instance here, beyond credentials
 // and `host_rewrite_literal`: pricing. The same model
 // name can be served by two clusters at two different rates -- `gpt-4o`
 // direct versus through a discounted secondary, say -- and a route only picks

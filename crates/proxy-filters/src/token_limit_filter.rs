@@ -1,4 +1,4 @@
-//! WP-34 increment 2 — wires the [`crate::token_limit`] budget limiter into
+//! Wires the [`crate::token_limit`] budget limiter into
 //! the real HTTP path as an enforcing `HttpFilter`.
 //!
 //! # Retrospective enforcement (recap; see `token_limit`'s module doc)
@@ -12,7 +12,7 @@
 //! # Filter position: BEFORE `llmproxy.usage` in config order
 //!
 //! S2.1: encoder callbacks run in **reverse** config order. This filter's
-//! encode-side job is to read the [`proxy_http::LlmTokenUsage`] the WP-33
+//! encode-side job is to read the [`proxy_http::LlmTokenUsage`] the
 //! usage filter (`crate::usage_filter`) wrote into `StreamInfo` at response
 //! end — but that only exists if the usage filter's own encode callback has
 //! *already run* by the time this filter's does. Reverse order means "already
@@ -64,7 +64,7 @@
 //!
 //! # Config: `llmproxy.filters.v0.TokenLimit`
 //!
-//! WP-47 gives the limiter an owned, versioned config message.  Its required
+//! The limiter has an owned, versioned config message.  Its required
 //! `max_tokens` and `fill_rate` fields map directly onto this filter's fixed
 //! window semantics; `fill_rate` is tokens per second and the window is
 //! `max_tokens / fill_rate` seconds.  Unlike the retired
@@ -76,19 +76,19 @@
 //! its wrapped fields exactly, emits a deprecation warning, and cannot become
 //! the default accidentally. New configuration must use [`TYPE_URL`].
 //!
-//! This increment does not expose per-descriptor configurability:
+//! This filter does not expose per-descriptor configurability:
 //! [`crate::token_limit::LimitOn::Total`] is hardcoded, and the bucket key is
 //! fixed as **(route name, the `authorization` header's value)** — no
 //! configured list of descriptors, no per-route override. This is a
-//! deliberate thin slice, not an oversight; the dialect `limits` config
-//! surface (increment 3) and any richer per-descriptor budget config want a
-//! vendored Lane-H proto, exactly like `body_rewrite_filter`'s and
+//! deliberate thin slice, not an oversight; any richer per-descriptor budget config
+//! (such as a dialect `limits` surface) wants a
+//! vendored proto, exactly like `body_rewrite_filter`'s and
 //! `usage_filter`'s module docs already predict for their own next config
 //! knob.
 //!
 //! # The bucket key: an authenticated tenant if there is one, else the credential
 //!
-//! **WP-50 increment 2a.** This filter originally bucketed on
+//! This filter originally bucketed on
 //! `(route, hash_credential(<the client's `authorization` header>))`. Nothing
 //! verified that header, so a caller who wanted more quota changed it and got a
 //! fresh bucket — the limit was advisory by construction, and v0.1.0's "a
@@ -145,7 +145,7 @@
 //! to do it. A tenant id needs no such treatment — it is an identifier the
 //! operator chose, not a secret.
 //!
-//! # `GET /v1/usage` — WP-54 increment 2, a read-only tenant self-service endpoint
+//! # `GET /v1/usage` — a read-only tenant self-service endpoint
 //!
 //! This filter also intercepts `GET /v1/usage` in `decode_headers`, before
 //! any budget check, and answers it directly rather than proxying it
@@ -197,7 +197,7 @@ use crate::usage::TokenUsage;
 /// Canonical owned type URL for this filter.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
 
-/// Borrowed type URL accepted for one release after the WP-47 migration.
+/// Borrowed type URL accepted for one release after the move to an owned, versioned message.
 pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings";
 
 /// Convert validated scalar budget values into the one-rule thin slice.
@@ -335,7 +335,7 @@ fn parse_legacy_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override —
-/// this increment has no per-route config (see the module doc's thin-slice
+/// this filter has no per-route config (see the module doc's thin-slice
 /// note); the trait default (`ConfigError::Unimplemented`) is correct.
 #[derive(Default)]
 pub struct TokenLimitFilterFactory;
@@ -438,7 +438,7 @@ fn create_filter_factory(
         ctx.scope, rule.on, rule.max_tokens, rule.window
     );
 
-    // WP-50 3c-ii-a: `ctx.stat_prefix` is passed through unchanged here so
+    // `ctx.stat_prefix` is passed through unchanged here so
     // the call compiles against the new two-identity signature; nothing
     // in `proxy-admin` addresses a `token_limit` singleton by name today,
     // so the by-name index this populates is inert for this filter. If
@@ -523,8 +523,7 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
 ///
 /// The repeat costs one extra `Instant` read and comparison, on the same
 /// rare, already-locked path the dedup check itself is on — not a
-/// background task or a timer, both of which the brief for this change
-/// rules out. That is cheap enough to keep here; a plain "once ever" set
+/// background task or a timer, both of which would add machinery the warner is meant to avoid. That is cheap enough to keep here; a plain "once ever" set
 /// (like `RouterStats`'s) would have been simpler still but would trade away
 /// exactly the visibility this exists to provide.
 struct UsageMissingWarner {
@@ -665,7 +664,7 @@ impl TokenLimitFilterInstance {
         self.store.record(key, &usage, 1.0, Instant::now());
     }
 
-    /// **WP-54 increment 2.** Terminates a `GET /v1/usage` request with the
+    /// Terminates a `GET /v1/usage` request with the
     /// authenticated caller's own current-window budgets, never proxying it
     /// upstream. See the module doc's usage-endpoint section for the
     /// security property this holds: the tenant comes ONLY from
@@ -744,7 +743,7 @@ const USAGE_PATH: &str = "/v1/usage";
 /// Render [`TokenLimitFilterInstance::handle_usage_request`]'s response body.
 ///
 /// Built with `serde_json` (already a `proxy-filters` dependency -- see
-/// `Cargo.toml`'s WP-50 3b comment; it rides in for `ControlPlaneStore`'s
+/// `Cargo.toml`'s `serde` comment; it rides in for `ControlPlaneStore`'s
 /// row encoding) rather than hand-rendered, specifically so `tenant` and
 /// every `route` name are escaped correctly by a library that has already
 /// solved that problem -- see
@@ -790,7 +789,7 @@ impl HttpFilter for TokenLimitFilterInstance {
         headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
-        // WP-54 increment 2: `GET /v1/usage` is intercepted here, before any
+        // `GET /v1/usage` is intercepted here, before any
         // budget check or bucket-key derivation, and never proxied upstream
         // -- see the module doc's usage-endpoint section. `Uri::path()`
         // deliberately excludes the query string, so `?tenant=B` (or
@@ -845,7 +844,7 @@ impl HttpFilter for TokenLimitFilterInstance {
                 retry_after,
             }) => {
                 self.key = Some(key);
-                // WP-24: this is the one place this filter actually REFUSES a
+                // This is the one place this filter actually REFUSES a
                 // request (as opposed to the fail-open paths above, which
                 // admit it) -- so it's the one place `RL` belongs. Set
                 // *before* `send_local_reply` so a `%RESPONSE_FLAGS%` logger
@@ -1146,7 +1145,7 @@ mod tests {
             self.stream_info.borrow_mut().llm.usage = Some(usage);
         }
 
-        /// Stand in for the WP-50 auth filter, which runs earlier in config
+        /// Stand in for the auth filter, which runs earlier in config
         /// order on the decode path and writes exactly this.
         fn set_authenticated_tenant(&self, tenant: &str) {
             self.stream_info.borrow_mut().auth.tenant = Some(tenant.to_string());
@@ -1375,7 +1374,7 @@ mod tests {
         assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "0");
     }
 
-    /// WP-24: a real 429 (driven through `decode_headers`, not a hand-built
+    /// A real 429 (driven through `decode_headers`, not a hand-built
     /// `StreamInfo`) must render `%RESPONSE_FLAGS%` as `RL` -- the defect
     /// this test exists to catch left this filter's own refusal
     /// indistinguishable in the access log from any other 429. Asserts
@@ -1765,7 +1764,7 @@ mod tests {
         cb.local_reply
     }
 
-    /// **The acceptance test for the WP-50 follow-up fix.** Two `create()`
+    /// **The acceptance test for the shared-singleton fix.** Two `create()`
     /// calls over ONE `FactoryContext` is exactly what two workers do: the
     /// HTTP filter chain (and therefore this factory) is rebuilt once per
     /// worker (ADR-0003), and every worker for one serve is handed the same
@@ -1862,10 +1861,10 @@ mod tests {
         );
     }
 
-    // --- WP-50: the bucket key is an assigned identity, not a client header ---
+    // --- the bucket key is an assigned identity, not a client header ---
 
     /// **This is the test that turns the rate limit from advisory into
-    /// enforceable, and it is the whole point of WP-50 increment 2a.**
+    /// enforceable, and it is the whole point of keying on the assigned identity.**
     ///
     /// Before the re-key, a caller who exhausted their budget changed their
     /// `authorization` header and got a fresh one — the bucket was derived
@@ -1905,7 +1904,7 @@ mod tests {
             "changing the `authorization` header must NOT buy a fresh budget once the \
              stream is authenticated -- the bucket keys on the tenant the proxy assigned, \
              not on anything the caller can choose. This is the enforcement property \
-             WP-50 increment 2a exists to deliver."
+             keying on the assigned identity exists to deliver."
         );
     }
 
@@ -1980,7 +1979,8 @@ mod tests {
     }
 
     /// With no auth filter in the chain there is no assigned identity to key
-    /// on, and the filter must keep working exactly as it did before WP-50
+    /// on, and the filter must keep working exactly as it did before keying on the
+    /// assigned identity
     /// rather than failing or bucketing everyone together.
     #[test]
     fn with_no_authenticated_tenant_the_filter_falls_back_to_the_hashed_credential() {
@@ -2099,7 +2099,7 @@ mod tests {
             _tenant: &str,
             _now: Instant,
         ) -> Result<Vec<TenantUsage>, BudgetUnavailable> {
-            // Doubles as the WP-54 increment 2 "store unavailable" stub --
+            // Doubles as the usage endpoint's "store unavailable" stub --
             // see `usage_endpoint_returns_503_when_the_budget_store_is_unavailable`.
             Err(BudgetUnavailable)
         }
@@ -2121,7 +2121,7 @@ mod tests {
         );
     }
 
-    // --- WP-54 increment 2: GET /v1/usage ------------------------------------
+    // --- GET /v1/usage ------------------------------------
 
     /// Drives ONLY `decode_headers` (the usage endpoint never reaches
     /// `encode_*` -- it terminates the request before any budget check),
@@ -2176,7 +2176,7 @@ mod tests {
     /// **Acceptance case 1**: an authenticated tenant with budgets on more
     /// than one route gets its own numbers back for every one of them, in
     /// deterministic (route-sorted) order — the multi-route case is the
-    /// whole reason `LimitKey` became a struct (increment 1); a
+    /// whole reason `LimitKey` became a struct ; a
     /// single-route test would not prove this.
     #[test]
     fn an_authenticated_tenant_reads_its_own_usage_across_multiple_routes() {
@@ -2317,7 +2317,7 @@ mod tests {
         );
     }
 
-    /// This is also the acceptance test for the plan's gating requirement
+    /// This is also the acceptance test for the gating requirement
     /// ("the endpoint never appears on a listener that has no `auth` block
     /// configured"): with no auth filter in the chain, `StreamInfo::auth.tenant`
     /// is structurally `None` (nothing ever writes it), so this filter's ONLY

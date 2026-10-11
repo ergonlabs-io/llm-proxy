@@ -1,4 +1,4 @@
-//! Internal representation (IR) of the proxy configuration — WP-05.
+//! Internal representation (IR) of the proxy configuration.
 //!
 //! The IR is the single most load-bearing API surface in the project: every
 //! lane codes against these types. It is built once per config update on the
@@ -16,10 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // Rust note: `FormatString` and `ResponseFlag` are re-exported from
-// `proxy-observability` rather than redefined here — WP-24's format engine
+// `proxy-observability` rather than redefined here — the format engine
 // (parser + renderer) lives there (see that crate's `access_log` module),
 // and the IR only needs to *hold* the already-parsed result, not know how to
-// build or render it (ground rule #2's spirit: keep the parsing/rendering
+// build or render it (AGENTS.md invariant 2's spirit: keep the parsing/rendering
 // logic in the crate that owns it).
 use proxy_observability::access_log::FormatString;
 #[cfg(unix)]
@@ -40,13 +40,13 @@ pub struct SnapshotVersion(pub u64);
 pub struct ConfigSnapshot {
     pub listeners: HashMap<ListenerName, Arc<ListenerConfig>>,
     pub clusters: HashMap<ClusterName, Arc<ClusterConfig>>,
-    /// RDS-delivered route tables (WP-21). Route tables inlined in an HCM live
+    /// RDS-delivered route tables. Route tables inlined in an HCM live
     /// on the [`HttpConnectionManagerConfig`] itself, not here.
     pub routes: HashMap<RouteConfigName, Arc<RouteTable>>,
     pub secrets: HashMap<SecretName, Arc<TlsSecret>>,
-    /// Admin endpoint bind address (WP-25), when configured.
+    /// Admin endpoint bind address, when configured.
     pub admin: Option<SocketAddr>,
-    /// OTLP trace export (WP-51 increment 3), when configured. `None` (the
+    /// OTLP trace export, when configured. `None` (the
     /// default) means tracing is off entirely -- no exporter runs, and no
     /// span is ever created, regardless of an inbound `traceparent`.
     ///
@@ -76,7 +76,7 @@ pub struct ConfigSnapshot {
     /// Presence is retained so an explicitly disabled namespace still conflicts
     /// with legacy capture CLI controls rather than silently choosing a mode.
     pub end_user_capture_configured: bool,
-    /// ADS transport configuration (WP-20), from bootstrap `dynamic_resources`.
+    /// ADS transport configuration, from bootstrap `dynamic_resources`.
     /// `None` -- the default, and every release through v0.2.0 -- means fully
     /// static configuration and no control-plane connection is ever attempted.
     ///
@@ -89,7 +89,7 @@ pub struct ConfigSnapshot {
 
 impl ConfigSnapshot {
     /// Build the snapshot that succeeds this one when xDS delivers a new set
-    /// of dynamic resources (WP-20 increment 4b-ii): everything that is not a
+    /// of dynamic resources: everything that is not a
     /// listener, cluster, or RDS route is carried forward from `self`
     /// unchanged, and those resource maps become `self`'s static entries plus
     /// the dynamic ones.
@@ -178,7 +178,7 @@ impl ConfigSnapshot {
 // -------------------------------------------------------------------- ads --
 
 /// How to reach the ADS control plane, lowered from bootstrap
-/// `dynamic_resources` (WP-20). Config surface only: nothing in this snapshot
+/// `dynamic_resources`. Config surface only: nothing in this snapshot
 /// dials anything, and the client that will is `proxy-xds`.
 ///
 /// v1 is deliberately narrow -- `api_type: GRPC|DELTA_GRPC`,
@@ -186,7 +186,7 @@ impl ConfigSnapshot {
 /// statically-defined cluster when any source uses ADS. LDS and CDS may also
 /// use filesystem sources independently.
 /// Every other member of `ApiConfigSource` is refused at load with its full
-/// dotted path rather than silently ignored (ground rule #1); see
+/// dotted path rather than silently ignored (AGENTS.md invariant 1); see
 /// `lower::convert_dynamic_resources`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdsConfig {
@@ -201,8 +201,8 @@ pub struct AdsConfig {
     /// Whether clusters arrive over the ADS channel (bootstrap `cds_config`
     /// with its `ads` field set).
     pub cds: bool,
-    /// S8 / WP-21's `initial_fetch_timeout`. Carried now so the config surface
-    /// is complete; WP-21 is what consumes it for warming.
+    /// S8 `initial_fetch_timeout`. Carried so the config surface is complete;
+    /// resource warming is what consumes it.
     pub initial_fetch_timeout: Option<Duration>,
     /// The xDS `Node` identity echoed on every `DiscoveryRequest` (S8).
     pub node: NodeIdentity,
@@ -235,7 +235,7 @@ pub struct NodeIdentity {
 
 // ---------------------------------------------------------------- tracing --
 
-/// OTLP trace-export configuration (WP-51 increment 3) -- config surface
+/// OTLP trace-export configuration -- config surface
 /// only. Nothing in the data plane consumes this yet; a later increment
 /// wires an actual exporter and starts minting/propagating spans. See
 /// `crates/proxy-config/tests/ir_readership.rs` for the allowlist entries
@@ -267,12 +267,11 @@ pub struct TracingConfig {
     /// Per-export deadline, applied as a `tokio::time::timeout` around each
     /// trace-batch export RPC. Default: 5s.
     ///
-    /// WP-51 increment 4 (review): the metric exporter got its deadline in the
-    /// same increment that split the two signals, and leaving traces without
-    /// one repeated, exactly, the hazard the split exists to prevent -- a
-    /// collector that accepts a connection and then goes silent parked the
-    /// trace exporter's `.await` forever, buffering every later batch and
-    /// filling the bounded sink behind it. Now neither signal can be stalled
+    /// The metric exporter has a deadline of its own, and leaving traces
+    /// without one would repeat, exactly, the hazard the split exists to
+    /// prevent -- a collector that accepts a connection and then goes silent
+    /// parks the trace exporter's `.await` forever, buffering every later
+    /// batch and filling the bounded sink behind it. So neither signal can be stalled
     /// indefinitely by the other's collector or its own. Bounded at lowering
     /// to `100ms..=60s` (the ceiling is
     /// `proxy_observability::otlp::TRACE_EXPORT_DEADLINE_MAX`, a multiple of
@@ -394,7 +393,7 @@ impl Default for TlsInspectorConfig {
 }
 
 /// One `filter_chains` entry: match criteria + transport socket + the network
-/// filters. Full 8-step matching lands with WP-07; the criteria live here.
+/// filters. The criteria live here.
 #[derive(Debug)]
 pub struct FilterChainSpec {
     pub name: Option<String>,
@@ -452,7 +451,7 @@ pub enum SourceType {
     External,
 }
 
-/// Full 9-criteria `FilterChainMatch` (WP-07). Field order mirrors Envoy's
+/// Full 9-criteria `FilterChainMatch`. Field order mirrors Envoy's
 /// matching precedence.
 #[derive(Debug, Default, PartialEq)]
 pub struct FilterChainMatch {
@@ -489,17 +488,17 @@ pub struct TcpProxyConfig {
     pub max_connect_attempts: u32,
 }
 
-/// WP-10: which HTTP codec the connection manager assumes for a downstream
+/// Which HTTP codec the connection manager assumes for a downstream
 /// connection, before any bytes have been read from it. Envoy's
 /// `HttpConnectionManager.codec_type`; `HTTP3` isn't representable here — this
 /// proxy has no QUIC/UDP listener, so lowering rejects it with its dotted
-/// path rather than adding a variant nothing can ever produce (ground rule
-/// #1 still applies to values with no implementation, not just unknown
+/// path rather than adding a variant nothing can ever produce (AGENTS.md invariant
+/// 1 still applies to values with no implementation, not just unknown
 /// fields).
 ///
 /// The dispatch that actually reads this lives in `proxy-core`'s listener
 /// (`terminal_filter`/`serve_connection`): `Auto` on a TLS connection defers
-/// to negotiated ALPN (unchanged since WP-10 chunk B); `Auto` on a plaintext
+/// to negotiated ALPN; `Auto` on a plaintext
 /// connection peeks the client connection preface (RFC 9113 §3.4) to tell h2
 /// prior-knowledge apart from h1; `Http1`/`Http2` skip detection entirely and
 /// assume the operator is right.
@@ -530,7 +529,7 @@ pub struct HttpConnectionManagerConfig {
     pub rds_route_config_name: Option<RouteConfigName>,
     /// Ordered HTTP filters; the last must be the router.
     pub http_filters: Vec<HttpFilterSpec>,
-    /// WP-10: which codec serves a downstream connection on this HCM. Envoy
+    /// Which codec serves a downstream connection on this HCM. Envoy
     /// default `AUTO`; see [`CodecType`]'s doc for the dispatch this drives.
     pub codec_type: CodecType,
     /// S9: generate an `x-request-id` when the request lacks one. Envoy
@@ -544,11 +543,10 @@ pub struct HttpConnectionManagerConfig {
     /// real client from an inbound XFF (only meaningful with
     /// use_remote_address=false). Envoy default: 0.
     pub xff_num_trusted_hops: u32,
-    /// WP-24 chunk 1: parsed access-log sinks, in configured order. Chunk 2
-    /// wires the actual per-request render + write; this crate only builds
-    /// the IR.
+    /// Parsed access-log sinks, in configured order. The per-request render
+    /// + write happens in the data plane; this crate only builds the IR.
     pub access_logs: Vec<AccessLogIR>,
-    /// S10 (WP-10): the upgrade types this HCM will proxy (`Upgrade:
+    /// S10: the upgrade types this HCM will proxy (`Upgrade:
     /// <type>` requests are tunnelled upstream). Empty = upgrades disabled
     /// (the Envoy default — no `upgrade_configs` means no upgrades). Each
     /// entry names a type and whether it is enabled by default; a route may
@@ -581,7 +579,7 @@ impl ListenerConfig {
     }
 }
 
-/// S10 (WP-10): one entry of an HCM's `upgrade_configs`. `upgrade_type` is
+/// S10: one entry of an HCM's `upgrade_configs`. `upgrade_type` is
 /// stored lowercased because Envoy matches it case-insensitively against the
 /// request's `Upgrade` header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,7 +610,7 @@ pub struct AccessLogIR {
 /// writes the destination, and `proxy-config` depends on it (never the
 /// reverse). Defining a same-shaped twin here instead would mean a new sink
 /// variant could be added on one side and silently not exist on the other,
-/// which is exactly the class of drift ground rule #1 exists to prevent.
+/// which is exactly the class of drift AGENTS.md invariant 1 exists to prevent.
 pub use proxy_observability::sink::AccessLogSink;
 
 /// A logger's `log_format`, pre-parsed at config time (never re-parsed per
@@ -650,7 +648,7 @@ pub const DEFAULT_ACCESS_LOG_FORMAT: &str = concat!(
 /// header match, and/and, gRPC status, metadata, ...); only the two
 /// operators reachable with what the proxy records today are implemented —
 /// anything else is a strict-mode config error naming its dotted path
-/// (ground rule #1), not a silent no-op filter.
+/// (AGENTS.md invariant 1), not a silent no-op filter.
 #[derive(Debug, Clone)]
 pub enum AccessLogFilterIR {
     StatusCode {
@@ -673,7 +671,7 @@ pub enum ComparisonOp {
 
 /// One entry of Envoy's `typed_per_filter_config` map: a per-route override
 /// for a single HTTP filter, left undecoded for the same reason
-/// [`HttpFilterSpec::config`] is (ground rule #2 -- the `proxy-http` registry
+/// [`HttpFilterSpec::config`] is (AGENTS.md invariant 2 -- the `proxy-http` registry
 /// owns per-filter parsing, not the IR).
 #[derive(Debug)]
 pub struct PerFilterConfig {
@@ -697,7 +695,7 @@ pub struct PerFilterConfig {
 /// decoded into a filter-specific IR type here — `proxy-config` doesn't know
 /// what any given filter's config shape means; that's `HttpFilterFactory`'s
 /// job (`proxy-http`), which is why `create` takes a `&DynamicMessage`
-/// directly (ground rule #2: the registry, not the IR, owns per-filter
+/// directly (AGENTS.md invariant 2: the registry, not the IR, owns per-filter
 /// parsing).
 #[derive(Debug)]
 pub struct HttpFilterSpec {
@@ -730,7 +728,7 @@ pub struct RequestPathRewrite {
 
 /// IR for `envoy.config.cluster.v3.Cluster` (supported surface).
 ///
-/// `PartialEq` (WP-59 increment 2) is a derive over every field, not a
+/// `PartialEq` is a derive over every field, not a
 /// hand-written comparison — `ClusterManager::update_from_snapshot` uses it
 /// to decide whether an incoming cluster's config actually changed, and a
 /// hand-written `eq` that skipped a field would silently treat a real change
@@ -748,7 +746,7 @@ pub struct ClusterConfig {
     /// Whether this cluster owns its own hosts ([`ClusterKind::Endpoints`],
     /// the common case) or is an [`envoy.clusters.aggregate`][agg] that
     /// serves its members' hosts instead ([`ClusterKind::Aggregate`],
-    /// WP-35 provider fallback).
+    /// provider fallback).
     ///
     /// [agg]: https://www.envoyproxy.io/docs/envoy/latest/configuration/upstream/cluster_manager/cluster_runtime#aggregate-cluster
     ///
@@ -777,7 +775,7 @@ pub struct ClusterConfig {
     /// attempt actually dialed — applied to the per-attempt head inside the
     /// router's retry loop, never once up front.
     ///
-    /// **This is where provider credentials belong, and the reason is WP-35.**
+    /// **This is where provider credentials belong, and the reason is provider fallback.**
     /// The dialect originally injected the API key, `anthropic-version`, and
     /// `extra_headers` through [`RouteEntry::request_headers_to_add`], which is
     /// resolved once when the route matches. That is correct only while a
@@ -797,7 +795,7 @@ pub struct ClusterConfig {
     /// shares one identity. LLM providers are the heterogeneous case. So this
     /// field stays empty under Envoy-mode config (no Envoy config expresses
     /// per-provider auth, so none is rejected for lacking it) and is populated
-    /// only by the `llmproxy` dialect. Ground rule #1 governs config → IR, not
+    /// only by the `llmproxy` dialect. AGENTS.md invariant 1 governs config → IR, not
     /// IR → Envoy proto, so an IR concept with no proto source violates
     /// nothing — the IR is a semantic model, not a proto mirror (compare
     /// [`UpstreamProtocol`], which flattens `typed_extension_protocol_options`).
@@ -816,17 +814,17 @@ pub struct ClusterConfig {
     /// different upstream.
     pub provider_runtime: Option<ProviderRuntimeConfig>,
     /// Which wire dialect this cluster's upstream speaks, for the usage
-    /// filter's token accounting -- ground rule #6's third instance (see
-    /// `AGENTS.md invariant 6`), following credentials (`request_headers_to_add`) and
+    /// filter's token accounting -- a known instance of AGENTS.md invariant 6,
+    /// alongside credentials (`request_headers_to_add`) and
     /// `host_rewrite_literal`. The dialect is a property of the *provider
     /// actually dialled*, not of the route that picked an aggregate; the
-    /// route still carries its own `typed_per_filter_config` copy today
-    /// (increment 1, additive only), but a value that varies per provider
+    /// route still carries its own `typed_per_filter_config` copy today,
+    /// but a value that varies per provider
     /// and lives on the route follows the routing decision instead of the
     /// connection, and reaches the wrong provider on failover -- exactly the
     /// credentials and `Host` bugs, just for token accounting instead of
     /// secrecy or connection identity. The usage filter does not read this
-    /// field yet (WP-35 increment 2 plumbs it through); until then it rides
+    /// field yet; until then it rides
     /// along unused, same as `request_headers_to_add` did before the router
     /// grew retries.
     ///
@@ -838,14 +836,14 @@ pub struct ClusterConfig {
     /// `convert_cluster`), so the member that actually serves a request is
     /// the one that must carry it.
     pub usage_dialect: Option<UsageDialect>,
-    /// S6 active health checking (WP-18); `None` when the config configures
+    /// S6 active health checking; `None` when the config configures
     /// none, which is Envoy's own default (no probing, every host healthy).
     /// Singular though the proto field is repeated — see [`HealthCheckIR`].
     pub health_check: Option<HealthCheckIR>,
-    /// S6 passive outlier detection (WP-19); `None` when the config configures
+    /// S6 passive outlier detection; `None` when the config configures
     /// none, which is Envoy's own default (no passive ejection at all — every
     /// host stays eligible regardless of the error rate it's returning).
-    /// Shape-only as of WP-19 part 1: nothing in `proxy-cluster` builds an
+    /// Shape-only: nothing in `proxy-cluster` builds an
     /// [`crate::ir::OutlierDetectionIR`]-backed detector from this field yet
     /// (see `crates/proxy-config/tests/ir_readership.rs`'s allowlist entry).
     pub outlier_detection: Option<OutlierDetectionIR>,
@@ -855,16 +853,16 @@ pub struct ClusterConfig {
     /// discovery type, including `Aggregate` -- an aggregate has no
     /// discovery mechanism of its own (see `kind`'s doc).
     ///
-    /// WP-21 increment 1 only lowers and validates this shape; nothing
-    /// subscribes to EDS or applies an endpoint update yet, so `endpoints`
+    /// Lowering only validates this shape; nothing here
+    /// subscribes to EDS or applies an endpoint update, so `endpoints`
     /// stays empty on an EDS cluster the same way it does on an aggregate --
     /// see `crates/proxy-config/tests/ir_readership.rs`'s allowlist entry for
-    /// which increment reads it.
+    /// who reads it.
     pub eds: Option<EdsClusterConfig>,
 }
 
 /// IR for `envoy.config.cluster.v3.Cluster.EdsClusterConfig` (supported
-/// surface) -- WP-21 increment 1.
+/// surface).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdsClusterConfig {
     /// The resource name to subscribe to. Envoy defaults this to the
@@ -877,12 +875,12 @@ pub struct EdsClusterConfig {
 
 // ---------------------------------------------------------- health checks --
 
-/// IR for `envoy.config.core.v3.HealthCheck` (supported surface) — WP-18.
+/// IR for `envoy.config.core.v3.HealthCheck` (supported surface).
 ///
 /// Envoy's `Cluster.health_checks` is *repeated*, and a host must pass every
 /// configured check. Only one check per cluster is implemented, so lowering
 /// rejects a config carrying more than one rather than silently running the
-/// first (ground rule #1).
+/// first (AGENTS.md invariant 1).
 ///
 /// Envoy marks `timeout`, `interval`, `unhealthy_threshold` and
 /// `healthy_threshold` required in its own PGV rules, so none of the four has
@@ -930,8 +928,8 @@ pub enum HealthCheckKindIR {
 
 // ------------------------------------------------------- outlier detection --
 
-/// IR for `envoy.config.cluster.v3.OutlierDetection` (supported surface) —
-/// WP-19. Mirrors `proxy_cluster::outlier::OutlierDetectionConfig` field for
+/// IR for `envoy.config.cluster.v3.OutlierDetection` (supported surface).
+/// Mirrors `proxy_cluster::outlier::OutlierDetectionConfig` field for
 /// field; see that type's doc for the full S6 semantics (edge-triggered
 /// counters, the gateway-failure/5xx interaction, enforcement-percent dice
 /// roll). Every field here is commented with its S6 default, duplicated from
@@ -948,8 +946,8 @@ pub enum HealthCheckKindIR {
 ///   Only `false` (Envoy's own default) is implemented anywhere in this
 ///   project — see `OutlierDetectionConfig::split_external_local_origin_errors`'s
 ///   doc — so lowering rejects `true` outright with its dotted path rather
-///   than accepting a field the IR would then silently ignore (ground rule
-///   #1's exact shape: accepted-but-inert is still a P0).
+///   than accepting a field the IR would then silently ignore (AGENTS.md invariant
+///   1's exact shape: accepted-but-inert is still a P0).
 /// - `uneject_on_healthy_active_hc` maps a real Envoy field,
 ///   `successful_active_health_check_uneject_host` (field 23, a `BoolValue`
 ///   defaulting to true) — `OutlierDetectionConfig`'s own doc comment used to
@@ -1022,8 +1020,7 @@ pub struct OutlierDetectionIR {
     /// for failure-percentage detection. S6 default: 50.
     pub failure_percentage_request_volume: u32,
 
-    /// Whether a host un-ejects the moment it passes an active health check
-    /// (WP-18), independent of its outlier ejection timer. S6 default: true
+    /// Whether a host un-ejects the moment it passes an active health check, independent of its outlier ejection timer. S6 default: true
     /// — maps `successful_active_health_check_uneject_host`
     /// (`envoy.config.cluster.v3.OutlierDetection`, field 23).
     pub uneject_on_healthy_active_hc: bool,
@@ -1173,16 +1170,16 @@ impl Default for CircuitBreakers {
 pub enum DiscoveryType {
     /// Endpoints are literal IPs.
     Static,
-    /// DNS-resolve every returned address (WP-16).
+    /// DNS-resolve every returned address.
     StrictDns,
-    /// DNS-resolve, use one address at a time (WP-16).
+    /// DNS-resolve, use one address at a time.
     LogicalDns,
     /// Endpoints arrive over EDS rather than from the cluster's own
     /// `endpoints` list -- `ClusterConfig::endpoints` is always empty for a
     /// cluster with this discovery type (`lower.rs::convert_cluster` rejects
-    /// a non-empty `load_assignment` alongside `type: EDS`). WP-21 owns the
-    /// subscription that will actually deliver a host set for these: this
-    /// increment (1) only makes the config surface loadable, not live.
+    /// a non-empty `load_assignment` alongside `type: EDS`). The EDS
+    /// subscription is what delivers a host set for these; lowering only
+    /// makes the config surface loadable.
     Eds,
 }
 
@@ -1191,9 +1188,8 @@ pub enum DiscoveryType {
 /// variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterKind {
-    /// Hosts come from this cluster's own `endpoints` + `discovery`. Every
-    /// cluster before WP-35 increment 2a, and still the overwhelming common
-    /// case.
+    /// Hosts come from this cluster's own `endpoints` + `discovery`. The
+    /// overwhelming common case.
     Endpoints,
     /// `envoy.clusters.aggregate`: this cluster has no hosts of its own.
     /// Host selection walks `members`, in the order listed, and serves the
@@ -1202,7 +1198,7 @@ pub enum ClusterKind {
     /// the exact algorithm (including how it deliberately diverges from
     /// Envoy's own cross-member combined priority set).
     ///
-    /// This exists for WP-35 provider fallback: one route target (the
+    /// This exists for provider fallback: one route target (the
     /// aggregate) whose members are different LLM providers, each with its
     /// own TLS and credentials (`ClusterConfig::request_headers_to_add`) --
     /// a retried attempt that falls over to the next member must carry that
@@ -1210,8 +1206,8 @@ pub enum ClusterKind {
     ///
     /// `endpoints`, `discovery`, `transport_socket`, and `upstream_protocol`
     /// are all unused on a `ClusterConfig` whose `kind` is `Aggregate` -- the
-    /// member that actually serves the request supplies all four. Ground
-    /// rule #1 ("every field maps to IR or errors") does not apply to these
+    /// member that actually serves the request supplies all four. AGENTS.md
+    /// invariant 1 ("every field maps to IR or errors") does not apply to these
     /// four staying unread here: they simply don't apply to an aggregate,
     /// the same way `endpoints` doesn't apply to an EDS cluster.
     Aggregate {
@@ -1242,9 +1238,8 @@ pub enum LbPolicy {
 }
 
 /// An upstream endpoint. `host` must be a literal IP for STATIC clusters (see
-/// `lower.rs::convert_endpoint`) and for EDS-delivered endpoints (WP-21
-/// increment 2b-i: `discovery::static_hosts` installs those without resolving
-/// them); it may be a DNS name for the DNS discovery types, where resolution
+/// `lower.rs::convert_endpoint`) and for EDS-delivered endpoints
+/// (`discovery::static_hosts` installs those without resolving them); it may be a DNS name for the DNS discovery types, where resolution
 /// is the cluster manager's job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointIR {
@@ -1254,7 +1249,7 @@ pub struct EndpointIR {
     pub weight: u32,
     /// Failover priority; 0 = primary (S5/S7).
     pub priority: u32,
-    /// WP-56: operator-facing labels for this endpoint, lowered from
+    /// Operator-facing labels for this endpoint, lowered from
     /// `LbEndpoint.metadata.filter_metadata["io.llmproxy.endpoint"]` -- the
     /// same `filter_metadata` smuggling channel `ClusterConfig`'s
     /// `request_headers_to_add` and `usage_dialect` already use, under an
@@ -1266,7 +1261,7 @@ pub struct EndpointIR {
     /// proxy does not implement. Lowering therefore REFUSES `envoy.lb` (and
     /// every other namespace) by dotted path rather than accepting it into
     /// this map: quietly taking a subset-routing selector and then not
-    /// routing on it is ground rule #1's exact shape, and it would silently
+    /// routing on it is AGENTS.md invariant 1's exact shape, and it would silently
     /// send traffic to endpoints the operator meant to exclude.
     ///
     /// `BTreeMap` rather than `HashMap` so `/config_dump` and test assertions
@@ -1402,7 +1397,7 @@ pub struct VirtualHostIR {
     pub name: String,
     /// Original domain strings, as configured (for `/config_dump`).
     pub domains: Vec<String>,
-    /// Ordered routes; first match wins (S1) — evaluated by WP-12.
+    /// Ordered routes; first match wins (S1).
     ///
     /// Rust note: `Arc<RouteEntry>`, not a bare `RouteEntry` — the S2.8 route
     /// cache (`DecoderCallbacks::route`, in `proxy-http`'s frozen filter API)
@@ -1532,7 +1527,7 @@ pub struct ForwardAction {
 #[derive(Debug)]
 pub enum ForwardTarget {
     Cluster(ClusterName),
-    /// Cluster name read from a request header (set by e.g. the WP-35 model
+    /// Cluster name read from a request header (set by e.g. the model
     /// router).
     ClusterHeader(String),
     Weighted(WeightedClusters),
@@ -1558,7 +1553,7 @@ impl WeightedClusters {
 }
 
 /// S3 retry policy. Defaults follow Envoy: `num_retries` 1, fully-jittered
-/// exponential backoff (base 25ms, cap 250ms) — timing lives in WP-14.
+/// exponential backoff (base 25ms, cap 250ms) — timing lives in the router.
 #[derive(Debug, Default)]
 pub struct RetryPolicyIR {
     pub retry_on: RetryOn,
@@ -1676,7 +1671,7 @@ pub enum HeaderAppendAction {
 
 // ----------------------------------------------------------------- tls/misc --
 
-/// Downstream TLS termination config for a filter chain (WP-08).
+/// Downstream TLS termination config for a filter chain.
 ///
 /// Field-presence semantics follow Envoy v1.38's `DownstreamTlsContext`:
 /// anything the lowering can't honor errors at config load with its dotted
@@ -1693,7 +1688,7 @@ pub struct DownstreamTlsSpec {
     /// struct.
     pub certificates: Vec<TlsCertificateIR>,
     /// `CommonTlsContext.tls_certificate_sds_secret_configs` names, in
-    /// declaration order (WP-22 increment 2). Non-empty means the serving
+    /// declaration order. Non-empty means the serving
     /// certificates arrive over SDS and the listener binds with an EMPTY
     /// cert set: it accepts TCP and fails every TLS handshake until the
     /// control plane delivers, rather than serving in the clear.
@@ -1701,7 +1696,7 @@ pub struct DownstreamTlsSpec {
     /// **Divergence from Envoy, deliberate.** Envoy documents
     /// `tls_certificate_sds_secret_configs` as *ignored* when
     /// `tls_certificates` is also set. Silently ignoring a set field is
-    /// exactly what ground rule #1 forbids, so lowering rejects the mixed
+    /// exactly what AGENTS.md invariant 1 forbids, so lowering rejects the mixed
     /// case with its dotted path instead of applying Envoy's precedence.
     /// Recorded in `internal-docs/envoy-divergences.md`.
     ///
@@ -1736,7 +1731,7 @@ pub struct DownstreamTlsSpec {
     pub disable_stateless_session_resumption: bool,
 }
 
-/// Upstream TLS origination config for a cluster (WP-08).
+/// Upstream TLS origination config for a cluster.
 #[derive(Debug, PartialEq)]
 pub struct UpstreamTlsSpec {
     pub sni: Option<String>,
@@ -1761,7 +1756,7 @@ pub struct TlsCertificateIR {
 ///
 /// This is configuration IR rather than xDS-client state: the discovery
 /// transport decodes it, while the TLS serving layer consumes it. Keeping the
-/// payload here prevents either layer from depending on the other (WP-22).
+/// payload here prevents either layer from depending on the other.
 #[derive(Debug, Clone)]
 pub struct DynamicSecret {
     /// `Secret.name` -- what an `SdsSecretConfig.name` subscribes to.
@@ -1784,8 +1779,8 @@ pub enum SecretKind {
 impl DynamicSecret {
     /// Convert a certificate secret into the TLS IR the serving registry
     /// consumes. A validation-context secret has no certificate material and
-    /// therefore returns `None`; its trust-anchor delivery is WP-22
-    /// increment 2c's distinct update path.
+    /// therefore returns `None`; its trust-anchor delivery goes
+    /// through a distinct update path.
     ///
     /// SDS carries certificate bytes inline. They must be UTF-8 PEM so the
     /// existing `DataSourceIR::Inline` TLS loader can consume them; invalid
@@ -1945,7 +1940,7 @@ pub enum StringMatcherIR {
 }
 
 /// Hand-written, not derived — `regex::Regex` itself has no `PartialEq`
-/// (WP-59 increment 2 needs this for `ValidationContextIR`'s `san_matchers`,
+/// (`ValidationContextIR`'s `san_matchers` need this,
 /// pulled in through `ClusterConfig::transport_socket`). This does not skip
 /// any field the way `apply.rs`'s `Entry<T>` comparison does: `compile_regex`
 /// (`lower.rs`) is a pure function of the pattern string (`^(?:{pattern})$`,
@@ -2102,7 +2097,7 @@ pub struct ProviderRuntimeConfig {
 }
 
 /// A validated TLS certificate/validation-context secret (static or
-/// SDS-delivered). Populated by WP-08/WP-22.
+/// SDS-delivered).
 #[derive(Debug)]
 pub struct TlsSecret {
     pub name: SecretName,

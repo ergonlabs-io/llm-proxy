@@ -11,7 +11,7 @@
 //! opaque `prefix/full.type.name` string, and only the suffix has to resolve
 //! against the descriptor pool (see `proxy-config::lower::decode_http_filter_config`),
 //! so pointing our `type.llmproxy.dev` prefix at that existing message name is
-//! legal, if a little unusual. A real Lane-H filter would get its own vendored
+//! legal, if a little unusual. A real `llmproxy.*` filter would get its own vendored
 //! proto; this one is deliberately the smallest thing that proves the path.
 
 use std::sync::Arc;

@@ -1,8 +1,8 @@
-//! Compiled TLS transport sockets (WP-08 chunks B1+B2): builds `rustls`
-//! `ServerConfig`/`ClientConfig` straight from the WP-08 chunk A IR
+//! Compiled TLS transport sockets: builds `rustls`
+//! `ServerConfig`/`ClientConfig` straight from the IR
 //! (`DownstreamTlsSpec`/`UpstreamTlsSpec`), one factory per filter chain /
-//! cluster. This module never sees Envoy protos -- ground rule #2 -- and
-//! never silently drops a configured field -- ground rule #1: every
+//! cluster. This module never sees Envoy protos -- AGENTS.md invariant 2 -- and
+//! never silently drops a configured field -- AGENTS.md invariant 1: every
 //! `ValidationContextIR` field (`ca`, `san_matchers`,
 //! `allow_expired_certificate`) is honored by the verifiers in [`verify`].
 //!
@@ -46,7 +46,7 @@ use verify::{
 };
 
 /// Error building a TLS factory from IR. `context` is caller-supplied (e.g.
-/// `listener 'x' filter_chains[0]`) -- ground rule #1's "where" for the parts
+/// `listener 'x' filter_chains[0]`) -- AGENTS.md invariant 1's "where" for the parts
 /// of config-loading that happen after IR conversion, at socket build time.
 #[derive(Debug, thiserror::Error)]
 #[error("TLS config error in {context}: {reason}")]
@@ -181,7 +181,7 @@ fn build_root_store(ca: &CaSource, context: &str) -> Result<RootCertStore, TlsBu
             }
             // Envoy/BoringSSL fail on malformed entries in an explicit CA
             // bundle; silently dropping some of a configured trust anchor set
-            // is exactly the degradation ground rule #1 forbids. (System
+            // is exactly the degradation AGENTS.md invariant 1 forbids. (System
             // roots below are different: platform stores routinely contain
             // entries webpki can't parse, and skipping those matches how
             // every TLS stack consumes them.)
@@ -239,7 +239,7 @@ pub struct DownstreamTlsFactory {
 impl DownstreamTlsFactory {
     pub fn build(spec: &DownstreamTlsSpec, context: &str) -> Result<Self, TlsBuildError> {
         let provider = Arc::new(build_crypto_provider(&spec.params));
-        // WP-22 increment 2a: an SDS-named chain binds with an EMPTY cert set
+        // An SDS-named chain binds with an EMPTY cert set
         // rather than refusing to build. `SwapCertResolver::resolve` answers
         // `None` for that set, so the listener accepts TCP and fails every TLS
         // handshake until the control plane delivers -- never serving in the
@@ -350,7 +350,7 @@ impl DownstreamTlsFactory {
     }
 
     /// Hot-swap the serving certificates without rebuilding the
-    /// `ServerConfig` -- the ArcSwap resolver seam SDS (WP-22) drives.
+    /// `ServerConfig` -- the ArcSwap resolver seam SDS drives.
     pub fn update_certificates(
         &self,
         certs: &[TlsCertificateIR],

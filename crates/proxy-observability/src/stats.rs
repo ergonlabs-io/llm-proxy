@@ -4,8 +4,7 @@
 //! resolution survive a config swap. Pure library: no HTTP, no `/stats`
 //! rendering, no Prometheus, no instrumentation call sites — rendering lives in
 //! `envoy_render` (this crate), and call sites live in the crates that own the
-//! request path (`internal-docs/IMPLEMENTATION_PLAN.md`, which is normative for
-//! every decision below).
+//! request path. The numbered decisions below are normative for this module.
 //!
 //! # Decision 1 — the hot path increments an index, not a name
 //!
@@ -73,8 +72,7 @@
 //! moment it is shared. Handles could only ever be resolved at boot, and a
 //! config swap that introduced a new cluster could never register its
 //! counters — the new cluster would serve traffic and report nothing,
-//! silently, forever. See `internal-docs/IMPLEMENTATION_PLAN.md`'s "Correction,
-//! 2026-08-09" section for the full argument.
+//! silently, forever.
 //!
 //! The fix keeps the compile-time guarantee, but moves it from a *receiver*
 //! split (`&mut self` vs `&self`) to a *type* split:
@@ -185,9 +183,21 @@
 //! Stats are *not* shared across replicas — each replica reports its own
 //! counters and the time-series database sums them, same as any Prometheus
 //! deployment. What ADR-0005 actually asks for here is the *intra-process*
-//! aggregation above (across workers, not across replicas); see the design
-//! brief's Decision 3 for the full argument against forcing a `StatsStore`
-//! trait onto this subsystem.
+//! aggregation above (across workers, not across replicas). A replica-shared
+//! `StatsStore` would produce numbers no one could attribute, break `rate()`
+//! on restart, and add a network dependency to a scrape, so no such trait is
+//! forced onto this subsystem; the trait-shaped seam is the exporter.
+//!
+//! # Decision 4 — Envoy names are rendered, and the mapping is not one-to-one
+//!
+//! The model is OTel-first; `/stats` is a rendering layer (`envoy_render`) with
+//! its own conformance tests. (1) One OTel instrument can render to several
+//! Envoy names, because Envoy's `upstream_rq_2xx`..`5xx` are separate stats
+//! while OTel has one counter with a `status_class` attribute. (2) Some
+//! instruments render to nothing: `llm.*` has no Envoy equivalent, and a name
+//! Envoy never had is not compatibility, so it appears in Prometheus and OTLP
+//! output only. (3) Envoy's label mangling is lossy, so the adapter may lose
+//! information on the way out but is never the source of truth.
 //!
 //! # Decision 5 — the semconv version is pinned in code
 //!
@@ -414,7 +424,7 @@ pub struct Instrument {
 /// A small starter set of instruments — enough to exercise the resolve/incr/
 /// value/observe model end to end, not the full Envoy stats surface. Named
 /// `instruments` so call sites read as
-/// `instruments::UPSTREAM_RQ`, matching the design brief's own examples.
+/// `instruments::UPSTREAM_RQ`, matching the examples in the module doc.
 pub mod instruments {
     use super::{
         Instrument, InstrumentKind, ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS,
@@ -427,7 +437,7 @@ pub mod instruments {
     /// semantic-conventions name — OTel has no generic "request count"
     /// counter (`http.client.request.duration`'s histogram implies a count,
     /// but does not name one). The name mirrors Envoy's own `upstream_rq`
-    /// stat family directly (see the design brief, Decision 4) so the
+    /// stat family directly (module doc, Decision 4) so the
     /// `/stats` renderer has an obvious mapping:
     /// `cluster.<name>.upstream_rq_total`.
     pub const UPSTREAM_RQ: Instrument = Instrument {
@@ -454,7 +464,7 @@ pub mod instruments {
     /// Tokens consumed by a GenAI request/response exchange. **Has no Envoy
     /// equivalent** — Envoy predates LLM gateways — so this renders to
     /// nothing in the `/stats` text output; it exists in
-    /// Prometheus/OTLP output only (design brief, Decision 4, point 2).
+    /// Prometheus/OTLP output only (module doc, Decision 4, point 2).
     ///
     /// This is deliberately our own `llm.*` name, not the
     /// OTel GenAI semconv name for the equivalent instrument. Semconv's
@@ -476,14 +486,13 @@ pub mod instruments {
     /// its own bucket boundaries (OTel doesn't mandate Envoy's millisecond
     /// `rq_time` set for a token count) and is a call for later, not this
     /// one's. Keeping it a `Counter` here avoids guessing at that number
-    /// now. Attribute keys (`provider`, `type`) match the design brief's own
-    /// table rather than semconv's fully qualified attribute names; the
+    /// now. Attribute keys (`provider`, `type`) are our own short names
+    /// rather than semconv's fully qualified attribute names; the
     /// Prometheus renderer is where full key names matter.
     ///
     /// `tenant` is the third attribute key, added so operators can
     /// build per-tenant usage dashboards over OTel export (the owner's
-    /// (a)-export-only decision — see `internal-docs/IMPLEMENTATION_PLAN.md`
-    /// WP-55 — this proxy never owns a usage datastore). Named `tenant`, not
+    /// export-only decision: this proxy never owns a usage datastore). Named `tenant`, not
     /// `gen_ai.*` anything: there is no upstream semconv attribute for this
     /// at all (semconv has no multi-tenancy concept), so there is no
     /// borrowed name to get wrong the way `llm.*` vs `gen_ai.*` was for the
@@ -558,8 +567,8 @@ pub mod instruments {
 
     /// Upstream request duration, per cluster, in **milliseconds**.
     ///
-    /// Mirrors Envoy's own `upstream_rq_time` stat family directly (see the
-    /// design brief, Decision 4), carrying Envoy's default `rq_time` bucket
+    /// Mirrors Envoy's own `upstream_rq_time` stat family directly (module
+    /// doc, Decision 4), carrying Envoy's default `rq_time` bucket
     /// boundaries so the `/stats` renderer's percentile output
     /// (`cluster.<name>.upstream_rq_time` P50/P90/P99/...) matches what
     /// Envoy itself would report for the same distribution. See the module
@@ -2391,13 +2400,13 @@ mod tests {
             registry.value(fresh),
             7,
             "a handle resolved AFTER the registry was already shared with a worker must work \
-             -- this is the exact case increment 5 exists to fix"
+             -- this is the case the `Registry`/`StatsControl` split exists to fix"
         );
     }
 
     // ---- 17: no lost increments across growth ------------------------------
 
-    /// Pins the design brief's explicitly REJECTED alternative as wrong:
+    /// Pins a REJECTED alternative as wrong:
     /// rebuilding the registry and copying counter VALUES across loses any
     /// increment landing between the read and the swap -- a metrics bug
     /// that would show up as a dip in `rate()` at every config reload. A

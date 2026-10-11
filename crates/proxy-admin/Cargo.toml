@@ -8,7 +8,7 @@ license.workspace = true
 proxy-config = { workspace = true }
 proxy-core = { workspace = true }
 proxy-observability = { workspace = true }
-# WP-50 increment 3b-ii, W4: the admin write API mints/revokes keys and
+# The admin write API mints/revokes keys and
 # edits tenant policy through `proxy_filters::control::ControlPlane` -- the
 # one type that owns the store and republishes its snapshot.
 proxy-filters = { workspace = true }

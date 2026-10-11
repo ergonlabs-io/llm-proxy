@@ -1,4 +1,4 @@
-//! WP-20 increment 4b-ii acceptance tests: driving [`ResourceApplier`] with
+//! Acceptance tests: driving [`ResourceApplier`] with
 //! hand-built `DiscoveryResponse`s directly -- no socket, no `controlplane`
 //! harness. This is the apply layer, not the transport; `client.rs`'s own
 //! tests already cover pumping a real stream.
@@ -669,7 +669,7 @@ async fn resending_an_identical_cluster_set_publishes_nothing_and_does_not_bump_
 /// Without this, an `Entry::eq` that always answered `true` -- the exact
 /// shape a careless edit to that hand-written impl produces -- would classify
 /// every re-delivery as `unchanged`, and a control plane moving a cluster to
-/// a new endpoint would be **silently ignored**. That is ground rule 1's
+/// a new endpoint would be **silently ignored**. That is AGENTS.md invariant 1's
 /// failure mode arriving over the wire instead of from a file, and every
 /// other test in this file passes while it happens.
 #[tokio::test]
@@ -988,7 +988,7 @@ async fn a_cds_full_state_response_does_not_remove_a_previously_published_listen
 
 // ------------------------------------------------------------ ResponseHandler --
 
-/// WP-20 increment 4d-i: `ResourceApplier` no longer needs an `into_validator`
+/// `ResourceApplier` no longer needs an `into_validator`
 /// adapter to reach the ADS client -- it IS a [`ResponseHandler`] directly.
 /// This is the replacement for the old `into_validator` test: the same claim
 /// ("the seam gives back exactly what `on_response` would"), now through
@@ -1012,8 +1012,8 @@ async fn resource_applier_is_a_response_handler_returning_the_same_verdict_as_on
 
 /// A valid EDS response reaches the sink with the right
 /// `(cluster_name, endpoints)` -- here the resource name and the cluster name
-/// happen to match, which is the common case; the mismatched-name case (the
-/// Part 1 regression) has its own test below.
+/// happen to match, which is the common case; the mismatched-name case has its
+/// own test below.
 #[tokio::test]
 async fn a_valid_eds_response_reaches_the_sink_with_the_right_name_and_endpoints() {
     let base = base_with_static_eds_cluster("my-cluster", "my-cluster");
@@ -1040,9 +1040,8 @@ async fn a_valid_eds_response_reaches_the_sink_with_the_right_name_and_endpoints
 /// (`ClusterLoadAssignment.cluster_name`) differs from the `Cluster.name` that
 /// subscribes to it via `eds_cluster_config.service_name` -- Envoy allows
 /// this. The sink must be called with the CLUSTER's name, never the resource
-/// name passed straight through. Against the code as it landed in increment
-/// 2b-ii (which called the sink with the assignment's own `cluster_name`),
-/// this fails: the sink is never called at all, because nothing in
+/// name passed straight through. Against a version that called the sink with
+/// the assignment's own `cluster_name`, this fails: the sink is never called at all, because nothing in
 /// `empty_base()` is named `eds-resource-name`, or -- had the bug instead
 /// been "call the sink with the resource name regardless of any cluster" --
 /// it would have called the sink under the wrong name.
@@ -1195,8 +1194,8 @@ async fn an_eds_response_with_a_resource_that_fails_to_lower_is_rejected_without
 /// (`SotwSet::forget` on a failed name), `apply` already recorded the first
 /// attempt, the second identical response would compare `unchanged`, and the
 /// sink would never be called again -- a resource stuck permanently
-/// uninstalled while the store reports it fine. This is the deliverable this
-/// increment's brief names explicitly.
+/// uninstalled while the store reports it fine. This is the regression the
+/// mismatched-name rule exists to prevent.
 #[tokio::test]
 async fn a_sink_that_fails_once_is_retried_on_the_next_identical_response() {
     let base = base_with_static_eds_cluster("my-cluster", "my-cluster");
@@ -1232,7 +1231,7 @@ async fn a_sink_that_fails_once_is_retried_on_the_next_identical_response() {
 
 /// An EDS response arriving before `with_endpoint_sink` is ever called is
 /// refused by name, not silently ignored, and names that this applier has no
-/// sink wired rather than blaming an unimplemented increment.
+/// sink wired rather than blaming an unimplemented feature.
 #[tokio::test]
 async fn an_eds_response_with_no_sink_wired_is_rejected_naming_the_reason() {
     let (publish, _published) = recording_publisher();
@@ -1267,7 +1266,7 @@ async fn eds_resource_names_picks_up_a_static_eds_clusters_service_name() {
 }
 
 // -------------------------------------------------------------------------
-// WP-22 increment 2a: SDS names its subscription from the listeners it holds.
+// SDS names its subscription from the listeners it holds.
 
 /// An `SdsSecretConfig` naming `secret` over ADS -- the only form lowering
 /// accepts (a name-only entry would mean `static_resources.secrets`, which is
@@ -1348,8 +1347,8 @@ fn listener_with_sds_validation_context(
 }
 
 /// An applied LDS listener whose chain names SDS secrets makes those names the
-/// SDS subscription: `desired_names` answers a real set, where before
-/// increment 2a it answered `None` for SDS unconditionally.
+/// SDS subscription: `desired_names` answers a real set, (it once answered
+/// `None` for SDS unconditionally).
 #[tokio::test]
 async fn sds_desired_names_come_from_the_applied_listeners() {
     let (publish, _published) = recording_publisher();
@@ -1408,20 +1407,16 @@ async fn a_listener_without_sds_certs_names_no_secrets() {
 }
 
 // -------------------------------------------------------------------------
-// WP-22 increment 2c: a `validation_context` secret reaches the real sink
-// shape rather than being ACKed and discarded.
+// A `validation_context` secret reaches a sink shaped like the real one,
+// rather than being ACKed and discarded.
 //
-// `crates/proxy-xds/src/apply.rs`'s own unit tests (increment 1) already
-// prove `a_well_formed_validation_context_secret_lowers_and_reaches_the_sink`
-// -- that is `on_sds_response`'s sink-agnostic plumbing, and a
-// `CertificateValidationContext` DOES lower and reach whatever sink is
-// wired. What increment 2b adds is the REAL sink `crates/proxy/src/main.rs`'s
-// `start_ads` builds, which has nowhere to route a validation_context secret
-// yet (`DynamicSecret::tls_certificate_ir` answers `None` for it) and so must
-// turn that into an explicit rejection rather than an accept. This test
-// exercises that rejection shape end to end through `ResourceApplier`, using
-// the same sink logic `main.rs` wires (mirrored here since the sink itself is
-// a closure private to `main`, not something this crate exports).
+// `crates/proxy-xds/src/apply.rs`'s own unit tests already prove
+// `a_well_formed_validation_context_secret_lowers_and_reaches_the_sink`:
+// that is `on_sds_response`'s sink-agnostic plumbing. These tests exercise
+// both secret kinds end to end through `ResourceApplier` with the same sink
+// logic `crates/proxy/src/main.rs`'s `start_ads` wires (mirrored here since
+// the sink itself is a closure private to `main`, not something this crate
+// exports).
 
 fn tls_cert_secret(name: &str, chain: &[u8], key: &[u8]) -> tls_v3::Secret {
     tls_v3::Secret {
@@ -1496,7 +1491,7 @@ fn main_rs_shaped_secret_sink() -> PublishSecrets {
 }
 
 #[tokio::test]
-async fn a_validation_context_secret_is_accepted_by_the_increment_2c_sink() {
+async fn a_validation_context_secret_is_accepted_by_the_secret_sink() {
     let (publish, _published) = recording_publisher();
     let mut applier =
         ResourceApplier::new(empty_base(), publish).with_secret_sink(main_rs_shaped_secret_sink());
@@ -1510,7 +1505,7 @@ async fn a_validation_context_secret_is_accepted_by_the_increment_2c_sink() {
 /// The same sink accepts an ordinary TLS certificate secret -- the rejection
 /// above is specific to `validation_context`, not a blanket SDS refusal.
 #[tokio::test]
-async fn a_tls_certificate_secret_is_accepted_by_the_same_increment_2c_sink() {
+async fn a_tls_certificate_secret_is_accepted_by_the_same_secret_sink() {
     let (publish, _published) = recording_publisher();
     let mut applier =
         ResourceApplier::new(empty_base(), publish).with_secret_sink(main_rs_shaped_secret_sink());

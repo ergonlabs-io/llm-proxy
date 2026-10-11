@@ -1,4 +1,4 @@
-//! WP-07 chunk A acceptance tests: the full 9-criteria `FilterChainMatch`,
+//! Acceptance tests: the full 9-criteria `FilterChainMatch`,
 //! listener socket options (`tcp_backlog_size`/`bind_to_port`), and the
 //! `CidrRange` matcher that backs `prefix_ranges`/`source_prefix_ranges`.
 

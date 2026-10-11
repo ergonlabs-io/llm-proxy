@@ -1,7 +1,6 @@
 //! Renders a [`Registry`] into Envoy's flat `/stats`
 //! text format, and nothing else: no Prometheus, no OTLP. See
-//! `internal-docs/IMPLEMENTATION_PLAN.md`'s Decision 4 for the
-//! naming rules this module implements.
+//! `stats.rs` Decision 4 for the naming rules this module implements.
 //!
 //! # Name rendering: one-to-many, and some render to nothing
 //!
@@ -20,14 +19,14 @@
 //! instrument's name. An instrument this table doesn't recognize is
 //! **omitted from the output entirely**, never rendered under an invented
 //! name — `/stats` is a compatibility surface, and a name Envoy never had
-//! is not compatibility (design brief, Decision 4, point 2).
+//! is not compatibility (`stats.rs` Decision 4, point 2).
 //!
 //! This mapping is deliberately independent of any particular `Instrument`
 //! const's declared `attribute_keys` — it only looks at the attribute keys
 //! actually present on a given resolved handle. That is what lets the same
 //! OTel instrument *name* (e.g. `"upstream_rq"`) expand into several Envoy
 //! names depending on which attributes a given call site resolved it with
-//! (design brief, Decision 4, point 1), without this module needing to
+//! (`stats.rs` Decision 4, point 1), without this module needing to
 //! know how many attribute-shaped variants of `UPSTREAM_RQ` exist.
 //!
 //! # Output ordering

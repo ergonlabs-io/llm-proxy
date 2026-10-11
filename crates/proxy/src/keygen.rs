@@ -11,8 +11,8 @@
 //! nothing in the proxy generated them -- an operator following the docs
 //! invented a key by hand, which is exactly the low-entropy, user-chosen
 //! secret that argument says these are not. This command is what makes the
-//! sentence true: see `internal-docs/IMPLEMENTATION_PLAN.md` and the module doc
-//! this paragraph quotes.
+//! sentence true: see the `proxy_filters::auth` module doc this paragraph
+//! quotes.
 //!
 //! # One shared derivation, not two
 //!
@@ -111,7 +111,7 @@ mod tests {
     // it is absent), so without this lock they race: the "neither source is
     // set" test could observe the other test's `env-secret` mid-flight and
     // "pass" a resolution that should have errored -- or fail, depending on
-    // thread timing. An edge here must not make CI a coin flip (ground rule:
+    // thread timing. An edge here must not make CI a coin flip (rule of thumb:
     // a flaky test is a broken test).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

@@ -1,11 +1,11 @@
-//! WP-20 increment 3b: the reconnect backoff, as pure arithmetic.
+//! The reconnect backoff, as pure arithmetic.
 //!
 //! **No I/O, no clock, no RNG of its own.** The delay is a function of the
 //! attempt number and one caller-supplied draw, which is what makes every
 //! claim below assertable without waiting for wall-clock time.
 //!
-//! WP-20 spells the requirement as "stream re-establishment with backoff
-//! (jittered, 500ms–30s)". Those two numbers are Envoy's own
+//! The requirement is stream re-establishment with jittered backoff,
+//! 500ms to 30s. Those two numbers are Envoy's own
 //! `RetryInitialDelayMs`/`RetryMaxDelayMs` for the xDS mux, so they are the
 //! defaults here.
 //!
@@ -18,8 +18,8 @@
 //! interval is `base * 2^n` -- so the first xDS reconnect waits up to
 //! `base` (500ms), not up to zero. Copying the retry curve here would make
 //! the first reconnect instantaneous and turn a control plane restart into a
-//! hot loop, which is precisely what PLAN.md Part 8.5 ("never NACK-storm")
-//! forbids.
+//! hot loop, which is precisely what `internal-docs/architecture.md` §12.2
+//! rule 5 ("never NACK-storm") forbids.
 //!
 //! One deliberate, harmless divergence: Envoy draws with an integer modulo,
 //! giving the half-open range `[0, cap)`. We take a float draw in `[0, 1]`
@@ -29,9 +29,8 @@
 
 use std::time::Duration;
 
-/// The reconnect curve's two knobs. Not IR yet -- WP-20 increment 4 is what
-/// wires bootstrap config in; until then these are constructed in code and
-/// the defaults are what runs.
+/// The reconnect curve's two knobs. Not IR yet: they are constructed in code
+/// and the defaults are what runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackoffPolicy {
     /// The cap on the very first reconnect delay; doubles per consecutive

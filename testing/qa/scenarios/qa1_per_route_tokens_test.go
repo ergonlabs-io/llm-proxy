@@ -224,7 +224,7 @@ observability:
 		t.Skipf(
 			"QA-1: SKIP (token half only) — access logs are emitted and both routes "+
 				"logged correctly, but every %%LLM_*_TOKENS%% operator rendered as \"-\": %v. "+
-				"WP-33 has not wired the usage filter into the `llmproxy` dialect's generated "+
+				"the proxy has not wired the usage filter into the `llmproxy` dialect's generated "+
 				"http_filters, so nothing populates the token buckets. Routing, provider "+
 				"dispatch, log emission, response codes and byte counts all passed above.",
 			missingTokens,

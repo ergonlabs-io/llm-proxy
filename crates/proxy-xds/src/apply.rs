@@ -1,12 +1,12 @@
-//! WP-20 increment 4b-ii: turning an ACCEPTED `DiscoveryResponse` into a
-//! published [`ConfigSnapshot`] (S8).
+//! Turning an ACCEPTED `DiscoveryResponse` into a published
+//! [`ConfigSnapshot`] (S8).
 //!
 //! Everything above this module deliberately stopped short of this:
 //! `store.rs` is "pure logic. No protobuf, no I/O, no `proxy-config` edge";
 //! `client.rs`'s validator "never reads `resources` -- only `type_url`,
 //! `version_info` and `nonce`". Assembling the actual snapshot is why THIS
 //! module is the one that finally takes the `proxy-config` edge this crate's
-//! own `Cargo.toml` comment has been predicting since increment 3a.
+//! own `Cargo.toml` comment predicts.
 //!
 //! # The pipeline this encodes, quoting `subscription.rs`'s own doc
 //!
@@ -41,21 +41,60 @@
 //! 6. **RDS is applied per name, with listener warming.** An LDS listener
 //!    that names RDS is staged until every named route arrives; a same-name
 //!    replacement waiting on a new table retains its last-good listener.
-//!    **EDS is applied, as of WP-21 increment 2b-ii, and SDS is applied, as
-//!    of WP-22 increment 1.** EDS and SDS have dedicated sinks because their
+//!    **EDS and SDS are applied too.** They have dedicated sinks because their
 //!    data is not a listener dependency: `EndpointIR` is already a plain
 //!    `Vec`, and [`DynamicSecret`] (in `secret.rs`) is resolved by the SDS
-//!    registry. **SDS names its subscription as of WP-22 increment 2a**:
+//!    registry. SDS names its subscription from the snapshot:
 //!    [`ResourceApplier::sds_resource_names`] reads every listener's
 //!    `DownstreamTlsSpec::certificate_sds_names`, so `desired_names` answers
-//!    a real set for SDS the same way it does for EDS. **What increment 2a
-//!    still leaves undone**: an accepted secret reaches the injected
-//!    [`PublishSecrets`] sink and stops there -- nothing maps a secret name
-//!    back to the `DownstreamTlsFactory` serving that chain, so the proxy
-//!    subscribes and ACKs but does not yet serve what arrives. That registry
-//!    is increment 2b's, and until it lands an SDS-named chain binds with an
-//!    empty cert set and fails every handshake, loudly (see
-//!    `DownstreamTlsFactory::build`).
+//!    a real set for SDS the same way it does for EDS. An accepted secret
+//!    reaches the injected [`PublishSecrets`] sink; mapping a secret name to
+//!    the `DownstreamTlsFactory` serving that chain is the sink's job (the
+//!    SDS registry in `proxy-core`), not this crate's.
+//!
+//! # EDS rules
+//!
+//! - **EDS names live in `EdsClusterConfig.service_name`, not `Cluster.name`.**
+//!   They are different namespaces, so `on_eds_response` resolves each
+//!   resource name to every cluster in the current snapshot that subscribes to
+//!   it (Envoy lets several clusters share one name) and calls the sink once
+//!   per match with the cluster's own name.
+//! - **The EDS set is `PerName` (absence is not removal) and seeded with an
+//!   EMPTY static-name set.** Seeding it from `base.clusters` would shadow the
+//!   case EDS exists to serve: a statically declared EDS cluster fed
+//!   dynamically.
+//! - **A resource that matches no cluster warns and is accepted.** NACKing
+//!   the whole response over one control-plane mistake would stall every
+//!   other resource in it.
+//! - **A sink failure NACKs and calls [`SotwSet::forget`]** for the failed
+//!   resource names, so a retransmission of identical bytes reads `added`
+//!   again instead of `unchanged` forever.
+//! - **An EDS response with no endpoint sink wired is a NACK**, not a silent
+//!   accept.
+//! - The caller (`crates/proxy/src/main.rs`'s `start_ads`) supplies a sink
+//!   that calls `ClusterManager::accept_eds_update` directly, not through the
+//!   control loop's install/publish channel: that channel exists to sequence
+//!   snapshot swaps, which an endpoint update into an already-live cluster
+//!   does not need. Its `initial_fetch_timeout` deadline only stops warming
+//!   from gating `/ready`; it never calls `force_initialize`, so a cluster
+//!   that never received endpoints stays un-initialized.
+//!
+//! # SDS rules
+//!
+//! - **The SDS set is `PerName`, like EDS and RDS and unlike LDS/CDS.** A
+//!   control plane pushing one secret must not be read as deleting the
+//!   others. Its static-name set is empty too.
+//! - **A response with no secret sink wired is a NACK.** Decoding a secret
+//!   and dropping it would ignore a config field where it is least
+//!   observable.
+//! - **All resources decode before any is applied**, and a sink failure
+//!   calls [`SotwSet::forget`] for the failed names and NACKs.
+//! - **SDS delta `removed_resources` reach the sink as
+//!   [`SecretUpdate::Remove`] before the ACK**, and a sink failure restores the
+//!   applier's prior store and NACKs.
+//! - Strict mode at the SDS boundary (inline bytes only, each refused field
+//!   by dotted path) lives in `secret.rs`; the `type_url` rule is on
+//!   `SDS_TYPE_URL`.
 //!
 //! # Ordering is `SotwSet::apply`'s job, not this module's
 //!
@@ -105,7 +144,9 @@ const RDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfi
 const EDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 /// Full `type_url` an SDS `DiscoveryResponse` carries -- verified against
 /// `secret.proto`'s own `package envoy.extensions.transport_sockets.tls.v3;`
-/// plus its `message Secret`, not just copied from memory.
+/// plus its `message Secret`, not just copied from memory. A wrong `type_url`
+/// is a subscription the control plane never answers and that never errors,
+/// so it must be exact.
 const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
 
 fn validate_delta_resource(
@@ -193,7 +234,7 @@ fn delta_apply_error(type_name: &str, error: DeltaApplyError) -> String {
 /// because the closure has to live in a struct field and be called from
 /// behind `&mut self`, and `Pin<Box<dyn Future>>` is the ordinary way to name
 /// "some future I will not spell out" there. It is a future (not a plain
-/// synchronous callback, as increment 4b-ii first had it) because the real
+/// synchronous callback) because the real
 /// `ConfigPublisher::publish` it wraps runs LAST in
 /// `crates/proxy/src/main.rs::reload`, after
 /// `ClusterManager::update_from_snapshot`'s own await -- this seam has to be
@@ -205,7 +246,7 @@ pub type Publish =
     Box<dyn FnMut(Arc<ConfigSnapshot>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 /// Where a newly assembled EDS resource's endpoints go once they lower
-/// cleanly -- WP-21 increment 2b-ii's counterpart to [`Publish`], mirroring
+/// cleanly -- the counterpart to [`Publish`] for endpoints, mirroring
 /// its shape and its reasoning (an injected callback, not a dependency on the
 /// real sink, for the same reason: the real one is
 /// `ClusterManager::accept_eds_update` in `proxy-cluster`, and this crate must
@@ -235,10 +276,10 @@ pub type PublishEndpoints = Box<
 >;
 
 /// Where a newly assembled SDS resource's decoded secret goes once it lowers
-/// cleanly -- WP-22 increment 1's counterpart to [`PublishEndpoints`], same
+/// cleanly -- the counterpart to [`PublishEndpoints`] for secrets, same
 /// shape and same reasoning (an injected callback, not a dependency on the
-/// real sink; the real one is the WP-08 `ArcSwap` cert resolver, wired in
-/// increment 2, and this crate must stay free of that edge).
+/// real sink; the real one is the `ArcSwap` cert resolver in `proxy-core`,
+/// and this crate must stay free of that edge).
 ///
 /// One accepted SDS change for the live TLS sink. Delta removals are explicit
 /// events so sinks can evict cached payloads and return consumers to their
@@ -291,8 +332,8 @@ pub type InitializationSink =
 /// bytes already implies an equal IR, and there is nothing for the ignored
 /// field to disagree about. This is also what Envoy itself does -- it hashes
 /// the resource rather than diffing the parsed config. Neither `ClusterConfig`
-/// nor `ListenerConfig` derives `PartialEq` (ground rule note: adding it
-/// across that whole tree is out of this increment's scope), which is the
+/// nor `ListenerConfig` derives `PartialEq` (adding it
+/// across that whole tree is not worth it for this one comparison), which is the
 /// other reason this compares bytes instead. A hand-written `PartialEq` that
 /// silently ignores a field is a footgun anywhere else in this codebase --
 /// safe here only because of the invariant above, which is why it is written
@@ -415,16 +456,15 @@ pub struct ResourceApplier {
     /// cluster is *supposed* to be declared statically (in `base.clusters`)
     /// while being fed dynamically over this exact set. Seeding this with
     /// `base.clusters`' names, the way `clusters`/`listeners` seed theirs,
-    /// would shadow precisely the case this increment exists to support: the
-    /// primary one, a statically-declared `Cluster` whose `eds_cluster_config`
+    /// would shadow precisely the case EDS exists to support: a
+    /// statically-declared `Cluster` whose `eds_cluster_config`
     /// names a resource this applier is meant to keep populated.
     endpoints: SotwSet<Entry<Vec<EndpointIR>>>,
     /// SDS's own set -- `PerName`, like `endpoints` above and for the same
     /// reason: an SDS response only ever carries the secrets a control plane
     /// feels like (re)declaring right now, not every secret ever
     /// subscribed to, so absence must not read as removal (S8: "SDS ... like
-    /// EDS ... absence != removal" -- this increment's own brief draws the
-    /// parallel explicitly).
+    /// EDS ... absence != removal").
     ///
     /// Its static-name set is deliberately EMPTY too, for a parallel reason
     /// to `endpoints`'s: a `Secret.name` and a bootstrap
@@ -434,7 +474,7 @@ pub struct ResourceApplier {
     /// (unset -> static; set -> SDS) -- not by first-come-first-served over
     /// the name itself, the way CDS/LDS static/dynamic shadowing works. That
     /// decision is `ir.rs`'s to encode once listener wiring lands
-    /// (increment 2); seeding a shadow set here now would just be a guess.
+    /// (listener wiring); seeding a shadow set here would just be a guess.
     secrets: SotwSet<Entry<DynamicSecret>>,
     /// The snapshot most recently published -- `base` itself until the first
     /// response that actually changes something.
@@ -488,7 +528,7 @@ impl ResourceApplier {
     /// `AdsClient::with_node` uses -- rather than a new `new` parameter, so
     /// every existing caller and test of `ResourceApplier::new` keeps
     /// compiling unchanged. Without this, `on_eds_response` keeps refusing
-    /// EDS by name (ground rule #1's shape) instead of silently no-op'ing.
+    /// EDS by name (AGENTS.md invariant 1's shape) instead of silently no-op'ing.
     pub fn with_endpoint_sink(mut self, sink: PublishEndpoints) -> Self {
         self.endpoint_sink = Some(sink);
         self
@@ -538,8 +578,7 @@ impl ResourceApplier {
     }
 
     /// Every secret name a listener in the current snapshot subscribes to,
-    /// across both `filter_chains` and `default_filter_chain` (WP-22
-    /// increment 2a). A `BTreeSet` both deduplicates -- two chains, or two
+    /// across both `filter_chains` and `default_filter_chain` A `BTreeSet` both deduplicates -- two chains, or two
     /// listeners, may name the same secret -- and orders, which is what the
     /// subscription's name set wants.
     ///
@@ -592,7 +631,7 @@ impl ResourceApplier {
     /// Routing is by the response's own `type_url`. CDS/LDS and RDS publish
     /// only warmed listeners; EDS/SDS use their dedicated sinks.
     ///
-    /// `async` since increment 4d-i: publishing (below, via [`Publish`]) can
+    /// `async`: publishing (below, via [`Publish`]) can
     /// now await, and this is the method that awaits it, so
     /// [`AdsClient::run_once`](crate::client::AdsClient::run_once) can finish
     /// applying a response before it sends that response's ACK.
@@ -1379,7 +1418,7 @@ impl ResourceApplier {
         // `apply` above already recorded every added/updated name in the
         // store -- BEFORE the sink below has run. See `SotwSet::forget`'s own
         // doc for why that ordering needs a fix-up rather than being left
-        // alone: this increment's chosen fix is (a), forgetting exactly the
+        // alone: the fix is forgetting exactly the
         // RESOURCE names for which any fed cluster's sink call failed, so a
         // later retransmission of identical bytes reads as `added` again
         // instead of `unchanged` and reaches the sink a second time. Names
@@ -1447,9 +1486,8 @@ impl ResourceApplier {
     /// any other name before reaching the sink -- `Secret.name` IS the name
     /// the sink is called under, since (unlike EDS's resource-name-vs-
     /// cluster-name split) there is no other resource in `self.current` for
-    /// an SDS name to resolve through in this increment (that correlation --
-    /// a listener's `SdsSecretConfig.name` -- is increment 2's, per this
-    /// module's SDS scope note). No `finish` call either, for the same
+    /// an SDS name to resolve through here (mapping a name to the listener
+    /// chain serving it is the sink's job; see the module doc). No `finish` call either, for the same
     /// reason `on_eds_response` skips it: an accepted secret never touches
     /// `ConfigSnapshot` or `self.publish`, only the injected sink.
     async fn on_sds_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
@@ -1637,7 +1675,7 @@ impl ResourceApplier {
 }
 
 /// `ResourceApplier` IS the real [`ResponseHandler`] -- there is no adapter
-/// step (increment 4b-ii's `into_validator` filled that role for the old
+/// step (an `into_validator` adapter once filled that role for the old
 /// synchronous [`crate::client::Validator`] seam and is gone; a caller now
 /// passes a `ResourceApplier` to [`crate::client::AdsClient::run`] /
 /// `run_once` directly).
@@ -1652,9 +1690,8 @@ impl ResponseHandler for ResourceApplier {
     /// every response, for every state it holds; returning `None` is what
     /// makes those calls no-ops.
     ///
-    /// SDS joined EDS in WP-22 increment 2a, once
-    /// `DownstreamTlsSpec::certificate_sds_names` gave the snapshot somewhere
-    /// to read the names from.
+    /// SDS names come from `DownstreamTlsSpec::certificate_sds_names` in the
+    /// snapshot, the way EDS names come from its clusters.
     fn desired_names(&self, type_url: &str) -> Option<BTreeSet<String>> {
         match type_url {
             EDS_TYPE_URL => Some(self.eds_resource_names()),
@@ -1678,9 +1715,8 @@ impl DeltaResponseHandler for ResourceApplier {
     }
 }
 
-/// WP-22 increment 1 acceptance tests for `on_sds_response`, colocated here
-/// (rather than in `tests/apply.rs`, which this increment does not own) --
-/// same idiom `store.rs` already uses for its own `SotwSet` tests. Fixture
+/// Acceptance tests for `on_sds_response`, colocated here
+/// (rather than in `tests/apply.rs`) -- same idiom `store.rs` already uses for its own `SotwSet` tests. Fixture
 /// shape mirrors `tests/apply.rs`'s EDS fixtures as closely as a single-file
 /// test module can: hand-build the proto, wrap it via `any_of`, drive
 /// `ResourceApplier::on_response` directly.

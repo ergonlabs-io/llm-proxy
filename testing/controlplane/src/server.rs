@@ -242,7 +242,7 @@ impl AggregatedDiscoveryService for ScriptedAds {
         _request: Request<tonic::Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
         Err(Status::unimplemented(
-            "ScriptedAds is a SotW-only puppet server; delta xDS is a later WP-28 chunk",
+            "ScriptedAds is a SotW-only puppet server; delta xDS is not supported yet",
         ))
     }
 }

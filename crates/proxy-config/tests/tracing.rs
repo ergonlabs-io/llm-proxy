@@ -1,4 +1,4 @@
-//! WP-51 increment 3 acceptance tests: config surface only.
+//! Acceptance tests: config surface only.
 //!
 //! Two front doors, and this file tests both:
 //! - `Bootstrap.node.metadata["io.llmproxy.tracing"]` -> `ConfigSnapshot.tracing`
@@ -13,7 +13,7 @@
 //! Everything here is the strict-parse -> PGV -> IR pipeline a hand-written
 //! Envoy config goes through, so a config that never sets either surface must
 //! be completely unaffected. Every malformed shape is a hard error carrying
-//! its full dotted path (ground rule #1), never a silent skip.
+//! its full dotted path (AGENTS.md invariant 1), never a silent skip.
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -103,7 +103,7 @@ node:
     );
 }
 
-/// Ground rule #1: a missing `otlp_endpoint` is a hard error naming the exact
+/// AGENTS.md invariant 1: a missing `otlp_endpoint` is a hard error naming the exact
 /// field, not a namespace silently treated as absent -- the operator wrote
 /// `io.llmproxy.tracing`, so something must have been meant by it.
 #[test]
@@ -174,8 +174,8 @@ node:
 }
 
 /// An unknown key inside the namespace is a hard error too. The reflective
-/// surface walk cannot see into a `Struct`, so this is the only place ground
-/// rule #1 can be enforced for it -- a typo'd `endpoint:` must not load as
+/// surface walk cannot see into a `Struct`, so this is the only place AGENTS.md
+/// invariant 1 can be enforced for it -- a typo'd `endpoint:` must not load as
 /// "no otlp_endpoint configured".
 #[test]
 fn unknown_key_under_the_tracing_namespace_is_a_hard_error() {
@@ -198,7 +198,7 @@ node:
 /// is caught by the generic surface walk first, since `Tracing`'s own
 /// allow-list entry is `&[]` (nothing mapped) -- naming the specific
 /// sub-field rather than the whole block, which is still a full dotted path
-/// (ground rule #1), just a more precise one than `convert_hcm`'s own check
+/// (AGENTS.md invariant 1), just a more precise one than `convert_hcm`'s own check
 /// produces for the bare-block case (see `empty_hcm_tracing_block_is_rejected`
 /// below).
 #[test]
@@ -274,7 +274,7 @@ static_resources:
     );
 }
 
-// ------------------------------------------ WP-51 increment 4: export deadline --
+// ------------------------------------------------------- export deadline --
 
 /// The default when the field is absent: 5s, matching the fixed batch
 /// interval. Present in the IR so the exporter always has a bounded RPC --

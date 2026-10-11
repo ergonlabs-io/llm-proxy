@@ -1,10 +1,8 @@
-//! WP-50 increment 3a — per-tenant model allow-lists, as a pure library.
+//! Per-tenant model allow-lists, as a pure library.
 //!
 //! This module answers one question: **given a tenant's [`crate::auth::TenantPolicy`],
 //! is a requested model permitted?** It does not touch `HttpFilter`, proto
-//! decoding, or `StreamInfo` — those are [`crate::model_authz_filter`]. See
-//! `internal-docs/IMPLEMENTATION_PLAN.md`'s "3a" section, which is
-//! normative here.
+//! decoding, or `StreamInfo` — those are [`crate::model_authz_filter`].
 //!
 //! # Matching rule: exact match, or one trailing `*` glob — no regex
 //!
@@ -12,8 +10,7 @@
 //! `gpt-4o`, `gpt-4-turbo`, and the literal string `gpt-4` itself (the `*`
 //! also matches zero characters); anything not ending in `*` must match a
 //! model name exactly. There is no other wildcard syntax, no character
-//! classes, no regex — see the design brief's 3a section ("do not invent a
-//! regex surface"). [`crate::model_authz_filter::parse_config`] rejects a
+//! classes, no regex (do not invent a regex surface). [`crate::model_authz_filter::parse_config`] rejects a
 //! pattern with a `*` anywhere but the final character (or more than one)
 //! at config load, so a [`ModelPattern`] built from a validated config
 //! always has at most one trailing `*`; [`ModelPattern::matches`] itself

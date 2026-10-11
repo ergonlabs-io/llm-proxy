@@ -1,5 +1,4 @@
-//! Worker runtime pool and control -> worker config propagation (WP-06,
-//! ADR-0003).
+//! Worker runtime pool and control -> worker config propagation (ADR-0003).
 //!
 //! Workers are share-nothing, `!Send` `current_thread` tokio runtimes, each
 //! on a dedicated OS thread driving a `LocalSet` (optionally core-pinned).
@@ -61,8 +60,8 @@ pub struct WorkerContext {
     pub config_ping: watch::Receiver<SnapshotVersion>,
     /// Flips to `true` when `ConfigPublisher::shutdown` is called.
     pub shutdown: watch::Receiver<bool>,
-    /// Fires when the control runtime calls `ConfigPublisher::start_drain`
-    /// (WP-06 chunk B). Worker mains hand this to
+    /// Fires when the control runtime calls `ConfigPublisher::start_drain`.
+    /// Worker mains hand this to
     /// [`crate::drain::drain_worker`].
     pub drain: watch::Receiver<DrainState>,
     /// The worker reports here (via `drain_worker`) once its connection
@@ -277,7 +276,7 @@ pub struct ConfigPublisher {
     config_txs: Vec<watch::Sender<SnapshotVersion>>,
     shutdown_tx: watch::Sender<bool>,
     threads: Vec<JoinHandle<()>>,
-    /// Drain coordination (WP-06 chunk B): kept here, not as a separate
+    /// Drain coordination: kept here, not as a separate
     /// handle callers juggle alongside this one, so "publish config",
     /// "shut down", and "drain" all live on the one control-side type.
     drain: DrainCoordinator,

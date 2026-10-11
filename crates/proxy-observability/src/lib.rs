@@ -22,7 +22,7 @@ pub mod sink;
 /// The stats registry core (instruments, `Handle`
 /// resolution, sharded counters/histograms) and the Envoy `/stats` text
 /// renderer (`stats::envoy_render`). Prometheus rendering (`/stats/prometheus`)
-/// lands in a later increment; see `internal-docs/IMPLEMENTATION_PLAN.md`.
+/// lives in `stats::prometheus_render`.
 pub mod stats;
 /// Our own span model plus W3C `traceparent`
 /// parsing. Pure library, not wired into the request path yet.

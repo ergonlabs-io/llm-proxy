@@ -4,7 +4,7 @@
 //!
 //! # What was actually checked before writing this file
 //!
-//! The design brief's acceptance criterion is "Envoy's own Grafana dashboard
+//! The acceptance criterion is "Envoy's own Grafana dashboard
 //! queries populating against our Prometheus output". Before writing a
 //! fixture, this repo and `envoyproxy/envoy` were both searched for one:
 //!

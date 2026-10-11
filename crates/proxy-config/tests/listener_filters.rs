@@ -1,4 +1,4 @@
-//! WP-08 chunk C1 acceptance tests: `Listener.listener_filters` lowering and
+//! Acceptance tests: `Listener.listener_filters` lowering and
 //! `tls_inspector` support, including Envoy's auto-injection of a default
 //! `tls_inspector` when a filter chain matches on SNI/ALPN/`transport_protocol:
 //! tls` but none was configured explicitly.

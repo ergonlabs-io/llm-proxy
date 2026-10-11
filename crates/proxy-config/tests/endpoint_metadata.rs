@@ -1,4 +1,4 @@
-//! WP-56: `LbEndpoint.metadata.filter_metadata["io.llmproxy.endpoint"]` ->
+//! `LbEndpoint.metadata.filter_metadata["io.llmproxy.endpoint"]` ->
 //! `EndpointIR::metadata`. See `EndpointIR::metadata`'s doc comment in
 //! `proxy-config/src/ir.rs` for the design this implements: our own
 //! namespace lowers to a `BTreeMap<String, String>`, and every other
@@ -201,7 +201,7 @@ static_resources:
 /// An `LbEndpoint` field outside the allowlist -- `health_status`, which
 /// `allowed_fields("envoy.config.endpoint.v3.LbEndpoint")` in `lower.rs`
 /// deliberately does not list -- is still rejected by its exact dotted path.
-/// This proves WP-56 widened that allowlist by exactly the one field
+/// This proves that allowlist was widened by exactly the one field
 /// (`metadata`) it was asked to add.
 #[test]
 fn an_lb_endpoint_field_still_outside_the_allowlist_is_refused() {

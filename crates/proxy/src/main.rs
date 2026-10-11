@@ -5,8 +5,7 @@
 //! `--mode keygen` (see `keygen`), `init`, serve mode's control runtime, worker
 //! pool, SIGTERM/SIGINT drain sequence, and the per-worker listener manager
 //! that binds sockets and accepts connections. The L4 network filter chain
-//! (`tcp_proxy` etc.) is still a stub -- see `proxy_core::listener`'s
-//! `TODO(WP-09)`.
+//! (`tcp_proxy` etc.) lives in `proxy_core` (`tcp_proxy`, `net_filter`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -682,7 +681,7 @@ async fn run_serve(
         // A rejected cluster (unimplemented `lb_policy`, or a
         // `transport_socket` that fails to build -- e.g. bad TLS config) is
         // fatal at startup, same as a bad listener certificate
-        // (`InitialBindError` below): ground rule #1 forbids leaving the
+        // (`InitialBindError` below): AGENTS.md invariant 1 forbids leaving the
         // proxy up serving 503s for a misconfigured cluster with no
         // diagnostic.
         for (name, err) in &rejected {
@@ -721,7 +720,7 @@ async fn run_serve(
     ));
     // `TokenUsageStatHandles`'s counterpart to
     // `stat_handles` above -- resolved once at boot for every cluster (a
-    // provider, per ground rule #6, is a cluster, never a route), same
+    // provider, per AGENTS.md invariant 6, is a cluster, never a route), same
     // cadence as `stat_handles`. `FilterChainHandler::with_token_stats`'s doc
     // names `crate-core`'s `build_hcm_handler` as the one real call site this
     // feeds -- see that function for the missing half of the wiring this
@@ -1143,7 +1142,7 @@ async fn run_serve(
 
     // Startup gate: every worker must report a successful initial bind
     // before we consider ourselves "up". A single failed listener is fatal
-    // at startup (ground rule #1 -- see `proxy_core::listener::initial_bind`'s
+    // at startup (AGENTS.md invariant 1 -- see `proxy_core::listener::initial_bind`'s
     // doc comment), so on the first failure (or a timeout) we tear the pool
     // down and exit nonzero instead of proceeding to the signal-wait loop.
     if let Err(message) = wait_for_initial_binds(&mut bind_rx, concurrency).await {
@@ -1506,7 +1505,7 @@ async fn reload(
             // Requirement 1: this is the one log line an operator's typo has
             // to produce. `err` is a `ConfigError`/`proxy-simple-config`
             // error `Display`, which already carries the full dotted field
-            // path (ground rule #1) -- the same detail the boot-time
+            // path (AGENTS.md invariant 1) -- the same detail the boot-time
             // `eprintln!("{err}")` in `main()` shows, just routed through
             // `tracing` instead since this runs mid-serve.
             tracing::error!(
@@ -1718,9 +1717,9 @@ fn effective_node(
 /// asks for one. Sources may be ADS, filesystem, or a mixture of both.
 ///
 /// Returns `None` -- and starts nothing -- in three cases, none of them
-/// fatal to `run_serve` (PLAN.md 8.5: keep serving last-good/static config):
+/// fatal to `run_serve` (architecture.md §12.2 rule 5: keep serving last-good/static config):
 /// - `snapshot.ads` is `None`: no `dynamic_resources` in bootstrap, today's
-///   behavior for every release through v0.2.0, untouched by this increment.
+///   behavior for every release through v0.2.0, untouched by this wiring.
 /// - none of `lds`, `cds`, or a statically-declared EDS cluster asks for
 ///   anything: nothing to subscribe to, logged at `info!`. EDS has no
 ///   bootstrap flag of its own -- Envoy expresses it per cluster, via
@@ -1938,9 +1937,9 @@ fn start_ads(
     // `ads.cluster` is a name config lowering has already checked exists in
     // `static_resources`, so a missing entry here would be that guarantee
     // breaking, not an operator mistake -- treated the same as "no
-    // endpoints" below rather than a panic, per ground rule #1's spirit
-    // (loud, not silent -- but never fatal to the process here, see PLAN.md
-    // 8.5).
+    // endpoints" below rather than a panic, per AGENTS.md invariant 1's spirit
+    // (loud, not silent -- but never fatal to the process here, see
+    // architecture.md §12.2 rule 5).
     let endpoint = match snapshot
         .clusters
         .get(ads_cluster)
@@ -1982,7 +1981,7 @@ fn start_ads(
         Box::pin(async move {
             // Rust note: `ConfigSnapshot` has no `Clone` impl (deliberately --
             // see `crates/proxy-config/tests/ir_readership.rs`'s module doc),
-            // so this is the one place this increment needs to turn the
+            // so this is the one place this wiring needs to turn the
             // `Arc<ConfigSnapshot>` `ResourceApplier` hands back into an
             // owned one to send down the channel. `with_dynamic_resources`
             // (its own public constructor) is reused for exactly that,
@@ -2340,7 +2339,7 @@ fn build_readiness_probe(
                 timeout_s = timeout.as_secs(),
                 "cluster warming deadline (initial_fetch_timeout) expired with clusters still \
                  unresolved; /ready now reports LIVE for them, but ClusterManager::is_initialized \
-                 stays false -- see WP-58"
+                 stays false because the deadline only stops warming from gating readiness"
             );
         }
         proxy_admin::Readiness::Live
@@ -2897,7 +2896,7 @@ mod tests {
         assert!(
             !manager.is_initialized("never-fed"),
             "the warming deadline must gate /ready only -- it must never mark a cluster \
-             initialized (that stays WP-58's job, at request time)"
+             initialized (the router's request-time `is_initialized` check depends on that)"
         );
     }
 

@@ -1,6 +1,6 @@
 //! Acceptance tests for the descriptor pool.
 //!
-//! Gate (internal-docs/IMPLEMENTATION_PLAN.md): `Bootstrap`, `Listener`, `Cluster`,
+//! Gate: `Bootstrap`, `Listener`, `Cluster`,
 //! `RouteConfiguration`, `ClusterLoadAssignment`, `HttpConnectionManager`,
 //! `Router`, ADS service types all addressable; the descriptor pool resolves
 //! every `type.googleapis.com/envoy.*` URL used in the config corpus.
@@ -136,7 +136,7 @@ fn example_bootstrap_yaml_parses_via_descriptor_pool() {
     );
 }
 
-/// Strict mode foundation (ground rule #2): unknown fields must be detectable
+/// Strict mode foundation (AGENTS.md invariant 1): unknown fields must be detectable
 /// at parse time so that the config loader can reject them with a field path.
 #[test]
 fn unknown_fields_are_rejected() {

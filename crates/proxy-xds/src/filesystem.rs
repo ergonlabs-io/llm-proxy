@@ -1,4 +1,4 @@
-//! Filesystem xDS source (WP-22).
+//! Filesystem xDS source.
 //!
 //! A source reads one complete `DiscoveryResponse` from disk and exposes a
 //! polling watcher for atomic file replacement. Reading happens only when a

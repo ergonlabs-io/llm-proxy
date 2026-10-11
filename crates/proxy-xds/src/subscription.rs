@@ -1,7 +1,7 @@
-//! WP-20 increment 2: the per-type xDS subscription state machine (S8).
+//! The per-type xDS subscription state machine (S8).
 //!
 //! **Pure logic. No I/O, no gRPC, no protobuf.** This module owns the rules
-//! that decide what a `DiscoveryRequest` says; increment 3 owns the tonic
+//! that decide what a `DiscoveryRequest` says; `client.rs` owns the tonic
 //! stream that carries it. Keeping them apart is deliberate: S8 conformance
 //! is a set of claims about version and nonce bookkeeping, and every one of
 //! them is testable here without a socket, a runtime, or a control plane.
@@ -74,7 +74,7 @@ pub enum Verdict {
     /// Every resource validated and was applied.
     Accept,
     /// At least one resource failed. The string becomes the NACK's
-    /// `error_detail` message -- in practice a WP-03/WP-04 dotted-path error.
+    /// `error_detail` message -- in practice a dotted-path config error.
     Reject(String),
 }
 

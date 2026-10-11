@@ -1,4 +1,4 @@
-//! WP-24's remaining acceptance criterion: "every response flag reachable by
+//! Acceptance criterion: "every response flag reachable by
 //! at least one test." This file drives the REAL condition behind each
 //! reachable flag not already covered elsewhere (see the crate-level test
 //! files this complements: `router_access_log.rs` for `NC`,
@@ -109,7 +109,7 @@ fn test_router_stats(cluster_names: &[&str]) -> Arc<RouterStats> {
 /// The knobs every test in this file needs to vary: the route's own path
 /// matcher (so `NR` can mismatch it), whether/how many endpoints cluster
 /// `"up"` has (`UH` needs zero), its circuit breakers (`UO` needs
-/// `max_requests: 0`), the forward action (timeouts, for `UT`), and (WP-58)
+/// `max_requests: 0`), the forward action (timeouts, for `UT`), and
 /// its discovery type -- `Eds` with no `accept_eds_update` ever sent is how a
 /// cluster is made to sit registered-but-never-warmed, the real condition
 /// behind `cluster_not_warmed` (see `ClusterManager::resolve_cluster`'s doc:
@@ -125,7 +125,7 @@ struct Scenario {
     protocol: proxy_config::ir::UpstreamProtocol,
     discovery: DiscoveryType,
     eds: Option<EdsClusterConfig>,
-    /// WP-58: the upgrade path's own `NoClusterFound`/warming check needs an
+    /// The upgrade path's own `NoClusterFound`/warming check needs an
     /// enabled upgrade type to ever reach `handle_upgrade` at all -- empty
     /// (the default) is what every non-upgrade test here wants.
     upgrade_configs: Vec<UpgradeConfig>,
@@ -151,7 +151,7 @@ impl Scenario {
         }
     }
 
-    /// WP-58: a cluster that's registered but has never completed its first
+    /// A cluster that's registered but has never completed its first
     /// resolution -- `Eds` discovery, no endpoints, and (crucially) the
     /// caller never calls `ClusterManager::accept_eds_update` on it, so
     /// `is_initialized` stays `false` forever. No live upstream is needed:
@@ -255,7 +255,7 @@ fn request(path: &'static str) -> HttpRequestParts {
     }
 }
 
-/// WP-58: a request carrying `Upgrade: websocket` -- routes through
+/// A request carrying `Upgrade: websocket` -- routes through
 /// `RouterHandler::handle_upgrade` rather than `apply_forward`, which is
 /// exactly the bypass this file's warming tests need to rule out. Same shape
 /// as `router_upgrade_e2e.rs`'s own `upgrade_request` (duplicated here, same
@@ -423,7 +423,7 @@ async fn zero_endpoints_records_and_renders_the_uh_flag() {
             assert_eq!(
                 read_to_string(&path),
                 "503 UH no_healthy_upstream\n",
-                "WP-58: an initialized cluster whose hosts are all ejected/absent must render \
+                "an initialized cluster whose hosts are all ejected/absent must render \
                  UH + no_healthy_upstream, NOT cluster_not_warmed -- see \
                  `cluster_not_warmed_is_distinguishable_from_all_hosts_ejected` for the direct \
                  comparison"
@@ -433,9 +433,9 @@ async fn zero_endpoints_records_and_renders_the_uh_flag() {
         .await;
 }
 
-// --- WP-58: a never-warmed cluster must be distinguishable from UH ----------
+// --- a never-warmed cluster must be distinguishable from UH ----------
 //
-// `internal-docs/IMPLEMENTATION_PLAN.md`'s WP-21 card: "nothing consults
+// Before the fix, "nothing consults
 // `is_initialized` before routing, so an un-initialized cluster still fails a
 // request through the same generic `NoHealthyUpstream` path as a cluster
 // whose hosts are all ejected". These three tests are the fix's acceptance
@@ -552,7 +552,7 @@ async fn cluster_not_warmed_is_distinguishable_from_all_hosts_ejected() {
             assert_eq!(ejected_line, "503 UH no_healthy_upstream\n");
             assert_ne!(
                 warming_line, ejected_line,
-                "WP-58's whole point: a never-warmed cluster and an all-hosts-ejected cluster \
+                "The whole point: a never-warmed cluster and an all-hosts-ejected cluster \
                  must be distinguishable in the access log, not share one generic path"
             );
         })
@@ -843,7 +843,7 @@ async fn a_cancelled_h2_stream_records_and_renders_the_ur_flag() {
 
 // --- DC: downstream connection termination ----------------------------------
 
-/// `DC` was the second flag the WP-24 audit found declared, apparently
+/// `DC` was the second flag an audit found declared, apparently
 /// wired, and unreachable. `access_logging.rs` maps `BodyError::Downstream`
 /// to it and has always had a unit test -- but that test **hand-constructs**
 /// the error, and nothing in the real pipeline could produce one, because

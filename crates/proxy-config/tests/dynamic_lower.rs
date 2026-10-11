@@ -1,13 +1,13 @@
-//! WP-20 increment 4b-i acceptance tests: lowering ONE xDS-delivered resource
+//! Acceptance tests: lowering ONE xDS-delivered resource
 //! (a `google.protobuf.Any`) into the IR.
 //!
 //! **The strict-mode test is the point of this file, not a nice-to-have.**
-//! `build_snapshot` enforces ground rule #1 by running `check_supported_surface`
+//! `build_snapshot` enforces AGENTS.md invariant 1 by running `check_supported_surface`
 //! over the whole bootstrap before converting anything; a resource delivered
 //! over ADS instead of from a file gets none of that unless `lower_dynamic_*`
 //! puts it there too. If an xDS-delivered `Cluster` could carry a field the
 //! `allowed_fields` allowlist does not permit and still be accepted, xDS would
-//! be a hole straight through the project's most important ground rule.
+//! be a hole straight through the project's most important invariant (AGENTS.md invariant 1).
 //!
 //! Built by constructing the proto types directly and
 //! `prost::Message::encode`ing them into an `Any`, rather than going through

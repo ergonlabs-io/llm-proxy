@@ -1,4 +1,4 @@
-//! WP-24 (chunk 1) acceptance tests: HCM `access_log` -> `Vec<AccessLogIR>`.
+//! Acceptance tests: HCM `access_log` -> `Vec<AccessLogIR>`.
 //!
 //! Covers stdout/stderr/file sinks, the Envoy default format, explicit
 //! text/JSON formats, `status_code`/`response_flag` filters, and strict

@@ -1,8 +1,8 @@
-//! WP-11: the HTTP filter manager — drives the S2 iteration state machine over
+//! The HTTP filter manager — drives the S2 iteration state machine over
 //! the frozen [`crate::filter`] API and bridges it to the codec's
 //! [`StreamHandler`] seam.
 //!
-//! # Scope so far (chunks 1-3)
+//! # Scope so far
 //!
 //! The **decode** (request) direction stays fully buffered: it collects the
 //! whole request body, then runs the decoder chain (config order). LLM request
@@ -15,7 +15,7 @@
 //! [`StreamingEncoder`] — a hand-rolled [`hyper::body::Body`] that pulls
 //! frames from the upstream body on demand, running the encoder chain
 //! (**reverse** config order, S2.1) over each one as it arrives. This is what
-//! makes time-to-first-token (WP-33) possible: bytes flow to the downstream
+//! makes time-to-first-token possible: bytes flow to the downstream
 //! connection as soon as a filter lets them through, without waiting for the
 //! upstream response to finish.
 //!
@@ -149,7 +149,7 @@ use proxy_observability::trace::{SpanSink, TraceContext};
 pub const DEFAULT_BUFFER_LIMIT: usize = 1 << 20;
 
 /// One `http_filters` chain entry, as building a [`FilterChainHandler`] with
-/// `typed_per_filter_config` resolution (ADR-0004 step 4 increment 2) needs
+/// `typed_per_filter_config` resolution (ADR-0004) needs
 /// it: the Envoy filter name (`typed_per_filter_config`'s map key), the
 /// per-stream instance factory (unchanged — what `factories` alone used to
 /// carry), and the REGISTERED [`HttpFilterFactory`] itself, needed once at
@@ -166,8 +166,7 @@ pub struct ConfiguredHttpFilter {
     pub factory: Arc<dyn HttpFilterFactory>,
 }
 
-/// Resolved `typed_per_filter_config` for one HCM's filter chain (ADR-0004
-/// step 4 increment 2), built once at [`FilterChainHandler`] construction —
+/// Resolved `typed_per_filter_config` for one HCM's filter chain (ADR-0004), built once at [`FilterChainHandler`] construction —
 /// never re-parsed per stream, mirroring how Envoy validates this against
 /// the real filter chain when it's built. Every row is `[filter_index]`
 /// -indexed, in the SAME config order `FilterChainHandler::factories` uses
@@ -239,14 +238,14 @@ impl PerRouteTable {
 
 /// Resolve one `typed_per_filter_config` map (one of the three levels) into
 /// a `[filter_index]`-indexed row, validating every entry against the
-/// ACTUAL chain (ground rule #1 — a name/shape mismatch is a config error,
+/// ACTUAL chain (AGENTS.md invariant 1 — a name/shape mismatch is a config error,
 /// not a silent no-op):
 ///
 /// - a name absent from `names` is an error naming the filter and
 ///   `context`, unless the entry's `is_optional` is set (then it's skipped);
 /// - `disabled: true` is an `Unimplemented` error (not yet supported —
 ///   skipping a filter per-route requires the manager to act on it at run
-///   time, which is a later increment); never silently dropped;
+///   time, which is not implemented yet); never silently dropped;
 /// - otherwise the entry's config is handed to that filter's
 ///   `HttpFilterFactory::parse_per_route`; an `Err` (including the trait's
 ///   own default — "this filter has no per-route config") propagates as-is
@@ -310,7 +309,7 @@ fn resolve_per_filter_row(
             // other variant means the filter does support per-route config and
             // rejected THIS config. Swallowing those under `is_optional` would
             // silently drop a malformed override on a filter that would have
-            // honored a correct one -- ground rule #1, and not what Envoy does
+            // honored a correct one -- AGENTS.md invariant 1, and not what Envoy does
             // either.
             Err(ConfigError::Unimplemented { .. }) if cfg.is_optional => continue,
             Err(e) => return Err(e),
@@ -319,8 +318,7 @@ fn resolve_per_filter_row(
     Ok(row)
 }
 
-/// Build the [`PerRouteTable`] for one HCM's filter chain (ADR-0004 step 4
-/// increment 2): resolve `RouteConfiguration`/`VirtualHost`/`Route`-level
+/// Build the [`PerRouteTable`] for one HCM's filter chain (ADR-0004): resolve `RouteConfiguration`/`VirtualHost`/`Route`-level
 /// `typed_per_filter_config` once, at build time, against the real chain —
 /// see [`resolve_per_filter_row`] for the per-entry rules. `names[i]` is
 /// `factories[i]`'s Envoy filter name; both share filter index with
@@ -332,7 +330,7 @@ fn build_per_route_table(
 ) -> Result<PerRouteTable, ConfigError> {
     let filter_count = names.len();
 
-    // WP-33: the assertion is checked against the factories actually
+    // The assertion is checked against the factories actually
     // registered in this listener's chain, not a hand-maintained list in the
     // config crate. A new filter therefore fails strict routes by default
     // until its author explicitly documents that its encode path never holds
@@ -450,7 +448,7 @@ pub struct FilterChainHandler {
     /// workers -- and different `FilterChainHandler`s in tests -- draw
     /// independent id sequences.
     request_id_rng: std::cell::RefCell<u64>,
-    /// WP-24 chunk 3, relocated from `RouterHandler` (see the module doc's
+    /// Relocated from `RouterHandler` (see the module doc's
     /// note on why access logging moved up here): this HCM's configured
     /// access loggers, already resolved to open sinks -- empty when the HCM
     /// has no `access_logs`, in which case [`Self::handle`] skips the
@@ -458,15 +456,15 @@ pub struct FilterChainHandler {
     /// every request this (`!Send`, per-worker) handler serves, never across
     /// workers.
     access_loggers: Rc<Vec<AccessLoggerRuntime>>,
-    /// ADR-0004 step 4 increment 2: this HCM's resolved `typed_per_filter_config`,
+    /// ADR-0004: this HCM's resolved `typed_per_filter_config`,
     /// keyed by filter index the same way `factories` is. `Arc` (not a plain
     /// field): cloned into every stream's `ChainCtx`, same pattern as
     /// `route_table`. Built by [`Self::new_with_filters`]; [`Self::new`] has
     /// no filter NAMES to resolve against, so it always gets the empty
     /// default (`per_route_config()` then always returns `None`, this
-    /// handler's pre-increment-2 behavior).
+    /// is the behavior without a resolved table).
     per_route: Arc<PerRouteTable>,
-    /// WP-23 increment 6b: this HCM's `llm.client.token.usage` recorder,
+    /// This HCM's `llm.client.token.usage` recorder,
     /// if the boot/reload wiring set one (`proxy-core`'s `build_hcm_handler`
     /// always does for a real HCM build -- see [`Self::with_token_stats`]).
     /// `None` is the constructors' baseline (every existing `new*` call site
@@ -476,11 +474,11 @@ pub struct FilterChainHandler {
     /// happens once, at stream end, from `access_logging::LoggingBody::finish`
     /// -- never here.
     token_stats: Option<Arc<GenAiTokenStats>>,
-    /// WP-33b: OTel GenAI TTFT/TPOT histograms. It shares LoggingBody's
+    /// OTel GenAI TTFT/TPOT histograms. It shares LoggingBody's
     /// stream-end hook with token accounting because both require final
     /// usage/timing and must run even without an access logger configured.
     latency_stats: Option<Arc<GenAiLatencyStats>>,
-    /// WP-51 increment 2: this HCM's span sink + head-sampling ratio, if
+    /// This HCM's span sink + head-sampling ratio, if
     /// boot/reload wired one (`proxy-core`'s `build_hcm_handler` does so
     /// whenever `ConfigSnapshot::tracing` is `Some` -- see
     /// [`Self::with_tracing`]). `None` is both the constructors' baseline
@@ -568,11 +566,10 @@ impl FilterChainHandler {
     /// Like [`Self::new`], but `filters` carries each configured filter's
     /// Envoy name and registered [`HttpFilterFactory`] alongside its
     /// per-stream instance factory, so this build/rebuild also resolves
-    /// `typed_per_filter_config` against the real chain (ADR-0004 step 4
-    /// increment 2 -- see [`build_per_route_table`]). A resolution failure
+    /// `typed_per_filter_config` against the real chain (ADR-0004 -- see [`build_per_route_table`]). A resolution failure
     /// (an unknown filter name, an unimplemented `disabled`, or a filter's
     /// own `parse_per_route` rejecting its config) fails the whole build,
-    /// same as any other invalid `http_filters` entry (ground rule #1: never
+    /// same as any other invalid `http_filters` entry (AGENTS.md invariant 1: never
     /// silently drop a config field).
     pub fn new_with_filters(
         filters: Vec<ConfiguredHttpFilter>,
@@ -639,7 +636,7 @@ impl FilterChainHandler {
         self
     }
 
-    /// WP-23 increment 6b: attaches this HCM's `llm.client.token.usage`
+    /// Attaches this HCM's `llm.client.token.usage`
     /// recorder -- a builder method (not a constructor parameter) so every
     /// existing `new*` call site, in this crate and its dependents, is
     /// unaffected. `proxy-core`'s `build_hcm_handler` calls this for every
@@ -659,7 +656,7 @@ impl FilterChainHandler {
         self
     }
 
-    /// WP-51 increment 2: attaches this HCM's span sink and head-sampling
+    /// Attaches this HCM's span sink and head-sampling
     /// ratio -- a builder method, same shape and reasoning as
     /// [`Self::with_token_stats`] right above (every existing `new*` call
     /// site stays unaffected; `proxy-core`'s `build_hcm_handler` calls this
@@ -687,7 +684,7 @@ impl StreamHandler for FilterChainHandler {
     /// [`FilterManager::run`] hands back in [`LoggingBody`] when this HCM has
     /// `access_logs` configured.
     ///
-    /// This is where WP-24 chunk 3's access logging now lives (relocated
+    /// This is where access logging lives (relocated
     /// from `RouterHandler::handle_and_log`; see [`crate::access_logging`]'s
     /// module doc for why). The nesting is `LoggingBody(StreamingEncoder(...))`
     /// -- `LoggingBody` wraps OUTSIDE the encode filter chain's own body, not
@@ -791,7 +788,7 @@ impl StreamHandler for FilterChainHandler {
             if stream_info.borrow().metadata_lease.is_some() {
                 crate::capture_cleanup::register(&stream_info);
             }
-            // S10 (WP-10 increment 2b/2c): move the downstream `OnUpgrade`
+            // S10: move the downstream `OnUpgrade`
             // handle (if this request asked for one) off `req` and onto the
             // just-built `StreamInfo`, before `req` moves into `mgr.run(req)`
             // below. Rust note: `Option::take` both reads the handle out and
@@ -806,7 +803,7 @@ impl StreamHandler for FilterChainHandler {
             // exactly like every other piece of per-stream state it reads via
             // `DecoderCallbacks::stream_info()`.
             stream_info.borrow_mut().on_upgrade = req.on_upgrade.take();
-            // WP-51 increment 2: mint (or join) this stream's SERVER trace
+            // Mint (or join) this stream's SERVER trace
             // context right here, before any filter runs, so
             // `DecoderCallbacks::stream_info()` sees `trace` already set for
             // the whole decode/encode chain -- including the router
@@ -856,14 +853,14 @@ impl StreamHandler for FilterChainHandler {
 
             // The wrap is what runs `finish()` at end-of-stream, and `finish()`
             // does TWO jobs: it renders the access log AND it records the
-            // LLM_CLIENT_TOKEN_USAGE instrument (WP-23 increment 6b). Gating
+            // LLM_CLIENT_TOKEN_USAGE instrument. Gating
             // it on access loggers alone meant a listener that configured
             // `llmproxy.usage` for token metrics but no `access_log` recorded no
             // tokens at all -- the stat was wired end to end and then skipped by
             // the one branch that decides whether anything runs. Neither reason
             // implies the other, so this is an OR.
             //
-            // WP-51 increment 2: `self.tracing.is_some()` joins the OR for
+            // `self.tracing.is_some()` joins the OR for
             // the identical reason -- the SERVER span (if this stream is
             // sampled) is also only known complete at end-of-stream, and
             // `LoggingBody::finish` is that one place, same as the other two
@@ -907,7 +904,7 @@ impl StreamHandler for FilterChainHandler {
             HttpResponseParts {
                 head: resp.head,
                 body: local_boxed(LoggingBody::new(resp.body, log_ctx)),
-                // S10 (WP-10 increment 2b/2c): preserved, not dropped -- a
+                // S10: preserved, not dropped -- a
                 // `101` tunnel response must keep carrying both `OnUpgrade`
                 // handles through this outermost wrap (access logging is
                 // orthogonal to the tunnel: it logs the `101` head/empty
@@ -953,7 +950,7 @@ struct DirectionState {
     /// of the status is that the stream is no longer known to be over, and
     /// that is a fact about the stream, not about one filter's view of it.
     dont_end_stream: bool,
-    /// WP-11 chunk 4 (I3): the decode direction's out-of-band resume signal
+    /// The decode direction's out-of-band resume signal
     /// — what [`DecoderCallbacksAdapter::continue_handle`] hands out
     /// (wrapped in a [`DecodeContinueHandle`]) and what
     /// [`wait_for_decode_resume`] parks on. One per direction, not one per
@@ -1073,7 +1070,7 @@ struct ChainCtx {
     /// newly reachable. [`DecoderCallbacksAdapter::clear_route_cache`] resets
     /// this to `None` to force a re-resolution.
     route: Option<Arc<RouteEntry>>,
-    /// ADR-0004 step 4 increment 2: this HCM's resolved `typed_per_filter_config`
+    /// ADR-0004: this HCM's resolved `typed_per_filter_config`
     /// (see [`PerRouteTable`]). `None` for a standalone/test invocation with
     /// no table attached (e.g. most direct `FilterManager` tests) --
     /// `per_route_config()` then always returns `None`, the same shape
@@ -1089,7 +1086,7 @@ struct ChainCtx {
     response_headers_forwarded: bool,
     /// S2.5: `send_local_reply` was called after `response_headers_forwarded`
     /// was already set. We can't express a real stream reset through the body
-    /// seam yet (TODO WP-11 chunk 4) — [`StreamingEncoder::poll_frame`]
+    /// seam yet (TODO) — [`StreamingEncoder::poll_frame`]
     /// checks this and terminates the body with a [`crate::handler::BodyError`]
     /// instead of silently ignoring the call.
     reset_after_headers: bool,
@@ -1110,14 +1107,14 @@ struct ChainCtx {
     /// clones this `Rc` out of `ChainCtx` before `run()` ever takes
     /// ownership (see that call site), and reads it back through the clone.
     request_headers_snapshot: Rc<RefCell<Option<RequestSnapshot>>>,
-    /// WP-45 increment 2a: once set, request headers have already reached
+    /// Once set, request headers have already reached
     /// the terminal, and [`DecoderCallbacksAdapter::modify_decoded_headers`]
     /// becomes a no-op returning `false` — see that method's doc. Set by
     /// [`FilterManager::run`] right after the decode filter chain
     /// (`drive_decode`) returns, exactly the point configured decoder
     /// filters stop getting a say over what the terminal forwards upstream.
     decoded_headers_forwarded: bool,
-    /// WP-11 chunk 4 (design C): the decode direction's high-watermark
+    /// The decode direction's high-watermark
     /// signal — set once a filter's own buffered bytes exceed `buffer_limit`
     /// while that filter is in one of the `*AndWatermark` statuses (see
     /// [`check_decode_overflow`]). `Rc<RefCell<..>>`, not a plain `bool` on
@@ -1174,7 +1171,7 @@ impl ChainCtx {
     }
 
     /// Attach the resolved `typed_per_filter_config` this stream reads
-    /// through `per_route_config()` (ADR-0004 step 4 increment 2). Same
+    /// through `per_route_config()` (ADR-0004). Same
     /// "separate builder, existing callers unaffected" shape as
     /// [`Self::with_route_table`].
     fn with_per_route(mut self, per_route: Arc<PerRouteTable>) -> Self {
@@ -1243,7 +1240,7 @@ fn resolve_and_cache_route(ctx: &mut ChainCtx) -> Option<Arc<RouteEntry>> {
     }
 }
 
-/// ADR-0004 step 4 increment 2: resolve `filter_index`'s most specific
+/// ADR-0004: resolve `filter_index`'s most specific
 /// `typed_per_filter_config` entry for the CALLING filter's stream —
 /// shared by [`DecoderCallbacksAdapter::per_route_config`] and
 /// [`EncoderCallbacksAdapter::per_route_config`]. Resolving the route here
@@ -1387,7 +1384,7 @@ impl FilterManager {
                         .await;
                 }
                 Err(RequestCollectionError::Body(err)) => {
-                    // WP-24 `DC`: a `BodyError::Downstream` means the CLIENT's
+                    // `DC`: a `BodyError::Downstream` means the CLIENT's
                     // connection failed while its request body was being read --
                     // Envoy's "downstream connection termination". Any other
                     // variant is a malformed body, which is a plain 400 with no
@@ -1440,7 +1437,7 @@ impl FilterManager {
             return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
         }
 
-        // WP-45 increment 2a: configured decoder filters have now had their
+        // Configured decoder filters have now had their
         // say (`drive_decode` returned) — from here on the terminal handles
         // the request, so `modify_decoded_headers` must stop taking effect
         // (see `ChainCtx::decoded_headers_forwarded`'s doc).
@@ -1520,7 +1517,7 @@ impl FilterManager {
             let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
             terminal.respond(&mut cb).await
         };
-        // S10 (WP-10 increment 2b/2c): `upgrade` is carried straight through
+        // S10: `upgrade` is carried straight through
         // to this function's own return below, past the encode header phase
         // and the `StreamingEncoder` wrap -- it's set only by the router
         // terminal's own `101` path, and every encoder filter still gets to
@@ -1745,7 +1742,7 @@ enum StopKind {
     /// header phase: "nothing (headers/data/trailers) proceeds past this
     /// filter" — unlike plain `StopIteration`'s S2.2 gotcha, this filter's own
     /// data callbacks do NOT fire either. Bytes just accumulate silently;
-    /// nothing here re-invokes the filter (TODO WP-11 chunk 4: needs an
+    /// nothing here re-invokes the filter (TODO: needs an
     /// out-of-band `continue_encoding()` to ever release, which isn't modeled
     /// yet — this position simply absorbs the rest of the stream).
     StopAll,
@@ -1841,7 +1838,7 @@ struct HeaderHoldOutcome {
 /// past this filter" means not even this filter's own data callbacks fire —
 /// there is no S2.2 gotcha for stop-all, so we don't try to resolve it here at
 /// all; the position is marked `StopAll` and absorbs the rest of the stream
-/// (TODO WP-11 chunk 4: only an out-of-band `continue_encoding()` should be
+/// (TODO: only an out-of-band `continue_encoding()` should be
 /// able to release it, which isn't modeled yet).
 ///
 /// Frames consumed while resolving a `StopIteration` hold must not be lost,
@@ -1949,7 +1946,7 @@ async fn encode_headers_phase(
                                     .into_trailers()
                                     .expect("hyper::body::Frame is data or trailers");
                                 // Trailers arrived before the hold resolved.
-                                // TODO(WP-11 chunk 4): Envoy would stall/reset
+                                // TODO: Envoy would stall/reset
                                 // here rather than giving up on the hold; we
                                 // forward the headers as-is and let the
                                 // streaming body deliver the final
@@ -1967,7 +1964,7 @@ async fn encode_headers_phase(
                             return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
                         }
                         None => {
-                            // TODO(WP-11 chunk 4): Envoy would stall/reset the
+                            // TODO: Envoy would stall/reset the
                             // stream rather than force headers out with an
                             // unresolved hold; we forward as-is.
                             ctx.encode.positions[p].stop = Some(StopKind::Buffering);
@@ -2039,7 +2036,7 @@ struct StreamingEncoder {
     /// through the chain) has already run.
     end_flush_done: bool,
     /// After the end-of-stream flush, the next position (in `0..n`) whose
-    /// leftover buffer still needs flushing to the caller (TODO WP-11 chunk 4:
+    /// leftover buffer still needs flushing to the caller (TODO:
     /// a filter stalled forever past end-of-stream should reset the stream
     /// instead; we can't express that through the body seam yet, so we flush
     /// the bytes rather than drop them). One `poll_frame` call flushes at most
@@ -2395,14 +2392,14 @@ impl Body for StreamingEncoder {
         let this = self.get_mut();
 
         // S2.5: `send_local_reply` was called after response headers were
-        // already forwarded. TODO(WP-11 chunk 4): the correct Envoy behavior
+        // already forwarded. TODO: the correct Envoy behavior
         // is a stream RESET, which we have no primitive for through the body
         // seam yet — terminate the body with an error instead of silently
         // pretending nothing happened.
         if this.ctx.reset_after_headers {
             return Poll::Ready(Some(Err(BodyError::Upstream(
                 "send_local_reply() was called after response headers were already forwarded; \
-                 this should reset the stream (TODO WP-11 chunk 4), but no reset primitive \
+                 this should reset the stream (TODO), but no reset primitive \
                  exists yet, so the response is being terminated with an error instead"
                     .into(),
             ))));
@@ -2515,7 +2512,7 @@ impl Body for StreamingEncoder {
 
             // A filter that is still stopped never continued, even on the
             // end-of-stream flush above.
-            // TODO(WP-11 chunk 4): a filter that stalls past end-of-stream
+            // TODO: a filter that stalls past end-of-stream
             // should reset the downstream stream; we cannot express a reset
             // through the body seam yet. For now, flush whatever the manager
             // buffered so the bytes aren't silently dropped -- one position
@@ -2564,7 +2561,7 @@ impl Drop for StreamingEncoder {
     }
 }
 
-/// WP-11 chunk 4 (design C): the shared decode buffer-limit check. Overflow
+/// The shared decode buffer-limit check. Overflow
 /// while `is_watermark` is `true` (the callback that just ran returned one of
 /// the `*AndWatermark` statuses) records
 /// [`ChainCtx::decode_high_watermark`] and keeps buffering instead of
@@ -2587,7 +2584,7 @@ fn check_decode_overflow(
     }
 }
 
-/// WP-11 chunk 4 (design B, I3): park the decode driver on the direction's
+/// Park the decode driver on the direction's
 /// out-of-band resume signal — the only place decode genuinely stalls the
 /// stream (a `StopAllIterationAndBuffer`/`Watermark` hold whose own data
 /// callback also declined to continue) rather than falling through.
@@ -2595,7 +2592,7 @@ fn check_decode_overflow(
 /// # What this buys, and what it does not
 ///
 /// An unresumed `StopAll*` hold now holds the stream **forever**: there is
-/// still no HCM `stream_idle_timeout` inheritance (WP-13) to bound it. That
+/// still no HCM `stream_idle_timeout` inheritance to bound it. That
 /// is Envoy's own layering — the idle timeout, not the filter manager, is
 /// what caps a stalled stream — but it is a real hazard for anything driving
 /// this code path without one configured. **Any caller that can reach this
@@ -2634,7 +2631,7 @@ async fn wait_for_decode_resume(ctx: &ChainCtx) {
 /// (`HttpFilter::poll_pending`) instead of only "wait for `continue_decoding()`".
 /// See [`poll_async_resumption`] for the shared retry policy both call sites use.
 ///
-/// WP-11 chunk 4 (design B): a `StopAllIterationAndBuffer`/`Watermark` header
+/// A `StopAllIterationAndBuffer`/`Watermark` header
 /// hold that the filter's own data callback also declines to continue is no
 /// longer treated as "give up and fall through" — it genuinely stalls this
 /// `async fn`'s future (see [`wait_for_decode_resume`]) until
@@ -2677,7 +2674,7 @@ async fn drive_decode(
         // immediately before this filter runs -- see `sync_route_head`'s doc
         // for why this can't be done once, up front, for the whole chain.
         sync_route_head(ctx, head);
-        // WP-45 increment 2b: `head` is reborrowed as the `headers` parameter
+        // `head` is reborrowed as the `headers` parameter
         // below, so `cb` is built with `::new` (no stored head borrow) — a
         // filter running `decode_headers` already has direct `&mut` access
         // through that parameter and can't be handed a second live `&mut` to
@@ -2754,7 +2751,7 @@ async fn drive_decode(
                 // Headers held at `idx`. Deliver the (buffered) data to this same
                 // filter; if it continues, resume header delivery at the next.
                 //
-                // WP-11 chunk 4 (design B): only a StopAll* header status
+                // Only a StopAll* header status
                 // (never plain `StopIteration`) makes this a genuine stall
                 // if the filter's own data callback also declines to
                 // continue -- see `deliver_decode_data`'s `is_stop_all`
@@ -2840,7 +2837,7 @@ async fn drive_decode(
 /// that always reports more pending work — must not spin the decode chain
 /// forever; once a filter exceeds this many resumptions we fail closed
 /// (a local reply) instead of hanging. Chosen generously: legitimate async
-/// filters (e.g. `ext_authz`, WP-32) resolve in one resumption per callback
+/// filters (e.g. `ext_authz`) resolve in one resumption per callback
 /// invocation, not a loop of their own.
 const MAX_ASYNC_RESUMPTIONS_PER_FILTER: u32 = 16;
 
@@ -2903,7 +2900,7 @@ async fn poll_async_resumption(
 /// struct isn't a clean win here (the borrows are all short-lived reborrows
 /// scoped to individual calls within `drive_decode`, not one value that
 /// outlives the whole function), so this just accepts the extra parameter.
-/// `&mut` (not `&`, WP-45 increment 2a): `decode_data`/`decode_trailers` have
+/// `&mut` (not `&`): `decode_data`/`decode_trailers` have
 /// no `headers` parameter of their own, so — unlike `decode_headers` — `cb`
 /// CAN be built with a genuine live borrow of `head` here
 /// (`DecoderCallbacksAdapter::with_head`), and `modify_decoded_headers`
@@ -2914,7 +2911,7 @@ async fn poll_async_resumption(
 /// `decode_data` also be offered an async resumption before this falls back
 /// to "stopped, wait for `continue_decoding()`" — see [`poll_async_resumption`].
 ///
-/// WP-11 chunk 4 (design B): `is_stop_all` is `true` exactly when `idx`'s
+/// `is_stop_all` is `true` exactly when `idx`'s
 /// `decode_headers` returned `StopAllIterationAndBuffer`/`Watermark` — i.e.
 /// this call is resolving a StopAll hold, not a plain `StopIteration` one
 /// (`false` from every trailing-phase call: see that call site's doc). When
@@ -2943,7 +2940,7 @@ async fn deliver_decode_data(
     // `decode_headers` call.
     sync_route_head(ctx, head);
     let end_stream = trailers.is_none();
-    // WP-11 chunk 4 (I3): once an out-of-band `continue_decoding()` has
+    // Once an out-of-band `continue_decoding()` has
     // released a StopAll hold, the NEXT loop iteration must not re-invoke
     // `decode_data` -- it already ran once and declined; the out-of-band
     // signal itself is what "continues" it now. This flag is what lets one
@@ -2958,7 +2955,7 @@ async fn deliver_decode_data(
         let continued = if resumed_out_of_band {
             true
         } else {
-            // WP-45 increment 2b: `head` has no competing borrow here (no
+            // `head` has no competing borrow here (no
             // `headers` parameter on `decode_data`), so `cb` holds the real
             // borrow directly — no clone, no splice-back.
             let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
@@ -2996,7 +2993,7 @@ async fn deliver_decode_data(
             if let Some(t) = trailers {
                 ctx.decode.current_idx = idx;
                 sync_route_head(ctx, head);
-                // WP-45 increment 2b: same real-borrow pattern -- no
+                // Same real-borrow pattern -- no
                 // `headers` parameter on `decode_trailers` either.
                 //
                 // S2.4 (chunk 4): reset `continue_requested` right before the
@@ -3039,7 +3036,7 @@ async fn deliver_decode_data(
             return Ok(false);
         }
 
-        // WP-11 chunk 4 (design B): a StopAll hold with no synchronous or
+        // A StopAll hold with no synchronous or
         // async resolution left genuinely stalls now, rather than giving up.
         // See `wait_for_decode_resume`'s doc for the hazard this trades in
         // (an unresumed hold blocks forever) and why every caller reaching
@@ -3096,7 +3093,7 @@ fn drain_decode_injections(
             // S2.8: same refresh as elsewhere -- an injected chunk's
             // recipient can call `route()` too.
             sync_route_head(ctx, head);
-            // WP-45 increment 2b: same real-borrow pattern as
+            // Same real-borrow pattern as
             // `deliver_decode_data` -- `decode_data` has no `headers`
             // parameter to alias.
             let mut cb = DecoderCallbacksAdapter::with_head(ctx, head);
@@ -3123,7 +3120,7 @@ fn drain_decode_injections(
 
 /// Borrows only [`ChainCtx`]; never the filter list (module doc).
 ///
-/// `head` (WP-45 increment 2b): an optional genuine live borrow of the
+/// `head`: an optional genuine live borrow of the
 /// request head, handed in by call sites that have one to give (everywhere
 /// EXCEPT the `decode_headers` call site — see
 /// [`DecoderCallbacks::modify_decoded_headers`]'s doc for why that one
@@ -3175,7 +3172,7 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
             // S2.5: once response headers have already gone out, a NEW
             // response can't be sent — Envoy resets the stream instead. We
             // have no reset primitive through the body seam yet
-            // (TODO(WP-11 chunk 4): plumb a real stream reset), so the best
+            // (TODO: plumb a real stream reset), so the best
             // we can do without silently ignoring the call is terminate the
             // response body with an error; `StreamingEncoder::poll_frame`
             // checks this flag and surfaces it.
@@ -3221,7 +3218,7 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
     }
 
     fn continue_handle(&mut self) -> DecodeContinueHandle {
-        // WP-11 chunk 4 (I3): wired to the direction's REAL resume signal —
+        // Wired to the direction's REAL resume signal —
         // unlike the trait's default (a throwaway `Notify` nobody awaits),
         // this is the one `wait_for_decode_resume` actually parks on.
         DecodeContinueHandle::new(self.ctx.decode.resume.clone())
@@ -3256,13 +3253,13 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
     }
 
     fn modify_decoded_headers(&mut self, f: &mut dyn FnMut(&mut RequestHeaders)) -> bool {
-        // WP-45 increment 2a: "already forwarded" == the decode filter chain
+        // "already forwarded" == the decode filter chain
         // has finished and the terminal is (or is about to be) handling the
         // request -- see `ChainCtx::decoded_headers_forwarded`'s doc.
         if self.ctx.decoded_headers_forwarded {
             return false;
         }
-        // WP-45 increment 2b: `self.head` is `None` exactly when this
+        // `self.head` is `None` exactly when this
         // adapter was built with `::new` -- either the calling filter is
         // `decode_headers` itself (which already has a direct `&mut
         // RequestHeaders` parameter and can't also be handed this one; see
@@ -3387,8 +3384,7 @@ async fn collect_request(
     // `downstream` is only used by `FilterChainHandler::handle` (XFF/S9,
     // access-log peer address), all of which runs before `FilterManager::run`
     // is even called -- this function only needs head + body. `on_upgrade`
-    // is always `None` by the time it reaches here (S10, WP-10 increment
-    // 2b/2c): `FilterChainHandler::handle` already moved it onto the shared
+    // is always `None` by the time it reaches here (S10): `FilterChainHandler::handle` already moved it onto the shared
     // `StreamInfo` before calling `mgr.run(req)`, which is what lets the
     // router terminal read it back out later without this function -- or any
     // decode filter in between -- needing to know upgrades exist at all.
@@ -3398,7 +3394,7 @@ async fn collect_request(
         downstream: _,
         on_upgrade: _,
     } = req;
-    // WP-24: the error is propagated rather than flattened to `()`. It used
+    // The error is propagated rather than flattened to `()`. It used
     // to be discarded here, which is what made `DC` unreachable -- by the
     // time the caller saw the failure there was nothing left to say whether
     // the client had gone away or the body was merely malformed.

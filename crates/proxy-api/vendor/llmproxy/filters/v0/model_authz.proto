@@ -1,6 +1,4 @@
-// Per-tenant model allow-lists for the llm-proxy data plane. See
-// `internal-docs/IMPLEMENTATION_PLAN.md`'s "3a" and "The load-bearing seam"
-// sections -- normative for this filter.
+// Per-tenant model allow-lists for the llm-proxy data plane.
 //
 // Vendored for its own sake, same reasoning as `auth.proto`: a per-tenant
 // allow-list is a REPEATED STRUCTURED record (tenant, access mode, patterns),
@@ -70,8 +68,8 @@ message OnlyModels {
   // Each entry is either an exact model name (e.g. `gpt-4o`), or a name
   // ending in exactly one trailing `*` glob (e.g. `gpt-4*`, which matches
   // `gpt-4o`, `gpt-4-turbo`, and the literal string `gpt-4` itself). No other
-  // wildcard or regex syntax is supported -- see the design brief's 3a
-  // section ("do not invent a regex surface"). A `*` anywhere other than the
+  // wildcard or regex syntax is supported (deliberately no regex
+  // surface). A `*` anywhere other than the
   // final character, or more than one `*`, is rejected at config load with
   // its dotted field path.
   //

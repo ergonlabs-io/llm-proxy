@@ -1,8 +1,6 @@
-//! WP-50 increment 3c-iii-b / WP-64 — wires [`crate::spend`]'s price table,
+//! Wires [`crate::spend`]'s price table,
 //! tenant/key spend accumulator and budgets into a real decode/encode
-//! `HttpFilter`: `llmproxy.spend_limit`. See
-//! `internal-docs/IMPLEMENTATION_PLAN.md`'s "3c-iii" section, normative
-//! here.
+//! `HttpFilter`: `llmproxy.spend_limit`.
 //!
 //! # The check/record split is inherent, not a shortcut -- restated from
 //! `token_limit_filter`, for money
@@ -90,13 +88,12 @@
 //! [`crate::control::ControlPlane::store`]. That matters concretely: with
 //! `store: persistent` configured on `llmproxy.auth`, a key's accrued
 //! spend survives a restart along with its budget, and only the unflushed
-//! window (bounded by the flush interval) is lost -- the crash-refund the
-//! design brief documents.
+//! window (bounded by the flush interval) is lost -- the crash-refund.
 //!
 //! A private store here would have been the quiet failure. Budgets would
 //! persist while SPEND reset to zero on every restart, so a monthly ceiling
-//! would be escapable by bouncing the proxy, and 3c-ii-b's entire
-//! persistence path (`add_spend`/`load_spend` on redb, additive writes,
+//! would be escapable by bouncing the proxy, and the entire
+//! spend persistence path (`add_spend`/`load_spend` on redb, additive writes,
 //! restart-resume) would be wired to nothing while still passing its own
 //! tests.
 //! # Loud on unreadable usage, but never fail-closed -- restated from
@@ -164,7 +161,7 @@ fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigEr
 /// legal (see [`PriceTable::cost_of`]'s "unpriced" semantic), not an error.
 /// A malformed ENTRY (empty `cluster`, empty `model`, or a price string
 /// [`parse_micro_usd`] rejects) is a hard `Err` naming its own dotted path,
-/// per ground rule #1.
+/// per AGENTS.md invariant 1.
 fn parse_pricing(config: &DynamicMessage) -> Result<PriceTable, ConfigError> {
     let mut table = PriceTable::new();
 
@@ -242,9 +239,9 @@ fn parse_pricing(config: &DynamicMessage) -> Result<PriceTable, ConfigError> {
 /// Reads `typed_config.default_period` (a `Period` enum) -- `PERIOD_UNSPECIFIED`
 /// (proto3's implicit zero, and an absent field reads the same way) means
 /// `MONTHLY`, per the proto's own doc; any other value this build's
-/// descriptor pool does not recognize is a hard `Err`, per ground rule #1 --
+/// descriptor pool does not recognize is a hard `Err`, per AGENTS.md invariant 1 --
 /// silently treating an unrecognized enum number as a default would be
-/// exactly the kind of "config means one thing, does another" ground rule #1
+/// exactly the kind of "config means one thing, does another" AGENTS.md invariant 1
 /// exists to catch.
 fn parse_default_period(config: &DynamicMessage) -> Result<Period, ConfigError> {
     let raw = config
@@ -281,7 +278,7 @@ fn parse_flush_interval(config: &DynamicMessage) -> Duration {
 
 /// Reads `typed_config.reconciliation_bound_seconds` and
 /// `typed_config.on_reconciliation_expired` into a [`ReconciliationPolicy`]
-/// (WP-62, ADR-0006 §5).
+/// (ADR-0006 §5).
 ///
 /// `0` seconds means [`spend::DEFAULT_RECONCILIATION_BOUND`], per the proto's
 /// own doc -- same "a visibility knob may default" reasoning as
@@ -292,7 +289,7 @@ fn parse_flush_interval(config: &DynamicMessage) -> Duration {
 /// tightening the policy later is a config change rather than a redesign,
 /// but neither is implemented -- so selecting one is a load error naming the
 /// field's full dotted path. Accepting it and behaving as `ALLOW` would be
-/// silently ignoring a config field, which ground rule 1 calls a P0 bug, and
+/// silently ignoring a config field, which AGENTS.md invariant 1 calls a P0 bug, and
 /// it would fail in the worst direction: an operator who deliberately asked
 /// for the strict behaviour would get the permissive one and no indication.
 fn parse_reconciliation(config: &DynamicMessage) -> Result<ReconciliationPolicy, ConfigError> {
@@ -342,7 +339,7 @@ fn parse_reconciliation(config: &DynamicMessage) -> Result<ReconciliationPolicy,
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override --
-/// this increment has no per-route config; the trait default
+/// this filter has no per-route config; the trait default
 /// (`ConfigError::Unimplemented`) is correct.
 #[derive(Default)]
 pub struct SpendLimitFilterFactory;
@@ -386,7 +383,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
             ));
         }
 
-        // WP-50 3c-iii-b: resolve the SAME `ControlPlane` singleton
+        // Resolve the SAME `ControlPlane` singleton
         // `llmproxy.auth`'s factory registers -- see `model_authz_filter`'s
         // identical resolution and its module doc for why this is `ctx.get`
         // (never `get_or_try_init`: this filter has none of a fresh
@@ -454,8 +451,8 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         //
         // The accumulator flushes into the SAME store the operator configured
         // on `llmproxy.auth` (`typed_config.store`), reached through
-        // `ControlPlane::store()`. A private store here would leave 3c-ii-b's
-        // whole persistence path wired to nothing and reset every tenant's
+        // `ControlPlane::store()`. A private store here would leave the
+        // whole spend persistence path wired to nothing and reset every tenant's
         // accrued spend on restart -- a ceiling an operator could escape by
         // bouncing the proxy.
         let store = control_plane.store();
@@ -519,7 +516,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
 /// The pieces every worker building the SAME chain must share -- see
 /// `create`'s doc for why both live behind ONE `SharedFactoryState` slot.
 ///
-/// `pub` (crossing the crate boundary) because WP-50 increment 3c-iv's admin
+/// `pub` (crossing the crate boundary) because the admin
 /// spend read (`proxy-admin`) downcasts to this exact type: what is
 /// registered under [`TYPE_URL`] in [`proxy_http::filter::SharedFactoryState`]
 /// is THIS wrapper, never a bare `Arc<SpendAccumulator>` -- an admin-side
@@ -897,10 +894,10 @@ impl HttpFilter for SpendLimitFilterInstance {
         //
         // Counted, not refused: ADR-0006 §5's `on_reconciliation_expired`,
         // of which only `Allow` is implemented -- a metering hiccup must not
-        // start refusing traffic (rule 17). The counter and the flusher's
+        // start refusing traffic (AGENTS.md "Fail-open controls"). The counter and the flusher's
         // warning are what make the over-admission VISIBLE rather than
         // silent, which is the whole difference between this and the
-        // fail-open bug rule 17 was written for.
+        // fail-open bug AGENTS.md "Fail-open controls" was written for.
         //
         // Deliberately after the deny check, so a replica that has already
         // burned the budget on its OWN traffic still returns 429 while
@@ -909,7 +906,7 @@ impl HttpFilter for SpendLimitFilterInstance {
         //
         // Deliberately inside the `Some(budget)` path: a tenant with no
         // ceiling cannot be over-admitted, so counting it would bury the
-        // real signal (rule 17: only where the control was meant to apply).
+        // real signal (AGENTS.md "Fail-open controls": only where the control was meant to apply).
         match self.accumulator.reconciliation_policy().on_expired {
             OnReconciliationExpired::Allow => {
                 self.accumulator.note_admission(now);
@@ -975,7 +972,7 @@ impl HttpFilter for SpendLimitFilterInstance {
 ///   works today: a fully static bootstrap does not carry a node id into the
 ///   IR at all.
 /// - Passing the empty string through fails OPEN and SILENTLY, which is the
-///   one outcome this whole work package exists to prevent.
+///   one outcome this whole filter exists to prevent.
 ///
 /// Synthesising loses nothing. A unique id cannot collide, so no flush is
 /// ever dropped as another replica's replay; the only property given up is
@@ -1213,7 +1210,7 @@ mod tests {
         assert_eq!(parse_flush_interval(&msg), Duration::from_secs(30));
     }
 
-    // --- WP-62: the reconciliation policy (ADR-0006 §5) --------------------
+    // --- the reconciliation policy (ADR-0006 §5) --------------------
 
     #[test]
     fn zero_reconciliation_bound_means_the_stated_default() {
@@ -1249,7 +1246,7 @@ mod tests {
         );
     }
 
-    /// Ground rule 1: a declared-but-unimplemented behaviour is a LOAD
+    /// AGENTS.md invariant 1: a declared-but-unimplemented behaviour is a LOAD
     /// ERROR naming its full dotted path, never a silent downgrade to the
     /// permissive policy. This is the one direction the failure must not
     /// take -- an operator who asked for DENY and silently got ALLOW would
@@ -1583,11 +1580,11 @@ mod tests {
         }
     }
 
-    // --- WP-62: over-admission while stale ---------------------------------
+    // --- over-admission while stale ---------------------------------
 
     /// A stale replica keeps serving (only `Allow` is implemented), and
     /// every admission it makes under a CONFIGURED budget is counted, so
-    /// the bypass is visible instead of silent (rule 17).
+    /// the bypass is visible instead of silent (AGENTS.md "Fail-open controls").
     ///
     /// Mutation: delete the `note_admission` call in `decode_headers`.
     #[test]
@@ -1615,7 +1612,7 @@ mod tests {
     }
 
     /// A tenant with NO ceiling cannot be over-admitted, so its requests
-    /// must not be counted -- rule 17's "only warn where the control was
+    /// must not be counted -- AGENTS.md "Fail-open controls" rule: "only warn where the control was
     /// actually meant to apply". Counting them would bury the real signal
     /// under whatever share of traffic happens to be unbudgeted.
     ///
@@ -2372,7 +2369,7 @@ mod tests {
         );
     }
 
-    // --- loud on unreadable usage (rule 17) -----------------------------
+    // --- loud on unreadable usage (AGENTS.md "Fail-open controls") -----------------------------
 
     struct WarnCapture {
         count: std::sync::atomic::AtomicUsize,

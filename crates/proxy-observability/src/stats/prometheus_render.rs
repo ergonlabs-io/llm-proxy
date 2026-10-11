@@ -1,5 +1,5 @@
 //! Renders a [`Registry`] into Prometheus text exposition
-//! format. See `internal-docs/IMPLEMENTATION_PLAN.md`'s Decision 4 for the naming
+//! format. See `stats.rs` Decision 4 for the naming
 //! rules this module implements, and [`envoy_render`](super::envoy_render)
 //! for the sibling renderer this one deliberately does *not* copy the shape
 //! of (see "Names vs. labels" below).
@@ -10,13 +10,13 @@
 //! name segment (`upstream_rq` `{cluster, status_class="2xx"}` becomes the
 //! name `cluster.<cluster>.upstream_rq_2xx`) because Envoy's flat `/stats`
 //! text format has no concept of a label. Prometheus does, so that expansion
-//! is not needed here and — per the design brief's Decision 4 — must not be
+//! is not needed here and — per `stats.rs` Decision 4 — must not be
 //! copied over: **every attribute becomes a label**, and the metric name is
 //! just the instrument's own (sanitized, `envoy_`-prefixed) name. This is
 //! also why, unlike `envoy_render`, this renderer has **no per-instrument
 //! name table and omits nothing** — `llm.*` (no Envoy `/stats` text
 //! equivalent at all) renders here exactly like `upstream_rq` does, which is
-//! the module doc's point 2 for Decision 4: those instruments "exist in
+//! Decision 4, point 2 in `stats.rs`: those instruments "exist in
 //! Prometheus/OTLP output only".
 //!
 //! # Name and label sanitization — confirmed against Envoy's own source
@@ -74,9 +74,7 @@
 //! # What this module does not do
 //!
 //! No periodic flush, no `?filter=`/`?histogram_buckets=` query parameters,
-//! no protobuf exposition format, no OpenMetrics. All out of scope per the
-//! design brief's "what this brief does not decide" and this module's own
-//! scope.
+//! no protobuf exposition format, no OpenMetrics. All out of scope for this module.
 
 use std::collections::BTreeMap;
 

@@ -1,9 +1,8 @@
-//! WP-34 (Lane H) — provider usage/token extraction.
+//! Provider usage/token extraction.
 //!
 //! This module answers one question: **how many tokens did this response
 //! cost?** It is the input to token-based rate limiting (the budget store and
-//! the 429 enforcement path, both later chunks) and to the GenAI token
-//! counters in WP-33.
+//! the 429 enforcement path) and to the GenAI token counters.
 //!
 //! # Why this is a pure-function module
 //!
@@ -14,7 +13,7 @@
 //!
 //! # The hard requirement: streaming-safe, never buffer the stream
 //!
-//! WP-33 guarantees flush-through on the encode path — tokens reach the client
+//! The encode path guarantees flush-through — tokens reach the client
 //! as they arrive. So usage extraction may **not** accumulate the response
 //! body to parse it at the end. [`SseUsageScanner`] is fed whatever byte chunks
 //! happen to arrive and must retain only a bounded amount of state (at most one
@@ -31,9 +30,8 @@
 //! OpenAI Responses, and Anthropic Messages), streaming and non-streaming, and
 //! the full acceptance suite below runs in the CI gate.
 //!
-//! Not yet done: this module is a pure extractor with no `HttpFilter` wrapper,
-//! so nothing calls it on real traffic. Wiring it into the encode chain is
-//! WP-33.
+//! This module is a pure extractor; [`crate::usage_filter`] wires it into the
+//! encode chain.
 
 /// Tokens consumed by one request/response exchange, split into the buckets
 /// that are **priced differently** so downstream cost accounting can apply a
@@ -90,7 +88,7 @@ impl TokenUsage {
 ///
 /// Kept as an enum rather than a trait because the set of dialects is small,
 /// closed, and known at config time; adding a variant should force every
-/// `match` in this module to be updated (ground rule #1's spirit: no silent
+/// `match` in this module to be updated (AGENTS.md invariant 1's spirit: no silent
 /// fallthrough).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
@@ -540,7 +538,7 @@ fn merge_line(target: &mut Option<TokenUsage>, dialect: Dialect, line: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    //! The WP-34 acceptance suite. Every test runs in the CI gate; they are
+    //! The acceptance suite. Every test runs in the CI gate; they are
     //! ordered easiest to hardest, which is also the order they were made to
     //! pass. Add a failing test here first when extending a dialect.
 
@@ -548,7 +546,7 @@ mod tests {
 
     // ---- token_count: a present-but-unparseable count must never read as 0 --
     //
-    // WP-48 (re-scoped): `serde_json::Value::as_u64()` returns `None` for any
+    // `serde_json::Value::as_u64()` returns `None` for any
     // JSON number that isn't a non-negative integer -- including an ordinary
     // `150.0`, which real providers emit -- and that `None` used to become a
     // silent `0` two calls downstream. These are table-driven per the case
@@ -717,7 +715,7 @@ mod tests {
         );
     }
 
-    // ---- WP-48: a present-but-unparseable count must never read as 0 ------
+    // ---- a present-but-unparseable count must never read as 0 ------
     //
     // End-to-end (through `extract_json_usage`, not just `token_count`
     // directly): a full OpenAI-shaped `usage` object with float counts must
@@ -802,7 +800,7 @@ mod tests {
         assert_eq!(usage.total(), 70);
     }
 
-    /// WP-48 end-to-end: an Anthropic `usage` object with float counts must
+    /// End-to-end: an Anthropic `usage` object with float counts must
     /// still produce the right `TokenUsage`, all four buckets included.
     #[test]
     fn anthropic_json_usage_with_float_counts() {
@@ -852,7 +850,7 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
     }
 
-    /// WP-48 end-to-end: an OpenAI Responses `usage` object with float
+    /// End-to-end: an OpenAI Responses `usage` object with float
     /// counts, cached-token subtraction included -- 14.0 - 4.0 = 10, not 0.
     #[test]
     fn openai_responses_json_usage_with_float_counts() {

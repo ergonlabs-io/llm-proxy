@@ -21,7 +21,7 @@ publish = false
 # instead would report all six as unused -- keep them here.
 [dev-dependencies]
 # Path deps into the real crates -- this is a TEST of the real client, never
-# a reimplementation of its protocol logic (ground rule: protos/xDS logic
+# a reimplementation of its protocol logic (AGENTS.md invariant 2: protos/xDS logic
 # stay inside proxy-config/proxy-xds; this crate only calls their public API).
 proxy-xds = { path = "../../crates/proxy-xds" }
 proxy-api = { path = "../../crates/proxy-api" }

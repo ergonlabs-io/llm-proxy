@@ -7,10 +7,10 @@ license.workspace = true
 [dependencies]
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
-# WP-13: threads the shared ClusterManager through the listener manager into
+# Threads the shared ClusterManager through the listener manager into
 # the HTTP router terminal.
 proxy-cluster = { workspace = true }
-# WP-33a (Lane H): the usage/token filter, registered into the shared
+# The usage/token filter, registered into the shared
 # FilterRegistry below so a `typed_config` can reach it.
 proxy-filters = { workspace = true }
 proxy-xds = { workspace = true }
@@ -19,7 +19,7 @@ bytes = { workspace = true }
 core_affinity = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
-# WP-51 increment 2: `SpanSink`/`TraceContext` -- the listener manager threads
+# `SpanSink`/`TraceContext` -- the listener manager threads
 # these down to `build_hcm_handler` alongside `RouterStats`/`GenAiTokenStats`.
 proxy-observability = { workspace = true }
 prost-reflect = { workspace = true }
@@ -39,11 +39,11 @@ hyper = { workspace = true }
 http-body-util = { workspace = true }
 proxy-xds = { workspace = true, features = ["test-support"] }
 proxy-api = { workspace = true }
-# WP-23 increment 6a: test helpers build a `StatsControl` to resolve the
+# Test helpers build a `StatsControl` to resolve the
 # `RouterStats` `initial_bind`/`build_listener_hcm` now require -- production
 # code only ever consumed `proxy_http::stat_handles::RouterStats`, already
 # reachable via the `proxy-http` dependency above, so this stayed dev-only
-# until WP-51 increment 2 promoted `proxy-observability` itself to a real
+# until `proxy-observability` became a real
 # `[dependencies]` entry above (`SpanSink`/`TraceContext`); kept here too
 # would be a duplicate-key error, not a stricter dev-only bound.
 rcgen = { workspace = true }

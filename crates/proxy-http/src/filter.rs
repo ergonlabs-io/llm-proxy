@@ -1,9 +1,9 @@
 //! The HTTP filter API — a Rust mirror of Envoy's `envoy/http/filter.h`, with the
-//! exact iteration semantics specified in internal-docs/IMPLEMENTATION_PLAN.md Appendix S2.
+//! exact iteration semantics specified in internal-docs/envoy-semantics.md S2.
 //!
-//! This is a frozen shared surface (ground rule #4): the filter manager (WP-11),
-//! the router (WP-13), the WP-31/32 filter batches, and the Lane H LLM filters all
-//! code against these types. Changing a signature here requires cross-lane review.
+//! This is a frozen shared surface (AGENTS.md invariant 8): the filter manager,
+//! the router, the other HTTP filters, and the LLM filters all
+//! code against these types. Changing a signature here requires cross-crate review.
 //!
 //! Rust note: we model Envoy's C++ virtual-method filter classes as *traits*
 //! (Rust's interfaces). A filter instance is held as `Box<dyn HttpFilter>` — a
@@ -105,7 +105,7 @@ pub struct BufferedBody(pub BytesMut);
 pub type HeaderMutationFn = Box<dyn FnOnce(&mut HeaderMap) + Send>;
 
 /// A cloneable handle that resumes a decode-direction `StopAll*` hold from
-/// OUTSIDE callback context (WP-11 chunk 4 — S2.2's "out-of-band continue"
+/// OUTSIDE callback context (S2.2's "out-of-band continue"
 /// case, the one thing [`DecoderCallbacks::continue_decoding`] can't do,
 /// since that method only exists on the callbacks borrow, which does not
 /// outlive the callback that received it). A filter that stops all
@@ -180,13 +180,12 @@ pub trait DecoderCallbacks {
     fn continue_decoding(&mut self);
 
     /// A cloneable handle that can call the equivalent of
-    /// [`Self::continue_decoding`] from OUTSIDE callback context (WP-11
-    /// chunk 4) — see [`DecodeContinueHandle`]'s doc for the whole
+    /// [`Self::continue_decoding`] from OUTSIDE callback context — see [`DecodeContinueHandle`]'s doc for the whole
     /// out-of-band-continue story.
     ///
     /// Rust note: defaulted (like [`Self::modify_decoded_headers`] and
     /// [`EncoderCallbacks::per_route_config`]) so existing test-double
-    /// implementors of this trait outside this increment's scope keep
+    /// implementors of this trait outside the filter manager keep
     /// compiling — the default builds a handle over its OWN throwaway
     /// `Notify` that nothing ever awaits, so calling `continue_decoding()`
     /// on it is a harmless no-op rather than a compile break. The real
@@ -209,7 +208,7 @@ pub trait DecoderCallbacks {
     fn modify_decoding_buffer(&mut self, f: &mut dyn FnMut(&mut BytesMut));
 
     /// Mutate request headers that have not yet been forwarded upstream
-    /// (WP-45 increment 2a — the seam a decode filter needs to fix up
+    /// (the seam a decode filter needs to fix up
     /// `content-length` after splicing bytes into the body, since that's a
     /// case `modify_decoding_buffer` alone can't cover).
     ///
@@ -220,17 +219,17 @@ pub trait DecoderCallbacks {
     /// Returns `false` and does nothing if the headers have already been
     /// sent, so a late caller is a no-op rather than a silent lie. It ALSO
     /// returns `false` and does nothing when called from **`decode_headers`
-    /// itself** (WP-45 increment 2b): `decode_headers` already hands the
+    /// itself**: `decode_headers` already hands the
     /// filter a direct `&mut RequestHeaders` parameter that IS the request
     /// head, and Rust's aliasing rules mean this callback cannot also hold a
     /// second live `&mut` to that same value while the filter is still
     /// holding the first one — there is no clone-free way to give both
     /// access at once, and a clone-based workaround is exactly what
-    /// reintroduced the increment 2a data-loss bug this increment fixes (see
+    /// reintroduced a data-loss bug (a stale pre-callback clone spliced back over a direct mutation; see
     /// `filter_manager::tests::probe_direct_and_seam_mutations_coexist`). A
     /// filter running in `decode_headers` should mutate its `headers`
     /// parameter directly instead — it needs no seam there. `decode_data`
-    /// and `decode_trailers` (WP-45's actual case: the decision to splice
+    /// and `decode_trailers` (the real use case: the decision to splice
     /// body bytes, and so the need to fix up `content-length`, is only made
     /// once body bytes have been scanned) have no such parameter and DO get
     /// the real working borrow.
@@ -243,8 +242,8 @@ pub trait DecoderCallbacks {
     ///
     /// Rust note: defaulted to a no-op returning `false` (unlike most of this
     /// trait, and like [`EncoderCallbacks::per_route_config`]'s default) —
-    /// `DecoderCallbacks` already has test-double implementors outside this
-    /// increment's scope that this change must not force edits onto; the
+    /// `DecoderCallbacks` already has test-double implementors outside the
+    /// filter manager that this change must not force edits onto; the
     /// real adapter (`filter_manager::DecoderCallbacksAdapter`) overrides
     /// this with the actual mutation.
     fn modify_decoded_headers(&mut self, _f: &mut dyn FnMut(&mut RequestHeaders)) -> bool {
@@ -264,8 +263,7 @@ pub trait DecoderCallbacks {
     fn clear_route_cache(&mut self);
 
     /// The most specific `typed_per_filter_config` entry that applies to the
-    /// CALLING filter for this stream's route, or `None` (ADR-0004 step 4
-    /// increment 2).
+    /// CALLING filter for this stream's route, or `None` (ADR-0004).
     ///
     /// Specificity, most to least (Envoy's `mostSpecificPerFilterConfig`):
     /// route > virtual host > route configuration. Resolving this resolves
@@ -310,8 +308,8 @@ pub trait EncoderCallbacks {
     ///
     /// Rust note: defaulted to `None` (unlike every other method here, and
     /// unlike [`DecoderCallbacks::per_route_config`], which has no default) —
-    /// `EncoderCallbacks` already has test-double implementors outside this
-    /// increment's scope (`proxy-filters`, `proxy-core`) that this change
+    /// `EncoderCallbacks` already has test-double implementors outside the
+    /// filter manager (`proxy-filters`, `proxy-core`) that this change
     /// must not force edits onto; the real adapter
     /// (`filter_manager::EncoderCallbacksAdapter`) overrides this with the
     /// actual resolution.
@@ -503,7 +501,7 @@ pub trait PerRouteConfig: Send + Sync {
 /// two listeners (or two chains on one listener) that both configure the same
 /// filter collide: the first chain to build wins the slot, and the second
 /// chain's own parsed config is silently discarded in favor of the first's
-/// (found on the auth path — ground rule #1). `scope` is the chain identity
+/// (found on the auth path — AGENTS.md invariant 1). `scope` is the chain identity
 /// (`FactoryContext::scope`, set from `build_hcm_handler`'s own `context`
 /// parameter); every filter built for one chain shares one scope, so
 /// cross-filter reads within a chain (e.g. `model_authz` reading `auth`'s
@@ -514,7 +512,7 @@ pub trait PerRouteConfig: Send + Sync {
 /// chain build (`format!(...)` in `build_hcm_handler`'s caller), so nothing
 /// `'static` is available to borrow.
 ///
-/// WP-50 3c-ii-a: a second map, `by_name`, indexes the SAME `Arc`s by
+/// A second map, `by_name`, indexes the SAME `Arc`s by
 /// `(stat_prefix, type_url)` — see [`FactoryContext`]'s doc for why `scope`
 /// and `stat_prefix` are two different identities, not one renamed. Both
 /// maps are populated together in `get_or_try_init`; nothing is ever in one
@@ -626,7 +624,7 @@ impl SharedFactoryState {
     /// [`FactoryContext`]'s doc for the split. `None` if no chain named
     /// `stat_prefix` has registered a singleton for `type_url` -- ambiguity
     /// cannot happen here the way it can for `get_across_scopes`, because
-    /// `proxy-config`'s lowering (Lane H) rejects a duplicate `stat_prefix`
+    /// `proxy-config`'s lowering rejects a duplicate `stat_prefix`
     /// among chains that register an admin-addressable singleton, so at most
     /// one chain can ever occupy this key.
     pub fn get_by_name(
@@ -652,8 +650,8 @@ impl SharedFactoryState {
     /// - `Err(scopes)` — MORE THAN ONE scope has registered a singleton under
     ///   this `type_url` (e.g. two listeners each configuring `llmproxy.auth`
     ///   with different keys). Returning an arbitrary one here would let an
-    ///   admin write land in the wrong tenant's control plane (ground rule
-    ///   #1); `scopes` names every chain identity that registered one so the
+    ///   admin write land in the wrong tenant's control plane (AGENTS.md
+    ///   invariant 1); `scopes` names every chain identity that registered one so the
     ///   caller can say so instead of guessing.
     pub fn get_across_scopes(
         &self,
@@ -686,8 +684,8 @@ impl SharedFactoryState {
 /// singleton slot ([`SharedFactoryState`]) plus this build's TWO chain
 /// identities; a stateless filter ignores all three.
 ///
-/// WP-50 3c-ii-a split these into two fields with two different jobs, per
-/// `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing follows Envoy":
+/// These are two fields with two different jobs (addressing follows Envoy:
+/// positional internals vs. an operator-supplied name):
 /// - **`scope`** KEYS singletons. It is positional, internal, and always
 ///   unique per chain build, even for two chains that would otherwise be
 ///   indistinguishable (same listener config repeated, same `stat_prefix`).
@@ -696,17 +694,17 @@ impl SharedFactoryState {
 /// - **`stat_prefix`** NAMES a chain externally. It is the HCM's
 ///   operator-supplied `stat_prefix` (`ir.rs:283`), already required and
 ///   already rendered in `/config_dump`. It is what admin URLs
-///   (`/chains/{stat_prefix}/...`) and persisted rows (WP-50 3c-ii-b) key by,
+///   (`/chains/{stat_prefix}/...`) and persisted rows key by,
 ///   because it is stable under reordering and human-chosen -- but it is
 ///   only enforced unique among chains that register an admin-addressable
-///   singleton (`proxy-config`'s Lane H check), so a filter that never calls
+///   singleton (`proxy-config`'s lowering check), so a filter that never calls
 ///   `get_by_name` must never assume it is unique.
 ///
 /// A reader adding a new call site: singleton lifetime and cross-filter reads
 /// within one chain use `scope` (via `get`/`get_or_try_init`); anything
 /// exposed outside the process (an admin endpoint, a spend row) uses
 /// `stat_prefix` (via `get_by_name`).
-/// TODO(WP-11): stats scope, runtime.
+/// TODO: stats scope, runtime.
 #[derive(Default)]
 pub struct FactoryContext {
     pub shared: Arc<SharedFactoryState>,
@@ -763,7 +761,7 @@ pub trait FilterInstanceFactory: Send + Sync {
 
 /// One registered filter implementation, keyed by its Envoy extension type URL
 /// (e.g. `type.googleapis.com/envoy.extensions.filters.http.router.v3.Router`).
-/// Lane H extensions register under `type.llmproxy.dev/...`.
+/// LLM extensions register under `type.llmproxy.dev/...`.
 pub trait HttpFilterFactory: Send + Sync {
     fn parse_ext_authz_per_route(
         &self,
@@ -807,7 +805,7 @@ pub trait HttpFilterFactory: Send + Sync {
 }
 
 /// Registry mapping extension type URLs to factories — mirrors Envoy's extension
-/// registry; used identically by bootstrap parsing and xDS (WP-11).
+/// registry; used identically by bootstrap parsing and xDS.
 #[derive(Default)]
 pub struct FilterRegistry {
     factories: HashMap<&'static str, Arc<dyn HttpFilterFactory>>,
@@ -965,7 +963,7 @@ mod tests {
         );
     }
 
-    /// WP-50 3c-ii-a: `get_by_name` resolves the same `Arc` `get` returns for
+    /// `get_by_name` resolves the same `Arc` `get` returns for
     /// the matching scope, and a DIFFERENT `stat_prefix` finds nothing --
     /// this is the property the admin server's scoped endpoints
     /// (`/chains/{stat_prefix}/...`) depend on to land a write in the right

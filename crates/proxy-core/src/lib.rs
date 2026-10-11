@@ -1,6 +1,6 @@
-//! Runtime core: control/worker runtimes and config propagation (WP-06),
-//! listener manager + filter-chain matching (WP-07), transport sockets (WP-08),
-//! and the L4 network filter framework (WP-09).
+//! Runtime core: control/worker runtimes and config propagation,
+//! listener manager + filter-chain matching, transport sockets,
+//! and the L4 network filter framework.
 
 pub mod drain;
 pub mod filter_chain;
@@ -20,7 +20,7 @@ use proxy_config::ConfigSnapshot;
 
 /// How each worker sees configuration. The control runtime builds immutable
 /// snapshots and `store`s them; workers `load` on connection accept (and react to
-/// a `watch` ping for listener socket add/remove — WP-06).
+/// a `watch` ping for listener socket add/remove).
 ///
 /// In-flight connections keep their `Arc<ConfigSnapshot>` clone, which is what
 /// gives Envoy-style drain semantics: old config lives exactly as long as the

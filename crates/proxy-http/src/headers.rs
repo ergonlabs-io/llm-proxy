@@ -1,15 +1,15 @@
-//! Appendix S9 — header sanitization & standard mutations (binds WP-13).
+//! envoy-semantics.md S9 — header sanitization & standard mutations.
 //!
 //! Pure, synchronous header transforms only: every function here takes an
 //! `&mut http::HeaderMap` (plus whatever small bits of context it needs) and
 //! returns nothing async, does no I/O, and never reaches into
-//! `proxy_config::ir`. WP-13 (the router) is the caller that will thread
+//! `proxy_config::ir`. The router is the caller that threads
 //! config values (`use_remote_address`, `xff_num_trusted_hops`, ...) and the
 //! live connection's remote address/transport into these functions.
 //!
 //! ⚠️ marks below correspond 1:1 to the `⚠️` marks in S9 of
-//! `internal-docs/IMPLEMENTATION_PLAN.md`: the plan itself says "verify against Envoy docs"
-//! at these points. Where the plan text does not resolve the ambiguity, the
+//! `internal-docs/envoy-semantics.md`: the text itself says "verify against Envoy docs"
+//! at these points. Where the semantics text does not resolve the ambiguity, the
 //! choice made here is written down next to the `⚠️`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -248,8 +248,8 @@ pub fn splitmix64(state: &mut u64) -> u64 {
 /// `8`/`9`/`a`/`b` per RFC 4122). This function implements the *mechanism* —
 /// `traced` selects `b` (Envoy's "traced" marker) vs. a plain RFC-4122
 /// variant nibble drawn from the RNG (`8`/`9`/`a`) when untraced — but no
-/// caller in this crate has a tracing decision to feed it yet (WP-13/router
-/// doesn't exist, and distributed tracing isn't wired up anywhere in the
+/// caller in this crate has a tracing decision to feed it yet (the router
+/// has none to pass, and distributed tracing isn't wired up anywhere in the
 /// data plane at this point). Every current caller should pass `false`,
 /// which is a documented divergence from Envoy's parity behavior, not a
 /// silent omission: once tracing lands, plumbing its sampling decision into

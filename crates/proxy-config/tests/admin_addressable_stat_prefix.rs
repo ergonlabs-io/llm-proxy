@@ -1,11 +1,11 @@
-//! WP-50 3c-ii-a: a duplicate HCM `stat_prefix` is a config error ONLY among
+//! A duplicate HCM `stat_prefix` is a config error ONLY among
 //! chains that configure `llmproxy.auth` -- the only filter an admin
 //! endpoint addresses by name today (`SharedFactoryState::get_by_name`,
 //! `proxy-admin`'s `/chains/{stat_prefix}/...`). Envoy itself tolerates a
 //! duplicate `stat_prefix` everywhere (it merges stats), so a duplicate
 //! among chains that register no admin-addressable singleton must stay
-//! legal -- see `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing
-//! follows Envoy" and `lower::check_admin_addressable_stat_prefixes`'s doc.
+//! legal (addressing follows Envoy) -- see
+//! `lower::check_admin_addressable_stat_prefixes`'s doc.
 
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
 

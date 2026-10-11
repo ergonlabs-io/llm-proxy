@@ -1,5 +1,5 @@
 //! Custom `rustls` server-cert verifiers implementing Envoy-parity behavior
-//! that the stock `webpki` verifiers don't provide out of the box (WP-08).
+//! that the stock `webpki` verifiers don't provide out of the box.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -76,7 +76,7 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 }
 
 /// `SanMatcherIR`/`StringMatcherIR` don't derive `Clone` in the IR (its
-/// public shape is frozen outside WP-08 chunk A) -- the two verifier wrappers
+/// public shape is frozen outside this module) -- the two verifier wrappers
 /// below need to own their matcher list past the borrowed `&ValidationContextIR`
 /// that `DownstreamTlsFactory::build`/`UpstreamTlsFactory::build` only see for
 /// the duration of the call, so this rebuilds an owned copy field-by-field.
@@ -353,7 +353,7 @@ impl ServerCertVerifier for HostnameBypassServerCertVerifier {
             )?,
         };
 
-        // Ground rule #1: SAN matching only runs after (real or bypassed)
+        // AGENTS.md invariant 1: SAN matching only runs after (real or bypassed)
         // chain-trust success -- an unauthenticated SAN check is meaningless.
         if !self.san_matchers.is_empty() {
             check_san_matchers(end_entity, &self.san_matchers)?;

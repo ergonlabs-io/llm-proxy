@@ -67,7 +67,7 @@ const KEY_REVOKED: &str = "llmp_e2e-revoked-key";
 const UNKNOWN_KEY: &str = "llmp_e2e-never-configured";
 
 /// The credential the CLUSTER injects via `io.llmproxy.provider_auth`
-/// metadata (ground rule #6: per-provider credentials belong on the cluster,
+/// metadata (AGENTS.md invariant 6: per-provider credentials belong on the cluster,
 /// never the route). Test 5 asserts the upstream sees exactly this and never
 /// a virtual key.
 const PROVIDER_KEY: &str = "sk-real-provider-credential-e2e";
@@ -167,7 +167,7 @@ static_resources:
               runtime_key: openai
           - name: llmproxy.token_limit
             typed_config:
-              # WP-47 compatibility fixture: real-binary coverage for the
+              # Compatibility fixture: real-binary coverage for the
               # one-release decoder of the old borrowed token-limit type.
               '@type': type.llmproxy.dev/envoy.config.core.v3.RateLimitSettings
               fill_rate: {fill_rate}
@@ -393,7 +393,7 @@ async fn no_authorization_header_gets_401_and_the_upstream_is_never_contacted() 
 }
 
 /// 5. The upstream sees the PROVIDER credential, never the virtual key. This
-/// is an acceptance criterion and ground rule #6: a per-provider credential belongs
+/// is an acceptance criterion and AGENTS.md invariant 6: a per-provider credential belongs
 /// on the cluster (the member actually dialled), never the route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_upstream_sees_the_provider_credential_never_the_virtual_key() {
@@ -535,7 +535,7 @@ async fn two_virtual_keys_on_the_same_tenant_share_one_token_budget() {
     assert_eq!(
         second.status, 429,
         "a SECOND live key belonging to the SAME tenant must be denied once the tenant's \
-         shared budget is exhausted -- got {}: {}. Before WP-50 this second, distinct \
+         shared budget is exhausted -- got {}: {}. Previously this second, distinct \
          `authorization` header value would have drawn a fresh budget instead of sharing \
          the exhausted one.",
         second.status, second.body

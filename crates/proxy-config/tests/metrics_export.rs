@@ -1,4 +1,4 @@
-//! WP-51 increment 4 acceptance, config half: OTLP metric export is
+//! Acceptance, config half: OTLP metric export is
 //! configured, validated, and lowered entirely independently of OTLP *trace*
 //! export.
 //!
@@ -13,7 +13,7 @@
 //! Same shape as `tests/tracing.rs` (see its module doc): the strict-parse ->
 //! PGV -> IR pipeline a hand-written Envoy config goes through, so a config
 //! that sets neither surface must be completely unaffected, and every malformed
-//! shape is a hard error carrying its full dotted path (ground rule #1), never
+//! shape is a hard error carrying its full dotted path (AGENTS.md invariant 1), never
 //! a silent skip.
 
 use std::time::Duration;
@@ -137,7 +137,7 @@ node:
 
 /// A namespace that is present but not an object is a hard error. Silently
 /// treating a malformed metrics block as "metrics off" is the exact failure
-/// mode ground rule #1 exists to prevent: the operator wrote the block, so
+/// mode AGENTS.md invariant 1 exists to prevent: the operator wrote the block, so
 /// something must have been meant by it.
 #[test]
 fn non_object_namespace_is_a_hard_error() {
@@ -218,7 +218,7 @@ node:
     );
 }
 
-/// Ground rule #1: a missing endpoint is a hard error naming the exact field,
+/// AGENTS.md invariant 1: a missing endpoint is a hard error naming the exact field,
 /// not a namespace silently treated as absent.
 #[test]
 fn missing_otlp_endpoint_is_a_hard_error() {
@@ -249,7 +249,7 @@ node:
 
 /// An unknown key under the namespace is a hard error. The reflective surface
 /// walk cannot see into a `Struct`, so this hand-written parse is the only
-/// place ground rule #1 can be enforced for it -- a typo'd `interval:` must not
+/// place AGENTS.md invariant 1 can be enforced for it -- a typo'd `interval:` must not
 /// load as "export_interval not set" and then get the default.
 #[test]
 fn unknown_key_under_the_metrics_namespace_is_a_hard_error() {

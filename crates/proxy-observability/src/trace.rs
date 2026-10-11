@@ -2,7 +2,7 @@
 //! `traceparent` parsing/serialization. Pure library code — nothing here is
 //! wired into the request path yet, and nothing here is an OTLP wire type.
 //! A later change maps [`FinishedSpan`] to `opentelemetry.proto.trace`
-//! (vendored in `proxy-api`); ground rule #2 keeps that
+//! (vendored in `proxy-api`); AGENTS.md invariant 2 keeps that
 //! proto on the far side of the exporter, never handled by the data plane.
 //!
 //! # Two independent pieces

@@ -1,6 +1,6 @@
-//! WP-24 chunk 3: proves access logs actually emit -- rendered lines land in
+//! Proves access logs actually emit -- rendered lines land in
 //! the configured sink, honoring `AccessLogIR.filter`, and (the mistake this
-//! chunk exists to catch) a streamed response's line carries the *final*
+//! file exists to catch) a streamed response's line carries the *final*
 //! byte count and a duration covering the whole stream, not just the time to
 //! response headers.
 //!
@@ -102,7 +102,7 @@ fn forward_to(cluster: &str) -> ForwardAction {
     }
 }
 
-/// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved for
+/// A fresh, single-worker [`RouterStats`] resolved for
 /// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
 /// mirroring how `crates/proxy/src/main.rs` builds the real one from the
 /// boot config snapshot's cluster names.
@@ -393,10 +393,10 @@ async fn unknown_cluster_records_and_renders_the_nc_flag() {
             resp.body.collect().await.unwrap();
 
             let logged = read_to_string(&path);
-            // WP-58: `cluster_not_found` -- a wholly unknown cluster name --
+            // `cluster_not_found` -- a wholly unknown cluster name --
             // is distinct from `cluster_not_warmed` (a registered cluster
             // that's never completed its first resolution; see
-            // `response_flags.rs`'s WP-58 tests for that case), even though
+            // `response_flags.rs`'s never-warmed tests for that case), even though
             // both render the same `NC` short code.
             assert_eq!(logged, "503 NC cluster_not_found\n");
 

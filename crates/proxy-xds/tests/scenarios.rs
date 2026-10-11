@@ -1,5 +1,4 @@
-//! WP-20 increment 5: the five acceptance scenarios named by WP-20's own
-//! **Acceptance** bullet -- {ACK, NACK-recover, reconnect-resync,
+//! The five ADS acceptance scenarios -- {ACK, NACK-recover, reconnect-resync,
 //! spurious-nonce, out-of-order-response} -- run against
 //! `testing/controlplane`'s `ScriptedAds` harness over a real loopback
 //! socket, the same model `tests/client.rs` and
@@ -20,9 +19,9 @@
 //! | out-of-order-response  | [`an_lds_response_before_cds_is_still_acked_independently_of_arrival_order`] (added here) | `types_keep_independent_version_and_nonce_state` (proves independent state, not ordering over a wire) |
 //!
 //! Rust note: every test bounds its wait with `tokio::time::timeout` or the
-//! shared `wait_for_log_len` poll helper (rule 14 -- a hang must fail loudly,
+//! shared `wait_for_log_len` poll helper (AGENTS.md "Build And Test", Hangs -- a hang must fail loudly,
 //! not stall) and runs on a `multi_thread` runtime, and every ephemeral
-//! socket comes from `Harness::spawn` binding `127.0.0.1:0` (rule 15).
+//! socket comes from `Harness::spawn` binding `127.0.0.1:0` (AGENTS.md "Running The Product").
 
 use std::time::{Duration, Instant};
 
@@ -66,7 +65,7 @@ fn always_accept() -> proxy_xds::Validator {
 // NACK-recover: the recovery leg, over the wire.
 // ---------------------------------------------------------------------------
 
-/// WP-20's `NACK-recover` acceptance scenario, the half `tests/client.rs`
+/// The `NACK-recover` acceptance scenario, the half `tests/client.rs`
 /// left unproven over a socket: `reject_produces_a_nack_with_the_previous_version_and_new_nonce`
 /// stops at the NACK itself. S8's rule composes with a plain accept ("apply
 /// -> ACK(version, nonce)") once the bad response is behind it, and
@@ -154,7 +153,7 @@ async fn a_nack_is_followed_by_a_normal_accept_of_the_next_good_response() {
 // spurious-nonce
 // ---------------------------------------------------------------------------
 
-/// WP-20's `spurious-nonce` acceptance scenario. S8: "Requests must echo
+/// The `spurious-nonce` acceptance scenario. S8: "Requests must echo
 /// latest nonce; responses with stale nonce ignored (server-side concern;
 /// client behavior = respond to every response)."
 ///
@@ -240,7 +239,7 @@ async fn an_unrequested_second_response_is_still_answered_with_its_own_nonce() {
 // out-of-order-response
 // ---------------------------------------------------------------------------
 
-/// WP-20's `out-of-order-response` acceptance scenario. S8: "Ordering
+/// The `out-of-order-response` acceptance scenario. S8: "Ordering
 /// expectation (server-side, but client must tolerate any order):
 /// make-before-break CDS->EDS->LDS->RDS->removes; client must not
 /// crash/drop on out-of-order."

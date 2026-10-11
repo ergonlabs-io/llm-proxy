@@ -1,7 +1,7 @@
 //! Minimal request-body introspection.
 //!
 //! This crate needs exactly two facts out of a request body -- `stream` and
-//! `model` -- and the crate doc's ground rule is that the body is never
+//! `model` -- and the crate doc's rule is that the body is never
 //! retained past learning them. Keeping that parse as its own pure function
 //! (no I/O, no async) makes it unit-testable without a server, and keeps
 //! `handler.rs`'s body-reading code from also having to think about JSON

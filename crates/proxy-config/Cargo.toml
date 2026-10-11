@@ -21,7 +21,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 prost = { workspace = true }
-# Test-only: pins the three Lane-H filter type URLs that `lower.rs` duplicates
+# Test-only: pins the three llmproxy filter type URLs that `lower.rs` duplicates
 # as string literals rather than importing (see `check_lane_h_filter_order`).
 # `proxy-filters` depends on `proxy-config`, so the production dependency
 # cannot point this way -- a DEV-dependency cycle is legal in cargo and keeps

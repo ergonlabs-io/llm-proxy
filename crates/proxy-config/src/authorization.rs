@@ -1,4 +1,4 @@
-//! Protobuf-free WP-32 authorization boundary.
+//! Protobuf-free authorization boundary.
 use std::{
     collections::BTreeMap,
     future::Future,

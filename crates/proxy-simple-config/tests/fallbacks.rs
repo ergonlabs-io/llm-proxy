@@ -239,7 +239,7 @@ fn fallback_config_lowers_through_the_real_loader_to_an_aggregate() {
     }
 }
 
-/// Ground rule #6 regression guard: `protocol: http2` on the PRIMARY and the
+/// AGENTS.md invariant 6 regression guard: `protocol: http2` on the PRIMARY and the
 /// FALLBACK provider must still lower cleanly through the real loader even
 /// though the route itself targets an `envoy.clusters.aggregate` cluster --
 /// `typed_extension_protocol_options` belongs on each MEMBER provider

@@ -21,10 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/service/discovery/v3/ads.proto",
         "envoy/service/discovery/v3/discovery.proto",
         "envoy/service/secret/v3/sds.proto",
-        // Extensions we implement (their type URLs must resolve — WP-02 gate).
+        // Extensions we implement (their type URLs must resolve).
         "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto",
         "envoy/extensions/filters/http/router/v3/router.proto",
-        // WP-31: route-scoped CORS policy and local HTTP token buckets. These
+        // Route-scoped CORS policy and local HTTP token buckets. These
         // must be roots, not merely vendored files: the descriptor pool is
         // what lets strict lowering decode their Any payloads.
         "envoy/extensions/filters/http/cors/v3/cors.proto",
@@ -35,46 +35,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/extensions/filters/listener/tls_inspector/v3/tls_inspector.proto",
         "envoy/extensions/transport_sockets/tls/v3/tls.proto",
         "envoy/extensions/upstreams/http/v3/http_protocol_options.proto",
-        // Aggregate clusters (WP-35 provider fallback): the type URL under a
+        // Aggregate clusters (provider fallback): the type URL under a
         // `Cluster.cluster_type.typed_config` must resolve for the surface
         // walk to see inside it.
         "envoy/extensions/clusters/aggregate/v3/cluster.proto",
-        // WP-14 remainder: the built-in retry host predicate. Its empty
+        // The built-in retry host predicate. Its empty
         // typed config still has to be in the descriptor pool so strict
         // bootstrap parsing can distinguish it from an unknown extension.
         "envoy/extensions/retry/host/previous_hosts/v3/previous_hosts.proto",
-        // Access logging (WP-24): common AccessLog/AccessLogFilter types plus
+        // Access logging: common AccessLog/AccessLogFilter types plus
         // the two logger extensions we implement (file, stdout/stderr).
         "envoy/config/accesslog/v3/accesslog.proto",
         "envoy/extensions/access_loggers/file/v3/file.proto",
         "envoy/extensions/access_loggers/stream/v3/stream.proto",
-        // Lane-H (LLM) extensions we define ourselves, rather than borrowing an
-        // unrelated Envoy message -- WP-47 increment 1. Note this is the only
+        // LLM extensions we define ourselves, rather than borrowing an
+        // unrelated Envoy message -- the auth filter. Note this is the only
         // root NOT under `vendor/envoy`: `scripts/vendor-protos.sh` does not
         // manage it, because it is ours and is not re-fetched on a proto bump.
         "llmproxy/filters/v0/auth.proto",
-        // WP-47 increment 2: owned token-budget configuration.  The legacy
+        // Owned token-budget configuration.  The legacy
         // Envoy RateLimitSettings decoder remains registered for one release,
         // but new configs lower to this message.
         "llmproxy/filters/v0/token_limit.proto",
-        // WP-47 increment 3: owned usage dialect and pricing carrier. The
+        // Owned usage dialect and pricing carrier. The
         // legacy DataSource decoder remains registered for one release.
         "llmproxy/filters/v0/usage.proto",
-        // WP-47 increment 4: owned body-rewrite configuration. The legacy
+        // Owned body-rewrite configuration. The legacy
         // RuntimeFeatureFlag decoder remains registered for one release.
         "llmproxy/filters/v0/body_rewrite.proto",
-        // WP-50 increment 3a: per-tenant model allow-lists.
+        // Per-tenant model allow-lists.
         "llmproxy/filters/v0/model_authz.proto",
-        // WP-50 increment 3c-i: the spend-budget filter's (cluster, model)
+        // The spend-budget filter's (cluster, model)
         // price table.
         "llmproxy/filters/v0/spend.proto",
-        // WP-51 increment 3: OTLP export. The collector gRPC services; protoc
+        // OTLP export. The collector gRPC services; protoc
         // pulls the transitive trace/metrics/common/resource messages. We
         // hand-roll the exporter over these (build_client) and the in-test
         // mock collector over the generated servers (build_server), rather
-        // than pulling in the opentelemetry SDK crates -- see the WP-51 plan
-        // for why (the SDK's Send+Sync async providers fight the !Send data
-        // plane, ADR-0003; these plain prost/tonic types do not).
+        // than pulling in the opentelemetry SDK crates --
+        // the SDK's Send+Sync async providers fight the !Send data
+        // plane (ADR-0003); these plain prost/tonic types do not.
         "opentelemetry/proto/collector/trace/v1/trace_service.proto",
         "opentelemetry/proto/collector/metrics/v1/metrics_service.proto",
     ];

@@ -1,4 +1,4 @@
-//! L4 network filter seam (WP-09). Terminal filters (`tcp_proxy`, HCM) own the
+//! L4 network filter seam. Terminal filters (`tcp_proxy`, HCM) own the
 //! upstream; config validation must reject chains whose last filter is not
 //! terminal (matches Envoy).
 //!

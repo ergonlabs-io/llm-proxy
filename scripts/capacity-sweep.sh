@@ -34,8 +34,8 @@
 # concurrent streams -- and rig.rs's ceiling models only the latter, so it
 # does not catch this. Realistic per-stream duration is what keeps the
 # connect rate under budget, and it is also the traffic shape the whole
-# exercise is supposed to measure (IMPLEMENTATION_PLAN.md: "Include the LLM
-# traffic shape, not just RPC-shaped load").
+# exercise is supposed to measure (load must include the LLM
+# traffic shape, not just RPC-shaped load).
 #
 # AGENTS.md "Running The Product" applies to this script as much as to an agent: it
 # binds ports and starts long-lived processes. Do not run it concurrently

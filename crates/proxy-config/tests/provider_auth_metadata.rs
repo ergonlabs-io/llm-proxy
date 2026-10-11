@@ -1,4 +1,4 @@
-//! WP-35 increment 1b: `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
+//! `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
 //! -> `ClusterConfig.request_headers_to_add`. This is the surface the
 //! `llmproxy` dialect uses to smuggle provider credentials onto the CLUSTER
 //! (see `ClusterConfig::request_headers_to_add`'s doc comment in
@@ -8,7 +8,7 @@
 //!
 //! A hand-written Envoy config that never sets this namespace must be
 //! completely unaffected -- covered here alongside the malformed-shape
-//! cases, which must all be hard errors (ground rule #1).
+//! cases, which must all be hard errors (AGENTS.md invariant 1).
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -41,7 +41,7 @@ static_resources:
 
 /// `metadata` present, but no `io.llmproxy.provider_auth` namespace: still
 /// empty, and a namespace belonging to some other consumer must not trip
-/// the surface check (ground rule #1 rejects unknown *fields*, not unknown
+/// the surface check (AGENTS.md invariant 1 rejects unknown *fields*, not unknown
 /// map entries under an allowed field).
 #[test]
 fn unrelated_metadata_namespace_is_left_alone() {
@@ -105,7 +105,7 @@ static_resources:
 }
 
 /// A sub-key other than `headers` under the namespace is a hard error with
-/// its full dotted path -- ground rule #1: a typo here must never silently
+/// its full dotted path -- AGENTS.md invariant 1: a typo here must never silently
 /// mean "no auth header".
 #[test]
 fn unknown_sub_key_under_provider_auth_is_a_hard_error() {

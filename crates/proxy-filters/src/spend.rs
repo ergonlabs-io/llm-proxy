@@ -1,16 +1,16 @@
-//! WP-50 increment 3c-i — the spend-budget filter's price table, as a pure
-//! library. See `internal-docs/IMPLEMENTATION_PLAN.md`, normative here.
+//! The spend-budget filter's price table, as a pure
+//! library.
 //!
 //! This module answers exactly one question: **what did this request cost?**
 //! It does not touch `HttpFilter`, proto decoding, `StreamInfo`, or any
 //! accumulation over time — those are [`crate::model_authz`]'s pattern
 //! repeated for money: [`PriceTable`] and [`PriceTable::cost_of`] are the
-//! pure core, and a later increment (3c-ii/iii) builds the filter that reads
+//! pure core, and `spend_limit_filter` is the filter that reads
 //! `typed_config`, holds a shared accumulator, and enforces a ceiling.
 //!
 //! # Keyed on `(cluster, model)`, not `model` alone — AGENTS.md invariant 6
 //!
-//! This is the third documented instance of rule 6's hazard: a per-provider
+//! This is another instance of AGENTS.md invariant 6's hazard: a per-provider
 //! value attached to the ROUTE (or, equivalently, resolved by model name
 //! alone with no notion of which member served it) follows the routing
 //! decision instead of the connection. The same model name can be served by
@@ -20,8 +20,8 @@
 //! cluster served the request would bill the primary's rate for a request a
 //! fallback actually served, which is silently wrong billing that only shows
 //! up on failover — the same shape as the credential and `host_rewrite_literal`
-//! bugs rule 6 already names. [`PriceTable::cost_of`] therefore takes the
-//! cluster *actually dialled* (a later increment resolves this from
+//! bugs invariant 6 already names. [`PriceTable::cost_of`] therefore takes the
+//! cluster *actually dialled* (the filter resolves this from
 //! `StreamInfo::upstream_cluster`, never from the route) as a first-class,
 //! required-to-match input, not an afterthought.
 //!
@@ -32,7 +32,7 @@
 //! decimal strings (`"2.50"`) for operator readability; [`parse_micro_usd`]
 //! parses each one EXACTLY ONCE, at load, into a `u64`. Binary floating point
 //! does not round-trip decimal fractions — `0.1 + 0.2 != 0.3` in IEEE 754 —
-//! and a spend ceiling (3c-iii) compared against a value that drifted through
+//! and a spend ceiling compared against a value that drifted through
 //! repeated `f64` addition over millions of requests is an unreproducible
 //! wrong answer, in the one subsystem whose entire job is to be right about
 //! money. `f64` does not appear anywhere in this module; if a future edit
@@ -50,13 +50,12 @@
 //! # An unpriced `(cluster, model)` costs ZERO — and that is not the same as
 //! a configured `"0.00"` rate
 //!
-//! Owner decision (see the design brief): a model or cluster with no
+//! Owner decision: a model or cluster with no
 //! configured price is admitted and charged nothing, and this is the DEFINED
-//! semantic, not a fallback from a failure — consistent with ground rule 17's
+//! semantic, not a fallback from a failure — consistent with AGENTS.md "Fail-open controls"'s
 //! precedent that metering must not start refusing traffic. But "no price
 //! configured" and "price configured as zero" are different facts an operator
-//! may care to tell apart later (a 3c-ii/iii accumulator is expected to
-//! report an unpriced-request count and the distinct unpriced `(cluster,
+//! may care to tell apart later (the accumulator reports an unpriced-request count and the distinct unpriced `(cluster,
 //! model)` pairs, so a config gap stays discoverable without reading logs).
 //! [`Charge`] keeps them distinguishable: [`Charge::Unpriced`] is the former,
 //! [`Charge::Priced`]`(MicroUsd(0))` is the latter. Collapsing them into one
@@ -103,7 +102,7 @@ use crate::auth::{KeyId, TenantId};
 
 mod recovery;
 
-// WP-50 increment 3c-ii-b: UTC calendar-aligned period keys. `chrono` is
+// UTC calendar-aligned period keys. `chrono` is
 // already a workspace dependency (`proxy-cluster`, `proxy-observability`
 // use it); this crate had no prior need for wall-clock rendering.
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -273,7 +272,7 @@ pub enum Charge {
 /// Rust note: `by_cluster` is a `HashMap<String, HashMap<String,
 /// ModelPrices>>` -- nested, not a single `HashMap<(String, String),
 /// ModelPrices>`. [`PriceTable::cost_of`] is meant to run on every priced
-/// request once wired into a filter (3c-ii's hot path), and a flat
+/// request once wired into a filter (the hot path), and a flat
 /// tuple-keyed map cannot be looked up by two borrowed `&str`s without
 /// allocating a fresh owned `(String, String)` first -- a tuple's `Borrow`
 /// impl does not let two owned `String`s be matched against two `&str`s the
@@ -379,8 +378,7 @@ fn round_once(numerator: u128) -> u64 {
 }
 
 // ============================================================================
-// WP-50 increment 3c-ii-b -- periods, the accumulator, and the flusher.
-// Normative: `internal-docs/IMPLEMENTATION_PLAN.md`'s "3c-ii-b" section.
+// Periods, the accumulator, and the flusher.
 // ============================================================================
 //
 // [`PriceTable`] above answers "what did this request cost"; everything
@@ -406,10 +404,10 @@ fn round_once(numerator: u128) -> u64 {
 // its mutation pin computes the key from the flush's own "now" instead.
 //
 // # `record` takes its `Period` explicitly -- a per-call parameter, not a
-// per-accumulator constant (WP-50 3c-iii-b fixup)
+// per-accumulator constant
 //
-// This was a live defect between two merged increments, not a design
-// preference: [`TenantBudget`] (3c-iii-a) carries a budget's period PER
+// This is a correctness requirement, not a design
+// preference: [`TenantBudget`] carries a budget's period PER
 // TENANT, but this accumulator originally fixed ONE `Period` for its entire
 // lifetime and `record` used that fixed value unconditionally. A daily-budget
 // tenant and a monthly-budget tenant sharing one accumulator (the ordinary
@@ -419,7 +417,7 @@ fn round_once(numerator: u128) -> u64 {
 // wrong for every tenant configured with the other period.
 //
 // So `record` takes `period: Period` as an explicit argument -- the caller
-// (the 3c-iii-b enforcement filter) resolves the CALLING tenant's own
+// (the spend enforcement filter) resolves the CALLING tenant's own
 // `TenantBudget::period` (or, for a tenant with no budget at all, falls back
 // to [`Self::default_period`] purely so spend history still accrues
 // somewhere reportable) and passes it in per call. The constructor's
@@ -435,19 +433,18 @@ fn round_once(numerator: u128) -> u64 {
 // [`SpendAccumulator::current_total`] reads the in-memory bucket directly
 // and never consults, or waits on, anything the flusher has or has not
 // written. A slow or entirely dead flusher thread therefore cannot loosen a
-// ceiling a future enforcement filter (3c-iii) checks against
+// ceiling the enforcement filter checks against
 // `current_total` -- it can only make the STORED total (what a restart
 // resumes from) staler than it could be. Pinned by
 // `a_dead_flusher_does_not_change_current_total`.
 //
 // # The flush driver is a plain `std::thread`, not tokio
 //
-// See the design brief's "3c-ii architecture -- who drives the flush"
-// section for the three rejected alternatives (a tokio task from the
-// filter factory, an inline flush on the request path, `run_serve` polling
-// for the singleton). The short version: the data-plane runtime is
+// Three alternatives were rejected: a tokio task from the
+// filter factory, an inline flush on the request path, and `run_serve` polling
+// for the singleton. The short version: the data-plane runtime is
 // `!Send`/worker-local (ADR-0003), a redb write on the request path
-// violates 3b's rule outright, and `run_serve` cannot name a singleton
+// violates the no-store-I/O-on-the-request-path rule outright, and `run_serve` cannot name a singleton
 // nothing has published yet. [`SpendAccumulator`] is already
 // `Send + Sync` -- a `SharedFactoryState` singleton reached from every
 // worker -- so an independent OS thread needs no runtime and entangles
@@ -487,8 +484,8 @@ impl Period {
     }
 
     /// The UTC instant this period's CURRENT window ends (exclusive) -- the
-    /// next daily or monthly calendar boundary strictly after `now`. WP-50
-    /// increment 3c-iii-b's enforcement filter uses this (never the
+    /// next daily or monthly calendar boundary strictly after `now`. The
+    /// spend enforcement filter uses this (never the
     /// accumulator itself, which has no notion of a ceiling) to compute
     /// `x-ratelimit-reset`/`retry-after` on a 429: "how many seconds until
     /// this tenant's ceiling resets", the same calendar alignment
@@ -530,8 +527,7 @@ impl Period {
     }
 
     /// The UTC instant this period's CURRENT window STARTED -- the mirror of
-    /// [`Self::next_boundary`] (which names when it ENDS). Private: WP-50
-    /// 3c-iv's only consumer of a period's start is [`Self::window_rfc3339_now`]
+    /// [`Self::next_boundary`] (which names when it ENDS). Private: the only consumer of a period's start is [`Self::window_rfc3339_now`]
     /// below, which renders it as a string rather than handing back a raw
     /// `DateTime`.
     fn current_boundary(&self, now: DateTime<Utc>) -> DateTime<Utc> {
@@ -547,7 +543,7 @@ impl Period {
     }
 
     /// [`Self::key_for`] evaluated against the real wall clock
-    /// (`Utc::now()`) -- WP-50 increment 3c-iv's admin spend read
+    /// (`Utc::now()`) -- the admin spend read
     /// (`proxy-admin`) needs "what period is it right now" and has no
     /// `chrono` dependency of its own to build a `DateTime<Utc>` with; this
     /// answers that without requiring one.
@@ -596,10 +592,10 @@ impl PeriodKey {
 }
 
 // ============================================================================
-// WP-50 increment 3c-iii-a -- per-tenant budgets: storage and admin CRUD
-// only. This increment carries a configured ceiling through
+// Per-tenant budgets: storage and admin CRUD
+// only. A configured ceiling is carried through
 // `crate::control::ControlPlane`/`ControlPlaneStore` and out over the admin
-// API; CHECKING a request against it is 3c-iii-b's filter, out of scope here.
+// API; CHECKING a request against it is `spend_limit_filter`'s job.
 // ============================================================================
 
 /// A tenant's spend ceiling: at most `max_micros` per `period`. Carried on
@@ -610,7 +606,7 @@ impl PeriodKey {
 ///
 /// Mirrors [`crate::model_authz::ModelAccess::default`]'s reasoning exactly,
 /// restated for money: a budget is an opt-in ceiling, not a default-deny. If
-/// an absent budget meant "spend nothing", turning WP-50 3c-iii-b's
+/// an absent budget meant "spend nothing", turning the
 /// enforcement filter on would deny every tenant's very first request the
 /// moment an operator adds it to a chain -- that is an outage, not a safety
 /// property. Restriction is opt-in: an operator sets a ceiling when they want
@@ -654,7 +650,7 @@ pub struct TenantBudget {
 /// wired, so tightening the policy later is a config value rather than a
 /// redesign. `deny` and `degrade` are named in the config surface
 /// (`llmproxy.filters.v0.SpendLimit.on_reconciliation_expired`) and REJECTED
-/// at config load, which is the strict-config-mode answer (ground rule 1):
+/// at config load, which is the strict-config-mode answer (AGENTS.md invariant 1):
 /// an operator who asks for a behaviour this build does not implement gets a
 /// load error naming the field, never a silent downgrade to `Allow`.
 ///
@@ -715,7 +711,7 @@ pub struct ReconciliationPolicy {
 /// that silently changes with an unrelated knob is worse than a stated one.
 ///
 /// ADR-0006 §4 requires the three staleness bounds to be stated SEPARATELY.
-/// This one happening to equal WP-61's 60-second revocation bound is a
+/// This one happening to equal the 60-second revocation bound is a
 /// coincidence of both meaning "about a minute", not a shared constant: a
 /// deployment that tightens one has said nothing about the other.
 pub const DEFAULT_RECONCILIATION_BOUND: Duration = Duration::from_secs(60);
@@ -765,8 +761,7 @@ struct Bucket {
     next_seq: Option<u64>,
     /// Requests this period whose `(cluster, model)` had no configured
     /// price -- see [`Charge::Unpriced`]'s doc. Charged nothing, but kept
-    /// discoverable per the design brief's "the gap must stay discoverable"
-    /// requirement.
+    /// discoverable.
     unpriced_requests: u64,
     /// Distinct `(cluster, model)` pairs seen among this bucket's unpriced
     /// requests, capped at [`MAX_UNPRICED_PAIRS`].
@@ -816,7 +811,7 @@ struct Inner {
     /// period for.
     default_period: Period,
     buckets: Mutex<HashMap<(TenantId, PeriodKey), Bucket>>,
-    /// WP-50 increment 3c-iv: when [`Inner::flush_now`] last wrote every
+    /// When [`Inner::flush_now`] last wrote every
     /// bucket to the store WITHOUT ERROR, as Unix milliseconds, or
     /// [`NEVER_FLUSHED`] until the first such flush. A FAILED flush (see
     /// [`Inner::flush_now`]'s `first_err`) must NEVER advance this: it would
@@ -828,9 +823,9 @@ struct Inner {
     /// assuming it.
     ///
     /// Rust note: an atomic, not the `Mutex<Option<DateTime<Utc>>>` this was
-    /// before WP-62. Reading it moved onto the REQUEST path (see
+    /// originally. Reading it moved onto the REQUEST path (see
     /// [`SpendAccumulator::note_admission`], called once per admitted
-    /// request under a budget), and rule 17's "keep the suppression state
+    /// request under a budget), and AGENTS.md "Fail-open controls" rule: "keep the suppression state
     /// off the healthy hot path" rules out taking a lock there. `Relaxed`
     /// ordering throughout: this value guards nothing else, and a reader
     /// that sees the previous flush's timestamp is off by one flush
@@ -860,7 +855,7 @@ impl Inner {
     /// through this, so a `current_total` read before any `record` call in
     /// a fresh period still resumes from the store rather than reporting
     /// zero for spend that already happened -- the "restart resume"
-    /// property the design brief requires.
+    /// property.
     ///
     /// A load failure here must NOT lose the request it is servicing: this
     /// logs loudly and starts the bucket at zero rather than propagating an
@@ -912,7 +907,7 @@ impl Inner {
     /// added since. Adopting it into `base_micros` is what makes two
     /// accumulators sharing one store converge; an implementation that
     /// discards the return value still writes correctly and still enforces
-    /// against its own spend alone, which is the pre-WP-60 behaviour wearing
+    /// against its own spend alone, which is the old non-additive behaviour wearing
     /// a new signature.
     ///
     /// A bucket with NOTHING to add is flushed anyway, with a delta of zero.
@@ -1125,8 +1120,8 @@ struct Flusher {
     join: JoinHandle<()>,
 }
 
-/// [`SpendAccumulator::report`]'s return value -- everything WP-50 increment
-/// 3c-iv's admin spend read renders for one `(tenant, period)`. See that
+/// [`SpendAccumulator::report`]'s return value -- everything the
+/// admin spend read renders for one `(tenant, period)`. See that
 /// method's doc for the "never-spent tenant reports zeros" guarantee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendReport {
@@ -1173,8 +1168,8 @@ pub struct SpendReport {
 
 /// Per-`(tenant, period)` spend, accumulated in memory with no store I/O on
 /// the record path, periodically flushed by a background OS thread. See
-/// the section above for the rollover and enforcement properties, and the
-/// design brief's "3c-ii architecture" section for why a plain thread.
+/// the section above for the rollover and enforcement properties and for why a
+/// plain thread.
 pub struct SpendAccumulator {
     inner: Arc<Inner>,
     flusher: Mutex<Option<Flusher>>,
@@ -1385,8 +1380,8 @@ impl SpendAccumulator {
 
     /// [`Self::record`] against the real wall clock (`Utc::now()`) -- the
     /// `record`-side counterpart of [`Period::key_for_now`]'s cross-crate
-    /// convenience: a caller with no `chrono` dependency of its own (WP-50
-    /// 3c-iv's `proxy-admin` server tests, standing in for what the
+    /// convenience: a caller with no `chrono` dependency of its own (the
+    /// `proxy-admin` server tests, standing in for what the
     /// `llmproxy.spend_limit` filter's own `record_if_present` does with a
     /// real `Utc::now()`) can record a charge without constructing a
     /// `DateTime<Utc>` itself.
@@ -1446,15 +1441,15 @@ impl SpendAccumulator {
     }
 
     /// The period a tenant with NO configured [`TenantBudget`] is metered
-    /// under -- see [`Inner::default_period`]'s doc. The 3c-iii-b enforcement
+    /// under -- see [`Inner::default_period`]'s doc. The spend enforcement
     /// filter reads this to build the `period` argument [`Self::record`]
     /// needs when the request's tenant has no budget at all.
     pub fn default_period(&self) -> Period {
         self.inner.default_period
     }
 
-    /// The live in-memory total for `(tenant, period)` -- what a future
-    /// enforcement filter (3c-iii) checks a ceiling against. See this
+    /// The live in-memory total for `(tenant, period)` -- what the
+    /// enforcement filter checks a ceiling against. See this
     /// section's "Enforcement reads live memory" note: this never consults
     /// the flusher or its state, so the flusher's liveness cannot affect
     /// what it returns.
@@ -1563,7 +1558,7 @@ impl SpendAccumulator {
         self.inner.unreconciled_admissions.load(Ordering::Relaxed)
     }
 
-    /// WP-50 increment 3c-iv -- the admin spend read's data source. Returns
+    /// The admin spend read's data source. Returns
     /// `(tenant, period)`'s live spend, unpriced-request discoverability
     /// counters, and the accumulator's last successful flush time, all in
     /// one snapshot so a caller (`proxy-admin`'s spend endpoint) does not
@@ -1587,7 +1582,7 @@ impl SpendAccumulator {
         let bucket = self.inner.get_or_load_bucket(&mut buckets, tenant, period);
         // Rust note: `unpriced_pairs` is a `BTreeSet`, so iterating it is
         // ALREADY in sorted order -- no separate `.sort()` needed to satisfy
-        // the design brief's "sorted for stable output" requirement.
+        // the stable-output requirement.
         let unpriced_pairs: Vec<(String, String)> = bucket.unpriced_pairs.iter().cloned().collect();
         let report = SpendReport {
             journal_checkpoint_at: DateTime::<Utc>::from_timestamp_millis(
@@ -1756,8 +1751,7 @@ impl Drop for SpendAccumulator {
     /// Shuts the flusher thread down (if one was started) and flushes once
     /// more, unconditionally. Without this final flush, every clean
     /// process exit would discard up to one flush interval of spend --
-    /// turning the documented crash-refund (see the design brief's
-    /// "Enforcement reads live memory" section) into an
+    /// turning the documented crash-refund (enforcement reads live memory) into an
     /// ORDINARY-OPERATION refund, which is a much larger and much more
     /// frequent hole than a crash. Pinned by
     /// `drop_flushes_what_was_recorded_since_the_last_tick`; its mutation
@@ -2090,7 +2084,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 3c-ii-b: periods, the accumulator, and the flusher.
+    // Periods, the accumulator, and the flusher.
     // ------------------------------------------------------------------
 
     use crate::control::InMemoryControlPlaneStore;
@@ -2335,9 +2329,9 @@ mod tests {
         );
     }
 
-    // --- record takes its period explicitly (WP-50 3c-iii-b fixup) -------
+    // --- record takes its period explicitly -------
 
-    /// The defect this fixup closes, as an executable assertion: ONE
+    /// The defect fixed by the explicit period, as an executable assertion: ONE
     /// accumulator, TWO tenants, each with its OWN period -- a daily-budget
     /// tenant and a monthly-budget tenant, the exact combination that cannot
     /// coexist correctly if `record` uses a single accumulator-wide period
@@ -2440,7 +2434,7 @@ mod tests {
         assert_eq!(
             total, 5_000_000,
             "a second flush with nothing recorded in between must send a delta of ZERO. \
-             WP-60 made the write additive, so a flusher that re-sent its running total \
+             The write is additive, so a flusher that re-sent its running total \
              instead of what it has yet to hand over would double the charge on every \
              tick"
         );
@@ -2682,8 +2676,8 @@ mod tests {
         // A very long interval: for the life of this test, the flusher
         // thread is running but will never tick -- functionally
         // indistinguishable, from `current_total`'s point of view, from a
-        // thread that panicked and died outright. Enforcement (a future
-        // 3c-iii filter) reads `current_total`, never the flusher's state,
+        // thread that panicked and died outright. Enforcement (the
+        // spend filter) reads `current_total`, never the flusher's state,
         // so neither case can loosen what it sees.
         accumulator.start_flusher(Duration::from_secs(3600));
 
@@ -2758,7 +2752,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 3c-iv: `SpendAccumulator::report` and `last_flush_at`.
+    // `SpendAccumulator::report` and `last_flush_at`.
     // ------------------------------------------------------------------
 
     #[test]
@@ -2978,9 +2972,9 @@ mod tests {
         );
     }
 
-    // --- WP-60: two replicas over one store ---------------------------------
+    // --- two replicas over one store ---------------------------------
     //
-    // The acceptance test this work package exists for, plus the properties
+    // The acceptance test for additive writes, plus the properties
     // that make it hold. `control.rs` covers the store contract these lean
     // on; these cover the accumulator's half -- adopting the returned total,
     // and never advancing a sequence the store has not confirmed.
@@ -3415,7 +3409,7 @@ mod tests {
         drop(accumulator);
     }
 
-    // --- WP-62: reconciliation staleness (ADR-0006 §5) ----------------------
+    // --- reconciliation staleness (ADR-0006 §5) ----------------------
     //
     // These read the clock, so they take `now` as `Utc::now()` offset by a
     // chrono `Duration` rather than the fixed `dt(...)` timestamps the rest
@@ -3446,7 +3440,7 @@ mod tests {
     /// from construction, not from zero. This is the whole shape of the
     /// fix: a process that came up while the store was down is the MOST
     /// unreconciled it can be, and reporting that as "age 0, reconciled"
-    /// would be the fail-open-and-silent failure rule 17 exists to stop.
+    /// would be the fail-open-and-silent failure AGENTS.md "Fail-open controls" exists to stop.
     ///
     /// Mutation: have `Inner::reconciliation_age` return
     /// `Duration::ZERO` in the `NEVER_FLUSHED` arm.

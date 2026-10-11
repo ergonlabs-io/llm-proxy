@@ -38,7 +38,7 @@
 //! actually routable by real traffic, and the proxy boots and serves its
 //! static config when the control plane is unreachable. All three were
 //! untested before this file, and the last is the single most important
-//! behavioral property of the wiring increment.
+//! behavioral property of the ADS wiring.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -796,8 +796,8 @@ static_resources:
     )
 }
 
-/// PLAN.md 8.5's own requirement, and currently the single most important
-/// behavioral property of the ADS wiring increment with no test of its own:
+/// architecture.md §12.2 rule 5's requirement, and the single most important
+/// behavioral property of the ADS wiring:
 /// an unreachable control plane at boot must not stop the proxy from
 /// binding its listeners and serving its static config. `start_ads`'s doc
 /// says the ADS `Channel` is built `connect_lazy` for exactly this reason,
@@ -930,10 +930,10 @@ static_resources:
 /// endpoint reads `ConfigSnapshot` (`config_dump`'s own source), and an EDS
 /// update deliberately never touches `ConfigSnapshot` at all (see
 /// `apply.rs`'s own doc on `on_eds_response`) -- only a live request actually
-/// exercises the path this increment wires.
+/// exercises the path the ADS wiring adds.
 ///
 /// Unlike test A/B, there is no CDS response to wait behind: `start_ads`'s
-/// Part 2 seeding means the EDS subscription's initial request already names
+/// EDS-name seeding means the EDS subscription's initial request already names
 /// `eds_backend` the moment the stream opens (read straight out of the boot
 /// snapshot's `eds_cluster_config.service_name`, not derived from any prior
 /// response) -- so this polls for the first ACK of ANY type_url, rather than

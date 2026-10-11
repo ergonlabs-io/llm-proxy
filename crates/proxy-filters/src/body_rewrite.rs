@@ -1,4 +1,4 @@
-//! WP-45 increment 1 — bounded request-body prefix scanner and splice engine.
+//! Bounded request-body prefix scanner and splice engine.
 //!
 //! This module answers two questions without ever buffering a request body:
 //! **what does the top-level JSON object say** (`model`, `stream`, whether
@@ -542,7 +542,7 @@ pub fn include_usage_injection(facts: &BodyFacts) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    //! The WP-45 increment-1 acceptance suite: the tokenizer and the
+    //! The acceptance suite: the tokenizer and the
     //! splice-policy function, in isolation from any filter wiring.
 
     use super::*;

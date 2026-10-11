@@ -1,6 +1,6 @@
-//! S6 active health checking (WP-18): `Cluster.health_checks` -> IR
+//! S6 active health checking: `Cluster.health_checks` -> IR
 //! `HealthCheckIR` lowering. Covers the HTTP and TCP happy paths end to end,
-//! every rejection ground rule #1 requires (a second check, gRPC/custom
+//! every rejection AGENTS.md invariant 1 requires (a second check, gRPC/custom
 //! checkers, an aggregate cluster, a second `receive` payload), the hex vs.
 //! binary `Payload` decoding trap, and `expected_statuses` range expansion.
 
@@ -20,7 +20,7 @@ fn err_path(err: &ConfigError) -> &str {
         ConfigError::InvalidValue { field_path, .. } => field_path,
         // A required field left unset (`timeout`, `interval`,
         // `unhealthy_threshold`, `healthy_threshold`, the `health_checker`
-        // oneof) is caught by the WP-04 PGV validator during
+        // oneof) is caught by the PGV validator during
         // `parse_bootstrap`, before `convert_health_check` ever runs -- same
         // defense-in-depth relationship as `aggregate_cluster.rs`'s
         // `empty_member_list_is_rejected`.
@@ -372,7 +372,7 @@ static_resources:
           healthy_threshold: 1
 "#;
     let err = snapshot_from(yaml).expect_err("a health_checker must be required");
-    // WP-04's own oneof-required PGV rule catches this before
+    // The PGV oneof-required rule catches this before
     // `convert_health_check` runs (see `err_path`'s `Validation` arm).
     assert!(
         err_path(&err).contains("health_checker"),

@@ -6,7 +6,7 @@
 //! parity with Envoy's hash function and endpoint-key format to avoid
 //! silently breaking session affinity across a mixed fleet, and we don't yet
 //! have the differential harness to prove that parity (see [`build`]). That
-//! is a deliberate scope cut, not an oversight -- ground rule #1 forbids
+//! is a deliberate scope cut, not an oversight -- AGENTS.md invariant 1 forbids
 //! silently substituting a different policy, so we reject the config
 //! instead.
 
@@ -36,15 +36,14 @@ const PANIC_THRESHOLD_PERCENT: u64 = 50;
 
 /// A configured `lb_policy` unsupported by this build. Cluster construction
 /// must fail loudly on this rather than silently falling back to
-/// round-robin (ground rule #1).
+/// round-robin (AGENTS.md invariant 1).
 #[derive(Debug, thiserror::Error)]
 pub enum LbError {
     #[error(
         "lb_policy {0:?} is not implemented: it requires bit-exact parity with Envoy's hash \
          function (ketama/xxhash64 for RING_HASH, the paper's permutation algorithm for \
          MAGLEV) to avoid silently breaking session affinity across a mixed fleet, and we \
-         don't have the differential test harness for that yet (see IMPLEMENTATION_PLAN.md \
-         WP-17 follow-up); refusing to substitute another policy silently"
+         don't have the differential test harness for that yet; refusing to substitute another policy silently"
     )]
     UnsupportedPolicy(LbPolicy),
 }

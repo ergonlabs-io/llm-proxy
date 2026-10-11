@@ -1,4 +1,4 @@
-//! WP-13 v1 (thin slice): the router terminal filter. Since ADR-0004 step 3
+//! The router terminal filter. Since ADR-0004 step 3
 //! this is an ordinary [`crate::filter::HttpFilter`] that also implements
 //! [`crate::filter::TerminalHttpFilter`] -- `proxy-core`'s HTTP connection
 //! manager wiring plugs a [`RouterFilterFactory`] in as the LAST entry of the
@@ -15,11 +15,11 @@
 //! In scope: `Forward` routing to a `Cluster`/`ClusterHeader`/`Weighted`
 //! target, both HTTP/1.1 and HTTP/2 upstreams. HTTP/1.1 reuses one IDLE
 //! keep-alive connection at a time per (cluster, address) via
-//! `crate::upstream_pool::H1ConnCache` (WP-15 slice B -- see that type's doc
+//! `crate::upstream_pool::H1ConnCache` (see that type's doc
 //! for the conservative reuse-vs-discard rule); HTTP/2 reuses a small bounded
 //! *set* of connections per (cluster, address), multiplexed across
 //! concurrent/sequential requests, via `crate::upstream_pool::UpstreamConnCache`
-//! (WP-15 slice A/C -- see that module's doc). `DirectResponse` for inline
+//! (see that module's doc). `DirectResponse` for inline
 //! bodies, the
 //! upstream request transforms `prefix_rewrite`/`host_rewrite_literal`/
 //! `x-envoy-expected-rq-timeout-ms`, the S4 route timeout
@@ -40,7 +40,7 @@
 //! retries plus safe hedges acquire the same fixed `max_retries` or dynamic
 //! `retry_budget` guard before dispatch.
 //!
-//! Deferred (known feature gaps, not silent drops -- ground rule #1):
+//! Deferred (known feature gaps, not silent drops -- AGENTS.md invariant 1):
 //! - S9 request-header transforms: XFF, `x-request-id`, `:authority`
 //!   rewrite. `crate::headers` already implements the functions; this
 //!   router doesn't call them yet.
@@ -48,15 +48,15 @@
 //!   body) and HCM-level `stream_idle_timeout` inheritance -- the IR has no
 //!   HCM `stream_idle_timeout` field yet, so a `None` route `idle_timeout`
 //!   means "no idle timeout" for now, not "inherit the listener's".
-//! - The retry & hedging engine (S3, WP-14).
+//! - The retry & hedging engine (S3).
 //! - HTTP/1.1 idle-connection eviction (an idle-timeout that closes a cached
-//!   h1 connection nobody's leased in a while) -- WP-15 slice B scoped this
-//!   out deliberately; see `crate::upstream_pool::H1ConnCache`'s doc.
+//!   h1 connection nobody's leased in a while) -- deliberately scoped
+//!   out; see `crate::upstream_pool::H1ConnCache`'s doc.
 //! - Connection-level circuit breakers (`max_connections`,
-//!   `max_pending_requests`) -- WP-15 slice D; this router still only
+//!   `max_pending_requests`) -- not implemented; this router still only
 //!   enforces the S5 `max_requests` per-cluster budget above.
 //!
-//! WP-24 chunk 3: response flags are recorded onto a per-request
+//! Response flags are recorded onto a per-request
 //! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below --
 //! `%BYTES_RECEIVED%`, upstream host/cluster/protocol, response flags. This
 //! router no longer renders access-log lines itself: that moved up to
@@ -114,10 +114,10 @@ fn hedge_safe_method(method: &Method) -> bool {
 /// What `apply_forward`'s attempt loop got back from connecting to the
 /// picked host: a [`LeasedH1`] from the worker's bounded-idle h1 connection
 /// cache -- possibly a reused, already-handshaken connection, possibly a
-/// freshly dialed one (WP-15 slice B) -- or a [`PooledSendRequest`] leased
+/// freshly dialed one -- or a [`PooledSendRequest`] leased
 /// from the worker's bounded h2 connection set -- possibly a clone of an
 /// already-cached, already-handshaken sender, possibly a freshly dialed one
-/// (WP-15 slice A, extended to a bounded set of connections by slice C -- see
+/// (h2 connections are cached as a bounded set -- see
 /// `crate::upstream_pool`'s module doc). One `Result<Connected, PoolError>`
 /// for both protocols keeps the shared connect-failure handling (S3 retry
 /// classification, circuit-breaker outcome, response-flag mapping) a single
@@ -174,7 +174,7 @@ const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
 /// see its doc) because it only holds `Arc`s -- thread-safe config-time
 /// state, same shape as `FilterInstanceFactory` implementors.
 ///
-/// WP-23 increment 6a: `stats` is built once per worker (a fresh
+/// `stats` is built once per worker (a fresh
 /// [`RouterStats`] carrying that worker's own `WorkerId` -- see
 /// `crates/proxy/src/main.rs`'s `worker_main`) and handed in here alongside
 /// `clusters`, the same way every other piece of shared, worker-scoped state
@@ -185,10 +185,10 @@ pub struct RouterFilterFactory {
     clusters: ClusterRegistrySnapshot,
     stats: Arc<RouterStats>,
     config_context: Option<(String, u64)>,
-    /// WP-51 increment 2: this HCM's span sink, if boot/reload wired one --
+    /// This HCM's span sink, if boot/reload wired one --
     /// see [`RouterHandler::span_sink`]'s doc for where it's read.
     span_sink: Option<SpanSink>,
-    /// S10 (WP-10 increment 2b/2c): this HCM's `upgrade_configs`, resolved
+    /// S10: this HCM's `upgrade_configs`, resolved
     /// once (at `with_upgrade_configs`, not per-stream) into "is this
     /// upgrade type enabled?" -- keyed by `UpgradeConfig::upgrade_type`
     /// (already lowercased at lowering, `proxy-config`'s doc on that field).
@@ -222,7 +222,7 @@ impl RouterFilterFactory {
         self
     }
 
-    /// WP-51 increment 2: attaches this HCM's span sink -- a builder method,
+    /// Attaches this HCM's span sink -- a builder method,
     /// same shape as `FilterChainHandler::with_tracing` one layer up (every
     /// existing `new` call site stays unaffected; `proxy-core`'s
     /// `build_hcm_handler` calls this whenever `ConfigSnapshot::tracing` is
@@ -232,7 +232,7 @@ impl RouterFilterFactory {
         self
     }
 
-    /// S10 (WP-10 increment 2b/2c): attaches this HCM's `upgrade_configs` --
+    /// S10: attaches this HCM's `upgrade_configs` --
     /// a builder method, same "every existing `new` call site stays
     /// unaffected" shape as [`Self::with_tracing`]. `proxy-core`'s
     /// `build_hcm_handler` calls this for every real HCM build/rebuild with
@@ -279,18 +279,18 @@ impl TerminalFilterInstanceFactory for RouterFilterFactory {
 pub struct RouterHandler {
     clusters: ClusterRegistrySnapshot,
     config_context: Option<(String, u64)>,
-    /// WP-23 increment 6a: this worker's `upstream_rq`/`upstream_rq_time`
+    /// This worker's `upstream_rq`/`upstream_rq_time`
     /// recorder -- see `apply_forward`'s attempt loop for where it's called
     /// and why.
     stats: Arc<RouterStats>,
-    /// WP-15 slice A: this worker's h2 connection-reuse cache. `Rc`, not a
+    /// This worker's h2 connection-reuse cache. `Rc`, not a
     /// field on `RouterFilterFactory` -- see `upstream_pool::worker_conn_cache`'s
     /// doc for why the factory (which must stay `Send + Sync`) can't hold
     /// this directly, and why a `thread_local!` is the fallback instead.
     /// Fetched fresh per stream (a cheap `Rc` clone -- pointer bump), so
     /// every request this worker serves shares the one underlying cache.
     conn_cache: Rc<UpstreamConnCache>,
-    /// WP-15 slice B: this worker's h1 keep-alive connection cache -- same
+    /// This worker's h1 keep-alive connection cache -- same
     /// `Rc`/`thread_local!` shape as `conn_cache` above, for the same reason
     /// (`RouterFilterFactory` must stay `Send + Sync`, so it can't hold this
     /// `!Send` cache directly; see `upstream_pool::worker_h1_conn_cache`'s
@@ -306,7 +306,7 @@ pub struct RouterHandler {
     captured_body: Bytes,
     /// Captured in `decode_trailers`, when present.
     captured_trailers: Option<RequestTrailers>,
-    /// WP-51 increment 2: this HCM's span sink, if tracing is on --
+    /// This HCM's span sink, if tracing is on --
     /// `apply_forward`'s attempt loop derives a CLIENT [`TraceContext::child`]
     /// of `StreamInfo::trace` (the SERVER context) for each attempt when
     /// this is `Some`, injects its `to_traceparent()` into that attempt's
@@ -315,7 +315,7 @@ pub struct RouterHandler {
     /// a retry/fallback is a fresh attempt, so it gets a fresh child span
     /// under the SAME server span, never a fresh trace.
     span_sink: Option<SpanSink>,
-    /// S10 (WP-10 increment 2b/2c): this HCM's resolved `upgrade_configs`,
+    /// S10: this HCM's resolved `upgrade_configs`,
     /// cloned (an `Arc` bump) from [`RouterFilterFactory::upgrade_configs`]
     /// at stream construction -- see that field's doc. Read by
     /// [`Self::upgrade_allowed`].
@@ -447,7 +447,7 @@ struct ClientSpanOutcome<'a> {
     extra_attributes: Vec<(&'static str, String)>,
 }
 
-/// WP-13: `RouteEntry::include_request_attempt_count`/
+/// `RouteEntry::include_request_attempt_count`/
 /// `include_attempt_count_in_response` (Envoy S9, `x-envoy-attempt-count`),
 /// bundled into one struct purely to keep `apply_forward`'s parameter count
 /// under clippy's `too_many_arguments` threshold -- same motivation
@@ -482,7 +482,7 @@ impl RouterHandler {
             }
         });
 
-        // S10 (WP-10 increment 2b/2c): this request asked for an HTTP
+        // S10: this request asked for an HTTP
         // upgrade -- `on_upgrade` was moved onto the shared `StreamInfo` by
         // `FilterChainHandler::handle`, right after it was built (see that
         // call site's Rust note). Handled here, before the ordinary
@@ -533,7 +533,7 @@ impl RouterHandler {
         }
     }
 
-    /// S10 (WP-10 increment 2b/2c): the S10.1 gate, plus dispatch to
+    /// S10: the S10.1 gate, plus dispatch to
     /// [`Self::handle_upgrade`] when there's a `Forward` route to tunnel to.
     /// `Some(_)` means this call decided the request's fate outright (a
     /// `403` from the gate, or whatever [`Self::handle_upgrade`] returned);
@@ -576,14 +576,14 @@ impl RouterHandler {
         )
     }
 
-    /// S10 (WP-10 increment 2b/2c, extended by S10.2 for h2): forward an
+    /// S10 (extended by S10.2 for h2): forward an
     /// ALLOWED upgrade request to the picked cluster/host, dialing a FRESH
     /// connection via `pool.new_stream()` -- bypassing BOTH `H1ConnCache` and
     /// `UpstreamConnCache` -- and build the tunnel response if (and only if)
     /// the upstream answers the accept status for its protocol (h1: `101`;
     /// h2: exactly `200`, RFC 8441 S4/finding (g) caveat (1)).
     ///
-    /// S10.2 (this increment): TRANSPARENT, same-protocol only. The
+    /// S10.2: TRANSPARENT, same-protocol only. The
     /// downstream mechanism the client used (`head.method == CONNECT` means
     /// h2 extended CONNECT; an ordinary `Upgrade` header means h1) must match
     /// the picked upstream's protocol -- an h1 client can only tunnel to an
@@ -591,7 +591,7 @@ impl RouterHandler {
     /// bridging (h1 client <-> h2 upstream, or the reverse) would need this
     /// proxy to synthesize/translate the actual WebSocket handshake (compute
     /// `Sec-WebSocket-Accept`, or fabricate the `:protocol` pseudo-header
-    /// from nothing) -- deliberately out of scope this increment, so it is
+    /// from nothing) -- deliberately out of scope, so it is
     /// rejected outright with a `502` rather than attempted half-correctly.
     ///
     /// Single attempt, no retries at all (S10.1): unlike [`Self::apply_forward`],
@@ -635,7 +635,7 @@ impl RouterHandler {
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
 
-        // WP-58: a cluster that exists but has never completed its first
+        // A cluster that exists but has never completed its first
         // resolution/EDS update must NOT reach host selection -- Envoy never
         // publishes a warming cluster to its worker thread-local cluster map
         // at all, so a request routed at one takes the SAME `cluster ==
@@ -668,7 +668,7 @@ impl RouterHandler {
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
         };
         let host = sel.host;
-        // WP-35: same "the member, not the routed aggregate, owns
+        // Same "the member, not the routed aggregate, owns
         // credentials/protocol" reasoning `apply_forward`'s own attempt loop
         // documents at length -- see there for the full explanation.
         let (attempt_cluster, attempt_entry): (&str, &dyn ClusterEntry) = match &sel.member {
@@ -919,7 +919,7 @@ impl RouterHandler {
         }
     }
 
-    /// WP-51 increment 2: emit one CLIENT span for a concluded attempt --
+    /// Emit one CLIENT span for a concluded attempt --
     /// called from the same 4 sites [`report_outlier`] already is, right
     /// after it (see [`Self::span_sink`]'s doc for why the two are
     /// deliberately kept in lockstep). A no-op whenever tracing is off
@@ -1001,7 +1001,7 @@ impl RouterHandler {
             return local_reply(StatusCode::SERVICE_UNAVAILABLE, "unknown cluster");
         };
 
-        // WP-58: same admission check as `handle_upgrade` -- see that call
+        // Same admission check as `handle_upgrade` -- see that call
         // site's Rust note for the full "why NC, not a new flag" reasoning.
         // Both cluster-lookup sites need this, not just this one: an upgrade
         // request never reaches `apply_forward` at all, so without the
@@ -1025,7 +1025,7 @@ impl RouterHandler {
         // "streamed straight through vs. collected up front" distinction to
         // make here: every attempt (retried or not) just clones the same,
         // already-in-memory `Bytes` (a refcount bump, never a deep copy).
-        // WP-24: `%BYTES_RECEIVED%` is exact and known up front for the same
+        // `%BYTES_RECEIVED%` is exact and known up front for the same
         // reason.
         let body_bytes = self.captured_body.clone();
         dcb.stream_info().bytes_received = body_bytes.len() as u64;
@@ -1048,7 +1048,7 @@ impl RouterHandler {
         // `send`. With no retry policy the loop runs exactly once, so this is
         // unobservable from a no-retry route's point of view.
         //
-        // WP-35: built once, outside the loop (not fresh per attempt like
+        // Built once, outside the loop (not fresh per attempt like
         // `attempt_head` below), because `attempted_clusters` has to
         // accumulate *across* attempts -- an aggregate's second attempt
         // needs to see the first attempt's pick to skip it. `mut` because
@@ -1059,7 +1059,7 @@ impl RouterHandler {
             ctx.host_selection_retry_max_attempts = policy.host_selection_retry_max_attempts;
         }
 
-        // WP-13: this attempt loop's own 1-based attempt counter, for
+        // This attempt loop's own 1-based attempt counter, for
         // `x-envoy-attempt-count` (S9) -- incremented at the same point as
         // `self.stats.record_attempt` below ("the attempt is actually
         // dispatched"), so a circuit-breaker or host-selection rejection
@@ -1094,7 +1094,7 @@ impl RouterHandler {
                 // exactly what "an attempt is free to land on a different
                 // host" implies for its circuit-breaker accounting too.
                 //
-                // WP-35: deliberately still `entry` (the *routed* cluster),
+                // Deliberately still `entry` (the *routed* cluster),
                 // not the not-yet-known `attempt_entry` a few lines below --
                 // this matches Envoy, whose `Router::Filter` checks the
                 // routed cluster's `max_requests` before any host selection
@@ -1102,7 +1102,7 @@ impl RouterHandler {
                 // Concretely: today an aggregate's members all share the
                 // aggregate's own `max_requests` budget (there is no
                 // per-member budget to acquire instead -- S5's other three
-                // budgets are connection-pool-level, WP-15, and likewise
+                // budgets are connection-pool-level and likewise
                 // untouched by which member ends up dialed).
                 let cb = entry.circuit_breaker(RoutingPriority::Default);
                 let Some(rq_guard) = cb.try_acquire_request() else {
@@ -1128,7 +1128,7 @@ impl RouterHandler {
                     return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
                 };
                 let host = sel.host;
-                // WP-35: `entry` is the *routed* cluster (a plain cluster,
+                // `entry` is the *routed* cluster (a plain cluster,
                 // or an aggregate); `sel.member` is set only when `entry` is
                 // an aggregate and names the member that actually owns
                 // `host`. Everything from here on -- protocol, pool,
@@ -1156,7 +1156,7 @@ impl RouterHandler {
                 ctx.attempted_clusters.push(attempt_cluster.to_string());
                 ctx.attempted_hosts.push(host.address);
 
-                // WP-23 increment 6a: this is "the attempt is actually
+                // This is "the attempt is actually
                 // dispatched" -- past the S5 circuit breaker and host
                 // selection above, so this is exactly one increment per
                 // upstream attempt (a retry is a second, later iteration of
@@ -1179,7 +1179,7 @@ impl RouterHandler {
                 let attempt_dispatched_at = std::time::Instant::now();
 
                 let proto = attempt_entry.upstream_protocol();
-                // WP-24: both known right here, at the dial site -- recorded
+                // Both known right here, at the dial site -- recorded
                 // onto `StreamInfo` for `%UPSTREAM_HOST%`/`%UPSTREAM_CLUSTER%`/
                 // `%PROTOCOL%` before the connect is even attempted, so a
                 // failed attempt still logs which host/cluster/protocol it
@@ -1190,7 +1190,7 @@ impl RouterHandler {
                 // names `attempt_cluster` (the cluster actually dialed), not
                 // the routed `cluster_name` -- matching Envoy's own
                 // `upstream_host->cluster().name()`.
-                // WP-51 increment 2: this attempt's CLIENT trace context --
+                // This attempt's CLIENT trace context --
                 // a fresh `TraceContext::child` of the SERVER span
                 // (`StreamInfo::trace`) for EVERY attempt, including a
                 // retry/fallback, so each one gets its own child span while
@@ -1236,7 +1236,7 @@ impl RouterHandler {
                 };
                 let attempt_guard = crate::attempt_logging::AttemptGuard(attempt_info.clone());
                 let pool = attempt_entry.http_pool(&host, proto);
-                // WP-15 slice A/B: both protocols are now cache-key'd --
+                // Both protocols are now cache-key'd --
                 // h2 upstreams are reused across requests via this worker's
                 // `UpstreamConnCache` (one TCP connection, or a small bounded
                 // set of them, per (cluster, address, protocol), multiplexed
@@ -1296,7 +1296,7 @@ impl RouterHandler {
                             "upstream connection attempt failed without retry"
                         );
                         // Rust note: bound to `resp` (rather than `return
-                        // match err {...}` directly) so the WP-24 `URX` flag
+                        // match err {...}` directly) so the `URX` flag
                         // below can be recorded AFTER this arm's own flag --
                         // `render_flags` joins in recording order, and Envoy
                         // always shows the specific failure first (e.g.
@@ -1330,7 +1330,7 @@ impl RouterHandler {
                             // Envoy folds this into the same `UF`/
                             // connect-failure bucket as a TCP failure, but it
                             // gets its own arm so the log line says which
-                            // half actually broke. WP-15 slice A: an h2
+                            // half actually broke. An h2
                             // preface/settings handshake failure (through
                             // `UpstreamConnCache::get_or_connect`) is folded
                             // into this same variant too -- see that
@@ -1365,7 +1365,7 @@ impl RouterHandler {
                     uri: head.uri.clone(),
                     headers: head.headers.clone(),
                 };
-                // WP-51 increment 2: propagate this attempt's CLIENT trace
+                // Propagate this attempt's CLIENT trace
                 // context to the upstream leg -- `HeaderMap::insert`
                 // deliberately (not `append`), so this OVERWRITES any
                 // `traceparent` the downstream caller sent, rather than
@@ -1380,7 +1380,7 @@ impl RouterHandler {
                         attempt_head.headers.insert("traceparent", value);
                     }
                 }
-                // WP-13 (S9): `VirtualHost.include_request_attempt_count`,
+                // S9: `VirtualHost.include_request_attempt_count`,
                 // denormalized onto the route (`RouteEntry`'s own doc). Set
                 // per attempt, not once outside the loop, so a retry
                 // overwrites it with the new attempt number rather than
@@ -1466,11 +1466,11 @@ impl RouterHandler {
                     head: attempt_head,
                     body: attempt_body,
                     downstream: DownstreamInfo::loopback(),
-                    // S10 (WP-10 increment 2a): this router-synthesised
+                    // S10: this router-synthesised
                     // upstream request has no downstream connection of its
                     // own to hand an `OnUpgrade` off from -- the real
                     // downstream one is threaded separately once the tunnel
-                    // exists (increment 2b/2c).
+                    // exists.
                     on_upgrade: None,
                 };
 
@@ -1480,7 +1480,7 @@ impl RouterHandler {
                 // future so the two arms share one type. h2 here is
                 // prior-knowledge cleartext (h2c) over the pool's raw TCP
                 // stream -- no per-request `Connection: close` concept at
-                // all. WP-15 slice A/B/C: BOTH arms now send over whatever
+                // all. BOTH arms now send over whatever
                 // connection `connected` was leased from -- possibly a
                 // reused, already-handshaken one, possibly a fresh one this
                 // attempt just dialed -- via each cache's own `.send()`
@@ -1876,13 +1876,13 @@ impl RouterHandler {
                             let _ = resp.body.collect().await;
                             continue;
                         }
-                        // WP-24: this is the one `URX` site that isn't
+                        // This is the one `URX` site that isn't
                         // paired with a synthesized `local_reply` -- `resp`
                         // is the real (failing) upstream response, passed
                         // through unmodified; the only flag it can carry at
                         // all is this one.
                         record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
-                        // WP-13: report this proxy's final upstream attempt,
+                        // Report this proxy's final upstream attempt,
                         // including connection acquisition and the wait for
                         // response headers. `insert` deliberately replaces a
                         // value supplied by an upstream proxy. Retriable
@@ -1928,7 +1928,7 @@ impl RouterHandler {
                     Err(err) => {
                         self.stats
                             .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
-                        // WP-15 slice A, hazard 2: a send failure on a cached
+                        // A send failure on a cached
                         // h2 sender means it's suspect (e.g. the peer closed
                         // right as we sent) -- evict it so the next
                         // request/retry redials rather than risking the same
@@ -2023,7 +2023,7 @@ impl RouterHandler {
                 local_reply(StatusCode::GATEWAY_TIMEOUT, "upstream request timeout")
             }
         };
-        // WP-13 (S9): `VirtualHost.include_attempt_count_in_response`,
+        // S9: `VirtualHost.include_attempt_count_in_response`,
         // denormalized onto the route. Set here -- the one place every
         // `attempt_loop` exit (success, exhausted retries, or the whole-route
         // `fwd.timeout` above) converges into the response this function
@@ -2066,7 +2066,7 @@ async fn sleep_backoff_and_reserve_retry(
     true
 }
 
-/// WP-24: the one call site for `ResponseFlag::UpstreamRetryLimitExceeded`
+/// The one call site for `ResponseFlag::UpstreamRetryLimitExceeded`
 /// (`URX`) -- see [`RetryState::retry_limit_exceeded`]'s doc for exactly
 /// which failures qualify. Called from every attempt-loop exit that already
 /// decided not to retry `outcome`, right after that exit's OWN flag (if any)
@@ -2086,9 +2086,8 @@ fn record_retry_limit_exceeded_if_applicable(
     }
 }
 
-/// Report one attempt's outcome to the dialed cluster's S6 outlier detector
-/// (WP-19). Called once per attempt, right where each `AttemptOutcome` is
-/// computed and BEFORE the retry decision, so a failed attempt that is then
+/// Report one attempt's outcome to the dialed cluster's S6 outlier detector. Called once per
+/// attempt, right where each `AttemptOutcome` is computed and BEFORE the retry decision, so a failed attempt that is then
 /// retried still counts against its host -- exactly what Envoy's detector
 /// does (every upstream response feeds it, retried or not).
 ///
@@ -2619,7 +2618,7 @@ mod tests {
 
     use super::*;
 
-    /// WP-19: the S6 classification the router applies to each attempt before
+    /// The S6 classification the router applies to each attempt before
     /// feeding the outlier detector. A silently-wrong arm here would eject (or
     /// fail to eject) on the wrong signal, so it is pinned directly.
     #[test]
@@ -2689,7 +2688,7 @@ mod tests {
     use crate::stat_handles::StatHandles;
     use proxy_observability::stats::{StatsControl, WorkerId};
 
-    /// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved
+    /// A fresh, single-worker [`RouterStats`] resolved
     /// for exactly `cluster_names` -- what every `build_router*` helper below
     /// hands to [`RouterFilterFactory::new`], mirroring how
     /// `crates/proxy/src/main.rs` builds the real one from the boot config
@@ -2866,7 +2865,7 @@ mod tests {
     }
 
     /// A loopback HTTP/2 upstream that accepts connections in a loop and
-    /// counts how many it has accepted -- what the WP-15 slice A
+    /// counts how many it has accepted -- what the h2
     /// connection-reuse tests assert against directly: N requests through a
     /// warm/reused connection must NOT increment this past 1.
     async fn spawn_counting_h2_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
@@ -2933,7 +2932,7 @@ mod tests {
     /// Like [`spawn_upstream_answers_ok_repeatedly`], but counts how many TCP
     /// connections it has accepted, and every response carries `Connection:
     /// close` -- what `connection_close_response_is_not_reused` asserts
-    /// against to prove the WP-15 slice B h1 cache honors an explicit
+    /// against to prove the h1 cache honors an explicit
     /// `Connection: close` and never reuses that connection.
     async fn spawn_counting_h1_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2965,7 +2964,7 @@ mod tests {
     /// capable: each accepted connection is served in a loop that reads and
     /// answers as many bodyless-GET requests as arrive on it (no
     /// `Connection: close`, plain HTTP/1.1 -- persistent by default), rather
-    /// than closing after one. What the WP-15 slice B reuse tests
+    /// than closing after one. What the h1 reuse tests
     /// (`reuse_across_two_requests_opens_one_connection`,
     /// `truncated_or_errored_response_is_not_reused`) assert against: with a
     /// peer willing to stay open, whether a SECOND request opens a new
@@ -3053,7 +3052,7 @@ mod tests {
     /// Like [`build_router_with_circuit_breakers`], but also hands back the
     /// [`RouterStats`] (and, through it, the
     /// [`proxy_observability::stats::Registry`]) the router was built with --
-    /// for the WP-23 increment 6a tests that need to assert on recorded
+    /// for the tests that need to assert on recorded
     /// traffic, not just the response the router returns. Builds a
     /// [`RouterStats`] resolved for cluster `"up"` (the only cluster this
     /// helper's `ClusterManager` ever registers) -- see
@@ -3156,7 +3155,7 @@ mod tests {
     }
 
     /// Like [`build_router`], but the cluster's `upstream_protocol` is
-    /// HTTP/2 -- lets the WP-15 slice A connection-reuse tests exercise the
+    /// HTTP/2 -- lets the h2 connection-reuse tests exercise the
     /// real `RouterHandler` -> `UpstreamConnCache` path end to end, instead
     /// of poking the cache directly.
     async fn build_router_h2(
@@ -3699,7 +3698,7 @@ mod tests {
         .expect("should complete well within the test's own guard timeout");
     }
 
-    /// WP-23 increment 6a: the S5 circuit breaker rejects the second attempt
+    /// The S5 circuit breaker rejects the second attempt
     /// before host selection ever runs, so that attempt was never dialed --
     /// it must not add an `upstream_rq_time` observation (a zero-duration
     /// entry for an attempt that never reached the upstream would corrupt
@@ -3749,7 +3748,7 @@ mod tests {
         .expect("should complete well within the test's own guard timeout");
     }
 
-    /// WP-23 increment 6a: a served request's `upstream_rq_time` observation
+    /// A served request's `upstream_rq_time` observation
     /// must be a real, plausible duration -- not zero, not absent. Bounded
     /// loosely (a few hundred milliseconds is generous for a loopback
     /// reflecting upstream) so this doesn't flake on a slow CI box while
@@ -3793,7 +3792,7 @@ mod tests {
             .await;
     }
 
-    /// WP-23 increment 6a: `ClusterManager` (routing/dialing) knows about
+    /// `ClusterManager` (routing/dialing) knows about
     /// `"up"`, but the stats handle table this router was built with does
     /// NOT (a config-shaped mismatch this table's boot-time construction
     /// makes possible in principle -- see `stat_handles`'s module doc). The
@@ -3979,7 +3978,7 @@ mod tests {
             .await;
     }
 
-    // ---------------------------------------- WP-13 follow-up: redirects --
+    // ---------------------------------------------------- redirects --
 
     /// Two `Redirect` routes, distinguished by prefix: `/foo` forces https
     /// and preserves the request's host+path (`RedirectIR::host_redirect`/
@@ -4130,7 +4129,7 @@ mod tests {
             .await;
     }
 
-    // ------------------------------------------- WP-15 slice A: h2 reuse --
+    // ------------------------------------------------- h2 reuse --
 
     /// An h2 upstream that answers `RST_STREAM(REFUSED_STREAM)` to the first
     /// `refusals` streams it is asked to serve, then serves 200 forever.
@@ -4215,7 +4214,7 @@ mod tests {
         }
     }
 
-    /// WP-15: `retry_on: refused-stream` end to end, on a real RST_STREAM.
+    /// `retry_on: refused-stream` end to end, on a real RST_STREAM.
     ///
     /// This trigger has been configurable, documented, and switched on by
     /// every config this repo's format produces since S3 landed, and until
@@ -4345,7 +4344,7 @@ mod tests {
             .await;
     }
 
-    /// WP-15 slice B's own core proof: two SEQUENTIAL requests against a
+    /// The h1 cache's own core proof: two SEQUENTIAL requests against a
     /// keep-alive-capable h1 upstream must open exactly ONE TCP connection --
     /// the second request reuses the first, rather than dialing fresh. Must
     /// FAIL if reuse is removed (i.e. reverts to two accepts).

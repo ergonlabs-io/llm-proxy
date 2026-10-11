@@ -1,11 +1,11 @@
-//! Config error type shared by bootstrap loading (WP-03), validation (WP-04),
-//! IR conversion (WP-05) and xDS NACKs (WP-20).
+//! Config error type shared by bootstrap loading, validation,
+//! IR conversion and xDS NACKs.
 
 /// A configuration error. `field_path` is always the full dotted path into the
 /// Envoy proto, e.g. `static_resources.listeners[0].filter_chains[0].filters[0].typed_config`.
 /// For errors scoped to a whole file rather than a proto field (e.g. an
 /// unimplemented bootstrap format), `field_path` is the file path instead —
-/// every strict-mode rejection names *where* (ground rule #2), whatever kind
+/// every strict-mode rejection names *where* (AGENTS.md invariant 1), whatever kind
 /// of "where" applies. xDS NACK `error_detail` messages are built from
 /// `Display` of this type.
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +60,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFrontEnd {
     /// `-c`/`--config-path`: the bootstrap configuration format. Loaded with
-    /// `deny_unknown_fields`, but `--permissive` (WP-03) genuinely relaxes
+    /// `deny_unknown_fields`, but `--permissive` genuinely relaxes
     /// that at boot, so the hint pointing at it is true here.
     Bootstrap,
     /// `--config`: the llm-proxy dialect (`schema/llmproxy-v0.schema.json`).

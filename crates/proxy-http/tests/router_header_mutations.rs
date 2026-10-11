@@ -36,7 +36,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::LocalSet;
 
-/// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved for
+/// A fresh, single-worker [`RouterStats`] resolved for
 /// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
 /// mirroring how `crates/proxy/src/main.rs` builds the real one from the
 /// boot config snapshot's cluster names.
@@ -87,7 +87,7 @@ async fn build_router(
 }
 
 /// Same as [`build_router`], but also lets a test set the cluster's own
-/// `request_headers_to_add` (WP-35 increment 1a) -- the mutations applied
+/// `request_headers_to_add` -- the mutations applied
 /// per attempt because of which cluster the attempt dialed, as opposed to
 /// `mutations`, which is the route-level set applied once up front.
 async fn build_router_with_cluster_mutations(
@@ -637,7 +637,7 @@ async fn empty_mutation_list_does_not_change_existing_behavior() {
         .await;
 }
 
-// --- WP-35 increment 1a: `ClusterConfig::request_headers_to_add`, applied per
+// --- `ClusterConfig::request_headers_to_add`, applied per
 // attempt because of which cluster the attempt dialed ---
 
 #[tokio::test(flavor = "current_thread")]
@@ -669,7 +669,7 @@ async fn cluster_level_mutation_reaches_the_upstream() {
         .await;
 }
 
-/// The load-bearing WP-35 guarantee: a cluster's `request_headers_to_add`
+/// The load-bearing guarantee: a cluster's `request_headers_to_add`
 /// wins over the route's on a key collision, since the cluster is more
 /// specific -- and critically, the route-level (e.g. a *different*
 /// provider's) credential must not leak upstream at all. Asserting only that

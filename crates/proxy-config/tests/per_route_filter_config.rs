@@ -1,4 +1,4 @@
-//! ADR-0004 step 4, increment 1: `typed_per_filter_config` -> IR
+//! ADR-0004 step 4: `typed_per_filter_config` -> IR
 //! `PerFilterConfig` acceptance tests.
 //!
 //! Covers bare (unwrapped) entries, `FilterConfig`-wrapped entries

@@ -8,13 +8,13 @@ license.workspace = true
 proxy-config = { workspace = true }
 proxy-observability = { workspace = true }
 arc-swap = { workspace = true }
-# WP-13: the router (router.rs) picks a host/pool through the cluster
+# The router (router.rs) picks a host/pool through the cluster
 # manager; pools live in proxy-cluster, their interface is consumed here.
 proxy-cluster = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 prost-reflect = { workspace = true }
-# WP-10 chunk B: the downstream h1 codec and the StreamHandler seam.
+# The downstream h1 codec and the StreamHandler seam.
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
@@ -40,7 +40,7 @@ serde_json = { workspace = true }
 h2 = "0.4"
 
 [dev-dependencies]
-# Rust note: these power the WP-10 chunk A hyper capability spike
+# Rust note: these power the hyper capability spike
 # (tests/hyper_spike.rs) only -- the real data-plane dependency surface above
 # is untouched.
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }

@@ -1,12 +1,12 @@
-//! WP-21 increment 1: the IR surface for EDS clusters, and nothing else.
+//! The IR surface for EDS clusters, and nothing else.
 //!
 //! **Config surface only.** Nothing here subscribes to EDS or applies an
-//! endpoint update -- that is a later WP-21 increment (see
+//! endpoint update -- that is a later step (see
 //! `crates/proxy-config/tests/ir_readership.rs`'s allowlist entry for
-//! `ClusterConfig.eds`). This file's job is the same shape WP-20 increment 1
-//! proved for `dynamic_resources`: an EDS cluster now *lowers* instead of
-//! being refused by name, and every part of the surface this increment does
-//! not implement is refused by its own full dotted path (ground rule #1)
+//! `ClusterConfig.eds`). This file's job is the same shape
+//! `dynamic_resources.rs` covers: an EDS cluster now *lowers* instead of
+//! being refused by name, and every part of the surface we do
+//! not implement is refused by its own full dotted path (AGENTS.md invariant 1)
 //! rather than silently ignored.
 
 use proxy_config::ir::*;
@@ -40,7 +40,7 @@ static_resources:
 }
 
 /// A valid `eds_cluster_config`, delivered over ADS -- the only transport we
-/// implement (WP-20's ADS client).
+/// implement (the ADS client).
 const VALID_EDS_CONFIG: &str = r#"
       type: EDS
       eds_cluster_config:
@@ -158,7 +158,7 @@ fn eds_config_set_to_a_filesystem_source_instead_of_ads_is_rejected() {
 
 /// An EDS cluster that also carries a non-empty `load_assignment` is
 /// rejected -- those endpoints would be silently ignored in favour of the
-/// EDS-delivered set, ground rule #1's exact shape.
+/// EDS-delivered set, AGENTS.md invariant 1's exact shape.
 #[test]
 fn eds_cluster_with_a_non_empty_load_assignment_is_rejected() {
     let yaml = yaml_with_eds_cluster(

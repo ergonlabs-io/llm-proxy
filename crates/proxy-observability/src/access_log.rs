@@ -6,7 +6,7 @@
 //!   format string (e.g. `"[%START_TIME%] %REQ(:METHOD)%\n"`) into a
 //!   [`FormatString`] — an ordered `Vec` of literal text and pre-resolved
 //!   [`FormatOp`]s. An unknown `%OPERATOR%` is rejected here, not silently
-//!   dropped or emitted as literal text (ground rule #1).
+//!   dropped or emitted as literal text (AGENTS.md invariant 1).
 //! - [`render`] runs per request, on the hot path: it never re-parses
 //!   anything, just walks the pre-built op list and writes into a `String`.
 //!
@@ -80,7 +80,7 @@ pub enum FormatOp {
     // `%LLM_INPUT_TOKENS%` to a `%GEN_AI_USAGE_INPUT_TOKENS%` operator would
     // therefore emit a standard name carrying non-standard arithmetic --
     // under-counting billed input by exactly the cached portion, silently,
-    // under a name that looks standard. That is ground rule #1's hazard
+    // under a name that looks standard. That is AGENTS.md invariant 1's hazard
     // wearing a naming disguise.
     //
     // A subset (`output_tokens`, the two cache buckets individually) COULD
@@ -156,7 +156,7 @@ pub struct HeaderSpec {
 
 /// A malformed format string, with a human-readable reason. `proxy-config`'s
 /// lowering pass wraps this into a `ConfigError` carrying the field's dotted
-/// path (this crate doesn't know about that type — ground rule #2 keeps
+/// path (this crate doesn't know about that type — AGENTS.md invariant 2 keeps
 /// proto/IR concerns out of the formatter).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -268,7 +268,7 @@ fn build_op(
     input: &str,
 ) -> Result<FormatOp, FormatParseError> {
     /// Operators that take neither `(ARGS)` nor `:Z` — anything else on them
-    /// is a config error, not silently ignored (ground rule #1).
+    /// is a config error, not silently ignored (AGENTS.md invariant 1).
     fn bare(
         name: &str,
         args: Option<String>,
@@ -450,7 +450,7 @@ const DEFAULT_START_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 /// Provider-reported token usage, in the four billing buckets --
 /// mirrors `proxy_http::LlmTokenUsage` field-for-field, but this crate can't
 /// name that type (`proxy-observability` is a *dependency* of `proxy-http`,
-/// not the other way around -- ground rule #2's direction applies to crate
+/// not the other way around -- AGENTS.md invariant 2's direction applies to crate
 /// layering here too), so the caller (`proxy-http::router::logging`) converts
 /// at the boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -739,7 +739,7 @@ fn render_header(map: &http::HeaderMap, spec: &HeaderSpec, out: &mut String) {
 /// `%REQ(X)%`/`%REQ(X?Y)%`: a name starting with `:` is one of Envoy's four
 /// request pseudo-headers (matched case-insensitively) and resolves against
 /// the typed [`LogContext`] fields; any other pseudo-name (e.g. `:bogus`)
-/// resolves to `None` rather than panicking (ground rule #1 doesn't apply
+/// resolves to `None` rather than panicking (AGENTS.md invariant 1 doesn't apply
 /// here -- the format string was already validated at parse time, this is
 /// just "no data" like any other absent header). Anything not starting with
 /// `:` falls through to a plain [`header_lookup`] against

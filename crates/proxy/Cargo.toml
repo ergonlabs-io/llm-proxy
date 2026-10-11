@@ -19,8 +19,8 @@ proxy-http = { workspace = true }
 proxy-observability = { workspace = true }
 proxy-simple-config = { workspace = true }
 # Constructs and drives the ADS client from bootstrap
-# `dynamic_resources` (see `run_serve`'s `start_ads`). `proxy-api` moved here
-# from dev-dependencies below in the same increment -- `AggregatedDiscoveryServiceClient`
+# `dynamic_resources` (see `run_serve`'s `start_ads`). `proxy-api` is a normal
+# dependency (not dev-only) because `AggregatedDiscoveryServiceClient`
 # (the concrete gRPC client type `proxy-xds::AdsClient::run` is generic over)
 # lives there, and this is now the first non-test call site that names it.
 proxy-api = { workspace = true }

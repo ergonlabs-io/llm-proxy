@@ -1,4 +1,4 @@
-//! S6 passive outlier detection (WP-19): `Cluster.outlier_detection` -> IR
+//! S6 passive outlier detection: `Cluster.outlier_detection` -> IR
 //! `OutlierDetectionIR` lowering. Covers the full-block happy path, the two
 //! silently-wrong-value traps (a present-but-empty block must mean all S6
 //! defaults not zeros, and `max_ejection_time` must clamp up to
@@ -193,7 +193,7 @@ static_resources:
 
 /// Only `split_external_local_origin_errors: false` is implemented; `true`
 /// needs a separate local-origin failure axis and is rejected rather than
-/// accepted and silently ignored (ground rule #1).
+/// accepted and silently ignored (AGENTS.md invariant 1).
 #[test]
 fn split_external_local_origin_errors_true_is_rejected() {
     let yaml = r#"

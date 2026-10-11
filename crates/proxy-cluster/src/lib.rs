@@ -4,7 +4,7 @@
 //!
 //! [`ClusterEntry`] / [`HttpConnPool`] are THE seam between the HTTP router and
 //! the cluster subsystem — changes to these traits require review from both
-//! sides (ground rule #4).
+//! sides (AGENTS.md invariant 8).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -591,7 +591,7 @@ pub trait ClusterEntry: Send + Sync {
     /// alongside this trait, so there is no reason to keep an old
     /// `pick_host` around next to it. A second way to get a host that
     /// silently drops the owner is a way to send provider A's API key to
-    /// provider B (ground rule #1: dropping that information is exactly the
+    /// provider B (AGENTS.md invariant 1: dropping that information is exactly the
     /// class of silent config error the rule exists to prevent, even though
     /// no proto field is involved here).
     fn select_host(&self, ctx: &LoadBalancerContext) -> Option<HostSelection>;

@@ -1,24 +1,23 @@
-//! WP-45 increment 2b/consumer-B — wires the [`crate::body_rewrite`]
+//! Wires the [`crate::body_rewrite`]
 //! scanner/splice engine into a real decode-path `HttpFilter`, for BOTH
-//! consumers of the one scan (WP-45 decision 1: one scan, one held prefix,
-//! two consumers — never a second scanner):
+//! consumers of the one scan (one scan, one held prefix, two consumers —
+//! never a second scanner):
 //!
 //! - **Consumer A** — force `stream_options.include_usage = true` onto
 //!   OpenAI-dialect streaming requests that didn't already opt in, so
-//!   WP-33's usage filter has something to find. Gated on `cfg.enabled &&
+//!   the usage filter has something to find. Gated on `cfg.enabled &&
 //!   cfg.dialect == OpenAi`, exactly as before.
 //! - **Consumer B** — publish the scanned `model` onto the
 //!   [`MODEL_HEADER_NAME`] request header (overwriting any client-supplied
-//!   value; removing it outright when no model was found — WP-45 decision
-//!   4, a security property, not a tidiness one) and call
+//!   value; removing it outright when no model was found — a security
+//!   property, not a tidiness one; see "Header trust" below) and call
 //!   `clear_route_cache()` so S2.8 re-resolves the route against it.
 //!   Dialect-agnostic and unconditional: it runs for every dialect and
-//!   regardless of `cfg.enabled` (decision 2/3 — model extraction has
+//!   regardless of `cfg.enabled` (model extraction has
 //!   nothing to do with the usage-reporting kill switch).
 //!
 //! The `llmproxy` dialect / JSON schema surface that configures this filter
-//! from `--config` is increment 2c, built separately (`proxy-simple-config`'s
-//! `lower.rs`).
+//! from `--config` lives in `proxy-simple-config`'s `lower.rs`.
 //!
 //! # State machine
 //!
@@ -28,7 +27,7 @@
 //! consumer B needs every dialect. A request with no scannable body still
 //! gets its model header cleared right there (see
 //! [`BodyRewriteFilterInstance::decode_headers`]) since absence there means
-//! the same thing decision 4 means everywhere else: no proven model, no
+//! the same thing "Header trust" means everywhere else: no proven model, no
 //! trusted header. Once in `PassThrough` (either from the start, or once a
 //! decision has been made), every subsequent `decode_data` call is a
 //! straight-through no-op: `Continue`, `data` untouched, no buffer touched.
@@ -45,10 +44,27 @@
 //! so this is still nowhere near `O(body)`: a 40MB multimodal request never
 //! costs more than `cap + one chunk`, and the moment a decision is made
 //! (`Decided`, or `end_stream`), `pending` is handed off and the state drops
-//! back to `PassThrough`, discarding it. IMPLEMENTATION_PLAN.md's WP-45
-//! acceptance 4b describes the bound as `O(cap)`; this doc is the precise
-//! version, written down so nobody "fixes" the extra chunk of slack later
-//! under a misunderstanding of the acceptance criterion.
+//! back to `PassThrough`, discarding it. The bound is often loosely described as `O(cap)`; this doc is
+//! the precise version, written down so nobody "fixes" the extra chunk of
+//! slack later under a misunderstanding.
+//!
+//! This bound is the central requirement of the filter. A multimodal request
+//! (several MB of inline base64 image data, with `model`/`stream` in their
+//! normal leading position) must be spliced into correctly, forwarded
+//! byte-identical after the splice point, and metered with real token counts,
+//! while peak memory stays independent of body size. The acceptance test for
+//! that case is what fails if someone "simplifies" the scanner back into a
+//! full-body buffer, which is the most likely way this filter gets built
+//! wrong.
+//!
+//! # Header trust
+//!
+//! [`MODEL_HEADER_NAME`] is derived from the body, never trusted from the
+//! client. A client-supplied value is overwritten when the body has a model
+//! and removed when it does not (including a non-JSON or bodyless request).
+//! A body whose `model` falls past the prefix cap (`CapExceeded`) is treated
+//! exactly like "no model found": absence is not proven, so the header is
+//! cleared and routing falls through to the `*` backstop.
 //!
 //! # Never fails a request
 //!
@@ -62,7 +78,7 @@
 //! The filter owns its enable switch and dialect. The old
 //! `RuntimeFeatureFlag` carrier remains accepted for one release through
 //! [`LegacyBodyRewriteFilterFactory`], so existing bootstraps keep loading
-//! while new configs use the versioned Lane-H message.
+//! while new configs use the versioned message.
 
 use bytes::{Bytes, BytesMut};
 use http::header::CONTENT_LENGTH;
@@ -84,7 +100,7 @@ use crate::usage::Dialect;
 /// Canonical type URL for the owned body-rewrite configuration.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite";
 
-/// Borrowed type URL accepted for one release after the WP-47 migration.
+/// Borrowed type URL accepted for one release after the move to an owned, versioned message.
 pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 
 /// The request header consumer B publishes the scanned `model` onto. Must
@@ -95,7 +111,7 @@ pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.Runtim
 /// cannot depend on `proxy-simple-config`: that would drag the whole data
 /// plane into a crate that only ever emits JSON, and `proxy-simple-config`
 /// already depends on `proxy-filters` as a dev-dependency to pin the type
-/// URLs the other direction). WP-45 decision 6 calls this out explicitly as
+/// URLs the other direction). This is
 /// the exact shape that produced the `io.llmproxy.provider_auth` seam gap
 /// found 2026-08-03: two crates agreeing on a string by convention, each
 /// crate's tests pinning its own literal, nothing testing the join. The pin
@@ -108,8 +124,8 @@ pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.Runtim
 pub const MODEL_HEADER_NAME: &str = "x-llmproxy-model";
 
 /// Write `model` onto [`MODEL_HEADER_NAME`], or remove the header outright
-/// when `model` is `None` — WP-45 decision 4: the header is derived from the
-/// body, never trusted from the client, so "no proven model" must clear
+/// when `model` is `None` — the header is derived from the
+/// body, never trusted from the client (see the module doc's "Header trust"), so "no proven model" must clear
 /// whatever the client sent rather than leave it standing. A `model` value
 /// that doesn't survive `HeaderValue::from_str` (e.g. it contains a raw
 /// newline) is treated the same as "no model": removed, never a failed
@@ -131,8 +147,8 @@ fn apply_model_header(headers: &mut HeaderMap, model: Option<&str>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BodyRewriteConfig {
     /// `typed_config.default_value` — an operator kill switch
-    /// (`observability.force_usage_reporting`, default `true` per the WP-45
-    /// dialect surface once 2c wires it up).
+    /// (`observability.force_usage_reporting`, default `true` in the dialect
+    /// surface).
     enabled: bool,
     dialect: Dialect,
 }
@@ -383,7 +399,7 @@ impl HttpFilter for BodyRewriteFilterInstance {
         end_stream: bool,
     ) -> FilterHeadersStatus {
         // A bodyless request, or a non-JSON content type, has no `model` to
-        // find -- WP-45 decision 4 still applies: any client-supplied
+        // find -- the header-trust rule still applies: any client-supplied
         // `x-llmproxy-model` must be removed here, not left standing, since
         // there is no proof of what the real model is. Mutate `headers`
         // directly rather than through `modify_decoded_headers` -- that
@@ -497,19 +513,18 @@ impl HttpFilter for BodyRewriteFilterInstance {
             }
         }
 
-        // Consumer B: unconditional (decision 3) -- publish the scanned
+        // Consumer B: unconditional -- publish the scanned
         // `model`, or remove any client-supplied value when none was found
-        // (decision 4/5: `CapExceeded` with no `model` seen yet means
+        // (`CapExceeded` with no `model` seen yet means
         // absence is NOT proven, so this deliberately still clears the
         // header and lets routing fall through to the `*` backstop, rather
         // than trusting a client-supplied value). `clear_route_cache()`
         // (S2.8) always follows, so a route match against the OLD header
         // value is never reused.
         let model = facts.model.clone();
-        // WP-50 increment 3a: publish the same extracted `model` onto
+        // Publish the same extracted `model` onto
         // `StreamInfo::requested_model` for `model_authz_filter` to read --
-        // reuses this scan rather than adding a second body buffer (see the
-        // design brief's "load-bearing seam" section). Rust note: scoped so
+        // reuses this scan rather than adding a second body buffer. Rust note: scoped so
         // the `RefMut` guard drops before `modify_decoded_headers` below --
         // `stream_info()` must not be held across another call on `cb` (see
         // its doc), same pattern `auth_filter`/`token_limit_filter` use.
@@ -559,7 +574,7 @@ mod tests {
         per_route_config: Option<Arc<dyn PerRouteConfig>>,
         stream_info: RefCell<StreamInfo>,
         /// How many times `clear_route_cache()` was called -- consumer B
-        /// (WP-45) calls it unconditionally once a decision is reached, so
+        /// calls it unconditionally once a decision is reached, so
         /// tests that want to pin that can inspect this instead of only
         /// inferring it from the header outcome.
         route_cache_cleared: std::cell::Cell<u32>,
@@ -1074,7 +1089,7 @@ mod tests {
     }
 
     // ======================================================================
-    // Consumer B: body-based model routing (WP-45)
+    // Consumer B: body-based model routing
     // ======================================================================
 
     /// Like [`request_headers`], but with an extra client-supplied header --
@@ -1118,7 +1133,7 @@ mod tests {
         );
     }
 
-    /// WP-50 increment 3a: the same scanned `model` is published onto
+    /// The same scanned `model` is published onto
     /// `StreamInfo::requested_model`, not only the routing header --
     /// `model_authz_filter` reads the `StreamInfo` field, never the header.
     #[test]
@@ -1134,7 +1149,7 @@ mod tests {
 
     /// A body with no extractable model must leave `StreamInfo::requested_model`
     /// at `None` -- the same "no proof, don't trust" rule the routing header
-    /// already follows (WP-45 decision 4), now checked for the WP-50 seam too.
+    /// already follows, now checked for the `model_authz_filter` seam too.
     #[test]
     fn body_with_no_model_leaves_stream_info_requested_model_none() {
         let body = br#"{"messages":[],"stream":false}"#;
@@ -1144,7 +1159,7 @@ mod tests {
     }
 
     /// The Anthropic dialect gets no `include_usage` splice, but model
-    /// extraction is dialect-agnostic (WP-45 decision 2) -- proves the old
+    /// extraction is dialect-agnostic -- proves the old
     /// `cfg.dialect != OpenAi` short-circuit no longer suppresses scanning.
     #[test]
     fn anthropic_dialect_body_also_publishes_the_routing_header() {
@@ -1156,7 +1171,7 @@ mod tests {
         assert_eq!(out, body);
     }
 
-    /// SECURITY (WP-45 decision 4): a client-supplied `x-llmproxy-model`
+    /// SECURITY: a client-supplied `x-llmproxy-model`
     /// must be OVERWRITTEN by the body's real value, never left standing or
     /// merely supplemented -- otherwise a client can steer its own request
     /// to a different provider by lying in the header while the body says
@@ -1177,7 +1192,7 @@ mod tests {
         );
     }
 
-    /// SECURITY (WP-45 decision 4): when the body has no extractable model,
+    /// SECURITY: when the body has no extractable model,
     /// a client-supplied `x-llmproxy-model` must be REMOVED, not left
     /// standing -- absence must not be silently trusted as "use the header".
     #[test]
@@ -1213,7 +1228,7 @@ mod tests {
         assert_eq!(cb.route_cache_cleared.get(), 1);
     }
 
-    /// WP-45 decision 5: `ScanOutcome::CapExceeded` before `model` was ever
+    /// `ScanOutcome::CapExceeded` before `model` was ever
     /// seen means absence is NOT proven -- but the policy here is still to
     /// treat it exactly like "no model found": clear the header and let
     /// routing fall through to the `*` backstop deliberately, rather than

@@ -1,8 +1,8 @@
-//! Per-worker listener manager (WP-07 chunk C): each worker binds its own
+//! Per-worker listener manager: each worker binds its own
 //! socket per listener, accepts connections, matches them against the
 //! listener's filter chains (`crate::filter_chain`), and dispatches to the
-//! matched chain's terminal L4 network filter -- `tcp_proxy` (WP-09,
-//! `crate::tcp_proxy`) today; HTTP connection manager L4 entry is WP-10/11.
+//! matched chain's terminal L4 network filter -- `tcp_proxy`
+//! (`crate::tcp_proxy`) or the HTTP connection manager.
 //!
 //! ## Platform divergence: `SO_REUSEPORT` accept balancing
 //!
@@ -56,8 +56,8 @@ use crate::WorkerConfigHandle;
 
 /// The shared [`FilterRegistry`]: every worker's listeners look up HTTP
 /// filter factories by `type_url` against the same registered set, built
-/// exactly once (ground rule from WP-11's wiring task: "construct it once
-/// and share it, do not build a registry per connection").
+/// exactly once ("construct it once and share it, do not build a registry per
+/// connection").
 ///
 /// Rust note: `std::sync::OnceLock` is the safe, `std`-only way to build a
 /// value lazily on first access and share it thereafter -- no `unsafe`, and
@@ -71,42 +71,42 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         let mut registry = FilterRegistry::default();
         registry.register(Arc::new(HeaderMutationFactory));
         registry.register(Arc::new(proxy_filters::ext_authz::ExtAuthzFactory));
-        // WP-31: CORS policies live on the route through
+        // CORS policies live on the route through
         // `typed_per_filter_config`; registration only makes a configured
         // policy buildable, never enables CORS on an unrelated route.
         registry.register(Arc::new(proxy_filters::cors::CorsFilterFactory));
-        // WP-31: local rate limits keep their process-wide buckets in the
+        // Local rate limits keep their process-wide buckets in the
         // factory's shared state. Registration alone consumes no requests;
         // a listener must configure this type URL to enforce a limit.
         registry.register(Arc::new(
             proxy_filters::local_ratelimit::LocalRateLimitFilterFactory,
         ));
-        // WP-33a (Lane H): the usage/token filter. Registered unconditionally
+        // The usage/token filter. Registered unconditionally
         // -- it only does anything on a route that configures it, and a filter
         // that isn't in the registry is a hard config error at load time.
         registry.register(Arc::new(proxy_filters::usage_filter::UsageFilterFactory));
-        // WP-47 migration compatibility: hand-written bootstraps using the
+        // Migration compatibility: hand-written bootstraps using the
         // borrowed DataSource carrier continue to load for one release.
         // Its factory emits a deprecation warning and preserves old field
         // semantics while new configs use the owned Usage message.
         registry.register(Arc::new(
             proxy_filters::usage_filter::LegacyUsageFilterFactory,
         ));
-        // WP-45 increment 2b (Lane H): the request-body rewrite filter
+        // The request-body rewrite filter
         // (forced `stream_options.include_usage` for OpenAI-dialect
         // streaming requests). Also registered unconditionally, same
         // reasoning as the usage filter above.
         registry.register(Arc::new(
             proxy_filters::body_rewrite_filter::BodyRewriteFilterFactory,
         ));
-        // WP-47 migration compatibility: hand-written bootstraps using the
+        // Migration compatibility: hand-written bootstraps using the
         // borrowed RuntimeFeatureFlag carrier continue to load for one
         // release. Its factory emits a deprecation warning and preserves old
         // field semantics while new configs use BodyRewrite.
         registry.register(Arc::new(
             proxy_filters::body_rewrite_filter::LegacyBodyRewriteFilterFactory,
         ));
-        // WP-34 increment 2 (Lane H): the token-budget limiter. Must be
+        // The token-budget limiter. Must be
         // configured BEFORE `llmproxy.usage` in any listener's `http_filters`
         // list for its encode-side `record` to observe usage the usage
         // filter wrote (S2.1: encode runs in reverse config order) -- see
@@ -115,14 +115,14 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::token_limit_filter::TokenLimitFilterFactory,
         ));
-        // WP-47 migration compatibility: hand-written bootstraps using the
+        // Migration compatibility: hand-written bootstraps using the
         // borrowed Envoy RateLimitSettings continue to load for one release.
         // Its factory emits a deprecation warning and has the same runtime
         // semantics as the owned TokenLimit message above.
         registry.register(Arc::new(
             proxy_filters::token_limit_filter::LegacyTokenLimitFilterFactory,
         ));
-        // WP-50 increment 2a (Lane H): downstream authentication. Must be
+        // Downstream authentication. Must be
         // configured BEFORE `llmproxy.token_limit` in any listener's
         // `http_filters` list -- decode callbacks run in FORWARD config order
         // (S2.1), and the limiter buckets on the tenant this filter resolves.
@@ -134,7 +134,7 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         // that registering it does NOT enable authentication anywhere; only a
         // listener that configures the filter authenticates.
         registry.register(Arc::new(proxy_filters::auth_filter::AuthFilterFactory));
-        // WP-50 increment 3a (Lane H): per-tenant model allow-lists. Must be
+        // Per-tenant model allow-lists. Must be
         // configured AFTER BOTH `llmproxy.auth` (needs the tenant) and
         // `llmproxy.body_rewrite` (needs the extracted model) in any
         // listener's `http_filters` list -- `proxy_config::lower::
@@ -145,7 +145,7 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::model_authz_filter::ModelAuthzFilterFactory,
         ));
-        // WP-50 increment 3c-iii-b (Lane H): per-tenant spend-budget
+        // Per-tenant spend-budget
         // enforcement. Decode-check + encode-record, exactly like
         // `llmproxy.token_limit` above -- must be configured AFTER
         // `llmproxy.auth` (needs the tenant) and BEFORE `llmproxy.usage`
@@ -162,15 +162,16 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
     })
 }
 
-/// Compiled downstream TLS factories for one listener's filter chains
-/// (WP-08 chunk C3), aligned by index with `ListenerConfig.filter_chains`,
+/// Compiled downstream TLS factories for one listener's filter chains,
+/// aligned by index with `ListenerConfig.filter_chains`,
 /// plus the `default_filter_chain`. `None` in a slot means that chain has no
 /// `transport_socket` (plaintext) -- or, only after a failed *runtime*
 /// rebuild (see `spawn_accept_loop`), that its factory couldn't be rebuilt.
 ///
 /// Rust note: these factories hold live `rustls` state (cert resolvers,
 /// crypto providers) so they can't live in `ConfigSnapshot` -- `proxy-config`
-/// can't depend on `proxy-core`'s TLS types (ground rule #2). Instead each
+/// can't depend on `proxy-core`'s TLS types (AGENTS.md invariant 2:
+/// protos and generated types stay out of the data plane). Instead each
 /// accept loop keeps its own `ListenerTls`, built once at bind time and
 /// rebuilt lazily whenever it notices the snapshot version changed.
 struct ListenerTls {
@@ -197,7 +198,7 @@ impl ListenerTls {
 /// error names the listener + chain in its `TlsBuildError::context` and
 /// propagates, letting the caller decide fatal-vs-log-and-skip.
 ///
-/// WP-22 increment 2b: any chain whose `transport_socket` names SDS secrets
+/// Any chain whose `transport_socket` names SDS secrets
 /// (`certificate_sds_names` non-empty -- `DownstreamTlsFactory::build` builds
 /// it with an empty cert set in that case, deliberately, since the cert
 /// hasn't arrived yet) is registered with `secret_registry` so a later --
@@ -257,7 +258,7 @@ fn build_listener_tls(
 /// failing that factory's own validation. Same fatal-at-[`initial_bind`] /
 /// logged-and-skip-at-reconcile treatment as [`TlsBuildError`] (see
 /// [`InitialBindError`]'s doc comment): this is a startup error, never a
-/// silent skip of a configured filter (ground rule #1).
+/// silent skip of a configured filter (AGENTS.md invariant 1).
 #[derive(Debug, thiserror::Error)]
 #[error("{context}: {reason}")]
 pub struct HttpFilterChainBuildError {
@@ -266,7 +267,7 @@ pub struct HttpFilterChainBuildError {
 }
 
 /// Compiled HTTP filter-chain handlers for one listener's filter chains
-/// (this WP-11 wiring task), aligned by index with
+/// aligned by index with
 /// `ListenerConfig.filter_chains`, plus the `default_filter_chain` -- the HCM
 /// counterpart to [`ListenerTls`], built and rebuilt on the same cadence
 /// (bind time, then whenever the accept loop notices the snapshot version
@@ -428,10 +429,10 @@ fn bind_listener(listener: &ListenerConfig) -> io::Result<TcpListener> {
 /// [`ListenerCaches`] document for their own bundling one layer down.
 /// Unpacked back into [`WorkerShared`]'s three separate fields wherever one
 /// is built -- `WorkerShared` keeps them separate because it predates this
-/// bundle (WP-23 increment 6a) and its own field count was never close to
+/// bundle and its own field count was never close to
 /// the threshold.
 ///
-/// WP-51 increment 2: `tracing` rides along in this same bundle rather than
+/// `tracing` rides along in this same bundle rather than
 /// as a fifth threaded parameter, for the identical reason the other three
 /// are bundled here -- it reaches [`build_hcm_handler`] on the exact same
 /// path (`initial_bind`/`reconcile` -> [`WorkerShared`] -> `spawn_bound` ->
@@ -471,7 +472,7 @@ pub struct TracingHandles {
 /// (`bind_and_spawn`) each decide what to do with the `Err` case differently.
 /// Bundles the per-worker state every bind/accept function below needs
 /// (config handle, connection registry, drain signal, cluster manager,
-/// WP-23 increment 6a's stats recorder) -- purely to keep
+/// the stats recorder) -- purely to keep
 /// `spawn_bound`/`bind_and_spawn`'s argument count under clippy's
 /// `too_many_arguments` threshold, the same motivation [`ListenerCaches`]
 /// documents for the per-listener build outputs. [`initial_bind`]/[`reconcile`]
@@ -488,7 +489,7 @@ struct WorkerShared<'a> {
     /// `crates/proxy/src/main.rs`'s `worker_main`, threaded down to
     /// [`RouterFilterFactory`] exactly like `cluster_manager` is.
     router_stats: &'a Arc<RouterStats>,
-    /// WP-23 increment 6b: this worker's `downstream_cx_total` recorder --
+    /// This worker's `downstream_cx_total` recorder --
     /// same per-worker cadence and construction site as `router_stats`
     /// above, threaded down to [`spawn_accept_loop`] instead of a filter
     /// factory since the instrument it records is about the accept loop
@@ -501,20 +502,20 @@ struct WorkerShared<'a> {
     /// [`proxy_http::filter_manager::FilterChainHandler::with_token_stats`].
     token_stats: &'a Arc<GenAiTokenStats>,
     latency_stats: &'a Arc<GenAiLatencyStats>,
-    /// WP-51 increment 2: this worker's span sink + head-sampling ratio, if
+    /// This worker's span sink + head-sampling ratio, if
     /// `ConfigSnapshot::tracing` is `Some` -- same per-worker cadence as
     /// `token_stats` above, threaded down to [`build_hcm_handler`], which
     /// wires it into both the `FilterChainHandler` (SERVER span) and the
     /// `RouterFilterFactory` (CLIENT spans) it builds.
     tracing: &'a Option<TracingHandles>,
     metadata: &'a Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
-    /// WP-50 3b-ii part B: the ONE per-serve [`SharedFactoryState`] slot,
+    /// The ONE per-serve [`SharedFactoryState`] slot,
     /// shared across every worker's filter-factory build -- same cadence and
     /// construction site (`crates/proxy/src/main.rs`'s `run_serve`) as
     /// `cluster_manager` above. Threaded down to [`build_hcm_handler`], which
     /// hands it to every `HttpFilterFactory::create` via `FactoryContext`.
     factory_state: &'a Arc<SharedFactoryState>,
-    /// WP-22 increment 2b: the one per-serve [`SdsSecretRegistry`] slot --
+    /// The one per-serve [`SdsSecretRegistry`] slot --
     /// same cadence and construction site as `factory_state` above
     /// (`crates/proxy/src/main.rs`'s `run_serve`). Threaded down to
     /// [`build_listener_tls`], which registers every SDS-named chain it
@@ -606,13 +607,13 @@ fn bind_and_spawn(
 /// instead of logging and skipping): Envoy itself fails startup when a
 /// static bootstrap listener can't bind, and starting the worker with fewer
 /// listeners than configured -- silently serving a subset -- is exactly the
-/// silent degradation ground rule #1 forbids. On error, any listeners this
+/// silent degradation AGENTS.md invariant 1 forbids. On error, any listeners this
 /// call already bound are unwound (their accept-loop tasks aborted) before
 /// returning, so a failed `initial_bind` leaves nothing running.
 ///
 /// On success, hand the returned map to [`run_listener_manager`], which picks
 /// up reconciliation against subsequent config pushes from there.
-// WP-22 increment 2b: `secret_registry` tips this over clippy's 7-arg
+// `secret_registry` tips this over clippy's 7-arg
 // ceiling, same reasoning as `reconcile`'s own `#[allow]` (it is a distinct
 // per-serve shared handle, not a stats recorder, so it doesn't fold into
 // `stats`).
@@ -691,7 +692,7 @@ struct AcceptLoopShared {
     shutdown: watch::Receiver<bool>,
     cluster_manager: Arc<ClusterManager>,
     router_stats: Arc<RouterStats>,
-    /// WP-23 increment 6b: this worker's `downstream_cx_total` recorder --
+    /// This worker's `downstream_cx_total` recorder --
     /// see [`WorkerShared::downstream_stats`].
     downstream_stats: Arc<DownstreamStats>,
     /// This worker's `llm.client.token.usage` recorder -- see
@@ -775,7 +776,7 @@ fn spawn_accept_loop(
                 }
             };
 
-            // WP-23 increment 6b: counted once per successfully accepted
+            // Counted once per successfully accepted
             // connection, and only here -- the `Err(err)` arm above already
             // `continue`d before reaching this line, so a failed `accept()`
             // never contributes to `downstream_cx_total`.
@@ -790,7 +791,7 @@ fn spawn_accept_loop(
             let snapshot = config.load();
 
             // The accept loop's own TLS factory cache goes stale exactly when
-            // the snapshot version does (WP-08 chunk C3): a chain-only config
+            // the snapshot version does: a chain-only config
             // change takes effect for new connections without a rebind (see
             // the "Rust note" above `spawn_accept_loop`'s doc), so a new
             // `transport_socket` or rotated cert on an existing chain needs a
@@ -926,8 +927,8 @@ async fn serve_connection(conn: ServeConnection) {
     // Rust note: `ListenerFilterSpec` currently has only one variant, so
     // destructuring it directly in the closure param (instead of a `match`) is
     // an *irrefutable* pattern -- if a second variant is ever added, this line
-    // stops compiling until it's handled here too, which is exactly ground
-    // rule #1 (never silently drop a config field) enforced by the type
+    // stops compiling until it's handled here too, which is exactly
+    // AGENTS.md invariant 1 (never silently drop a config field) enforced by the type
     // checker.
     let mut server_name = None;
     let mut transport_protocol = "raw_buffer".to_string();
@@ -1005,7 +1006,7 @@ async fn serve_connection(conn: ServeConnection) {
     };
     let filter = terminal_filter(matched, buffer_limit, hcm_handler);
 
-    // WP-10: the configured `codec_type` for `matched`'s terminal filter, if
+    // The configured `codec_type` for `matched`'s terminal filter, if
     // it has one (a `tcp_proxy` chain has no HCM and so no codec to pick --
     // `Auto` there is inert, never read, since the `(false, _)` arm below
     // only consults it when `filter` is actually `TerminalFilter::Http`).
@@ -1025,7 +1026,7 @@ async fn serve_connection(conn: ServeConnection) {
     match (matched.transport_socket.is_some(), factory) {
         (true, Some(factory)) => match factory.wrap(stream).await {
             Ok(tls_stream) => {
-                // WP-10: an explicit `codec_type` (`Http1`/`Http2`) is
+                // An explicit `codec_type` (`Http1`/`Http2`) is
                 // unconditional -- the operator has said what the client
                 // speaks, so there's nothing to negotiate. Only `Auto` (the
                 // Envoy default) falls back to reading what ALPN actually
@@ -1120,7 +1121,7 @@ async fn serve_connection(conn: ServeConnection) {
 /// `alpn_protocols: ["h2"]` on a downstream listener, rustls would happily
 /// negotiate `h2` with the client during `factory.wrap`, and this module then
 /// unconditionally called `serve_http1` on the result -- a config field
-/// accepted and then silently not honored (ground rule #1), and a protocol
+/// accepted and then silently not honored (AGENTS.md invariant 1), and a protocol
 /// violation from the client's point of view (it believes it's speaking h2
 /// framing to us; we read h1 framing off the same bytes). This function is
 /// the fix: read what rustls actually negotiated, post-handshake, rather than
@@ -1180,7 +1181,7 @@ const H2_PREFACE_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 /// the same stale peek instead of waiting for more to arrive.
 const H2_PREFACE_STALL_BACKOFF: Duration = Duration::from_millis(5);
 
-/// WP-10: which codec serves a **plaintext** HTTP connection manager
+/// Which codec serves a **plaintext** HTTP connection manager
 /// connection, given its configured `codec_type`. `Http1`/`Http2` are
 /// unconditional -- the operator has said what the client speaks. `Auto`
 /// (the Envoy default) has no ALPN to consult over plaintext (unlike
@@ -1291,10 +1292,9 @@ fn terminal_filter(
 /// `http_filters` entry becomes one `FilterInstanceFactory` (config order),
 /// looked up in the shared [`filter_registry`] by `type_url`; a `type_url`
 /// with no registered factory is a startup error (`context` names the
-/// listener/chain), never a silent skip (ground rule #1). The router itself
+/// listener/chain), never a silent skip (AGENTS.md invariant 1). The router itself
 /// (`envoy.filters.http.router`, `is_router: true`) is the terminal --
-/// [`proxy_http::router::RouterHandler`] -- not one of these chain filters
-/// (WP-13).
+/// [`proxy_http::router::RouterHandler`] -- not one of these chain filters.
 fn build_hcm_handler(
     hcm: &HttpConnectionManagerConfig,
     routes: &HashMap<String, Arc<proxy_config::ir::RouteTable>>,
@@ -1311,7 +1311,7 @@ fn build_hcm_handler(
     let factory_ctx = FactoryContext {
         shared: runtime.factory_state.clone(),
         scope: context.to_string(),
-        // WP-50 3c-ii-a: the HCM's own operator-supplied `stat_prefix` (this
+        // The HCM's own operator-supplied `stat_prefix` (this
         // function already holds `hcm`) becomes the chain's external name --
         // see `FactoryContext`'s doc for why this is a second field, not a
         // rename of `scope`.
@@ -1381,7 +1381,7 @@ fn build_hcm_handler(
         filters.push(ConfiguredHttpFilter {
             name: f.name.clone(),
             instance_factory: Arc::from(instance_factory),
-            // ADR-0004 step 4 increment 2: kept alongside the instance
+            // ADR-0004 step 4: kept alongside the instance
             // factory -- `FilterChainHandler::new_with_filters` needs the
             // registered `HttpFilterFactory` (not just the per-stream
             // instance factory) once, at construction, to resolve any
@@ -1391,7 +1391,7 @@ fn build_hcm_handler(
         });
     }
 
-    // WP-51 increment 2: `.with_tracing` on the router factory whenever
+    // `.with_tracing` on the router factory whenever
     // tracing is on -- every attempt this HCM's router dispatches gets a
     // CLIENT span sink to emit through (see `RouterFilterFactory::with_tracing`'s
     // doc). `None` costs nothing; see this function's own `.with_tracing`
@@ -1404,14 +1404,14 @@ fn build_hcm_handler(
     if let Some(t) = runtime.tracing_handles {
         router_factory = router_factory.with_tracing(t.sink.clone());
     }
-    // S10 (WP-10 increment 2b/2c): thread this HCM's `upgrade_configs` into
+    // S10: thread this HCM's `upgrade_configs` into
     // the router -- empty is the common case (no upgrades configured) and
     // costs nothing beyond an empty `HashMap`; see
     // `RouterFilterFactory::with_upgrade_configs`'s doc.
     router_factory = router_factory.with_upgrade_configs(hcm.upgrade_configs.clone());
     let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(router_factory);
 
-    // WP-24 chunk 3: `access_logs` sinks are opened here, at the same
+    // `access_logs` sinks are opened here, at the same
     // bind/rebuild cadence as everything else in this function (a fresh
     // `FilterChainHandler` -- and so a fresh set of loggers/sinks -- is built
     // every time `build_listener_hcm` rebuilds this chain, mirroring
@@ -1426,11 +1426,11 @@ fn build_hcm_handler(
     // so logging from there can never observe what an encode filter does at
     // end-of-stream).
     //
-    // ADR-0004 step 4 increment 2: `new_with_filters_and_access_logs` (not
+    // ADR-0004 step 4: `new_with_filters_and_access_logs` (not
     // plain `new_with_access_logs`) -- `filters` carries each entry's Envoy
     // name and registered factory, needed to resolve `typed_per_filter_config`
-    // against the real chain once, here, rather than never (ground rule #1).
-    // WP-23 increment 6b: `.with_token_stats` on every real HCM build --
+    // against the real chain once, here, rather than never (AGENTS.md invariant 1).
+    // `.with_token_stats` on every real HCM build --
     // `FilterChainHandler::with_token_stats`'s own doc says this is exactly
     // what this function is supposed to do; before this, the field it sets
     // was wired end to end everywhere except here, so `token_stats` was
@@ -1467,7 +1467,7 @@ fn build_hcm_handler(
     if let Some(sink) = runtime.metadata {
         handler = handler.with_request_record_sink(sink.clone());
     }
-    // WP-51 increment 2: `.with_tracing` on the FilterChainHandler half of
+    // `.with_tracing` on the FilterChainHandler half of
     // this build -- see the `router_factory` one above for the other half
     // (the CLIENT-span-emitting router terminal); this half is what mints
     // the SERVER span and joins/propagates an inbound `traceparent`.
@@ -1478,7 +1478,7 @@ fn build_hcm_handler(
 }
 
 /// Everything [`run_terminal_filter`] needs beyond `stream`/`filter`/
-/// `snapshot` -- WP-10 h2's new `codec` field is what pushed the plain
+/// `snapshot` -- the `codec` field is what pushed the plain
 /// parameter list over clippy's `too_many_arguments` threshold; bundled here
 /// rather than adding an 8th positional parameter (same motivation
 /// [`WorkerShared`]/[`ListenerCaches`] document for their own bundling).
@@ -1489,7 +1489,7 @@ struct RunTerminalFilterCtx<'a> {
     // Rust note: `Copy`, so it threads cheaply -- also doubles as `peer` for
     // the tracing calls below via `downstream.remote`.
     downstream: DownstreamInfo,
-    // WP-10 h2: which codec to drive the `Http` terminal filter with --
+    // Which codec to drive the `Http` terminal filter with --
     // always `Http1` on the plaintext call site, ALPN-derived on the TLS one
     // (see `downstream_codec_for_alpn`). Ignored by the `TcpProxy`/`None`
     // arms below, which have no HTTP codec to pick.
@@ -1584,13 +1584,13 @@ fn reset(stream: &TcpStream, listener: &str) {
 /// Reconcile `bound` against `snapshot`: bind new listeners, warm a replacement
 /// before stopping an address-changed listener, leave unchanged ones alone, and
 /// stop accepting on ones that were removed.
-// WP-50 3b-ii part B: `factory_state` is the 8th argument, tipping this over
+// `factory_state` is the 8th argument, tipping this over
 // clippy's 7-arg ceiling -- it can't fold into `stats` (a `&StatsRecorders`,
 // already a bundle of the actual per-worker *stats recorders*; `factory_state`
 // is a different kind of shared handle) without muddying that bundle's own
 // documented purpose, so this leaf allows the extra arg instead, same
 // tradeoff `crates/proxy/src/main.rs`'s `worker_main` already made for
-// `tracing_handles`. WP-22 increment 2b: `secret_registry` rides along the
+// `tracing_handles`. `secret_registry` rides along the
 // same way, for the same reason.
 #[allow(clippy::too_many_arguments)]
 fn reconcile(
@@ -1760,10 +1760,10 @@ fn reconcile(
 /// Established connections are unaffected by any of this: they hold their
 /// own `Arc<ConfigSnapshot>` and their own task, independent of the accept
 /// loop that spawned them.
-// WP-50 3b-ii part B: `factory_state` tips this over clippy's 7-arg ceiling,
+// `factory_state` tips this over clippy's 7-arg ceiling,
 // same reasoning as `reconcile`'s own `#[allow]` just above (this function's
-// only job with it is forwarding it there every reconcile). WP-22 increment
-// 2b: `secret_registry` rides along the same way.
+// only job with it is forwarding it there every reconcile). `secret_registry`
+// rides along the same way.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_listener_manager(
     mut bound: HashMap<ListenerName, BoundListener>,
@@ -1855,7 +1855,7 @@ mod tests {
         (client, server)
     }
 
-    // --- WP-10: `codec_type` peek/dispatch on a plaintext connection --------
+    // --- `codec_type` peek/dispatch on a plaintext connection --------
 
     /// Sanity check: a preface delivered in a single write is recognized.
     #[test]
@@ -1891,7 +1891,7 @@ mod tests {
         });
     }
 
-    /// WP-10 acceptance criterion: "a connection that sends 23 bytes of a
+    /// "A connection that sends 23 bytes of a
     /// valid preface then more must still work" -- the peek loop must keep
     /// waiting across a slow, split write of an otherwise-valid preface, not
     /// bail out (or misread the split as a mismatch) on the first incomplete
@@ -1924,7 +1924,7 @@ mod tests {
         });
     }
 
-    /// WP-10 acceptance criterion: "a connection sending fewer than 24 bytes
+    /// "A connection sending fewer than 24 bytes
     /// and then waiting must not hang forever" -- a client that sends a valid
     /// preface *prefix* and then goes quiet forever must still resolve,
     /// falling back to h1 once `H2_PREFACE_PEEK_TIMEOUT` elapses rather than
@@ -1957,7 +1957,7 @@ mod tests {
     /// A `tcp_proxy` filter targeting `cluster`, no idle timeout, a single
     /// connect attempt -- the minimal filter every "held open" fixture below
     /// needs now that empty filter lists no longer hold a connection open
-    /// (WP-09: a chain with no terminal filter is reset, matching Envoy/the
+    /// (a chain with no terminal filter is reset, matching Envoy/the
     /// lowering-time non-empty-filters invariant).
     fn tcp_proxy_filter(cluster: &str) -> NetworkFilterSpec {
         tcp_proxy_filter_with_idle(cluster, None)
@@ -1976,7 +1976,7 @@ mod tests {
     }
 
     /// A minimal `http_connection_manager` filter -- an empty route table (no
-    /// virtual hosts) and no http_filters. Since WP-13, the terminal is a
+    /// virtual hosts) and no http_filters. The terminal is a
     /// real [`proxy_http::router::RouterHandler`], so a request against this
     /// empty table always takes the `NoVirtualHost` path (404) -- see
     /// `hcm_terminal_filter_serves_http_over_the_real_socket`, which exists
@@ -2009,7 +2009,7 @@ mod tests {
     /// terminal synthesizes this response itself, no cluster/upstream
     /// involved. Used by `hcm_filter_chain_mutates_headers_over_the_real_socket`
     /// to prove the header-mutation filter's mutation survives the real
-    /// router terminal (as opposed to the WP-13 acceptance test below, which
+    /// router terminal (as opposed to the router-forwarding test below, which
     /// proves the `Forward` path to a real upstream).
     fn direct_response_route_table(status: u16) -> Arc<proxy_config::ir::RouteTable> {
         use proxy_config::ir::{
@@ -2051,8 +2051,7 @@ mod tests {
     /// `hcm_filter_chain_mutates_headers_over_the_real_socket` below). The
     /// route table is [`direct_response_route_table`] (200), so the real
     /// router terminal produces a response for the header-mutation encode
-    /// filter to mutate -- WP-13 replaced the fixed-200 stub this used to
-    /// exercise.
+    /// filter to mutate (the terminal used to be a fixed-200 stub).
     fn hcm_filter_with_header_mutation(header_name: &str, header_value: &str) -> NetworkFilterSpec {
         use crate::header_mutation_filter::{header_value_option, TYPE_URL};
         NetworkFilterSpec::HttpConnectionManager(proxy_config::ir::HttpConnectionManagerConfig {
@@ -2165,7 +2164,7 @@ mod tests {
     }
 
     /// Accept connections forever and echo back whatever's read, byte for
-    /// byte, until the peer closes -- the default WP-09 upstream fixture for
+    /// byte, until the peer closes -- the default upstream fixture for
     /// tests that actually push data through the pump.
     async fn spawn_echo_upstream() -> SocketAddr {
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2245,7 +2244,7 @@ mod tests {
 
     /// Same match criteria as [`sni_only_listener`], but with a `tls_inspector`
     /// listener filter -- the only thing that lets `server_names` matching
-    /// actually see the ClientHello's SNI (WP-08 chunk C2).
+    /// actually see the ClientHello's SNI.
     fn sni_only_listener_with_tls_inspector(
         name: &str,
         addr: SocketAddr,
@@ -2288,7 +2287,7 @@ mod tests {
     /// Builds a [`ClusterManager`] populated (and force-initialized, so
     /// `pick_host` never has to wait on real DNS) from `snapshot`'s cluster
     /// map -- the same manager both the `tcp_proxy` fixtures' listener wiring
-    /// and (WP-13) the HTTP router's `RouterHandler` see.
+    /// and the HTTP router's `RouterHandler` see.
     async fn cluster_manager_for(snapshot: &ConfigSnapshot) -> Arc<ClusterManager> {
         let manager = Arc::new(ClusterManager::new(
             Arc::new(proxy_cluster::resolver::TokioResolver),
@@ -2301,7 +2300,7 @@ mod tests {
         manager
     }
 
-    /// WP-23 increment 6a: a fresh, single-worker [`RouterStats`] resolved
+    /// A fresh, single-worker [`RouterStats`] resolved
     /// for every cluster in `snapshot` -- what `crates/proxy/src/main.rs`
     /// builds once at boot from the real config snapshot; these tests need
     /// the same shape so `RouterFilterFactory` (built deep inside
@@ -2355,8 +2354,8 @@ mod tests {
 
     /// [`router_stats_for`]'s counterpart for `llm.client.token.usage` --
     /// see that function's doc for why this shares `control` rather than
-    /// building its own. Resolved for every cluster (= provider, ground
-    /// rule #6) in `snapshot`.
+    /// building its own. Resolved for every cluster (= provider,
+    /// AGENTS.md invariant 6) in `snapshot`.
     pub(super) fn token_stats_for(
         control: &proxy_observability::stats::StatsControl,
         snapshot: &ConfigSnapshot,
@@ -2864,7 +2863,7 @@ mod tests {
         });
     }
 
-    // --- WP-08 chunk C3: downstream TLS termination in the accept path -----
+    // --- downstream TLS termination in the accept path -----
 
     fn tls_params() -> TlsParametersIR {
         TlsParametersIR {
@@ -2994,7 +2993,7 @@ mod tests {
     }
 
     /// Like [`client_factory_with_sni`], but with an explicit ALPN offer --
-    /// the WP-10 h2 dispatch test below needs to control exactly which
+    /// the h2 dispatch test below needs to control exactly which
     /// protocol the client proposes (rather than none at all), unlike every
     /// pre-h2 TLS test in this module.
     fn client_factory_with_alpn(sni: &str, alpns: &[&str]) -> UpstreamTlsFactory {
@@ -3012,7 +3011,7 @@ mod tests {
     }
 
     /// An `http_connection_manager` filter whose route table always returns a
-    /// fixed-status `DirectResponse` -- the WP-10 h2 dispatch tests below only
+    /// fixed-status `DirectResponse` -- the h2 dispatch tests below only
     /// care "did the right codec (h1 vs h2) serve this connection", not
     /// about routing, so this is deliberately simpler than
     /// [`hcm_filter_with_header_mutation`]. `codec_type` defaults to `Auto`
@@ -3042,7 +3041,7 @@ mod tests {
         })
     }
 
-    /// WP-10 h2 -- the ALPN dispatch test, and the regression test for the
+    /// The ALPN dispatch test, and the regression test for the
     /// bug [`downstream_codec_for_alpn`]'s doc comment describes: before that
     /// function existed, this listener unconditionally called `serve_http1`
     /// regardless of what ALPN negotiated, so an operator configuring
@@ -3185,7 +3184,7 @@ mod tests {
         }
     }
 
-    /// WP-10: `codec_type: AUTO` (the default) on a **plaintext** connection
+    /// `codec_type: AUTO` (the default) on a **plaintext** connection
     /// has no ALPN to consult -- see [`resolve_plaintext_codec`]'s doc. This
     /// is the plaintext counterpart of
     /// `alpn_negotiated_protocol_selects_the_serving_codec`: same
@@ -3243,7 +3242,7 @@ mod tests {
         });
     }
 
-    /// WP-10: `codec_type: HTTP2` is unconditional -- `serve_http2` is used
+    /// `codec_type: HTTP2` is unconditional -- `serve_http2` is used
     /// even for a request that, under `AUTO`, would have been detected as h1
     /// (see `plaintext_codec_auto_detects_h2_prior_knowledge_and_an_ordinary_h1_request`'s
     /// h1 side, which sends the exact same bytes against the same fixture
@@ -3298,8 +3297,8 @@ mod tests {
         });
     }
 
-    /// WP-10: `codec_type: HTTP1` is unconditional -- `serve_http1` is used
-    /// "even when a preface is present" (WP-10's own acceptance wording).
+    /// `codec_type: HTTP1` is unconditional -- `serve_http1` is used
+    /// "even when a preface is present" (Envoy's wording for an explicit codec).
     /// Mirrors `plaintext_codec_type_http2_serves_h2_unconditionally`, with
     /// the codec and the discriminating payload swapped.
     #[test]
@@ -3541,7 +3540,7 @@ mod tests {
         });
     }
 
-    // --- WP-09: tcp_proxy runtime ------------------------------------------
+    // --- tcp_proxy runtime ------------------------------------------
 
     #[test]
     fn tcp_proxy_bidirectional_round_trip() {
@@ -3884,15 +3883,15 @@ mod tests {
         });
     }
 
-    // --- WP-10 deferred chunk: HCM terminal filter wired to the h1 codec ----
+    // --- HCM terminal filter wired to the h1 codec ----
 
-    /// Since WP-13, `build_hcm_handler`'s terminal is a real
+    /// `build_hcm_handler`'s terminal is a real
     /// `proxy_http::router::RouterHandler`, not a fixed-200 stub -- an empty
     /// route table (`hcm_filter`) means every request takes the
     /// `NoVirtualHost` path, a 404. This test now proves HTTP is served over
     /// the real socket *at all* (request parsed, response written back) --
     /// see `hcm_filter_chain_mutates_headers_over_the_real_socket` for a
-    /// route that actually matches, and the WP-13 acceptance test below for
+    /// route that actually matches, and the router-forwarding test below for
     /// a route that forwards to a real upstream.
     #[test]
     fn hcm_terminal_filter_serves_http_over_the_real_socket() {
@@ -3981,7 +3980,7 @@ mod tests {
         });
     }
 
-    // --- WP-13: router terminal + cluster-manager wiring -------------------
+    // --- router terminal + cluster-manager wiring -------------------
 
     /// A one-vhost, one-route table matching every request (`*` domain,
     /// empty-prefix path) with a `Forward` action targeting `cluster` --
@@ -4070,7 +4069,7 @@ mod tests {
 
     /// Serve a fixed 200 response (a known body, no extra headers) over real
     /// HTTP/1.1 on a fresh ephemeral-port `TcpListener`, forever -- the "real
-    /// upstream" fixture for the WP-13 acceptance test below. Reuses
+    /// upstream" fixture for the router-forwarding test below. Reuses
     /// `proxy_http`'s own downstream codec + `FixedResponseHandler` stub
     /// (exactly what `proxy-http`'s own tests use to fake an origin), so this
     /// isn't hand-rolled wire parsing.
@@ -4161,14 +4160,14 @@ mod tests {
         addr
     }
 
-    /// The WP-13 acceptance test: a real HTTP request is routed (via the
+    /// Acceptance test: a real HTTP request is routed (via the
     /// router terminal + `ClusterManager`) to a real upstream over HTTP/1.1,
     /// and the response still flows back through the encode filter chain --
     /// proving all three pieces (route match -> cluster/host pick -> upstream
     /// codec -> encode filters) work together over real sockets.
     ///
     /// Mutation-tested: reverting `build_hcm_handler`'s terminal to
-    /// `FixedResponseHandler` (the pre-WP-13 stub) makes this fail, since the
+    /// `FixedResponseHandler` (the earlier fixed-response stub) makes this fail, since the
     /// stub never contacts `upstream_addr` and never emits its body.
     #[test]
     fn router_forwards_a_real_request_to_a_real_upstream_over_http1() {
@@ -4226,7 +4225,7 @@ mod tests {
         });
     }
 
-    // --- WP-33a: usage filter over a real socket ---------------------------
+    // --- usage filter over a real socket ---------------------------
 
     /// Undo HTTP/1.1 chunked transfer-coding: `<hex-len>\r\n<chunk>\r\n`
     /// repeated, terminated by a `0\r\n\r\n` end chunk (no trailers in this
@@ -4253,7 +4252,7 @@ mod tests {
         out
     }
 
-    /// The WP-33a acceptance test: a **YAML-shaped** bootstrap (not
+    /// Acceptance test: a **YAML-shaped** bootstrap (not
     /// hand-built IR) wires the `type.llmproxy.dev/envoy.config.core.v3.DataSource`
     /// usage filter and a file access logger into one HCM, `build_snapshot`
     /// lowers it exactly the way `proxy_config::load_bootstrap_file` would for
@@ -4430,7 +4429,7 @@ static_resources:
         });
     }
 
-    /// WP-33 acceptance criterion 3: an invalid per-route usage dialect must
+    /// An invalid per-route usage dialect must
     /// be a build error, even when the `typed_per_filter_config` entry is
     /// wrapped `is_optional: true`. `is_optional` only tolerates a filter
     /// that has *no* per-route config at all (`ConfigError::Unimplemented`,
@@ -4693,13 +4692,13 @@ static_resources:
         );
     }
 
-    // --- WP-45 increment 2b: body-rewrite filter over a real socket -----------
+    // --- body-rewrite filter over a real socket -----------
 
     /// A real upstream that reads a raw HTTP/1.1 request by hand, echoes the
     /// request body back as its own response body, and reports two numbers
     /// as response headers: the `content-length` the request DECLARED, and
-    /// the number of body bytes it actually READ off the wire. WP-45
-    /// increment 2's whole point is that those two numbers must agree after
+    /// the number of body bytes it actually READ off the wire. The
+    /// point of the body-rewrite filter is that those two numbers must agree after
     /// the body-rewrite filter splices bytes in and grows `content-length`
     /// to match -- a unit test can't observe that, since it never puts real
     /// bytes on a real socket with real HTTP/1.1 framing.
@@ -4788,7 +4787,7 @@ static_resources:
         addr
     }
 
-    /// The WP-45 increment 2 acceptance test: a bootstrap YAML wires the
+    /// Acceptance test: a bootstrap YAML wires the
     /// `type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite`
     /// body-rewrite filter ahead of the router, a streaming OpenAI request
     /// WITHOUT `stream_options` is sent over a real socket, and the request
@@ -4952,9 +4951,9 @@ static_resources:
         });
     }
 
-    // --- WP-34 increment 2: token limiter over real sockets ------------------
+    // --- token limiter over real sockets ------------------
 
-    /// The WP-34 increment 2 acceptance test: a bootstrap wires
+    /// Acceptance test: a bootstrap wires
     /// `llmproxy.token_limit` BEFORE `llmproxy.usage` (see
     /// `token_limit_filter`'s module doc for why the order matters), a real
     /// upstream reports a fixed, known token usage on every response, and a

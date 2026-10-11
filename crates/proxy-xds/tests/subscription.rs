@@ -1,7 +1,7 @@
-//! WP-20 increment 2 acceptance: the S8 subscription state machine.
+//! Acceptance: the S8 subscription state machine.
 //!
-//! Every test here pins one sentence of appendix S8. That is the point of
-//! splitting this increment out of the transport — these are the rules a
+//! Every test here pins one sentence of `internal-docs/envoy-semantics.md` S8.
+//! That is the point of splitting this out of the transport — these are the rules a
 //! control plane will hold us to, and none of them needs a socket to check.
 
 use std::collections::BTreeSet;
@@ -97,7 +97,7 @@ fn a_nacked_response_does_not_change_the_acked_version() {
     );
 }
 
-/// The error text reaches the wire: S8 wants our WP-03/04 dotted-path errors
+/// The error text reaches the wire: S8 wants our dotted-path config errors
 /// in `error_detail`, not a generic failure.
 #[test]
 fn a_nack_carries_the_validation_message_verbatim() {

@@ -1,5 +1,4 @@
-//! Per-worker HTTP/2 upstream connection cache (WP-15 slice A, extended by
-//! slice C): keeps a small, bounded *set* of live hyper h2 [`SendRequest`]s
+//! Per-worker HTTP/2 upstream connection cache: keeps a small, bounded *set* of live hyper h2 [`SendRequest`]s
 //! per (cluster, address, protocol) instead of exactly one, and hands out
 //! clones from whichever member of that set has room, instead of dialing a
 //! fresh TCP connection (and TLS handshake, where configured) for every
@@ -8,14 +7,14 @@
 //! N concurrent requests to one provider costing far fewer than N TCP
 //! connections -- just not always exactly 1 any more.
 //!
-//! ## Why slice A's "exactly one connection" wasn't enough (slice C)
+//! ## Why "exactly one connection" wasn't enough
 //!
 //! A capacity sweep plateaued at exactly 202 concurrent streams no matter
 //! how much load was offered, because the peer (any real h2 server,
 //! including hyper's own, whose server default is
 //! `max_concurrent_streams: 200`, `hyper-1.11.0/src/proto/h2/server.rs:69`)
-//! caps how many streams *one* connection may carry at once, and slice A
-//! cached exactly one connection per key. h1 hit no such ceiling (its own
+//! caps how many streams *one* connection may carry at once, and the original
+//! design cached exactly one connection per key. h1 hit no such ceiling (its own
 //! pool dials a fresh connection per stream), so h2 pooling was costing up
 //! to 5x peak concurrency versus h1 for the identical workload.
 //!
@@ -38,10 +37,10 @@
 //! (or new) connection; hyper's real per-connection queue is still what
 //! ultimately keeps everything safe if that guess runs a little high.
 //!
-//! h1 was untouched by slices A/C: h1 has no multiplexing (one request in
+//! h1 was untouched by the h2 set: h1 has no multiplexing (one request in
 //! flight per connection, ever), so none of the stream-accounting machinery
-//! above applies to it. Keep-alive reuse for h1 is [`H1ConnCache`] (WP-15
-//! slice B, below) -- a much smaller cache in shape (one IDLE connection
+//! above applies to it. Keep-alive reuse for h1 is [`H1ConnCache`]
+//! (below) -- a much smaller cache in shape (one IDLE connection
 //! leased to one request at a time, never shared concurrently) but with its
 //! own hazard the h2 cache never has to think about: an h1 connection is
 //! only safe to hand to the NEXT request after its CURRENT response body has
@@ -85,11 +84,11 @@ use crate::handler::{local_boxed, BodyError, HttpRequestParts, HttpResponseParts
 /// clusters can be configured to point at the very same address with
 /// different `transport_socket`s (different TLS trust roots, client certs,
 /// SNI) and different per-provider credentials
-/// (`ClusterConfig::request_headers_to_add`, WP-35). Dropping `cluster` from
+/// (`ClusterConfig::request_headers_to_add`). Dropping `cluster` from
 /// this key would let a request routed to cluster B reuse cluster A's
 /// already-established h2 connection -- shipping A's TLS identity, and every
 /// request sent over that connection afterward, to a destination the config
-/// never authorized for it. This is the same class of bug ground rule #6
+/// never authorized for it. This is the same class of bug AGENTS.md invariant 6
 /// already names twice (provider credentials and `host_rewrite_literal`
 /// following the routing decision instead of the connection); a future
 /// reader who notices `addr` alone "looks like enough" and removes `cluster`
@@ -170,7 +169,7 @@ const SOFT_STREAMS_PER_CONNECTION: usize = 100;
 /// handshake cost over many requests per connection, and without opening
 /// enough parallel connections to itself look like abuse to a peer that
 /// caps concurrent connections per client. Not (yet) configurable per
-/// cluster; a fixed conservative default is in scope for this slice.
+/// cluster; a fixed conservative default is used.
 const MAX_CONNECTIONS_PER_KEY: usize = 4;
 
 /// One connection this cache is holding open for a [`ConnKey`], plus our own
@@ -180,7 +179,7 @@ const MAX_CONNECTIONS_PER_KEY: usize = 4;
 struct PooledConn {
     sender: SendRequest<StreamBody>,
     in_flight: Rc<Cell<usize>>,
-    /// The S5 `max_connections` slot (WP-15) this physical connection holds
+    /// The S5 `max_connections` slot this physical connection holds
     /// -- moved out of the [`proxy_cluster::UpstreamStream`] `pool.new_stream()`
     /// returned, rather than dropped at the end of `get_or_connect`, so it
     /// lives exactly as long as this cached connection does and releases the
@@ -201,7 +200,7 @@ type Slot = Rc<tokio::sync::Mutex<Vec<PooledConn>>>;
 /// A leased h2 sender plus the [`StreamGuard`] that must ride along with
 /// whatever response body this stream produces -- see [`Self::send`].
 /// Returned by [`UpstreamConnCache::get_or_connect`] instead of a bare
-/// `SendRequest` (what slice A returned) so the router can't accidentally
+/// `SendRequest` (what the original single-connection design returned) so the router can't accidentally
 /// send a request without also carrying its stream-accounting guard.
 #[derive(Debug)]
 pub struct PooledSendRequest {
@@ -219,8 +218,8 @@ impl PooledSendRequest {
     /// was built for.
     ///
     /// Kept here rather than changing `codec::send_on_http2`'s own
-    /// signature, so `codec.rs` stays pool-agnostic -- the same split slice
-    /// A already drew between "dial" (`handshake_upstream_http2`) and "send"
+    /// signature, so `codec.rs` stays pool-agnostic -- the same split the
+    /// original design already drew between "dial" (`handshake_upstream_http2`) and "send"
     /// (`send_on_http2`).
     pub async fn send(
         self,
@@ -351,7 +350,7 @@ impl UpstreamConnCache {
     /// error purely because every existing connection is busy: once the set
     /// is at [`MAX_CONNECTIONS_PER_KEY`], this hands out the least-loaded
     /// member anyway and lets hyper's own per-connection queue (see this
-    /// module's doc) absorb the rest, exactly as slice A's single connection
+    /// module's doc) absorb the rest, exactly as the original single connection
     /// already did for everything past its one connection's real capacity.
     ///
     /// Rust note: the per-key `tokio::sync::Mutex` (not this cache's own
@@ -436,7 +435,7 @@ impl UpstreamConnCache {
         // because of that -- hand out the least-loaded connection anyway.
         // hyper's own per-connection queue still won't drop or reject the
         // request; it queues internally until a real stream slot frees,
-        // exactly like slice A's single connection did for everything past
+        // exactly like the original single connection did for everything past
         // its own real capacity.
         let conn = conns
             .iter()
@@ -465,7 +464,7 @@ impl UpstreamConnCache {
     /// endpoint, or file watcher that calls `publish()` after boot. The only
     /// callers of `publish` anywhere in the tree are unit tests. Wiring a
     /// real post-boot reload trigger is separate, already-scheduled work.
-    /// This is not a silently-unhandled config-swap gap (ground rule #1):
+    /// This is not a silently-unhandled config-swap gap (AGENTS.md invariant 1):
     /// there is no reload path yet for a stale entry to survive, so there is
     /// nothing to get wrong. This method (and [`Self::invalidate`]) exist so
     /// that whoever wires the reload trigger has a correct, already-tested
@@ -498,7 +497,7 @@ thread_local! {
     // implements `TerminalFilterInstanceFactory`, which requires
     // `Send + Sync` (config-time factories are built once and used across
     // every worker), and `Rc`/`RefCell` are neither. `thread_local!` is the
-    // fallback WP-15's brief calls out for exactly this shape of constraint.
+    // fallback for exactly this shape of constraint.
     static WORKER_CONN_CACHE: Rc<UpstreamConnCache> = Rc::new(UpstreamConnCache::new());
 }
 
@@ -511,7 +510,7 @@ pub fn worker_conn_cache() -> Rc<UpstreamConnCache> {
 }
 
 // ---------------------------------------------------------------------
-// WP-15 slice B: HTTP/1.1 upstream keep-alive connection reuse.
+// HTTP/1.1 upstream keep-alive connection reuse.
 // ---------------------------------------------------------------------
 
 /// How many IDLE h1 connections [`H1ConnCache`] will hold open, at most, for
@@ -522,7 +521,7 @@ pub fn worker_conn_cache() -> Rc<UpstreamConnCache> {
 /// for the same upstream soon -- 8 is enough to smooth out a bursty
 /// sequential workload against one provider without accumulating a large
 /// number of sockets that just sit there between bursts. There is
-/// deliberately no idle-timeout eviction in this slice (see this module's
+/// deliberately no idle-timeout eviction yet (see this module's
 /// doc and `router.rs`'s "Deferred" list) -- an idle connection nobody
 /// leases again just waits until the peer closes it, and the next
 /// `get_or_connect_h1` call's `is_closed()` check on it catches that.
@@ -534,7 +533,7 @@ const MAX_IDLE_PER_KEY: usize = 8;
 struct IdleH1Conn {
     sender: Http1SendRequest<StreamBody>,
     conn_task: tokio::task::JoinHandle<()>,
-    /// The S5 `max_connections` slot (WP-15) this physical connection holds,
+    /// The S5 `max_connections` slot this physical connection holds,
     /// exactly like [`PooledConn::_cb_guard`] -- moved out of the
     /// `proxy_cluster::UpstreamStream` `pool.new_stream()` returned, and kept
     /// alive for as long as this connection is cached, releasing the slot
@@ -547,7 +546,7 @@ impl IdleH1Conn {
     /// Explicitly tear this idle connection down: abort `conn_task` (which
     /// stops it being polled, dropping the underlying IO), then let
     /// `sender`/`cb_guard` drop normally as this method returns -- `cb_guard`
-    /// dropping is what releases the WP-15 `max_connections` slot.
+    /// dropping is what releases the `max_connections` slot.
     ///
     /// Rust note: this is a plain consuming method, not a `Drop` impl.
     /// `Drop::drop` only ever gets `&mut self`, and Rust forbids moving a
@@ -1307,12 +1306,12 @@ mod tests {
             .await;
     }
 
-    /// WP-15 slice C's own motivating regression test: a peer that only
+    /// The motivating regression test for the connection set: a peer that only
     /// allows `PEER_LIMIT` concurrent streams on one connection must not cap
     /// this cache's *total* achievable concurrency at `PEER_LIMIT` once
     /// demand exceeds it -- the exact shape of the measured bug (a real
     /// capacity sweep plateaued at 202 concurrent streams against a peer
-    /// whose real limit was 200, because slice A cached exactly one
+    /// whose real limit was 200, because the original design cached exactly one
     /// connection). `PEER_LIMIT` here is deliberately tiny (2, not 200) so
     /// this test proves the same property in milliseconds instead of
     /// needing hundreds of real sockets.

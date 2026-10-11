@@ -21,5 +21,5 @@ corpus` to regenerate `corpus-report.md` with the current numbers; treat
 this percentage as a snapshot, not a target to game — most of the
 "unsupported" results here name a real, if narrow, gap (typed extension
 configs like access loggers, transport sockets, and listener filters we
-haven't vendored/mapped yet), which is exactly what ground rule #2 is
+haven't vendored/mapped yet), which is exactly what AGENTS.md invariant 1 is
 for.

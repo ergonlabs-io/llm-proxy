@@ -1,4 +1,4 @@
-//! WP-33: route metadata carries the `streaming: strict` assertion through
+//! Route metadata carries the `streaming: strict` assertion through
 //! strict Envoy parsing into the IR.  The factory-capability check belongs to
 //! `proxy-http`; these tests pin this config crate's half of the contract.
 

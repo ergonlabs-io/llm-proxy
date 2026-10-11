@@ -1,4 +1,4 @@
-//! WP-33a — wires the WP-34 [`crate::usage`] extractor into the real HTTP
+//! Wires the [`crate::usage`] extractor into the real HTTP
 //! encode path.
 //!
 //! This is the filter that actually watches response bytes go by: it picks a
@@ -8,7 +8,7 @@
 //!
 //! # The one rule that matters more than any other
 //!
-//! This filter must **never** buffer the response. WP-33's whole product bet
+//! This filter must **never** buffer the response. The whole product bet
 //! is that a client streaming tokens from an LLM sees them as they're
 //! generated, not after the proxy has assembled the full response. See the
 //! `// Rust note:` on [`UsageFilterInstance::encode_data`] for the mechanical
@@ -140,7 +140,7 @@ impl PricingRegistry {
     }
 }
 
-/// Borrowed type URL accepted for one release after the WP-47 migration.
+/// Borrowed type URL accepted for one release after the move to an owned, versioned message.
 pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSource";
 
 /// Upper bound on the response body this filter will accumulate to parse as a
@@ -151,7 +151,7 @@ pub const MAX_JSON_BODY_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Convert a [`TokenUsage`] into the [`LlmTokenUsage`] that `StreamInfo`
 /// carries. All four cost buckets cross the boundary intact — dropping the
-/// cache buckets would leave anything downstream (billing, the WP-34 token
+/// cache buckets would leave anything downstream (billing, the token
 /// limiter) unable to compute a correct cost, since the buckets are priced
 /// differently.
 ///
@@ -606,7 +606,7 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
 /// Rust note: an enum used as a small state machine — which strategy (if any)
 /// this stream's body is being read with. Matching on it is exhaustive, so
 /// adding a fourth mode later forces every call site here to decide what it
-/// does in that case (ground rule #1's spirit, applied to our own code).
+/// does in that case (AGENTS.md invariant 1's spirit, applied to our own code).
 enum BodyMode {
     /// `text/event-stream`: feed chunks to the incremental SSE scanner.
     Sse(SseUsageScanner),
@@ -733,7 +733,7 @@ impl UsageFilterInstance {
         // panics. It's dropped at the end of this function.
         let mut stream_info = cb.stream_info();
         // `None` must stay `None` here — never write `Some(0, 0)` for a
-        // response that reported no usage at all (WP-34's rule; this number
+        // response that reported no usage at all (this number
         // feeds billing, and a wrong zero is worse than an honest "unknown").
         stream_info.llm.usage = usage.map(LlmTokenUsage::from);
         // The card is evaluated only after the terminal usage extractor has
@@ -1453,7 +1453,7 @@ mod tests {
         assert_eq!(usage.output_tokens, 9);
     }
 
-    /// The load-bearing property behind WP-33 acceptance criterion 3: an
+    /// The load-bearing property behind per-route dialect validation: an
     /// invalid per-route dialect must come back as `ConfigError::InvalidValue`,
     /// never `ConfigError::Unimplemented`.
     /// `filter_manager::resolve_per_filter_row` swallows exactly
@@ -1462,8 +1462,8 @@ mod tests {
     /// variant here ever regressed to `Unimplemented`, a typo'd per-route
     /// dialect on an `is_optional: true` entry would be silently dropped
     /// instead of failing the build, and the route would go on to meter with
-    /// the wrong (fallback) dialect -- exactly the silent-field-drop ground
-    /// rule #1 forbids.
+    /// the wrong (fallback) dialect -- exactly the silent field drop AGENTS.md
+    /// invariant 1 forbids.
     #[test]
     fn parse_per_route_rejects_an_invalid_dialect_as_invalid_value() {
         let factory = UsageFilterFactory;

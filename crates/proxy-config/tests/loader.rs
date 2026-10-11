@@ -1,4 +1,4 @@
-//! WP-03 acceptance tests: bootstrap loading with field-path-precise errors.
+//! Acceptance tests: bootstrap loading with field-path-precise errors.
 
 use proxy_config::{
     parse_bootstrap, ConfigError, ConfigFormat, ConfigFrontEnd, StrictMode,
@@ -72,7 +72,7 @@ fn proto_binary_format_parses() {
     assert_eq!(loaded.bootstrap.node.unwrap().id, "n1");
 }
 
-/// Ground rule #2: a nested unknown field is rejected, and the error names the
+/// AGENTS.md invariant 1: a nested unknown field is rejected, and the error names the
 /// FULL dotted path — this is the error-quality bar for the whole project.
 #[test]
 fn nested_unknown_field_error_carries_full_path() {

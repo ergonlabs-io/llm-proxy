@@ -1,11 +1,11 @@
-//! WP-50 increment 2c-i — JWT verification against a STATICALLY configured
+//! JWT verification against a STATICALLY configured
 //! JWKS.
 //!
-//! **Library only**, exactly like [`crate::auth`]'s own 2a-i scope: this
+//! **Library only**, exactly like [`crate::auth`]: this
 //! module is a second `impl` [`crate::auth::Authenticator`] and is not wired
 //! into [`crate::auth_filter`]'s `AuthenticatorChain` here -- see this
-//! module's closing section, "What this increment does not build", for why
-//! and for what a future increment still owes.
+//! module's closing section, "What this module does not build", for why
+//! and for what is still owed.
 //!
 //! # Which algorithms this authenticator accepts, and only these
 //!
@@ -58,7 +58,7 @@
 //! different identity providers put the tenant in different places. A
 //! verified token whose named claim is absent, or present but not a
 //! non-empty string, is [`crate::auth::AuthError::JwtMissingTenantClaim`],
-//! never a default tenant -- see the design brief's fail-closed rule: a
+//! never a default tenant -- a
 //! control that silently degrades (here, to some fallback tenant) is worse
 //! than one that refuses.
 //!
@@ -234,7 +234,7 @@ pub struct JwtValidationConfig {
 /// in the token** unless that claim name is also added to
 /// `required_spec_claims` -- so configuring `Validation::set_issuer` alone
 /// does NOT reject a token that omits `iss` entirely. That is documented
-/// behavior, not a bug, but it is exactly the fail-open shape rule 17 warns
+/// behavior, not a bug, but it is exactly the fail-open shape AGENTS.md "Fail-open controls" warns
 /// about: an operator who configures an expected issuer has stated an intent
 /// ("only tokens from this issuer"), and a token that dodges the check by
 /// omitting the claim must not silently pass it. So whenever
@@ -498,8 +498,8 @@ mod tests {
     //
     // `ring`/`rcgen` can SIGN with RSA but cannot GENERATE an RSA keypair --
     // see this crate's `Cargo.toml` `rsa` dev-dependency comment. `rsa`
-    // builds a fresh 2048-bit keypair per test process (never committed --
-    // the design brief's "never commit a private key, even a test one"); this
+    // builds a fresh 2048-bit keypair per test process (never commit a private key, even
+    // a test one); this
     // module then signs every test token with `ring` directly, the same
     // primitive `jsonwebtoken` uses in production, so tests exercise the real
     // verification path rather than a stand-in for it.

@@ -1,21 +1,21 @@
-//! Admin server (WP-25 / WP-50 increment 1: the read-only surface; WP-50
-//! increment 3b-ii W4 adds a bearer-gated write API for the control plane).
+//! Admin server: a read-only surface plus a bearer-gated write API for the
+//! control plane.
 //!
 //! Read endpoints, ungated: `/ready`, `/config_dump`, `/clusters`,
 //! `/server_info`, `/stats`, `/stats/prometheus`, and `/models` (every route
 //! the loaded config matches on the `x-llmproxy-model` header -- the model
 //! inventory; see `dump::models_from_snapshot` for what counts). `/stats`
 //! (`/prometheus`) is
-//! a deliberate 404 when no WP-23 stats registry is wired rather than a fake
+//! a deliberate 404 when no stats registry is wired rather than a fake
 //! empty `200` -- an operator who trusts an empty `/stats` believes there is
-//! no traffic. `/ready` (WP-21 increment 3) is `200 "LIVE"` unless a
+//! no traffic. `/ready` is `200 "LIVE"` unless a
 //! [`server::ReadinessProbe`] was wired AND reports still-warming clusters,
 //! in which case it is `503 "INITIALIZING"` -- see that type's doc for the
 //! injected-closure seam and `crates/proxy/src/main.rs` for the production
 //! probe and its warming deadline.
 //!
 //! **Two READS are nonetheless gated exactly like writes: `GET
-//! /tenants/{id}/spend` (WP-50 increment 3c-iv) and the key listing `GET
+//! /tenants/{id}/spend` and the key listing `GET
 //! /keys` / `GET /chains/{stat_prefix}/keys`.** Every other read above is
 //! deliberately non-sensitive -- config shape, cluster names, model
 //! patterns, aggregate stats -- but per-tenant spend is financial data (how
@@ -31,10 +31,8 @@
 //! here): `POST /keys` (mint), `DELETE /keys/{id}` (revoke),
 //! `POST /tenants` (create), `DELETE /tenants/{id}` (delete),
 //! `PUT /tenants/{id}/policy` (set model-access policy),
-//! `PUT /tenants/{id}/budget` (set or clear a tenant's spend ceiling -- WP-50
-//! increment 3c-iii-a; storage and admin CRUD only, the enforcing filter is a
-//! later increment), and the reads described above,
-//! `GET /tenants/{id}/spend` (WP-50 increment 3c-iv) and `GET /keys` (the
+//! `PUT /tenants/{id}/budget` (set or clear a tenant's spend ceiling), and
+//! the reads described above, `GET /tenants/{id}/spend` and `GET /keys` (the
 //! key listing: `key_id`, `tenant`, `revoked`, `budget`, sorted by
 //! `(tenant, key_id)`). Unset (or
 //! empty/whitespace) token means every one of these -- write OR read -- is
@@ -52,8 +50,8 @@
 //! budget (unlimited) and an explicitly configured zero ceiling are kept
 //! distinct rather than collapsed.
 //!
-//! WP-50 3c-ii-a added a **scoped** form of every write endpoint (and, since
-//! 3c-iv, the gated spend read too, plus the `GET /keys` listing),
+//! Every write endpoint also has a **scoped** form (as do the gated spend
+//! read and the `GET /keys` listing),
 //! `/chains/{stat_prefix}/keys` (POST to mint, GET to list), `/chains/{stat_prefix}/keys/{id}`,
 //! `/chains/{stat_prefix}/tenants`, `/chains/{stat_prefix}/tenants/{id}`,
 //! `/chains/{stat_prefix}/tenants/{id}/policy`,
@@ -66,9 +64,9 @@
 //! configures `llmproxy.auth`, and explicitly refuses (rather than guessing)
 //! when more than one does -- see `server::resolve_control_plane`'s doc for
 //! why guessing would be a real cross-tenant write hazard, and
-//! `internal-docs/IMPLEMENTATION_PLAN.md`'s "addressing follows Envoy"
-//! for why `stat_prefix`, not the internal positional chain identity, is the
-//! externally-addressable name.
+//! Envoy's convention of addressing an HTTP connection manager by its
+//! operator-chosen `stat_prefix` for why `stat_prefix`, not the internal
+//! positional chain identity, is the externally-addressable name.
 //!
 //! Everything else 404s, naming the endpoints that exist. `/quitquitquit`,
 //! `/drain_listeners`, and `/logging` (Envoy's own admin mutating
@@ -102,7 +100,7 @@
 //!
 //! Concretely, this means:
 //! - `RouteEntry.request_headers_to_add` values -- exactly how provider API
-//!   keys are injected upstream (WP-34/WP-50 history) -- always render as
+//!   keys are injected upstream -- always render as
 //!   `"[redacted]"`. Only the header **name** is shown, which is what an
 //!   operator debugging auth actually needs.
 //! - TLS private keys, certificate chains, and any `DataSourceIR::File`

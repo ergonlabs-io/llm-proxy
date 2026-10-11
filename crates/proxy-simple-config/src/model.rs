@@ -6,6 +6,47 @@
 //! token amounts, provider refs, limit keys) parse eagerly via
 //! `#[serde(try_from = "String")]`, so shape errors surface at load with the
 //! offending field's path.
+//!
+//! # Provider taxonomy: why `providers` and `models` are separate
+//!
+//! One logical model can be served by several backends (Claude by Anthropic,
+//! Vertex, or Bedrock), so a provider conflates four things that must stay
+//! separate: the endpoint (host, TLS, URL path shape), the credential scheme
+//! (static header, minted OAuth token, per-request signature), the wire
+//! dialect (OpenAI- or Anthropic-shaped), and the model catalogue. Three
+//! levels keep them apart:
+//! 1. Provider TYPE ([`ProviderType`]) is built into the code, not config. It
+//!    fixes the endpoint shape, the credential mechanism, and the default
+//!    dialect.
+//! 2. Provider INSTANCE (a `providers:` entry) is a named, credentialed
+//!    placement of a type. Config supplies material (keys, region, project,
+//!    deployment), never the mechanism. Two instances of one type (`vertex-us`
+//!    and `vertex-eu`) are a normal case.
+//! 3. MODEL (a `models:` entry) is a client-facing name mapped to an ordered
+//!    list of providers, each with an optional upstream model ID and dialect.
+//!
+//! The config surface has exactly two nouns, `providers` and `models`; the
+//! word "backend" is deliberately absent so one word never means two things
+//! at different nesting depths.
+//!
+//! Rules that follow from this:
+//! - Dialect follows the wire format, not the provider name. It is derived for
+//!   unambiguous types and required for `vertex`/`bedrock`
+//!   ([`ProviderType::dialect_is_ambiguous`]): omitting it is a load error,
+//!   because parsing an Anthropic body with the OpenAI parser partially
+//!   matches and bills against a number nobody computed.
+//! - Some provider types own a URL path template rendered from instance and
+//!   model variables (Vertex puts project, location, publisher, and model in
+//!   the path; Azure puts a deployment name in the path plus an `api-version`
+//!   query). Host rewrite and prefix rewrite cannot express that.
+//! - Model catalogue keys allow only exact, `prefix*`, or a bare `*`
+//!   (narrower than `routes[].model`, which falls back to a regex), so
+//!   precedence is exact, then longest prefix, then `*` -- the same shape as
+//!   virtual-host domain precedence (S1). A mid-string `*` or a duplicate key
+//!   is a load error, so ambiguity is impossible rather than first-match-wins.
+//! - A `models.<name>.providers[]` entry is either the `provider/model`
+//!   shorthand or an object form (needed to state `dialect`); both lower
+//!   identically.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -59,7 +100,7 @@ pub struct SimpleConfig {
 /// Deserializes `models:` into a `BTreeMap`, erroring on a literal duplicate
 /// key instead of silently keeping only the last one (the rule is:
 /// "a genuine tie ... is a config-load error naming both offenders, never a
-/// silent pick" -- ground rule #1 applies to ambiguity, not just unknown
+/// silent pick" -- AGENTS.md invariant 1 applies to ambiguity, not just unknown
 /// fields). `serde`'s own blanket `BTreeMap` deserialize can't tell us this:
 /// it inserts key by key, so a repeated key just overwrites the earlier
 /// entry before we ever see it. Rust note: this is a hand-written
@@ -304,7 +345,7 @@ pub struct ModelDef {
     /// Tried in priority order. A multi-provider model lowers to an ordered
     /// aggregate cluster, and each retry advances to the next provider (see
     /// `lower_model`). Every entry is validated; a bad one fails the load
-    /// (ground rule #1).
+    /// (AGENTS.md invariant 1).
     pub providers: Vec<ModelProviderRef>,
 }
 

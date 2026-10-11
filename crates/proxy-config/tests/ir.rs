@@ -1,9 +1,9 @@
-//! WP-05 acceptance tests: proto -> IR conversion.
+//! Acceptance tests: proto -> IR conversion.
 //!
 //! Covers: the Phase-1 example config, S1 domain-precedence pre-computation,
 //! route defaults (15s timeout, case-sensitive), weighted-cluster cumulative
 //! arrays, retry policy parsing, and — critically — that every proto field
-//! outside the supported surface errors with its full path (ground rule #2).
+//! outside the supported surface errors with its full path (AGENTS.md invariant 1).
 
 use std::time::Duration;
 
@@ -333,7 +333,7 @@ fn retry_policy_defaults_and_parsing() {
     assert_eq!(rp.host_selection_retry_max_attempts, 1);
 }
 
-/// WP-14 hedging is opt-in and deliberately narrow: it only uses the existing
+/// Hedging is opt-in and deliberately narrow: it only uses the existing
 /// per-try timeout/retry budget rather than accepting an independent retry
 /// mechanism that the router could not account for.
 #[test]
@@ -436,8 +436,8 @@ fn retry_back_off_explicit_base_derives_default_max() {
     assert_eq!(rp.retry_back_off.max_interval, Duration::from_millis(1000));
 }
 
-/// Ground rule #1, guarding a gap that actually bit us: route-level
-/// `request_headers_to_add` IS lowered (and, as of WP-13, applied by the
+/// AGENTS.md invariant 1, guarding a gap that actually bit us: route-level
+/// `request_headers_to_add` IS lowered (and applied by the
 /// router), but Envoy also allows the same field on `VirtualHost` and
 /// `RouteConfiguration`, where we model nothing. Those levels must be
 /// REJECTED with their field path rather than parsed and dropped — the
@@ -464,7 +464,7 @@ fn virtual_host_level_request_headers_to_add_is_rejected() {
     );
 }
 
-/// WP-14 remainder: Envoy's built-in `previous_hosts` predicate is lowered
+/// Envoy's built-in `previous_hosts` predicate is lowered
 /// with the exact host-selection reattempt count.  The runtime owns the
 /// history; config only carries this explicit policy through to it.
 #[test]
@@ -517,7 +517,7 @@ fn host_selection_retry_max_attempts_above_one_without_predicate_is_rejected() {
     assert!(err.to_string().contains("previous_hosts"));
 }
 
-/// Ground rule #1: `envoy-ratelimited` fires on the `x-envoy-ratelimited`
+/// AGENTS.md invariant 1: `envoy-ratelimited` fires on the `x-envoy-ratelimited`
 /// response header, which no filter sets yet — so accepting the token would
 /// silently never retry anything.
 #[test]
@@ -574,7 +574,7 @@ fn retry_back_off_explicit_base_and_max() {
     assert_eq!(rp.retry_back_off.max_interval, Duration::from_millis(500));
 }
 
-/// Ground rule #2: an unsupported `retry_policy` sub-field (e.g.
+/// AGENTS.md invariant 1: an unsupported `retry_policy` sub-field (e.g.
 /// `retry_priority`) must error with its full dotted path, not be silently
 /// dropped.
 #[test]
@@ -639,7 +639,7 @@ fn regex_route_match_compiles_anchored() {
     assert!(!matcher.path.matches("prefix/v1/chat", true));
 }
 
-/// Ground rule #2: a SET proto field outside the supported surface errors
+/// AGENTS.md invariant 1: a SET proto field outside the supported surface errors
 /// with its full dotted path — never silently dropped.
 #[test]
 fn unsupported_field_errors_with_path() {
@@ -665,7 +665,7 @@ static_resources:
     assert_eq!(field_path, "static_resources.listeners[0].transparent");
 }
 
-/// WP-17 deliberately ships without RING_HASH/MAGLEV (they need bit-exact
+/// We deliberately ship without RING_HASH/MAGLEV (they need bit-exact
 /// parity with Envoy's hashing, or session affinity breaks across a mixed
 /// fleet). That has to fail at *config* time: `proxy-cluster` also refuses to
 /// build such a cluster, but that happens after startup and merely leaves the
@@ -909,7 +909,7 @@ static_resources:
 
 /// S9: `generate_request_id` is unset by default and lowers to Envoy's
 /// default (`true`); the field must also be accepted by the surface check
-/// rather than rejected as an unsupported HCM field (ground rule #1: the
+/// rather than rejected as an unsupported HCM field (AGENTS.md invariant 1: the
 /// allowlist and the IR must agree).
 #[test]
 fn hcm_generate_request_id_defaults_to_true() {
@@ -966,7 +966,7 @@ static_resources:
 }
 
 /// An explicit `generate_request_id: false` lowers to `false` (and is not
-/// silently ignored, per ground rule #1).
+/// silently ignored, per AGENTS.md invariant 1).
 #[test]
 fn hcm_generate_request_id_explicit_false() {
     let yaml = r#"
@@ -1002,7 +1002,7 @@ static_resources:
 }
 
 /// S9: `use_remote_address` and `xff_num_trusted_hops` lower to the values
-/// set on the HCM (not silently dropped, per ground rule #1).
+/// set on the HCM (not silently dropped, per AGENTS.md invariant 1).
 #[test]
 fn hcm_use_remote_address_and_trusted_hops_explicit() {
     let yaml = r#"
@@ -1060,9 +1060,9 @@ fn hcm_use_remote_address_and_trusted_hops_default() {
     assert_eq!(hcm.xff_num_trusted_hops, 0);
 }
 
-/// WP-10: `codec_type` is unset by default and lowers to Envoy's default
+/// `codec_type` is unset by default and lowers to Envoy's default
 /// (`AUTO`, proto zero-value) -- must also be accepted by the surface check
-/// rather than rejected as an unsupported HCM field (ground rule #1: the
+/// rather than rejected as an unsupported HCM field (AGENTS.md invariant 1: the
 /// allowlist and the IR must agree).
 #[test]
 fn hcm_codec_type_defaults_to_auto() {
@@ -1082,9 +1082,9 @@ fn hcm_codec_type_defaults_to_auto() {
     assert_eq!(hcm.codec_type, CodecType::Auto);
 }
 
-/// WP-10: `codec_type: HTTP1`/`codec_type: HTTP2` both round-trip through
+/// `codec_type: HTTP1`/`codec_type: HTTP2` both round-trip through
 /// the real loader into the matching IR variant (not silently dropped, per
-/// ground rule #1).
+/// AGENTS.md invariant 1).
 #[test]
 fn hcm_codec_type_explicit_http1_and_http2_lower() {
     for (proto_value, expected) in [("HTTP1", CodecType::Http1), ("HTTP2", CodecType::Http2)] {
@@ -1127,9 +1127,9 @@ static_resources:
     }
 }
 
-/// WP-10: `codec_type: HTTP3` has no IR variant (no QUIC/UDP listener in
+/// `codec_type: HTTP3` has no IR variant (no QUIC/UDP listener in
 /// this proxy -- see `CodecType`'s doc) and must be rejected with its full
-/// dotted path, not silently accepted and treated as `AUTO` (ground rule #1
+/// dotted path, not silently accepted and treated as `AUTO` (AGENTS.md invariant 1
 /// applies to values with no implementation, not just unrecognized fields).
 #[test]
 fn hcm_codec_type_http3_is_rejected_with_path() {

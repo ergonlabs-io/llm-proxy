@@ -1,9 +1,9 @@
-//! S1 route matching engine (WP-12): pure, synchronous, allocation-light
+//! S1 route matching engine: pure, synchronous, allocation-light
 //! selection of virtual host -> route -> cluster on top of the pre-compiled
 //! IR in `proxy_config::ir`. No async, no I/O — this module only reads data
 //! the caller hands it.
 //!
-//! TODO(WP-12 follow-up): the IR (`proxy_config::ir`) does not yet model the
+//! TODO: the IR (`proxy_config::ir`) does not yet model the
 //! following S1 features, so they are unimplemented here for lack of a place
 //! to store the compiled matcher. The orchestrator will extend the IR
 //! separately:
@@ -68,7 +68,7 @@ pub enum RouteMatch<'t> {
         vhost: &'t VirtualHostIR,
         // Rust note: `&'t Arc<RouteEntry>`, not `&'t RouteEntry` -- the extra
         // layer matters. `VirtualHostIR.routes` is `Vec<Arc<RouteEntry>>`
-        // (WP-12), and the filter manager's route cache (S2.8) needs to hold
+        // and the filter manager's route cache (S2.8) needs to hold
         // an OWNED, cheaply-cloned handle to the matched route across the
         // rest of the stream (past this call's borrow of the route table),
         // not just read its fields. Borrowing the `Arc` itself (rather than
@@ -201,7 +201,7 @@ fn header_kind_matches(kind: &HeaderMatchKind, value: &str) -> bool {
 /// is stable across retries) — this function takes no randomness itself.
 ///
 /// `ClusterHeader`: reads the named request header. Missing, empty, or
-/// non-UTF-8 -> `None` (the router turns that into 503 `NC`, per WP-13).
+/// non-UTF-8 -> `None` (the router turns that into 503 `NC`).
 ///
 /// Rust note: `headers` shares the `'t` lifetime with `target` rather than
 /// having its own. References are covariant in their lifetime, so callers
@@ -271,7 +271,7 @@ pub fn strip_port(authority: &str) -> &str {
 }
 
 /// Replace the matched prefix with `rewrite`, preserving the remainder of
-/// the path and the query string (used by WP-13 for `prefix_rewrite`).
+/// the path and the query string (used by the router for `prefix_rewrite`).
 /// Only meaningful when the route's matcher is `Prefix` or `Exact`; `None`
 /// for `Regex` matchers, which have no fixed prefix to replace.
 pub fn apply_prefix_rewrite(matcher: &RouteMatcher, rewrite: &str, path: &str) -> Option<String> {

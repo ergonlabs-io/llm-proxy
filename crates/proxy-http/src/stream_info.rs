@@ -8,14 +8,14 @@ use std::time::{Duration, Instant, SystemTime};
 use proxy_observability::trace::TraceContext;
 use proxy_observability::ResponseFlag;
 
-/// WP-33/34: tokens billed for one LLM request, as reported by the provider.
+/// Tokens billed for one LLM request, as reported by the provider.
 ///
 /// Four buckets, not two, and they are mirrored one-for-one from
 /// `proxy_filters::usage::TokenUsage` — because the four are **priced
 /// differently**. Cache-read tokens bill at a steep discount and cache-write
 /// tokens at a premium, so a downstream consumer handed only
 /// `input`/`output` cannot compute a correct cost. Collapsing them here would
-/// make the token-budget limiter (WP-34) structurally unable to be right.
+/// make the token-budget limiter structurally unable to be right.
 ///
 /// The buckets do not overlap — `input_tokens` is already net of the cached
 /// portion — so [`total`](Self::total) is a plain sum.
@@ -37,7 +37,7 @@ pub struct LlmTokenUsage {
     pub output_tokens: u64,
 }
 
-/// The immutable list-price observation for one completed request (WP-53).
+/// The immutable list-price observation for one completed request.
 ///
 /// `LlmStats::list_cost` stays `None` when the provider reported no usage,
 /// the request had no extracted model, or that `(provider type, model)` is
@@ -79,12 +79,12 @@ impl GenAiSystem {
     }
 }
 
-/// WP-33: the GenAI observations for one stream, filled in by the usage filter
+/// The GenAI observations for one stream, filled in by the usage filter
 /// on the encode path.
 ///
 /// `None` everywhere is the correct state for a non-LLM route, a request that
 /// never reached an upstream, or a provider response that reported no usage —
-/// per the WP-34 spec subtlety, *absent* usage must never be recorded as zero
+/// *absent* usage must never be recorded as zero
 /// tokens, because this number feeds billing.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LlmStats {
@@ -105,15 +105,15 @@ pub struct LlmStats {
     pub time_to_first_body_byte: Option<Duration>,
     /// Largest gap between two consecutive body chunks — the tail of the TPOT
     /// (time-per-output-token) distribution, which is what users feel as a
-    /// stall. The full histogram lands with stats in WP-33b.
+    /// stall. The full histogram is recorded by the GenAI TTFT/TPOT instruments.
     pub max_inter_chunk: Option<Duration>,
     /// Number of response body chunks observed. A streamed response that got
     /// coalesced into one chunk shows up here as `1` — which is exactly the
-    /// WP-33 streaming invariant failing, so it is worth counting.
+    /// streaming invariant failing, so it is worth counting.
     pub response_chunks: u64,
 }
 
-/// WP-50: who the downstream caller was authenticated as, written by the auth
+/// Who the downstream caller was authenticated as, written by the auth
 /// filter (`proxy-filters`) on the decode path.
 ///
 /// # Why plain `String`s and not `proxy_filters::auth::Principal`
@@ -181,11 +181,11 @@ impl AttemptInfo {
 }
 
 /// Envoy's `StreamInfo`: populated throughout the request lifecycle, consumed by
-/// access logging (WP-24) and stats (WP-23).
+/// access logging and stats.
 ///
-/// TODO(WP-11/WP-13): TTFT/TPOT timing points for Lane H, attempt count,
+/// TODO: attempt count,
 /// dynamic metadata, filter state. Response flags, upstream host/cluster,
-/// protocol, and byte counts are wired as of WP-24 chunk 3 -- see
+/// protocol, and byte counts are wired -- see
 /// `router::apply_forward` (flags, upstream host/cluster, protocol, at the
 /// dial site) and `router::logging::LoggingBody` (`bytes_sent`, finalized at
 /// stream end, not at header-flush time).
@@ -203,40 +203,40 @@ pub struct StreamInfo {
     /// `%RESPONSE_CODE_DETAILS%` — set by whoever finalizes the response.
     pub response_code_details: Option<String>,
     pub is_local_reply: bool,
-    /// WP-24: the upstream host dialed for this request's last (or only)
+    /// The upstream host dialed for this request's last (or only)
     /// attempt -- `%UPSTREAM_HOST%`. Set at the router's dial site, once a
     /// host is picked; `None` for a request that never reached an upstream
     /// (a local reply, or one that failed before host selection).
     pub upstream_host: Option<String>,
-    /// WP-24: the cluster the request was forwarded to -- `%UPSTREAM_CLUSTER%`.
+    /// The cluster the request was forwarded to -- `%UPSTREAM_CLUSTER%`.
     pub upstream_cluster: Option<String>,
     /// The usage dialect spoken by the selected upstream member. This is the
     /// provider actually dialled after any aggregate/fallback choice, so the
     /// usage filter can parse the response with the correct schema even when
     /// the route still carries a legacy compatibility override.
     pub upstream_usage_dialect: Option<proxy_config::ir::UsageDialect>,
-    /// WP-24: the HTTP version spoken to the upstream -- `%PROTOCOL%`.
+    /// The HTTP version spoken to the upstream -- `%PROTOCOL%`.
     /// `None` for a local reply, which never dials one.
     pub protocol: Option<String>,
-    /// WP-24: running byte count for `%BYTES_RECEIVED%`. Set from the
+    /// Running byte count for `%BYTES_RECEIVED%`. Set from the
     /// already-buffered request body's length (ADR-0004 step 3: decode is
     /// always fully buffered before the terminal runs, so this is a plain
     /// assignment in `router::apply_forward`, never incremental).
     pub bytes_received: u64,
-    /// WP-24: final byte count for `%BYTES_SENT%`, written by
+    /// Final byte count for `%BYTES_SENT%`, written by
     /// `access_logging::LoggingBody` once the response body ends (or is
     /// dropped mid-stream) -- see its doc for why that, not header-flush
     /// time, is the only correct moment for a streamed response.
     pub bytes_sent: u64,
-    /// WP-33: GenAI observations, written by the usage filter (`proxy-filters`)
+    /// GenAI observations, written by the usage filter (`proxy-filters`)
     /// on the encode path. Left at `Default` for every non-LLM stream.
     pub llm: LlmStats,
-    /// WP-50: the authenticated caller, written by the auth filter
+    /// The authenticated caller, written by the auth filter
     /// (`proxy-filters`) on the decode path. Both fields stay `None` when no
     /// auth filter is configured — see [`AuthInfo`] for why that case must
     /// never be papered over with a default identity.
     pub auth: AuthInfo,
-    /// WP-50 increment 3a: the request body's `model` field, published by
+    /// The request body's `model` field, published by
     /// the body_rewrite filter (`proxy_filters::body_rewrite_filter`) on the
     /// decode path once it has scanned the body -- the same scan that filter
     /// already performs for its own `x-llmproxy-model` routing header, never
@@ -258,7 +258,7 @@ pub struct StreamInfo {
     pub attempts_truncated: bool,
     pub physical_attempt_count: u64,
     pub selected_attempt: Option<Rc<RefCell<AttemptInfo>>>,
-    /// WP-51 increment 2: this stream's SERVER span context, set by
+    /// This stream's SERVER span context, set by
     /// `filter_manager::FilterChainHandler::handle` right after `StreamInfo`
     /// is built -- `None` whenever tracing is off (`ConfigSnapshot::tracing`
     /// is `None`), regardless of whether an inbound request carried a
@@ -268,7 +268,7 @@ pub struct StreamInfo {
     /// (`proxy-config`) for the sampling contract this field's `sampled` bit
     /// must satisfy.
     pub trace: Option<TraceContext>,
-    /// S10 (WP-10 increment 2b/2c): the downstream connection's pending HTTP
+    /// S10: the downstream connection's pending HTTP
     /// upgrade, moved here from `HttpRequestParts::on_upgrade` by
     /// `filter_manager::FilterChainHandler::handle` right after this
     /// `StreamInfo` is built -- see that call site's Rust note for why it

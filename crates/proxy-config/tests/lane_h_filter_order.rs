@@ -1,9 +1,9 @@
-//! WP-50 increment 2a-ii: Lane-H HTTP filter ordering is a config error, not
+//! llmproxy HTTP filter ordering is a config error, not
 //! a doc comment.
 //!
-//! Two orderings among the Lane-H filters fail **silently** when reversed —
+//! Two orderings among the llmproxy filters fail **silently** when reversed —
 //! every request succeeds, nothing is logged, and the affected filter just
-//! reads `None` out of `StreamInfo` forever. That is exactly ground rule #1's
+//! reads `None` out of `StreamInfo` forever. That is exactly AGENTS.md invariant 1's
 //! failure mode, so `lower::check_lane_h_filter_order` rejects both at config
 //! load. These are its acceptance tests.
 //!
@@ -92,14 +92,14 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
         MODEL_AUTHZ,
         proxy_filters::model_authz_filter::TYPE_URL,
         "the model_authz filter's type URL changed; update `MODEL_AUTHZ_FILTER_TYPE` in \
-         proxy-config/src/lower.rs or BOTH new WP-50 increment 3a ordering rules silently \
+         proxy-config/src/lower.rs or BOTH model_authz ordering rules silently \
          stop firing"
     );
     assert_eq!(
         SPEND_LIMIT,
         proxy_filters::spend_limit_filter::TYPE_URL,
         "the spend_limit filter's type URL changed; update `SPEND_LIMIT_FILTER_TYPE` in \
-         proxy-config/src/lower.rs or BOTH new WP-50 increment 3c-iii-b ordering rules \
+         proxy-config/src/lower.rs or BOTH spend_limit ordering rules \
          silently stop firing"
     );
 }
@@ -226,7 +226,7 @@ fn canonical_and_legacy_limiters_are_each_checked_when_both_are_configured() {
 /// **The security-relevant one.** Reversed, the limiter's `decode_headers`
 /// runs before the auth filter has written `StreamInfo::auth.tenant`, reads
 /// `None`, and falls back to bucketing on the client's `authorization`
-/// header — the spoofable key WP-50 exists to remove. Nothing about that
+/// header — the spoofable key the auth filter exists to remove. Nothing about that
 /// failure is visible at runtime.
 #[test]
 fn token_limit_before_auth_is_rejected_because_the_limiter_would_silently_bucket_on_a_client_header(
@@ -290,7 +290,7 @@ fn usage_before_token_limit_is_rejected_because_the_limiter_would_record_zero_to
     );
 }
 
-// --- rule 3: auth before model_authz (both decode-side, WP-50 inc 3a) ------
+// --- rule 3: auth before model_authz (both decode-side) ----------------
 
 #[test]
 fn auth_before_model_authz_is_accepted() {
@@ -378,7 +378,7 @@ fn model_authz_before_body_rewrite_is_rejected_because_the_authz_filter_would_se
     );
 }
 
-// --- rule 5: auth before spend_limit (decode-side, WP-50 inc 3c-iii-b) -----
+// --- rule 5: auth before spend_limit (decode-side) -------------------
 
 #[test]
 fn auth_before_spend_limit_is_accepted() {
@@ -468,7 +468,7 @@ fn each_lane_h_filter_alone_is_a_valid_chain() {
     }
 }
 
-/// A chain with no Lane-H filters at all is the overwhelmingly common case and
+/// A chain with no llmproxy filters at all is the overwhelmingly common case and
 /// must not be touched by this pass.
 #[test]
 fn a_chain_with_no_lane_h_filters_is_unaffected() {

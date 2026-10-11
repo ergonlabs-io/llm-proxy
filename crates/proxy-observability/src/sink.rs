@@ -269,7 +269,7 @@ impl AccessLogWriter for FileSink {
 
 // -------------------------------------------------------------- build_sink --
 
-/// Build a single, non-shared writer for `sink`. Ground rule #1: every
+/// Build a single, non-shared writer for `sink`. AGENTS.md invariant 1: every
 /// [`AccessLogSink`] variant is matched explicitly, so adding a variant
 /// without updating this function is a compile error, not a silent
 /// stdout-fallback.
