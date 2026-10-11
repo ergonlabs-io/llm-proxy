@@ -16,6 +16,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - `listen.max_request_body_bytes` in the `llmproxy` config file sets the largest
   request body the listener accepts (default 1 MiB). It lowers to the listener's
   `per_connection_buffer_limit_bytes`. Write `listen` as an object to use it.
+- `PUT /tenants/{id}/provider_credentials/{provider}` checks a tenant key with the
+  provider before it stores the key. It sends one `GET` to the cluster's
+  `verify_path` and stores the key with `verified_at` set only on a `2xx`. A
+  rejected key returns `422 credential_rejected`, and a provider error returns
+  `502 credential_verification_unavailable`. Nothing is stored on failure. Send
+  `"verify": false` to store the key unchecked. Set the path with
+  `providers.<name>.tenant_credential_verify_path` or the Envoy slot's
+  `verify_path`. See [Tenant provider credentials](docs/site/src/content/docs/authentication/tenant-provider-credentials.md).
 
 ### Changed
 

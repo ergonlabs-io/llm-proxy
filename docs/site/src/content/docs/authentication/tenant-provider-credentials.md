@@ -2,8 +2,8 @@
 title: Tenant provider credentials
 summary: Let a tenant send its traffic on its own provider key. Covers strict
   tenant mode, Envoy-mode setup with the key-encryption key file and the
-  cluster slot, the admin API, access-log and counter attribution, budget
-  scope, and what does not work yet.
+  cluster slot, the admin API and its save-time key check, access-log and
+  counter attribution, budget scope, and what does not work yet.
 last_updated: 2026-10-11
 related:
   - ../authentication/virtual-keys/
@@ -213,7 +213,7 @@ clusters:
         io.llmproxy.provider_auth:
           headers:
             - { key: authorization, value: "Bearer replace-with-platform-key" }
-          tenant_credential: { provider: openrouter, header: authorization, prefix: "Bearer " }
+          tenant_credential: { provider: openrouter, header: authorization, prefix: "Bearer ", verify_path: /api/v1/key }
     load_assignment:
       cluster_name: openrouter
       endpoints:
@@ -231,6 +231,7 @@ transport settings your provider needs.
 | `provider` | yes, non-empty | The provider label. Tenants store keys under this name. |
 | `header` | yes | The request header that carries the key. Stored in lowercase. Must be a valid HTTP header name. |
 | `prefix` | no, default empty | Text put before the key in the header value. `Bearer ` for `Authorization`. Must not contain CR, LF, or control characters. |
+| `verify_path` | no, no default | The path of the `GET` that checks a key when it is saved. Must start with `/`. Without it, `PUT` with `verify` set to `true` returns `422 credential_verification_not_configured`. See [Save-time check](#save-time-check). |
 
 Rules for the slot:
 
@@ -263,27 +264,95 @@ key files, `previous_keys`, or the store.
 
 Create the tenant and a virtual key as described in
 [Virtual keys](../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
-Then store the tenant key. The next request from that tenant uses it.
+Then store the tenant key. The proxy checks the key with the provider before it
+stores it. The next request from that tenant uses the key.
 
 ```sh
 curl --max-time 10 -X PUT \
   -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"schema_version":1,"api_key":"<the tenant key>"}' \
+  -d '{"schema_version":1,"api_key":"<the tenant key>","verify":true}' \
   http://127.0.0.1:9901/tenants/acme/provider_credentials/openrouter
 ```
 
-Replace `127.0.0.1:9901` with the `admin.address` in your bootstrap. A
-successful call returns `200` and metadata. The response never includes the
-key:
+Replace `127.0.0.1:9901` with the `admin.address` in your bootstrap. `verify`
+is optional. Leave it out to check the key. A successful call returns `200`
+and metadata. The response never includes the key:
 
 ```json
-{"tenant":"acme","provider":"openrouter","last4":"9f2K","fingerprint":"3c1a7e0b5d8f2a94","created_at":"2026-10-11T08:00:00Z","updated_at":"2026-10-11T08:00:00Z","verified_at":null,"policy_generation":7}
+{"tenant":"acme","provider":"openrouter","last4":"9f2K","fingerprint":"3c1a7e0b5d8f2a94","created_at":"2026-10-11T08:00:00Z","updated_at":"2026-10-11T08:00:00Z","verified_at":"2026-10-11T08:00:00Z","policy_generation":7}
 ```
 
-The values above are examples. `verified_at` is `null` because the proxy does
-not check the key when you store it. A wrong key shows up as the provider's
-own `401` on the tenant's next request.
+The values above are examples. `verified_at` is set because the provider
+accepted the key during the check. A key stored with `"verify": false` has
+`verified_at` set to `null`.
+
+### Save-time check
+
+`PUT` checks the key with the provider before it stores the key. This is the
+save-time check. It runs when `verify` is `true`, which is the default. Send
+`"verify": false` to store the key without the check.
+
+The check sends one request to the provider:
+
+- **Method and path.** `GET` to the slot's `verify_path`, as is. The cluster's
+  path rewrite does not apply.
+- **Headers.** The cluster's static headers. Then the proxy removes
+  `authorization`, `x-api-key`, and `api-key`. Then it sets the slot header to
+  the candidate key. The check does not forward any header from the admin
+  request.
+- **Connection.** The cluster's own endpoints, transport, TLS settings, and
+  upstream protocol.
+- **Time limit.** 5 seconds, from connect to the response head.
+- **Body.** The proxy never reads the response body. It keeps only the status.
+
+If more than one cluster has a slot for the provider with a `verify_path`, the
+proxy uses the cluster whose name sorts first.
+
+The path is set in each front end:
+
+| Front end | Where the path is set | Default |
+|---|---|---|
+| `llmproxy` config file | `providers.<name>.tenant_credential_verify_path`. Requires `tenant_credentials: true`. | `/api/v1/key` for `openrouter`. `/v1/models` for `openai` and `anthropic`. None for the other types. None when `base_url` is set. |
+| Envoy mode | `verify_path` in the `tenant_credential` slot under `io.llmproxy.provider_auth`. | None. Set it in the slot. |
+
+A path must start with `/`. It must be at most 2048 bytes. It must contain only
+printable ASCII, no `#`, and it must be a valid URI path with an optional
+query. The proxy refuses any other value when it loads the config.
+
+Each result of the check, and the response that `PUT` returns:
+
+| Result of the check | `PUT` status | Error type | `upstream_status` | Key stored |
+|---|---|---|---|---|
+| `2xx` | `200` | none | none | Yes, with `verified_at` set |
+| `401` or `403` | `422` | `credential_rejected` | `401` or `403` | No |
+| Any other status, such as `3xx`, `429`, or `5xx` | `502` | `credential_verification_unavailable` | The status | No |
+| No response within 5 seconds | `502` | `credential_verification_unavailable` | none | No |
+| Connect failure, TLS failure, protocol error, or no healthy host | `502` | `credential_verification_unavailable` | none | No |
+| No cluster slot has a `verify_path` for this provider, or the admin server has no probe | `422` | `credential_verification_not_configured` | none | No |
+
+The proxy checks the key-encryption keys before it sends the key. With no
+key-encryption keys, `PUT` returns `503` and the key does not reach the
+provider.
+
+The checks run in this order. The first failure ends the request:
+
+1. The request body. Returns `400`.
+2. The tenant. Returns `404`.
+3. The provider label on a cluster. Returns `422 provider_not_enabled`.
+4. The key-encryption keys. Returns `503 tenant_credentials_not_configured`.
+5. The save-time check, when `verify` is `true`. Returns the `422` or `502` above.
+6. The store.
+
+On any failure, the proxy stores nothing. A key that was already stored stays
+as it was. A `PUT` that replaces a key sets `verified_at` only when the new key
+passes the check. The old key's `verified_at` does not carry over.
+
+Example `PUT` error when the provider rejects the key:
+
+```json
+{"error":{"message":"the provider rejected this API key","type":"credential_rejected","upstream_status":401}}
+```
 
 ### Rotate the key-encryption key
 
@@ -314,7 +383,7 @@ as `Authorization: Bearer`. The routes also accept the scoped
 
 | Method and path | Request body | Success |
 |---|---|---|
-| `PUT /tenants/{id}/provider_credentials/{provider}` | `{"schema_version":1,"api_key":"..."}` | `200` with the metadata shown in step 5 |
+| `PUT /tenants/{id}/provider_credentials/{provider}` | `{"schema_version":1,"api_key":"...","verify":true}`. `verify` is optional and defaults to `true`. | `200` with the metadata shown in step 5 |
 | `GET /tenants/{id}/provider_credentials` | none | `200` with `{"schema_version":1,"tenant":"...","credentials":[...]}`, sorted by provider |
 | `DELETE /tenants/{id}/provider_credentials/{provider}` | none | `204`, empty body |
 
@@ -328,20 +397,23 @@ uses a key derived from `hmac_secret`, so it changes if `hmac_secret` changes.
 Decryption does not depend on `hmac_secret`.
 
 Status codes for `PUT`, from `crates/proxy-admin/src/server.rs`
-(`put_tenant_credential_inner`). The proxy checks in this order: body, tenant,
-provider, then store.
+(`put_tenant_credential_inner`). The order of the checks is in
+[Save-time check](#save-time-check).
 
 | Status | Body | When |
 |---|---|---|
-| `200` | Metadata JSON | The key is stored. |
-| `400` | `{"error":{"type":"invalid_request",...}}` | The body is not JSON. Or it has an unknown field, a `schema_version` other than `1`, an empty or whitespace-only `api_key`, an `api_key` over 4096 bytes, or bytes that cannot go in an HTTP header. Also an empty tenant or provider. |
+| `200` | Metadata JSON | The key is stored. `verified_at` is set when the save-time check got a `2xx`. It is `null` when `verify` is `false`. |
+| `400` | `{"error":{"type":"invalid_request",...}}` | The body is not JSON. Or it has an unknown field, a `verify` that is not a boolean, a `schema_version` other than `1`, an empty or whitespace-only `api_key`, an `api_key` over 4096 bytes, or bytes that cannot go in an HTTP header. Also an empty tenant or provider. |
 | `401` | Empty, with `www-authenticate` | The bearer token is missing or wrong. |
 | `403` | Text | `LLMPROXY_ADMIN_TOKEN` is unset, empty, or whitespace-only. |
 | `404` | `{"error":{"type":"tenant_not_found","message":"unknown tenant"}}` | The tenant does not exist. |
 | `422` | `{"error":{"type":"provider_not_enabled",...}}` | No cluster has a slot with this provider label. |
+| `422` | `{"error":{"type":"credential_rejected","upstream_status":401,...}}` | The save-time check got `401` or `403`. `upstream_status` is that status. Nothing is stored. |
+| `422` | `{"error":{"type":"credential_verification_not_configured",...}}` | No cluster slot has a `verify_path` for this provider, or the admin server has no probe. Nothing is stored. Send `"verify": false` to store the key unchecked. |
 | `500` | `{"error":{"type":"credential_seal_failed",...}}` | The key could not be sealed. |
 | `500` | Text | The store refused the write. The Redis store always does, but a config with tenant credentials cannot select it (see [Limitations](#limitations)). |
-| `503` | `{"error":{"type":"tenant_credentials_not_configured",...}}` | The auth filter has no `tenant_credentials` block. |
+| `502` | `{"error":{"type":"credential_verification_unavailable",...}}` | The save-time check got another status, timed out, or could not connect. `upstream_status` is present only when the provider answered. Nothing is stored. |
+| `503` | `{"error":{"type":"tenant_credentials_not_configured",...}}` | The auth filter has no `tenant_credentials` block, so no key-encryption keys are loaded. Checked before the save-time check, so the key is not sent to the provider. |
 
 Status codes for `GET` and `DELETE`:
 
@@ -456,8 +528,10 @@ doc and `on_request_headers`; `crates/proxy-filters/src/control.rs`,
   snapshot, so it always uses the platform credential. Its records show
   `platform` (`crates/proxy-filters/src/jwt_auth.rs`, which sets
   `tenant_credentials: None`).
-- **No save-time check.** `PUT` does not call the provider. `verified_at` stays
-  `null`. A wrong key shows up as the provider's `401`.
+- **One check, at save time.** `PUT` checks the key once, before it stores the
+  key. The proxy does not check the key again. If the provider revokes the key
+  later, `verified_at` does not change. The tenant's next request then gets the
+  provider's `401`, passed through as in the strict tenant mode table.
 - **No mixed mode.** A tenant in tenant mode uses only its own keys. A request
   that needs a provider the tenant lacks gets a `403`. It does not use the
   platform credential for that provider.
@@ -537,6 +611,34 @@ doc and `on_request_headers`; `crates/proxy-filters/src/control.rs`,
 - **Cause.** No cluster has a slot whose `provider` equals the `{provider}` in
   the path. The check is exact.
 - **Fix.** Use the slot's `provider` value in the path.
+
+### `PUT` returns `422` with `credential_rejected`
+
+- **Cause.** The provider answered the save-time check with `401` or `403`.
+  The `upstream_status` field holds that status. The proxy logs `admin:
+  provider rejected a tenant credential at save time` at `info`. Nothing is
+  stored.
+- **Fix.** Check the key at the provider. Send the key again with `PUT`. Use
+  `"verify": false` only when you accept a key that the proxy did not check.
+
+### `PUT` returns `502` with `credential_verification_unavailable`
+
+- **Cause.** The provider answered with a status other than `2xx`, `401`, or
+  `403`. Or it did not answer within 5 seconds. Or the proxy could not connect.
+  `upstream_status` is present only in the first case. A connect failure logs
+  `admin: could not reach the provider to verify a tenant credential` at `warn`,
+  with a `reason`. A timeout and a status error log no line. Nothing is stored.
+- **Fix.** Check that the cluster's endpoint and transport settings match the
+  provider. Check the provider's status. Then send the `PUT` again. If the
+  provider is down and you must store the key now, send `"verify": false`.
+
+### `PUT` returns `422` with `credential_verification_not_configured`
+
+- **Cause.** No cluster slot for this provider has a `verify_path`. Envoy mode
+  has no default path. Or the admin server has no probe.
+- **Fix.** Set `verify_path` in the slot (Envoy mode). Or set
+  `tenant_credential_verify_path` on the provider (`llmproxy` config file). Or
+  send `"verify": false` to store the key unchecked.
 
 ### The tenant's key stops applying after a restart
 
