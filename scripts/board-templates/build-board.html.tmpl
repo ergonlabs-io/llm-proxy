@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/boards/backlog.yaml · internal-docs/MILESTONES.md · P0–P2 priorities · planning updated 2026-10-10 · test totals: <code>make tq-count</code></p>
+  <p class="eyebrow">internal-docs/boards/backlog.yaml · internal-docs/MILESTONES.md · P0–P2 priorities · planning updated 2026-10-11 · test totals: <code>make tq-count</code></p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -195,6 +195,11 @@
     <code>key_id</code>. WP-65 is started: same-dialect model providers lower to ordered
     fallback. Generic per-attempt OpenAI/Anthropic model-body rewriting remains open. Neither
     changes the current ADS ship gate.
+    <b>Status update 2026-10-11:</b> WP-66 is DONE (05dd378, request body capped before auth).
+    WP-67 (7f0009f) and WP-25 (88434cc) are STARTED, not done: their core behavior landed with tests,
+    but WP-67 has known test gaps (no GOAWAY or TCP-proxy drain test, Go QA-7 not run) and WP-25's
+    istioctl and /clusters smoke-diff acceptance items were never run. None of the three moves the
+    v0.3.2 gate, which is still RED.
     <b>Planning update 2026-10-10 (owner decisions):</b> tags v0.3.0 (2026-09-29) and v0.3.1
     (2026-10-09) are shipped; the latest release is v0.3.1. <b>The "Dynamic configuration" gate
     was still open when they were cut, so it moved to v0.3.2 — same gate text, still RED.</b>
