@@ -247,23 +247,49 @@ OpenRouter API families are not qualified by this example. See the
 
 ### Install a release
 
-On macOS or Linux, install the latest published binary with:
+On macOS (Apple Silicon) or Linux (x86-64), install the latest release and start
+it as a service:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh
 ```
 
-The installer detects the operating system and CPU architecture and installs to
-`~/.local/bin/llm-proxy`. Set `LLM_PROXY_VERSION=v0.3.1` to pin a release or
-`LLM_PROXY_INSTALL_DIR=/usr/local/bin` to choose another destination.
-To create the starter configuration and start the proxy immediately, append
-`--start`; it uses proxy port `53421` and admin/UI port `53422`:
+The installer:
+
+- downloads the release for your platform and verifies its SHA-256 checksum;
+- creates a starter configuration with `llm-proxy init` and an admin token;
+- starts the proxy as a launchd agent (macOS) or a systemd user unit (Linux),
+  so it restarts after a crash and at login;
+- waits until the proxy is ready, then prints the admin UI address, the admin
+  token, and the proxy API key.
+
+Open `http://127.0.0.1:53422/ui/` and paste the admin token to manage keys,
+tenants, and pricing. The proxy API listens on port `53421`. The admin UI
+listens on loopback only; on a remote host, use `ssh -L 53422:127.0.0.1:53422`,
+or install with `--admin-address 0.0.0.0:53422` on a network you trust. The
+admin API is plain HTTP, so on that address the admin token crosses the network
+unencrypted, and `/config_dump`, `/stats`, and `/clusters` are readable without
+it. The installer warns about this on every run.
+
+Run as root on Linux, the installer writes a system unit that runs as an
+`llm-proxy` system user, with files in `/usr/local/bin` and `/var/lib/llm-proxy`.
+Without systemd (for example, in a container), it starts a background process.
+
+Re-run the same command to upgrade. It keeps the existing configuration,
+secrets, and admin token. Pass options after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | bash -s -- --start
+curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh -s -- --version v0.3.1 --port 8080 --admin-port 8081
 ```
 
-The admin UI is available at `http://127.0.0.1:53422/ui/`.
+| Option | Effect |
+| --- | --- |
+| `--version TAG` | Install this release instead of the latest. |
+| `--port N`, `--admin-port N` | Ports for a new configuration. |
+| `--admin-address HOST:PORT` | Admin and UI address for a new configuration, for example `0.0.0.0:53422`. |
+| `--no-start` | Install only. |
+| `--no-service` | Start a background process instead of a service. |
+| `--uninstall [--purge]` | Remove the service and binary; `--purge` also deletes the data directory. |
 
 ## Quick start
 

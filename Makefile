@@ -51,6 +51,10 @@ redb-retention-build: ## Build production encrypted redb retention qualification
 redb-retention-check: ## Check production redb qualification reporting without workloads
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_redb_retention.py
 
+.PHONY: install-check
+install-check: ## Run scripts/install.sh end to end against the local debug build
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_install.py
+
 .PHONY: check
 check: ## Fast type-check of the whole workspace (no codegen)
 	cargo check --workspace
