@@ -502,3 +502,129 @@ static_resources:
         );
     }
 }
+
+const TENANT_SLOT_PATH: &str =
+    "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential";
+
+/// A cluster whose tenant slot carries `verify_path` set to `verify_path_yaml`,
+/// a YAML scalar spliced in as-is (so callers pass their own quoting).
+fn tenant_slot_yaml(verify_path_yaml: &str) -> String {
+    format!(
+        r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: {{ provider: openrouter, header: authorization, prefix: "Bearer ", verify_path: {verify_path_yaml} }}
+"#
+    )
+}
+
+/// The `verify_path` of the one cluster in `tenant_slot_yaml`, when it lowers.
+fn lowered_verify_path(verify_path_yaml: &str) -> Option<String> {
+    let snapshot = snapshot_from(&tenant_slot_yaml(verify_path_yaml)).expect("must lower");
+    snapshot
+        .clusters
+        .get("c1")
+        .and_then(|c| c.provider_runtime.as_ref())
+        .and_then(|r| r.tenant_credential.as_ref())
+        .expect("slot")
+        .verify_path
+        .clone()
+}
+
+/// A `verify_path` on the slot lowers to `Some`, sent exactly as written.
+#[test]
+fn tenant_credential_verify_path_lowers_to_the_slot() {
+    assert_eq!(
+        lowered_verify_path("\"/api/v1/key\"").as_deref(),
+        Some("/api/v1/key")
+    );
+}
+
+/// `verify_path` is optional: a slot without it lowers to `None`, the same
+/// as before the key existed.
+#[test]
+fn tenant_credential_verify_path_absent_lowers_to_none() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provider: openrouter, header: authorization, prefix: "Bearer " }
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    let slot = snapshot
+        .clusters
+        .get("c1")
+        .and_then(|c| c.provider_runtime.as_ref())
+        .and_then(|r| r.tenant_credential.as_ref())
+        .expect("slot");
+    assert_eq!(slot.verify_path, None);
+}
+
+/// A path with a query is valid origin form, so it is kept whole.
+#[test]
+fn tenant_credential_verify_path_keeps_its_query() {
+    assert_eq!(
+        lowered_verify_path("\"/v1/models?limit=1\"").as_deref(),
+        Some("/v1/models?limit=1")
+    );
+}
+
+/// The 2048-byte cap is inclusive: exactly 2048 bytes lowers.
+#[test]
+fn tenant_credential_verify_path_at_the_length_cap_lowers() {
+    let path = format!("/{}", "a".repeat(2047));
+    assert_eq!(path.len(), 2048);
+    assert_eq!(
+        lowered_verify_path(&format!("\"{path}\"")).as_deref(),
+        Some(path.as_str())
+    );
+}
+
+/// Every refused `verify_path` names its full dotted path, with a reason that
+/// says which rule it broke.
+#[test]
+fn tenant_credential_verify_path_invalid_values_are_hard_errors() {
+    let too_long = format!("\"/{}\"", "a".repeat(2048));
+    let cases: [(&str, &str); 12] = [
+        ("\"\"", "must start with `/`"),
+        ("\"api/v1/key\"", "must start with `/`"),
+        ("\"/api/v1/key with space\"", "whitespace"),
+        ("\"/api\\tv1\"", "whitespace"),
+        (r#""/api/v1/key\r\nX-Injected: 1""#, "whitespace"),
+        ("\"/caf\u{e9}\"", "non-ASCII"),
+        ("\"/api/v1/key#frag\"", "must not contain `#`"),
+        ("\"/api/v1/key?x=1#frag\"", "must not contain `#`"),
+        (too_long.as_str(), "at most 2048 bytes"),
+        ("\"/<x>\"", "valid URI path"),
+        ("5", "must be a string"),
+        ("[\"/api/v1/key\"]", "must be a string"),
+    ];
+    for (verify_path_yaml, reason) in cases {
+        let yaml = tenant_slot_yaml(verify_path_yaml);
+        match snapshot_from(&yaml) {
+            Ok(_) => panic!("`{verify_path_yaml}` must be refused"),
+            Err(ConfigError::InvalidValue {
+                field_path,
+                reason: got,
+            }) => {
+                assert_eq!(
+                    field_path,
+                    format!("{TENANT_SLOT_PATH}.verify_path"),
+                    "wrong path for `{verify_path_yaml}`"
+                );
+                assert!(
+                    got.contains(reason),
+                    "reason for `{verify_path_yaml}` was `{got}`, expected it to contain `{reason}`"
+                );
+            }
+            Err(other) => panic!("`{verify_path_yaml}`: expected InvalidValue, got: {other}"),
+        }
+    }
+}

@@ -249,6 +249,14 @@ pub struct Provider {
     /// that key instead. Requires `auth.tenant_credentials`. Default `false`.
     #[serde(default)]
     pub tenant_credentials: bool,
+    /// Upstream path of the zero-cost `GET` that checks a tenant key when it is
+    /// saved (ADR-0007 decision 10), e.g. `/api/v1/key`. Requires
+    /// `tenant_credentials: true`. Unset defaults to `/api/v1/key` for
+    /// `openrouter`, `/v1/models` for `openai` and `anthropic`, and nothing for
+    /// other types. Nothing is defaulted when `base_url` is set. The path is
+    /// sent as is, without the cluster path rewrite.
+    #[serde(default)]
+    pub tenant_credential_verify_path: Option<String>,
 }
 
 /// `providers.<name>.protocol`: which HTTP version the proxy dials this

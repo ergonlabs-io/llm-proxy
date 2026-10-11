@@ -155,6 +155,7 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
                 "provider": "openai",
                 "header": "authorization",
                 "prefix": "Bearer ",
+                "verify_path": "/v1/models",
             },
         })
     );
@@ -170,6 +171,7 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
                 "provider": "anthropic",
                 "header": "x-api-key",
                 "prefix": "",
+                "verify_path": "/v1/models",
             },
         })
     );
@@ -194,6 +196,7 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
                 "provider": "openrouter",
                 "header": "authorization",
                 "prefix": "Bearer ",
+                "verify_path": "/api/v1/key",
             },
         })
     );
@@ -484,7 +487,7 @@ fn the_slot_reaches_the_ir_cluster_and_the_ring_reaches_the_filter() {
             provider: "anthropic".to_string(),
             header: "x-api-key".to_string(),
             value_prefix: String::new(),
-            verify_path: None,
+            verify_path: Some("/v1/models".to_string()),
         }
     );
     let openai_slot = snapshot.clusters["provider:openai"]
@@ -652,4 +655,179 @@ fn tenant_credentials_with_a_persistent_store_lowers_and_loads() {
 
     std::fs::remove_file(&key).ok();
     std::fs::remove_file(&db).ok();
+}
+
+// --- 10: the verify path (ADR-0007 decision 10) ----------------------------
+
+/// The config text for one provider `p` whose body is `fields` (a YAML flow
+/// mapping body), routed to by `*`, with a key ring. `key` is the key file the
+/// ring names.
+fn provider_text(key: &std::path::Path, fields: &str) -> String {
+    format!(
+        "version: 0\nproviders:\n  p: {{ {fields} }}\nroutes:\n  - {{ model: \"*\", provider: p }}\n{auth}",
+        auth = auth_block(&key.display().to_string(), None),
+    )
+}
+
+/// The tenant slot the IR gives cluster `provider:p`, lowered through the real
+/// loader. `tag` names the key file, so each test's file is unique.
+fn ir_slot(tag: &str, fields: &str) -> Option<proxy_config::ir::TenantCredentialSlot> {
+    let key = key_file(tag);
+    let config = parse(&provider_text(&key, fields)).expect("must parse");
+    let snapshot = strict_load_accepts(&config);
+    std::fs::remove_file(&key).ok();
+    snapshot.clusters["provider:p"]
+        .provider_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.tenant_credential.clone())
+}
+
+/// The load error for provider `p` with body `fields`, given a key ring.
+fn dialect_error(tag: &str, fields: &str) -> ConfigError {
+    let key = key_file(tag);
+    let config = parse(&provider_text(&key, fields)).expect("must parse");
+    let result = lower_to_loaded(&config);
+    std::fs::remove_file(&key).ok();
+    match result {
+        Ok(_) => panic!("`{fields}` must be refused"),
+        Err(err) => err,
+    }
+}
+
+/// An openrouter provider with no verify path set gets the openrouter default
+/// on its slot, and the IR carries it through.
+#[test]
+fn openrouter_default_verify_path_reaches_the_ir_slot() {
+    let slot = ir_slot(
+        "vp-openrouter",
+        "type: openrouter, tenant_credentials: true",
+    )
+    .expect("openrouter opted in, so its cluster carries a slot");
+    assert_eq!(
+        slot,
+        proxy_config::ir::TenantCredentialSlot {
+            provider: "p".to_string(),
+            header: "authorization".to_string(),
+            value_prefix: "Bearer ".to_string(),
+            verify_path: Some("/api/v1/key".to_string()),
+        }
+    );
+}
+
+/// openai and anthropic default to `/v1/models`, the zero-cost list endpoint
+/// both serve.
+#[test]
+fn openai_and_anthropic_default_verify_path_is_models() {
+    for (tag, fields) in [
+        ("vp-openai", "type: openai, tenant_credentials: true"),
+        ("vp-anthropic", "type: anthropic, tenant_credentials: true"),
+    ] {
+        let slot = ir_slot(tag, fields).expect("opted in, so the cluster carries a slot");
+        assert_eq!(slot.verify_path.as_deref(), Some("/v1/models"), "{fields}");
+    }
+}
+
+/// An explicit `tenant_credential_verify_path` replaces the default, and it
+/// applies even when `base_url` is set, since only the default is gated on it.
+#[test]
+fn explicit_verify_path_overrides_the_default() {
+    let openrouter = ir_slot(
+        "vp-explicit-openrouter",
+        "type: openrouter, tenant_credentials: true, tenant_credential_verify_path: \"/api/v1/auth/key\"",
+    )
+    .expect("slot");
+    assert_eq!(openrouter.verify_path.as_deref(), Some("/api/v1/auth/key"));
+
+    let compat = ir_slot(
+        "vp-explicit-compat",
+        "type: openai-compatible, base_url: \"https://llm.example.com\", tenant_credentials: true, tenant_credential_verify_path: \"/v1/models?limit=1\"",
+    )
+    .expect("slot");
+    assert_eq!(compat.verify_path.as_deref(), Some("/v1/models?limit=1"));
+}
+
+/// openai-compatible has no default, because there is no known zero-cost path
+/// across the servers it covers. Without an explicit path the slot has none,
+/// so a save that asks for verification is refused.
+#[test]
+fn openai_compatible_has_no_default_verify_path() {
+    let slot = ir_slot(
+        "vp-compat-none",
+        "type: openai-compatible, base_url: \"https://llm.example.com\", tenant_credentials: true",
+    )
+    .expect("slot");
+    assert_eq!(slot.verify_path, None);
+}
+
+/// A provider with `base_url` set gets no default, even for a type that has
+/// one: the endpoint behind a custom URL may not serve the default path.
+#[test]
+fn base_url_set_suppresses_the_default_verify_path() {
+    let slot = ir_slot(
+        "vp-base-url",
+        "type: openrouter, base_url: \"https://openrouter.example.com\", tenant_credentials: true",
+    )
+    .expect("slot");
+    assert_eq!(slot.verify_path, None);
+}
+
+/// A verify path on a provider that did not opt in is refused at the dialect
+/// path, because it would otherwise be dropped with no slot to carry it.
+#[test]
+fn verify_path_without_tenant_credentials_is_refused_at_the_dialect_path() {
+    let err = dialect_error(
+        "vp-no-optin",
+        "type: openrouter, tenant_credential_verify_path: \"/api/v1/key\"",
+    );
+    match err {
+        ConfigError::InvalidValue { field_path, reason } => {
+            assert_eq!(field_path, "providers.p.tenant_credential_verify_path");
+            assert!(
+                reason.contains("requires `tenant_credentials: true`"),
+                "reason was: {reason}"
+            );
+        }
+        other => panic!("expected InvalidValue, got: {other}"),
+    }
+}
+
+/// Every refused dialect verify path names `providers.<name>.tenant_credential_verify_path`
+/// (not the Envoy metadata path), with a reason that says which rule it broke.
+#[test]
+fn invalid_verify_path_is_refused_at_the_dialect_path() {
+    let too_long = format!("\"/{}\"", "a".repeat(2048));
+    let cases: [(&str, &str); 8] = [
+        ("\"\"", "must start with `/`"),
+        ("\"api/v1/key\"", "must start with `/`"),
+        ("\"/api/v1/key with space\"", "whitespace"),
+        (r#""/api/v1/key\r\nX-Injected: 1""#, "whitespace"),
+        ("\"/caf\u{e9}\"", "non-ASCII"),
+        ("\"/api/v1/key#frag\"", "must not contain `#`"),
+        (too_long.as_str(), "at most 2048 bytes"),
+        ("\"/<x>\"", "valid URI path"),
+    ];
+    for (i, (value, reason)) in cases.iter().enumerate() {
+        let err = dialect_error(
+            &format!("vp-invalid-{i}"),
+            &format!(
+                "type: openrouter, tenant_credentials: true, tenant_credential_verify_path: {value}"
+            ),
+        );
+        match err {
+            ConfigError::InvalidValue {
+                field_path,
+                reason: got,
+            } => {
+                assert_eq!(
+                    field_path, "providers.p.tenant_credential_verify_path",
+                    "for `{value}`"
+                );
+                assert!(
+                    got.contains(reason),
+                    "reason for `{value}` was `{got}`, expected it to contain `{reason}`"
+                );
+            }
+            other => panic!("`{value}`: expected InvalidValue, got: {other}"),
+        }
+    }
 }

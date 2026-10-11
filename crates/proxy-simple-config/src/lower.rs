@@ -738,8 +738,17 @@ fn lower_provider(
     // router reads both from one cluster. It is computed before the
     // provider-type match so an opted-in Vertex/Bedrock provider is reported
     // at the opt-in field, not at its missing OAuth2 or SigV4 secret.
+    // A verify path without a slot would be silently dropped, so refuse it
+    // here at the field that set it (AGENTS.md invariant 1).
+    if provider.tenant_credential_verify_path.is_some() && !provider.tenant_credentials {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("providers.{name}.tenant_credential_verify_path"),
+            reason: "requires `tenant_credentials: true`; the verify path is only used by a tenant credential slot".to_string(),
+        });
+    }
     if provider.tenant_credentials {
-        provider_auth["tenant_credential"] = tenant_credential_slot(config, name, provider_type)?;
+        provider_auth["tenant_credential"] =
+            tenant_credential_slot(config, name, provider, provider_type)?;
     }
     let mut path_template = None;
     match provider_type {
@@ -977,6 +986,7 @@ fn api_key_header(provider_type: ProviderType) -> (&'static str, &'static str) {
 fn tenant_credential_slot(
     config: &SimpleConfig,
     name: &str,
+    provider: &Provider,
     provider_type: ProviderType,
 ) -> Result<Value, ConfigError> {
     let field_path = format!("providers.{name}.tenant_credentials");
@@ -1004,7 +1014,42 @@ fn tenant_credential_slot(
         });
     }
     let (header, prefix) = api_key_header(provider_type);
-    Ok(json!({ "provider": name, "header": header, "prefix": prefix }))
+    let mut slot = json!({ "provider": name, "header": header, "prefix": prefix });
+    // Omitted when there is no probe, so the Envoy side lowers it to `None`.
+    if let Some(verify_path) = tenant_verify_path(name, provider, provider_type)? {
+        slot["verify_path"] = json!(verify_path);
+    }
+    Ok(slot)
+}
+
+/// The `verify_path` for a tenant slot (ADR-0007 decision 10): the explicit
+/// `tenant_credential_verify_path`, else a default for the provider types with
+/// a known zero-cost `GET`. A provider with `base_url` set gets no default,
+/// because the endpoint behind a custom URL may not serve that path.
+fn tenant_verify_path(
+    name: &str,
+    provider: &Provider,
+    provider_type: ProviderType,
+) -> Result<Option<String>, ConfigError> {
+    if let Some(path) = &provider.tenant_credential_verify_path {
+        // The rule set lives in `proxy-config`, shared with the Envoy-mode
+        // check; only the field path is this dialect's own.
+        if let Some(reason) = proxy_config::tenant_credential_verify_path_problem(path) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("providers.{name}.tenant_credential_verify_path"),
+                reason,
+            });
+        }
+        return Ok(Some(path.clone()));
+    }
+    if provider.base_url.is_some() {
+        return Ok(None);
+    }
+    Ok(match provider_type {
+        ProviderType::Openrouter => Some("/api/v1/key".to_string()),
+        ProviderType::Openai | ProviderType::Anthropic => Some("/v1/models".to_string()),
+        _ => None,
+    })
 }
 
 /// The token-extraction dialect this provider's responses speak.

@@ -4304,7 +4304,9 @@ fn convert_provider_runtime_metadata(
 /// stack compares header names, so the router can write it without a case
 /// check. `prefix` is optional, defaults to empty, and must be a valid header
 /// value fragment, which rejects CR and LF so a tenant value cannot inject a
-/// header. Any other key is a hard error with its full dotted path.
+/// header. `verify_path` is optional and is checked by
+/// [`tenant_credential_verify_path_problem`].
+/// Any other key is a hard error with its full dotted path.
 fn convert_tenant_credential_slot(
     auth: &prost_types::Struct,
     auth_path: &str,
@@ -4326,13 +4328,18 @@ fn convert_tenant_credential_slot(
     let mut unknown: Vec<&String> = slot
         .fields
         .keys()
-        .filter(|key| !matches!(key.as_str(), "provider" | "header" | "prefix"))
+        .filter(|key| {
+            !matches!(
+                key.as_str(),
+                "provider" | "header" | "prefix" | "verify_path"
+            )
+        })
         .collect();
     unknown.sort();
     if let Some(key) = unknown.first() {
         return Err(unsupported(
             format!("{slot_path}.{key}"),
-            "only `provider`, `header`, and `prefix` are supported",
+            "only `provider`, `header`, `prefix`, and `verify_path` are supported",
         ));
     }
 
@@ -4365,12 +4372,63 @@ fn convert_tenant_credential_slot(
         ));
     }
 
+    let verify_path = match slot.fields.get("verify_path") {
+        None => None,
+        Some(_) => {
+            let path = provider_auth_string_field(slot, "verify_path", &slot_path)?;
+            if let Some(reason) = tenant_credential_verify_path_problem(&path) {
+                return Err(invalid(format!("{slot_path}.verify_path"), reason));
+            }
+            Some(path)
+        }
+    };
+
     Ok(Some(TenantCredentialSlot {
         provider,
         header: header.to_ascii_lowercase(),
         value_prefix,
-        verify_path: None,
+        verify_path,
     }))
+}
+
+/// Longest tenant `verify_path` accepted. Real probe paths are a few dozen
+/// bytes; the cap keeps a config from putting an unbounded value in a request
+/// line.
+const MAX_VERIFY_PATH_BYTES: usize = 2048;
+
+/// Why a tenant `verify_path` is refused, or `None` when it is acceptable
+/// (ADR-0007 decision 10). The path is sent as the request target of a `GET`,
+/// so it must be an origin-form path with nothing that could split the request
+/// line. This is the one rule set for both dialects: `proxy-simple-config`
+/// calls it and reports the reason at its own field path.
+pub fn tenant_credential_verify_path_problem(path: &str) -> Option<String> {
+    if path.len() > MAX_VERIFY_PATH_BYTES {
+        return Some(format!("must be at most {MAX_VERIFY_PATH_BYTES} bytes"));
+    }
+    if !path.starts_with('/') {
+        return Some("must start with `/`".to_string());
+    }
+    // Rust note: `is_ascii_graphic` is true exactly for bytes 0x21..=0x7E, so
+    // one scan rejects whitespace, CR and LF, other controls, and non-ASCII.
+    if !path.bytes().all(|b| b.is_ascii_graphic()) {
+        return Some(
+            "must not contain whitespace, control characters, or non-ASCII bytes".to_string(),
+        );
+    }
+    // A fragment is never sent in a request target, so `#` is refused even
+    // though `PathAndQuery` would parse it.
+    if path.contains('#') {
+        return Some(
+            "must not contain `#`; a fragment is not part of a request target".to_string(),
+        );
+    }
+    // Rust note: `TryFrom<&str>` for `PathAndQuery` does the full URI grammar
+    // check (path characters, and an optional `?query`), so we reuse the
+    // `http` crate's parser rather than hand-writing one.
+    if http::uri::PathAndQuery::try_from(path).is_err() {
+        return Some("must be a valid URI path with an optional query".to_string());
+    }
+    None
 }
 
 fn provider_model_rewrites(

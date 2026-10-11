@@ -394,6 +394,11 @@
           "type": "boolean",
           "default": false,
           "description": "Let tenants with their own key for this provider send it instead of the operator key. Requires `auth.tenant_credentials`. Only header API-key provider types qualify: `openai`, `anthropic`, `openai-compatible`, `openrouter`, and `azure-openai`. `vertex` and `bedrock` are rejected."
+        },
+        "tenant_credential_verify_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Upstream path of the zero-cost GET that checks a tenant key when it is saved, e.g. `/api/v1/key`. Requires `tenant_credentials: true`. Defaults when unset and `base_url` is unset: `/api/v1/key` for `openrouter`, `/v1/models` for `openai` and `anthropic`; no default for other types, and none when `base_url` is set. Sent as is, without the cluster path rewrite."
         }
       },
       "not": {
