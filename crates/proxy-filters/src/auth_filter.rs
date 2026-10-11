@@ -38,13 +38,29 @@
 //! credential still being tried apart from a caller who simply typed the
 //! wrong thing, and only the operator-facing side of the response is allowed
 //! to say so.
+//!
+//! # The verified credential is removed before forwarding
+//!
+//! On success the filter removes every `authorization` header from the
+//! request. Both authenticators in the chain read that header, and the value
+//! is a proxy-local credential (a virtual key, or a JWT issued for this
+//! proxy) that no provider can use. Leaving it in place relied on the
+//! cluster's `request_headers_to_add` (AGENTS.md invariant 6) to overwrite it, which
+//! only happens for providers that carry their own key in `authorization`:
+//! an `anthropic` cluster sends `x-api-key`, and a keyless
+//! `openai-compatible` cluster (Ollama, vLLM) sends nothing, so both received
+//! the tenant's key. This is Envoy's `jwt_authn` default (`forward: false`);
+//! there is no knob to forward the credential, because no upstream can
+//! verify it. Cluster headers are applied after this filter, so a provider
+//! credential in `authorization` is unaffected. Requests this filter rejects
+//! never reach the router, so there is nothing to remove on those paths.
 
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::header::WWW_AUTHENTICATE;
+use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use prost_reflect::DynamicMessage;
 
@@ -1004,6 +1020,10 @@ impl HttpFilter for AuthFilterInstance {
                         key_id: Some(principal.key_id.as_str().to_string()),
                     };
                 }
+                // The credential has been consumed; see the module doc's
+                // "removed before forwarding" section. `remove` drops every
+                // value, not just the first one `authenticate` read.
+                headers.headers.remove(AUTHORIZATION);
                 FilterHeadersStatus::Continue
             }
             AuthOutcome::Rejected(AuthError::UnknownKey) => {
@@ -1949,24 +1969,29 @@ mod tests {
         assert_ne!(none_details, revoked_details);
     }
 
-    // 17: a valid key leaves stream_info().auth set AND the request's
-    // authorization header untouched -- this filter authenticates, it does
-    // not strip.
+    // 17: a valid key sets stream_info().auth AND removes the request's
+    // authorization header -- the virtual key must never reach a provider.
+    // `crates/proxy/tests/credential_forwarding_e2e.rs` proves the same thing
+    // end to end for each provider type.
     #[test]
-    fn a_valid_key_leaves_the_authorization_header_untouched() {
+    fn a_valid_key_removes_the_authorization_header() {
         let mut filter =
             filter_with_one_key(b"secret", "llmp_good-key", "key-1", "tenant-a", false);
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         let mut head = request_headers(Some("Bearer llmp_good-key"));
+        head.headers.append(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer llmp_second-value"),
+        );
 
         filter.decode_headers(&mut cb, &mut head, true);
 
-        assert_eq!(
-            head.headers.get(http::header::AUTHORIZATION),
-            Some(&HeaderValue::from_static("Bearer llmp_good-key")),
-            "the client credential must still be present -- replacing it with the \
-             provider credential is the cluster's request_headers_to_add, which runs \
-             later (AGENTS.md invariant 6)"
+        assert!(
+            !head.headers.contains_key(http::header::AUTHORIZATION),
+            "every authorization value must be removed after authentication -- an \
+             anthropic or keyless openai-compatible cluster never overwrites it, so \
+             anything left here is forwarded to the provider: {:?}",
+            head.headers.get_all(http::header::AUTHORIZATION)
         );
         let info = cb.stream_info.borrow();
         assert_eq!(info.auth.tenant.as_deref(), Some("tenant-a"));

@@ -24,6 +24,8 @@ distinct from any provider's own API key. A virtual key identifies a caller
 to llm-proxy; the provider credential a request is forwarded with is a
 separate value attached to the cluster — see
 [Providers and clusters](../providers-and-routing/providers-and-clusters/).
+After a request is authenticated, llm-proxy removes its `Authorization`
+header. A provider never receives the virtual key.
 
 ## Authentication fails closed; authorization defaults open
 
