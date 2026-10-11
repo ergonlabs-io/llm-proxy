@@ -37,6 +37,9 @@ type Seen = Arc<Mutex<Vec<String>>>;
 
 /// An upstream that records each request head and answers `status`, or, when
 /// `status` is `None`, accepts and never answers.
+/// Recorded by a never-answering upstream when the probe closes the connection.
+const CLOSED: &str = "<closed>";
+
 async fn spawn_upstream(status: Option<u16>) -> (SocketAddr, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -68,8 +71,16 @@ async fn spawn_upstream(status: Option<u16>) -> (SocketAddr, Seen) {
                         );
                         let _ = stream.write_all(reply.as_bytes()).await;
                     }
-                    // Hold the connection open without answering.
-                    None => tokio::time::sleep(Duration::from_secs(60)).await,
+                    // Never answer; record when the probe closes the
+                    // connection, so a test can check nothing is left open.
+                    None => {
+                        let closed =
+                            tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
+                                .await;
+                        if matches!(closed, Ok(Ok(0)) | Ok(Err(_))) {
+                            record.lock().unwrap().push(CLOSED.to_owned());
+                        }
+                    }
                 }
             });
         }
@@ -236,7 +247,23 @@ async fn upstream_that_never_answers_times_out() {
         run(&probe, "openrouter").await,
         CredentialProbeOutcome::TimedOut
     );
-    assert_eq!(seen.lock().unwrap().len(), 1, "the request did reach it");
+    assert!(
+        seen.lock()
+            .unwrap()
+            .first()
+            .is_some_and(|r| r.contains(VERIFY_PATH)),
+        "the request did reach it"
+    );
+    // The timed-out probe must close its connection (and so free its
+    // circuit-breaker slot) rather than leave the driver running.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !seen.lock().unwrap().iter().any(|r| r == CLOSED) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the probe left its connection open after timing out"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

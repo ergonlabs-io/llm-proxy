@@ -94,6 +94,18 @@ impl TenantCredentialProbe for ClusterCredentialProbe {
     }
 }
 
+/// Aborts the connection driver when dropped, including when a timeout drops
+/// the probe future mid-request. hyper already ends the connection once the
+/// sender and the pending response are dropped; this makes the release of
+/// the connection and its circuit-breaker slot not depend on that.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Connect, send `GET verify_path`, and return the status of the response
 /// head. Failure reasons never include a header value or the secret.
 async fn send_probe(
@@ -182,10 +194,10 @@ async fn send_probe(
                 Ok(parts) => parts,
                 Err(err) => return Unreachable(format!("handshake failed: {err}")),
             };
-            let driver = tokio::spawn(async move {
+            let driver = AbortOnDrop(tokio::spawn(async move {
                 let _guard = cb_guard;
                 let _ = conn.await;
-            });
+            }));
             (sender.send_request(req).await, driver)
         }
         UpstreamProtocol::Http2 => {
@@ -193,16 +205,16 @@ async fn send_probe(
                 Ok(parts) => parts,
                 Err(err) => return Unreachable(format!("handshake failed: {err}")),
             };
-            let driver = tokio::spawn(async move {
+            let driver = AbortOnDrop(tokio::spawn(async move {
                 let _guard = cb_guard;
                 let _ = conn.await;
-            });
+            }));
             (sender.send_request(req).await, driver)
         }
     };
-    // The body is never read; aborting the driver drops the connection and
-    // releases the circuit-breaker slot.
-    driver.abort();
+    // The body is never read; dropping the driver aborts it, which drops the
+    // connection and releases the circuit-breaker slot.
+    drop(driver);
     match result {
         Ok(response) => CredentialProbeOutcome::Status(response.status()),
         Err(err) => Unreachable(format!("request failed: {err}")),
