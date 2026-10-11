@@ -2663,6 +2663,14 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Whether key-encryption keys are configured, so that
+    /// [`Self::store_tenant_secret`] can store anything. The admin API checks
+    /// this before the save-time probe, so a candidate key is never sent to a
+    /// provider when it could not be stored afterwards.
+    pub fn tenant_credentials_configured(&self) -> bool {
+        self.credential_keys.is_some()
+    }
+
     /// Seals `secret` under the current key-encryption key, stores it as
     /// (`tenant`, `provider`)'s credential row, republishes, and returns the
     /// row's metadata (ADR-0007 decisions 2 and 3). The plaintext is never

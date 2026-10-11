@@ -1785,6 +1785,14 @@ async fn handle_put_tenant_credential(
     response
 }
 
+fn tenant_credentials_not_configured() -> Response<Full<Bytes>> {
+    error_json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant_credentials_not_configured",
+        "tenant credentials are not enabled: `tenant_credentials` is not configured on the auth filter",
+    )
+}
+
 async fn put_tenant_credential_inner(
     control_plane: &ControlPlane,
     config: &WorkerConfigHandle,
@@ -1896,6 +1904,11 @@ async fn put_tenant_credential_inner(
     // ADR-0007 decision 10: a key is stored as verified only after a probe
     // got a 2xx from the provider. Every failure path returns before the store.
     let verified = if request.verify {
+        // Without key-encryption keys the store refuses the key below, so do
+        // not send it to the provider first.
+        if !control_plane.tenant_credentials_configured() {
+            return tenant_credentials_not_configured();
+        }
         let (Some(probe), Some((cluster, slot))) = (probe, verify_target) else {
             return error_json(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1978,11 +1991,7 @@ async fn put_tenant_credential_inner(
             );
             json(StatusCode::OK, &metadata)
         }
-        Err(CredentialStoreError::NotConfigured) => error_json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "tenant_credentials_not_configured",
-            "tenant credentials are not enabled: `tenant_credentials` is not configured on the auth filter",
-        ),
+        Err(CredentialStoreError::NotConfigured) => tenant_credentials_not_configured(),
         Err(CredentialStoreError::Store(err)) => {
             store_error_response("/tenants/{id}/provider_credentials/{provider}", err)
         }

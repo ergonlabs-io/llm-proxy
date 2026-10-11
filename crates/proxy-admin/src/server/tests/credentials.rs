@@ -700,6 +700,30 @@ async fn timed_out_and_unreachable_probes_are_502_without_upstream_status() {
     }
 }
 
+/// Without key-encryption keys the key could not be stored, so it must not be
+/// sent to the provider: 503 before the probe.
+#[tokio::test]
+async fn no_key_encryption_keys_is_503_before_the_probe() {
+    let probe = FakeProbe::new(CredentialProbeOutcome::Status(StatusCode::OK));
+    let (_server, addr) = start_probed(
+        snapshot_with_credential_slot(Some(VERIFY_PATH)),
+        false,
+        Some(probe.clone()),
+    )
+    .await;
+
+    let (status, body) = put_default(addr).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        error_object(&body)["type"],
+        "tenant_credentials_not_configured"
+    );
+    assert!(
+        probe.calls().is_empty(),
+        "the candidate key reached the provider"
+    );
+}
+
 #[tokio::test]
 async fn verify_false_stores_unverified_and_never_calls_the_probe() {
     // A probe that would reject the key: if it were consulted, the PUT would
