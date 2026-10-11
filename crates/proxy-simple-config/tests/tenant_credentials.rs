@@ -104,10 +104,14 @@ fn real_filter_accepts(snapshot: &proxy_config::ConfigSnapshot) {
 }
 
 /// The `auth:` block for a config whose key ring points at `current` (and
-/// optionally one previous key), with the operator HMAC secret.
+/// optionally one previous key), with the operator HMAC secret. Tenant
+/// credentials need the persistent store (ADR-0007), so the block selects one
+/// at `{current}.redb`, beside the key file in the temp dir.
 fn auth_block(current: &str, previous: Option<(&str, &str)>) -> String {
     let mut block = format!(
-        "auth:\n  hmac_secret: \"test-operator-secret\"\n  tenant_credentials:\n    \
+        "auth:\n  hmac_secret: \"test-operator-secret\"\n  \
+         store:\n    persistent:\n      path: \"{current}.redb\"\n  \
+         tenant_credentials:\n    \
          encryption_key_file: \"{current}\"\n    encryption_key_id: \"kek-2026\"\n"
     );
     if let Some((id, file)) = previous {
@@ -555,4 +559,96 @@ fn translate_output_carries_the_slot_and_the_ring_and_round_trips() {
 
     std::fs::remove_file(&current).ok();
     std::fs::remove_file(&previous).ok();
+}
+
+// --- 8: tenant credentials require the persistent store --------------------
+
+/// An `auth:` block with a key ring and the given `store:` block (empty for
+/// no store at all). Lowering never connects, so the `shared` URL is inert.
+fn auth_with_store(store: &str, key: &str) -> String {
+    format!(
+        "auth:\n  hmac_secret: \"test-operator-secret\"\n{store}  \
+         tenant_credentials:\n    encryption_key_file: \"{key}\"\n    \
+         encryption_key_id: \"kek-2026\"\n"
+    )
+}
+
+/// Absent, `in_memory` and `shared` stores are each a load error at
+/// `auth.tenant_credentials`, with the reason naming the requirement. The
+/// `providers.<name>.tenant_credentials: true` opt-in reaches the same error,
+/// because it needs the ring.
+#[test]
+fn tenant_credentials_without_a_persistent_store_is_rejected_at_the_block() {
+    let key = key_file("store-required").display().to_string();
+    let stores = [
+        ("", "an absent store"),
+        ("  store:\n    in_memory: {}\n", "an in_memory store"),
+        (
+            "  store:\n    shared:\n      url: \"redis://127.0.0.1:6390/0\"\n",
+            "a shared store",
+        ),
+    ];
+    for (store, label) in stores {
+        let text = format!(
+            "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+             routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
+            auth_with_store(store, &key)
+        );
+        match lower_text(&text).expect_err("must be rejected") {
+            ConfigError::InvalidValue { field_path, reason } => {
+                assert_eq!(field_path, "auth.tenant_credentials", "{label}");
+                assert!(
+                    reason.contains("tenant credentials require the persistent store"),
+                    "{label}: got {reason}"
+                );
+            }
+            other => panic!("{label}: expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    let opt_in = format!(
+        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}}, tenant_credentials: true }}\n\
+         routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
+        auth_with_store("  store:\n    in_memory: {}\n", &key)
+    );
+    match lower_text(&opt_in).expect_err("an opt-in on an in_memory store must be rejected") {
+        ConfigError::InvalidValue { field_path, .. } => {
+            assert_eq!(field_path, "auth.tenant_credentials");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+    std::fs::remove_file(&key).ok();
+}
+
+/// The persistent store is the one that loads: it lowers, the strict loader
+/// accepts it, and the real auth filter opens the ring against it.
+#[test]
+fn tenant_credentials_with_a_persistent_store_lowers_and_loads() {
+    let key = key_file("store-persistent");
+    let db = key.with_extension("redb");
+    let text = format!(
+        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+         routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
+        auth_with_store(
+            &format!(
+                "  store:\n    persistent:\n      path: \"{}\"\n",
+                db.display()
+            ),
+            &key.display().to_string(),
+        )
+    );
+    let config = parse(&text).expect("must parse");
+    let lowered = lower(&config).expect("a persistent store must lower");
+    let typed = &http_filters(&lowered.bootstrap)[0]["typed_config"];
+    assert_eq!(
+        typed["persistent"]["path"].as_str(),
+        Some(db.display().to_string().as_str())
+    );
+    assert!(typed["tenant_credentials"].is_object());
+
+    let snapshot = strict_load_accepts(&config);
+    real_filter_accepts(&snapshot);
+
+    std::fs::remove_file(&key).ok();
+    std::fs::remove_file(&db).ok();
 }

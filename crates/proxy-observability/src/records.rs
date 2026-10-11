@@ -39,9 +39,17 @@ pub enum Termination {
 
 /// Whose provider credential an attempt was sent with (ADR-0007).
 ///
-/// Records carry it as an optional field under schema version 1. A reader
-/// that finds it missing must assume `Platform`: every record written before
-/// tenant credentials existed was sent on the operator's credential.
+/// Records carry it as an optional field under schema version 1. Three shapes
+/// occur on the wire:
+///
+/// - Field absent: a record from a build before tenant credentials. It was
+///   sent on the operator's credential, so read it as `Platform`.
+/// - Present with a value: the credential the attempt was sent with.
+/// - Present and `null`: no attempt reached the credential step, so nothing
+///   was sent upstream and there is no cost.
+///
+/// The Rust field is an `Option`, so absent and `null` both decode to `None`.
+/// Readers that must tell them apart need the raw JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialSource {
@@ -109,7 +117,8 @@ pub struct AttemptRecord {
     pub bytes_response: u64,
     pub usage: Option<Usage>,
     pub cost: Option<Cost>,
-    /// `None` when the attempt never reached the credential step.
+    /// `null` when the attempt never reached the credential step. Absent in
+    /// records from a build before tenant credentials; see [`CredentialSource`].
     #[serde(default)]
     pub credential_source: Option<CredentialSource>,
 }

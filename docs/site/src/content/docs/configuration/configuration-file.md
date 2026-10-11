@@ -107,7 +107,7 @@ present at all.
 | `hmac_secret_file` | string (path) | one of `hmac_secret`/`hmac_secret_file` | — | Read the HMAC secret from a file, trimmed of trailing whitespace. Not watched automatically, but re-read on a `SIGHUP` config reload, same as `providers.<name>.api_key_file` above. |
 | `keys` | array of `AuthKey` | no | `[]` | Configured virtual keys. An empty list authenticates nothing, so `auth` present with no keys refuses every request — legal, and almost certainly a mistake, so it produces a load-time warning. |
 | `store` | `AuthStore` | no | `in_memory` | Where keys minted through the admin API and tenant policy live. Exactly one of `in_memory: {}`, `persistent: {path}`, or `shared: {url \| url_file, namespace}`. Fixed at startup: changing it takes a restart. |
-| `tenant_credentials` | `AuthTenantCredentials` | required when any `providers` entry sets `tenant_credentials: true`; otherwise no | absent | The key ring that seals tenant provider credentials at rest. Absent means the proxy cannot seal or open them. See the table below. |
+| `tenant_credentials` | `AuthTenantCredentials` | required when any `providers` entry sets `tenant_credentials: true`; otherwise no | absent | The key ring that seals tenant provider credentials at rest. Absent means the proxy cannot seal or open them. Requires `store.persistent`: with `store` absent, `in_memory`, or `shared`, this block is a load error at `auth.tenant_credentials`. See the table below. |
 
 `store.persistent.path` is an embedded `redb` file, created if missing; an empty
 path is an error. `store.shared` is Redis: exactly one of `url` (inline, use

@@ -887,8 +887,10 @@ mod tests {
     }
 
     /// One snapshot holding a key for `tenant-t` (which has an `openrouter`
-    /// credential) and a key for `tenant-u` (which has none). Built directly,
-    /// because no store write path feeds `tenant_credentials` yet.
+    /// credential) and a key for `tenant-u` (which has none). Built by hand
+    /// so these tests cover only the hand-off from snapshot to `StreamInfo`.
+    /// The decrypt path that fills `tenant_credentials` in a real snapshot is
+    /// covered in `control.rs`.
     fn snapshot_with_tenant_credentials(secret: &HmacSecret) -> Arc<ArcSwap<ControlPlaneSnapshot>> {
         let mut keys = KeySet::new();
         keys.insert(

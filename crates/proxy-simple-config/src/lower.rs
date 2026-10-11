@@ -1833,13 +1833,27 @@ fn lower_auth(
     // Only an explicit `store:` adds a member. Absent means no store field at
     // all, which is what keeps configs written before this field lowering
     // byte-identical.
-    if let Some((member, value)) = lower_auth_store(auth.store.as_ref())? {
+    let store_member = lower_auth_store(auth.store.as_ref())?;
+    let store_is_persistent = matches!(&store_member, Some(("persistent", _)));
+    if let Some((member, value)) = store_member {
         typed_config[member] = value;
     }
     // Same rule as `store`: absent adds no field, so configs written before
-    // this block existed lower byte-identically.
+    // this block existed lower byte-identically. The ring is lowered first so
+    // its own field errors win over the store requirement below.
     if let Some(ring) = &auth.tenant_credentials {
-        typed_config["tenant_credentials"] = lower_tenant_credentials(ring)?;
+        let lowered = lower_tenant_credentials(ring)?;
+        // Tenant credentials are sealed rows in the control-plane store. Only
+        // `persistent` keeps them across restarts and can hold them; `in_memory`
+        // loses them and `shared` does not support them yet (ADR-0007 decision 2).
+        // Refused at load, so tenants never fall back to the operator key silently.
+        if !store_is_persistent {
+            return Err(ConfigError::InvalidValue {
+                field_path: "auth.tenant_credentials".to_string(),
+                reason: TENANT_CREDENTIALS_NEED_PERSISTENT_STORE.to_string(),
+            });
+        }
+        typed_config["tenant_credentials"] = lowered;
     }
 
     Ok(Some(json!({
@@ -1918,6 +1932,11 @@ fn lower_auth_store(
         }),
     }
 }
+
+/// Why `auth.tenant_credentials` needs `auth.store.persistent`. The same words
+/// as the Envoy-mode check in `proxy-filters`' `auth_filter`, so both entry
+/// points report one message.
+const TENANT_CREDENTIALS_NEED_PERSISTENT_STORE: &str = "tenant credentials require the persistent store: in_memory loses them on restart and shared does not support them yet";
 
 /// `auth.tenant_credentials` -> `llmproxy.filters.v0.TenantCredentials`,
 /// lowered verbatim. Only presence and non-emptiness are checked here. Key

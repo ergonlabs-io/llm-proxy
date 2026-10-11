@@ -190,8 +190,12 @@ fn an_auth_filter_setting_poll_interval_seconds_lowers() {
 
 #[test]
 fn an_auth_filter_configuring_tenant_credentials_lowers() {
+    // Tenant credentials require `persistent` (ADR-0007 decision 2). The
+    // filter refuses any other store when it parses its config.
     let yaml = listener_yaml(
-        r#"                      tenant_credentials:
+        r#"                      persistent:
+                        path: /var/lib/llm-proxy/control-plane.redb
+                      tenant_credentials:
                         encryption_key_file: /etc/llmproxy/credential-kek
                         encryption_key_id: kek-2026-10
                         previous_keys:

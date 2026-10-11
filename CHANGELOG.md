@@ -40,11 +40,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   uses the platform credential.
 - A tenant key is not checked when it is saved. A wrong key shows up as the
   provider's `401`.
-- The Redis store (`store.shared`) does not support tenant credentials. Writes
-  return `500`. Stored credentials are not loaded from it, so a deployment that
-  moves from a `persistent` store to Redis uses the platform credential for its
-  tenants, with no warning.
-- The default `in_memory` store loses stored tenant keys on restart.
+- Tenant credentials require the `persistent` store. With `auth.tenant_credentials`
+  (or Envoy's `tenant_credentials`), an absent, `in_memory`, or `shared` store is a
+  load error at the block's field path. `in_memory` loses stored keys on restart,
+  and `shared` loads none, so either would leave tenants on the platform credential.
+- The Redis store (`store.shared`) does not hold tenant credentials yet. Writes
+  return `500`, and a config cannot select it while tenant credentials are set.
 - In tenant mode only `authorization`, `x-api-key`, and `api-key` are cleared. A
   platform key on any other header is still sent with the tenant key.
 - In the `llmproxy` config file, a bad key-encryption key file or a duplicate key id

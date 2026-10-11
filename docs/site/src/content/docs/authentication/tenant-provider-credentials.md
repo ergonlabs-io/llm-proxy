@@ -124,9 +124,13 @@ Set `auth.tenant_credentials` and turn the feature on for each provider with
 `tenant_credentials: true`. A provider that opts in without the key ring is a
 load error. A key ring with no opted-in provider loads and adds no slot
 (`key_ring_without_an_opted_in_provider_adds_no_slot` in
-`crates/proxy-simple-config/tests/tenant_credentials.rs`). Use a `persistent`
-store. A key stored in the default `in_memory` store is lost when
-the process restarts (see [Limitations](#limitations)).
+`crates/proxy-simple-config/tests/tenant_credentials.rs`).
+
+Tenant credentials require the `persistent` store. Setting `auth.tenant_credentials`
+with `auth.store` absent, `in_memory`, or `shared` is a load error at
+`auth.tenant_credentials`, and the proxy does not start. Without that check,
+tenant keys would be lost on restart or never loaded, and tenants would fall back
+to the operator key.
 
 ```yaml
 version: 0
@@ -158,7 +162,8 @@ Bearer`. `vertex` and `bedrock` are rejected at `tenant_credentials`.
 #### In Envoy mode
 
 Add the block to the `llmproxy.auth` filter's `typed_config`. The filter also
-needs a store. Use `persistent`.
+needs the `persistent` store. With `tenant_credentials` set, an absent,
+`in_memory`, or `shared` store is a load error at `typed_config.tenant_credentials`.
 
 ```yaml
 http_filters:
@@ -335,7 +340,7 @@ provider, then store.
 | `404` | `{"error":{"type":"tenant_not_found","message":"unknown tenant"}}` | The tenant does not exist. |
 | `422` | `{"error":{"type":"provider_not_enabled",...}}` | No cluster has a slot with this provider label. |
 | `500` | `{"error":{"type":"credential_seal_failed",...}}` | The key could not be sealed. |
-| `500` | Text | The store refused the write. The Redis store always does (see [Limitations](#limitations)). |
+| `500` | Text | The store refused the write. The Redis store always does, but a config with tenant credentials cannot select it (see [Limitations](#limitations)). |
 | `503` | `{"error":{"type":"tenant_credentials_not_configured",...}}` | The auth filter has no `tenant_credentials` block. |
 
 Status codes for `GET` and `DELETE`:
@@ -456,19 +461,13 @@ doc and `on_request_headers`; `crates/proxy-filters/src/control.rs`,
 - **No mixed mode.** A tenant in tenant mode uses only its own keys. A request
   that needs a provider the tenant lacks gets a `403`. It does not use the
   platform credential for that provider.
-- **Redis store.** The `shared` store (Redis) does not support tenant
-  credentials. A `PUT` returns `500` with the text `control-plane store
-  unavailable: tenant credentials are not supported by this store`. The Redis
-  store also loads no stored tenant credentials. A deployment that moves from a
-  `persistent` store to `shared` therefore sends every tenant's requests on the
-  platform credential. The proxy logs no warning for this case. Do not move a
-  deployment that holds tenant keys to `shared`
-  (`crates/proxy-filters/src/control_redis.rs`, `load`, which returns
-  `tenant_credentials: Vec::new()`).
-- **In-memory store.** The default `in_memory` store loses stored tenant keys
-  when the process restarts. The tenant then uses the platform credential until
-  it stores its key again (`crates/proxy-api/vendor/llmproxy/filters/v0/auth.proto`,
-  `InMemoryStore`).
+- **Persistent store only.** With tenant credentials configured, the `shared`
+  (Redis) store and the default `in_memory` store are load errors. The `shared`
+  store does not hold tenant credentials yet, and `in_memory` loses them on
+  restart. Without the check, tenants would silently use the platform
+  credential. A config that sets `auth.tenant_credentials` or Envoy's
+  `tenant_credentials` with another store fails at load and names the field
+  path (`crates/proxy-filters/src/auth_filter.rs`, `parse_config`).
 - **Header shapes.** Only the `Authorization`, `x-api-key`, and `api-key` shapes
   work. A cluster with Vertex OAuth2 or Bedrock SigV4 cannot carry a slot.
 - **Three header names are cleared.** In tenant mode the proxy clears only
@@ -541,6 +540,9 @@ doc and `on_request_headers`; `crates/proxy-filters/src/control.rs`,
 
 ### The tenant's key stops applying after a restart
 
-- **Cause.** The store is `in_memory`, which keeps nothing across a restart.
-- **Fix.** Set `persistent` (Envoy mode) and store the keys again. Keys stored
-  before the restart are gone.
+- **Cause.** The `persistent.path` changed, or its redb file was deleted. Keys
+  live only in that file.
+- **Fix.** Keep `persistent.path` on the same file across restarts. The proxy
+  refuses to start with tenant credentials on an absent, `in_memory`, or
+  `shared` store, so the keys cannot be dropped that way. Keys stored against the
+  old file must be stored again.

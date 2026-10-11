@@ -324,6 +324,11 @@ fn parse_store(config: &DynamicMessage) -> Result<StoreSpec, ConfigError> {
     }
 }
 
+/// Reason for the persistent-store requirement. [`parse_config`] returns it
+/// for Envoy mode, and `proxy-simple-config`'s `lower.rs` returns the same
+/// words for the dialect, so an operator sees one message either way.
+const TENANT_CREDENTIALS_NEED_PERSISTENT_STORE: &str = "tenant credentials require the persistent store: in_memory loses them on restart and shared does not support them yet";
+
 /// Reads `typed_config.tenant_credentials` and loads its key-encryption keys
 /// (ADR-0007 decision 2). Unset is `Ok(None)`: the proxy then cannot seal or
 /// open tenant credentials, and stored rows fail closed. Any problem with the
@@ -829,13 +834,26 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         );
     }
 
+    let credential_ring = parse_tenant_credentials(config)?;
+    // Tenant credentials are sealed rows in the control-plane store, so they
+    // need a store that survives restarts and can hold them. `in_memory`
+    // drops every row on restart, and `shared` has no credential rows yet
+    // (ADR-0007 decision 2). Both would leave tenants silently on the
+    // operator key, so the config is refused here, before any store is opened.
+    if credential_ring.is_some() && !matches!(store_spec, StoreSpec::Persistent(_)) {
+        return Err(invalid(
+            "typed_config.tenant_credentials",
+            TENANT_CREDENTIALS_NEED_PERSISTENT_STORE,
+        ));
+    }
+
     Ok(AuthConfig {
         secret_bytes,
         bootstrap_keys: key_set,
         store_spec,
         poll_interval,
         jwt_providers: parse_jwt_providers(config)?,
-        credential_ring: parse_tenant_credentials(config)?,
+        credential_ring,
     })
 }
 
@@ -1955,8 +1973,10 @@ mod tests {
     }
 
     /// One snapshot with a key for `tenant-t` (which holds an `openrouter`
-    /// credential) and a key for `tenant-u` (which holds none). Built directly,
-    /// because no store write path feeds `tenant_credentials` yet.
+    /// credential) and a key for `tenant-u` (which holds none). Built by hand
+    /// so these tests cover only the hand-off from snapshot to `StreamInfo`.
+    /// The decrypt path that fills `tenant_credentials` in a real snapshot is
+    /// covered in `control.rs`.
     fn filter_with_tenant_credentials() -> AuthFilterInstance {
         let secret = HmacSecret::new(b"secret");
         let mut keys = KeySet::new();
@@ -3397,11 +3417,91 @@ mod tests {
     #[test]
     fn parse_config_carries_the_key_ring_and_a_bad_block_stops_the_config() {
         let good = key_file("cfg-good", KEK_BYTES, 0o600);
-        let config = with_tenant_credentials(good.to_str().unwrap(), "kek", vec![]);
+        let config = with_persistent_store(
+            with_tenant_credentials(good.to_str().unwrap(), "kek", vec![]),
+            "/var/lib/llm-proxy/control-plane.redb",
+        );
         assert!(parse_config(&config).unwrap().credential_ring.is_some());
         std::fs::remove_file(&good).ok();
 
-        let config = with_tenant_credentials("/nonexistent/llm-proxy-kek", "kek", vec![]);
+        let config = with_persistent_store(
+            with_tenant_credentials("/nonexistent/llm-proxy-kek", "kek", vec![]),
+            "/var/lib/llm-proxy/control-plane.redb",
+        );
         assert!(parse_config(&config).is_err());
+    }
+
+    // A key ring with no store, or with a store that loses or cannot hold
+    // credentials, is a load error at the block's own path. `shared` is
+    // covered here too: `parse_config` only parses the URL and never opens a
+    // connection, so these cases run with no Redis.
+    #[test]
+    fn tenant_credentials_without_a_persistent_store_is_a_load_error() {
+        let key = key_file("store-absent", KEK_BYTES, 0o600);
+        let file = key.to_str().unwrap();
+
+        let absent = with_tenant_credentials(file, "kek", vec![]);
+        let explicit_in_memory = with_in_memory_store(with_tenant_credentials(file, "kek", vec![]));
+        let shared = with_shared_store(
+            with_tenant_credentials(file, "kek", vec![]),
+            "redis://127.0.0.1:6390/0",
+        );
+
+        for (label, config) in [
+            ("an absent store", absent),
+            ("an explicit in_memory store", explicit_in_memory),
+            ("a shared store", shared),
+        ] {
+            let err = match parse_config(&config) {
+                Err(err) => err,
+                Ok(_) => panic!("{label} must be rejected"),
+            };
+            match &err {
+                ConfigError::InvalidValue { field_path, reason } => {
+                    assert_eq!(
+                        field_path, "typed_config.tenant_credentials",
+                        "{label} must be rejected at the tenant_credentials block"
+                    );
+                    assert!(
+                        reason.contains("require the persistent store"),
+                        "{label}: the reason must name the requirement; got {reason}"
+                    );
+                }
+                other => panic!("{label}: expected InvalidValue, got {other:?}"),
+            }
+        }
+        std::fs::remove_file(&key).ok();
+    }
+
+    #[test]
+    fn tenant_credentials_with_a_persistent_store_loads() {
+        let key = key_file("store-persistent", KEK_BYTES, 0o600);
+        let config = with_persistent_store(
+            with_tenant_credentials(key.to_str().unwrap(), "kek", vec![]),
+            "/var/lib/llm-proxy/control-plane.redb",
+        );
+        let loaded = parse_config(&config).expect("a persistent store must load");
+        std::fs::remove_file(&key).ok();
+        assert!(loaded.credential_ring.is_some());
+        assert!(matches!(loaded.store_spec, StoreSpec::Persistent(_)));
+    }
+
+    #[test]
+    fn a_store_without_tenant_credentials_is_unaffected_by_the_check() {
+        // No key ring means no credential rows, so no store is refused.
+        for config in [
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            with_in_memory_store(authentication(
+                inline_secret("operator-hmac-secret"),
+                vec![],
+            )),
+            with_shared_store(
+                authentication(inline_secret("operator-hmac-secret"), vec![]),
+                "redis://127.0.0.1:6390/0",
+            ),
+        ] {
+            let loaded = parse_config(&config).expect("no tenant_credentials must load");
+            assert!(loaded.credential_ring.is_none());
+        }
     }
 }
