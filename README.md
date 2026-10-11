@@ -142,6 +142,11 @@ provider on failover. That has been a real key-disclosure bug here twice.
 - **Authenticates callers.** Virtual keys verified with HMAC-SHA256 in constant
   time. Authentication fails closed: with an `auth` block configured, a request
   with no recognised credential is refused rather than admitted anonymously.
+  After a request is authenticated, its `Authorization` header is removed, so
+  no provider ever receives the virtual key. As a result, any filter placed
+  after `llmproxy.auth` in an Envoy-mode `http_filters` chain (for example
+  `ext_authz`) does not see that header either. Envoy's `jwt_authn` with
+  `forward: false` behaves the same way.
 
 - **Authorizes models.** A tenant can be restricted to named models and exclude
   specific models from that grant. The effective access is allow minus deny,
