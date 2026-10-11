@@ -111,7 +111,8 @@ is a load error, never silently dropped or emitted as literal text.
 | `%LLM_TPOT%` | Mean time per output token: `(duration - ttft) / output_tokens`, in fractional milliseconds. `-` if usage, TTFT, or duration is missing, or output tokens is zero. |
 | `%LLM_MAX_STALL%` | The largest gap between two consecutive response chunks, in milliseconds — the tail of the per-token latency distribution, not the mean. |
 | `%LLM_RESPONSE_CHUNKS%` | Number of response body chunks observed. |
-| `%LLM_CREDENTIAL_SOURCE%` | Whose provider credential the last attempt that reached the credential step was sent with: `platform` (the operator's) or `tenant` (the authenticated tenant's own). `-` when no attempt got that far. |
+| `%LLM_TENANT%` | The authenticated tenant id the auth filter resolved. `-` when the request is not authenticated. |
+| `%LLM_CREDENTIAL_SOURCE%` | The source of the last provider credential applied to this request: `platform` (the operator's) or `tenant` (the tenant's own key). `-` when no credential was applied, for example after a `403 tenant_credential_missing`. See [Tenant provider credentials](../authentication/tenant-provider-credentials/#access-log). |
 
 A literal `%` is written as `%%`.
 

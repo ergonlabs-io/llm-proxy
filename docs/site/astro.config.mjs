@@ -77,6 +77,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Virtual keys', slug: 'authentication/virtual-keys' },
 						{ label: 'Managing secrets', slug: 'authentication/managing-secrets' },
+						{ label: 'Tenant provider credentials', slug: 'authentication/tenant-provider-credentials' },
 					],
 				},
 				{

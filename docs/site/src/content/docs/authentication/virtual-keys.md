@@ -7,6 +7,7 @@ summary: How downstream authentication works — the `auth:` block, the
 last_updated: 2026-09-07
 related:
   - ../authentication/managing-secrets/
+  - ../authentication/tenant-provider-credentials/
   - ../configuration/configuration-file/
   - ../providers-and-routing/providers-and-clusters/
 ---
@@ -266,24 +267,12 @@ rotation, permanent revocation tombstones, API versioning, and migration.
 
 ### Tenant provider credentials
 
-A tenant can bring its own provider key. Three bearer-gated calls manage it,
-each with the same `/chains/{stat_prefix}/...` scoped form as the rest:
-
-| Call | Success | Errors |
-| --- | --- | --- |
-| `PUT /tenants/{id}/provider_credentials/{provider}` with `{"schema_version":1,"api_key":"..."}` | `200` with metadata (`provider`, `last4`, `fingerprint`, timestamps, `verified_at`, `policy_generation`) | `400` malformed JSON, unknown field, `schema_version` other than 1, empty or whitespace-only key, key over 4096 bytes, key that is not valid in a header value; `404` unknown tenant; `422` `provider_not_enabled`; `503` `tenant_credentials_not_configured` |
-| `GET /tenants/{id}/provider_credentials` | `200` with `{"schema_version":1,"tenant":...,"credentials":[...]}` | `404` unknown tenant |
-| `DELETE /tenants/{id}/provider_credentials/{provider}` | `204` | `404` unknown tenant or no such credential |
-
-`{provider}` is the operator label in a cluster's `tenant_credential` slot, so a
-`422 provider_not_enabled` means no cluster accepts that name. The store needs
-`tenant_credentials` (a 0600 key-encryption-key file) on the `llmproxy.auth`
-filter, otherwise `PUT` answers `503`. Errors on these routes are JSON
-(`{"error":{"message":...,"type":...}}`). No response, log line or error
-message contains the key; only the last four characters and a keyed fingerprint
-are returned. The key is not checked against the provider when it is saved
-(`verified_at` stays `null`), so a rejected key shows up as the provider's own
-`401` on the tenant's next request.
+A tenant can store its own provider key, so its requests use that key instead
+of the platform credential. The routes are `PUT`, `GET`, and `DELETE` under
+`/tenants/{id}/provider_credentials/{provider}`, with the same bearer-token gate
+as the other write routes. The full setup, the status codes, and the rules for
+tenant mode are in
+[Tenant provider credentials](../authentication/tenant-provider-credentials/).
 
 Keys and tenant policy live in one of three stores. The default,
 `in_memory`, holds everything only for the life of the process. `persistent`

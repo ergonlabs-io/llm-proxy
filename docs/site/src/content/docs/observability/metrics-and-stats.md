@@ -20,7 +20,7 @@ format the same numbers (`crates/proxy-observability/src/stats/`, the
 
 ## What is real today
 
-Two instruments are wired to real traffic, both per cluster:
+Three instruments are wired to real traffic. The first two are per cluster:
 
 - **`upstream_rq`** — a counter, incremented once for every upstream
   attempt the router actually dispatches (past circuit-breaker and host
@@ -32,6 +32,13 @@ Two instruments are wired to real traffic, both per cluster:
   defined in `crates/proxy-observability/src/stats.rs`
   (`crates/proxy-http/src/router.rs:524`,
   `crates/proxy-http/src/stat_handles.rs:143`).
+- **`llmproxy_tenant_credential_requests_total`** — a counter with `provider`
+  and `outcome` labels, incremented only for tenant-mode requests. It appears
+  on `/stats/prometheus` as `envoy_llmproxy_tenant_credential_requests_total`
+  and is omitted from the flat `/stats` output. The outcomes are `applied`,
+  `missing`, and `unusable`. See
+  [Tenant provider credentials](../authentication/tenant-provider-credentials/#counter)
+  (`crates/proxy-observability/src/stats.rs`, `TENANT_CREDENTIAL_REQUESTS`).
 
 The cluster label is the proxy's internal cluster name, not the bare
 provider name from the config — a provider named `ollama` shows up
@@ -64,7 +71,7 @@ renders `No recorded values` instead of a percentile line.
 
 ### `/stats/prometheus`
 
-The same two numbers, in Prometheus text exposition format. Real output for
+The same numbers, in Prometheus text exposition format. Real output for
 the same state as above:
 
 ```text

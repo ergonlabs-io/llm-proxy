@@ -11,6 +11,48 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- Tenant provider credentials (bring your own key). A tenant stores its own key
+  for a provider with `PUT`, `GET`, and `DELETE`
+  `/tenants/{id}/provider_credentials/{provider}`. The key is sealed with
+  AES-256-GCM under a 0600 key-encryption key file. A tenant with a stored key runs
+  in strict tenant mode: no attempt uses the platform credential. Configure it with
+  `providers.<name>.tenant_credentials` and `auth.tenant_credentials` in the
+  `llmproxy` config file, or with the `tenant_credential` cluster slot in Envoy
+  mode. See [Tenant provider credentials](docs/site/src/content/docs/authentication/tenant-provider-credentials.md).
+- `auth.store` in the `llmproxy` config file selects the auth control-plane store:
+  `in_memory`, `persistent`, or `shared`.
+- Access-log operators `%LLM_TENANT%` and `%LLM_CREDENTIAL_SOURCE%`, the
+  `llmproxy_tenant_credential_requests_total` counter, and a `credential_source`
+  field on request and attempt records.
+- Admin budget routes accept `credential_source` (`platform` or `tenant`).
+
+### Changed
+
+- Spend budgets are scoped to one credential source. Existing budgets are
+  platform-scoped. A budget counts only the spend in its scope, so tenant-mode
+  spend is not counted against a platform-scoped budget.
+
+### Known limitations
+
+- Tenant credentials apply to virtual-key principals only. A JWT principal always
+  uses the platform credential.
+- A tenant key is not checked when it is saved. A wrong key shows up as the
+  provider's `401`.
+- The Redis store (`store.shared`) does not support tenant credentials. Writes
+  return `500`. Stored credentials are not loaded from it, so a deployment that
+  moves from a `persistent` store to Redis uses the platform credential for its
+  tenants, with no warning.
+- The default `in_memory` store loses stored tenant keys on restart.
+- In tenant mode only `authorization`, `x-api-key`, and `api-key` are cleared. A
+  platform key on any other header is still sent with the tenant key.
+- In the `llmproxy` config file, a bad key-encryption key file or a duplicate key id
+  fails at load, but the error names the Envoy-mode field path.
+- If every key-encryption key is lost, stored tenant keys cannot be recovered.
+- Rolling back to a build without budget scopes applies tenant-scoped budgets to
+  all traffic.
+
 ## [0.3.1] - 2026-10-09
 
 Follow-up fixes and optional local metadata capture after v0.3.0.

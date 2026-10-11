@@ -56,6 +56,7 @@ JSON error body listing known models.
 | `ca_file` | string (path) | no | system roots | PEM CA bundle for verifying this provider's TLS certificate. Only needed for a self-hosted backend with a private CA. |
 | `connect_timeout` | `Duration` | no | `5s` | TCP/TLS connection establishment timeout for this provider. |
 | `protocol` | enum: `http1`, `http2` | no | `http1` | Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse — the proxy keeps one multiplexed connection per worker to this provider instead of connecting fresh on every request. Most hosted providers support it; many local/self-hosted plaintext servers do not. |
+| `tenant_credentials` | boolean | no | `false` | Lets a tenant that stored its own key for this provider send that key instead of the operator key. Requires `auth.tenant_credentials`. Only header API-key types qualify: `openai`, `anthropic`, `openai-compatible`, `openrouter`, and `azure-openai`. `vertex` and `bedrock` are rejected at this field. The key goes in `x-api-key` for `anthropic`, in `api-key` for `azure-openai`, and in `Authorization: Bearer` for the rest. See [Tenant provider credentials](../authentication/tenant-provider-credentials/). |
 
 A `Provider` config rejects setting both `api_key` and `api_key_file`.
 
@@ -106,6 +107,7 @@ present at all.
 | `hmac_secret_file` | string (path) | one of `hmac_secret`/`hmac_secret_file` | — | Read the HMAC secret from a file, trimmed of trailing whitespace. Not watched automatically, but re-read on a `SIGHUP` config reload, same as `providers.<name>.api_key_file` above. |
 | `keys` | array of `AuthKey` | no | `[]` | Configured virtual keys. An empty list authenticates nothing, so `auth` present with no keys refuses every request — legal, and almost certainly a mistake, so it produces a load-time warning. |
 | `store` | `AuthStore` | no | `in_memory` | Where keys minted through the admin API and tenant policy live. Exactly one of `in_memory: {}`, `persistent: {path}`, or `shared: {url \| url_file, namespace}`. Fixed at startup: changing it takes a restart. |
+| `tenant_credentials` | `AuthTenantCredentials` | required when any `providers` entry sets `tenant_credentials: true`; otherwise no | absent | The key ring that seals tenant provider credentials at rest. Absent means the proxy cannot seal or open them. See the table below. |
 
 `store.persistent.path` is an embedded `redb` file, created if missing; an empty
 path is an error. `store.shared` is Redis: exactly one of `url` (inline, use
@@ -119,6 +121,49 @@ re-seeded on every start and are not written to the store.
 | `tenant` | string | yes | — | The tenant (account/team) this key authenticates as. Several keys may share a tenant — that is the normal case, so revoking one leaked key does not revoke the whole account. |
 | `digest` | string, 64 lowercase hex chars | yes | — | `HMAC-SHA256(hmac_secret, <plaintext key>)`. The plaintext key is shown once, at creation, and is never recoverable from configuration. Generate it with `llm-proxy --mode keygen --tenant <tenant> --key-id <id> --hmac-secret-file <path>`. |
 | `revoked` | boolean | no | `false` | A revoked key is refused, distinguished from an unknown key in the access log's response-code detail (`auth_revoked_key` vs. `auth_unknown_key`) but not on the wire — both produce an identical 401. |
+
+### `auth.tenant_credentials` (`AuthTenantCredentials`)
+
+Key-encryption keys that seal tenant provider credentials at rest. Each key is
+a `0600` file holding exactly 32 raw bytes. The key bytes never appear in
+configuration.
+
+| Field | Type | Required | Default | What it does |
+|---|---|---|---|---|
+| `encryption_key_file` | string (path) | yes | — | The key that new tenant credentials are sealed under. Read at startup. |
+| `encryption_key_id` | string | yes | — | Names that key. The id is stored in plaintext beside each sealed credential. |
+| `previous_keys` | array of `{id, file}` | no | `[]` | Retired keys. Each one opens credentials sealed before a rotation, and never seals a new one. Each `id` and `file` is required. |
+
+Ids must be unique across `encryption_key_id` and `previous_keys[].id`.
+
+Only presence and non-emptiness are checked at this level. The key files are
+checked when the auth filter opens the ring. A bad file or a duplicate id fails
+the load, but the error names the Envoy-mode field path,
+`typed_config.tenant_credentials.…`, not `auth.tenant_credentials.…`. This is a
+known gap in the error path, and it does not change what is rejected. The
+file rules and the rotation procedure are in
+[Tenant provider credentials](../authentication/tenant-provider-credentials/#1-create-the-key-encryption-key-file).
+
+Example:
+
+```yaml
+version: 0
+auth:
+  hmac_secret: ${LLMPROXY_AUTH_SECRET}
+  store:
+    persistent:
+      path: /var/lib/llmproxy/control.redb
+  tenant_credentials:
+    encryption_key_file: /etc/llmproxy/credential-kek
+    encryption_key_id: kek-2026-10
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    tenant_credentials: true
+routes:
+  - model: "*"
+    provider: openai
+```
 
 Authentication fails closed; authorization does not. An authenticated tenant
 with no configured policy may use every model and provider.
