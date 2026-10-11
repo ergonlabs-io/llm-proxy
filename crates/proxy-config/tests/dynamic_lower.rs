@@ -131,6 +131,24 @@ fn a_minimal_dynamic_listener_lowers_to_listener_config_with_the_expected_name()
     assert_eq!(listener.name, "ingress");
 }
 
+/// LDS goes through the same `convert_listener` check as file config, so a
+/// dynamic listener with an explicit 0 buffer limit is refused (NACKed).
+#[test]
+fn a_dynamic_listener_with_zero_buffer_limit_is_rejected() {
+    let mut listener = minimal_listener("ingress", "payments-primary");
+    listener.per_connection_buffer_limit_bytes = Some(0);
+    let any = any_of(&listener, LISTENER_TYPE);
+    let err = lower_dynamic_listener(&any, "lds.listeners[ingress]")
+        .expect_err("0 buffer limit must be rejected");
+    match err {
+        ConfigError::InvalidValue { field_path, .. } => assert_eq!(
+            field_path,
+            "lds.listeners[ingress].per_connection_buffer_limit_bytes"
+        ),
+        other => panic!("expected InvalidValue, got: {other}"),
+    }
+}
+
 // ---------------------------------------------------- strict mode over xDS --
 
 /// THE IMPORTANT ONE. `close_connections_on_host_health_failure` is a real

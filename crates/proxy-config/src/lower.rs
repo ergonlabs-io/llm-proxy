@@ -1387,6 +1387,16 @@ fn convert_listener(l: &listener_v3::Listener, path: &str) -> Result<ListenerCon
         )
     })?;
 
+    // Envoy accepts an explicit 0 (documented as a soft limit); we use the
+    // value as the HTTP body buffer cap, so 0 would 413 every request body.
+    // Unset keeps the default; only an explicit 0 is rejected.
+    if l.per_connection_buffer_limit_bytes == Some(0) {
+        return Err(invalid(
+            format!("{path}.per_connection_buffer_limit_bytes"),
+            "0 would reject every request body; omit the field to use the 1 MiB default",
+        ));
+    }
+
     let mut filter_chains = Vec::new();
     for (i, fc) in l.filter_chains.iter().enumerate() {
         filter_chains.push(convert_filter_chain(
