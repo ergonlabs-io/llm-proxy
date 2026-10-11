@@ -2,6 +2,9 @@
 //! driven over a real admin socket like the rest of `server/tests.rs`.
 
 use super::*;
+use proxy_http::credential_probe::{
+    CredentialProbeOutcome, CredentialProbeRequest, TenantCredentialProbe,
+};
 
 /// A plaintext tenant key no response body, error message or listing may ever
 /// contain.
@@ -12,28 +15,119 @@ const CRED_PROVIDER: &str = "openrouter";
 
 const CRED_PATH: &str = "/tenants/acme/provider_credentials/openrouter";
 
-/// `snapshot_with_secret()` with the single cluster carrying a tenant
-/// credential slot for [`CRED_PROVIDER`], so `PUT` passes the
-/// "provider is enabled" check.
-fn snapshot_with_credential_slot() -> Arc<ConfigSnapshot> {
-    let mut snapshot = snapshot_with_secret();
-    let clusters = &mut Arc::get_mut(&mut snapshot)
-        .expect("fresh snapshot is uniquely owned")
-        .clusters;
-    let cluster = Arc::get_mut(clusters.get_mut("upstream").expect("fixture cluster"))
-        .expect("fresh cluster is uniquely owned");
-    cluster.provider_runtime = Some(proxy_config::ir::ProviderRuntimeConfig {
-        credential: None,
-        path_template: None,
-        model_rewrites: Vec::new(),
-        tenant_credential: Some(proxy_config::ir::TenantCredentialSlot {
-            provider: CRED_PROVIDER.to_string(),
-            header: "authorization".to_string(),
-            value_prefix: "Bearer ".to_string(),
-            verify_path: None,
+/// One provider cluster named `name`, carrying a tenant credential slot for
+/// [`CRED_PROVIDER`] with the given `verify_path`. Built field by field because
+/// `ClusterConfig` is not `Clone`; it mirrors the fixture in `tests.rs`.
+fn provider_cluster(name: &str, verify_path: Option<&str>) -> ClusterConfig {
+    ClusterConfig {
+        eds: None,
+        name: name.to_string(),
+        discovery: DiscoveryType::Static,
+        lb_policy: LbPolicy::RoundRobin,
+        connect_timeout: Duration::from_secs(5),
+        endpoints: vec![EndpointIR {
+            metadata: Default::default(),
+            host: "10.0.0.5".to_string(),
+            port: 8080,
+            weight: 1,
+            priority: 0,
+        }],
+        kind: ClusterKind::Endpoints,
+        transport_socket: None,
+        per_connection_buffer_limit_bytes: 1024 * 1024,
+        circuit_breakers: Default::default(),
+        upstream_protocol: UpstreamProtocol::Http1,
+        request_headers_to_add: Vec::new(),
+        usage_dialect: None,
+        request_path_rewrite: None,
+        provider_runtime: Some(proxy_config::ir::ProviderRuntimeConfig {
+            credential: None,
+            path_template: None,
+            model_rewrites: Vec::new(),
+            tenant_credential: Some(proxy_config::ir::TenantCredentialSlot {
+                provider: CRED_PROVIDER.to_string(),
+                header: "authorization".to_string(),
+                value_prefix: "Bearer ".to_string(),
+                verify_path: verify_path.map(str::to_string),
+            }),
         }),
-    });
+        health_check: None,
+        outlier_detection: None,
+    }
+}
+
+/// `snapshot_with_secret()` with one provider cluster per `(name, verify_path)`
+/// entry, so `PUT` passes the "provider is enabled" check and the probe has a
+/// slot cluster to choose from.
+fn snapshot_with_slot_clusters(clusters: &[(&str, Option<&str>)]) -> Arc<ConfigSnapshot> {
+    let mut snapshot = snapshot_with_secret();
+    Arc::get_mut(&mut snapshot)
+        .expect("fresh snapshot is uniquely owned")
+        .clusters = clusters
+        .iter()
+        .map(|(name, verify_path)| {
+            (
+                name.to_string(),
+                Arc::new(provider_cluster(name, *verify_path)),
+            )
+        })
+        .collect();
     snapshot
+}
+
+/// A single `upstream` cluster carrying a tenant credential slot for
+/// [`CRED_PROVIDER`], with the given `verify_path` (`None` means no probe can
+/// verify a key for this provider).
+fn snapshot_with_credential_slot(verify_path: Option<&str>) -> Arc<ConfigSnapshot> {
+    snapshot_with_slot_clusters(&[("upstream", verify_path)])
+}
+
+/// The request a probe saw, reduced to what the tests assert on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeenProbe {
+    cluster: String,
+    path: String,
+    header: String,
+    secret: String,
+}
+
+/// A [`TenantCredentialProbe`] that answers every call with one scripted
+/// outcome and records what it was asked to dial. Never touches the network.
+struct FakeProbe {
+    outcome: CredentialProbeOutcome,
+    seen: Mutex<Vec<SeenProbe>>,
+}
+
+impl FakeProbe {
+    fn new(outcome: CredentialProbeOutcome) -> Arc<Self> {
+        Arc::new(Self {
+            outcome,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn calls(&self) -> Vec<SeenProbe> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl TenantCredentialProbe for FakeProbe {
+    // Rust note: `BoxFuture` is a type alias for a boxed, pinned trait object.
+    // The fake spells it out because this test crate does not depend on
+    // `futures`; `Box::pin(std::future::ready(..))` is the boxed form of an
+    // already-finished future.
+    fn probe(
+        &self,
+        request: CredentialProbeRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CredentialProbeOutcome> + Send>> {
+        self.seen.lock().unwrap().push(SeenProbe {
+            cluster: request.cluster,
+            path: request.slot.verify_path.clone().unwrap_or_default(),
+            header: request.slot.header.clone(),
+            secret: request.secret.expose().to_string(),
+        });
+        Box::pin(std::future::ready(self.outcome.clone()))
+    }
 }
 
 /// Registers a `ControlPlane` that has (`with_kek`) or lacks key-encryption
@@ -65,15 +159,34 @@ fn factory_state_with_credential_plane(with_kek: bool) -> Arc<SharedFactoryState
     factory_state
 }
 
-/// Admin server with a credential-capable control plane and tenant `acme`.
-async fn start_credentials(with_kek: bool) -> (AdminServer, SocketAddr) {
-    let (server, addr) = start_full(
-        snapshot_with_credential_slot(),
-        None,
-        factory_state_with_credential_plane(with_kek),
-        Some(ADMIN_TOKEN.to_string()),
+/// Admin server with a credential-capable control plane, tenant `acme`, and
+/// `probe` as the save-time probe (`None` means the probe is not wired).
+async fn start_probed(
+    snapshot: Arc<ConfigSnapshot>,
+    with_kek: bool,
+    probe: Option<Arc<dyn TenantCredentialProbe>>,
+) -> (AdminServer, SocketAddr) {
+    // Built directly rather than through `start_full`, which always passes
+    // `credential_probe: None`.
+    let config = SnapshotHandles::new().register(snapshot);
+    let server = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        AdminRuntime {
+            config,
+            registry: None,
+            started_at: Instant::now(),
+            factory_state: factory_state_with_credential_plane(with_kek),
+            admin_token: Some(ADMIN_TOKEN.to_string()),
+            readiness: None,
+            cluster_state: None,
+            ui: None,
+            lifecycle: None,
+            credential_probe: probe,
+        },
     )
-    .await;
+    .await
+    .expect("admin server bind");
+    let addr = server.local_addr();
     let (status, ..) = request(
         addr,
         "POST",
@@ -86,8 +199,41 @@ async fn start_credentials(with_kek: bool) -> (AdminServer, SocketAddr) {
     (server, addr)
 }
 
+/// Admin server with a credential-capable control plane and tenant `acme`, a
+/// `verify_path`-less slot, and no probe.
+async fn start_credentials(with_kek: bool) -> (AdminServer, SocketAddr) {
+    start_probed(snapshot_with_credential_slot(None), with_kek, None).await
+}
+
 fn credential_body(key: &str) -> String {
     serde_json::json!({ "schema_version": 1, "api_key": key }).to_string()
+}
+
+/// A PUT body with `"verify": false`, for tests that are about storage rather
+/// than the save-time probe.
+fn unverified_body(key: &str) -> String {
+    serde_json::json!({ "schema_version": 1, "api_key": key, "verify": false }).to_string()
+}
+
+/// The `error` object of a JSON error response.
+fn error_object(body: &str) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap();
+    value["error"].clone()
+}
+
+/// The listing of `acme`'s stored credentials, as JSON.
+async fn list_credentials(addr: SocketAddr) -> Vec<serde_json::Value> {
+    let (status, _h, body) = request(
+        addr,
+        "GET",
+        "/tenants/acme/provider_credentials",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+    list["credentials"].as_array().unwrap().clone()
 }
 
 #[tokio::test]
@@ -99,7 +245,7 @@ async fn put_then_get_returns_metadata_and_no_response_contains_the_plaintext() 
         "PUT",
         CRED_PATH,
         Some(ADMIN_TOKEN),
-        &credential_body(TENANT_KEY_SENTINEL),
+        &unverified_body(TENANT_KEY_SENTINEL),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -114,7 +260,7 @@ async fn put_then_get_returns_metadata_and_no_response_contains_the_plaintext() 
     );
     assert!(
         put["verified_at"].is_null(),
-        "the save-time probe is deferred, so a stored key is unverified"
+        "verify:false stores a key unverified"
     );
 
     let (status, _h, body) = request(
@@ -188,6 +334,14 @@ async fn put_rejects_invalid_bodies_with_400_and_never_echoes_them() {
             "non-ASCII in key",
             credential_body(&format!("{TENANT_KEY_SENTINEL}\u{e9}")),
         ),
+        (
+            "verify of the wrong type",
+            format!("{{\"schema_version\":1,\"api_key\":\"{TENANT_KEY_SENTINEL}\",\"verify\":\"yes\"}}"),
+        ),
+        (
+            "verify as null",
+            format!("{{\"schema_version\":1,\"api_key\":\"{TENANT_KEY_SENTINEL}\",\"verify\":null}}"),
+        ),
     ];
     for (name, body) in cases {
         let (status, _h, response) =
@@ -260,7 +414,7 @@ async fn put_without_key_encryption_keys_is_503_tenant_credentials_not_configure
         "PUT",
         CRED_PATH,
         Some(ADMIN_TOKEN),
-        &credential_body(TENANT_KEY_SENTINEL),
+        &unverified_body(TENANT_KEY_SENTINEL),
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -288,7 +442,7 @@ async fn credential_routes_are_gated_like_the_other_tenant_writes() {
 
     // With no admin token configured at all, unset never means open.
     let (_open, open_addr) = start_full(
-        snapshot_with_credential_slot(),
+        snapshot_with_credential_slot(None),
         None,
         factory_state_with_credential_plane(true),
         None,
@@ -321,7 +475,7 @@ async fn chain_scoped_credential_routes_work_and_unknown_chain_is_404() {
         "PUT",
         &format!("{base}/openrouter"),
         Some(ADMIN_TOKEN),
-        &credential_body(TENANT_KEY_SENTINEL),
+        &unverified_body(TENANT_KEY_SENTINEL),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -361,7 +515,7 @@ async fn delete_credential_is_204_then_404_and_removes_it_from_the_listing() {
         "PUT",
         CRED_PATH,
         Some(ADMIN_TOKEN),
-        &credential_body(TENANT_KEY_SENTINEL),
+        &unverified_body(TENANT_KEY_SENTINEL),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -398,4 +552,337 @@ async fn credential_route_with_a_wrong_verb_is_405() {
     )
     .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// The `verify_path` the default fixture's slot carries.
+const VERIFY_PATH: &str = "/v1/models";
+
+/// A plain `PUT` with the default `verify` (true).
+async fn put_default(addr: SocketAddr) -> (StatusCode, String) {
+    let (status, _h, body) = request(
+        addr,
+        "PUT",
+        CRED_PATH,
+        Some(ADMIN_TOKEN),
+        &credential_body(TENANT_KEY_SENTINEL),
+    )
+    .await;
+    (status, body)
+}
+
+fn probe_seen(cluster: &str, path: &str) -> SeenProbe {
+    SeenProbe {
+        cluster: cluster.to_string(),
+        path: path.to_string(),
+        header: "authorization".to_string(),
+        secret: TENANT_KEY_SENTINEL.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn verified_put_stores_with_verified_at_after_a_2xx_probe() {
+    let probe = FakeProbe::new(CredentialProbeOutcome::Status(StatusCode::OK));
+    let (_server, addr) = start_probed(
+        snapshot_with_credential_slot(Some(VERIFY_PATH)),
+        true,
+        Some(probe.clone()),
+    )
+    .await;
+
+    let (status, body) = put_default(addr).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains(TENANT_KEY_SENTINEL), "PUT leaked: {body}");
+    let put: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(put["verified_at"].is_string(), "{body}");
+
+    // The probe dialled the slot's cluster, at its path, with the candidate key.
+    assert_eq!(
+        probe.calls(),
+        vec![probe_seen("upstream", VERIFY_PATH)],
+        "the probe must see the slot cluster, its verify_path, and the key"
+    );
+
+    let listed = list_credentials(addr).await;
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0]["verified_at"].is_string());
+}
+
+#[tokio::test]
+async fn provider_401_or_403_is_422_credential_rejected_and_nothing_is_stored() {
+    for upstream in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+        let probe = FakeProbe::new(CredentialProbeOutcome::Status(upstream));
+        let (_server, addr) = start_probed(
+            snapshot_with_credential_slot(Some(VERIFY_PATH)),
+            true,
+            Some(probe.clone()),
+        )
+        .await;
+
+        let (status, body) = put_default(addr).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{upstream}: {body}"
+        );
+        assert!(!body.contains(TENANT_KEY_SENTINEL), "{upstream}: {body}");
+        let error = error_object(&body);
+        assert_eq!(error["type"], "credential_rejected", "{upstream}");
+        assert_eq!(error["upstream_status"], upstream.as_u16(), "{upstream}");
+        assert_eq!(probe.calls().len(), 1, "{upstream}");
+        assert!(
+            list_credentials(addr).await.is_empty(),
+            "{upstream}: a rejected key was stored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn other_provider_status_is_502_with_upstream_status_and_nothing_is_stored() {
+    for upstream in [
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        let probe = FakeProbe::new(CredentialProbeOutcome::Status(upstream));
+        let (_server, addr) = start_probed(
+            snapshot_with_credential_slot(Some(VERIFY_PATH)),
+            true,
+            Some(probe.clone()),
+        )
+        .await;
+
+        let (status, body) = put_default(addr).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{upstream}: {body}");
+        assert!(!body.contains(TENANT_KEY_SENTINEL), "{upstream}: {body}");
+        let error = error_object(&body);
+        assert_eq!(
+            error["type"], "credential_verification_unavailable",
+            "{upstream}"
+        );
+        assert_eq!(error["upstream_status"], upstream.as_u16(), "{upstream}");
+        assert!(
+            list_credentials(addr).await.is_empty(),
+            "{upstream}: an unverified key was stored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn timed_out_and_unreachable_probes_are_502_without_upstream_status() {
+    let outcomes = [
+        CredentialProbeOutcome::TimedOut,
+        CredentialProbeOutcome::Unreachable("connect refused".to_string()),
+    ];
+    for outcome in outcomes {
+        let name = format!("{outcome:?}");
+        let probe = FakeProbe::new(outcome);
+        let (_server, addr) = start_probed(
+            snapshot_with_credential_slot(Some(VERIFY_PATH)),
+            true,
+            Some(probe.clone()),
+        )
+        .await;
+
+        let (status, body) = put_default(addr).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{name}: {body}");
+        assert!(!body.contains(TENANT_KEY_SENTINEL), "{name}: {body}");
+        // The Unreachable reason goes to the log, never into the reply.
+        assert!(!body.contains("connect refused"), "{name}: {body}");
+        let error = error_object(&body);
+        assert_eq!(
+            error["type"], "credential_verification_unavailable",
+            "{name}"
+        );
+        assert!(
+            error.get("upstream_status").is_none(),
+            "{name}: no provider status was received, so none may be reported: {body}"
+        );
+        assert!(list_credentials(addr).await.is_empty(), "{name}: stored");
+    }
+}
+
+#[tokio::test]
+async fn verify_false_stores_unverified_and_never_calls_the_probe() {
+    // A probe that would reject the key: if it were consulted, the PUT would
+    // be a 422, so a 200 here shows it was skipped.
+    let probe = FakeProbe::new(CredentialProbeOutcome::Status(StatusCode::UNAUTHORIZED));
+    let (_server, addr) = start_probed(
+        snapshot_with_credential_slot(Some(VERIFY_PATH)),
+        true,
+        Some(probe.clone()),
+    )
+    .await;
+
+    let (status, _h, body) = request(
+        addr,
+        "PUT",
+        CRED_PATH,
+        Some(ADMIN_TOKEN),
+        &unverified_body(TENANT_KEY_SENTINEL),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains(TENANT_KEY_SENTINEL), "{body}");
+    let put: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(put["verified_at"].is_null(), "{body}");
+    assert!(probe.calls().is_empty(), "verify:false must not probe");
+    let listed = list_credentials(addr).await;
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0]["verified_at"].is_null());
+}
+
+#[tokio::test]
+async fn no_slot_with_a_verify_path_is_422_not_configured_and_nothing_is_stored() {
+    let probe = FakeProbe::new(CredentialProbeOutcome::Status(StatusCode::OK));
+    let (_server, addr) = start_probed(
+        snapshot_with_credential_slot(None),
+        true,
+        Some(probe.clone()),
+    )
+    .await;
+
+    let (status, body) = put_default(addr).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.contains(TENANT_KEY_SENTINEL), "{body}");
+    let error = error_object(&body);
+    assert_eq!(error["type"], "credential_verification_not_configured");
+    assert!(error.get("upstream_status").is_none(), "{body}");
+    assert!(probe.calls().is_empty());
+    assert!(list_credentials(addr).await.is_empty());
+}
+
+#[tokio::test]
+async fn unwired_probe_is_422_not_configured_even_when_a_slot_has_a_verify_path() {
+    let (_server, addr) =
+        start_probed(snapshot_with_credential_slot(Some(VERIFY_PATH)), true, None).await;
+
+    let (status, body) = put_default(addr).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.contains(TENANT_KEY_SENTINEL), "{body}");
+    assert_eq!(
+        error_object(&body)["type"],
+        "credential_verification_not_configured"
+    );
+    assert!(
+        list_credentials(addr).await.is_empty(),
+        "unverified key stored"
+    );
+
+    // The same server still stores a key the caller marks unverified.
+    let (status, _h, body) = request(
+        addr,
+        "PUT",
+        CRED_PATH,
+        Some(ADMIN_TOKEN),
+        &unverified_body(TENANT_KEY_SENTINEL),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(list_credentials(addr).await.len(), 1);
+}
+
+#[tokio::test]
+async fn replacing_a_verified_key_with_verify_false_clears_verified_at() {
+    let probe = FakeProbe::new(CredentialProbeOutcome::Status(StatusCode::OK));
+    let (_server, addr) = start_probed(
+        snapshot_with_credential_slot(Some(VERIFY_PATH)),
+        true,
+        Some(probe.clone()),
+    )
+    .await;
+
+    let (status, body) = put_default(addr).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(list_credentials(addr).await[0]["verified_at"].is_string());
+
+    let (status, _h, body) = request(
+        addr,
+        "PUT",
+        CRED_PATH,
+        Some(ADMIN_TOKEN),
+        &unverified_body(TENANT_KEY_SENTINEL),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let put: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(put["verified_at"].is_null(), "{body}");
+    assert_eq!(probe.calls().len(), 1, "only the verified PUT probes");
+    assert!(list_credentials(addr).await[0]["verified_at"].is_null());
+}
+
+#[tokio::test]
+async fn validation_errors_keep_their_codes_and_never_reach_the_probe() {
+    let probe = FakeProbe::new(CredentialProbeOutcome::Status(StatusCode::OK));
+    let (_server, addr) = start_probed(
+        snapshot_with_credential_slot(Some(VERIFY_PATH)),
+        true,
+        Some(probe.clone()),
+    )
+    .await;
+    let cases: Vec<(&str, &str, String, StatusCode, &str)> = vec![
+        (
+            "empty key",
+            CRED_PATH,
+            credential_body(""),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "whitespace-only key",
+            CRED_PATH,
+            credential_body(" \t "),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "verify of the wrong type",
+            CRED_PATH,
+            format!(
+                "{{\"schema_version\":1,\"api_key\":\"{TENANT_KEY_SENTINEL}\",\"verify\":\"yes\"}}"
+            ),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "unknown provider",
+            "/tenants/acme/provider_credentials/not-a-provider",
+            credential_body(TENANT_KEY_SENTINEL),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "provider_not_enabled",
+        ),
+        (
+            "unknown tenant",
+            "/tenants/ghost/provider_credentials/openrouter",
+            credential_body(TENANT_KEY_SENTINEL),
+            StatusCode::NOT_FOUND,
+            "tenant_not_found",
+        ),
+    ];
+    for (name, path, body, expected, error_type) in cases {
+        let (status, _h, response) = request(addr, "PUT", path, Some(ADMIN_TOKEN), &body).await;
+        assert_eq!(status, expected, "{name}: {response}");
+        assert!(
+            !response.contains(TENANT_KEY_SENTINEL),
+            "{name}: {response}"
+        );
+        assert_eq!(error_object(&response)["type"], error_type, "{name}");
+    }
+    assert!(
+        probe.calls().is_empty(),
+        "a validation error reached the probe"
+    );
+    assert!(list_credentials(addr).await.is_empty());
+}
+
+#[tokio::test]
+async fn probe_goes_to_the_first_slot_cluster_by_name_that_has_a_verify_path() {
+    // `alpha` sorts first but carries no verify_path, so it is skipped;
+    // `beta` is the first by name that can be probed.
+    let snapshot =
+        snapshot_with_slot_clusters(&[("zeta", Some("/z")), ("beta", Some("/b")), ("alpha", None)]);
+    let probe = FakeProbe::new(CredentialProbeOutcome::Status(StatusCode::OK));
+    let (_server, addr) = start_probed(snapshot, true, Some(probe.clone())).await;
+
+    let (status, body) = put_default(addr).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(probe.calls(), vec![probe_seen("beta", "/b")]);
 }

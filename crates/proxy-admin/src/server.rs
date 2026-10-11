@@ -53,6 +53,9 @@ use proxy_filters::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudg
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
 use proxy_filters::tenant_credential_crypto::TenantSecret;
 use proxy_filters::usage_filter::PricingRegistry;
+use proxy_http::credential_probe::{
+    CredentialProbeOutcome, CredentialProbeRequest, TenantCredentialProbe,
+};
 use proxy_http::filter::SharedFactoryState;
 use proxy_http::tenant_credentials::CredentialSource;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
@@ -728,9 +731,21 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         // `body` moves into the handler (unlike every arm above, which
         // borrows it) so the handler can wipe the buffer holding the
         // plaintext key. Only one arm runs, so the move is fine.
+        //
+        // Rust note: `Option<Arc<dyn Trait>>::as_deref()` borrows the trait
+        // object out of the `Arc` without cloning it, giving the handler an
+        // `Option<&dyn Trait>` it can call through.
         WriteRoute::TenantCredentialPut(id, provider)
         | WriteRoute::ScopedTenantCredentialPut(_, id, provider) => {
-            handle_put_tenant_credential(&control_plane, config, id, provider, body)
+            handle_put_tenant_credential(
+                &control_plane,
+                config,
+                runtime.credential_probe.as_deref(),
+                id,
+                provider,
+                body,
+            )
+            .await
         }
         WriteRoute::TenantCredentialDelete(id, provider)
         | WriteRoute::ScopedTenantCredentialDelete(_, id, provider) => {
@@ -1671,6 +1686,27 @@ fn error_json(status: StatusCode, error_type: &str, message: &str) -> Response<F
     )
 }
 
+/// [`error_json`] plus `upstream_status` inside the `error` object, for the
+/// save-time probe's failures where the provider did answer. The status is a
+/// bare code, so it carries nothing from the request or the response body.
+fn error_json_with_upstream(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    upstream: StatusCode,
+) -> Response<Full<Bytes>> {
+    json(
+        status,
+        &serde_json::json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "upstream_status": upstream.as_u16(),
+            }
+        }),
+    )
+}
+
 /// Deserializes straight into a [`TenantSecret`] so the parsed plaintext
 /// lives in a zeroize-on-drop buffer from its first owned form onward.
 ///
@@ -1682,12 +1718,20 @@ fn deserialize_tenant_secret<'de, D: serde::Deserializer<'de>>(
     <String as serde::Deserialize>::deserialize(de).map(TenantSecret::new)
 }
 
+/// `verify` defaults to `true`: a key is checked against the provider unless
+/// the caller opts out (ADR-0007 decision 10).
+fn default_verify() -> bool {
+    true
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PutTenantCredentialRequest {
     schema_version: u32,
     #[serde(deserialize_with = "deserialize_tenant_secret")]
     api_key: TenantSecret,
+    #[serde(default = "default_verify")]
+    verify: bool,
 }
 
 /// Whether `tenant` exists: created through the store, or implied by a
@@ -1722,25 +1766,29 @@ fn wipe_body(body: Bytes) {
 /// `PUT /tenants/{id}/provider_credentials/{provider}`.
 ///
 /// Check order: body shape (400), tenant (404), provider enabled on some
-/// cluster (422), then the store (503 when `tenant_credentials` is not
-/// configured). The request body is never logged, echoed, or formatted into an
-/// error message: serde's own errors can quote input, so this handler maps them
-/// to fixed text by [`serde_json::Error::classify`].
-fn handle_put_tenant_credential(
+/// cluster (422), then, when `verify` is true, the save-time probe (422 or 502,
+/// nothing stored on failure), then the store (503 when `tenant_credentials` is
+/// not configured). The request body is never logged, echoed, or formatted into
+/// an error message: serde's own errors can quote input, so this handler maps
+/// them to fixed text by [`serde_json::Error::classify`].
+async fn handle_put_tenant_credential(
     control_plane: &ControlPlane,
     config: &WorkerConfigHandle,
+    probe: Option<&dyn TenantCredentialProbe>,
     tenant: &str,
     provider: &str,
     body: Bytes,
 ) -> Response<Full<Bytes>> {
-    let response = put_tenant_credential_inner(control_plane, config, tenant, provider, &body);
+    let response =
+        put_tenant_credential_inner(control_plane, config, probe, tenant, provider, &body).await;
     wipe_body(body);
     response
 }
 
-fn put_tenant_credential_inner(
+async fn put_tenant_credential_inner(
     control_plane: &ControlPlane,
     config: &WorkerConfigHandle,
+    probe: Option<&dyn TenantCredentialProbe>,
     tenant: &str,
     provider: &str,
     body: &[u8],
@@ -1761,7 +1809,7 @@ fn put_tenant_credential_inner(
         Err(err) => {
             let message = match err.classify() {
                 serde_json::error::Category::Data => {
-                    "body must be {\"schema_version\":1,\"api_key\":\"...\"} with no other fields"
+                    "body must be {\"schema_version\":1,\"api_key\":\"...\",\"verify\":true} with no other fields; verify is optional"
                 }
                 _ => "request body is not valid JSON",
             };
@@ -1809,25 +1857,118 @@ fn put_tenant_credential_inner(
     }
 
     // A credential no cluster slot would ever use is a typo the operator wants
-    // to hear about now, not an inert row.
-    let snapshot = config.load();
-    let enabled = snapshot.clusters.values().any(|cluster| {
-        cluster
-            .provider_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.tenant_credential.as_ref())
-            .is_some_and(|slot| slot.provider == provider)
-    });
-    if !enabled {
-        return error_json(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "provider_not_enabled",
-            "no configured cluster accepts tenant credentials for this provider",
-        );
-    }
+    // to hear about now, not an inert row. The snapshot guard is dropped before
+    // any `.await` below.
+    let verify_target = {
+        let snapshot = config.load();
+        let enabled = snapshot.clusters.values().any(|cluster| {
+            cluster
+                .provider_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.tenant_credential.as_ref())
+                .is_some_and(|slot| slot.provider == provider)
+        });
+        if !enabled {
+            return error_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "provider_not_enabled",
+                "no configured cluster accepts tenant credentials for this provider",
+            );
+        }
+        // The probe goes to the first slot cluster, by name, that has a
+        // `verify_path`. `min_by` over the names keeps that choice independent
+        // of the map's iteration order.
+        snapshot
+            .clusters
+            .iter()
+            .filter_map(|(name, cluster)| {
+                let slot = cluster
+                    .provider_runtime
+                    .as_ref()?
+                    .tenant_credential
+                    .as_ref()?;
+                (slot.provider == provider && slot.verify_path.is_some())
+                    .then(|| (name.to_string(), slot.clone()))
+            })
+            .min_by(|a, b| a.0.cmp(&b.0))
+    };
 
-    // The save-time verification probe is deferred (ADR-0007 decision 9).
-    match control_plane.store_tenant_secret(&tenant_id, provider, &request.api_key, false) {
+    // ADR-0007 decision 10: a key is stored as verified only after a probe
+    // got a 2xx from the provider. Every failure path returns before the store.
+    let verified = if request.verify {
+        let (Some(probe), Some((cluster, slot))) = (probe, verify_target) else {
+            return error_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "credential_verification_not_configured",
+                "no provider cluster has a verify_path for this provider, or the credential probe is not wired; pass \"verify\": false to store the key unverified",
+            );
+        };
+        // The probe owns its secret, and the store still needs the key, so
+        // this is the one extra plaintext copy the save path makes. Both
+        // copies are zeroize-on-drop.
+        let probe_request = CredentialProbeRequest {
+            cluster: cluster.clone(),
+            slot,
+            secret: TenantSecret::new(key.to_owned()),
+        };
+        match probe.probe(probe_request).await {
+            CredentialProbeOutcome::Status(status) if status.is_success() => true,
+            CredentialProbeOutcome::Status(status)
+                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN =>
+            {
+                tracing::info!(
+                    endpoint = "/tenants/{id}/provider_credentials/{provider}",
+                    tenant,
+                    provider,
+                    cluster = %cluster,
+                    upstream_status = status.as_u16(),
+                    "admin: provider rejected a tenant credential at save time"
+                );
+                return error_json_with_upstream(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "credential_rejected",
+                    "the provider rejected this API key",
+                    status,
+                );
+            }
+            CredentialProbeOutcome::Status(status) => {
+                return error_json_with_upstream(
+                    StatusCode::BAD_GATEWAY,
+                    "credential_verification_unavailable",
+                    "the provider answered the verification probe with an unexpected status",
+                    status,
+                );
+            }
+            CredentialProbeOutcome::TimedOut => {
+                return error_json(
+                    StatusCode::BAD_GATEWAY,
+                    "credential_verification_unavailable",
+                    "the provider did not answer the verification probe in time",
+                );
+            }
+            CredentialProbeOutcome::Unreachable(reason) => {
+                // The reason names the failure only (see the probe trait's
+                // doc), so it is safe for the log but not for the reply.
+                tracing::warn!(
+                    endpoint = "/tenants/{id}/provider_credentials/{provider}",
+                    tenant,
+                    provider,
+                    cluster = %cluster,
+                    reason = %reason,
+                    "admin: could not reach the provider to verify a tenant credential"
+                );
+                return error_json(
+                    StatusCode::BAD_GATEWAY,
+                    "credential_verification_unavailable",
+                    "the provider could not be reached to verify this API key",
+                );
+            }
+        }
+    } else {
+        false
+    };
+
+    match control_plane.store_tenant_secret(&tenant_id, provider, &request.api_key, verified) {
         Ok(metadata) => {
             tracing::info!(
                 endpoint = "/tenants/{id}/provider_credentials/{provider}",
