@@ -976,6 +976,132 @@ async fn a_tenant_policy_write_changes_model_authorization_live() {
 /// MICRO-DOLLARS (`spend_limit_filter`'s convention, not a token/request
 /// count).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tenant_budget_aggregates_multiple_keys_and_enforces_both_scopes() {
+    let (listener, admin, upstream, scratch, proxy) =
+        spawn_suite("admin-tenant-budget", Some(ADMIN_TOKEN), false).await;
+    assert_eq!(
+        admin_request_retrying(
+            admin,
+            "POST",
+            "/tenants",
+            Some(ADMIN_TOKEN),
+            &json!({"tenant":"aggregate-tenant"})
+        )
+        .await
+        .status,
+        201
+    );
+    let mut credentials = Vec::new();
+    for id in ["aggregate-a", "aggregate-b"] {
+        let minted = admin_request_retrying(
+            admin,
+            "POST",
+            "/keys",
+            Some(ADMIN_TOKEN),
+            &json!({"tenant":"aggregate-tenant","key_id":id}),
+        )
+        .await;
+        assert_eq!(minted.status, 201);
+        credentials.push(format!(
+            "Bearer {}",
+            parse_json(&minted.body)["key"].as_str().unwrap()
+        ));
+        assert_eq!(
+            admin_request_retrying(
+                admin,
+                "PUT",
+                &format!("/keys/{id}/budget"),
+                Some(ADMIN_TOKEN),
+                &json!({"budget":{"max_usd":"1.50","period":"monthly"}})
+            )
+            .await
+            .status,
+            204
+        );
+    }
+    assert_eq!(
+        admin_request_retrying(
+            admin,
+            "PUT",
+            "/tenants/aggregate-tenant/budget",
+            Some(ADMIN_TOKEN),
+            &json!({"budget":{"max_usd":"1.50","period":"daily"}})
+        )
+        .await
+        .status,
+        204
+    );
+    for credential in &credentials {
+        assert_eq!(
+            send_chat_request(
+                listener,
+                &[("authorization", credential.as_str())],
+                MODEL_ALLOWED
+            )
+            .await
+            .status,
+            200
+        );
+    }
+    assert_eq!(
+        send_chat_request(
+            listener,
+            &[("authorization", credentials[0].as_str())],
+            MODEL_ALLOWED
+        )
+        .await
+        .status,
+        429
+    );
+    for (path, expected) in [
+        ("/tenants/aggregate-tenant/spend", 2_000_000),
+        ("/keys/aggregate-a/spend", 1_000_000),
+        ("/keys/aggregate-b/spend", 1_000_000),
+    ] {
+        let report =
+            admin_request_retrying(admin, "GET", path, Some(ADMIN_TOKEN), &json!({})).await;
+        assert_eq!(report.status, 200);
+        assert_eq!(parse_json(&report.body)["spend_micro_usd"], expected);
+    }
+    assert_eq!(
+        admin_request_retrying(
+            admin,
+            "PUT",
+            "/tenants/aggregate-tenant/budget",
+            Some(ADMIN_TOKEN),
+            &json!({"budget":null})
+        )
+        .await
+        .status,
+        204
+    );
+    assert_eq!(
+        send_chat_request(
+            listener,
+            &[("authorization", credentials[0].as_str())],
+            MODEL_ALLOWED
+        )
+        .await
+        .status,
+        200
+    );
+    assert_eq!(
+        send_chat_request(
+            listener,
+            &[("authorization", credentials[0].as_str())],
+            MODEL_ALLOWED
+        )
+        .await
+        .status,
+        429,
+        "clearing tenant ceiling must not clear key spend or ceiling"
+    );
+    drop(proxy);
+    drop(scratch);
+    drop(upstream);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
     let (listener_addr, admin_addr, upstream, scratch, proxy) =
         spawn_suite("admin-budget", Some(ADMIN_TOKEN), false).await;

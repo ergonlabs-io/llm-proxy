@@ -23,26 +23,36 @@ export function Keys({ conn }: { conn: AdminConn }) {
   const [spendId, setSpendId] = useState('')
   const [spendRes, setSpendRes] = useState<ApiResult | null>(null)
 
+  function dismissKey() {
+    setShowKey(false)
+    setMintedKey(null)
+    setCopied(false)
+  }
+
   async function mint() {
     if (!tenant.trim() || !keyId.trim()) return
+    dismissKey()
     const r = await apiFetch(conn, '/keys', {
       method: 'POST',
       auth: true,
       scopedWrite: true,
       body: { tenant: tenant.trim(), key_id: keyId.trim() },
     })
-    setMintRes(r)
-    if (r.ok) {
-      try {
-        const parsed = JSON.parse(r.bodyText) as { key?: string }
-        if (parsed.key) {
-          setMintedKey(parsed.key)
-          setShowKey(true)
-          setCopied(false)
-        }
-      } catch {
-        setMintedKey(null)
+    if (!r.ok) {
+      setMintRes(r)
+      return
+    }
+    try {
+      const parsed = JSON.parse(r.bodyText) as { key?: string; [field: string]: unknown }
+      const { key, ...identity } = parsed
+      // Keep the secret only in the dialog, never in the persistent result panel.
+      setMintRes({ ...r, bodyText: JSON.stringify(identity) })
+      if (typeof key === 'string' && key) {
+        setMintedKey(key)
+        setShowKey(true)
       }
+    } catch {
+      setMintRes({ ...r, bodyText: 'Invalid key mint response' })
     }
   }
 
@@ -78,6 +88,7 @@ export function Keys({ conn }: { conn: AdminConn }) {
     setSpendRes(
       await apiFetch(conn, `/keys/${encodeURIComponent(spendId.trim())}/spend`, {
         auth: true,
+        scopedWrite: true,
       }),
     )
   }
@@ -156,7 +167,7 @@ export function Keys({ conn }: { conn: AdminConn }) {
           </CardContent>
         </Card>
       </div>
-      <Dialog open={showKey} onClose={() => setShowKey(false)} title="Key minted — copy it now">
+      <Dialog open={showKey} onClose={dismissKey} title="Key minted — copy it now">
         <p className="mb-2 text-xs text-zinc-500">
           The plaintext key is shown once. It cannot be retrieved again.
         </p>
@@ -168,7 +179,7 @@ export function Keys({ conn }: { conn: AdminConn }) {
           </Button>
         </div>
         <div className="mt-3 text-right">
-          <Button size="sm" onClick={() => setShowKey(false)}>Done</Button>
+          <Button size="sm" onClick={dismissKey}>Done</Button>
         </div>
       </Dialog>
     </div>

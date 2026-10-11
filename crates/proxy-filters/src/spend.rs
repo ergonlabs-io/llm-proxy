@@ -1277,16 +1277,28 @@ impl SpendAccumulator {
     /// Startup prefetch: production request workers never read a store on first touch.
     /// New keys/windows begin with local state and reconcile on the next flusher tick.
     pub fn prepare_request_workers(&self, keys: &[KeyId]) -> Result<(), StoreError> {
+        self.prepare_request_subjects(keys.iter().map(key_spend_subject))
+    }
+
+    /// Load tenant aggregates at startup, before request workers become memory-only.
+    pub fn prepare_tenant_request_workers(&self, tenants: &[TenantId]) -> Result<(), StoreError> {
+        self.prepare_request_subjects(tenants.iter().cloned())
+    }
+
+    fn prepare_request_subjects(
+        &self,
+        subjects: impl IntoIterator<Item = TenantId>,
+    ) -> Result<(), StoreError> {
         let now = Utc::now();
         let mut buckets = self
             .inner
             .buckets
             .lock()
             .expect("spend accumulator mutex poisoned");
-        for key in keys {
+        for subject in subjects {
             for period in [Period::Daily, Period::Monthly] {
                 for date in [now, now + chrono::Duration::days(1)] {
-                    let row = (key_spend_subject(key), period.key_for(date));
+                    let row = (subject.clone(), period.key_for(date));
                     if let std::collections::hash_map::Entry::Vacant(entry) = buckets.entry(row) {
                         let row = entry.key();
                         let total =
@@ -2156,6 +2168,55 @@ mod tests {
         assert_eq!(
             Period::Daily.seconds_until_reset(dt(2026, 8, 31, 23, 59, 0)),
             60
+        );
+    }
+
+    #[test]
+    fn startup_prefetch_restores_separate_tenant_and_key_ledgers() {
+        let (accumulator, store) = test_accumulator(Period::Monthly);
+        let tenant = TenantId::new("tenant-a");
+        let key = KeyId::new("key-a");
+        let now = Utc::now();
+        accumulator.record(
+            &tenant,
+            now,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(3)),
+            None,
+            None,
+        );
+        accumulator.record_key(
+            &key,
+            now,
+            Period::Monthly,
+            Charge::Priced(MicroUsd::from_micros(7)),
+            None,
+            None,
+        );
+        accumulator.flush_now().unwrap();
+        let restored = SpendAccumulator::new(
+            "test-chain".to_string(),
+            store,
+            Period::Monthly,
+            "restart-node".to_string(),
+        );
+        restored
+            .prepare_tenant_request_workers(std::slice::from_ref(&tenant))
+            .unwrap();
+        restored
+            .prepare_request_workers(std::slice::from_ref(&key))
+            .unwrap();
+        assert_eq!(
+            restored.current_total(&tenant, &Period::Daily.key_for(now)),
+            3
+        );
+        assert_eq!(
+            restored.current_total_key(&key, &Period::Monthly.key_for(now)),
+            7
+        );
+        assert_eq!(
+            restored.current_total(&tenant, &Period::Monthly.key_for(now)),
+            0
         );
     }
 

@@ -87,6 +87,7 @@ export function Tenants({ conn }: { conn: AdminConn }) {
     setSpendRes(
       await apiFetch(conn, `/tenants/${encodeURIComponent(lookupId.trim())}/spend`, {
         auth: true,
+        scopedWrite: true,
       }),
     )
   }

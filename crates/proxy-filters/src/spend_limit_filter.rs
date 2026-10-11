@@ -1,5 +1,5 @@
 //! WP-50 increment 3c-iii-b / WP-64 — wires [`crate::spend`]'s price table,
-//! per-key spend accumulator, and per-key budget into a real decode/encode
+//! tenant/key spend accumulator and budgets into a real decode/encode
 //! `HttpFilter`: `llmproxy.spend_limit`. See
 //! `internal-docs/IMPLEMENTATION_PLAN.md`'s "3c-iii" section, normative
 //! here.
@@ -10,7 +10,7 @@
 //! A request's cost is unknown until its response finishes (usage arrives at
 //! the END of the stream, never before), so this filter -- exactly like
 //! [`crate::token_limit_filter`] -- checks on the **decode** path (before a
-//! request is sent upstream, against whatever the key's live spend
+//! request is sent upstream, against whatever each scope's live spend
 //! already is) and records on the **encode** path, at response end. The
 //! cost of every request admitted before prior responses finish can exceed
 //! the ceiling. There are no spend reservations: overspend includes all admitted
@@ -37,7 +37,11 @@
 //! `proxy_config::lower::check_lane_h_filter_order` enforces both at config
 //! load; this comment states the reasoning, not the guard.
 //!
-//! # Missing key identity is denied when any key budget is configured
+//! Each completed priced or unpriced request is attributed to both tenant and
+//! key. Each scope uses its own configured period, or the reporting default.
+//! Either configured ceiling can refuse admission; both ledgers remain separate.
+//!
+//! # Missing identity is denied when a spend budget is configured
 //!
 //! Two DIFFERENT "nothing to enforce" cases, both admitting, for different
 //! reasons:
@@ -46,11 +50,11 @@
 //!   authenticator, and duplicating `llmproxy.auth`'s own fail-closed 401
 //!   here would only produce a second, confusingly different refusal reason
 //!   for the same underlying fact ("this request was never authenticated").
-//!   With configured key budgets this returns 403, preventing a JWT or missing
-//!   key identity from bypassing policy. With no key budgets, it admits without
+//!   With configured tenant or key budgets this returns 403, preventing a JWT or
+//!   missing key identity from bypassing policy. With no budgets, it admits without
 //!   recording unattributable spend.
-//! - **The authenticated key has no configured [`crate::spend::TenantBudget`]**
-//!   (absent from the snapshot's `key_budgets`). Mirrors
+//! - **Neither the authenticated key nor its tenant has a configured
+//!   [`crate::spend::TenantBudget`].** Mirrors
 //!   [`crate::model_authz_filter`]'s and
 //!   [`crate::spend::TenantBudget`]'s own "`None` means unlimited, and that
 //!   is the deliberate default" reasoning: a budget is an opt-in ceiling, not
@@ -127,7 +131,7 @@ use proxy_http::filter::{
 };
 use proxy_observability::ResponseFlag;
 
-use crate::auth::KeyId;
+use crate::auth::{KeyId, TenantId};
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::spend::{
@@ -476,6 +480,16 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                     .into_iter()
                     .map(|key| key.key_id)
                     .collect();
+                let snapshot = control_plane.handle().load_full();
+                let tenants: Vec<_> = snapshot.key_tenants.values().cloned().collect();
+                accumulator
+                    .prepare_tenant_request_workers(&tenants)
+                    .map_err(|err| {
+                        invalid(
+                            "typed_config",
+                            format!("tenant spend startup prefetch failed: {err}"),
+                        )
+                    })?;
                 accumulator.prepare_request_workers(&keys).map_err(|err| {
                     invalid(
                         "typed_config",
@@ -560,6 +574,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             snapshot: Arc::clone(&self.snapshot),
             key_id: None,
+            tenant: None,
             period: None,
             budget_applies: false,
             recorded: false,
@@ -627,16 +642,11 @@ struct SpendLimitFilterInstance {
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
-    /// Set in `decode_headers` whenever this stream has an authenticated
-    /// tenant, regardless of whether that tenant has a budget -- `None`
-    /// means "nothing to record" (see the module doc's "no tenant -> admit"
-    /// case).
+    /// Authenticated key and its reporting period, captured at admission.
     key_id: Option<KeyId>,
-    /// The period this tenant's spend accrues into for THIS request -- the
-    /// tenant's own `TenantBudget::period` if one is configured, else
-    /// `self.accumulator.default_period()`. Set alongside `tenant`; `None`
-    /// exactly when `tenant` is `None`.
     period: Option<Period>,
+    /// Tenant aggregation uses its own budget period independently of the key.
+    tenant: Option<(TenantId, Period)>,
     /// Whether a budget actually applied to this request -- distinguishes
     /// "no usage at encode time on a budgeted tenant" (warn: see the module
     /// doc) from "no usage on an unbudgeted tenant" (silent: nothing was
@@ -666,7 +676,7 @@ impl SpendLimitFilterInstance {
         };
         let period = self
             .period
-            .expect("period is always set alongside tenant in decode_headers");
+            .expect("period is always set alongside key in decode_headers");
 
         // Rust note: read every field out of the `RefMut` guard and drop it
         // before calling `self.accumulator.record` below -- `stream_info()`
@@ -708,14 +718,25 @@ impl SpendLimitFilterInstance {
                 .cost_of(cluster.as_deref(), model.as_deref(), &usage)
         });
 
+        let now = Utc::now();
         self.accumulator.record_key(
             &key_id,
-            Utc::now(),
+            now,
             period,
             charge,
             cluster.as_deref(),
-            model.as_deref(),
+            selected_model.as_deref().or(model.as_deref()),
         );
+        if let Some((tenant, tenant_period)) = &self.tenant {
+            self.accumulator.record(
+                tenant,
+                now,
+                *tenant_period,
+                charge,
+                cluster.as_deref(),
+                selected_model.as_deref().or(model.as_deref()),
+            );
+        }
     }
 }
 
@@ -731,15 +752,19 @@ impl HttpFilter for SpendLimitFilterInstance {
         // `Option<String>` out and letting the guard drop at the end of this
         // block keeps that rule visibly satisfied, same pattern as
         // `token_limit_filter`/`model_authz_filter`.
-        let key_id = cb.stream_info().auth.key_id.clone();
-
-        // Case: no authenticated tenant -- see the module doc's "no tenant ->
-        // admit" section. This filter is not an authenticator.
+        let (key_id, tenant) = {
+            let info = cb.stream_info();
+            (info.auth.key_id.clone(), info.auth.tenant.clone())
+        };
+        let snapshot = self.snapshot.load();
+        let tenant_budgets_configured = (key_id.is_none() || tenant.is_none())
+            && snapshot.policies.values().any(|p| p.budget.is_some());
         let Some(key_id) = key_id else {
             self.key_id = None;
             self.period = None;
+            self.tenant = None;
             self.budget_applies = false;
-            if !self.snapshot.load().key_budgets.is_empty() {
+            if !snapshot.key_budgets.is_empty() || tenant_budgets_configured {
                 cb.send_local_reply(
                     StatusCode::FORBIDDEN,
                     "authenticated key identity required for spend policy",
@@ -750,85 +775,118 @@ impl HttpFilter for SpendLimitFilterInstance {
             }
             return FilterHeadersStatus::Continue;
         };
+        if tenant.is_none() && tenant_budgets_configured {
+            cb.send_local_reply(
+                StatusCode::FORBIDDEN,
+                "authenticated tenant identity required for spend policy",
+                None,
+                "spend_identity_missing",
+            );
+            return FilterHeadersStatus::StopIteration;
+        }
 
         let key_id = KeyId::new(key_id);
-        let budget = self.snapshot.load().key_budgets.get(&key_id).copied();
-
+        let tenant = tenant.map(TenantId::new);
+        let key_budget = snapshot.key_budgets.get(&key_id).copied();
+        let tenant_budget = tenant
+            .as_ref()
+            .and_then(|id| snapshot.policies.get(id.as_str()))
+            .and_then(|p| p.budget);
+        let default_period = self.accumulator.default_period();
         self.key_id = Some(key_id.clone());
-        self.budget_applies = budget.is_some();
-        let period = budget
-            .map(|b| b.period)
-            .unwrap_or_else(|| self.accumulator.default_period());
-        self.period = Some(period);
-
-        // Case: no configured budget -- unlimited. Spend is still tracked
-        // (via `record_if_present`, at encode time) under
-        // `self.accumulator.default_period()`; nothing to check here.
-        let Some(budget) = budget else {
-            return FilterHeadersStatus::Continue;
-        };
-
+        self.period = Some(key_budget.map(|b| b.period).unwrap_or(default_period));
+        self.tenant = tenant.clone().map(|id| {
+            (
+                id,
+                tenant_budget.map(|b| b.period).unwrap_or(default_period),
+            )
+        });
+        self.budget_applies = key_budget.is_some() || tenant_budget.is_some();
         let now = Utc::now();
-        let period_key = period.key_for(now);
-        let current_micros = self.accumulator.current_total_key(&key_id, &period_key);
-        let limit_micros = budget.max_micros.as_micros();
+        let ceilings = [
+            key_budget.map(|budget| {
+                (
+                    budget,
+                    self.accumulator
+                        .current_total_key(&key_id, &budget.period.key_for(now)),
+                )
+            }),
+            tenant_budget.map(|budget| {
+                (
+                    budget,
+                    self.accumulator.current_total(
+                        tenant
+                            .as_ref()
+                            .expect("tenant budget requires tenant identity"),
+                        &budget.period.key_for(now),
+                    ),
+                )
+            }),
+        ];
+        for (budget, current_micros) in ceilings.into_iter().flatten() {
+            let period = budget.period;
+            let limit_micros = budget.max_micros.as_micros();
 
-        // At or over the ceiling denies -- see the module doc's "A
-        // configured ceiling of exactly zero denies immediately" section for
-        // why this is `>=`, not `>`.
-        if current_micros >= limit_micros {
-            cb.stream_info()
-                .set_response_flag(ResponseFlag::RateLimited);
+            // At or over the ceiling denies -- see the module doc's "A
+            // configured ceiling of exactly zero denies immediately" section for
+            // why this is `>=`, not `>`.
+            if current_micros >= limit_micros {
+                cb.stream_info()
+                    .set_response_flag(ResponseFlag::RateLimited);
 
-            let remaining_micros = limit_micros.saturating_sub(current_micros);
-            let reset_secs = period.seconds_until_reset(now);
-            // Mirrors `token_limit_filter`'s convention: `retry-after` equals
-            // `x-ratelimit-reset` here (there is only one reset event -- the
-            // period boundary -- for this filter to name).
-            let retry_secs = reset_secs;
+                let remaining_micros = limit_micros.saturating_sub(current_micros);
+                let reset_secs = period.seconds_until_reset(now);
+                // Mirrors `token_limit_filter`'s convention: `retry-after` equals
+                // `x-ratelimit-reset` here (there is only one reset event -- the
+                // period boundary -- for this filter to name).
+                let retry_secs = reset_secs;
 
-            cb.send_local_reply(
-                StatusCode::TOO_MANY_REQUESTS,
-                "spend budget exceeded",
-                Some(Box::new(move |headers: &mut http::HeaderMap| {
-                    // Rust note: `HeaderValue::from_str` on formatted decimal
-                    // strings never fails (ASCII digits are always a valid
-                    // header value), so these unwraps are total -- same as
-                    // `token_limit_filter`'s identical headers.
-                    //
-                    // VALUES ARE IN MICRO-DOLLARS (1e-6 USD), NOT REQUEST
-                    // COUNTS -- unlike `token_limit_filter`'s identically
-                    // named headers, which count tokens. These header names
-                    // are a convention borrowed from request-count rate
-                    // limiting; nothing about the name says "money", so an
-                    // integrator reading a raw `x-ratelimit-remaining` value
-                    // here without reading this filter's docs would
-                    // reasonably misinterpret it as a request or token count.
-                    headers.insert(
-                        "x-ratelimit-limit",
-                        http::HeaderValue::from_str(&limit_micros.to_string()).unwrap(),
-                    );
-                    headers.insert(
-                        "x-ratelimit-remaining",
-                        http::HeaderValue::from_str(&remaining_micros.to_string()).unwrap(),
-                    );
-                    headers.insert(
-                        "x-ratelimit-reset",
-                        http::HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
-                    );
-                    headers.insert(
-                        "retry-after",
-                        http::HeaderValue::from_str(&retry_secs.to_string()).unwrap(),
-                    );
-                })),
-                DENY_DETAILS,
-            );
-            // Rust note: the returned status is irrelevant here --
-            // `drive_decode` checks `ctx.local_reply.is_some()` right after
-            // this callback returns and stops the chain unconditionally when
-            // it's set, regardless of what status this function returns (see
-            // `filter_manager.rs`), same as `token_limit_filter`/
-            // `model_authz_filter`.
+                cb.send_local_reply(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "spend budget exceeded",
+                    Some(Box::new(move |headers: &mut http::HeaderMap| {
+                        // Rust note: `HeaderValue::from_str` on formatted decimal
+                        // strings never fails (ASCII digits are always a valid
+                        // header value), so these unwraps are total -- same as
+                        // `token_limit_filter`'s identical headers.
+                        //
+                        // VALUES ARE IN MICRO-DOLLARS (1e-6 USD), NOT REQUEST
+                        // COUNTS -- unlike `token_limit_filter`'s identically
+                        // named headers, which count tokens. These header names
+                        // are a convention borrowed from request-count rate
+                        // limiting; nothing about the name says "money", so an
+                        // integrator reading a raw `x-ratelimit-remaining` value
+                        // here without reading this filter's docs would
+                        // reasonably misinterpret it as a request or token count.
+                        headers.insert(
+                            "x-ratelimit-limit",
+                            http::HeaderValue::from_str(&limit_micros.to_string()).unwrap(),
+                        );
+                        headers.insert(
+                            "x-ratelimit-remaining",
+                            http::HeaderValue::from_str(&remaining_micros.to_string()).unwrap(),
+                        );
+                        headers.insert(
+                            "x-ratelimit-reset",
+                            http::HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
+                        );
+                        headers.insert(
+                            "retry-after",
+                            http::HeaderValue::from_str(&retry_secs.to_string()).unwrap(),
+                        );
+                    })),
+                    DENY_DETAILS,
+                );
+                // Rust note: the returned status is irrelevant here --
+                // `drive_decode` checks `ctx.local_reply.is_some()` right after
+                // this callback returns and stops the chain unconditionally when
+                // it's set, regardless of what status this function returns (see
+                // `filter_manager.rs`), same as `token_limit_filter`/
+                // `model_authz_filter`.
+                return FilterHeadersStatus::Continue;
+            }
+        }
+        if !self.budget_applies {
             return FilterHeadersStatus::Continue;
         }
 
@@ -1414,6 +1472,7 @@ mod tests {
                 pricing_snapshot: self.pricing_registry.snapshot_context(),
                 snapshot: Arc::clone(&self.snapshot),
                 key_id: None,
+                tenant: None,
                 period: None,
                 budget_applies: false,
                 recorded: false,
@@ -1740,6 +1799,161 @@ mod tests {
                 .0,
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    #[test]
+    fn tenant_budget_aggregates_keys_with_independent_periods() {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                max_micros: MicroUsd::from_micros(10),
+                period: Period::Monthly,
+            },
+        )]);
+        let tenant = TenantId::new("tenant-a");
+        cp.set_budget(
+            &tenant,
+            Some(&TenantBudget {
+                max_micros: MicroUsd::from_micros(3),
+                period: Period::Daily,
+            }),
+        )
+        .unwrap();
+        let second = KeyId::new("second-key");
+        cp.mint_key(&tenant, &second).unwrap();
+        let mut table = PriceTable::new();
+        table.insert(
+            "cluster-a",
+            "m",
+            ModelPrices {
+                input_per_million: MicroUsd::from_micros(1_000_000),
+                ..Default::default()
+            },
+        );
+        let harness = filter_with(&cp, table, Period::Monthly);
+        assert!(
+            run_request(&harness, "tenant-a", Some(("cluster-a", "m")), Some(2))
+                .0
+                .is_none()
+        );
+        let mut filter = harness.new_instance();
+        let mut cb = TestCallbacks::new();
+        cb.set_tenant("tenant-a");
+        cb.stream_info.borrow_mut().auth.key_id = Some(second.as_str().to_string());
+        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        assert!(cb.local_reply.is_none());
+        cb.set_upstream("cluster-a", "m");
+        cb.set_usage(usage(2));
+        filter.encode_data(&mut cb, &mut Bytes::new(), true);
+        filter.encode_trailers(&mut cb, &mut ResponseTrailers(HeaderMap::new()));
+        let now = Utc::now();
+        assert_eq!(
+            harness
+                .accumulator
+                .current_total(&tenant, &Period::Daily.key_for(now)),
+            4
+        );
+        assert_eq!(
+            harness
+                .accumulator
+                .current_total_key(&second, &Period::Monthly.key_for(now)),
+            2
+        );
+        assert_eq!(
+            harness
+                .accumulator
+                .current_total(&tenant, &Period::Monthly.key_for(now)),
+            0
+        );
+        let (reply, _) = run_request(&harness, "tenant-a", None, None);
+        let (status, headers) = reply.unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers["x-ratelimit-limit"], "3");
+        // Clearing the tenant ceiling must leave the independent key ledger intact.
+        cp.set_budget(&tenant, None).unwrap();
+        cp.set_key_budget(
+            &test_key_id("tenant-a"),
+            Some(&TenantBudget {
+                max_micros: MicroUsd::from_micros(2),
+                period: Period::Monthly,
+            }),
+        )
+        .unwrap();
+        let (reply, _) = run_request(&harness, "tenant-a", None, None);
+        assert_eq!(reply.unwrap().1["x-ratelimit-limit"], "2");
+    }
+
+    #[test]
+    fn tenant_reports_track_priced_and_unpriced_requests_without_a_budget() {
+        let cp = control_plane_with(&[]);
+        let mut table = PriceTable::new();
+        table.insert(
+            "cluster-a",
+            "m",
+            ModelPrices {
+                input_per_million: MicroUsd::from_micros(1_000_000),
+                ..Default::default()
+            },
+        );
+        let harness = filter_with(&cp, table, Period::Monthly);
+        run_request(&harness, "tenant-a", Some(("cluster-a", "m")), Some(2));
+        run_request(&harness, "tenant-a", Some(("unknown", "m")), Some(3));
+        let period = Period::Monthly.key_for_now();
+        let tenant = harness
+            .accumulator
+            .report(&TenantId::new("tenant-a"), &period);
+        let key = harness
+            .accumulator
+            .report_key(&test_key_id("tenant-a"), &period);
+        assert_eq!(tenant.total_micros, key.total_micros);
+        assert_eq!(tenant.total_micros, 2);
+        assert_eq!(tenant.unpriced_requests, 1);
+        assert_eq!(tenant.unpriced_pairs, key.unpriced_pairs);
+    }
+
+    #[test]
+    fn tenant_zero_budget_applies_without_any_key_budget() {
+        let cp = control_plane_with(&[]);
+        cp.set_budget(
+            &TenantId::new("tenant-a"),
+            Some(&TenantBudget {
+                max_micros: MicroUsd::from_micros(0),
+                period: Period::Daily,
+            }),
+        )
+        .unwrap();
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let (reply, _) = run_request(&harness, "tenant-a", None, None);
+        assert_eq!(reply.unwrap().0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(run_request(&harness, "other-tenant", None, None)
+            .0
+            .is_none());
+    }
+
+    #[test]
+    fn missing_identity_cannot_bypass_a_tenant_budget() {
+        let cp = control_plane_with(&[]);
+        cp.set_budget(
+            &TenantId::new("tenant-a"),
+            Some(&TenantBudget {
+                max_micros: MicroUsd::from_micros(3),
+                period: Period::Daily,
+            }),
+        )
+        .unwrap();
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        for missing_key in [false, true] {
+            let mut filter = harness.new_instance();
+            let mut cb = TestCallbacks::new();
+            cb.set_tenant("tenant-a");
+            if missing_key {
+                cb.stream_info.borrow_mut().auth.key_id = None;
+            } else {
+                cb.stream_info.borrow_mut().auth.tenant = None;
+            }
+            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            assert_eq!(cb.local_reply.unwrap().0, StatusCode::FORBIDDEN);
+        }
     }
 
     #[test]
