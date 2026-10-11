@@ -182,7 +182,8 @@
     <button class="chip" data-ms="v0.2.0">v0.2.0 · prod<span class="n" id="n-v020"></span></button>
     <button class="chip" data-ms="v0.3.0">v0.3.0 · shipped<span class="n" id="n-v030"></span></button>
     <button class="chip" data-ms="v0.3.2">v0.3.2 · xDS gate<span class="n" id="n-v032"></span></button>
-    <button class="chip" data-ms="v0.3.3">v0.3.3 · hardening<span class="n" id="n-v033"></span></button>
+    <button class="chip" data-ms="v0.3.3">v0.3.3 · tenant creds<span class="n" id="n-v033"></span></button>
+    <button class="chip" data-ms="v0.3.4">v0.3.4 · hardening<span class="n" id="n-v034"></span></button>
     <button class="chip" data-ms="v0.4.0">v0.4.0 · parity<span class="n" id="n-v040"></span></button>
     <button class="chip" data-ms="v1.0.0">v1.0.0<span class="n" id="n-v100"></span></button>
     <span class="sep"></span>
@@ -205,11 +206,13 @@
     was still open when they were cut, so it moved to v0.3.2 — same gate text, still RED.</b>
     v0.3.2 carries the open gate work plus WP-69 (H1 makes the clause "ACKs and NACKs correctly
     per S8" false today) and the five live defects WP-66, WP-67, WP-68, WP-70, WP-74, plus WP-25
-    (health-check toggles and <code>/drain_listeners</code>, to land together with WP-67; WP-67 is
-    ready and does not depend on it). v0.3.3 "hardening" holds WP-71-73 and WP-75-84; its gate is
-    that every C/H finding in <code>architecture.md</code> section 11 is closed or has a recorded
-    owner decision. v0.4.0 is back to Envoy-parity scope only. None of the WP-66-84 work is
-    started.
+    (health-check toggles and <code>/drain_listeners</code>, to land together with WP-67; WP-67 does
+    not depend on it). v0.3.3 "tenant creds" (WP-85, swapped ahead of hardening by owner decision
+    2026-10-11) is DONE (c48d86c adds the failover negative assertion): its gate is met and it is ready to
+    tag, not tagged. v0.3.4
+    "hardening" holds WP-71-73, WP-75-84 and WP-86 (done); its gate is that every C/H finding in
+    <code>architecture.md</code> section 11 is closed or has a recorded owner decision. Every
+    WP-71-84 item is unstarted. v0.4.0 is back to Envoy-parity scope only.
     <b>Now — v0.3.2 "dynamic configuration" (formerly v0.3.0): be deployable the way Envoy is deployed.</b> Current
     since v0.3.1 shipped. Everything below about this gate was written while it was labelled
     v0.3.0. <b>WP-20 is DONE, 2026-09-05/06 — all six
@@ -596,7 +599,7 @@
     document.getElementById("n-" + pr).textContent = wps.filter(w => w.prio === pr).length;
   }
   for (const [ms, id] of [["v0.0.1", "n-v001"], ["v0.1.0", "n-v010"], ["v0.2.0", "n-v020"],
-                          ["v0.3.0", "n-v030"], ["v0.3.2", "n-v032"], ["v0.3.3", "n-v033"], ["v0.4.0", "n-v040"], ["v1.0.0", "n-v100"]]) {
+                          ["v0.3.0", "n-v030"], ["v0.3.2", "n-v032"], ["v0.3.3", "n-v033"], ["v0.3.4", "n-v034"], ["v0.4.0", "n-v040"], ["v1.0.0", "n-v100"]]) {
     document.getElementById(id).textContent = wps.filter(w => w.ms === ms).length;
   }
 
