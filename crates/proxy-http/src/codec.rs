@@ -20,6 +20,7 @@
 //! standalone, over an in-memory pipe, in `tests/http1_codec.rs` and
 //! `tests/http2_codec.rs`.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::rc::Rc;
 use std::time::Duration;
@@ -30,6 +31,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Notify;
 
 use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{
@@ -97,9 +99,14 @@ where
     // rather than consuming it -- it's called once per request on this
     // connection, an unbounded number of times. `downstream` is `Copy`, so
     // each invocation gets its own duplicate rather than a shared borrow.
+    let tunnels = UpgradeTunnels::default();
+    let service_tunnels = tunnels.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let handler = handler.clone();
-        async move { Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream).await) }
+        let tunnels = service_tunnels.clone();
+        async move {
+            Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream, &tunnels).await)
+        }
     });
 
     let mut builder = hyper::server::conn::http1::Builder::new();
@@ -124,20 +131,26 @@ where
     tokio::pin!(conn);
     tokio::pin!(shutdown);
 
-    tokio::select! {
-        result = &mut conn => {
-            return result.map_err(CodecError::Connection);
-        }
+    let result = tokio::select! {
+        result = &mut conn => result,
         _ = &mut shutdown => {
             conn.as_mut().graceful_shutdown();
+            // `graceful_shutdown` only *requests* the shutdown; the
+            // connection must keep being polled to actually drain the
+            // in-flight request (if any) and then finish. Spike finding (d):
+            // after this, hyper serves out anything already in flight, then
+            // closes without accepting a next request.
+            conn.as_mut().await
         }
-    }
+    };
 
-    // `graceful_shutdown` only *requests* the shutdown; the connection must
-    // keep being polled to actually drain the in-flight request (if any) and
-    // then finish. Spike finding (d): after this, hyper serves out anything
-    // already in flight, then closes without accepting a next request.
-    conn.await.map_err(CodecError::Connection)
+    // An upgrade makes `conn` resolve as soon as hyper hands the raw IO to
+    // the tunnel task, while that tunnel is still live. The caller's
+    // connection accounting (proxy-core's drain registry) ends when this
+    // function returns, and envoy-semantics.md S10.5 counts upgraded streams
+    // as active for drain, so return only once every tunnel has closed.
+    tunnels.wait_idle().await;
+    result.map_err(CodecError::Connection)
 }
 
 /// Serve one accepted downstream connection as HTTP/2 until the peer closes
@@ -186,9 +199,14 @@ where
     // Rust note: same shape as `serve_http1`'s `service` closure -- see its
     // comment for why `.clone()`-ing the `Rc` (not moving `handler`) is
     // correct here, once per stream, for an unbounded number of streams.
+    let tunnels = UpgradeTunnels::default();
+    let service_tunnels = tunnels.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let handler = handler.clone();
-        async move { Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream).await) }
+        let tunnels = service_tunnels.clone();
+        async move {
+            Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream, &tunnels).await)
+        }
     });
 
     let mut builder = hyper::server::conn::http2::Builder::new(LocalExec);
@@ -210,16 +228,19 @@ where
     tokio::pin!(conn);
     tokio::pin!(shutdown);
 
-    tokio::select! {
-        result = &mut conn => {
-            return result.map_err(CodecError::Connection);
-        }
+    let result = tokio::select! {
+        result = &mut conn => result,
         _ = &mut shutdown => {
             conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
         }
-    }
+    };
 
-    conn.await.map_err(CodecError::Connection)
+    // Same drain contract as `serve_http1`'s tail. An h2 tunnel's bytes ride
+    // this connection, so it normally ends no later than `conn`; waiting
+    // keeps "returned" meaning "no tunnel left" on both codecs.
+    tunnels.wait_idle().await;
+    result.map_err(CodecError::Connection)
 }
 
 /// Upstream (proxy-to-origin) connection-level codec failures. Distinct from
@@ -878,6 +899,7 @@ async fn serve_one(
     handler: &dyn StreamHandler,
     mut req: Request<Incoming>,
     downstream: DownstreamInfo,
+    tunnels: &UpgradeTunnels,
 ) -> Response<StreamBody> {
     // Rust note: `hyper::upgrade::on` doesn't itself *detect* an upgrade --
     // it only *removes* the `OnUpgrade` handle hyper already stashed in the
@@ -973,10 +995,64 @@ async fn serve_one(
         cb_guard,
     }) = upgrade
     {
-        tokio::task::spawn_local(bridge_upgrade(downstream, upstream, cb_guard));
+        tunnels.spawn(bridge_upgrade(downstream, upstream, cb_guard));
     }
 
     built
+}
+
+/// Upgrade tunnels one downstream connection has spawned and that are still
+/// running. `serve_http1`/`serve_http2` wait on it before returning, so a
+/// caller that holds a per-connection guard across the codec call (the
+/// listener's drain registry) keeps counting the connection while its tunnel
+/// is live.
+///
+/// Rust note: `!Send` (`Rc`/`Cell`) for the same reason as proxy-core's
+/// `ConnectionRegistry` -- one connection, one worker thread (ADR-0003).
+#[derive(Clone, Default)]
+struct UpgradeTunnels {
+    inner: Rc<UpgradeTunnelsInner>,
+}
+
+#[derive(Default)]
+struct UpgradeTunnelsInner {
+    live: Cell<usize>,
+    idle: Notify,
+}
+
+/// Decrements [`UpgradeTunnels`]' count on drop, so a tunnel task that is
+/// dropped without finishing (runtime teardown) still releases its slot.
+struct UpgradeTunnelSlot(Rc<UpgradeTunnelsInner>);
+
+impl Drop for UpgradeTunnelSlot {
+    fn drop(&mut self) {
+        let remaining = self.0.live.get() - 1;
+        self.0.live.set(remaining);
+        if remaining == 0 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl UpgradeTunnels {
+    fn spawn(&self, tunnel: impl Future<Output = ()> + 'static) {
+        self.inner.live.set(self.inner.live.get() + 1);
+        let slot = UpgradeTunnelSlot(self.inner.clone());
+        tokio::task::spawn_local(async move {
+            let _slot = slot;
+            tunnel.await;
+        });
+    }
+
+    async fn wait_idle(&self) {
+        // Rust note: same check-then-`notified()` shape as proxy-core's
+        // `ConnectionRegistry::wait_empty`, and race-free for the same
+        // reason: on a current-thread runtime no slot can drop between the
+        // check and the first poll that registers this waiter.
+        while self.inner.live.get() != 0 {
+            self.inner.idle.notified().await;
+        }
+    }
 }
 
 /// Envoy's HCM `stream_idle_timeout` default (S10) -- this is a FIXED

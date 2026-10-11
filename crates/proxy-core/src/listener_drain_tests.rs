@@ -71,8 +71,69 @@ fn reserve_port() -> u16 {
         .port()
 }
 
+/// Upstream that answers its first request with `101 Switching Protocols`,
+/// then echoes tunnel bytes until the peer closes.
+async fn spawn_upgrade_echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match socket.read(&mut byte).await {
+                Ok(1) => head.push(byte[0]),
+                _ => return,
+            }
+        }
+        let switched = socket
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await;
+        if switched.is_err() {
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if socket.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    address
+}
+
 /// One HTTP listener per entry in `ports`, all routing `/` to an upstream.
 fn snapshot_for(ports: &[u16], upstream_port: u16, version: u64) -> Arc<ConfigSnapshot> {
+    snapshot_with_hcm_extra(ports, upstream_port, version, "")
+}
+
+/// [`snapshot_for`] with WebSocket upgrades enabled on every listener.
+fn websocket_snapshot_for(ports: &[u16], upstream_port: u16, version: u64) -> Arc<ConfigSnapshot> {
+    snapshot_with_hcm_extra(
+        ports,
+        upstream_port,
+        version,
+        "upgrade_configs: [{ upgrade_type: websocket }]",
+    )
+}
+
+/// `hcm_extra` is one YAML line spliced into each HCM's `typed_config`.
+fn snapshot_with_hcm_extra(
+    ports: &[u16],
+    upstream_port: u16,
+    version: u64,
+    hcm_extra: &str,
+) -> Arc<ConfigSnapshot> {
     let listeners: String = ports
         .iter()
         .enumerate()
@@ -88,6 +149,7 @@ fn snapshot_for(ports: &[u16], upstream_port: u16, version: u64) -> Arc<ConfigSn
               typed_config:
                 '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: drain_http_{i}
+                {hcm_extra}
                 route_config:
                   name: application_routes
                   virtual_hosts:
@@ -418,6 +480,80 @@ async fn drain_worker_reports_done_when_only_an_idle_connection_remains() {
                 .expect("an idle keep-alive connection must not hold the drain open");
             assert_eq!(done, Some(crate::runtime::WorkerId(0)));
             drop(client);
+            worker.stop().await;
+        })
+        .await;
+}
+
+/// Writes `payload` into an established tunnel and reads the echo back.
+async fn echo(client: &mut TcpStream, payload: &[u8]) {
+    client.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(WAIT, client.read_exact(&mut echoed))
+        .await
+        .expect("tunnel echo must arrive")
+        .expect("tunnel must still be open");
+    assert_eq!(echoed, payload);
+}
+
+/// envoy-semantics.md S10.5: an upgraded stream counts as active for drain.
+/// Hyper resolves an upgraded connection as soon as it hands the raw IO to
+/// the tunnel task, so the drain start that gracefully shuts down HTTP
+/// connections must neither cut the tunnel nor let `drain_worker` report
+/// done while it still carries bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes() {
+    LocalSet::new()
+        .run_until(async {
+            let upstream = spawn_upgrade_echo_upstream().await;
+            let port = reserve_port();
+            let worker = start_worker(websocket_snapshot_for(&[port], upstream.port(), 1)).await;
+            let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+            tokio::task::spawn_local(crate::drain::drain_worker(
+                crate::runtime::WorkerId(0),
+                worker.drain_rx.clone(),
+                done_tx,
+                worker.registry.clone(),
+            ));
+
+            let mut client = TcpStream::connect(addr(port)).await.unwrap();
+            client
+                .write_all(
+                    b"GET /ws HTTP/1.1\r\nHost: t\r\n\
+                      Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                tokio::time::timeout(WAIT, client.read_exact(&mut byte))
+                    .await
+                    .expect("101 head must arrive")
+                    .expect("read 101 head");
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head);
+            assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+            echo(&mut client, b"before").await;
+
+            // The deadline is an hour away, so only the registry emptying can
+            // make the worker report.
+            worker.start_drain();
+            // The refusal proves this worker has observed the drain start.
+            assert_connect_refused(addr(port)).await;
+            echo(&mut client, b"during").await;
+            assert!(
+                matches!(done_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "drain_worker reported done while an upgraded tunnel was live"
+            );
+            assert_eq!(worker.registry.live(), 1, "the tunnel's connection is live");
+
+            drop(client);
+            let done = tokio::time::timeout(WAIT, done_rx.recv())
+                .await
+                .expect("drain_worker must report once the tunnel closes");
+            assert_eq!(done, Some(crate::runtime::WorkerId(0)));
             worker.stop().await;
         })
         .await;

@@ -1545,7 +1545,9 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
         Some(TerminalFilter::Http(handler)) => {
             // Held for the whole HTTP connection's lifetime -- same role as
             // `tcp_proxy`'s guard above -- so drain accounting sees this
-            // connection as live until the codec returns.
+            // connection as live until the codec returns. The codecs return
+            // only after any upgrade tunnel they spawned has closed, so this
+            // also covers upgraded streams (envoy-semantics.md S10.5).
             let _guard = registry.register();
 
             // Rust note: `serve_http1` wants an `impl Future<Output = ()>`,
