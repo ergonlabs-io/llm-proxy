@@ -144,11 +144,11 @@ Every replica needs a distinct identity, and today the only place to set one
 is the CLI flag, at process start:
 
 ```sh
-llm-proxy --mode serve --config bootstrap.yaml --service-node replica-a
+llm-proxy --mode serve -c bootstrap.yaml --service-node replica-a
 ```
 
 `--service-node` overrides the bootstrap `node.id`
-(`crates/proxy/src/main.rs`'s `effective_node`, lines 1177–1190); the
+(`crates/proxy/src/main.rs`'s `effective_node`, lines 1830–1843); the
 `llmproxy` dialect has no config-file field for it. This value is what
 `llmproxy.spend_limit` uses as the writer identity in every `FlushToken` it
 sends to the store.
