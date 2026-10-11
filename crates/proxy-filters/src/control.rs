@@ -57,7 +57,7 @@ use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
 use crate::tenant_credential_crypto::{
     self as credential_crypto, CryptoError, KeyRing, TenantSecret,
 };
-use proxy_http::tenant_credentials::{TenantCredential, TenantCredentialSet};
+use proxy_http::tenant_credentials::{CredentialSource, TenantCredential, TenantCredentialSet};
 use zeroize::Zeroizing;
 // Spend rows are keyed by a `PeriodKey`, which
 // `spend.rs` owns (it also owns the calendar-alignment logic that produces
@@ -1045,9 +1045,51 @@ impl From<EncodedPeriod> for crate::spend::Period {
     }
 }
 
+/// [`CredentialSource`] as `serde_json` sees it -- the same local-mirror
+/// reasoning as [`EncodedPeriod`] above. The stored spelling is snake_case
+/// (`"platform"`/`"tenant"`), matching the representation records already
+/// use for the same enum (ADR-0007 decision 7).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EncodedCredentialSource {
+    Platform,
+    Tenant,
+}
+
+impl From<CredentialSource> for EncodedCredentialSource {
+    fn from(source: CredentialSource) -> Self {
+        match source {
+            CredentialSource::Platform => EncodedCredentialSource::Platform,
+            CredentialSource::Tenant => EncodedCredentialSource::Tenant,
+        }
+    }
+}
+
+impl From<EncodedCredentialSource> for CredentialSource {
+    fn from(encoded: EncodedCredentialSource) -> Self {
+        match encoded {
+            EncodedCredentialSource::Platform => CredentialSource::Platform,
+            EncodedCredentialSource::Tenant => CredentialSource::Tenant,
+        }
+    }
+}
+
+/// The scope a budget row written BEFORE ADR-0007 decision 8 carried no
+/// `credential_source` field at all. Every such budget was enforced against
+/// -- and charged by -- the operator's credential, so `Platform` is the
+/// value that preserves its meaning on read rather than inventing one.
+fn legacy_credential_source() -> EncodedCredentialSource {
+    EncodedCredentialSource::Platform
+}
+
 /// [`TenantBudget`] as `serde_json` sees it -- same "local mirror, not a
 /// derive on the real type" reasoning as [`EncodedModelAccess`] and
 /// [`EncodedPeriod`] above.
+///
+/// `credential_source` defaults to [`legacy_credential_source`] when a row
+/// lacks it: rows written before ADR-0007 decision 8 scoped budgets keep
+/// their platform meaning, and `SPEND_SCHEMA_VERSION` does NOT bump -- the
+/// field is additive for every reader that ignores unknown fields.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodedTenantBudget {
     #[serde(
@@ -1057,6 +1099,8 @@ pub(crate) struct EncodedTenantBudget {
     schema_version: u32,
     max_micros: u64,
     period: EncodedPeriod,
+    #[serde(default = "legacy_credential_source")]
+    credential_source: EncodedCredentialSource,
 }
 
 impl From<&TenantBudget> for EncodedTenantBudget {
@@ -1065,6 +1109,7 @@ impl From<&TenantBudget> for EncodedTenantBudget {
             schema_version: SPEND_SCHEMA_VERSION,
             max_micros: budget.max_micros.as_micros(),
             period: budget.period.into(),
+            credential_source: budget.credential_source.into(),
         }
     }
 }
@@ -1074,6 +1119,7 @@ impl From<EncodedTenantBudget> for TenantBudget {
         TenantBudget {
             max_micros: crate::spend::MicroUsd::from_micros(encoded.max_micros),
             period: encoded.period.into(),
+            credential_source: encoded.credential_source.into(),
         }
     }
 }
@@ -3971,6 +4017,7 @@ mod tests {
         let zero_budget = TenantBudget {
             max_micros: MicroUsd::from_micros(0),
             period: Period::Daily,
+            credential_source: CredentialSource::Platform,
         };
         cp.set_budget(&TenantId::new("tenant-zero"), Some(&zero_budget))
             .expect("set_budget must succeed");
@@ -4013,6 +4060,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(500_000_000),
             period: Period::Monthly,
+            credential_source: CredentialSource::Platform,
         };
         cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
             .expect("set_budget must succeed");
@@ -4042,6 +4090,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(1_000_000),
             period: Period::Daily,
+            credential_source: CredentialSource::Platform,
         };
         cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
             .expect("set_budget must succeed");
@@ -4087,6 +4136,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(2_000_000),
             period: Period::Daily,
+            credential_source: CredentialSource::Platform,
         };
         cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
             .expect("set_budget must succeed");
@@ -4118,6 +4168,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(3_000_000),
             period: Period::Monthly,
+            credential_source: CredentialSource::Platform,
         };
         cp.set_budget(&TenantId::new("tenant-a"), Some(&budget))
             .expect("set_budget must succeed");
@@ -4153,6 +4204,7 @@ mod tests {
             let budget = TenantBudget {
                 max_micros: crate::spend::MicroUsd::from_micros(10),
                 period: crate::spend::Period::Daily,
+                credential_source: CredentialSource::Platform,
             };
             cp.set_policy(
                 &tenant,
@@ -4235,6 +4287,48 @@ mod tests {
         )
         .is_err());
         assert!(decode_json::<EncodedKeyRow>(br#"{"schema_version":99,"digest":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"tenant":"a","revoked":false}"#).is_err());
+    }
+
+    /// ADR-0007 decision 8: a budget row stored BEFORE budgets were scoped
+    /// carries no `credential_source` and must decode as `Platform` -- the
+    /// source every such budget was enforced and charged by -- both with an
+    /// explicit `schema_version` on the row and without one (the oldest
+    /// rows have neither field).
+    #[test]
+    fn budget_rows_without_a_credential_source_decode_as_platform() {
+        let without_version: EncodedTenantBudget =
+            decode_json(br#"{"max_micros":5,"period":"Daily"}"#).unwrap();
+        let with_version: EncodedTenantBudget =
+            decode_json(br#"{"schema_version":2,"max_micros":5,"period":"Daily"}"#).unwrap();
+        for encoded in [without_version, with_version] {
+            let budget: TenantBudget = encoded.into();
+            assert_eq!(budget.credential_source, CredentialSource::Platform);
+            assert_eq!(budget.max_micros, MicroUsd::from_micros(5));
+            assert_eq!(budget.period, Period::Daily);
+        }
+    }
+
+    /// The other direction: a `Tenant`-scoped budget survives the
+    /// encode/decode round trip unchanged, and encodes under the same
+    /// snake_case spelling records already use for this enum. This is the
+    /// ONE serialization both the redb and the Redis store go through
+    /// (`EncodedTenantBudget`), so it covers both without a live Redis.
+    #[test]
+    fn a_tenant_scoped_budget_round_trips_through_the_encoded_form() {
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(7),
+            period: Period::Monthly,
+            credential_source: CredentialSource::Tenant,
+        };
+        let encoded: EncodedTenantBudget = (&budget).into();
+        let value: serde_json::Value = serde_json::from_slice(&encode_json(&encoded)).unwrap();
+        assert_eq!(value["credential_source"], "tenant");
+        let decoded: EncodedTenantBudget = decode_json(&encode_json(&encoded)).unwrap();
+        assert_eq!(
+            TenantBudget::from(decoded),
+            budget,
+            "the scope must survive the round trip"
+        );
     }
 
     // --- mutation pins: a write that skips `self.rebuild()` must not be
@@ -4496,6 +4590,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(9_000_000),
             period: Period::Daily,
+            credential_source: CredentialSource::Platform,
         };
         store
             .set_budget(&TenantId::new("tenant-a"), Some(&budget))
@@ -4515,12 +4610,67 @@ mod tests {
         );
     }
 
+    /// ADR-0007 decision 8, redb: a raw row written by a build that predates
+    /// budget scoping -- no `credential_source`, no `schema_version` -- must
+    /// `load()` as a `Platform`-scoped budget. Written directly into the
+    /// `BUDGETS` table (bypassing `set_budget`, which only ever writes
+    /// current-format rows), exactly like the other legacy-row fixtures in
+    /// this module.
+    #[test]
+    fn redb_load_reads_a_pre_scope_budget_row_as_platform() {
+        let store = RedbControlPlaneStore::in_memory();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(BUDGETS_TABLE).unwrap();
+                table
+                    .insert(
+                        "tenant-a",
+                        br#"{"max_micros":5,"period":"Daily"}"#.as_slice(),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let loaded = store.load().unwrap();
+        let budget = loaded
+            .budgets
+            .get(&TenantId::new("tenant-a"))
+            .expect("the pre-scope row must still load");
+        assert_eq!(budget.credential_source, CredentialSource::Platform);
+        assert_eq!(budget.max_micros, MicroUsd::from_micros(5));
+        assert_eq!(budget.period, Period::Daily);
+    }
+
+    /// ADR-0007 decision 8, redb: `set_budget` + `load` round trip a
+    /// `Tenant`-scoped budget without collapsing its scope to `Platform`.
+    #[test]
+    fn redb_round_trips_a_tenant_scoped_budget() {
+        let store = RedbControlPlaneStore::in_memory();
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(11),
+            period: Period::Monthly,
+            credential_source: CredentialSource::Tenant,
+        };
+        store
+            .set_budget(&TenantId::new("tenant-a"), Some(&budget))
+            .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.budgets.get(&TenantId::new("tenant-a")),
+            Some(&budget)
+        );
+    }
+
     #[test]
     fn redb_persists_a_budget_across_reopen() {
         let path = temp_db_path("budget-persists-across-reopen");
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(42_000_000),
             period: Period::Monthly,
+            credential_source: CredentialSource::Platform,
         };
 
         {
@@ -4669,6 +4819,7 @@ mod tests {
                     Some(&TenantBudget {
                         max_micros: MicroUsd::from_micros(500_000_000),
                         period: Period::Monthly,
+                        credential_source: CredentialSource::Platform,
                     }),
                 )
                 .unwrap();
@@ -4971,6 +5122,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(1_000_000),
             period: Period::Monthly,
+            credential_source: CredentialSource::Platform,
         };
         store.set_budget(&tenant, Some(&budget)).unwrap();
         expected += 1;
@@ -5050,6 +5202,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: MicroUsd::from_micros(1_000_000),
             period: Period::Monthly,
+            credential_source: CredentialSource::Platform,
         };
         store.set_budget(&tenant, Some(&budget)).unwrap();
         expected += 1;

@@ -109,6 +109,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::control::{ControlPlaneStore, FlushToken, StoreError};
 use crate::usage::TokenUsage;
+use proxy_http::tenant_credentials::CredentialSource;
 
 /// An amount of money in integer micro-dollars (1e-6 USD). See the module
 /// doc's "Money is integer, never `f64`" section for why.
@@ -638,6 +639,12 @@ pub struct TenantBudget {
     pub max_micros: MicroUsd,
     /// The calendar-aligned window this ceiling resets on.
     pub period: Period,
+    /// Which credential source this ceiling is scoped to (ADR-0007 decision
+    /// 8): admission enforces this budget only for requests in that mode,
+    /// and spend is charged to it only when the attempt's source matches.
+    /// Budget rows stored before the field existed decode as
+    /// [`CredentialSource::Platform`], preserving their meaning.
+    pub credential_source: CredentialSource,
 }
 
 /// What this replica does when its spend state has gone STALE -- when the

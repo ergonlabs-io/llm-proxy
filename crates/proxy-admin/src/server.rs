@@ -1973,6 +1973,9 @@ fn handle_set_budget(
             Ok(max_micros) => Some(TenantBudget {
                 max_micros,
                 period: spec.period.into(),
+                // The admin API cannot choose a scope yet, so every budget
+                // it writes keeps its existing meaning (ADR-0007 decision 8).
+                credential_source: proxy_http::tenant_credentials::CredentialSource::Platform,
             }),
             Err(err) => {
                 return bad_request(&format!("invalid `max_usd`: {err}"));
@@ -2015,6 +2018,9 @@ fn handle_set_key_budget(
             Ok(max_micros) => Some(TenantBudget {
                 max_micros,
                 period: spec.period.into(),
+                // The admin API cannot choose a scope yet, so every budget
+                // it writes keeps its existing meaning (ADR-0007 decision 8).
+                credential_source: proxy_http::tenant_credentials::CredentialSource::Platform,
             }),
             Err(err) => return bad_request(&format!("invalid `max_usd`: {err}")),
         },

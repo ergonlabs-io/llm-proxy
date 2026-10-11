@@ -680,6 +680,7 @@ mod tests {
     use chrono::TimeZone;
 
     use crate::spend::{Charge, MicroUsd, Period, SpendAccumulator};
+    use proxy_http::tenant_credentials::CredentialSource;
 
     // ------------------------------------------------------------------
     // Unit tests: no Redis needed. `Client::open` only parses the URL, so
@@ -799,6 +800,7 @@ mod tests {
         let budget = TenantBudget {
             max_micros: crate::spend::MicroUsd::from_micros(10),
             period: crate::spend::Period::Monthly,
+            credential_source: CredentialSource::Platform,
         };
         store.set_budget(&subject, Some(&budget)).unwrap();
         store
@@ -1071,6 +1073,7 @@ mod tests {
                 Some(&TenantBudget {
                     max_micros: MicroUsd::from_micros(5_000_000),
                     period: Period::Monthly,
+                    credential_source: CredentialSource::Platform,
                 }),
             )
             .unwrap();
