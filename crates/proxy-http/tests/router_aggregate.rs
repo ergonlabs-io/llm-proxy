@@ -448,3 +448,151 @@ async fn metadata_keeps_failed_primary_and_actual_fallback_member() {
         })
         .await;
 }
+
+/// An upstream that reads one whole request (headers, then `Content-Length`
+/// body bytes) before answering 200, and reports the body length it read.
+/// Unlike [`spawn_reflecting_upstream`] it never answers with request bytes
+/// unread, which on a large body could reset the connection under the
+/// router's write.
+async fn spawn_body_counting_upstream() -> (SocketAddr, oneshot::Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 64 * 1024];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "upstream closed before the header block ended");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let content_length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map(|v| v.trim().parse().unwrap())
+            .unwrap_or(0);
+        while buf.len() - header_end < content_length {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "upstream closed before the body ended");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let _ = tx.send(buf.len() - header_end);
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+    (addr, rx)
+}
+
+/// S3.4: the retry replay limit is the stream's buffer limit (the listener's
+/// `per_connection_buffer_limit_bytes`), not a fixed 1 MiB. With the limit
+/// raised to 4 MiB, a 2 MiB body whose first member fails to connect must
+/// still fail over and reach the second member whole. A fixed 1 MiB replay
+/// limit marks the body unretriable, and the client gets the first member's
+/// 503 instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_over_1_mib_fails_over_when_the_buffer_limit_allows_it() {
+    const BODY_LEN: usize = 2 << 20;
+    let closed_addr = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let (live_addr, rx) = spawn_body_counting_upstream().await;
+    let (status, received) = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        LocalSet::new().block_on(&rt, async move {
+            let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+            let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
+            snapshot.insert(
+                "a".to_string(),
+                Arc::new(member_cluster("a", closed_addr, Vec::new())),
+            );
+            snapshot.insert(
+                "b".to_string(),
+                Arc::new(member_cluster("b", live_addr, Vec::new())),
+            );
+            snapshot.insert("providers".to_string(), Arc::new(aggregate_cluster()));
+            manager.update_from_snapshot(&snapshot).await;
+            let route_table = RouteTable::new(
+                "test-routes".to_string(),
+                vec![VirtualHostIR {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Arc::new(RouteEntry {
+                        name: None,
+                        matcher: prefix_matcher("/v1/"),
+                        action: RouteActionIR::Forward(forward_to_providers()),
+                        request_headers_to_add: Vec::new(),
+                        streaming_strict: false,
+                        typed_per_filter_config: BTreeMap::new(),
+                        route_index: 0,
+                        include_request_attempt_count: false,
+                        include_attempt_count_in_response: false,
+                    })],
+                    typed_per_filter_config: BTreeMap::new(),
+                }],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+                Arc::new(RouterFilterFactory::new(
+                    Arc::new(manager),
+                    test_router_stats(&["a", "b", "providers"]),
+                ));
+            let handler = FilterChainHandler::new_with_access_logs(
+                Vec::new(),
+                terminal_factory,
+                Arc::new(route_table),
+                false,
+                false,
+                0,
+                &[],
+            )
+            .unwrap()
+            .with_buffer_limit(4 << 20);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::HOST, HeaderValue::from_static("test.local"));
+            let req = HttpRequestParts {
+                head: RequestHeaders {
+                    method: Method::POST,
+                    uri: Uri::from_static("/v1/chat/completions"),
+                    headers,
+                },
+                body: local_boxed(
+                    Full::new(Bytes::from(vec![b'x'; BODY_LEN]))
+                        .map_err(|infallible: std::convert::Infallible| match infallible {}),
+                ),
+                downstream: DownstreamInfo::loopback(),
+                on_upgrade: None,
+            };
+            let resp = tokio::time::timeout(Duration::from_secs(10), handler.handle(req))
+                .await
+                .expect("request bounded");
+            let status = resp.head.status;
+            resp.body.collect().await.unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(10), rx)
+                .await
+                .ok()
+                .and_then(Result::ok);
+            (status, received)
+        })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a 2 MiB body under a 4 MiB limit must fail over to b"
+    );
+    assert_eq!(received, Some(BODY_LEN), "b must receive the whole body");
+}

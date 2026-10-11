@@ -163,15 +163,6 @@ mod guarded;
 // (UC) when classifying a body error for the access log.
 pub(crate) mod idle;
 
-/// S3.4 (Envoy's `no_retry_body_too_large`): the largest request body this
-/// router will hold in memory for retry replay. Matches
-/// `filter_manager::DEFAULT_BUFFER_LIMIT` -- both exist for the same reason
-/// (the decode chain is already fully buffered by the time a request reaches
-/// the router terminal, so this doesn't add a *new* buffering cost, just caps
-/// how much of what's already buffered upstream we're willing to hold a
-/// second (replayable) copy of).
-const RETRY_REQUEST_BUFFER_LIMIT: usize = 1 << 20;
-
 /// ADR-0004 step 3: the router's own [`TerminalFilterInstanceFactory`] --
 /// mints a fresh [`RouterHandler`] per stream, exactly like every other
 /// filter's factory. `Send + Sync` (required by `TerminalFilterInstanceFactory`,
@@ -1089,10 +1080,14 @@ impl RouterHandler {
 
         let mut retry_state = fwd.retry_policy.as_ref().map(RetryState::new);
         if let Some(state) = &mut retry_state {
-            if body_bytes.len() > RETRY_REQUEST_BUFFER_LIMIT {
-                // S3.4 (Envoy's `no_retry_body_too_large`): too big to
-                // safely hold a second copy of for replay. The request still
-                // proceeds -- it just can't be retried.
+            // S3.4 (Envoy's `no_retry_body_too_large`): the replay limit is
+            // the stream's buffer limit (the listener's
+            // `per_connection_buffer_limit_bytes`), as in Envoy, so raising
+            // the listener limit also raises the largest retriable body.
+            // Replay clones the already-buffered `Bytes`, so it costs no
+            // second copy. The request still proceeds when over the limit;
+            // it just can't be retried.
+            if body_bytes.len() > dcb.decoder_buffer_limit() {
                 state.mark_body_not_retriable();
             }
         }
