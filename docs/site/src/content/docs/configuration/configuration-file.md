@@ -267,6 +267,7 @@ explicitly — the shorthand string form cannot carry it:
 | `address` | `HostPort` | yes | — | Where the proxy binds. |
 | `tls.cert_file` | string (path) | yes, if `tls` is set | — | PEM certificate chain. |
 | `tls.key_file` | string (path) | yes, if `tls` is set | — | PEM private key. |
+| `max_request_body_bytes` | integer, 1 to 4294967295 | no | `1048576` (1 MiB) | The largest request body the listener accepts, in bytes. See [Request body size limit](#request-body-size-limit). |
 
 ### Request body size limit
 
@@ -274,10 +275,21 @@ Every HTTP request body is capped at the listener's
 `per_connection_buffer_limit_bytes` (default 1 MiB). The cap applies before
 any HTTP filter runs. A larger body gets a `413` and the connection is closed.
 
-This file format has no field for the limit, so it is always 1 MiB here. To
-raise it, use Envoy mode (`-c`) and set `per_connection_buffer_limit_bytes` on
-the listener. Raise it on listeners that serve multimodal requests with
-inline base64 images. The value must be greater than 0.
+To raise it, write `listen` as an object and set `max_request_body_bytes`.
+It lowers to the listener's `per_connection_buffer_limit_bytes`. The value
+must be greater than 0. Raise it for long-context requests and for
+multimodal requests with inline base64 images:
+
+```yaml
+listen:
+  address: 0.0.0.0:8080
+  max_request_body_bytes: 20971520   # 20 MiB
+```
+
+The same value is the largest body that can be retried or fail over to
+another provider. Each in-flight request can hold up to this many bytes in
+memory, so a higher limit increases the memory that concurrent requests can
+use. The shorthand `listen: host:port` form always uses the 1 MiB default.
 
 The schema's description says certificate files under `tls` are "watched and
 hot-reloaded on change." The mechanism for a live swap exists internally

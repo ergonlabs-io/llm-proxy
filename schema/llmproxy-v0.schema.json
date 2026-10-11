@@ -120,6 +120,14 @@
       "required": ["address"],
       "properties": {
         "address": { "$ref": "#/$defs/HostPort" },
+        "max_request_body_bytes": {
+          "description": "The largest request body the listener accepts, in bytes. A larger body gets `413`. Default: 1048576 (1 MiB). Raise it for long-context or image requests. The same value is the largest body that can be retried or fail over to another provider. Each in-flight request can hold up to this many bytes in memory. Lowers to the listener's `per_connection_buffer_limit_bytes`.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1048576,
+          "examples": [20971520]
+        },
         "tls": {
           "description": "Terminate TLS for client connections. Certificate files are read once at startup; a renewed certificate needs a restart to be served. The hot-swap mechanism exists internally but nothing watches the files yet, so do not plan renewal around it.",
           "type": "object",

@@ -2348,12 +2348,13 @@ fn lower_listener(
     pricing: Option<Value>,
     _warnings: &mut [ConfigWarning],
 ) -> Result<Value, ConfigError> {
-    let (address, tls) = match &config.listen {
-        None => (("0.0.0.0".to_string(), 8080), None),
-        Some(Listen::Address(a)) => (parse_host_port(a, "listen")?, None),
+    let (address, tls, max_request_body_bytes) = match &config.listen {
+        None => (("0.0.0.0".to_string(), 8080), None, None),
+        Some(Listen::Address(a)) => (parse_host_port(a, "listen")?, None, None),
         Some(Listen::Full(spec)) => (
             parse_host_port(&spec.address, "listen.address")?,
             spec.tls.as_ref(),
+            spec.max_request_body_bytes,
         ),
     };
 
@@ -2455,13 +2456,17 @@ fn lower_listener(
         });
     }
 
-    Ok(json!({
+    let mut listener = json!({
         "name": "llmproxy_listener",
         "address": { "socket_address": {
             "address": address.0, "port_value": address.1
         } },
         "filter_chains": [filter_chain],
-    }))
+    });
+    if let Some(limit) = max_request_body_bytes {
+        listener["per_connection_buffer_limit_bytes"] = json!(limit);
+    }
+    Ok(listener)
 }
 
 fn warning(field_path: impl Into<String>, message: impl Into<String>) -> ConfigWarning {

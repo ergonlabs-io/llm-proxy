@@ -158,6 +158,11 @@ pub struct ListenerSpec {
     pub address: String,
     #[serde(default)]
     pub tls: Option<ListenTls>,
+    /// The largest request body the listener accepts, in bytes. Lowers to the
+    /// listener's `per_connection_buffer_limit_bytes`; unset keeps its 1 MiB
+    /// default. A larger body gets `413`.
+    #[serde(default)]
+    pub max_request_body_bytes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -9,8 +9,8 @@ use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
 use crate::lower::{classify_model_key, dialect_from_models, resolved_dialect};
 use crate::model::{
-    is_valid_provider_name, Listen, ModelProviderRef, Provider, ProviderModelRef, ProviderType,
-    SimpleConfig, RESERVED_KEYS,
+    is_valid_provider_name, Listen, ListenerSpec, ModelProviderRef, Provider, ProviderModelRef,
+    ProviderType, SimpleConfig, RESERVED_KEYS,
 };
 
 /// Parse dialect YAML from a file.
@@ -317,6 +317,18 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
             Listen::Full(spec) => &spec.address,
         };
         parse_host_port(addr, "listen")?;
+        if let Listen::Full(ListenerSpec {
+            max_request_body_bytes: Some(0),
+            ..
+        }) = listen
+        {
+            // Envoy mode rejects an explicit 0 too: it would answer every
+            // request that has a body with 413.
+            return Err(ConfigError::InvalidValue {
+                field_path: "listen.max_request_body_bytes".to_string(),
+                reason: "must be greater than 0; 0 would reject every request body".to_string(),
+            });
+        }
     }
     if let Some(admin) = &config.admin {
         parse_host_port(admin, "admin")?;

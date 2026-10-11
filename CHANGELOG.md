@@ -11,6 +11,19 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- `listen.max_request_body_bytes` in the `llmproxy` config file sets the largest
+  request body the listener accepts (default 1 MiB). It lowers to the listener's
+  `per_connection_buffer_limit_bytes`. Write `listen` as an object to use it.
+
+### Changed
+
+- The largest request body that can be retried or fail over is now the listener's
+  request body limit, as in Envoy, not a fixed 1 MiB. Before, a listener with a
+  raised limit never retried a body over 1 MiB.
+- `VERSION` matches the Cargo workspace version, and `make ci` checks it.
+
 ## [0.3.2] - 2026-10-11
 
 Tenant provider credentials, plus security and drain fixes. The "Dynamic configuration"

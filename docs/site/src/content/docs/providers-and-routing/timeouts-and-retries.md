@@ -91,9 +91,10 @@ the same trigger table the retry engine uses everywhere, pinned by
 `gateway_error_is_502_503_504_or_no_response_only`, which is why 504 needs
 the `gateway-error` token this configuration format never sets).
 
-A request whose body exceeds 1 MiB is never retried at all, regardless of
-`attempts` — too large to safely hold a second copy of for replay
-(`RETRY_REQUEST_BUFFER_LIMIT` in `crates/proxy-http/src/router.rs`).
+Every request that the listener accepts can be retried. A request body larger than the
+listener's request body limit is rejected with `413` before it reaches the router, so the
+retry limit and the body limit are the same value (default 1 MiB). When you raise the
+limit with `listen.max_request_body_bytes`, larger requests also fail over.
 
 Backoff between retries is fully jittered exponential: attempt *n* waits a
 duration drawn uniformly from `[0, min((2ⁿ-1) × 25ms, 250ms)]` — fixed
