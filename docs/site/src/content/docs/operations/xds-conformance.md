@@ -34,8 +34,8 @@ the protocol itself, not just about internal consistency.
 
 It needs `docker` and a working daemon, and `make ci` is meant to stay
 hermetic. So this is an opt-in target with a stated cadence instead: run it
-before the v0.3.0 ship gate is declared closed (`internal-docs/MILESTONES.md`'s
-v0.3.0 section names this target as the gate's verification).
+before the v0.3.2 ship gate is declared closed (`internal-docs/MILESTONES.md`'s
+v0.3.2 section names this target as the gate's verification).
 
 An opt-in target nobody runs reads as coverage it does not provide — the
 Makefile records this reasoning directly above the target, next to the

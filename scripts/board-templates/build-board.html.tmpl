@@ -180,7 +180,9 @@
     <button class="chip" data-ms="v0.0.1">v0.0.1 · first light<span class="n" id="n-v001"></span></button>
     <button class="chip" data-ms="v0.1.0">v0.1.0 · LLM gateway<span class="n" id="n-v010"></span></button>
     <button class="chip" data-ms="v0.2.0">v0.2.0 · prod<span class="n" id="n-v020"></span></button>
-    <button class="chip" data-ms="v0.3.0">v0.3.0 · xDS<span class="n" id="n-v030"></span></button>
+    <button class="chip" data-ms="v0.3.0">v0.3.0 · shipped<span class="n" id="n-v030"></span></button>
+    <button class="chip" data-ms="v0.3.2">v0.3.2 · xDS gate<span class="n" id="n-v032"></span></button>
+    <button class="chip" data-ms="v0.3.3">v0.3.3 · hardening<span class="n" id="n-v033"></span></button>
     <button class="chip" data-ms="v0.4.0">v0.4.0 · parity<span class="n" id="n-v040"></span></button>
     <button class="chip" data-ms="v1.0.0">v1.0.0<span class="n" id="n-v100"></span></button>
     <span class="sep"></span>
@@ -193,8 +195,19 @@
     <code>key_id</code>. WP-65 is started: same-dialect model providers lower to ordered
     fallback. Generic per-attempt OpenAI/Anthropic model-body rewriting remains open. Neither
     changes the current ADS ship gate.
-    <b>Now — v0.3.0 "dynamic configuration": be deployable the way Envoy is deployed.</b> Current
-    by declaration since v0.2.0 shipped 2026-08-29. <b>WP-20 is DONE, 2026-09-05/06 — all six
+    <b>Planning update 2026-10-10 (owner decisions):</b> tags v0.3.0 (2026-09-29) and v0.3.1
+    (2026-10-09) are shipped; the latest release is v0.3.1. <b>The "Dynamic configuration" gate
+    was still open when they were cut, so it moved to v0.3.2 — same gate text, still RED.</b>
+    v0.3.2 carries the open gate work plus WP-69 (H1 makes the clause "ACKs and NACKs correctly
+    per S8" false today) and the five live defects WP-66, WP-67, WP-68, WP-70, WP-74, plus WP-25
+    (health-check toggles and <code>/drain_listeners</code>, to land together with WP-67; WP-67 is
+    ready and does not depend on it). v0.3.3 "hardening" holds WP-71-73 and WP-75-84; its gate is
+    that every C/H finding in <code>architecture.md</code> section 11 is closed or has a recorded
+    owner decision. v0.4.0 is back to Envoy-parity scope only. None of the WP-66-84 work is
+    started.
+    <b>Now — v0.3.2 "dynamic configuration" (formerly v0.3.0): be deployable the way Envoy is deployed.</b> Current
+    since v0.3.1 shipped. Everything below about this gate was written while it was labelled
+    v0.3.0. <b>WP-20 is DONE, 2026-09-05/06 — all six
     increments (0 through 5).</b> Increment 5 landed all five WP-28 acceptance scenarios {ACK,
     NACK-recover, reconnect-resync, spurious-nonce, out-of-order-response} over a real socket, plus
     <code>make xds-conformance</code>, which <b>found a real deadlock on its first run</b>
@@ -332,7 +345,7 @@
     <code>0d7bd1b</code>; HTTP upgrades/WebSocket tunneling (WP-10 S10) landed the same window as
     a bonus, not gate-required. Full history of this gate's long path to closing is in
     <code>internal-docs/MILESTONES.md</code>, not repeated here now that it's shipped.</span>
-    <span class="gate"><b>v0.3.0's SHIP GATE — still RED.</b> The proxy
+    <span class="gate"><b>v0.3.2's SHIP GATE (carried over from v0.3.0, which was tagged without it) — still RED.</b> The proxy
     takes its entire configuration from an ADS control plane, ACKs and NACKs correctly per S8,
     and survives a control-plane reconnect with make-before-break cluster warming. <b>WP-20 (ADS
     client) is DONE, 2026-09-05/06 — all six increments.</b> It opens a real gRPC stream,
@@ -521,7 +534,7 @@
     { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
   ];
 
-  const CURRENT_MS = "v0.3.0";
+  const CURRENT_MS = "v0.3.2";
 
   // status: done | ready | started | blocked ; ms = the release the WP closes in
   const wps = /*__DATA__*/;
@@ -578,7 +591,7 @@
     document.getElementById("n-" + pr).textContent = wps.filter(w => w.prio === pr).length;
   }
   for (const [ms, id] of [["v0.0.1", "n-v001"], ["v0.1.0", "n-v010"], ["v0.2.0", "n-v020"],
-                          ["v0.3.0", "n-v030"], ["v0.4.0", "n-v040"], ["v1.0.0", "n-v100"]]) {
+                          ["v0.3.0", "n-v030"], ["v0.3.2", "n-v032"], ["v0.3.3", "n-v033"], ["v0.4.0", "n-v040"], ["v1.0.0", "n-v100"]]) {
     document.getElementById(id).textContent = wps.filter(w => w.ms === ms).length;
   }
 

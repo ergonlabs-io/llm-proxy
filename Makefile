@@ -238,9 +238,9 @@ validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.ya
 # behind an `#[ignore]`. A target nobody runs is worse than no target, because it
 # reads as coverage.
 #
-# So this has a stated cadence, not just an existence: run it before the v0.3.0
+# So this has a stated cadence, not just an existence: run it before the v0.3.2
 # ship gate is declared closed.
-# `internal-docs/MILESTONES.md`'s v0.3.0 gate names it as the verification, which
+# `internal-docs/MILESTONES.md`'s v0.3.2 gate names it as the verification, which
 # is what keeps the cadence enforceable rather than aspirational.
 
 DOCKER := $(shell command -v docker 2>/dev/null)

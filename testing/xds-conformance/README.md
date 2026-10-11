@@ -83,7 +83,7 @@ Preserved from the Makefile's own comment above the `xds-conformance` target,
 because AGENTS.md "Coverage" records exactly this shape (`local_openai_smoke.rs`)
 quietly going stale for a whole work package while the suite stayed green:
 
-- run it before the v0.3.0 ship gate is declared closed.
+- run it before the v0.3.2 ship gate is declared closed.
 
 An opt-in target nobody runs is worse than no target -- it reads as coverage it
 is not providing.
