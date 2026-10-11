@@ -59,3 +59,6 @@ admin-ui/dist/
 # Local agent tooling (agent definitions, skills, Claude Code settings).
 /.agents/
 /.claude/
+
+# Python bytecode from running scripts/*.py (check-deps, check-citations, ...).
+__pycache__/
