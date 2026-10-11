@@ -31,33 +31,6 @@ fn err_path(err: &ConfigError) -> &str {
     }
 }
 
-/// A bootstrap with no `node` at all -- the overwhelming majority of configs
-/// today -- must come through with tracing off, not a guessed default.
-#[test]
-fn absent_node_leaves_tracing_unset() {
-    let yaml = r#"
-static_resources:
-  listeners: []
-"#;
-    let snapshot = snapshot_from(yaml).expect("must lower");
-    assert_eq!(snapshot.tracing, None);
-}
-
-/// A `node.metadata` that never sets this namespace (including one that's
-/// entirely absent, or sets only unrelated keys) must also leave tracing off.
-#[test]
-fn unrelated_node_metadata_is_left_alone() {
-    let yaml = r#"
-node:
-  id: my-node
-  metadata:
-    some.other.namespace:
-      anything: "goes here"
-"#;
-    let snapshot = snapshot_from(yaml).expect("must lower");
-    assert_eq!(snapshot.tracing, None);
-}
-
 /// The full shape the dialect emits: all three fields set explicitly.
 #[test]
 fn full_shape_lowers() {

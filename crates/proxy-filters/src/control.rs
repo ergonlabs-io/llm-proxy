@@ -987,13 +987,12 @@ impl RedbControlPlaneStore {
         Self::from_database(db)
     }
 
-    /// An ephemeral, in-memory `redb` database -- for tests only. It runs
-    /// through the exact same transaction and table code every other
-    /// constructor does; the only difference is the `StorageBackend` pages
-    /// are written to (RAM instead of a file), so it proves nothing about
-    /// `redb`'s own durability -- see the `reopening_the_same_path_...` test
-    /// below for that.
-    pub fn in_memory() -> Self {
+    /// An ephemeral, in-memory `redb` database. It runs through the same
+    /// transaction and table code as every other constructor; only the
+    /// `StorageBackend` differs, so it proves nothing about `redb`'s own
+    /// durability -- see the `reopening_the_same_path_...` test for that.
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
         let db = redb::Builder::new()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .expect("an in-memory redb backend cannot fail to open");

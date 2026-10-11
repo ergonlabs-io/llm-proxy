@@ -354,20 +354,4 @@ impl SdsSecretRegistry {
         );
         Ok(())
     }
-
-    /// The number of currently-live factories registered under `name` --
-    /// i.e. after pruning dead `Weak`s. Not used by production code; exists
-    /// so `crates/proxy-core/tests/tls.rs` can assert the pruning behavior
-    /// directly (a plain `pub fn`, not `#[cfg(test)]`, because that test file
-    /// compiles as a separate integration-test crate and so cannot see
-    /// anything gated on this crate's own `cfg(test)`).
-    pub fn registered_factory_count(&self, name: &str) -> usize {
-        let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
-        let list = inner
-            .certificate_factories
-            .entry(name.to_string())
-            .or_default();
-        list.retain(|w| w.strong_count() > 0);
-        list.len()
-    }
 }

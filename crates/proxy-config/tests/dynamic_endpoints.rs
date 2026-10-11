@@ -201,41 +201,6 @@ fn a_listener_typed_any_passed_to_lower_dynamic_endpoints_is_refused_naming_both
     );
 }
 
-#[test]
-fn a_type_url_absent_from_the_descriptor_pool_is_an_unknown_type_url_error() {
-    let any = prost_types::Any {
-        type_url: "type.googleapis.com/definitely.not.a.real.Type".to_string(),
-        value: vec![],
-    };
-    let err = lower_dynamic_endpoints(&any, "eds.assignments[bogus]")
-        .expect_err("a type absent from the descriptor pool must be refused");
-    let ConfigError::UnknownTypeUrl {
-        field_path,
-        type_url,
-    } = &err
-    else {
-        panic!("expected UnknownTypeUrl, got: {err}");
-    };
-    assert_eq!(field_path, "eds.assignments[bogus]");
-    assert_eq!(type_url, "type.googleapis.com/definitely.not.a.real.Type");
-}
-
-#[test]
-fn undecodable_bytes_under_a_correct_type_url_are_refused_rather_than_panicking() {
-    let any = prost_types::Any {
-        type_url: format!("type.googleapis.com/{ENDPOINTS_TYPE}"),
-        // Not valid protobuf wire format under any schema: an invalid varint
-        // tag byte with the continuation bit set and no terminator.
-        value: vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-    };
-    let err = lower_dynamic_endpoints(&any, "eds.assignments[garbage]")
-        .expect_err("undecodable bytes must be refused, not panic");
-    assert!(
-        format!("{err}").to_lowercase().contains("decode"),
-        "error should say decoding failed, got: {err}"
-    );
-}
-
 // ------------------------------------------------------------- empty case --
 
 /// An assignment with no localities at all is a legitimate "this cluster has

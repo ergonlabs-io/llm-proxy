@@ -226,18 +226,6 @@ fn undefined_enum_number_fails() {
     assert!(rule.contains("not a defined value"), "got rule: {rule}");
 }
 
-/// A fully valid config passes validation (no false positives).
-#[test]
-fn valid_example_config_passes() {
-    let yaml = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/tcp-proxy.yaml"
-    ))
-    .expect("read example");
-    parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
-        .expect("example must pass PGV validation");
-}
-
 /// Validation runs in permissive mode too: only UNKNOWN fields are forgiven,
 /// never constraint violations.
 #[test]

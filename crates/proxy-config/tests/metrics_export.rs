@@ -120,10 +120,10 @@ fn absent_node_leaves_both_surfaces_unset() {
     assert_eq!(snapshot.metrics, None);
 }
 
-/// A `node.metadata` that never sets this namespace (absent, or set only to
-/// unrelated keys) leaves metric export off.
+/// A `node.metadata` that never sets either namespace (absent, or set only to
+/// unrelated keys) must also leave BOTH surfaces off.
 #[test]
-fn unrelated_node_metadata_is_left_alone() {
+fn unrelated_node_metadata_leaves_both_surfaces_unset() {
     let yaml = r#"
 node:
   id: my-node
@@ -132,6 +132,7 @@ node:
       anything: "goes here"
 "#;
     let snapshot = snapshot_from(yaml).expect("must lower");
+    assert_eq!(snapshot.tracing, None);
     assert_eq!(snapshot.metrics, None);
 }
 
