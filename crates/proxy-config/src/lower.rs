@@ -4369,6 +4369,7 @@ fn convert_tenant_credential_slot(
         provider,
         header: header.to_ascii_lowercase(),
         value_prefix,
+        verify_path: None,
     }))
 }
 

@@ -2580,6 +2580,7 @@ async fn start_admin(
             cluster_state: runtime.cluster_state,
             ui,
             lifecycle: Some(runtime.lifecycle),
+            credential_probe: None,
         },
     )
     .await

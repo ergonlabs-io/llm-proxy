@@ -210,6 +210,11 @@ pub struct AdminRuntime {
     /// unwired `/stats`. The admin server only WRITES this state; `/ready`
     /// is still answered solely by [`ReadinessProbe`].
     pub lifecycle: Option<Arc<LifecycleState>>,
+    /// Sends the save-time credential probe for
+    /// `PUT /tenants/{id}/provider_credentials/{provider}` (ADR-0007
+    /// decision 10). `None` refuses every save that asks for verification,
+    /// so an unwired probe never reports a key as verified.
+    pub credential_probe: Option<Arc<dyn proxy_http::credential_probe::TenantCredentialProbe>>,
 }
 
 /// One static file served under `/ui/`.

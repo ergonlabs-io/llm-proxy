@@ -484,6 +484,7 @@ fn the_slot_reaches_the_ir_cluster_and_the_ring_reaches_the_filter() {
             provider: "anthropic".to_string(),
             header: "x-api-key".to_string(),
             value_prefix: String::new(),
+            verify_path: None,
         }
     );
     let openai_slot = snapshot.clusters["provider:openai"]

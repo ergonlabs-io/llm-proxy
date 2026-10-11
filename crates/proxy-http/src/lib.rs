@@ -22,6 +22,7 @@ mod attempt_logging;
 #[cfg(unix)]
 mod capture_cleanup;
 pub mod codec;
+pub mod credential_probe;
 mod credential_provider;
 pub mod filter;
 pub mod filter_manager;

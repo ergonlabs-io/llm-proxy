@@ -1617,6 +1617,7 @@ mod tests {
                     provider: provider.to_string(),
                     header: "authorization".to_string(),
                     value_prefix: "Bearer ".to_string(),
+                    verify_path: None,
                 }),
             });
         Arc::new(config)

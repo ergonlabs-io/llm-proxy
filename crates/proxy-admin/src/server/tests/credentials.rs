@@ -30,6 +30,7 @@ fn snapshot_with_credential_slot() -> Arc<ConfigSnapshot> {
             provider: CRED_PROVIDER.to_string(),
             header: "authorization".to_string(),
             value_prefix: "Bearer ".to_string(),
+            verify_path: None,
         }),
     });
     snapshot

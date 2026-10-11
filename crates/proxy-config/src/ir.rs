@@ -2110,6 +2110,11 @@ pub struct TenantCredentialSlot {
     pub header: String,
     /// Prefix written before the secret, e.g. `Bearer `; empty for raw keys.
     pub value_prefix: String,
+    /// Upstream path of a zero-cost `GET` that checks a credential when it is
+    /// saved, e.g. `/api/v1/key` (ADR-0007 decision 10). Sent as is: the
+    /// cluster's path rewrite does not apply. `None` means this cluster has
+    /// no probe, so a save that asks for verification is refused.
+    pub verify_path: Option<String>,
 }
 
 /// A validated TLS certificate/validation-context secret (static or

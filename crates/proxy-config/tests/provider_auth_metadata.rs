@@ -271,6 +271,7 @@ static_resources:
                 provider: "openrouter".to_string(),
                 header: "authorization".to_string(),
                 value_prefix: "Bearer ".to_string(),
+                verify_path: None,
             }),
         })
     );

@@ -424,6 +424,7 @@ async fn start_full_with_readiness(
             cluster_state: None,
             ui: None,
             lifecycle: None,
+            credential_probe: None,
         },
     )
     .await
@@ -452,6 +453,7 @@ async fn start_with_cluster_state(
             cluster_state: Some(cluster_state),
             ui: None,
             lifecycle: None,
+            credential_probe: None,
         },
     )
     .await
@@ -1032,6 +1034,7 @@ async fn start_lifecycle(
             cluster_state: None,
             ui: None,
             lifecycle: Some(Arc::clone(&state)),
+            credential_probe: None,
         },
     )
     .await
@@ -2962,6 +2965,7 @@ async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::Pa
             cluster_state: None,
             ui: Some(Arc::new(ui)),
             lifecycle: None,
+            credential_probe: None,
         },
     )
     .await

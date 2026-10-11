@@ -192,6 +192,7 @@ fn member(
                 provider: provider.to_string(),
                 header: header.to_string(),
                 value_prefix: prefix.to_string(),
+                verify_path: None,
             }),
         }),
         usage_dialect: None,
