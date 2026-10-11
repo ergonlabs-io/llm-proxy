@@ -18,9 +18,11 @@ citations when you rename one.
 
 ## Before Editing
 
-- Read Part 0 of `internal-docs/IMPLEMENTATION_PLAN.md` and the relevant WP.
-- Treat S1-S10 appendices as normative Envoy semantics; protos are not the
-  source of truth.
+- Read `internal-docs/architecture.md` for how the system is built and its
+  standing design principles (section 12).
+- Treat `internal-docs/envoy-semantics.md` (S1-S10) as normative Envoy
+  semantics; protos are not the source of truth. Deliberate departures are in
+  `internal-docs/envoy-divergences.md`.
 - Start from the smallest relevant code path, nearby test, or call site.
 - Do not revert or overwrite unrelated user changes.
 - Keep edits focused. Do not commit unless explicitly asked.
@@ -28,7 +30,10 @@ citations when you rename one.
 ## Architecture Invariants
 
 1. Strict config mode is default. Every config field must map to IR or fail
-   with its full dotted path. Never silently ignore fields.
+   with its full dotted path (a load error for static config, a NACK for xDS).
+   Never silently ignore fields; that is a P0 bug. `--permissive` relaxes
+   unknown fields in a bootstrap loaded with `-c` only; the `--config` dialect
+   is always strict.
 2. Generated protos stay inside `proxy-config` and `proxy-xds`. Other crates
    consume `crates/proxy-config/src/ir.rs`.
 3. `unsafe` is denied workspace-wide.
@@ -44,6 +49,22 @@ citations when you rename one.
    the selected provider wins on collisions. Assume another instance exists:
    audit anything per-provider that sits on a `RouteEntry`.
 7. Reject cross-dialect fallback chains rather than guessing how to parse them.
+8. Shared interfaces are frozen early: the IR in `ir.rs`, the filter traits,
+   and other cross-crate trait signatures. Do not change them unilaterally in
+   a feature change; propose the change and land it as its own commit.
+9. The reference is Envoy v1.38 / xDS v3. Pin the release tag in `proxy-api`
+   and the same image digest in the differential rig. Nobody upgrades Envoy
+   inside a feature change.
+10. When Envoy documentation and Envoy behavior disagree, behavior wins. Pin it
+    as a differential-rig fixture and record the departure in
+    `internal-docs/envoy-divergences.md`.
+
+## Comments
+
+Comments explain why, in place. Cite only durable references: ADR numbers,
+`internal-docs/envoy-semantics.md` S-sections, `internal-docs/envoy-divergences.md`,
+sections of this file, and upstream Envoy docs. Never cite work-package IDs,
+increments, lanes, or planning-document parts; git history records provenance.
 
 ## Policy Domains
 
@@ -171,8 +192,10 @@ writing, changing, reviewing, or sweeping tests.
 
 ## Change Completion
 
-1. Run the narrowest relevant test or check after each substantive edit.
-2. Fix local failures before widening scope.
-3. Run `make tq-changed` for touched crates.
-4. Run `make tq` and `make tq-doc` before landing; run `make ci` when required.
-5. Report changed files, validation run, and any unrelated pre-existing failure.
+1. Every change lands with tests. Code that only compiles is not done; name
+   the test that proves the behavior.
+2. Run the narrowest relevant test or check after each substantive edit.
+3. Fix local failures before widening scope.
+4. Run `make tq-changed` for touched crates.
+5. Run `make tq` and `make tq-doc` before landing; run `make ci` when required.
+6. Report changed files, validation run, and any unrelated pre-existing failure.
