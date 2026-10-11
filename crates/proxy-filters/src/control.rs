@@ -1127,7 +1127,7 @@ impl From<EncodedTenantBudget> for TenantBudget {
 /// Only version this build understands for a tenant credential row
 /// (ADR-0007 §2). A row stamped by a future build fails closed on load
 /// rather than being half-read -- see [`decode_tenant_credential_row`].
-const TENANT_CREDENTIALS_SCHEMA_VERSION: u16 = 1;
+pub(crate) const TENANT_CREDENTIALS_SCHEMA_VERSION: u16 = 1;
 
 /// One `tenant_credentials` row, exactly as `redb` stores it -- a private
 /// mirror, following [`EncodedKeyRow`]'s precedent: `tenant` and `provider`
@@ -1149,7 +1149,7 @@ const TENANT_CREDENTIALS_SCHEMA_VERSION: u16 = 1;
 /// [`decode_tenant_credential_row`] -- see [`EncodedKeyRow`]'s
 /// `schema_version` for the same convention on key rows.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct EncodedTenantCredentialRow {
+pub(crate) struct EncodedTenantCredentialRow {
     schema_version: u16,
     key_id: String,
     nonce: String,
@@ -1226,7 +1226,7 @@ fn decode_hex_lower(hex: &str) -> Option<Vec<u8>> {
 /// a serde message can echo the offending field's value, and the one thing
 /// that must never render here is ciphertext (AGENTS.md "Fail-open
 /// controls": check what the log line renders).
-fn decode_tenant_credential_row(
+pub(crate) fn decode_tenant_credential_row(
     tenant: &str,
     provider: &str,
     value: &[u8],

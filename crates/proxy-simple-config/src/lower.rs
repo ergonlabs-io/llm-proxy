@@ -1879,7 +1879,7 @@ fn lower_auth(
     // all, which is what keeps configs written before this field lowering
     // byte-identical.
     let store_member = lower_auth_store(auth.store.as_ref())?;
-    let store_is_persistent = matches!(&store_member, Some(("persistent", _)));
+    let store_is_durable = matches!(&store_member, Some(("persistent" | "shared", _)));
     if let Some((member, value)) = store_member {
         typed_config[member] = value;
     }
@@ -1889,13 +1889,13 @@ fn lower_auth(
     if let Some(ring) = &auth.tenant_credentials {
         let lowered = lower_tenant_credentials(ring)?;
         // Tenant credentials are sealed rows in the control-plane store. Only
-        // `persistent` keeps them across restarts and can hold them; `in_memory`
-        // loses them and `shared` does not support them yet (ADR-0007 decision 2).
-        // Refused at load, so tenants never fall back to the operator key silently.
-        if !store_is_persistent {
+        // `persistent` and `shared` keep them across restarts; `in_memory`
+        // loses them (ADR-0007 decision 2). Refused at load, so tenants never
+        // fall back to the operator key silently.
+        if !store_is_durable {
             return Err(ConfigError::InvalidValue {
                 field_path: "auth.tenant_credentials".to_string(),
-                reason: TENANT_CREDENTIALS_NEED_PERSISTENT_STORE.to_string(),
+                reason: TENANT_CREDENTIALS_NEED_DURABLE_STORE.to_string(),
             });
         }
         typed_config["tenant_credentials"] = lowered;
@@ -1978,10 +1978,10 @@ fn lower_auth_store(
     }
 }
 
-/// Why `auth.tenant_credentials` needs `auth.store.persistent`. The same words
+/// Why `auth.tenant_credentials` needs `auth.store.persistent` or `shared`. The same words
 /// as the Envoy-mode check in `proxy-filters`' `auth_filter`, so both entry
 /// points report one message.
-const TENANT_CREDENTIALS_NEED_PERSISTENT_STORE: &str = "tenant credentials require the persistent store: in_memory loses them on restart and shared does not support them yet";
+const TENANT_CREDENTIALS_NEED_DURABLE_STORE: &str = "tenant credentials require a durable store (`persistent` or `shared`): in_memory loses them on restart";
 
 /// `auth.tenant_credentials` -> `llmproxy.filters.v0.TenantCredentials`,
 /// lowered verbatim. Only presence and non-emptiness are checked here. Key

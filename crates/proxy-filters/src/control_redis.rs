@@ -32,6 +32,7 @@
 //! {ns}:keys                                 HASH key_id -> encode_json(EncodedKeyRow)
 //! {ns}:policies                             HASH tenant -> encode_json(EncodedModelAccess)
 //! {ns}:budgets                              HASH tenant -> encode_json(EncodedTenantBudget)
+//! {ns}:tenant_credentials                   HASH <esc(tenant)>|<esc(provider)> -> encode_json(EncodedTenantCredentialRow)
 //! {ns}:generation                           STRING, INCR
 //! {ns}:spend:{<prefix>|<tenant>|<period>}   STRING, micros
 //! {ns}:seq:{<prefix>|<tenant>|<period>}     HASH node_id -> highest accepted seq
@@ -44,6 +45,12 @@
 //! [`RedisControlPlaneStore::hash_tag`]'s doc for why they are a Redis
 //! Cluster hash tag, not decoration, and [`escape_component`]'s doc for why
 //! the three components must be escaped before they are joined.
+//!
+//! The `tenant_credentials` field is the escaped tenant and the escaped
+//! provider joined by `|`. `escape_component` rewrites every `|` inside a
+//! component, so the first `|` in a field is always the separator and no
+//! two (tenant, provider) pairs share a field. The row value carries
+//! ciphertext only; this store never decrypts (ADR-0007 decision 2).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -51,10 +58,11 @@ use std::sync::Mutex;
 use redis::{Client, Connection, Script};
 
 use crate::auth::{KeyId, TenantId};
+use crate::control::decode_tenant_credential_row;
 use crate::control::{
     decode_json, encode_json, store_err, ControlPlaneStore, EncodedKeyRow, EncodedModelAccess,
-    EncodedTenantBudget, FlushToken, StoreError, StoredControlPlane, StoredKey,
-    SPEND_SCHEMA_VERSION,
+    EncodedTenantBudget, EncodedTenantCredentialRow, FlushToken, StoreError, StoredControlPlane,
+    StoredKey, StoredTenantCredential, SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION,
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
@@ -151,6 +159,37 @@ redis.call('INCR', KEYS[2])
 return 1
 "#;
 
+/// Deletes one tenant credential field and bumps the generation in one
+/// script, so a missing field returns `0` with no bump. `KEYS[1]` = the
+/// credentials hash, `KEYS[2]` = the generation counter, `ARGV[1]` = field.
+const DELETE_TENANT_CREDENTIAL_LUA: &str = r#"
+if redis.call('HDEL', KEYS[1], ARGV[1]) == 0 then
+  return 0
+end
+redis.call('INCR', KEYS[2])
+return 1
+"#;
+
+/// `delete_tenant` as one script, so the tenant's credential rows go in the
+/// same atomic write as the rest (the trait requires it). The credential
+/// fields are `<esc(tenant)>|<esc(provider)>`, so the prefix
+/// `<esc(tenant)>|` matches exactly that tenant: an escaped tenant contains
+/// no `|`. `KEYS` = tenants, policies, budgets, credentials, generation.
+/// `ARGV[1]` = tenant, `ARGV[2]` = credential field prefix.
+const DELETE_TENANT_LUA: &str = r#"
+redis.call('SREM', KEYS[1], ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+redis.call('HDEL', KEYS[3], ARGV[1])
+local prefix = ARGV[2]
+for _, field in ipairs(redis.call('HKEYS', KEYS[4])) do
+  if string.sub(field, 1, #prefix) == prefix then
+    redis.call('HDEL', KEYS[4], field)
+  end
+end
+redis.call('INCR', KEYS[5])
+return 1
+"#;
+
 /// Percent-encodes the four bytes that would otherwise let two DIFFERENT
 /// `(stat_prefix, tenant, period)` triples build the SAME Redis key: `%`
 /// itself (so the encoding cannot be ambiguous), `|` (the delimiter
@@ -193,6 +232,25 @@ fn escape_component(raw: &str) -> String {
         .expect("escape_component only ever rewrites single-byte ASCII characters")
 }
 
+/// Inverse of [`escape_component`]. `None` on a malformed `%XX` sequence or
+/// non-UTF-8 result; the caller turns that into a load error.
+fn unescape_component(escaped: &str) -> Option<String> {
+    let raw = escaped.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            let hex = std::str::from_utf8(raw.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Persistent, shared [`ControlPlaneStore`] backed by Redis -- the
 /// multi-replica counterpart to [`crate::control::RedbControlPlaneStore`].
 /// Built on composable (additive) spend writes and the policy generation
@@ -216,6 +274,8 @@ pub struct RedisControlPlaneStore {
     namespace: String,
     add_spend_script: Script,
     revoke_key_script: Script,
+    delete_tenant_credential_script: Script,
+    delete_tenant_script: Script,
 }
 
 impl RedisControlPlaneStore {
@@ -245,6 +305,8 @@ impl RedisControlPlaneStore {
             namespace: namespace.into(),
             add_spend_script: Script::new(ADD_SPEND_LUA),
             revoke_key_script: Script::new(REVOKE_KEY_LUA),
+            delete_tenant_credential_script: Script::new(DELETE_TENANT_CREDENTIAL_LUA),
+            delete_tenant_script: Script::new(DELETE_TENANT_LUA),
         })
     }
 
@@ -315,6 +377,19 @@ impl RedisControlPlaneStore {
         format!("{}:budgets", self.namespace)
     }
 
+    fn tenant_credentials_key(&self) -> String {
+        format!("{}:tenant_credentials", self.namespace)
+    }
+
+    /// Hash field for one credential row: `<esc(tenant)>|<esc(provider)>`.
+    fn credential_field(tenant: &str, provider: &str) -> String {
+        format!(
+            "{}|{}",
+            escape_component(tenant),
+            escape_component(provider)
+        )
+    }
+
     fn generation_key(&self) -> String {
         format!("{}:generation", self.namespace)
     }
@@ -377,6 +452,7 @@ type LoadReply = (
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
+    HashMap<String, Vec<u8>>,
 );
 
 impl ControlPlaneStore for RedisControlPlaneStore {
@@ -391,7 +467,9 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let policies_key = self.policies_key();
         let budgets_key = self.budgets_key();
 
-        let (tenants_raw, keys_raw, policies_raw, budgets_raw): LoadReply =
+        let credentials_key = self.tenant_credentials_key();
+
+        let (tenants_raw, keys_raw, policies_raw, budgets_raw, credentials_raw): LoadReply =
             self.with_connection(|conn| {
                 redis::pipe()
                     .atomic()
@@ -403,6 +481,8 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                     .arg(&policies_key)
                     .cmd("HGETALL")
                     .arg(&budgets_key)
+                    .cmd("HGETALL")
+                    .arg(&credentials_key)
                     .query(conn)
             })?;
 
@@ -431,12 +511,29 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             budgets.insert(TenantId::new(tenant), encoded.into());
         }
 
+        // Same fail-closed rule as redb: one row this build cannot read
+        // fails the whole load rather than dropping a tenant's credential.
+        let mut tenant_credentials = Vec::with_capacity(credentials_raw.len());
+        for (field, bytes) in credentials_raw {
+            let (tenant, provider) = field
+                .split_once('|')
+                .and_then(|(t, p)| Some((unescape_component(t)?, unescape_component(p)?)))
+                .ok_or_else(|| {
+                    StoreError::Unavailable(
+                        "tenant credential hash has a malformed field; \
+                         refusing the whole control-plane load"
+                            .into(),
+                    )
+                })?;
+            tenant_credentials.push(decode_tenant_credential_row(&tenant, &provider, &bytes)?);
+        }
+
         Ok(StoredControlPlane {
             tenants,
             keys,
             policies,
             budgets,
-            tenant_credentials: Vec::new(),
+            tenant_credentials,
         })
     }
 
@@ -465,34 +562,69 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     }
 
     fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
-        let tenants_key = self.tenants_key();
-        let policies_key = self.policies_key();
-        let budgets_key = self.budgets_key();
-        let generation_key = self.generation_key();
         // Matches `InMemoryControlPlaneStore`/`RedbControlPlaneStore`: the
         // `keys` hash is left untouched -- a tenant's keys outliving the
-        // tenant row is the existing, deliberate behaviour, not something
-        // this store gets to diverge from quietly.
+        // tenant row is the existing, deliberate behaviour. Credential rows
+        // go in the same script (see [`DELETE_TENANT_LUA`]).
+        let prefix = format!("{}|", escape_component(tenant.as_str()));
+        self.with_connection(|conn| {
+            self.delete_tenant_script
+                .key(self.tenants_key())
+                .key(self.policies_key())
+                .key(self.budgets_key())
+                .key(self.tenant_credentials_key())
+                .key(self.generation_key())
+                .arg(tenant.as_str())
+                .arg(prefix)
+                .invoke::<i64>(conn)
+        })?;
+        Ok(())
+    }
+
+    fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
+        // Reject before any write: no row, no generation bump.
+        if rec.schema_version != TENANT_CREDENTIALS_SCHEMA_VERSION {
+            return Err(StoreError::Conflict(
+                "unsupported tenant credential schema_version".into(),
+            ));
+        }
+        let field = Self::credential_field(rec.tenant.as_str(), &rec.provider);
+        let value = encode_json(&EncodedTenantCredentialRow::from(rec));
+        // No tenant-existence check, same as redb. HSET is last-writer-wins,
+        // which is the required create-or-replace.
         self.with_connection(|conn| {
             redis::pipe()
                 .atomic()
-                .cmd("SREM")
-                .arg(&tenants_key)
-                .arg(tenant.as_str())
-                .ignore()
-                .cmd("HDEL")
-                .arg(&policies_key)
-                .arg(tenant.as_str())
-                .ignore()
-                .cmd("HDEL")
-                .arg(&budgets_key)
-                .arg(tenant.as_str())
+                .cmd("HSET")
+                .arg(self.tenant_credentials_key())
+                .arg(&field)
+                .arg(value)
                 .ignore()
                 .cmd("INCR")
-                .arg(&generation_key)
+                .arg(self.generation_key())
                 .ignore()
                 .query::<()>(conn)
         })
+    }
+
+    fn delete_tenant_credential(
+        &self,
+        tenant: &TenantId,
+        provider: &str,
+    ) -> Result<(), StoreError> {
+        let field = Self::credential_field(tenant.as_str(), provider);
+        let removed: i64 = self.with_connection(|conn| {
+            self.delete_tenant_credential_script
+                .key(self.tenant_credentials_key())
+                .key(self.generation_key())
+                .arg(&field)
+                .invoke::<i64>(conn)
+        })?;
+        if removed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound)
+        }
     }
 
     fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
@@ -1109,6 +1241,239 @@ mod tests {
     // the store-level convergence and resume properties those processes
     // would rely on.
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Tenant credential rows (ADR-0007). Same semantics as the redb and
+    // in-memory stores; see `control.rs`'s `tenant_credential_*` tests.
+    // ------------------------------------------------------------------
+
+    /// A row whose every replaceable field carries `marker`. The bytes are
+    /// opaque: this store persists ciphertext and never interprets it.
+    fn credential_row(tenant: &str, provider: &str, marker: &str) -> StoredTenantCredential {
+        let mut nonce = [0u8; 12];
+        nonce[0] = marker.as_bytes()[0];
+        StoredTenantCredential {
+            schema_version: 1,
+            tenant: TenantId::new(tenant),
+            provider: provider.to_string(),
+            key_id: format!("kek-{marker}"),
+            nonce,
+            ciphertext: format!("ciphertext-{marker}").into_bytes(),
+            last4: format!("last4-{marker}"),
+            fingerprint: format!("fp-{marker}"),
+            created_at: "2026-10-11T00:00:00Z".to_string(),
+            updated_at: "2026-10-11T00:00:01Z".to_string(),
+            verified_at: None,
+        }
+    }
+
+    #[test]
+    fn credential_field_never_collides_across_differently_split_pairs() {
+        let a = RedisControlPlaneStore::credential_field("a|b", "c");
+        let b = RedisControlPlaneStore::credential_field("a", "b|c");
+        assert_ne!(a, b);
+        assert_eq!(a, "a%7Cb|c");
+        assert_eq!(unescape_component("a%7Cb"), Some("a|b".to_string()));
+        assert_eq!(unescape_component("100%25"), Some("100%".to_string()));
+        assert_eq!(unescape_component("bad%2"), None);
+        assert_eq!(unescape_component("bad%zz"), None);
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_tenant_credential_put_then_load_round_trips_and_replaces() {
+        let store = test_store("cred-roundtrip");
+        // Tenant and provider chosen so escaping is exercised on the way
+        // in and decoded on the way out.
+        let first = credential_row("ten|ant{1}%", "prov|ider", "first");
+        store.put_tenant_credential(&first).unwrap();
+        assert_eq!(
+            store.load().unwrap().tenant_credentials,
+            vec![first.clone()]
+        );
+
+        store
+            .put_tenant_credential(&credential_row("ten|ant{1}%", "other", "other"))
+            .unwrap();
+        let second = credential_row("ten|ant{1}%", "prov|ider", "second");
+        store.put_tenant_credential(&second).unwrap();
+        let loaded = store.load().unwrap().tenant_credentials;
+        assert_eq!(loaded.len(), 2, "same (tenant, provider) must replace");
+        let replaced = loaded
+            .iter()
+            .find(|r| r.provider == "prov|ider")
+            .expect("replaced row present");
+        assert_eq!(replaced, &second);
+        assert!(loaded.iter().any(|r| r.provider == "other"));
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_tenant_credential_put_bumps_the_generation() {
+        let store = test_store("cred-put-bump");
+        let before = store.policy_generation().unwrap();
+        store
+            .put_tenant_credential(&credential_row("t", "p", "one"))
+            .unwrap();
+        assert_eq!(store.policy_generation().unwrap(), before + 1);
+        store
+            .put_tenant_credential(&credential_row("t", "p", "two"))
+            .unwrap();
+        assert_eq!(store.policy_generation().unwrap(), before + 2);
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_tenant_credential_bad_schema_version_is_conflict_with_no_bump_and_no_row() {
+        let store = test_store("cred-bad-version");
+        let mut row = credential_row("t", "p", "one");
+        row.schema_version = 2;
+        assert!(matches!(
+            store.put_tenant_credential(&row),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(store.policy_generation().unwrap(), 0);
+        assert!(store.load().unwrap().tenant_credentials.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_tenant_credential_delete_removes_and_bumps_and_a_missing_row_is_not_found() {
+        let store = test_store("cred-delete");
+        let tenant = TenantId::new("t");
+        store
+            .put_tenant_credential(&credential_row("t", "p", "one"))
+            .unwrap();
+        let before = store.policy_generation().unwrap();
+
+        store.delete_tenant_credential(&tenant, "p").unwrap();
+        assert!(store.load().unwrap().tenant_credentials.is_empty());
+        assert_eq!(store.policy_generation().unwrap(), before + 1);
+
+        assert_eq!(
+            store.delete_tenant_credential(&tenant, "p"),
+            Err(StoreError::NotFound)
+        );
+        assert_eq!(
+            store.delete_tenant_credential(&tenant, "never-written"),
+            Err(StoreError::NotFound)
+        );
+        assert_eq!(
+            store.policy_generation().unwrap(),
+            before + 1,
+            "a NotFound delete must not bump"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_delete_tenant_cascades_to_only_that_tenants_credentials() {
+        let store = test_store("cred-cascade");
+        // "a" and "a|b" share a naive prefix ("a|"), and under naive
+        // joining ("a", "b|c") would equal ("a|b", "c"). Escaping must keep
+        // the survivors out of the cascade.
+        let doomed = [("a", "b|c"), ("a", "plain")];
+        let survivors = [("a|b", "c"), ("ab", "plain"), ("other", "plain")];
+        for (t, p) in doomed.iter().chain(survivors.iter()) {
+            store
+                .put_tenant_credential(&credential_row(t, p, "x"))
+                .unwrap();
+        }
+        store.create_tenant(&TenantId::new("a")).unwrap();
+        let before = store.policy_generation().unwrap();
+
+        store.delete_tenant(&TenantId::new("a")).unwrap();
+
+        let mut left: Vec<(String, String)> = store
+            .load()
+            .unwrap()
+            .tenant_credentials
+            .into_iter()
+            .map(|r| (r.tenant.as_str().to_string(), r.provider))
+            .collect();
+        left.sort();
+        let mut want: Vec<(String, String)> = survivors
+            .iter()
+            .map(|(t, p)| (t.to_string(), p.to_string()))
+            .collect();
+        want.sort();
+        assert_eq!(left, want);
+        assert_eq!(
+            store.policy_generation().unwrap(),
+            before + 1,
+            "the cascade shares the delete's single bump"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_a_second_replica_sees_a_tenant_secret_stored_and_deleted_by_the_first() {
+        use crate::auth::{HmacSecret, KeySet};
+        use crate::control::{ControlPlane, CredentialKeys};
+        use crate::tenant_credential_crypto::{CredentialKek, KeyRing, TenantSecret};
+        use proxy_http::tenant_credentials::TenantCredential;
+
+        let url = std::env::var("LLM_PROXY_TEST_REDIS").expect("LLM_PROXY_TEST_REDIS is not set");
+        let namespace = format!(
+            "llmproxy-test-replicas-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let replica = || {
+            let ring = KeyRing::new(
+                CredentialKek::from_bytes("kek", *b"0123456789abcdef0123456789abcdef").unwrap(),
+                vec![],
+            )
+            .unwrap();
+            ControlPlane::new_with_credential_keys(
+                Box::new(
+                    RedisControlPlaneStore::open_with_namespace(&url, namespace.clone()).unwrap(),
+                ),
+                HmacSecret::new(b"operator-secret"),
+                KeySet::new(),
+                Some(CredentialKeys::new(ring, b"operator-secret")),
+            )
+            .expect("replica must load")
+        };
+        let first = replica();
+        let second = replica();
+        let usable = |cp: &ControlPlane| {
+            let snapshot = cp.handle().load();
+            let set = snapshot
+                .tenant_credentials
+                .get(&TenantId::new("tenant-a"))?;
+            match set.get("openai")? {
+                TenantCredential::Usable(secret) => Some(secret.expose().to_string()),
+                TenantCredential::Unusable => None,
+            }
+        };
+        assert_eq!(usable(&second), None);
+
+        first
+            .store_tenant_secret(
+                &TenantId::new("tenant-a"),
+                "openai",
+                &TenantSecret::new("sk-replica-secret".to_string()),
+                false,
+            )
+            .unwrap();
+        assert_eq!(usable(&second), None, "not visible before the poll");
+        assert!(second.poll_once().unwrap(), "the generation moved");
+        assert_eq!(usable(&second).as_deref(), Some("sk-replica-secret"));
+
+        first
+            .delete_tenant_credential(&TenantId::new("tenant-a"), "openai")
+            .unwrap();
+        assert!(second.poll_once().unwrap());
+        assert_eq!(usable(&second), None);
+        let snapshot = second.handle().load();
+        assert!(snapshot
+            .tenant_credentials
+            .get(&TenantId::new("tenant-a"))
+            .is_none_or(|set| set.get("openai").is_none()));
+    }
 
     fn dt(y: i32, mo: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc.with_ymd_and_hms(y, mo, d, 12, 0, 0).unwrap()

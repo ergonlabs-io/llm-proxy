@@ -565,7 +565,7 @@ fn translate_output_carries_the_slot_and_the_ring_and_round_trips() {
     std::fs::remove_file(&previous).ok();
 }
 
-// --- 8: tenant credentials require the persistent store --------------------
+// --- 8: tenant credentials require a durable store -------------------------
 
 /// An `auth:` block with a key ring and the given `store:` block (empty for
 /// no store at all). Lowering never connects, so the `shared` URL is inert.
@@ -577,20 +577,16 @@ fn auth_with_store(store: &str, key: &str) -> String {
     )
 }
 
-/// Absent, `in_memory` and `shared` stores are each a load error at
+/// Absent and `in_memory` stores are each a load error at
 /// `auth.tenant_credentials`, with the reason naming the requirement. The
 /// `providers.<name>.tenant_credentials: true` opt-in reaches the same error,
 /// because it needs the ring.
 #[test]
-fn tenant_credentials_without_a_persistent_store_is_rejected_at_the_block() {
+fn tenant_credentials_without_a_durable_store_is_rejected_at_the_block() {
     let key = key_file("store-required").display().to_string();
     let stores = [
         ("", "an absent store"),
         ("  store:\n    in_memory: {}\n", "an in_memory store"),
-        (
-            "  store:\n    shared:\n      url: \"redis://127.0.0.1:6390/0\"\n",
-            "a shared store",
-        ),
     ];
     for (store, label) in stores {
         let text = format!(
@@ -602,7 +598,7 @@ fn tenant_credentials_without_a_persistent_store_is_rejected_at_the_block() {
             ConfigError::InvalidValue { field_path, reason } => {
                 assert_eq!(field_path, "auth.tenant_credentials", "{label}");
                 assert!(
-                    reason.contains("tenant credentials require the persistent store"),
+                    reason.contains("tenant credentials require a durable store"),
                     "{label}: got {reason}"
                 );
             }
@@ -655,6 +651,33 @@ fn tenant_credentials_with_a_persistent_store_lowers_and_loads() {
 
     std::fs::remove_file(&key).ok();
     std::fs::remove_file(&db).ok();
+}
+
+/// A `shared` (Redis) store holds credential rows too, so it lowers and the
+/// strict loader accepts it. The real auth filter is not created here: that
+/// would open a connection, and this test needs no Redis.
+#[test]
+fn tenant_credentials_with_a_shared_store_lowers_and_loads() {
+    let key = key_file("store-shared");
+    let text = format!(
+        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+         routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
+        auth_with_store(
+            "  store:\n    shared:\n      url: \"redis://127.0.0.1:6390/0\"\n",
+            &key.display().to_string(),
+        )
+    );
+    let config = parse(&text).expect("must parse");
+    let lowered = lower(&config).expect("a shared store must lower");
+    let typed = &http_filters(&lowered.bootstrap)[0]["typed_config"];
+    assert_eq!(
+        typed["shared"]["url"]["inline_string"].as_str(),
+        Some("redis://127.0.0.1:6390/0")
+    );
+    assert!(typed["tenant_credentials"].is_object());
+    strict_load_accepts(&config);
+
+    std::fs::remove_file(&key).ok();
 }
 
 // --- 10: the verify path (ADR-0007 decision 10) ----------------------------

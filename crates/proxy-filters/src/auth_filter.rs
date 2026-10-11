@@ -324,10 +324,10 @@ fn parse_store(config: &DynamicMessage) -> Result<StoreSpec, ConfigError> {
     }
 }
 
-/// Reason for the persistent-store requirement. [`parse_config`] returns it
+/// Reason for the durable-store requirement. [`parse_config`] returns it
 /// for Envoy mode, and `proxy-simple-config`'s `lower.rs` returns the same
 /// words for the dialect, so an operator sees one message either way.
-const TENANT_CREDENTIALS_NEED_PERSISTENT_STORE: &str = "tenant credentials require the persistent store: in_memory loses them on restart and shared does not support them yet";
+const TENANT_CREDENTIALS_NEED_DURABLE_STORE: &str = "tenant credentials require a durable store (`persistent` or `shared`): in_memory loses them on restart";
 
 /// Reads `typed_config.tenant_credentials` and loads its key-encryption keys
 /// (ADR-0007 decision 2). Unset is `Ok(None)`: the proxy then cannot seal or
@@ -836,14 +836,19 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
 
     let credential_ring = parse_tenant_credentials(config)?;
     // Tenant credentials are sealed rows in the control-plane store, so they
-    // need a store that survives restarts and can hold them. `in_memory`
-    // drops every row on restart, and `shared` has no credential rows yet
-    // (ADR-0007 decision 2). Both would leave tenants silently on the
-    // operator key, so the config is refused here, before any store is opened.
-    if credential_ring.is_some() && !matches!(store_spec, StoreSpec::Persistent(_)) {
+    // need a store that survives restarts: `persistent` (redb) or `shared`
+    // (Redis). `in_memory` drops every row on restart, which would leave
+    // tenants silently on the operator key (ADR-0007 decision 2), so it is
+    // refused here, before any store is opened.
+    if credential_ring.is_some()
+        && !matches!(
+            store_spec,
+            StoreSpec::Persistent(_) | StoreSpec::Shared { .. }
+        )
+    {
         return Err(invalid(
             "typed_config.tenant_credentials",
-            TENANT_CREDENTIALS_NEED_PERSISTENT_STORE,
+            TENANT_CREDENTIALS_NEED_DURABLE_STORE,
         ));
     }
 
@@ -3431,10 +3436,8 @@ mod tests {
         assert!(parse_config(&config).is_err());
     }
 
-    // A key ring with no store, or with a store that loses or cannot hold
-    // credentials, is a load error at the block's own path. `shared` is
-    // covered here too: `parse_config` only parses the URL and never opens a
-    // connection, so these cases run with no Redis.
+    // A key ring with no store, or with a store that loses credentials on
+    // restart, is a load error at the block's own path.
     #[test]
     fn tenant_credentials_without_a_persistent_store_is_a_load_error() {
         let key = key_file("store-absent", KEK_BYTES, 0o600);
@@ -3442,15 +3445,9 @@ mod tests {
 
         let absent = with_tenant_credentials(file, "kek", vec![]);
         let explicit_in_memory = with_in_memory_store(with_tenant_credentials(file, "kek", vec![]));
-        let shared = with_shared_store(
-            with_tenant_credentials(file, "kek", vec![]),
-            "redis://127.0.0.1:6390/0",
-        );
-
         for (label, config) in [
             ("an absent store", absent),
             ("an explicit in_memory store", explicit_in_memory),
-            ("a shared store", shared),
         ] {
             let err = match parse_config(&config) {
                 Err(err) => err,
@@ -3463,7 +3460,7 @@ mod tests {
                         "{label} must be rejected at the tenant_credentials block"
                     );
                     assert!(
-                        reason.contains("require the persistent store"),
+                        reason.contains("require a durable store"),
                         "{label}: the reason must name the requirement; got {reason}"
                     );
                 }
@@ -3484,6 +3481,21 @@ mod tests {
         std::fs::remove_file(&key).ok();
         assert!(loaded.credential_ring.is_some());
         assert!(matches!(loaded.store_spec, StoreSpec::Persistent(_)));
+    }
+
+    // `parse_config` only parses the URL and never opens a connection, so
+    // this runs with no Redis.
+    #[test]
+    fn tenant_credentials_with_a_shared_store_loads() {
+        let key = key_file("store-shared", KEK_BYTES, 0o600);
+        let config = with_shared_store(
+            with_tenant_credentials(key.to_str().unwrap(), "kek", vec![]),
+            "redis://127.0.0.1:6390/0",
+        );
+        let loaded = parse_config(&config).expect("a shared store must load");
+        std::fs::remove_file(&key).ok();
+        assert!(loaded.credential_ring.is_some());
+        assert!(matches!(loaded.store_spec, StoreSpec::Shared { .. }));
     }
 
     #[test]
