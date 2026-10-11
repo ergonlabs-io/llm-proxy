@@ -76,13 +76,15 @@ use crate::auth::{
     KeySet, TenantId, VirtualKeyAuthenticator,
 };
 use crate::control::{
-    ControlPlane, ControlPlaneStore, InMemoryControlPlaneStore, RedbControlPlaneStore,
+    ControlPlane, ControlPlaneStore, CredentialKeys, InMemoryControlPlaneStore,
+    RedbControlPlaneStore,
 };
 use crate::control_redis::RedisControlPlaneStore;
 use crate::jwks_refresh::{
     JwksSnapshot, RefreshSpec, DEFAULT_REFRESH_INTERVAL, STALE_AFTER_MISSED,
 };
 use crate::jwt_auth::{JwkRsaKey, JwtAuthenticator, JwtKeySet, JwtValidationConfig};
+use crate::tenant_credential_crypto::{CredentialKek, KekError, KeyRing};
 
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
@@ -322,6 +324,93 @@ fn parse_store(config: &DynamicMessage) -> Result<StoreSpec, ConfigError> {
     }
 }
 
+/// Reads `typed_config.tenant_credentials` and loads its key-encryption keys
+/// (ADR-0007 decision 2). Unset is `Ok(None)`: the proxy then cannot seal or
+/// open tenant credentials, and stored rows fail closed. Any problem with the
+/// block or a key file is a config load error naming the dotted path, so a
+/// proxy meant to protect tenant credentials refuses to start rather than
+/// running without its keys. Errors never carry key bytes: `KekError`
+/// renders only fixed text or an I/O reason.
+fn parse_tenant_credentials(config: &DynamicMessage) -> Result<Option<KeyRing>, ConfigError> {
+    const BASE: &str = "typed_config.tenant_credentials";
+    if !config.has_field_by_name("tenant_credentials") {
+        return Ok(None);
+    }
+    let block = config
+        .get_field_by_name("tenant_credentials")
+        .and_then(|v| v.as_message().cloned())
+        .ok_or_else(|| invalid(BASE, "must be a message"))?;
+    let string_field = |msg: &DynamicMessage, name: &str| {
+        msg.get_field_by_name(name)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let current_file = string_field(&block, "encryption_key_file");
+    if current_file.is_empty() {
+        return Err(invalid(
+            format!("{BASE}.encryption_key_file"),
+            "is required and must not be empty",
+        ));
+    }
+    let current_id = string_field(&block, "encryption_key_id");
+    if current_id.is_empty() {
+        return Err(invalid(
+            format!("{BASE}.encryption_key_id"),
+            "is required and must not be empty",
+        ));
+    }
+    let previous_entries: Vec<prost_reflect::Value> = block
+        .get_field_by_name("previous_keys")
+        .and_then(|v| v.as_list().map(<[_]>::to_vec))
+        .unwrap_or_default();
+    let mut previous_specs = Vec::with_capacity(previous_entries.len());
+    for (i, entry) in previous_entries.iter().enumerate() {
+        let msg = entry
+            .as_message()
+            .ok_or_else(|| invalid(format!("{BASE}.previous_keys[{i}]"), "must be a message"))?;
+        let id = string_field(msg, "id");
+        if id.is_empty() {
+            return Err(invalid(
+                format!("{BASE}.previous_keys[{i}].id"),
+                "is required and must not be empty",
+            ));
+        }
+        let file = string_field(msg, "file");
+        if file.is_empty() {
+            return Err(invalid(
+                format!("{BASE}.previous_keys[{i}].file"),
+                "is required and must not be empty",
+            ));
+        }
+        previous_specs.push((id, file));
+    }
+
+    let kek_error = |path: String, err: KekError| invalid(path, err.to_string());
+    let current = CredentialKek::load(&current_id, std::path::Path::new(&current_file))
+        .map_err(|e| kek_error(format!("{BASE}.encryption_key_file"), e))?;
+    let mut previous = Vec::with_capacity(previous_specs.len());
+    for (i, (id, file)) in previous_specs.iter().enumerate() {
+        previous.push(
+            CredentialKek::load(id, std::path::Path::new(file))
+                .map_err(|e| kek_error(format!("{BASE}.previous_keys[{i}].file"), e))?,
+        );
+    }
+    KeyRing::new(current, previous).map(Some).map_err(|e| {
+        // `KeyRing::new` only ever reports a duplicate among the previous
+        // keys (the current key is checked first), so the id locates the
+        // offending entry.
+        let path = match &e {
+            KekError::DuplicateId(id) => previous_specs
+                .iter()
+                .position(|(prev_id, _)| prev_id == id)
+                .map(|i| format!("{BASE}.previous_keys[{i}].id"))
+                .unwrap_or_else(|| BASE.to_string()),
+            _ => BASE.to_string(),
+        };
+        invalid(path, e.to_string())
+    })
+}
+
 /// Reads `typed_config.poll_interval_seconds` -- `0` (proto3's implicit
 /// default for an unset `uint32`) means "use the built-in 48-second default",
 /// per the proto's own doc. Modeled exactly on `spend_limit_filter`'s
@@ -365,6 +454,8 @@ struct AuthConfig {
     /// in config order. Each becomes one `JwtAuthenticator` appended to the
     /// chain after the virtual-key authenticator.
     jwt_providers: Vec<JwtProviderConfig>,
+    /// Loaded `typed_config.tenant_credentials` key ring, if configured.
+    credential_ring: Option<KeyRing>,
 }
 
 /// One parsed `typed_config.jwt_providers[i]` -- the pieces
@@ -744,6 +835,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         store_spec,
         poll_interval,
         jwt_providers: parse_jwt_providers(config)?,
+        credential_ring: parse_tenant_credentials(config)?,
     })
 }
 
@@ -773,6 +865,7 @@ impl HttpFilterFactory for AuthFilterFactory {
             store_spec,
             poll_interval,
             jwt_providers,
+            credential_ring,
         } = parse_config(config)?;
 
         // One shared JWKS snapshot per JWT provider,
@@ -913,7 +1006,17 @@ impl HttpFilterFactory for AuthFilterFactory {
                     }
                 };
                 let secret = HmacSecret::new(&secret_bytes);
-                let cp = ControlPlane::new(store, secret, bootstrap_keys).map_err(|e| {
+                // The fingerprint key derives from `hmac_secret` (ADR-0007
+                // decision 2), so the ring and the secret bytes travel together.
+                let credential_keys =
+                    credential_ring.map(|ring| CredentialKeys::new(ring, &secret_bytes));
+                let cp = ControlPlane::new_with_credential_keys(
+                    store,
+                    secret,
+                    bootstrap_keys,
+                    credential_keys,
+                )
+                .map_err(|e| {
                     invalid(
                         "typed_config",
                         format!("control-plane snapshot could not be built: {e}"),
@@ -3112,5 +3215,193 @@ mod tests {
         let reply = cb.local_reply.expect("an unmapped value must be denied");
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
         assert_eq!(reply.details, "auth_jwt_tenant_not_mapped");
+    }
+
+    // --- `tenant_credentials` (ADR-0007 decision 2) -------------------------
+
+    /// Writes a key file with the given mode and returns its path. This crate
+    /// has no `tempfile` dependency; the name is process- and test-unique.
+    fn key_file(name: &str, bytes: &[u8], mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "llm-proxy-auth-filter-test-kek-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn descriptor(name: &str) -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name(name)
+            .unwrap_or_else(|| panic!("{name} is compiled into proxy-api"))
+    }
+
+    fn str_val(value: &str) -> prost_reflect::Value {
+        prost_reflect::Value::String(value.to_string())
+    }
+
+    fn previous_key(id: &str, file: &str) -> prost_reflect::Value {
+        let mut msg = DynamicMessage::new(descriptor("llmproxy.filters.v0.PreviousCredentialKey"));
+        msg.set_field_by_name("id", str_val(id));
+        msg.set_field_by_name("file", str_val(file));
+        prost_reflect::Value::Message(msg)
+    }
+
+    /// `Authentication` with a `tenant_credentials` block; empty strings are
+    /// left unset, as proto3 would.
+    fn with_tenant_credentials(
+        file: &str,
+        id: &str,
+        previous: Vec<prost_reflect::Value>,
+    ) -> DynamicMessage {
+        let mut block = DynamicMessage::new(descriptor("llmproxy.filters.v0.TenantCredentials"));
+        block.set_field_by_name("encryption_key_file", str_val(file));
+        block.set_field_by_name("encryption_key_id", str_val(id));
+        block.set_field_by_name("previous_keys", prost_reflect::Value::List(previous));
+        let mut config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+        config.set_field_by_name("tenant_credentials", prost_reflect::Value::Message(block));
+        config
+    }
+
+    fn credentials_error_path(config: &DynamicMessage) -> String {
+        match parse_tenant_credentials(config).expect_err("config must be rejected") {
+            ConfigError::InvalidValue { field_path, .. } => field_path,
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    const KEK_BYTES: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn unset_tenant_credentials_parses_to_no_key_ring() {
+        let config = authentication(inline_secret("s"), vec![]);
+        assert!(parse_tenant_credentials(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_valid_tenant_credentials_block_loads_current_and_previous_keys() {
+        let current = key_file("valid-cur", KEK_BYTES, 0o600);
+        let previous = key_file("valid-prev", b"fedcba9876543210fedcba9876543210", 0o400);
+        let config = with_tenant_credentials(
+            current.to_str().unwrap(),
+            "kek-new",
+            vec![previous_key("kek-old", previous.to_str().unwrap())],
+        );
+        let ring = parse_tenant_credentials(&config).unwrap().expect("ring");
+        std::fs::remove_file(&current).ok();
+        std::fs::remove_file(&previous).ok();
+        // Seal under the current key, then check the ring also names both ids
+        // through its Debug (which never prints key bytes).
+        let sealed = crate::tenant_credential_crypto::seal(
+            &ring,
+            "t",
+            "p",
+            &crate::tenant_credential_crypto::TenantSecret::new("x".to_string()),
+        )
+        .unwrap();
+        assert_eq!(sealed.key_id, "kek-new");
+        assert!(format!("{ring:?}").contains("previous_count: 1"));
+    }
+
+    #[test]
+    fn tenant_credentials_missing_or_empty_fields_fail_with_their_dotted_paths() {
+        let file = key_file("fields", KEK_BYTES, 0o600);
+        let f = file.to_str().unwrap();
+        let base = "typed_config.tenant_credentials";
+        assert_eq!(
+            credentials_error_path(&with_tenant_credentials("", "kek", vec![])),
+            format!("{base}.encryption_key_file")
+        );
+        assert_eq!(
+            credentials_error_path(&with_tenant_credentials(f, "", vec![])),
+            format!("{base}.encryption_key_id")
+        );
+        assert_eq!(
+            credentials_error_path(&with_tenant_credentials(
+                f,
+                "kek",
+                vec![previous_key("", f)]
+            )),
+            format!("{base}.previous_keys[0].id")
+        );
+        assert_eq!(
+            credentials_error_path(&with_tenant_credentials(
+                f,
+                "kek",
+                vec![previous_key("old", f), previous_key("older", "")]
+            )),
+            format!("{base}.previous_keys[1].file")
+        );
+        std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn tenant_credentials_key_file_problems_fail_at_load_without_echoing_bytes() {
+        let base = "typed_config.tenant_credentials";
+        let loose = key_file("loose", KEK_BYTES, 0o644);
+        let short = key_file("short", &KEK_BYTES[..31], 0o600);
+        let good = key_file("good", KEK_BYTES, 0o600);
+
+        let config = with_tenant_credentials(loose.to_str().unwrap(), "kek", vec![]);
+        assert_eq!(
+            credentials_error_path(&config),
+            format!("{base}.encryption_key_file")
+        );
+        let config = with_tenant_credentials(short.to_str().unwrap(), "kek", vec![]);
+        let err = parse_tenant_credentials(&config).unwrap_err();
+        assert!(!format!("{err:?}").contains("0123456789abcdef"));
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { ref field_path, .. }
+                if field_path == &format!("{base}.encryption_key_file")
+        ));
+        let config = with_tenant_credentials("/nonexistent/llm-proxy-kek", "kek", vec![]);
+        assert_eq!(
+            credentials_error_path(&config),
+            format!("{base}.encryption_key_file")
+        );
+        // A bad previous key names its own index.
+        let config = with_tenant_credentials(
+            good.to_str().unwrap(),
+            "kek",
+            vec![previous_key("old", loose.to_str().unwrap())],
+        );
+        assert_eq!(
+            credentials_error_path(&config),
+            format!("{base}.previous_keys[0].file")
+        );
+        for path in [loose, short, good] {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn tenant_credentials_duplicate_key_id_fails_naming_the_previous_entry() {
+        let a = key_file("dup-a", KEK_BYTES, 0o600);
+        let b = key_file("dup-b", b"fedcba9876543210fedcba9876543210", 0o600);
+        let config = with_tenant_credentials(
+            a.to_str().unwrap(),
+            "same",
+            vec![previous_key("same", b.to_str().unwrap())],
+        );
+        assert_eq!(
+            credentials_error_path(&config),
+            "typed_config.tenant_credentials.previous_keys[0].id"
+        );
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn parse_config_carries_the_key_ring_and_a_bad_block_stops_the_config() {
+        let good = key_file("cfg-good", KEK_BYTES, 0o600);
+        let config = with_tenant_credentials(good.to_str().unwrap(), "kek", vec![]);
+        assert!(parse_config(&config).unwrap().credential_ring.is_some());
+        std::fs::remove_file(&good).ok();
+
+        let config = with_tenant_credentials("/nonexistent/llm-proxy-kek", "kek", vec![]);
+        assert!(parse_config(&config).is_err());
     }
 }

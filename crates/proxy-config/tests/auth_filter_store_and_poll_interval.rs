@@ -187,3 +187,52 @@ fn an_auth_filter_setting_poll_interval_seconds_lowers() {
         Some(90),
     );
 }
+
+#[test]
+fn an_auth_filter_configuring_tenant_credentials_lowers() {
+    let yaml = listener_yaml(
+        r#"                      tenant_credentials:
+                        encryption_key_file: /etc/llmproxy/credential-kek
+                        encryption_key_id: kek-2026-10
+                        previous_keys:
+                          - { id: kek-2026-04, file: /etc/llmproxy/credential-kek-prev }
+"#,
+    );
+    let snapshot = snapshot_from(&yaml)
+        .expect("a `tenant_credentials` block must survive the strict parse and surface walk");
+    let config = auth_config(&snapshot);
+    let block = config
+        .get_field_by_name("tenant_credentials")
+        .and_then(|v| v.as_message().cloned())
+        .expect("`tenant_credentials` must reach the filter's own config");
+    assert_eq!(
+        block
+            .get_field_by_name("encryption_key_id")
+            .and_then(|v| v.as_str().map(str::to_string)),
+        Some("kek-2026-10".to_string()),
+    );
+    assert_eq!(
+        block
+            .get_field_by_name("previous_keys")
+            .and_then(|v| v.as_list().map(<[_]>::len)),
+        Some(1),
+    );
+}
+
+#[test]
+fn unknown_fields_in_tenant_credentials_are_rejected_by_name() {
+    for extra in [
+        "                        bogus_field: 1\n",
+        "                        previous_keys:\n                          - { id: a, file: /f, bogus_field: 1 }\n",
+    ] {
+        let yaml = listener_yaml(&format!(
+            "                      tenant_credentials:\n                        encryption_key_file: /k\n                        encryption_key_id: kek\n{extra}"
+        ));
+        let err = snapshot_from(&yaml)
+            .expect_err("an unknown field under `tenant_credentials` must be rejected");
+        assert!(
+            format!("{err}").contains("bogus_field"),
+            "the error must name the offending field; got: {err}"
+        );
+    }
+}

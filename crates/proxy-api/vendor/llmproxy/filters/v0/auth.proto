@@ -103,6 +103,36 @@ message Authentication {
   // built-in default; OIDC discovery / background refresh is a later
   // step, not this field.
   repeated JwtProvider jwt_providers = 7;
+
+  // Key-encryption keys for tenant provider credentials (ADR-0007 decision 2).
+  // UNSET means the proxy cannot seal new tenant credentials and cannot
+  // decrypt stored ones: a tenant that already holds stored credentials then
+  // fails closed (503) instead of falling back to a platform key.
+  TenantCredentials tenant_credentials = 8;
+}
+
+// Where the proxy finds the keys that seal tenant provider credentials at rest.
+message TenantCredentials {
+  // Required. Path to a file holding exactly 32 raw bytes (an AES-256 key).
+  // The file must be a regular file with no group or other permission bits.
+  // New credentials are sealed under this key.
+  string encryption_key_file = 1;
+
+  // Required, non-empty. Names `encryption_key_file`'s key. It is stored in
+  // plaintext beside each sealed credential so a reader can pick the key.
+  string encryption_key_id = 2;
+
+  // Optional. Retired keys, kept decrypt-only so rows sealed before a
+  // rotation still open. Ids must be unique across this list and
+  // `encryption_key_id`.
+  repeated PreviousCredentialKey previous_keys = 3;
+}
+
+message PreviousCredentialKey {
+  // Required, non-empty.
+  string id = 1;
+  // Required. Same file rules as `TenantCredentials.encryption_key_file`.
+  string file = 2;
 }
 
 // Keeps every minted key, revocation, and tenant policy only in process

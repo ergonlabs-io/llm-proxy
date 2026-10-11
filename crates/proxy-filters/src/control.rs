@@ -42,7 +42,8 @@
 //!
 //! [`VirtualKeyAuthenticator`]: crate::auth::VirtualKeyAuthenticator
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -53,6 +54,11 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::auth::{HmacSecret, KeyId, KeyRecord, KeySet, TenantId, TenantPolicy};
 use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
+use crate::tenant_credential_crypto::{
+    self as credential_crypto, CryptoError, KeyRing, TenantSecret,
+};
+use proxy_http::tenant_credentials::{TenantCredential, TenantCredentialSet};
+use zeroize::Zeroizing;
 // Spend rows are keyed by a `PeriodKey`, which
 // `spend.rs` owns (it also owns the calendar-alignment logic that produces
 // one) -- `control.rs` only stores and retrieves values already computed
@@ -102,7 +108,7 @@ impl std::fmt::Debug for StoredKey {
 ///
 /// The encryption fields are plain bytes rather than the crypto module's own
 /// type, so the storage format does not change when that code does.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredTenantCredential {
     pub schema_version: u16,
     pub tenant: TenantId,
@@ -118,6 +124,28 @@ pub struct StoredTenantCredential {
     pub created_at: String,
     pub updated_at: String,
     pub verified_at: Option<String>,
+}
+
+// Rust note: hand-written `Debug`, like `StoredKey`'s. A derive would print
+// `nonce` and `ciphertext` byte-for-byte; they are not plaintext, but a log
+// line or panic message holding sealed credentials is exactly what a copied
+// database is, so only their lengths are rendered (ADR-0007 decision 2).
+impl std::fmt::Debug for StoredTenantCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredTenantCredential")
+            .field("schema_version", &self.schema_version)
+            .field("tenant", &self.tenant)
+            .field("provider", &self.provider)
+            .field("key_id", &self.key_id)
+            .field("nonce_len", &self.nonce.len())
+            .field("ciphertext_len", &self.ciphertext.len())
+            .field("last4", &self.last4)
+            .field("fingerprint", &self.fingerprint)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("verified_at", &self.verified_at)
+            .finish()
+    }
 }
 
 /// Everything one [`ControlPlaneStore::load`] call returns -- the whole
@@ -1906,6 +1934,200 @@ struct PolicyPoller {
     join: JoinHandle<()>,
 }
 
+/// The key-encryption keys for tenant provider credentials plus the secret
+/// that keys their fingerprints (ADR-0007 decision 2).
+///
+/// The fingerprint secret is the auth `hmac_secret` bytes. [`HmacSecret`]
+/// deliberately has no accessor back to its bytes, so the raw bytes are kept
+/// here, zeroized on drop, for exactly this one use.
+pub struct CredentialKeys {
+    ring: KeyRing,
+    fingerprint_secret: Zeroizing<Vec<u8>>,
+}
+
+impl CredentialKeys {
+    pub fn new(ring: KeyRing, hmac_secret: &[u8]) -> Self {
+        Self {
+            ring,
+            fingerprint_secret: Zeroizing::new(hmac_secret.to_vec()),
+        }
+    }
+}
+
+impl std::fmt::Debug for CredentialKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialKeys")
+            .field("ring", &self.ring)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the admin API may show about a stored tenant credential. There is no
+/// field that can hold the secret or the sealed bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TenantCredentialMetadata {
+    pub tenant: String,
+    pub provider: String,
+    pub last4: String,
+    pub fingerprint: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub verified_at: Option<String>,
+    pub policy_generation: u64,
+}
+
+impl TenantCredentialMetadata {
+    fn from_row(row: &StoredTenantCredential, policy_generation: u64) -> Self {
+        Self {
+            tenant: row.tenant.as_str().to_string(),
+            provider: row.provider.clone(),
+            last4: row.last4.clone(),
+            fingerprint: row.fingerprint.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            verified_at: row.verified_at.clone(),
+            policy_generation,
+        }
+    }
+}
+
+/// Why [`ControlPlane::store_tenant_secret`] did not store a credential.
+///
+/// A local enum rather than another [`StoreError`] variant: the admin layer
+/// must tell "this deployment has no credential keys" (a clear refusal the
+/// operator fixes in config) apart from a store outage (a retryable 5xx), and
+/// `StoreError` is matched exhaustively by every store backend.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CredentialStoreError {
+    /// `typed_config.tenant_credentials` is not configured.
+    NotConfigured,
+    Crypto(CryptoError),
+    Store(StoreError),
+}
+
+impl From<StoreError> for CredentialStoreError {
+    fn from(err: StoreError) -> Self {
+        CredentialStoreError::Store(err)
+    }
+}
+
+impl std::fmt::Display for CredentialStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialStoreError::NotConfigured => write!(
+                f,
+                "tenant credentials are not enabled: `tenant_credentials` is not configured \
+                 on the auth filter"
+            ),
+            CredentialStoreError::Crypto(err) => write!(f, "{err}"),
+            CredentialStoreError::Store(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for CredentialStoreError {}
+
+/// Suppression state for the "credential row is unusable" warning. Lives on
+/// the [`ControlPlane`], touched only during a rebuild, so the request path
+/// never sees it.
+#[derive(Default)]
+struct CredentialWarnings {
+    /// (tenant, provider, reason) triples already logged and still failing.
+    seen: Mutex<HashSet<(String, String, &'static str)>>,
+    emitted: AtomicU64,
+}
+
+/// Opens every stored row into the per-tenant sets the snapshot publishes
+/// (ADR-0007 decision 3). A row that cannot be opened becomes
+/// [`TenantCredential::Unusable`] and is never dropped, so that tenant fails
+/// closed instead of falling back to the platform key. This path fails
+/// closed but must be visible (AGENTS.md "Fail-open controls"): one warning
+/// per (tenant, provider, reason) until the row is usable again or gone, so a
+/// poller rebuilding every 48 s does not repeat it forever. Warnings name
+/// tenant, provider and key id only, never sealed or plaintext bytes.
+fn decrypt_credentials(
+    keys: Option<&CredentialKeys>,
+    warnings: &CredentialWarnings,
+    rows: Vec<StoredTenantCredential>,
+) -> HashMap<TenantId, Arc<TenantCredentialSet>> {
+    let mut by_tenant: HashMap<TenantId, HashMap<String, TenantCredential>> = HashMap::new();
+    let mut failing: HashSet<(String, String, &'static str)> = HashSet::new();
+    let mut to_warn = Vec::new();
+    for row in rows {
+        let outcome = match keys {
+            None => Err("key_ring_not_configured"),
+            Some(keys) => credential_crypto::open(
+                &keys.ring,
+                row.tenant.as_str(),
+                &row.provider,
+                &credential_crypto::SealedCredential {
+                    key_id: row.key_id.clone(),
+                    nonce: row.nonce,
+                    ciphertext: row.ciphertext.clone(),
+                },
+            )
+            .map_err(|err| match err {
+                CryptoError::UnknownKeyId(_) => "unknown_key_id",
+                _ => "decrypt_failed",
+            }),
+        };
+        let entry = match outcome {
+            Ok(secret) => TenantCredential::Usable(secret),
+            Err(reason) => {
+                let id = (
+                    row.tenant.as_str().to_string(),
+                    row.provider.clone(),
+                    reason,
+                );
+                failing.insert(id.clone());
+                to_warn.push((id, row.key_id.clone()));
+                TenantCredential::Unusable
+            }
+        };
+        by_tenant
+            .entry(row.tenant)
+            .or_default()
+            .insert(row.provider, entry);
+    }
+    {
+        let mut seen = warnings
+            .seen
+            .lock()
+            .expect("credential warning mutex poisoned");
+        // Forget entries that recovered, so a later regression warns again.
+        seen.retain(|id| failing.contains(id));
+        for (id, key_id) in to_warn {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            warnings.emitted.fetch_add(1, Ordering::Relaxed);
+            let (tenant, provider, reason) = id;
+            if reason == "key_ring_not_configured" {
+                tracing::warn!(
+                    tenant = tenant.as_str(),
+                    provider = provider.as_str(),
+                    key_id = key_id.as_str(),
+                    "tenant credentials are stored but `tenant_credentials` is not configured \
+                     on the auth filter; this tenant's requests fail closed (503)"
+                );
+            } else {
+                tracing::warn!(
+                    tenant = tenant.as_str(),
+                    provider = provider.as_str(),
+                    key_id = key_id.as_str(),
+                    reason,
+                    "stored tenant credential cannot be decrypted; this tenant's requests \
+                     fail closed (503)"
+                );
+            }
+        }
+    }
+    by_tenant
+        .into_iter()
+        .map(|(tenant, set)| (tenant, Arc::new(TenantCredentialSet::new(set))))
+        .collect()
+}
+
 /// Owns the store, the operator's HMAC secret, the config bootstrap keys, and
 /// the published snapshot. See the module doc for the full seam and the
 /// boot/refresh fail-closed split.
@@ -1928,6 +2150,12 @@ pub struct ControlPlane {
     /// [`Self::snapshot_age`].
     last_reconciled_at: Mutex<Instant>,
     poller: Mutex<Option<PolicyPoller>>,
+    /// Key-encryption keys for tenant provider credentials (ADR-0007
+    /// decision 2). `None` means `typed_config.tenant_credentials` is not
+    /// configured: stored rows then decrypt to `Unusable` and nothing can be
+    /// sealed.
+    credential_keys: Option<CredentialKeys>,
+    credential_warnings: CredentialWarnings,
 }
 
 impl ControlPlane {
@@ -1944,6 +2172,20 @@ impl ControlPlane {
         secret: HmacSecret,
         bootstrap_keys: KeySet,
     ) -> Result<Self, StoreError> {
+        Self::new_with_credential_keys(store, secret, bootstrap_keys, None)
+    }
+
+    /// As [`Self::new`], with the key-encryption keys that seal and open
+    /// tenant provider credentials. A separate constructor rather than a new
+    /// `new` parameter so the many existing call sites, which have no tenant
+    /// credentials, stay unchanged.
+    pub fn new_with_credential_keys(
+        store: Box<dyn ControlPlaneStore>,
+        secret: HmacSecret,
+        bootstrap_keys: KeySet,
+        credential_keys: Option<CredentialKeys>,
+    ) -> Result<Self, StoreError> {
+        let credential_warnings = CredentialWarnings::default();
         let store: Arc<dyn ControlPlaneStore> = Arc::from(store);
         // Read the generation stamp BEFORE `load()`, not after.
         //
@@ -1968,7 +2210,12 @@ impl ControlPlane {
         // not a missed revocation.
         let generation = store.policy_generation().ok();
         let loaded = store.load()?;
-        let snapshot = Self::merge(&bootstrap_keys, loaded);
+        let snapshot = Self::build_snapshot(
+            &bootstrap_keys,
+            credential_keys.as_ref(),
+            &credential_warnings,
+            loaded,
+        );
         // Rust note: `ArcSwap::new` takes the initial `Arc<T>` directly --
         // unlike `rebuild` below, there is no "leave it alone on error"
         // question at construction time, because there is nothing published
@@ -1983,6 +2230,8 @@ impl ControlPlane {
             last_generation: Mutex::new(generation),
             last_reconciled_at: Mutex::new(Instant::now()),
             poller: Mutex::new(None),
+            credential_keys,
+            credential_warnings,
         })
     }
 
@@ -2019,7 +2268,7 @@ impl ControlPlane {
         let generation = self.store.policy_generation().ok();
         match self.store.load() {
             Ok(loaded) => {
-                let snapshot = Self::merge(&self.bootstrap_keys, loaded);
+                let snapshot = self.snapshot_from(loaded);
                 self.published.store(Arc::new(snapshot));
                 *self
                     .last_generation
@@ -2069,7 +2318,7 @@ impl ControlPlane {
             return Ok(false);
         }
         let loaded = self.store.load()?;
-        let snapshot = Self::merge(&self.bootstrap_keys, loaded);
+        let snapshot = self.snapshot_from(loaded);
         self.published.store(Arc::new(snapshot));
         *self
             .last_generation
@@ -2197,6 +2446,13 @@ impl ControlPlane {
     /// bouncing the proxy. See `spend_limit_filter`'s module doc.
     pub fn store(&self) -> Arc<dyn ControlPlaneStore> {
         Arc::clone(&self.store)
+    }
+
+    /// How many unusable-credential warnings have been emitted, for tests of
+    /// the suppression.
+    #[cfg(test)]
+    fn credential_warnings_emitted(&self) -> u64 {
+        self.credential_warnings.emitted.load(Ordering::Relaxed)
     }
 
     /// The HMAC secret this control plane was built with. Unused by the
@@ -2338,12 +2594,8 @@ impl ControlPlane {
     /// that could claim to reflect it (see the module doc's boot-vs-refresh
     /// section).
     ///
-    /// Republish deliberately does NOT decrypt the row yet: ADR-0007 §3's
-    /// decryption into [`ControlPlaneSnapshot::tenant_credentials`] lands as
-    /// its own change, and until then `rebuild` leaves that map empty -- so
-    /// today's rebuild has only one honest job: keeping `last_generation`
-    /// in step with the store, exactly as every other wrapper's republish
-    /// does.
+    /// Takes an already-sealed row. Callers holding a plaintext key use
+    /// [`Self::store_tenant_secret`], which seals it first.
     pub fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
         self.store.put_tenant_credential(rec)?;
         self.rebuild();
@@ -2363,6 +2615,89 @@ impl ControlPlane {
         self.store.delete_tenant_credential(tenant, provider)?;
         self.rebuild();
         Ok(())
+    }
+
+    /// Seals `secret` under the current key-encryption key, stores it as
+    /// (`tenant`, `provider`)'s credential row, republishes, and returns the
+    /// row's metadata (ADR-0007 decisions 2 and 3). The plaintext is never
+    /// part of the return value.
+    ///
+    /// Replacing an existing row keeps its `created_at`. `verified` records
+    /// that the caller confirmed the key works upstream; the new row's
+    /// `verified_at` is set only then, because a replaced secret has not been
+    /// verified just because its predecessor was.
+    ///
+    /// Refuses with [`CredentialStoreError::NotConfigured`] when no
+    /// key-encryption keys are configured: storing plaintext, or a row nothing
+    /// could ever open, would both be worse than a refusal.
+    pub fn store_tenant_secret(
+        &self,
+        tenant: &TenantId,
+        provider: &str,
+        secret: &TenantSecret,
+        verified: bool,
+    ) -> Result<TenantCredentialMetadata, CredentialStoreError> {
+        let keys = self
+            .credential_keys
+            .as_ref()
+            .ok_or(CredentialStoreError::NotConfigured)?;
+        let sealed = credential_crypto::seal(&keys.ring, tenant.as_str(), provider, secret)
+            .map_err(CredentialStoreError::Crypto)?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // Admin-path read of the whole store, only to find the row being
+        // replaced. Request workers never reach this.
+        let created_at = self
+            .store
+            .load()?
+            .tenant_credentials
+            .into_iter()
+            .find(|row| &row.tenant == tenant && row.provider == provider)
+            .map(|row| row.created_at)
+            .unwrap_or_else(|| now.clone());
+        let row = StoredTenantCredential {
+            schema_version: TENANT_CREDENTIALS_SCHEMA_VERSION,
+            tenant: tenant.clone(),
+            provider: provider.to_string(),
+            key_id: sealed.key_id,
+            nonce: sealed.nonce,
+            ciphertext: sealed.ciphertext,
+            last4: credential_crypto::last4(secret),
+            fingerprint: credential_crypto::fingerprint(&keys.fingerprint_secret, secret),
+            created_at,
+            updated_at: now.clone(),
+            verified_at: verified.then_some(now),
+        };
+        self.put_tenant_credential(&row)?;
+        // Read after the write so the stamp is the one this write produced.
+        // A failed read degrades to 0 rather than failing a write that
+        // already landed.
+        let policy_generation = self.store.policy_generation().unwrap_or(0);
+        Ok(TenantCredentialMetadata::from_row(&row, policy_generation))
+    }
+
+    /// Metadata for every credential `tenant` holds, sorted by provider,
+    /// without decrypting anything.
+    ///
+    /// Read from the store, not the snapshot: the snapshot holds only
+    /// decrypted secrets and adding a metadata map to it would change a type
+    /// every filter test constructs. This is an admin GET, never on the
+    /// request path, and reading the store means the answer reflects the
+    /// latest write even before the next republish.
+    pub fn tenant_credential_metadata(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<TenantCredentialMetadata>, StoreError> {
+        let policy_generation = self.store.policy_generation().unwrap_or(0);
+        let mut out: Vec<TenantCredentialMetadata> = self
+            .store
+            .load()?
+            .tenant_credentials
+            .iter()
+            .filter(|row| &row.tenant == tenant)
+            .map(|row| TenantCredentialMetadata::from_row(row, policy_generation))
+            .collect();
+        out.sort_by(|a, b| a.provider.cmp(&b.provider));
+        Ok(out)
     }
 
     /// Sets or clears a budget for an existing stable key identity. The
@@ -2451,6 +2786,30 @@ impl ControlPlane {
 
         self.rebuild();
         Ok(())
+    }
+
+    fn snapshot_from(&self, loaded: StoredControlPlane) -> ControlPlaneSnapshot {
+        Self::build_snapshot(
+            &self.bootstrap_keys,
+            self.credential_keys.as_ref(),
+            &self.credential_warnings,
+            loaded,
+        )
+    }
+
+    /// [`Self::merge`] plus decryption of the tenant credential rows
+    /// (ADR-0007 decision 3). An associated function rather than a method so
+    /// [`Self::new_with_credential_keys`] can call it before `self` exists.
+    fn build_snapshot(
+        bootstrap_keys: &KeySet,
+        credential_keys: Option<&CredentialKeys>,
+        warnings: &CredentialWarnings,
+        mut loaded: StoredControlPlane,
+    ) -> ControlPlaneSnapshot {
+        let rows = std::mem::take(&mut loaded.tenant_credentials);
+        let mut snapshot = Self::merge(bootstrap_keys, loaded);
+        snapshot.tenant_credentials = decrypt_credentials(credential_keys, warnings, rows);
+        snapshot
     }
 
     /// Bootstrap keys layered under the store's, then the store's layered on
@@ -5703,14 +6062,18 @@ mod tests {
             Ok(false),
             "put_tenant_credential must republish exactly like set_policy/set_budget"
         );
-        // Decryption into the snapshot is deliberately NOT wired yet
-        // (ADR-0007 §3 lands as its own change) -- this pins that rebuild
-        // keeps leaving `tenant_credentials` empty rather than half-filling
-        // it with rows it never decrypted.
-        assert!(
-            cp.handle().load().tenant_credentials.is_empty(),
-            "ControlPlaneSnapshot.tenant_credentials must stay empty until decryption lands"
-        );
+        // No key ring is configured here, so the stored row must appear as
+        // Unusable rather than be dropped (ADR-0007 decision 3).
+        let snapshot = cp.handle().load();
+        let set = snapshot
+            .tenant_credentials
+            .get(&TenantId::new("tenant-a"))
+            .expect("a stored row must keep its tenant in tenant mode");
+        assert!(matches!(
+            set.get("provider-x"),
+            Some(TenantCredential::Unusable)
+        ));
+        drop(snapshot);
 
         cp.delete_tenant_credential(&TenantId::new("tenant-a"), "provider-x")
             .expect("delete_tenant_credential must succeed");
@@ -5721,5 +6084,282 @@ mod tests {
             Err(StoreError::NotFound),
             "the wrapper must propagate the store's NotFound unchanged"
         );
+    }
+
+    // --- tenant credential decryption and storage (ADR-0007 decisions 2, 3)
+
+    /// Distinctive so any Debug, serde, or on-disk leak is visible to the
+    /// assertions below.
+    const CREDENTIAL_SENTINEL: &str = "sk-or-v1-SENTINEL-plaintext-do-not-leak";
+    const KEK_A: [u8; 32] = *b"0123456789abcdef0123456789abcdef";
+    const KEK_B: [u8; 32] = *b"fedcba9876543210fedcba9876543210";
+
+    fn credential_keys(current: (&str, [u8; 32]), previous: &[(&str, [u8; 32])]) -> CredentialKeys {
+        use crate::tenant_credential_crypto::CredentialKek;
+        let ring = KeyRing::new(
+            CredentialKek::from_bytes(current.0, current.1).unwrap(),
+            previous
+                .iter()
+                .map(|(id, bytes)| CredentialKek::from_bytes(id, *bytes).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        CredentialKeys::new(ring, b"operator-secret")
+    }
+
+    fn control_plane_with(
+        store: Box<dyn ControlPlaneStore>,
+        keys: Option<CredentialKeys>,
+    ) -> ControlPlane {
+        ControlPlane::new_with_credential_keys(
+            store,
+            HmacSecret::new(b"operator-secret"),
+            KeySet::new(),
+            keys,
+        )
+        .expect("store must load")
+    }
+
+    fn in_memory_cp(keys: Option<CredentialKeys>) -> ControlPlane {
+        control_plane_with(Box::new(InMemoryControlPlaneStore::default()), keys)
+    }
+
+    fn secret_for(cp: &ControlPlane, tenant: &str, provider: &str) -> Option<String> {
+        let snapshot = cp.handle().load();
+        let set = snapshot.tenant_credentials.get(&TenantId::new(tenant))?;
+        match set.get(provider)? {
+            TenantCredential::Usable(secret) => Some(secret.expose().to_string()),
+            TenantCredential::Unusable => None,
+        }
+    }
+
+    fn is_unusable(cp: &ControlPlane, tenant: &str, provider: &str) -> bool {
+        let snapshot = cp.handle().load();
+        matches!(
+            snapshot
+                .tenant_credentials
+                .get(&TenantId::new(tenant))
+                .and_then(|set| set.get(provider)),
+            Some(TenantCredential::Unusable)
+        )
+    }
+
+    fn sentinel() -> TenantSecret {
+        TenantSecret::new(CREDENTIAL_SENTINEL.to_string())
+    }
+
+    #[test]
+    fn stored_secret_rebuilds_as_usable_with_the_same_plaintext() {
+        let cp = in_memory_cp(Some(credential_keys(("k1", KEK_A), &[])));
+        let tenant = TenantId::new("tenant-a");
+        cp.store_tenant_secret(&tenant, "openrouter", &sentinel(), false)
+            .unwrap();
+        assert_eq!(
+            secret_for(&cp, "tenant-a", "openrouter").as_deref(),
+            Some(CREDENTIAL_SENTINEL)
+        );
+    }
+
+    #[test]
+    fn a_row_copied_to_another_tenant_is_unusable_not_dropped() {
+        let cp = in_memory_cp(Some(credential_keys(("k1", KEK_A), &[])));
+        cp.store_tenant_secret(&TenantId::new("tenant-a"), "openrouter", &sentinel(), false)
+            .unwrap();
+        let mut copied = cp.store().load().unwrap().tenant_credentials.remove(0);
+        copied.tenant = TenantId::new("tenant-b");
+        cp.put_tenant_credential(&copied).unwrap();
+
+        assert!(
+            is_unusable(&cp, "tenant-b", "openrouter"),
+            "AAD binds the row to its tenant; a copy must be Unusable, not absent and not Usable"
+        );
+        assert_eq!(
+            secret_for(&cp, "tenant-a", "openrouter").as_deref(),
+            Some(CREDENTIAL_SENTINEL),
+            "the original tenant is unaffected"
+        );
+    }
+
+    #[test]
+    fn a_row_sealed_under_an_unknown_key_id_is_unusable() {
+        let cp = in_memory_cp(Some(credential_keys(("k1", KEK_A), &[])));
+        // `credential_row` stamps key id `kek-one`, which the ring lacks.
+        cp.put_tenant_credential(&credential_row("tenant-a", "openrouter", "one"))
+            .unwrap();
+        assert!(is_unusable(&cp, "tenant-a", "openrouter"));
+        assert_eq!(cp.credential_warnings_emitted(), 1);
+    }
+
+    #[test]
+    fn rotation_keeps_old_rows_openable_only_while_the_old_key_is_listed() {
+        let path = temp_db_path("credential-rotation");
+        let tenant = TenantId::new("tenant-a");
+        {
+            let cp = control_plane_with(
+                Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+                Some(credential_keys(("k1", KEK_A), &[])),
+            );
+            cp.store_tenant_secret(&tenant, "openrouter", &sentinel(), false)
+                .unwrap();
+        }
+        {
+            let cp = control_plane_with(
+                Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+                Some(credential_keys(("k2", KEK_B), &[("k1", KEK_A)])),
+            );
+            assert_eq!(
+                secret_for(&cp, "tenant-a", "openrouter").as_deref(),
+                Some(CREDENTIAL_SENTINEL),
+                "a row sealed under a previous key must still open"
+            );
+        }
+        {
+            let cp = control_plane_with(
+                Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+                Some(credential_keys(("k2", KEK_B), &[])),
+            );
+            assert!(
+                is_unusable(&cp, "tenant-a", "openrouter"),
+                "dropping the old key from the ring must fail the row closed"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn stored_rows_without_a_key_ring_are_unusable_and_warn_once() {
+        let cp = in_memory_cp(None);
+        cp.put_tenant_credential(&credential_row("tenant-a", "openrouter", "one"))
+            .unwrap();
+        assert!(is_unusable(&cp, "tenant-a", "openrouter"));
+        assert_eq!(cp.credential_warnings_emitted(), 1);
+        cp.rebuild();
+        cp.rebuild();
+        assert!(is_unusable(&cp, "tenant-a", "openrouter"));
+        assert_eq!(
+            cp.credential_warnings_emitted(),
+            1,
+            "repeat rebuilds must not re-warn for the same (tenant, provider, reason)"
+        );
+        // A second row is a new offender and warns once.
+        cp.put_tenant_credential(&credential_row("tenant-a", "anthropic", "two"))
+            .unwrap();
+        assert_eq!(cp.credential_warnings_emitted(), 2);
+    }
+
+    #[test]
+    fn a_recovered_row_warns_again_if_it_regresses() {
+        let cp = in_memory_cp(None);
+        cp.put_tenant_credential(&credential_row("tenant-a", "openrouter", "one"))
+            .unwrap();
+        assert_eq!(cp.credential_warnings_emitted(), 1);
+        cp.delete_tenant_credential(&TenantId::new("tenant-a"), "openrouter")
+            .unwrap();
+        cp.put_tenant_credential(&credential_row("tenant-a", "openrouter", "one"))
+            .unwrap();
+        assert_eq!(cp.credential_warnings_emitted(), 2);
+    }
+
+    #[test]
+    fn replacing_a_secret_keeps_created_at_and_changes_fingerprint_and_last4() {
+        let cp = in_memory_cp(Some(credential_keys(("k1", KEK_A), &[])));
+        let tenant = TenantId::new("tenant-a");
+        let first = cp
+            .store_tenant_secret(&tenant, "openrouter", &sentinel(), false)
+            .unwrap();
+        assert_eq!(first.last4, "leak");
+        assert_eq!(first.verified_at, None);
+
+        // Backdate the stored row so a regression that stamps `created_at`
+        // afresh cannot hide inside one clock second.
+        let mut row = cp.store().load().unwrap().tenant_credentials.remove(0);
+        row.created_at = "2020-01-01T00:00:00Z".to_string();
+        cp.put_tenant_credential(&row).unwrap();
+
+        let second = cp
+            .store_tenant_secret(
+                &tenant,
+                "openrouter",
+                &TenantSecret::new("sk-replacement-9999".to_string()),
+                true,
+            )
+            .unwrap();
+        assert_eq!(second.created_at, "2020-01-01T00:00:00Z");
+        assert_ne!(second.updated_at, "2020-01-01T00:00:00Z");
+        assert_eq!(second.last4, "9999");
+        assert_ne!(second.fingerprint, first.fingerprint);
+        assert!(second.verified_at.is_some());
+        assert!(second.policy_generation >= first.policy_generation);
+        assert_eq!(
+            secret_for(&cp, "tenant-a", "openrouter").as_deref(),
+            Some("sk-replacement-9999")
+        );
+        assert_eq!(
+            cp.tenant_credential_metadata(&tenant).unwrap(),
+            vec![second]
+        );
+    }
+
+    #[test]
+    fn metadata_and_stored_row_never_render_the_plaintext() {
+        let cp = in_memory_cp(Some(credential_keys(("k1", KEK_A), &[])));
+        let meta = cp
+            .store_tenant_secret(&TenantId::new("tenant-a"), "openrouter", &sentinel(), false)
+            .unwrap();
+        assert!(!format!("{meta:?}").contains("SENTINEL"));
+        assert!(!serde_json::to_string(&meta).unwrap().contains("SENTINEL"));
+        let row = cp.store().load().unwrap().tenant_credentials.remove(0);
+        let debug = format!("{row:?}");
+        assert!(!debug.contains("SENTINEL"));
+        assert!(
+            !debug.contains("ciphertext: ["),
+            "Debug must print lengths, not sealed bytes: {debug}"
+        );
+        assert!(!format!("{:?}", cp.credential_keys).contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn store_tenant_secret_without_a_key_ring_is_refused_and_writes_nothing() {
+        let cp = in_memory_cp(None);
+        let err = cp
+            .store_tenant_secret(&TenantId::new("tenant-a"), "openrouter", &sentinel(), false)
+            .unwrap_err();
+        assert_eq!(err, CredentialStoreError::NotConfigured);
+        assert!(cp.store().load().unwrap().tenant_credentials.is_empty());
+    }
+
+    #[test]
+    fn redb_round_trips_a_stored_secret_and_never_writes_the_plaintext_to_disk() {
+        let path = temp_db_path("credential-e2e");
+        let tenant = TenantId::new("tenant-a");
+        {
+            let cp = control_plane_with(
+                Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+                Some(credential_keys(("k1", KEK_A), &[])),
+            );
+            cp.store_tenant_secret(&tenant, "openrouter", &sentinel(), false)
+                .unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes
+                .windows(CREDENTIAL_SENTINEL.len())
+                .any(|w| w == CREDENTIAL_SENTINEL.as_bytes()),
+            "the database file must not contain the plaintext"
+        );
+        assert!(
+            bytes.windows(2).any(|w| w == b"k1"),
+            "sanity: the scan reads the rows it is meant to protect"
+        );
+        let cp = control_plane_with(
+            Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+            Some(credential_keys(("k1", KEK_A), &[])),
+        );
+        assert_eq!(
+            secret_for(&cp, "tenant-a", "openrouter").as_deref(),
+            Some(CREDENTIAL_SENTINEL)
+        );
+        drop(cp);
+        std::fs::remove_file(&path).ok();
     }
 }

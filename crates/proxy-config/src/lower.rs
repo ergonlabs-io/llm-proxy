@@ -460,7 +460,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "shared",
             "poll_interval_seconds",
             "jwt_providers",
+            "tenant_credentials",
         ],
+        "llmproxy.filters.v0.TenantCredentials" => {
+            &["encryption_key_file", "encryption_key_id", "previous_keys"]
+        }
+        "llmproxy.filters.v0.PreviousCredentialKey" => &["id", "file"],
         "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
         "llmproxy.filters.v0.JwtProvider" => &[
             "tenant_claim",
