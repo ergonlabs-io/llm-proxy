@@ -59,9 +59,15 @@ impl AuthorizationClient for GrpcAuthorizationClient {
                 .max_encoding_message_size(MAX_MESSAGE_BYTES);
             let mut request = tonic::Request::new(request);
             request.set_timeout(timeout);
+            let started = tokio::time::Instant::now();
             match tokio::time::timeout(timeout, client.check(request)).await {
                 Err(_) => error(AuthorizationError::Timeout),
-                Ok(Err(s)) => error(if is_timeout(&s) {
+                // The service enforces the same `grpc-timeout` and may answer
+                // first (tonic sends CANCELLED, without the source error). Under
+                // load that answer can be ready when this task wakes, and
+                // `timeout` polls the call before its timer, so judge by our
+                // own deadline rather than by which side noticed it first.
+                Ok(Err(s)) => error(if is_timeout(&s) || started.elapsed() >= timeout {
                     AuthorizationError::Timeout
                 } else {
                     AuthorizationError::Transport
@@ -535,11 +541,28 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn grpc_v3_deadline_and_saturation_are_bounded_and_drop_releases_capacity() {
         let service = TestService::spawn(Mode::Stall).await;
-        let client = GrpcAuthorizationClient::new(
+        let warm = GrpcAuthorizationClient::new(
             service.address,
-            Duration::from_millis(500),
-            Duration::from_millis(500),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
         );
+        // Shares `warm`'s connection, so the deadline below is spent stalled in
+        // the service rather than connecting to it.
+        let client = GrpcAuthorizationClient {
+            channel: warm.channel.clone(),
+            permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            timeout: Duration::from_millis(500),
+        };
+        let warming = tokio::spawn(warm.check(AuthorizationRequest::default()));
+        tokio::time::timeout(Duration::from_secs(5), service.entered.notified())
+            .await
+            .unwrap();
+        service.release.notify_one();
+        let warmed = tokio::time::timeout(Duration::from_secs(5), warming)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(warmed.decision, AuthorizationDecision::Allow(_)));
         let pending: Vec<_> = (0..MAX_IN_FLIGHT)
             .map(|_| client.check(AuthorizationRequest::default()))
             .collect();
@@ -548,10 +571,16 @@ mod tests {
             AuthorizationDecision::Error(AuthorizationError::Saturation)
         ));
         drop(pending);
-        assert!(matches!(
-            client.check(AuthorizationRequest::default()).await.decision,
-            AuthorizationDecision::Error(AuthorizationError::Timeout)
-        ));
+        let decision = client.check(AuthorizationRequest::default()).await.decision;
+        assert!(
+            matches!(
+                decision,
+                AuthorizationDecision::Error(AuthorizationError::Timeout)
+            ),
+            "{decision:?}"
+        );
+        // The dropped checks never sent an RPC; this one reached the stall.
+        assert_eq!(service.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         let next = client.check(AuthorizationRequest::default());
         drop(next);
         let next = (0..MAX_IN_FLIGHT)
