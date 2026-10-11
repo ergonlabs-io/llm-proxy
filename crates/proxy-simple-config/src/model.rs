@@ -272,6 +272,80 @@ pub struct Auth {
     /// warns rather than silently accepting it.
     #[serde(default)]
     pub keys: Vec<AuthKey>,
+    /// Where minted keys, revocations, and tenant policy live. Absent means
+    /// `in_memory`, the same default Envoy mode uses, so every config written
+    /// before this field existed lowers unchanged.
+    #[serde(default)]
+    pub store: Option<AuthStore>,
+}
+
+/// `auth.store`: exactly one of three members, mirroring the `store` oneof on
+/// `llmproxy.filters.v0.Authentication`. Only these three are accepted --
+/// Envoy mode's `store` has no other members, so the dialect exposes no more.
+/// Exactly-one is checked in `lower.rs`, the same way `hmac_secret` /
+/// `hmac_secret_file` is, so a doubled or empty `store` is reported at
+/// `auth.store` by name.
+///
+/// Rust note: this is a struct of `Option`s rather than a serde enum. An
+/// externally tagged enum would read as `store: !persistent {...}` in YAML
+/// (serde_yaml's tag syntax), not the `store: { persistent: {...} }` every
+/// other dialect block uses.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthStore {
+    /// Keys and policy live only for the life of the process. Written as
+    /// `in_memory: {}`; the empty map exists so the shape stays a map.
+    #[serde(default)]
+    pub in_memory: Option<InMemoryStore>,
+    #[serde(default)]
+    pub persistent: Option<PersistentStore>,
+    #[serde(default)]
+    pub shared: Option<SharedStore>,
+}
+
+/// `auth.store.in_memory`. Takes no fields.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InMemoryStore {}
+
+/// `auth.store.persistent`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentStore {
+    /// Path to the redb database file. Created if it does not exist. Required
+    /// and non-empty: an empty path is an error, never a silent fall back to
+    /// `in_memory`, which would lose every key minted at runtime.
+    pub path: String,
+}
+
+/// `auth.store.shared`. Mirrors `hmac_secret`/`hmac_secret_file`: exactly one
+/// of `url`/`url_file`, because a Redis URL may embed a password and so
+/// belongs in the environment or a mounted file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedStore {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub url_file: Option<String>,
+    /// Prefixes every Redis key this store touches. Unset or empty means the
+    /// built-in default, same as Envoy mode.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+// Rust note: hand-written rather than derived, for the same reason
+// `proxy-filters`' `StoreSpec` has a hand-written `Debug`: a derived impl would
+// print `url`, and a Redis URL may carry a password. `Auth` derives `Debug`
+// and holds this struct, so the redaction has to live here.
+impl std::fmt::Debug for SharedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedStore")
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("url_file", &self.url_file)
+            .field("namespace", &self.namespace)
+            .finish()
+    }
 }
 
 /// One entry in `auth.keys`. The plaintext key never appears in

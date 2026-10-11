@@ -264,17 +264,17 @@ every write plus the two financial/identity reads, `GET .../spend` and
 See [Spend policies and recovery](/limits-and-budgets/spend-policies/) for
 rotation, permanent revocation tombstones, API versioning, and migration.
 
-Keys and tenant policy live in one of three stores, selected by
-the auth store oneof (`in_memory`, `persistent`, or `shared`) on the `llmproxy.auth` filter. The default,
-`in_memory`, holds everything only for the life of the process. Setting
-`typed_config.persistent.path` selects `RedbControlPlaneStore`, an
-embedded on-disk store that survives a restart of that one process
-(`crates/proxy-filters/src/auth_filter.rs:182-213`, `StoreSpec` and
-`parse_store`). This selection is Envoy-mode only: the dialect's schema
-(`schema/llmproxy-v0.schema.json`) has no `store` field under `auth`, and its
-lowering only ever emits `hmac_secret` and `virtual_keys`
-(`crates/proxy-simple-config/src/lower.rs:1367-1368`) — a config written in
-the `llmproxy` dialect always runs the in-memory store. The admin write API
+Keys and tenant policy live in one of three stores. The default,
+`in_memory`, holds everything only for the life of the process. `persistent`
+(a `path`) selects an embedded `redb` file that survives a restart of that
+one process. `shared` (a Redis `url` or `url_file`, optional `namespace`)
+selects Redis, which every replica shares.
+
+In the `llmproxy` dialect, set `auth.store` to one of those shapes; see
+[Configuration file](/configuration/configuration-file/). In Envoy mode the
+same choice is the `store` oneof on the `llmproxy.auth` filter
+(`in_memory`, `persistent.path`, `shared.url`). The store is fixed at
+startup, so changing it takes a restart. The admin write API
 itself works the same way regardless of dialect, since it talks to whichever
 store the chain built.
 

@@ -68,7 +68,7 @@
       "items": { "$ref": "#/$defs/Route" }
     },
     "limits": {
-      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a load-time warning naming the exact field. NOTE: limits are enforced PER PROXY INSTANCE in v0, and a fleet-wide token rate limit has no store to be enforced against. Do not read the shared `ControlPlaneStore` as covering this: it reconciles CURRENCY SPEND for the Envoy-mode `llmproxy.spend_limit` filter, holds no token-rate-limit counters, and is not reachable from this dialect at all. Two replicas each admit up to `tokens_per_minute`.",
+      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a load-time warning naming the exact field. NOTE: limits are enforced PER PROXY INSTANCE in v0, and a fleet-wide token rate limit has no store to be enforced against. Do not read the shared `ControlPlaneStore` as covering this: it reconciles CURRENCY SPEND for the Envoy-mode `llmproxy.spend_limit` filter and holds no token-rate-limit counters. `auth.store` selects that same store type for minted keys and tenant policy only, and no `limits` entry reads it, so `auth.store: shared` does not make a token limit fleet-wide. Two replicas each admit up to `tokens_per_minute`.",
       "type": "array",
       "items": { "$ref": "#/$defs/Limit" }
     },
@@ -151,11 +151,53 @@
           "default": [],
           "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning.",
           "items": { "$ref": "#/$defs/AuthKey" }
+        },
+        "store": {
+          "description": "Where minted keys, revocations, and tenant policy live. Absent means `in_memory`, which keeps them only for the life of the process. Exactly one of the three shapes below, the same three the Envoy-mode `llmproxy.auth` filter accepts. The store is fixed at startup: changing it takes a restart, not a `SIGHUP` reload.",
+          "$ref": "#/$defs/AuthStore"
         }
       },
       "oneOf": [
         { "required": ["hmac_secret"], "not": { "required": ["hmac_secret_file"] } },
         { "required": ["hmac_secret_file"], "not": { "required": ["hmac_secret"] } }
+      ]
+    },
+    "AuthStore": {
+      "type": "object",
+      "description": "Exactly one of `in_memory`, `persistent`, or `shared`.",
+      "additionalProperties": false,
+      "properties": {
+        "in_memory": { "type": "object", "additionalProperties": false, "description": "Keys and policy live only for the life of the process. Takes no fields." },
+        "persistent": { "$ref": "#/$defs/AuthStorePersistent" },
+        "shared": { "$ref": "#/$defs/AuthStoreShared" }
+      },
+      "oneOf": [
+        { "required": ["in_memory"] },
+        { "required": ["persistent"] },
+        { "required": ["shared"] }
+      ]
+    },
+    "AuthStorePersistent": {
+      "type": "object",
+      "description": "Keys and policy survive a restart in an embedded `redb` file. The file is created if missing and takes a lock, so one process owns it at a time.",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "description": "Path to the `redb` database file." }
+      }
+    },
+    "AuthStoreShared": {
+      "type": "object",
+      "description": "Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`.",
+      "additionalProperties": false,
+      "properties": {
+        "url": { "type": "string", "minLength": 1, "description": "The Redis connection URL, e.g. `redis://:${REDIS_PASSWORD}@host:6379/0`. Use `${ENV_VAR}` interpolation rather than inlining a password." },
+        "url_file": { "type": "string", "minLength": 1, "description": "Read the Redis URL from this file (trailing whitespace trimmed; read once at startup)." },
+        "namespace": { "type": "string", "description": "Prefixes every Redis key this store touches, so two deployments can share one Redis. Unset or empty uses the built-in default, `llmproxy`." }
+      },
+      "oneOf": [
+        { "required": ["url"], "not": { "required": ["url_file"] } },
+        { "required": ["url_file"], "not": { "required": ["url"] } }
       ]
     },
     "AuthKey": {

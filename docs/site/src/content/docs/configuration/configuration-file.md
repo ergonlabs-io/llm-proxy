@@ -105,6 +105,13 @@ present at all.
 | `hmac_secret` | string | one of `hmac_secret`/`hmac_secret_file` | — | The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` rather than inlining it. |
 | `hmac_secret_file` | string (path) | one of `hmac_secret`/`hmac_secret_file` | — | Read the HMAC secret from a file, trimmed of trailing whitespace. Not watched automatically, but re-read on a `SIGHUP` config reload, same as `providers.<name>.api_key_file` above. |
 | `keys` | array of `AuthKey` | no | `[]` | Configured virtual keys. An empty list authenticates nothing, so `auth` present with no keys refuses every request — legal, and almost certainly a mistake, so it produces a load-time warning. |
+| `store` | `AuthStore` | no | `in_memory` | Where keys minted through the admin API and tenant policy live. Exactly one of `in_memory: {}`, `persistent: {path}`, or `shared: {url \| url_file, namespace}`. Fixed at startup: changing it takes a restart. |
+
+`store.persistent.path` is an embedded `redb` file, created if missing; an empty
+path is an error. `store.shared` is Redis: exactly one of `url` (inline, use
+`${ENV_VAR}` for any password) or `url_file` (read at load time, trailing
+newlines trimmed); `namespace` prefixes every Redis key. Config-file `keys` are
+re-seeded on every start and are not written to the store.
 
 | `AuthKey` field | Type | Required | Default | What it does |
 |---|---|---|---|---|

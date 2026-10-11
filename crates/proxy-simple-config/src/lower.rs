@@ -1769,14 +1769,110 @@ fn lower_auth(
         ));
     }
 
+    let mut typed_config = json!({
+        "@type": AUTH_FILTER_TYPE_URL,
+        "hmac_secret": hmac_secret,
+        "virtual_keys": virtual_keys,
+    });
+    // Only an explicit `store:` adds a member. Absent means no store field at
+    // all, which is what keeps configs written before this field lowering
+    // byte-identical.
+    if let Some((member, value)) = lower_auth_store(auth.store.as_ref())? {
+        typed_config[member] = value;
+    }
+
     Ok(Some(json!({
         "name": AUTH_FILTER_NAME,
-        "typed_config": {
-            "@type": AUTH_FILTER_TYPE_URL,
-            "hmac_secret": hmac_secret,
-            "virtual_keys": virtual_keys,
-        }
+        "typed_config": typed_config,
     })))
+}
+
+/// `auth.store` -> the `llmproxy.filters.v0.Authentication` oneof member that
+/// selects it, as `(member name, member value)`. The members are direct
+/// fields of `typed_config` (`in_memory`, `persistent`, `shared`), not a
+/// nested `store` object, because that is how the proto declares the oneof.
+///
+/// Same validation shape as `hmac_secret`/`hmac_secret_file` above: every
+/// error names the dialect path, and a file-backed Redis URL is read here
+/// once so an unreadable file fails at load time rather than at bind time.
+/// The URL's contents are never echoed in an error or a warning.
+fn lower_auth_store(
+    store: Option<&AuthStore>,
+) -> Result<Option<(&'static str, Value)>, ConfigError> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    // Rust note: matching on a tuple of the three `Option`s makes "exactly one
+    // set" a single `_` arm, instead of three separate checks that could drift.
+    match (&store.in_memory, &store.persistent, &store.shared) {
+        (Some(_), None, None) => Ok(Some(("in_memory", json!({})))),
+        (None, Some(persistent), None) => {
+            if persistent.path.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field_path: "auth.store.persistent.path".to_string(),
+                    reason: "must not be empty (an empty path would silently lose every key \
+                             minted at runtime)"
+                        .to_string(),
+                });
+            }
+            Ok(Some(("persistent", json!({ "path": persistent.path }))))
+        }
+        (None, None, Some(shared)) => {
+            let url = match (&shared.url, &shared.url_file) {
+                (Some(url), None) => {
+                    if url.is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field_path: "auth.store.shared.url".to_string(),
+                            reason: "must not be empty".to_string(),
+                        });
+                    }
+                    json!({ "inline_string": url })
+                }
+                (None, Some(file)) => {
+                    check_readable_non_empty_file(file, "auth.store.shared.url_file")?;
+                    json!({ "filename": file })
+                }
+                (None, None) => {
+                    return Err(ConfigError::InvalidValue {
+                        field_path: "auth.store.shared".to_string(),
+                        reason: "set either url or url_file".to_string(),
+                    });
+                }
+                (Some(_), Some(_)) => {
+                    return Err(ConfigError::InvalidValue {
+                        field_path: "auth.store.shared".to_string(),
+                        reason: "set either url or url_file, not both".to_string(),
+                    });
+                }
+            };
+            let mut member = json!({ "url": url });
+            if let Some(namespace) = &shared.namespace {
+                member["namespace"] = json!(namespace);
+            }
+            Ok(Some(("shared", member)))
+        }
+        _ => Err(ConfigError::InvalidValue {
+            field_path: "auth.store".to_string(),
+            reason: "set exactly one of in_memory, persistent, or shared".to_string(),
+        }),
+    }
+}
+
+/// Reads `file` once purely to check it is readable and non-empty. The
+/// contents are discarded, never echoed, and never folded into the lowered
+/// config, which keeps `filename` so the proxy reads the URL again itself.
+fn check_readable_non_empty_file(file: &str, field_path: &str) -> Result<(), ConfigError> {
+    let contents = std::fs::read_to_string(file).map_err(|e| ConfigError::Io {
+        path: file.to_string(),
+        reason: e.to_string(),
+    })?;
+    if contents.trim_end_matches(['\n', '\r']).is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field_path: field_path.to_string(),
+            reason: "must not be empty".to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ limits --

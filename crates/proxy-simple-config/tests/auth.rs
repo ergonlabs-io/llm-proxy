@@ -503,3 +503,307 @@ fn no_auth_block_leaves_http_filters_unchanged() {
         "no `auth:` block must mean no `llmproxy.auth` filter anywhere in the chain"
     );
 }
+
+// --- auth.store: the dialect exposes Envoy mode's three shapes, no more -------
+
+/// A config whose only variable part is `auth.store`, written as a YAML value
+/// (`in_memory`, or a flow map such as `{ persistent: { path: "..." } }`).
+fn config_with_store(store: &str) -> String {
+    format!(
+        "version: 0\n\
+         providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+         routes:\n  - {{ model: \"*\", provider: openai }}\n\
+         auth:\n  hmac_secret: \"test-operator-secret\"\n  store: {store}\n"
+    )
+}
+
+/// The `llmproxy.auth` filter's `typed_config` for `config`, after lowering.
+fn auth_typed_config(config: &SimpleConfig) -> serde_json::Value {
+    let lowered = lower(config).expect("must lower");
+    http_filters(&lowered.bootstrap)[0]["typed_config"].clone()
+}
+
+/// The strict half of the real loader: the lowered config must pass the proto
+/// validation and build IR. Does NOT construct the filter, so it needs no
+/// external store -- see `shared_*` tests for why that matters.
+fn strict_load_accepts(config: &SimpleConfig) {
+    let loaded = lower_to_loaded(config).expect("must lower and strict-validate");
+    proxy_config::build_snapshot(&loaded).expect("must build IR");
+}
+
+/// Lowers `config` through the real loader and hands the lowered `llmproxy.auth`
+/// `typed_config` to the REAL `AuthFilterFactory::create`, which is what opens
+/// a `persistent` store. A `shared` store can't go through here: `create`
+/// connects to Redis while building the control plane.
+fn real_filter_accepts(config: &SimpleConfig) {
+    strict_load_accepts(config);
+    let loaded = lower_to_loaded(config).expect("must lower and strict-validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    let listener = snapshot
+        .listeners
+        .values()
+        .next()
+        .expect("exactly one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+    let auth_entry = hcm
+        .http_filters
+        .iter()
+        .find(|f| f.type_url == proxy_filters::auth_filter::TYPE_URL)
+        .expect("llmproxy.auth must be in the IR's http_filters");
+    let typed = auth_entry
+        .config
+        .as_ref()
+        .expect("the auth filter's typed_config must survive to the IR");
+    AuthFilterFactory
+        .create(typed, &FactoryContext::default())
+        .expect("the real auth_filter::parse_config must accept the lowered store");
+}
+
+/// Absent `store` must lower to exactly today's output: the same three
+/// members, pinned as a whole value so any drift (an added empty member, a
+/// renamed field) fails here.
+#[test]
+fn absent_store_lowers_byte_identical_to_the_pre_store_output() {
+    let secret = "test-operator-secret";
+    let digest = digest_hex(secret.as_bytes(), "llmp_test-key");
+    let config = parse(&config_with_one_key(secret, "k1", "acme", &digest)).expect("must parse");
+    let lowered = lower(&config).expect("must lower");
+
+    assert_eq!(
+        http_filters(&lowered.bootstrap)[0],
+        serde_json::json!({
+            "name": "llmproxy.auth",
+            "typed_config": {
+                "@type": proxy_filters::auth_filter::TYPE_URL,
+                "hmac_secret": { "inline_string": secret },
+                "virtual_keys": [{
+                    "key_id": "k1",
+                    "tenant": "acme",
+                    "digest_hex": digest,
+                    "revoked": false,
+                }],
+            }
+        })
+    );
+}
+
+#[test]
+fn explicit_in_memory_store_lowers_to_an_empty_in_memory_member() {
+    let config = parse(&config_with_store("{ in_memory: {} }")).expect("must parse");
+    let typed = auth_typed_config(&config);
+    assert_eq!(typed["in_memory"], serde_json::json!({}));
+    assert!(typed.get("persistent").is_none() && typed.get("shared").is_none());
+    real_filter_accepts(&config);
+}
+
+#[test]
+fn persistent_store_lowers_to_path_and_the_real_filter_opens_it() {
+    let path = std::env::temp_dir().join(format!(
+        "llm-proxy-simple-config-auth-store-{}.redb",
+        std::process::id()
+    ));
+    let config = parse(&config_with_store(&format!(
+        "{{ persistent: {{ path: \"{}\" }} }}",
+        path.display()
+    )))
+    .expect("must parse");
+
+    let typed = auth_typed_config(&config);
+    assert_eq!(
+        typed["persistent"],
+        serde_json::json!({ "path": path.display().to_string() })
+    );
+    assert!(typed.get("in_memory").is_none() && typed.get("shared").is_none());
+    real_filter_accepts(&config);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn shared_store_inline_url_lowers_with_namespace_and_the_real_filter_accepts_it() {
+    let config = parse(&config_with_store(
+        "{ shared: { url: \"redis://:pw@127.0.0.1:1/0\", namespace: \"fleet-a\" } }",
+    ))
+    .expect("must parse");
+    let typed = auth_typed_config(&config);
+    assert_eq!(
+        typed["shared"],
+        serde_json::json!({
+            "url": { "inline_string": "redis://:pw@127.0.0.1:1/0" },
+            "namespace": "fleet-a",
+        })
+    );
+    strict_load_accepts(&config);
+
+    // Without `namespace`, the member carries no namespace key at all, so the
+    // filter's built-in default applies.
+    let no_ns = parse(&config_with_store(
+        "{ shared: { url: \"redis://127.0.0.1:1/0\" } }",
+    ))
+    .expect("must parse");
+    assert!(auth_typed_config(&no_ns)["shared"]
+        .get("namespace")
+        .is_none());
+}
+
+#[test]
+fn shared_store_url_file_lowers_to_filename_and_a_bad_file_errors_naming_it() {
+    let path = std::env::temp_dir().join(format!(
+        "llm-proxy-simple-config-auth-store-url-{}",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"redis://:pw@127.0.0.1:1/0\n").expect("write temp url file");
+    let config = parse(&config_with_store(&format!(
+        "{{ shared: {{ url_file: \"{}\" }} }}",
+        path.display()
+    )))
+    .expect("must parse");
+    assert_eq!(
+        auth_typed_config(&config)["shared"]["url"],
+        serde_json::json!({ "filename": path.display().to_string() })
+    );
+    strict_load_accepts(&config);
+
+    // An empty file is rejected at load time, naming the dialect path and not
+    // echoing anything from the file.
+    std::fs::write(&path, b"\n").expect("write empty temp url file");
+    let empty = parse(&config_with_store(&format!(
+        "{{ shared: {{ url_file: \"{}\" }} }}",
+        path.display()
+    )))
+    .expect("must parse");
+    match lower(&empty).expect_err("an empty url_file must be rejected") {
+        ConfigError::InvalidValue { field_path, .. } => {
+            assert_eq!(field_path, "auth.store.shared.url_file");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&path);
+
+    let missing = parse(&config_with_store(
+        "{ shared: { url_file: \"/nonexistent/llm-proxy-store-url\" } }",
+    ))
+    .expect("must parse");
+    match lower(&missing).expect_err("a missing url_file must be rejected") {
+        ConfigError::Io { path, .. } => assert_eq!(path, "/nonexistent/llm-proxy-store-url"),
+        other => panic!("expected Io, got {other:?}"),
+    }
+}
+
+#[test]
+fn shared_store_needs_exactly_one_of_url_and_url_file_and_a_nonempty_url() {
+    for store in [
+        "{ shared: {} }",
+        "{ shared: { url: \"redis://a\", url_file: \"/x\" } }",
+    ] {
+        let config = parse(&config_with_store(store)).expect("must parse");
+        match lower(&config).expect_err("url and url_file are exactly-one-of") {
+            ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, "auth.store.shared", "for {store}");
+            }
+            other => panic!("expected InvalidValue for {store}, got {other:?}"),
+        }
+    }
+
+    let empty = parse(&config_with_store("{ shared: { url: \"\" } }")).expect("must parse");
+    match lower(&empty).expect_err("an empty url must be rejected") {
+        ConfigError::InvalidValue { field_path, .. } => {
+            assert_eq!(field_path, "auth.store.shared.url");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn persistent_store_with_empty_path_is_rejected_naming_its_path() {
+    let config = parse(&config_with_store("{ persistent: { path: \"\" } }")).expect("must parse");
+    match lower(&config).expect_err("an empty persistent path must be rejected") {
+        ConfigError::InvalidValue { field_path, .. } => {
+            assert_eq!(field_path, "auth.store.persistent.path");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+}
+
+/// Strict mode: a misspelled field inside `store` fails at parse time with the
+/// full dotted path, not just the leaf name (AGENTS.md invariant 1).
+#[test]
+fn unknown_fields_inside_store_are_rejected_with_the_full_dotted_path() {
+    let err = parse(&config_with_store("{ persistent: { pth: \"/x.redb\" } }"))
+        .expect_err("unknown field inside persistent must fail");
+    match err {
+        ConfigError::UnknownField { field_path, .. } => {
+            assert_eq!(field_path, "auth.store.persistent.pth");
+        }
+        other => panic!("expected UnknownField, got {other:?}"),
+    }
+
+    let err = parse(&config_with_store(
+        "{ shared: { url: \"redis://a\", namspace: \"x\" } }",
+    ))
+    .expect_err("unknown field inside shared must fail");
+    match err {
+        ConfigError::UnknownField { field_path, .. } => {
+            assert_eq!(field_path, "auth.store.shared.namspace");
+        }
+        other => panic!("expected UnknownField, got {other:?}"),
+    }
+}
+
+/// A store named by something other than the three members is an unknown field
+/// at its dotted path. Two members at once, or none, is an error at
+/// `auth.store` -- never a silent pick of one.
+#[test]
+fn unknown_or_doubled_store_shapes_are_rejected_at_auth_store() {
+    let cases = [
+        ("{ redis: { url: \"redis://a\" } }", "auth.store.redis"),
+        (
+            "{ persistent: { path: \"/x.redb\" }, shared: { url: \"redis://a\" } }",
+            "auth.store",
+        ),
+        ("{}", "auth.store"),
+    ];
+    for (store, expected) in cases {
+        let err = parse(&config_with_store(store))
+            .and_then(|config| lower(&config).map(|_| ()))
+            .expect_err("must be rejected");
+        match err {
+            ConfigError::UnknownField { field_path, .. }
+            | ConfigError::InvalidValue { field_path, .. } => {
+                assert_eq!(field_path, expected, "for {store}");
+            }
+            other => panic!("expected a dotted-path error for {store}, got {other:?}"),
+        }
+    }
+}
+
+/// `--mode translate` emits the store into the Envoy bootstrap, and that output
+/// is strict-valid Envoy config that builds (same round trip as
+/// `dialect.rs::translate_output_round_trips_through_envoy_mode`).
+#[test]
+fn translate_output_carries_the_persistent_store() {
+    let config = parse(&config_with_store(
+        "{ persistent: { path: \"/var/lib/llm-proxy/control.redb\" } }",
+    ))
+    .expect("must parse");
+    let (yaml, _warnings) = proxy_simple_config::to_envoy_yaml(&config).expect("must translate");
+
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("translate output is YAML");
+    let typed = &doc["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
+        ["typed_config"]["http_filters"][0]["typed_config"];
+    assert_eq!(
+        typed["persistent"]["path"].as_str(),
+        Some("/var/lib/llm-proxy/control.redb")
+    );
+
+    let loaded = proxy_config::parse_bootstrap(
+        yaml.as_bytes(),
+        proxy_config::ConfigFormat::Yaml,
+        proxy_config::StrictMode::Strict,
+    )
+    .expect("translate output must be strict-valid Envoy config");
+    proxy_config::build_snapshot(&loaded).expect("and must build IR");
+}
