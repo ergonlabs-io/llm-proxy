@@ -1366,10 +1366,32 @@ fn build_hcm_handler(
             } else {
                 format!("{}.ext_authz.{}", hcm.stat_prefix, config.stat_prefix)
             };
-            let stats = Arc::new(proxy_filters::ext_authz::ExtAuthzStats::new(
-                runtime.router_stats.registry(),
-                &scope,
-            ));
+            // Every worker and every config rebuild runs this function, so the
+            // stats (and their warn-once fail-open flag) live in the process-wide
+            // factory state, keyed by stat scope. A per-build instance would log
+            // the bypass again per worker and per update (AGENTS.md "Fail-open
+            // controls": suppress repeats). Chains that share a scope already
+            // share its counters.
+            let stats = runtime
+                .factory_state
+                .get_or_try_init(
+                    &scope,
+                    &scope,
+                    proxy_config::authorization::TYPE_URL,
+                    || {
+                        Ok(Arc::new(proxy_filters::ext_authz::ExtAuthzStats::new(
+                            runtime.router_stats.registry(),
+                            &scope,
+                        ))
+                            as Arc<dyn std::any::Any + Send + Sync>)
+                    },
+                )
+                .map_err(|e| HttpFilterChainBuildError {
+                    context: context.to_string(),
+                    reason: format!("http filter '{}': {e}", f.name),
+                })?
+                .downcast::<proxy_filters::ext_authz::ExtAuthzStats>()
+                .expect("ext_authz stats singleton is always ExtAuthzStats");
             filters.push(ConfiguredHttpFilter {
                 name: f.name.clone(),
                 instance_factory: Arc::new(proxy_filters::ext_authz::ExtAuthzInstanceFactory {

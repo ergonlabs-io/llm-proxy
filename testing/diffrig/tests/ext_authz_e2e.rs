@@ -782,6 +782,98 @@ async fn ext_authz_pending_request_pins_old_client_across_sighup() {
     drop(proxy);
 }
 
+/// AGENTS.md "Fail-open controls": the bypass warning is logged once per
+/// process. Every worker builds its own filter chain, and a reload rebuilds
+/// it, so a flag owned by one build would log again per worker and per update.
+/// The reload forces a rebuild on any platform; the extra connections reach
+/// other workers where the kernel balances accepts.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn ext_authz_fail_open_warning_is_not_repeated_after_reload() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    async fn admitted(address: std::net::SocketAddr) {
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            send_json_optional(address, "GET", "/v1", &[("host", "application")], None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 200);
+    }
+    let binary = resolve_llm_proxy_bin();
+    let scratch = ScratchDir::new("ext-authz-fail-open-reload");
+    let service = TestService::spawn(Mode::TransportError).await;
+    let upstream = Upstream::spawn().await;
+    let port = free_port();
+    let text = include_str!("../../../examples/ext-authz.yaml")
+        .replace("port_value: 9000", &format!("port_value: {port}"))
+        .replace(
+            "port_value: 9001",
+            &format!("port_value: {}", service.address.port()),
+        )
+        .replace(
+            "port_value: 9002",
+            &format!("port_value: {}", upstream.address.port()),
+        )
+        .replace(
+            "validate_mutations: true",
+            "validate_mutations: true\n                      failure_mode_allow: true",
+        );
+    let config = scratch.write("bootstrap.yaml", &text);
+    let log_path = scratch.path().join("proxy.log");
+    let warnings = || {
+        std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .matches("explicit failure_mode_allow admitted the request")
+            .count()
+    };
+    let output = std::fs::File::create(&log_path).unwrap();
+    let proxy = ChildGuard(
+        std::process::Command::new(binary)
+            .arg("-c")
+            .arg(&config)
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap(),
+    );
+    let address = format!("127.0.0.1:{port}").parse().unwrap();
+    ready(address).await;
+    admitted(address).await;
+    assert_eq!(warnings(), 1);
+    assert!(std::process::Command::new("kill")
+        .args(["-HUP", &proxy.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .contains("SIGHUP: config reload succeeded")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        admitted(address).await;
+    }
+    assert_eq!(service.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(warnings(), 1);
+    drop(proxy);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ext_authz_checks_headers_before_upload_and_preserves_body_after_allow() {
     let binary = resolve_llm_proxy_bin();
