@@ -184,6 +184,7 @@ lint: ## Clippy with warnings denied (what CI enforces)
 .PHONY: ci
 ci: ## Everything CI runs: format check, lint, citations, tests, doctests, dep audit, black-box QA
 	cargo fmt --all --check
+	@$(MAKE) version-check
 	@$(MAKE) citations-check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo nextest run --workspace
@@ -365,6 +366,14 @@ docs-build: ## Production build of the docs site to docs/site/dist/
 .PHONY: deps-check
 deps-check: ## Fail if any crate declares a dependency nothing references
 	python3 scripts/check-deps.py
+
+.PHONY: version-check
+version-check: ## Fail if VERSION differs from the workspace version in Cargo.toml
+	@cargo_v=$$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml); \
+	file_v=$$(tr -d '[:space:]' < VERSION); \
+	if [ "$$cargo_v" != "$$file_v" ]; then \
+		echo "VERSION is '$$file_v' but Cargo.toml [workspace.package] version is '$$cargo_v'" >&2; exit 1; \
+	fi
 
 .PHONY: citations-check
 citations-check: ## Fail if code or user docs cite work packages or planning docs (AGENTS.md "Comments")
