@@ -69,7 +69,8 @@ const ROUTER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.http
 /// The auth filter's name in `http_filters` -- always the FIRST entry when
 /// `auth:` is configured (see [`lower_listener`]): ahead of
 /// `llmproxy.body_rewrite` so an unauthenticated request is refused before
-/// the body-peek filter buffers anything, and ahead of `llmproxy.token_limit`
+/// the body-peek filter parses it (the body itself is capped at the listener's
+/// buffer limit before any filter runs), and ahead of `llmproxy.token_limit`
 /// so the limiter buckets on the tenant this filter resolves --
 /// `proxy_config::lower::check_lane_h_filter_order` enforces the second half
 /// of that ordering as a hard error, so getting it wrong fails loudly rather
@@ -2152,7 +2153,7 @@ fn lower_listener(
     if let Some(auth_filter) = auth_filter {
         // FIRST, ahead of everything else added to the chain below -- see
         // `AUTH_FILTER_NAME`'s doc for why (an unauthenticated request must
-        // be refused before the body-peek filter buffers it, and the token
+        // be refused before the body-peek filter parses it, and the token
         // limiter must see `StreamInfo::auth.tenant` already written).
         http_filters.push(auth_filter);
     }

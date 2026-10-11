@@ -1461,7 +1461,9 @@ fn build_hcm_handler(
     })?
     .with_token_stats(runtime.token_stats.clone())
     // The listener's `per_connection_buffer_limit_bytes` (Envoy default 1 MiB,
-    // applied at lowering) bounds request-body collection and filter buffering.
+    // applied at lowering) caps request-body collection for every HTTP request,
+    // before any filter runs, as well as filter buffering. A larger body gets a
+    // 413 (`decode_buffer_overflow`).
     .with_buffer_limit(buffer_limit_bytes as usize);
     handler = handler.with_gen_ai_latency_stats(runtime.latency_stats.clone());
     if let Some(sink) = runtime.metadata {
@@ -1809,6 +1811,10 @@ pub async fn run_listener_manager(
 #[cfg(test)]
 #[path = "listener_ext_authz_tests.rs"]
 mod ext_authz_tests;
+
+#[cfg(test)]
+#[path = "listener_body_cap_tests.rs"]
+mod body_cap_tests;
 
 #[cfg(test)]
 mod tests {

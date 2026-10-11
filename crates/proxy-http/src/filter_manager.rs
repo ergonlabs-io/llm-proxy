@@ -1366,53 +1366,51 @@ impl FilterManager {
             }
         }
         // --- collect the request body (buffered model) ---
-        let (mut head, req_trailers, mut body) =
-            match collect_request(req, if early > 0 { Some(buffer_limit) } else { None }).await {
-                Ok(parts) => parts,
-                // A downstream body read error is a client problem: 400. (Streaming
-                // will surface this mid-flight instead; chunk 1 sees it up front.)
-                // S2.5: routed through the encoder chain like any other response —
-                // no filters have run yet, but the still-fresh `filters`/`ctx` are
-                // exactly what `respond_with_local_reply` needs.
-                Err(RequestCollectionError::TooLarge) => {
-                    let reply = LocalReply::new(
-                        http::StatusCode::PAYLOAD_TOO_LARGE,
-                        "request body exceeds buffer limit",
-                        "decode_buffer_overflow",
+        // Always capped at the listener's buffer limit, so a client cannot
+        // make a worker buffer an unbounded body before any decode filter
+        // (auth included) has run. Envoy streams the body under flow control
+        // instead; see `internal-docs/envoy-divergences.md`.
+        let (mut head, req_trailers, mut body) = match collect_request(req, buffer_limit).await {
+            Ok(parts) => parts,
+            // A downstream body read error is a client problem: 400. (Streaming
+            // will surface this mid-flight instead; chunk 1 sees it up front.)
+            // S2.5: routed through the encoder chain like any other response —
+            // no filters have run yet, but the still-fresh `filters`/`ctx` are
+            // exactly what `respond_with_local_reply` needs.
+            Err(RequestCollectionError::TooLarge) => {
+                let reply = LocalReply::new(
+                    http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds buffer limit",
+                    "decode_buffer_overflow",
+                );
+                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            }
+            Err(RequestCollectionError::Body(err)) => {
+                // `DC`: a `BodyError::Downstream` means the CLIENT's
+                // connection failed while its request body was being read --
+                // Envoy's "downstream connection termination". Any other
+                // variant is a malformed body, which is a plain 400 with no
+                // flag. This is the only site that can tell them apart: the
+                // distinction exists in `codec.rs`, and before the error was
+                // propagated out of `collect_request` it was destroyed here.
+                //
+                // Set before `respond_with_local_reply` so a `%RESPONSE_FLAGS%`
+                // logger reading `StreamInfo` afterwards already sees it --
+                // the same ordering `router.rs` uses for its own flags.
+                if matches!(err, BodyError::Downstream(_)) {
+                    tracing::debug!(response_flag = "DC", "downstream request body read failed");
+                    ctx.stream_info.borrow_mut().set_response_flag(
+                        proxy_observability::ResponseFlag::DownstreamConnectionTermination,
                     );
-                    return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply)
-                        .await;
                 }
-                Err(RequestCollectionError::Body(err)) => {
-                    // `DC`: a `BodyError::Downstream` means the CLIENT's
-                    // connection failed while its request body was being read --
-                    // Envoy's "downstream connection termination". Any other
-                    // variant is a malformed body, which is a plain 400 with no
-                    // flag. This is the only site that can tell them apart: the
-                    // distinction exists in `codec.rs`, and before the error was
-                    // propagated out of `collect_request` it was destroyed here.
-                    //
-                    // Set before `respond_with_local_reply` so a `%RESPONSE_FLAGS%`
-                    // logger reading `StreamInfo` afterwards already sees it --
-                    // the same ordering `router.rs` uses for its own flags.
-                    if matches!(err, BodyError::Downstream(_)) {
-                        tracing::debug!(
-                            response_flag = "DC",
-                            "downstream request body read failed"
-                        );
-                        ctx.stream_info.borrow_mut().set_response_flag(
-                            proxy_observability::ResponseFlag::DownstreamConnectionTermination,
-                        );
-                    }
-                    let reply = LocalReply::new(
-                        http::StatusCode::BAD_REQUEST,
-                        "invalid request body",
-                        "request_body_read_error",
-                    );
-                    return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply)
-                        .await;
-                }
-            };
+                let reply = LocalReply::new(
+                    http::StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                    "request_body_read_error",
+                );
+                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            }
+        };
 
         // --- decode chain (config order) ---
         if let Err(status) = drive_decode(
@@ -3379,7 +3377,7 @@ enum RequestCollectionError {
 
 async fn collect_request(
     req: HttpRequestParts,
-    limit: Option<usize>,
+    limit: usize,
 ) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), RequestCollectionError> {
     // `downstream` is only used by `FilterChainHandler::handle` (XFF/S9,
     // access-log peer address), all of which runs before `FilterManager::run`
@@ -3398,23 +3396,19 @@ async fn collect_request(
     // to be discarded here, which is what made `DC` unreachable -- by the
     // time the caller saw the failure there was nothing left to say whether
     // the client had gone away or the body was merely malformed.
-    let collected = if let Some(limit) = limit {
-        http_body_util::Limited::new(body, limit)
-            .collect()
-            .await
-            .map_err(|error| {
-                if error.is::<http_body_util::LengthLimitError>() {
-                    RequestCollectionError::TooLarge
-                } else {
-                    match error.downcast::<BodyError>() {
-                        Ok(error) => RequestCollectionError::Body(*error),
-                        Err(error) => RequestCollectionError::Body(BodyError::Downstream(error)),
-                    }
+    let collected = http_body_util::Limited::new(body, limit)
+        .collect()
+        .await
+        .map_err(|error| {
+            if error.is::<http_body_util::LengthLimitError>() {
+                RequestCollectionError::TooLarge
+            } else {
+                match error.downcast::<BodyError>() {
+                    Ok(error) => RequestCollectionError::Body(*error),
+                    Err(error) => RequestCollectionError::Body(BodyError::Downstream(error)),
                 }
-            })?
-    } else {
-        body.collect().await.map_err(RequestCollectionError::Body)?
-    };
+            }
+        })?;
     let trailers = collected.trailers().cloned().map(RequestTrailers);
     Ok((head, trailers, collected.to_bytes()))
 }

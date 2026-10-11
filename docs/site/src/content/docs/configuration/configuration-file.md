@@ -216,6 +216,17 @@ explicitly — the shorthand string form cannot carry it:
 | `tls.cert_file` | string (path) | yes, if `tls` is set | — | PEM certificate chain. |
 | `tls.key_file` | string (path) | yes, if `tls` is set | — | PEM private key. |
 
+### Request body size limit
+
+Every HTTP request body is capped at the listener's
+`per_connection_buffer_limit_bytes` (default 1 MiB). The cap applies before
+any HTTP filter runs. A larger body gets a `413` and the connection is closed.
+
+This file format has no field for the limit, so it is always 1 MiB here. To
+raise it, use Envoy mode (`-c`) and set `per_connection_buffer_limit_bytes` on
+the listener. Raise it on listeners that serve multimodal requests with
+inline base64 images. The value must be greater than 0.
+
 The schema's description says certificate files under `tls` are "watched and
 hot-reloaded on change." The mechanism for a live swap exists internally
 (`SwapCertResolver`/`update_certificates` in `crates/proxy-core/src/tls/`,
