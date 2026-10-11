@@ -110,6 +110,7 @@ use http::header::AUTHORIZATION;
 use http::HeaderMap;
 
 use crate::control::ControlPlaneSnapshot;
+use proxy_http::tenant_credentials::TenantCredentialSet;
 
 /// Scheme prefix this authenticator recognizes on the `authorization`
 /// header. Anything else (no header, a different scheme, a bare token) is
@@ -268,6 +269,12 @@ pub struct Principal {
     /// `Arc` so the hot path clones a pointer, and so a future policy change
     /// is a snapshot swap rather than a per-request lookup.
     pub policy: Arc<TenantPolicy>,
+    /// The tenant's provider credentials, taken from the same snapshot that
+    /// verified the key (ADR-0007 decision 4). `None` for a tenant with no
+    /// credentials, and for authenticators that do not read the control-plane
+    /// snapshot. Left out of the hand-written `Debug` below on purpose: it
+    /// holds plaintext keys.
+    pub tenant_credentials: Option<Arc<TenantCredentialSet>>,
 }
 
 impl fmt::Debug for Principal {
@@ -758,10 +765,14 @@ impl Authenticator for VirtualKeyAuthenticator {
         let snapshot = self.snapshot.load();
         match snapshot.keys.find(&self.secret, presented) {
             Some(record) if record.revoked => AuthOutcome::Rejected(AuthError::RevokedKey),
+            // The credential set comes from this same guard, never a second
+            // load, so a key revoked between two loads cannot mix states
+            // (ADR-0007 decision 4).
             Some(record) => AuthOutcome::Authenticated(Principal {
                 tenant: record.tenant.clone(),
                 key_id: record.key_id.clone(),
                 policy: Arc::new(TenantPolicy::default()),
+                tenant_credentials: snapshot.tenant_credentials.get(&record.tenant).cloned(),
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }
@@ -832,6 +843,7 @@ mod tests {
     use http::HeaderValue;
 
     use crate::control::test_snapshot_handle;
+    use proxy_http::tenant_credentials::{TenantCredential, TenantSecret};
 
     fn headers_with_authorization(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -871,6 +883,77 @@ mod tests {
                 assert_eq!(principal.key_id.as_str(), "key-1");
             }
             other => panic!("expected Authenticated, got a different outcome (variant only, no Debug on AuthOutcome): matched={}", matches!(other, AuthOutcome::Authenticated(_))),
+        }
+    }
+
+    /// One snapshot holding a key for `tenant-t` (which has an `openrouter`
+    /// credential) and a key for `tenant-u` (which has none). Built directly,
+    /// because no store write path feeds `tenant_credentials` yet.
+    fn snapshot_with_tenant_credentials(secret: &HmacSecret) -> Arc<ArcSwap<ControlPlaneSnapshot>> {
+        let mut keys = KeySet::new();
+        keys.insert(
+            secret,
+            "llmp_key-t",
+            KeyRecord {
+                key_id: KeyId::new("key-t"),
+                tenant: TenantId::new("tenant-t"),
+                revoked: false,
+            },
+        );
+        keys.insert(
+            secret,
+            "llmp_key-u",
+            KeyRecord {
+                key_id: KeyId::new("key-u"),
+                tenant: TenantId::new("tenant-u"),
+                revoked: false,
+            },
+        );
+        let set = TenantCredentialSet::new(HashMap::from([(
+            "openrouter".to_string(),
+            TenantCredential::Usable(TenantSecret::new("sk-or-test-secret".to_string())),
+        )]));
+        Arc::new(ArcSwap::new(Arc::new(ControlPlaneSnapshot {
+            keys,
+            policies: crate::model_authz::TenantPolicyMap::new(),
+            key_budgets: HashMap::new(),
+            key_tenants: HashMap::new(),
+            tenant_credentials: HashMap::from([(TenantId::new("tenant-t"), Arc::new(set))]),
+        })))
+    }
+
+    // --- the principal carries its own tenant's credential set, read from the
+    // --- same snapshot that verified its key (ADR-0007 decision 4) ---
+
+    #[test]
+    fn a_principal_carries_its_tenants_credential_set_from_the_same_snapshot() {
+        let secret = HmacSecret::new(b"operator-secret");
+        let auth = VirtualKeyAuthenticator::new(
+            HmacSecret::new(b"operator-secret"),
+            snapshot_with_tenant_credentials(&secret),
+        );
+
+        match auth.authenticate(&headers_with_authorization("Bearer llmp_key-t")) {
+            AuthOutcome::Authenticated(principal) => {
+                let set = principal
+                    .tenant_credentials
+                    .as_ref()
+                    .expect("tenant-t holds a credential set");
+                assert!(matches!(
+                    set.get("openrouter"),
+                    Some(TenantCredential::Usable(_))
+                ));
+                // The Debug of a principal must never print the plaintext key.
+                assert!(!format!("{principal:?}").contains("sk-or-test-secret"));
+            }
+            _ => panic!("tenant-t's key must authenticate"),
+        }
+
+        match auth.authenticate(&headers_with_authorization("Bearer llmp_key-u")) {
+            AuthOutcome::Authenticated(principal) => {
+                assert!(principal.tenant_credentials.is_none());
+            }
+            _ => panic!("tenant-u's key must authenticate"),
         }
     }
 

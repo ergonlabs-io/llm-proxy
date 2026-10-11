@@ -1019,6 +1019,10 @@ impl HttpFilter for AuthFilterInstance {
                         tenant: Some(principal.tenant.as_str().to_string()),
                         key_id: Some(principal.key_id.as_str().to_string()),
                     };
+                    // Hand-off of the set the key was verified against, so the
+                    // router never reads the snapshot itself. A request keeps
+                    // the set it was admitted with (ADR-0007 decision 4).
+                    info.tenant_credentials = principal.tenant_credentials.clone();
                 }
                 // The credential has been consumed; see the module doc's
                 // "removed before forwarding" section. `remove` drops every
@@ -1107,6 +1111,7 @@ mod tests {
     use proxy_config::ir::RouteEntry;
     use proxy_http::filter::{BufferedBody, EncoderCallbacks, HeaderMutationFn, PerRouteConfig};
     use proxy_http::stream_info::StreamInfo;
+    use proxy_http::tenant_credentials::{TenantCredential, TenantCredentialSet, TenantSecret};
 
     use crate::control::test_snapshot_handle;
     use proxy_http::filter::SharedFactoryState;
@@ -1846,6 +1851,107 @@ mod tests {
         assert_eq!(info.auth.key_id.as_deref(), Some("key-1"));
     }
 
+    /// One snapshot with a key for `tenant-t` (which holds an `openrouter`
+    /// credential) and a key for `tenant-u` (which holds none). Built directly,
+    /// because no store write path feeds `tenant_credentials` yet.
+    fn filter_with_tenant_credentials() -> AuthFilterInstance {
+        let secret = HmacSecret::new(b"secret");
+        let mut keys = KeySet::new();
+        keys.insert(
+            &secret,
+            "llmp_key-t",
+            KeyRecord {
+                key_id: KeyId::new("key-t"),
+                tenant: TenantId::new("tenant-t"),
+                revoked: false,
+            },
+        );
+        keys.insert(
+            &secret,
+            "llmp_key-u",
+            KeyRecord {
+                key_id: KeyId::new("key-u"),
+                tenant: TenantId::new("tenant-u"),
+                revoked: false,
+            },
+        );
+        let set = TenantCredentialSet::new(std::collections::HashMap::from([(
+            "openrouter".to_string(),
+            TenantCredential::Usable(TenantSecret::new("sk-or-test-secret".to_string())),
+        )]));
+        let snapshot = crate::control::ControlPlaneSnapshot {
+            keys,
+            policies: crate::model_authz::TenantPolicyMap::new(),
+            key_budgets: std::collections::HashMap::new(),
+            key_tenants: std::collections::HashMap::new(),
+            tenant_credentials: std::collections::HashMap::from([(
+                TenantId::new("tenant-t"),
+                Arc::new(set),
+            )]),
+        };
+        let handle = Arc::new(arc_swap::ArcSwap::new(Arc::new(snapshot)));
+        let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
+            HmacSecret::new(b"secret"),
+            handle,
+        ));
+        AuthFilterInstance {
+            chain: Arc::new(AuthenticatorChain::new(vec![authenticator])),
+        }
+    }
+
+    // 11b: a request authenticated as tenant-t gets tenant-t's credential set on
+    // stream_info, taken from the snapshot that verified its key (ADR-0007 4).
+    #[test]
+    fn an_authenticated_tenant_gets_its_credential_set_on_stream_info() {
+        let mut filter = filter_with_tenant_credentials();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_key-t"));
+
+        let status = filter.decode_headers(&mut cb, &mut head, true);
+
+        assert_eq!(status, FilterHeadersStatus::Continue);
+        let info = cb.stream_info.borrow();
+        assert_eq!(info.auth.tenant.as_deref(), Some("tenant-t"));
+        let set = info
+            .tenant_credentials
+            .as_ref()
+            .expect("tenant-t holds a credential set");
+        assert!(matches!(
+            set.get("openrouter"),
+            Some(TenantCredential::Usable(_))
+        ));
+    }
+
+    // 11c: a request authenticated as tenant-u, who has no credentials, gets
+    // no set, so it stays in platform mode.
+    #[test]
+    fn another_tenant_gets_no_credential_set_on_stream_info() {
+        let mut filter = filter_with_tenant_credentials();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_key-u"));
+
+        let status = filter.decode_headers(&mut cb, &mut head, true);
+
+        assert_eq!(status, FilterHeadersStatus::Continue);
+        let info = cb.stream_info.borrow();
+        assert_eq!(info.auth.tenant.as_deref(), Some("tenant-u"));
+        assert!(info.tenant_credentials.is_none());
+    }
+
+    // 11d: a rejected request never reaches stream_info with a credential set.
+    #[test]
+    fn a_rejected_request_leaves_tenant_credentials_none() {
+        let mut filter = filter_with_tenant_credentials();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer llmp_wrong-key"));
+
+        filter.decode_headers(&mut cb, &mut head, true);
+
+        let reply = cb.local_reply.as_ref().expect("unknown key must be denied");
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert!(cb.stream_info.borrow().tenant_credentials.is_none());
+    }
+
     // 12: an unknown llmp_ key -> 401.
     #[test]
     fn an_unknown_key_is_401ed() {
@@ -2009,6 +2115,7 @@ mod tests {
                 tenant: TenantId::new("should-never-be-reached"),
                 key_id: KeyId::new("should-never-be-reached"),
                 policy: Arc::new(Default::default()),
+                tenant_credentials: None,
             })
         }
     }

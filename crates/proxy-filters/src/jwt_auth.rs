@@ -484,6 +484,10 @@ impl Authenticator for JwtAuthenticator {
             // See the module doc's "`Principal::key_id` for a JWT" section.
             key_id,
             policy: Arc::new(TenantPolicy::default()),
+            // JWT principals stay in platform mode; see ADR-0007. This path
+            // reads the JWKS snapshot, not the control-plane snapshot, and
+            // must not add a second load to reach tenant credentials.
+            tenant_credentials: None,
         })
     }
 }
@@ -1208,6 +1212,7 @@ GdGIML90cFtpXr13uutgIg==
                     tenant: TenantId::new("should-never-be-reached"),
                     key_id: KeyId::new("should-never-be-reached"),
                     policy: Arc::new(TenantPolicy::default()),
+                    tenant_credentials: None,
                 })
             }
         }

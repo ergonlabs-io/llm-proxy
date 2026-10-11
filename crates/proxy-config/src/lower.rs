@@ -4046,6 +4046,7 @@ fn convert_provider_auth_metadata(
                     | "secret_access_key"
                     | "session_token"
                     | "models"
+                    | "tenant_credential"
             )
         })
         .collect();
@@ -4054,7 +4055,7 @@ fn convert_provider_auth_metadata(
         return Err(unsupported(
             format!("{auth_path}.{key}"),
             format!(
-                "`{PROVIDER_AUTH_METADATA_KEY}` contains an unsupported field; supported fields are `headers`, provider credential fields, and `models`"
+                "`{PROVIDER_AUTH_METADATA_KEY}` contains an unsupported field; supported fields are `headers`, provider credential fields, `models`, and `tenant_credential`"
             ),
         ));
     }
@@ -4132,8 +4133,19 @@ fn convert_provider_runtime_metadata(
                     None => return Err(invalid(format!("{auth_path}.scheme"), "must be a string")),
                 },
             };
+            // ADR-0007 decision 1: a tenant slot is a header API-key shape, so
+            // it cannot sit beside an OAuth2 or SigV4 credential. Checked before
+            // the generic allow-list so the error names the actual conflict.
+            if matches!(scheme, Some("vertex-oauth2") | Some("bedrock-sigv4"))
+                && auth.fields.contains_key("tenant_credential")
+            {
+                return Err(unsupported(
+                    format!("{auth_path}.tenant_credential"),
+                    "a tenant credential cannot be combined with a vertex-oauth2 or bedrock-sigv4 credential; only header API-key clusters can carry one",
+                ));
+            }
             let allowed = match scheme {
-                None => &["headers", "models"][..],
+                None => &["headers", "models", "tenant_credential"][..],
                 Some("vertex-oauth2") => &["headers", "scheme", "access_token", "models"][..],
                 Some("bedrock-sigv4") => &[
                     "headers",
@@ -4254,16 +4266,105 @@ fn convert_provider_runtime_metadata(
         .transpose()?
         .unwrap_or_default();
 
-    if credential.is_none() && path_template.is_none() && model_rewrites.is_empty() {
+    let tenant_credential =
+        match metadata.and_then(|m| m.filter_metadata.get(PROVIDER_AUTH_METADATA_KEY)) {
+            Some(auth) => {
+                let auth_path =
+                    format!("{path}.metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"]");
+                convert_tenant_credential_slot(auth, &auth_path)?
+            }
+            None => None,
+        };
+
+    if credential.is_none()
+        && path_template.is_none()
+        && model_rewrites.is_empty()
+        && tenant_credential.is_none()
+    {
         Ok(None)
     } else {
         Ok(Some(ProviderRuntimeConfig {
             credential,
             path_template,
             model_rewrites,
-            tenant_credential: None,
+            tenant_credential,
         }))
     }
+}
+
+/// Lower the optional `tenant_credential` object under
+/// `io.llmproxy.provider_auth` into a [`TenantCredentialSlot`] (ADR-0007).
+/// `provider` is required and non-empty. `header` is required and must be a
+/// valid HTTP header name; it is stored lowercased, the same way the HTTP
+/// stack compares header names, so the router can write it without a case
+/// check. `prefix` is optional, defaults to empty, and must be a valid header
+/// value fragment, which rejects CR and LF so a tenant value cannot inject a
+/// header. Any other key is a hard error with its full dotted path.
+fn convert_tenant_credential_slot(
+    auth: &prost_types::Struct,
+    auth_path: &str,
+) -> Result<Option<TenantCredentialSlot>, ConfigError> {
+    let Some(value) = auth.fields.get("tenant_credential") else {
+        return Ok(None);
+    };
+    let slot_path = format!("{auth_path}.tenant_credential");
+    let slot = match value.kind.as_ref() {
+        Some(prost_types::value::Kind::StructValue(slot)) => slot,
+        _ => {
+            return Err(invalid(
+                &slot_path,
+                "must be an object with `provider` and `header` string fields",
+            ))
+        }
+    };
+
+    let mut unknown: Vec<&String> = slot
+        .fields
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "provider" | "header" | "prefix"))
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{slot_path}.{key}"),
+            "only `provider`, `header`, and `prefix` are supported",
+        ));
+    }
+
+    let provider = provider_auth_string_field(slot, "provider", &slot_path)?;
+    if provider.is_empty() {
+        return Err(invalid(
+            format!("{slot_path}.provider"),
+            "must not be empty",
+        ));
+    }
+
+    let header = provider_auth_string_field(slot, "header", &slot_path)?;
+    // Rust note: `HeaderName::from_bytes` accepts upper- and lowercase input
+    // alike; we validate first and only then lowercase the stored copy.
+    if http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+        return Err(invalid(
+            format!("{slot_path}.header"),
+            "must be a valid HTTP header name",
+        ));
+    }
+
+    let value_prefix = match slot.fields.get("prefix") {
+        None => String::new(),
+        Some(_) => provider_auth_string_field(slot, "prefix", &slot_path)?,
+    };
+    if http::HeaderValue::from_str(&value_prefix).is_err() {
+        return Err(invalid(
+            format!("{slot_path}.prefix"),
+            "must be a valid header value fragment (no CR, LF, or control characters)",
+        ));
+    }
+
+    Ok(Some(TenantCredentialSlot {
+        provider,
+        header: header.to_ascii_lowercase(),
+        value_prefix,
+    }))
 }
 
 fn provider_model_rewrites(

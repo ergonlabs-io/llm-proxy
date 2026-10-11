@@ -225,3 +225,279 @@ static_resources:
         "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].headers[0].extra"
     );
 }
+
+/// A cluster without `tenant_credential` (and without any other runtime
+/// metadata) keeps `provider_runtime` unset.
+#[test]
+fn cluster_without_tenant_credential_has_no_provider_runtime() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            headers:
+              - { key: authorization, value: "Bearer sk-test" }
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    let cluster = snapshot.clusters.get("c1").expect("cluster");
+    assert_eq!(cluster.provider_runtime, None);
+}
+
+/// A slot alone (no credential, no path template, no model rewrites) is
+/// enough to produce a `ProviderRuntimeConfig`. The header is stored
+/// lowercase, and `prefix` is kept verbatim including its trailing space.
+#[test]
+fn tenant_credential_slot_alone_lowers_to_provider_runtime() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provider: openrouter, header: authorization, prefix: "Bearer " }
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    let cluster = snapshot.clusters.get("c1").expect("cluster");
+    assert_eq!(
+        cluster.provider_runtime,
+        Some(ProviderRuntimeConfig {
+            credential: None,
+            path_template: None,
+            model_rewrites: Vec::new(),
+            tenant_credential: Some(TenantCredentialSlot {
+                provider: "openrouter".to_string(),
+                header: "authorization".to_string(),
+                value_prefix: "Bearer ".to_string(),
+            }),
+        })
+    );
+}
+
+/// `prefix` is optional and defaults to empty, for raw API-key headers such
+/// as `x-api-key`.
+#[test]
+fn tenant_credential_prefix_defaults_to_empty() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provider: anthropic, header: x-api-key }
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    let cluster = snapshot.clusters.get("c1").expect("cluster");
+    let slot = cluster
+        .provider_runtime
+        .as_ref()
+        .and_then(|r| r.tenant_credential.as_ref())
+        .expect("slot");
+    assert_eq!(slot.value_prefix, "");
+    assert_eq!(slot.header, "x-api-key");
+}
+
+/// Header names are matched case-insensitively by Envoy and by `http`, so a
+/// mixed-case `header` is stored lowercase.
+#[test]
+fn tenant_credential_header_is_stored_lowercase() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provider: openrouter, header: Authorization, prefix: "Bearer " }
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    let cluster = snapshot.clusters.get("c1").expect("cluster");
+    let slot = cluster
+        .provider_runtime
+        .as_ref()
+        .and_then(|r| r.tenant_credential.as_ref())
+        .expect("slot");
+    assert_eq!(slot.header, "authorization");
+}
+
+/// The slot sits beside the existing `headers` list without disturbing it.
+#[test]
+fn tenant_credential_coexists_with_headers() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            headers:
+              - { key: anthropic-version, value: "2023-06-01" }
+            tenant_credential: { provider: anthropic, header: x-api-key }
+"#;
+    let snapshot = snapshot_from(yaml).expect("must lower");
+    let cluster = snapshot.clusters.get("c1").expect("cluster");
+    assert_eq!(cluster.request_headers_to_add.len(), 1);
+    assert_eq!(cluster.request_headers_to_add[0].key, "anthropic-version");
+    assert!(cluster
+        .provider_runtime
+        .as_ref()
+        .and_then(|r| r.tenant_credential.as_ref())
+        .is_some());
+}
+
+/// `provider` is required.
+#[test]
+fn tenant_credential_missing_provider_is_a_hard_error() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { header: authorization }
+"#;
+    let err = snapshot_from(yaml).expect_err("missing provider must fail");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential.provider"
+    );
+}
+
+/// An empty `provider` would store a credential under no name the router
+/// could ever match, so it is rejected.
+#[test]
+fn tenant_credential_empty_provider_is_a_hard_error() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provider: "", header: authorization }
+"#;
+    let err = snapshot_from(yaml).expect_err("empty provider must fail");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential.provider"
+    );
+}
+
+/// A header name with a space is not a valid HTTP header name.
+#[test]
+fn tenant_credential_bad_header_name_is_a_hard_error() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provider: openrouter, header: "bad header" }
+"#;
+    let err = snapshot_from(yaml).expect_err("bad header name must fail");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential.header"
+    );
+}
+
+/// A CR/LF in `prefix` would let a tenant value split the header, so the
+/// slot is rejected at load time.
+#[test]
+fn tenant_credential_crlf_in_prefix_is_a_hard_error() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provider: openrouter, header: authorization, prefix: "Bearer \r\nX-Injected: 1" }
+"#;
+    let err = snapshot_from(yaml).expect_err("CR/LF in prefix must fail");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential.prefix"
+    );
+}
+
+/// A typo'd key (`provder`) is a hard error with the full dotted path, never
+/// a slot that silently has no provider.
+#[test]
+fn tenant_credential_unknown_key_names_the_full_dotted_path() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: { provder: openrouter, header: authorization }
+"#;
+    let err = snapshot_from(yaml).expect_err("unknown key must fail");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential.provder"
+    );
+}
+
+/// `tenant_credential` must be an object, not a bare string.
+#[test]
+fn tenant_credential_non_object_is_a_hard_error() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            tenant_credential: "openrouter"
+"#;
+    let err = snapshot_from(yaml).expect_err("non-object slot must fail");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential"
+    );
+}
+
+/// ADR-0007 decision 1: a tenant slot is a header API-key shape, so it cannot
+/// sit beside Vertex OAuth2 or Bedrock SigV4. Both schemes are checked.
+#[test]
+fn tenant_credential_with_vertex_or_bedrock_is_a_hard_error() {
+    let vertex = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            scheme: vertex-oauth2
+            access_token: "ya29.test"
+            tenant_credential: { provider: openrouter, header: authorization }
+"#;
+    let bedrock = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            scheme: bedrock-sigv4
+            region: us-east-1
+            access_key_id: AKIATEST
+            secret_access_key: secret
+            tenant_credential: { provider: openrouter, header: authorization }
+"#;
+    for yaml in [vertex, bedrock] {
+        let err = snapshot_from(yaml).expect_err("slot beside a SigV4/OAuth2 credential must fail");
+        assert_eq!(
+            err_path(&err),
+            "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].tenant_credential"
+        );
+    }
+}
