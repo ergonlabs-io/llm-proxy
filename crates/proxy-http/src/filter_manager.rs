@@ -1029,6 +1029,11 @@ struct EncodeState {
 /// while the driver still holds `&mut filters[i]` (see the module doc).
 struct ChainCtx {
     decode: DirectionState,
+    /// This stream's request buffer limit (the listener's
+    /// `per_connection_buffer_limit_bytes`), for
+    /// [`DecoderCallbacks::decoder_buffer_limit`]. `FilterManager::run` sets
+    /// it from its own `buffer_limit`, so the two never disagree.
+    buffer_limit: usize,
     encode: EncodeState,
     /// Rust note: `Rc<RefCell<StreamInfo>>` — shared, interior-mutable
     /// ownership. This is the ONE `StreamInfo` for the whole stream: the
@@ -1143,6 +1148,7 @@ impl ChainCtx {
     fn new(stream_info: Rc<RefCell<StreamInfo>>) -> Self {
         Self {
             decode: DirectionState::default(),
+            buffer_limit: DEFAULT_BUFFER_LIMIT,
             encode: EncodeState::default(),
             stream_info,
             route_table: None,
@@ -1318,6 +1324,7 @@ impl FilterManager {
             mut terminal,
             buffer_limit,
         } = self;
+        ctx.buffer_limit = buffer_limit;
 
         // Access-log request-header snapshot (fallback): taken here, before
         // `collect_request` consumes `req`, purely so the failure paths
@@ -3293,6 +3300,10 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
 
     fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo> {
         self.ctx.stream_info.borrow_mut()
+    }
+
+    fn decoder_buffer_limit(&self) -> usize {
+        self.ctx.buffer_limit
     }
 }
 

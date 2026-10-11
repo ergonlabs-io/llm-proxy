@@ -292,6 +292,18 @@ pub trait DecoderCallbacks {
     /// or the underlying `RefCell` panics at runtime — drop it (end the
     /// statement/block) before making another call.
     fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo>;
+
+    /// The most request body bytes this stream may buffer: the listener's
+    /// `per_connection_buffer_limit_bytes` (Envoy's `decoderBufferLimit()`).
+    /// The router uses it as the retry replay limit (S3.4), so raising the
+    /// listener limit also raises the largest retriable body, as in Envoy.
+    ///
+    /// Rust note: defaulted, like [`Self::modify_decoded_headers`], so test
+    /// doubles outside the filter manager need no edit; the real adapter
+    /// returns the stream's actual limit.
+    fn decoder_buffer_limit(&self) -> usize {
+        crate::filter_manager::DEFAULT_BUFFER_LIMIT
+    }
 }
 
 /// Callbacks available to encoder (response-path) filters.

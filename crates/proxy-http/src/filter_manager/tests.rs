@@ -4577,3 +4577,36 @@ fn a_trailer_hold_resumed_in_the_same_callback_reaches_later_filters() {
         );
     });
 }
+
+/// Records what `decoder_buffer_limit` reports, the value the router reads as
+/// its retry replay limit (S3.4).
+struct RecordsBufferLimitFilter {
+    seen: Arc<Mutex<Option<usize>>>,
+}
+
+impl HttpFilter for RecordsBufferLimitFilter {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _h: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        *self.seen.lock().unwrap() = Some(cb.decoder_buffer_limit());
+        FilterHeadersStatus::Continue
+    }
+}
+
+/// `decoder_buffer_limit` reports the manager's configured limit, not the
+/// default: a filter must see the listener's raised limit.
+#[test]
+fn decoder_buffer_limit_reports_the_configured_limit() {
+    block_on(async {
+        let seen = Arc::new(Mutex::new(None));
+        let filters: Vec<Box<dyn HttpFilter>> =
+            vec![Box::new(RecordsBufferLimitFilter { seen: seen.clone() })];
+        let limit = 5 * DEFAULT_BUFFER_LIMIT + 7;
+        let (status, _, _) = run_chain(filters, log_of(), b"body", limit).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), Some(limit));
+    });
+}
