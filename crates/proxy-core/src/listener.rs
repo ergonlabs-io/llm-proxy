@@ -46,9 +46,10 @@ use tokio::task::JoinHandle;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::drain::ConnectionRegistry;
+use crate::drain::{drain_started, ConnectionRegistry, DrainState};
 use crate::filter_chain::{select_filter_chain, ConnectionProperties};
 use crate::header_mutation_filter::HeaderMutationFactory;
+use crate::lifecycle::LifecycleState;
 use crate::tcp_proxy::{self, TcpProxyParams};
 use crate::tls::{DownstreamTlsFactory, SdsSecretRegistry, TlsBuildError};
 use crate::tls_inspector::inspect_client_hello;
@@ -483,6 +484,9 @@ struct WorkerShared<'a> {
     config: &'a Arc<WorkerConfigHandle>,
     registry: &'a ConnectionRegistry,
     shutdown: &'a watch::Receiver<bool>,
+    /// Handed to every connection so its HTTP codec can start a graceful
+    /// shutdown at drain start instead of waiting for `shutdown`.
+    drain: &'a watch::Receiver<DrainState>,
     cluster_manager: &'a Arc<ClusterManager>,
     /// This worker's `upstream_rq`/`upstream_rq_time` recorder -- built once
     /// per worker (it carries that worker's own `WorkerId`) in
@@ -563,6 +567,7 @@ fn spawn_bound(
             config: shared.config.clone(),
             registry: shared.registry.clone(),
             shutdown: shared.shutdown.clone(),
+            drain: shared.drain.clone(),
             cluster_manager: shared.cluster_manager.clone(),
             router_stats: shared.router_stats.clone(),
             downstream_stats: shared.downstream_stats.clone(),
@@ -623,6 +628,7 @@ pub fn initial_bind(
     config: &Arc<WorkerConfigHandle>,
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
+    drain: &watch::Receiver<DrainState>,
     cluster_manager: &Arc<ClusterManager>,
     stats: &StatsRecorders,
     factory_state: &Arc<SharedFactoryState>,
@@ -632,6 +638,7 @@ pub fn initial_bind(
         config,
         registry,
         shutdown,
+        drain,
         cluster_manager,
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
@@ -690,6 +697,7 @@ struct AcceptLoopShared {
     config: Arc<WorkerConfigHandle>,
     registry: ConnectionRegistry,
     shutdown: watch::Receiver<bool>,
+    drain: watch::Receiver<DrainState>,
     cluster_manager: Arc<ClusterManager>,
     router_stats: Arc<RouterStats>,
     /// This worker's `downstream_cx_total` recorder --
@@ -741,6 +749,7 @@ fn spawn_accept_loop(
         config,
         registry,
         mut shutdown,
+        drain,
         cluster_manager,
         router_stats,
         downstream_stats,
@@ -874,6 +883,7 @@ fn spawn_accept_loop(
                 hcm: hcm_cache.clone(),
                 registry: registry.clone(),
                 shutdown: shutdown.clone(),
+                drain: drain.clone(),
             }));
         }
     })
@@ -902,6 +912,7 @@ struct ServeConnection {
     hcm: Rc<ListenerHcm>,
     registry: ConnectionRegistry,
     shutdown: watch::Receiver<bool>,
+    drain: watch::Receiver<DrainState>,
 }
 
 async fn serve_connection(conn: ServeConnection) {
@@ -914,6 +925,7 @@ async fn serve_connection(conn: ServeConnection) {
         hcm,
         registry,
         shutdown,
+        drain,
     } = conn;
 
     let local_addr = stream.local_addr().unwrap_or(peer);
@@ -1053,6 +1065,7 @@ async fn serve_connection(conn: ServeConnection) {
                     RunTerminalFilterCtx {
                         registry: &registry,
                         shutdown,
+                        drain,
                         name: &name,
                         downstream,
                         codec,
@@ -1101,6 +1114,7 @@ async fn serve_connection(conn: ServeConnection) {
                 RunTerminalFilterCtx {
                     registry: &registry,
                     shutdown,
+                    drain,
                     name: &name,
                     downstream,
                     codec,
@@ -1487,6 +1501,9 @@ fn build_hcm_handler(
 struct RunTerminalFilterCtx<'a> {
     registry: &'a ConnectionRegistry,
     shutdown: watch::Receiver<bool>,
+    /// Starts the HTTP codecs' graceful shutdown; TCP proxy connections ignore
+    /// it and run until `shutdown`.
+    drain: watch::Receiver<DrainState>,
     name: &'a ListenerName,
     // Rust note: `Copy`, so it threads cheaply -- also doubles as `peer` for
     // the tracing calls below via `downstream.remote`.
@@ -1513,6 +1530,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
     let RunTerminalFilterCtx {
         registry,
         mut shutdown,
+        mut drain,
         name,
         downstream,
         codec,
@@ -1533,18 +1551,30 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
             // Rust note: `serve_http1` wants an `impl Future<Output = ()>`,
             // not a `watch::Receiver` directly (it's decoupled from
             // proxy-core's drain machinery on purpose -- see its doc
-            // comment). `changed()` only ever resolves once in practice (the
-            // sender flips `false` -> `true` exactly once, at drain time),
-            // but the loop guards against spurious/duplicate notifications
-            // rather than assuming that.
+            // comment). Hyper's graceful shutdown must start at whichever
+            // comes first: drain start (idle keep-alive connections close now,
+            // in-flight requests finish, then `Connection: close` on HTTP/1
+            // or GOAWAY on HTTP/2) or the final `shutdown` signal.
+            // Hook: a realtime/WebSocket session would send Close 1001 when
+            // `drain_started` resolves.
             let shutdown_fut = async move {
-                if *shutdown.borrow() {
-                    return;
-                }
-                while shutdown.changed().await.is_ok() {
+                let shutdown_signal = async {
                     if *shutdown.borrow() {
                         return;
                     }
+                    // `changed()` only ever resolves once in practice (the
+                    // sender flips `false` -> `true` exactly once), but the
+                    // loop guards against spurious/duplicate notifications
+                    // rather than assuming that.
+                    while shutdown.changed().await.is_ok() {
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = drain_started(&mut drain) => {}
+                    _ = shutdown_signal => {}
                 }
             };
 
@@ -1601,6 +1631,7 @@ fn reconcile(
     config: &Arc<WorkerConfigHandle>,
     registry: &ConnectionRegistry,
     shutdown: &watch::Receiver<bool>,
+    drain: &watch::Receiver<DrainState>,
     cluster_manager: &Arc<ClusterManager>,
     stats: &StatsRecorders,
     factory_state: &Arc<SharedFactoryState>,
@@ -1610,6 +1641,7 @@ fn reconcile(
         config,
         registry,
         shutdown,
+        drain,
         cluster_manager,
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
@@ -1749,8 +1781,16 @@ fn reconcile(
 
 /// Runs for the rest of a worker's lifetime: reconciles `bound` (already
 /// populated by a prior, fallible [`initial_bind`] call) against each new
-/// snapshot the control runtime publishes (`config_ping`), until `shutdown`
-/// fires -- at which point every accept loop is aborted and this returns.
+/// snapshot the control runtime publishes (`config_ping`), until `drain` or
+/// `shutdown` fires.
+///
+/// At drain start every accept loop is aborted and awaited, which drops its
+/// `TcpListener`: new connections are refused from then on, and no later
+/// snapshot (SIGHUP, xDS) can bind a listener again. Established connections
+/// are untouched here; they own their tasks and react to `drain` themselves.
+/// `lifecycle.mark_listener_bound()` runs after each reconcile that leaves a
+/// listener bound, so `/ready` also turns live for listeners that arrive
+/// later through LDS.
 ///
 /// Rust note: the split between `initial_bind` (fallible, run first, can
 /// report a fatal startup error) and this function (infallible from here on
@@ -1772,6 +1812,8 @@ pub async fn run_listener_manager(
     config: Arc<WorkerConfigHandle>,
     mut config_ping: watch::Receiver<SnapshotVersion>,
     mut shutdown: watch::Receiver<bool>,
+    mut drain: watch::Receiver<DrainState>,
+    lifecycle: Arc<LifecycleState>,
     registry: ConnectionRegistry,
     cluster_manager: Arc<ClusterManager>,
     stats: StatsRecorders,
@@ -1779,7 +1821,18 @@ pub async fn run_listener_manager(
     secret_registry: Arc<SdsSecretRegistry>,
 ) {
     loop {
+        // Rust note: `biased;` makes `select!` poll branches in source order
+        // instead of randomly. Drain is first so a snapshot published in the
+        // same instant as the drain can never rebind a listener.
         tokio::select! {
+            biased;
+            _ = drain_started(&mut drain) => {
+                tracing::info!("drain started: closing listening sockets, no further binds");
+                break;
+            }
+            _ = shutdown.changed() => {
+                break;
+            }
             changed = config_ping.changed() => {
                 if changed.is_err() {
                     break;
@@ -1791,20 +1844,28 @@ pub async fn run_listener_manager(
                     &config,
                     &registry,
                     &shutdown,
+                    &drain,
                     &cluster_manager,
                     &stats,
                     &factory_state,
                     &secret_registry,
                 );
-            }
-            _ = shutdown.changed() => {
-                break;
+                if !bound.is_empty() {
+                    lifecycle.mark_listener_bound();
+                }
             }
         }
     }
 
-    for (_, bound_listener) in bound.drain() {
-        bound_listener.task.abort();
+    // Aborting only schedules the cancellation; awaiting each handle is what
+    // guarantees the `TcpListener` is dropped (the port refuses connections)
+    // before this returns.
+    let tasks: Vec<JoinHandle<()>> = bound.drain().map(|(_, b)| b.task).collect();
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 }
 
@@ -1815,6 +1876,10 @@ mod ext_authz_tests;
 #[cfg(test)]
 #[path = "listener_body_cap_tests.rs"]
 mod body_cap_tests;
+
+#[cfg(test)]
+#[path = "listener_drain_tests.rs"]
+mod drain_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2390,6 +2455,9 @@ mod tests {
         let config = Arc::new(WorkerConfigHandle::new(initial.clone()));
         let (config_tx, config_rx) = watch::channel(initial.version);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Dropping the sender makes `drain_started` pend forever, which is
+        // what these non-drain tests want; the drain tests own their own harness.
+        let (_drain_tx, drain_rx) = watch::channel(DrainState::NotDraining);
         let registry = ConnectionRegistry::new();
         let cluster_manager = cluster_manager_for(&initial).await;
         let stats_control = proxy_observability::stats::StatsControl::new(1);
@@ -2409,6 +2477,7 @@ mod tests {
             &config,
             &registry,
             &shutdown_rx,
+            &drain_rx,
             &cluster_manager,
             &stats,
             &factory_state,
@@ -2421,6 +2490,8 @@ mod tests {
             config.clone(),
             config_rx,
             shutdown_rx,
+            drain_rx,
+            Arc::new(LifecycleState::new()),
             registry.clone(),
             cluster_manager,
             stats,
@@ -3506,6 +3577,7 @@ mod tests {
             let config = Arc::new(WorkerConfigHandle::new(snapshot.clone()));
             let registry = ConnectionRegistry::new();
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (_drain_tx, drain_rx) = watch::channel(DrainState::NotDraining);
             let cluster_manager = cluster_manager_for(&snapshot).await;
             let stats_control = proxy_observability::stats::StatsControl::new(1);
             let stats = StatsRecorders {
@@ -3524,6 +3596,7 @@ mod tests {
                 &config,
                 &registry,
                 &shutdown_rx,
+                &drain_rx,
                 &cluster_manager,
                 &stats,
                 &factory_state,

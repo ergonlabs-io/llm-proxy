@@ -22,9 +22,8 @@ use proxy_config::ir::{AdsProtocol, DiscoverySource, NodeIdentity, SnapshotVersi
 use proxy_config::{
     build_snapshot, load_bootstrap_file, ConfigSnapshot, LoadedBootstrap, StrictMode,
 };
-use proxy_core::drain::{
-    drain_worker, graceful_shutdown, ConnectionRegistry, DrainStrategy as CoreDrainStrategy,
-};
+use proxy_core::drain::{drain_worker, ConnectionRegistry};
+use proxy_core::lifecycle::LifecycleState;
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::{SnapshotHandles, WorkerContext, WorkerId, WorkerPool, WorkerPoolConfig};
 use proxy_core::tls::SdsSecretRegistry;
@@ -130,8 +129,8 @@ struct Args {
     )]
     drain_time_s: u64,
 
-    /// How aggressively in-flight requests are encouraged to close during a
-    /// drain.
+    /// Accepted for Envoy CLI compatibility. Both values behave as Envoy's
+    /// `immediate`: see the startup warning and the docs.
     #[arg(long = "drain-strategy", value_enum, default_value_t = DrainStrategyArg::Gradual)]
     drain_strategy: DrainStrategyArg,
 
@@ -185,22 +184,13 @@ enum Mode {
     Keygen,
 }
 
-/// CLI-facing drain strategy. Rust note: `proxy_core::drain::DrainStrategy`
-/// lives in another crate, so it can't derive `clap::ValueEnum` here -- this
-/// mirrors it and converts via `From` below.
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// CLI-facing drain strategy. Both values are accepted so Envoy command lines
+/// keep working, and both behave as `immediate` (see the startup warning in
+/// `main`); nothing in the data plane reads the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DrainStrategyArg {
     Gradual,
     Immediate,
-}
-
-impl From<DrainStrategyArg> for CoreDrainStrategy {
-    fn from(value: DrainStrategyArg) -> Self {
-        match value {
-            DrainStrategyArg::Gradual => CoreDrainStrategy::Gradual,
-            DrainStrategyArg::Immediate => CoreDrainStrategy::Immediate,
-        }
-    }
 }
 
 /// Envoy's `--log-level` values.
@@ -510,25 +500,19 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     }
 
     let drain_time = Duration::from_secs(args.drain_time_s);
-    let strategy: CoreDrainStrategy = args.drain_strategy.into();
+    let strategy = args.drain_strategy;
 
-    // `DrainState::drain_close_probability` (proxy-core's `drain.rs`) is the
-    // seam a per-response close decision was BUILT to consult, but nothing
-    // calls it: the drain sequence (`graceful_shutdown`) only ever waits for
-    // the connection registry to empty or the drain deadline to pass, then
-    // flips the plain shutdown signal hyper's `graceful_shutdown()` reacts
-    // to. Neither step reads `strategy` at all, so `gradual` and `immediate`
-    // are byte-identical today. The CLI flag policy
-    // (`internal-docs/envoy-divergences.md`) requires that to be loud rather than
-    // silently accepted -- wiring it properly means teaching the HTTP codecs
-    // (`proxy-http`) to consult a per-response close probability, which is
-    // its own work package, not a one-line fix here.
+    // The flag is accepted so Envoy command lines keep working, but it has no
+    // effect: every drain is `immediate` (internal-docs/envoy-divergences.md,
+    // "Drain strategy"). Loud on purpose, so an operator who chose `gradual`
+    // learns that idle and finished connections close at drain start.
     tracing::warn!(
         drain_strategy = ?strategy,
-        "--drain-strategy is accepted but not enforced during drain: connections are not \
-         proactively closed until the drain deadline passes or every connection ends on its \
-         own, regardless of `gradual` vs `immediate` (see internal-docs/envoy-divergences.md, \
-         \"Drain strategy\")"
+        "--drain-strategy has no effect: `gradual` and `immediate` both behave as immediate. \
+         At drain start the proxy stops accepting, closes idle keep-alive connections, and lets \
+         in-flight requests finish before closing their connection (Connection: close on \
+         HTTP/1, GOAWAY on HTTP/2); connections still open at --drain-time-s are cut \
+         (see internal-docs/envoy-divergences.md, \"Drain strategy\")"
     );
 
     // Rust note: the control runtime is a separate, ordinary multi-thread
@@ -545,7 +529,6 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     control_rt.block_on(run_serve(
         args.concurrency,
         drain_time,
-        strategy,
         args.service_node,
         args.service_cluster,
         Arc::new(snapshot),
@@ -601,7 +584,6 @@ const ADMIN_UI_DIR_ENV_VAR: &str = "LLMPROXY_ADMIN_UI_DIR";
 async fn run_serve(
     concurrency: usize,
     drain_time: Duration,
-    strategy: CoreDrainStrategy,
     service_node: Option<String>,
     service_cluster: Option<String>,
     snapshot: Arc<ConfigSnapshot>,
@@ -934,8 +916,17 @@ async fn run_serve(
         .as_ref()
         .and_then(|ads| ads.initial_fetch_timeout)
         .unwrap_or(proxy_cluster::discovery::DEFAULT_INITIAL_FETCH_TIMEOUT);
-    let readiness =
-        build_readiness_probe(cluster_manager.clone(), readiness_timeout, Instant::now());
+    // The ONE lifecycle state: `/ready`, the admin drain and health-check
+    // endpoints, every worker, and the signal loop below all read or write
+    // this, so they cannot disagree about whether the process is out of
+    // rotation.
+    let lifecycle = Arc::new(LifecycleState::new());
+    let readiness = build_readiness_probe(
+        cluster_manager.clone(),
+        readiness_timeout,
+        Instant::now(),
+        lifecycle.clone(),
+    );
 
     // proxy-admin stays free of data-plane/proto dependencies: this
     // binary is the narrow adapter from ClusterManager's plain runtime view
@@ -984,6 +975,7 @@ async fn run_serve(
             factory_state: factory_state.clone(),
             readiness: Some(readiness),
             cluster_state: Some(cluster_state),
+            lifecycle: lifecycle.clone(),
         },
     )
     .await
@@ -1056,7 +1048,8 @@ async fn run_serve(
     }
 
     let startup_gate_for_workers = startup_gate.clone();
-    let publisher = WorkerPool::spawn(
+    let lifecycle_for_workers = lifecycle.clone();
+    let mut publisher = WorkerPool::spawn(
         WorkerPoolConfig {
             concurrency,
             pin_cores: true,
@@ -1070,6 +1063,7 @@ async fn run_serve(
                 ctx,
                 bind_tx,
                 startup_gate,
+                lifecycle_for_workers.clone(),
                 cluster_manager.clone(),
                 registry.clone(),
                 stat_handles.clone(),
@@ -1086,7 +1080,6 @@ async fn run_serve(
     tracing::info!(
         workers = concurrency,
         drain_time_s = drain_time.as_secs(),
-        drain_strategy = ?strategy,
         service_node = service_node.as_deref().unwrap_or("-"),
         service_cluster = service_cluster.as_deref().unwrap_or("-"),
         listeners = %listener_summary.join(", "),
@@ -1165,7 +1158,9 @@ async fn run_serve(
     // Runs until a shutdown signal arrives; a SIGHUP along the way triggers a
     // config reload, and an ADS-applied snapshot
     // does likewise, and both loop back to waiting, exactly like Envoy's own
-    // hot-reload trigger. See `reload`'s doc for what "reload" does and does
+    // hot-reload trigger. An admin `POST /drain_listeners` also starts the
+    // drain from inside this loop, but the process keeps running (SIGHUP and
+    // ADS still apply; workers no longer bind) until a signal arrives. See `reload`'s doc for what "reload" does and does
     // not apply, and requirement 1's test (`sighup_with_a_broken_config_...`
     // in `tests/reload.rs`) for why a failed reload must never reach the
     // `break` below.
@@ -1173,6 +1168,7 @@ async fn run_serve(
     // Rust note: `tokio::select!` picks whichever branch is ready first, so
     // this is what turns two independent producers of "apply a new snapshot"
     // (SIGHUP and ADS) into one control loop that never applies both at once.
+    let mut drain_deadline: Option<Instant> = None;
     loop {
         tokio::select! {
             signal = control_signals.recv() => match signal {
@@ -1193,6 +1189,16 @@ async fn run_serve(
                     }
                 }
             },
+            // Rust note: the `if` guard disables this branch once the drain
+            // has started, so a later `Notify` permit cannot start it twice.
+            _ = lifecycle.drain_requested(), if drain_deadline.is_none() => {
+                drain_deadline = Some(begin_drain(
+                    &lifecycle,
+                    &publisher,
+                    drain_time,
+                    "POST /drain_listeners",
+                ));
+            }
             ads_msg = recv_ads_apply(&mut ads_apply_rx) => match ads_msg {
                 Some((mut ads_snapshot, reply)) => {
                     // Rust note: authoritative version stamping happens HERE,
@@ -1246,80 +1252,203 @@ async fn run_serve(
         }
     }
 
-    if let Some(supervisor) = &capture_supervisor {
-        supervisor.stop_admissions();
-    }
-    let outcome = graceful_shutdown(publisher, drain_time, strategy).await;
-    if let Some(delivery) = capture_delivery {
-        let deadline = capture_supervisor
-            .as_ref()
-            .map(|s| s.drain_deadline())
-            .unwrap_or(Duration::from_secs(5));
-        let timed_out = delivery.shutdown(deadline).await;
-        tracing::info!(timed_out, "local capture delivery stopped");
-    }
-    if let Some(delivery) = metadata_delivery {
-        let summary = delivery.shutdown(Duration::from_secs(5)).await;
-        tracing::info!(
-            ?summary,
-            "metadata delivery stopped; file writes do not imply durability"
+    // A signal that arrives before any admin drain starts the drain now; after
+    // an admin drain it keeps the ORIGINAL deadline, so the window is
+    // `--drain-time-s` from the first drain trigger, not from the signal.
+    let deadline = match drain_deadline {
+        Some(deadline) => deadline,
+        None => begin_drain(&lifecycle, &publisher, drain_time, "signal"),
+    };
+
+    // Wait for every worker to report its connections gone (or the deadline),
+    // while still listening for a second SIGTERM/SIGINT, which means "stop
+    // waiting". Rust note: the wait future is pinned OUTSIDE the loop so a
+    // SIGHUP iteration does not restart it and lose the workers that already
+    // reported; the block ends its `&mut publisher` borrow.
+    let drain_result = {
+        let wait = publisher.wait_drained(deadline);
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                outcome = &mut wait => break Some(outcome),
+                signal = control_signals.recv() => match signal {
+                    ControlSignal::Shutdown => break None,
+                    ControlSignal::Reload => tracing::warn!(
+                        "SIGHUP ignored: the proxy is draining and will not bind new listeners"
+                    ),
+                },
+            }
+        }
+    };
+    let fast_exit = drain_result.is_none();
+    if fast_exit {
+        tracing::error!(
+            "second termination signal during drain: cutting in-flight requests and exiting now"
         );
     }
 
-    // Workers have dropped their senders. Flush remaining traces before taking
-    // the final metric snapshot so export failures and drops are included.
-    if let Some((mut handle, budget)) = trace_export_shutdown.take() {
-        match tokio::time::timeout(budget, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!(error = %err, "trace exporter stopped unexpectedly"),
-            Err(_) => {
-                handle.abort();
-                let _ = handle.await;
+    // Stopping the workers drops every connection still open: this is the
+    // deadline cut (or the fast exit). Workers that already drained exit at once.
+    publisher.shutdown();
+    publisher.join();
+
+    // Capture admissions close only now, after the drain, so a request that
+    // completed inside the drain window was still admitted and recorded;
+    // stopping them first dropped every record from the window.
+    if let Some(supervisor) = &capture_supervisor {
+        supervisor.stop_admissions();
+    }
+
+    tracing::info!("drain finished: flushing capture, metadata, trace and metric exports");
+
+    // Rust note: the whole flush sequence is one future so it can be raced
+    // against `control_signals.recv()` below. Our handlers replaced the default
+    // SIGTERM action, so without that race a second signal during a slow
+    // flush would be swallowed and every budget below waited out.
+    let flush = async {
+        // A fast exit bounds each flush to one second and skips the final metric
+        // snapshot (its budget is derived from the exporter deadline and can be
+        // tens of seconds): the operator asked for "now", but records for requests
+        // that already finished are still worth a moment.
+        let fast_flush_cap = Duration::from_secs(1);
+        if let Some(delivery) = capture_delivery {
+            let configured = capture_supervisor
+                .as_ref()
+                .map(|s| s.drain_deadline())
+                .unwrap_or(Duration::from_secs(5));
+            let deadline = if fast_exit {
+                configured.min(fast_flush_cap)
+            } else {
+                configured
+            };
+            let timed_out = delivery.shutdown(deadline).await;
+            tracing::info!(timed_out, "local capture delivery stopped");
+        }
+        if let Some(delivery) = metadata_delivery {
+            let budget = if fast_exit {
+                fast_flush_cap
+            } else {
+                Duration::from_secs(5)
+            };
+            let summary = delivery.shutdown(budget).await;
+            tracing::info!(
+                ?summary,
+                "metadata delivery stopped; file writes do not imply durability"
+            );
+        }
+
+        // Workers have dropped their senders. Flush remaining traces before taking
+        // the final metric snapshot so export failures and drops are included.
+        if let Some((mut handle, budget)) = trace_export_shutdown.take() {
+            let budget = if fast_exit {
+                budget.min(fast_flush_cap)
+            } else {
+                budget
+            };
+            match tokio::time::timeout(budget, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!(error = %err, "trace exporter stopped unexpectedly"),
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    tracing::warn!(
+                        budget_ms = budget.as_millis() as u64,
+                        "trace exporter exceeded the shutdown budget; pending spans may be lost"
+                    );
+                }
+            }
+        }
+
+        // Ask the metric exporter for one last snapshot and WAIT
+        // for it, AFTER the drain has finished -- so the final
+        // cumulative figures include everything the drain period itself served, and
+        // so a slow collector's deadline can never delay the drain. An earlier
+        // revision fired this before the drain and was corrected in review on both
+        // counts: drain-period traffic was missing from the "final" snapshot, and
+        // the pre-drain await added up to one export deadline of latency to every
+        // shutdown for no benefit.
+        //
+        // Design doc §13's other half still holds: this proves delivery of the
+        // last snapshot at the collector's ACK level and nothing more, and the
+        // wait is bounded (the exporter's deadline plus slack, captured at spawn)
+        // so an unreachable collector cannot hang exit -- the process was already
+        // done serving when this starts, so the only cost here is exit latency,
+        // and it is one bounded RPC, not a reconnect loop.
+        //
+        // Each `send`/`await` result is deliberately ignored rather than unwrapped:
+        // a closed channel or a panicked task means the exporter was already gone
+        // (or never started), and there is no useful recovery for either at this
+        // point in shutdown. The proxy is exiting; a missing final metric snapshot
+        // must not change its exit behavior.
+        if fast_exit {
+            // Dropping the sender and handle without waiting: see the fast-exit
+            // comment above.
+            drop(metric_export_shutdown.take());
+        } else if let Some((tx, handle, final_snapshot_budget)) = metric_export_shutdown.take() {
+            let _ = tx.send(());
+            if tokio::time::timeout(final_snapshot_budget, handle)
+                .await
+                .is_err()
+            {
                 tracing::warn!(
-                    budget_ms = budget.as_millis() as u64,
-                    "trace exporter exceeded the shutdown budget; pending spans may be lost"
+                    budget_ms = final_snapshot_budget.as_millis() as u64,
+                    "metric exporter did not finish its final snapshot before the shutdown budget \
+                 expired; the last cumulative figures may not reach the collector"
                 );
             }
         }
-    }
-
-    // Ask the metric exporter for one last snapshot and WAIT
-    // for it, AFTER `graceful_shutdown` has returned -- so the final
-    // cumulative figures include everything the drain period itself served, and
-    // so a slow collector's deadline can never delay the drain. An earlier
-    // revision fired this before the drain and was corrected in review on both
-    // counts: drain-period traffic was missing from the "final" snapshot, and
-    // the pre-drain await added up to one export deadline of latency to every
-    // shutdown for no benefit.
-    //
-    // Design doc §13's other half still holds: this proves delivery of the
-    // last snapshot at the collector's ACK level and nothing more, and the
-    // wait is bounded (the exporter's deadline plus slack, captured at spawn)
-    // so an unreachable collector cannot hang exit -- the process was already
-    // done serving when this starts, so the only cost here is exit latency,
-    // and it is one bounded RPC, not a reconnect loop.
-    //
-    // Each `send`/`await` result is deliberately ignored rather than unwrapped:
-    // a closed channel or a panicked task means the exporter was already gone
-    // (or never started), and there is no useful recovery for either at this
-    // point in shutdown. The proxy is exiting; a missing final metric snapshot
-    // must not change its exit behavior.
-    if let Some((tx, handle, final_snapshot_budget)) = metric_export_shutdown.take() {
-        let _ = tx.send(());
-        if tokio::time::timeout(final_snapshot_budget, handle)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                budget_ms = final_snapshot_budget.as_millis() as u64,
-                "metric exporter did not finish its final snapshot before the shutdown budget \
-                 expired; the last cumulative figures may not reach the collector"
-            );
+    };
+    tokio::pin!(flush);
+    let abandoned = loop {
+        tokio::select! {
+            () = &mut flush => break false,
+            signal = control_signals.recv() => match signal {
+                ControlSignal::Shutdown => {
+                    tracing::error!(
+                        "termination signal while flushing telemetry: abandoning the remaining \
+                         flushes and exiting now"
+                    );
+                    break true;
+                }
+                ControlSignal::Reload => tracing::warn!(
+                    "SIGHUP ignored: the proxy is shutting down and will not reload"
+                ),
+            },
         }
+    };
+    if abandoned {
+        return ExitCode::FAILURE;
     }
 
-    tracing::info!(?outcome, "drain sequence finished, exiting");
-    ExitCode::SUCCESS
+    match drain_result {
+        Some(outcome) => {
+            tracing::info!(?outcome, "drain sequence finished, exiting");
+            ExitCode::SUCCESS
+        }
+        None => ExitCode::FAILURE,
+    }
+}
+
+/// Starts the one drain: flips `/ready` to DRAINING first (so load balancers
+/// stop sending before sockets close), then broadcasts the drain to every
+/// worker. Returns the deadline that bounds the whole drain. Idempotent on the
+/// lifecycle side (`request_drain` reports whether it was first), but callers
+/// invoke it once: SIGTERM/SIGINT or an admin request, whichever comes first.
+fn begin_drain(
+    lifecycle: &LifecycleState,
+    publisher: &proxy_core::runtime::ConfigPublisher,
+    drain_time: Duration,
+    trigger: &str,
+) -> Instant {
+    lifecycle.request_drain();
+    let deadline = publisher.start_drain(drain_time);
+    tracing::info!(
+        trigger,
+        drain_time_s = drain_time.as_secs(),
+        "drain started: /ready now answers DRAINING, listeners are closing, idle connections \
+         close now, in-flight requests may finish until the deadline"
+    );
+    deadline
 }
 
 /// The SIGHUP config-reload path: re-reads `source`'s file through the exact
@@ -2288,7 +2417,17 @@ async fn wait_for_initial_binds(
 
 /// Builds the `/ready` readiness probe `run_serve` wires
 /// into [`start_admin`], which passes it straight through to
-/// `proxy_admin::serve`. Reads [`proxy_cluster::manager::ClusterManager::warming_clusters`]
+/// `proxy_admin::serve`. Checked in this order on every call:
+///
+/// 1. `lifecycle.out_of_rotation()` (SIGTERM, `POST /drain_listeners`, or
+///    `/healthcheck/fail`) answers [`proxy_admin::Readiness::Draining`].
+/// 2. No worker has bound a listener yet answers
+///    [`proxy_admin::Readiness::Initializing`] with whatever is warming (maybe
+///    nothing). There is deliberately no deadline here: a proxy that never
+///    receives LDS has nothing to serve and must stay not-ready.
+/// 3. Otherwise the warming rule below.
+///
+/// The warming rule reads [`proxy_cluster::manager::ClusterManager::warming_clusters`]
 /// fresh on every call -- no caching, since the whole point is that warming
 /// state can change between polls -- and reports [`proxy_admin::Readiness::Initializing`]
 /// for as long as it is non-empty AND `deadline_started_at.elapsed()` is
@@ -2323,10 +2462,17 @@ fn build_readiness_probe(
     cluster_manager: Arc<proxy_cluster::manager::ClusterManager>,
     timeout: Duration,
     deadline_started_at: Instant,
+    lifecycle: Arc<LifecycleState>,
 ) -> proxy_admin::ReadinessProbe {
     let warned = AtomicBool::new(false);
     Arc::new(move || {
+        if lifecycle.out_of_rotation() {
+            return proxy_admin::Readiness::Draining;
+        }
         let warming = cluster_manager.warming_clusters();
+        if !lifecycle.listener_bound() {
+            return proxy_admin::Readiness::Initializing { warming };
+        }
         if warming.is_empty() {
             return proxy_admin::Readiness::Live;
         }
@@ -2391,6 +2537,7 @@ struct AdminStartRuntime<'a> {
     factory_state: Arc<proxy_http::filter::SharedFactoryState>,
     readiness: Option<proxy_admin::ReadinessProbe>,
     cluster_state: Option<proxy_admin::ClusterStateProvider>,
+    lifecycle: Arc<LifecycleState>,
 }
 
 async fn start_admin(
@@ -2432,7 +2579,7 @@ async fn start_admin(
             readiness: runtime.readiness,
             cluster_state: runtime.cluster_state,
             ui,
-            lifecycle: None,
+            lifecycle: Some(runtime.lifecycle),
         },
     )
     .await
@@ -2445,7 +2592,10 @@ async fn start_admin(
 /// sockets, accepts, matches filter chains), the drain routine (reports back
 /// once the registry empties or the drain deadline passes), and a final wait
 /// on the plain shutdown signal so the worker thread doesn't exit before the
-/// control runtime calls `ConfigPublisher::shutdown`.
+/// control runtime calls `ConfigPublisher::shutdown`. At drain start the
+/// listener manager closes the listening sockets and HTTP connections begin
+/// their graceful shutdown; `shutdown` is also watched during the drain so a
+/// fast exit does not wait for the deadline.
 ///
 /// The very first thing this does is bind every listener in the initial
 /// snapshot (`initial_bind`) and report the outcome over `bind_tx` --
@@ -2466,6 +2616,7 @@ async fn worker_main(
     ctx: WorkerContext,
     bind_tx: mpsc::UnboundedSender<(WorkerId, Result<(), String>)>,
     startup_gate: Arc<StartupGate>,
+    lifecycle: Arc<LifecycleState>,
     cluster_manager: Arc<proxy_cluster::manager::ClusterManager>,
     stats_registry: Arc<proxy_observability::stats::Registry>,
     stat_handles: Arc<proxy_http::stat_handles::StatHandles>,
@@ -2536,12 +2687,18 @@ async fn worker_main(
         &ctx.config,
         &registry,
         &ctx.shutdown,
+        &ctx.drain,
         &cluster_manager,
         &stats,
         &factory_state,
         &secret_registry,
     ) {
         Ok(bound) => {
+            // `/ready` stays INITIALIZING until a socket is actually listening;
+            // a worker whose snapshot has no bindable listener (yet) leaves it so.
+            if !bound.is_empty() {
+                lifecycle.mark_listener_bound();
+            }
             let _ = bind_tx.send((ctx.id, Ok(())));
             bound
         }
@@ -2562,6 +2719,8 @@ async fn worker_main(
         ctx.config,
         ctx.config_ping,
         ctx.shutdown.clone(),
+        ctx.drain.clone(),
+        lifecycle,
         registry.clone(),
         cluster_manager.clone(),
         stats,
@@ -2569,10 +2728,17 @@ async fn worker_main(
         secret_registry,
     ));
 
-    drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
-
+    // `drain_worker` only returns once the registry empties or the drain
+    // deadline passes, so shutdown must also be watched while it runs: a
+    // second termination signal stops the workers mid-drain and must not wait
+    // for the deadline.
     let mut shutdown = ctx.shutdown;
-    let _ = shutdown.changed().await;
+    tokio::select! {
+        _ = drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry) => {
+            let _ = shutdown.changed().await;
+        }
+        _ = shutdown.changed() => {}
+    }
 
     // `run_listener_manager` also watches `shutdown` and aborts its accept
     // loops on the same signal; wait for it so the thread doesn't tear down
@@ -2716,6 +2882,7 @@ mod tests {
                 factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
                 readiness: None,
                 cluster_state: None,
+                lifecycle: Arc::new(LifecycleState::new()),
             },
         )
         .await
@@ -2745,6 +2912,7 @@ mod tests {
                 factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
                 readiness: None,
                 cluster_state: None,
+                lifecycle: Arc::new(LifecycleState::new()),
             },
         )
         .await
@@ -2779,6 +2947,7 @@ mod tests {
                 factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
                 readiness: None,
                 cluster_state: None,
+                lifecycle: Arc::new(LifecycleState::new()),
             },
         )
         .await
@@ -2856,6 +3025,75 @@ mod tests {
         Arc::new(manager)
     }
 
+    fn bound_lifecycle() -> Arc<LifecycleState> {
+        let lifecycle = Arc::new(LifecycleState::new());
+        lifecycle.mark_listener_bound();
+        lifecycle
+    }
+
+    /// A cluster manager with nothing warming: isolates the lifecycle checks
+    /// from the warming rule.
+    fn idle_manager() -> Arc<proxy_cluster::manager::ClusterManager> {
+        Arc::new(
+            proxy_cluster::manager::ClusterManager::with_default_transport(Arc::new(
+                proxy_cluster::resolver::TokioResolver,
+            )),
+        )
+    }
+
+    /// M6: with no cluster warming at all, `/ready` still must not be LIVE
+    /// until a worker has bound a listener, and a backdated deadline must not
+    /// release it (a proxy that never receives LDS has nothing to serve).
+    #[test]
+    fn readiness_probe_is_initializing_until_a_listener_is_bound() {
+        let lifecycle = Arc::new(LifecycleState::new());
+        let probe = build_readiness_probe(
+            idle_manager(),
+            Duration::from_secs(1),
+            Instant::now() - Duration::from_secs(60),
+            lifecycle.clone(),
+        );
+        assert_eq!(
+            probe(),
+            proxy_admin::Readiness::Initializing { warming: vec![] }
+        );
+        lifecycle.mark_listener_bound();
+        assert_eq!(probe(), proxy_admin::Readiness::Live);
+    }
+
+    /// Drain and a failed health check win over every other state, including
+    /// warming clusters and a bound listener; `/healthcheck/ok` restores
+    /// readiness but a drain never reverses.
+    #[test]
+    fn readiness_probe_reports_draining_before_anything_else() {
+        let lifecycle = bound_lifecycle();
+        let probe = build_readiness_probe(
+            idle_manager(),
+            Duration::from_secs(60),
+            Instant::now(),
+            lifecycle.clone(),
+        );
+        assert_eq!(probe(), proxy_admin::Readiness::Live);
+        lifecycle.fail_health_check();
+        assert_eq!(probe(), proxy_admin::Readiness::Draining);
+        lifecycle.restore_health_check();
+        assert_eq!(probe(), proxy_admin::Readiness::Live);
+        lifecycle.request_drain();
+        lifecycle.restore_health_check();
+        assert_eq!(probe(), proxy_admin::Readiness::Draining);
+
+        // Draining also beats "no listener bound yet".
+        let unbound = Arc::new(LifecycleState::new());
+        unbound.request_drain();
+        let probe = build_readiness_probe(
+            idle_manager(),
+            Duration::from_secs(60),
+            Instant::now(),
+            unbound,
+        );
+        assert_eq!(probe(), proxy_admin::Readiness::Draining);
+    }
+
     // ---- The readiness probe's deadline -----------------
     //
     // Both tests drive `build_readiness_probe` directly (per the task's own
@@ -2867,7 +3105,12 @@ mod tests {
     #[tokio::test]
     async fn readiness_probe_reports_initializing_before_the_deadline() {
         let manager = manager_with_one_never_fed_cluster().await;
-        let probe = build_readiness_probe(manager.clone(), Duration::from_secs(60), Instant::now());
+        let probe = build_readiness_probe(
+            manager.clone(),
+            Duration::from_secs(60),
+            Instant::now(),
+            bound_lifecycle(),
+        );
         match probe() {
             proxy_admin::Readiness::Initializing { warming } => {
                 assert_eq!(warming, vec!["never-fed".to_string()]);
@@ -2890,8 +3133,12 @@ mod tests {
         // Backdated, not slept-past: the deadline already elapsed before the
         // first call.
         let deadline_started_at = Instant::now() - Duration::from_secs(60);
-        let probe =
-            build_readiness_probe(manager.clone(), Duration::from_secs(1), deadline_started_at);
+        let probe = build_readiness_probe(
+            manager.clone(),
+            Duration::from_secs(1),
+            deadline_started_at,
+            bound_lifecycle(),
+        );
 
         assert_eq!(probe(), proxy_admin::Readiness::Live);
         assert!(

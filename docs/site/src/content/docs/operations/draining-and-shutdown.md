@@ -1,8 +1,8 @@
 ---
 title: Draining and shutdown
-summary: SIGTERM/SIGINT trigger a drain window before the process exits. What
-  the drain deadline actually bounds, and what it does not.
-last_updated: 2026-08-09
+summary: What SIGTERM, SIGINT, and POST /drain_listeners do, how /ready
+  changes, and what the drain deadline cuts.
+last_updated: 2026-10-10
 related:
   - ../operations/config-reload/
   - ../reference/cli/
@@ -10,66 +10,71 @@ related:
 
 # Draining and shutdown
 
-`SIGTERM` or `SIGINT` starts a drain sequence rather than killing the
-process outright. Signal handlers are installed before the proxy binds any
-listener, so there is no window at startup where a signal would fall back
-to the OS default (immediate termination, no drain)
-(`crates/proxy/src/main.rs`'s `ControlSignals::install`).
+`SIGTERM` or `SIGINT` starts a drain instead of killing the process. Signal
+handlers are installed before any listener binds, so a signal at startup never
+falls back to the OS default.
 
 ## What happens, in order
 
-1. Every worker is told draining has started. A per-connection close
-   probability is computed for the configured strategy (see "What
-   `--drain-strategy` does today" below), broadcast to every worker
-   (`crates/proxy-core/src/drain.rs`'s `DrainState`/`DrainCoordinator`).
-2. Each worker races its own live-connection count reaching zero against
-   the drain deadline (`--drain-time-s`, default 600 seconds) — whichever
-   happens first. An open HTTP connection counts as live for as long as it
-   is open, including an idle keep-alive connection nobody is actively
-   using (`crates/proxy-core/src/drain.rs`'s `ConnectionRegistry`).
-3. Once every worker has reported back (by either path), the process-wide
-   shutdown flag flips. Every still-open HTTP/1.1 or HTTP/2 connection then
-   receives a real protocol-level graceful shutdown: hyper finishes
-   whatever request is currently in flight on that connection, refuses to
-   accept a next one, and closes
-   (`crates/proxy-http/src/codec.rs`'s `serve_http1`/`serve_http2`).
-4. The control runtime waits for every worker thread to exit before the
-   process exits.
+1. `/ready` on the admin port answers `503 DRAINING` at once. Your load
+   balancer or Kubernetes stops sending new traffic.
+2. Every worker closes its listening sockets. New connections are refused.
+   A config reload (SIGHUP or xDS) during the drain does not open them again.
+3. Idle keep-alive connections close now.
+4. A request or stream already in flight keeps running. When it finishes, its
+   connection closes: the response carries `Connection: close` on HTTP/1, and
+   the proxy sends `GOAWAY` on HTTP/2.
+5. When no connection is left, the process flushes capture, traces, and
+   metrics, then exits `0`. It does not wait for the full window.
+6. If connections are still open after `--drain-time-s` (default 600), they
+   are cut and the process exits `0`.
 
-Proven end to end by `sigterm_drains_then_exits_cleanly` in
-`crates/proxy/tests/cli.rs`: the test config's real deployment shape, a
-`SIGTERM`, and an assertion that the process exits `0` within a bounded
-time.
+TCP proxy connections are not closed early. They run until the window ends.
 
-## The drain deadline does not cut off an in-flight request
+## A second signal
 
-`--drain-time-s` bounds how long the proxy *waits* for connections to close
-naturally before telling every remaining connection to stop accepting new
-requests. It is not a hard deadline on a request already in flight: step 3
-above only refuses a *next* request on a connection — a response already
-streaming when the deadline arrives is allowed to finish, however long that
-takes, before the connection actually closes and the process exits. For a
-long-running LLM generation still streaming when the drain deadline is
-reached, this means the response completes rather than being cut off
-mid-stream.
+A second `SIGTERM` or `SIGINT` during the drain means "stop waiting". The
+proxy logs an error, cuts every connection that is still open, spends at most
+about a second on each flush, skips the final metric snapshot, and exits with
+status `1`.
 
-## What `--drain-strategy` does today
+The same holds at any point after the first signal, including while telemetry
+is being flushed: a second `SIGTERM` or `SIGINT` abandons the remaining flushes
+and exits promptly with status `1`.
 
-`--drain-strategy` accepts `gradual` (the default) and `immediate`, and
-both are threaded through to a computed close-probability ramp
-(`DrainState::drain_close_probability`) — but nothing in the HTTP codec
-currently reads that value. In practice, today, `gradual` and `immediate`
-behave identically: neither one actively closes an idle keep-alive
-connection any sooner than the plain "wait for the deadline" behavior
-described above. The seam is built and unit-tested in isolation
-(`crates/proxy-core/src/drain.rs`), but connecting it to a live HTTP
-connection so the strategies actually diverge in practice is not done yet.
+## Admin endpoints
+
+These need the admin port and the `LLMPROXY_ADMIN_TOKEN` environment variable.
+Send the token as `Authorization: Bearer <token>`. All three are `POST`. If
+the token is unset they answer `403`; a wrong token gets `401`.
+
+| Endpoint | Effect |
+|---|---|
+| `POST /healthcheck/fail` | `/ready` answers `503 DRAINING`. Nothing else changes. |
+| `POST /healthcheck/ok` | Undoes `/healthcheck/fail`. It never undoes a drain. |
+| `POST /drain_listeners` | Starts the same drain as `SIGTERM`. The process keeps running until a signal arrives. |
+
+After `POST /drain_listeners` the process keeps serving in-flight connections
+(HTTP streams and TCP proxy sessions) past `--drain-time-s` until a signal
+arrives. The deadline is enforced only from a signal, which is the point where
+the process exits and cuts whatever is still open. Envoy's server drain
+likewise closes connections only at exit.
+
+`/drain_listeners` accepts `?graceful` and `?inboundonly` and treats both as
+no-ops. Any other query parameter is a `400`.
+
+## Readiness at startup
+
+`/ready` answers `503 INITIALIZING` until at least one listener is bound. A
+proxy with no listener, for example one that never receives LDS, never becomes
+ready. After a listener binds, `/ready` also waits for clusters that are still
+warming, until `initial_fetch_timeout`.
 
 ## Flags
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--drain-time-s` | `600` | Seconds to wait for connections to close before forcing every remaining one into graceful protocol shutdown. |
-| `--drain-strategy` | `gradual` | `gradual` or `immediate` — see the note above for what these do and do not affect today. |
+| `--drain-time-s` | `600` | Seconds to wait for connections to finish before cutting them. |
+| `--drain-strategy` | `gradual` | Accepted for Envoy command lines. It has no effect: both values drain as described above, and the proxy logs a warning at startup. |
 
 See [CLI reference](../reference/cli/) for the full flag list.

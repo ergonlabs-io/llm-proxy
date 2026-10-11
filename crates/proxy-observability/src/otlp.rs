@@ -408,7 +408,7 @@ pub async fn run_trace_exporter(
 /// [`shutdown`] is how this task ends. There is no channel to close here (it
 /// consumes no events, only time), so without an explicit signal it would run
 /// until the runtime dropped it -- and the process's own shutdown sequence
-/// (`proxy_core::runtime::graceful_shutdown`) is what a caller passes this. A
+/// (the drain-then-stop sequence in `crates/proxy/src/main.rs`) is what a caller passes this. A
 /// receiver that fires mid-sleep still gets one last snapshot out: a metric
 /// snapshot is cheap, cumulative, and the natural last word on a run.
 ///

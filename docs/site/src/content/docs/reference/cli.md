@@ -86,7 +86,7 @@ digest. Store it immediately.
 | `--config <PATH>` | — | Path to the config file. Required. |
 | `--concurrency <N>` | number of available CPU cores | Number of worker runtimes. |
 | `--drain-time-s <SECS>` | `600` | Seconds to wait for connections to close during shutdown — see [Draining and shutdown](../operations/draining-and-shutdown/). |
-| `--drain-strategy <gradual\|immediate>` | `gradual` | How shutdown encourages connections to close. See [Draining and shutdown](../operations/draining-and-shutdown/) for what these do and do not affect today. |
+| `--drain-strategy <gradual\|immediate>` | `gradual` | Accepted for Envoy compatibility. Both values behave the same and the proxy warns at startup. See [Draining and shutdown](../operations/draining-and-shutdown/). |
 | `--base-id <N>` | — | Accepted for compatibility with tooling that always passes it. llm-proxy has no hot-restart implementation, so this is parsed and ignored. |
 | `-l`, `--log-level <LEVEL>` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `critical`, or `off`. `critical` maps to `error`. |
 | `--service-node <NAME>` | — | Reserved for future dynamic-configuration support; not consumed by anything today. |

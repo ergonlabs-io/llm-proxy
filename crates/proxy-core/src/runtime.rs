@@ -19,7 +19,7 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, watch};
 use tokio::task::LocalSet;
 
-use crate::drain::{DrainCoordinator, DrainOutcome, DrainState, DrainStrategy};
+use crate::drain::{DrainCoordinator, DrainOutcome, DrainState};
 use crate::WorkerConfigHandle;
 
 /// Identifies a worker thread/runtime.
@@ -312,8 +312,8 @@ impl ConfigPublisher {
     /// Begin a drain: broadcast the new [`DrainState`] to every worker.
     /// Workers see this via `WorkerContext::drain` and react through
     /// [`crate::drain::drain_worker`].
-    pub fn start_drain(&self, duration: std::time::Duration, strategy: DrainStrategy) {
-        self.drain.start_drain(duration, strategy);
+    pub fn start_drain(&self, duration: std::time::Duration) -> std::time::Instant {
+        self.drain.start_drain(duration)
     }
 
     /// Wait until every worker has reported drain completion, or `deadline`

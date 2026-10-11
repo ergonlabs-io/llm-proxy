@@ -1,12 +1,15 @@
 //! Drain state machine, per-worker connection registry, and control/worker
 //! coordination for graceful shutdown.
 //!
-//! Drain semantics follow Envoy v1.38 (`--drain-time-s`, `--drain-strategy`):
-//! during a drain window connections are progressively encouraged to close on
-//! request completion (`Connection: close` on HTTP/1, `GOAWAY` on HTTP/2).
-//! Those protocol nudges live in the HTTP codecs; this module only
-//! builds the seam they consult (`DrainState::drain_close_probability`) plus
-//! the registry and coordination machinery around it.
+//! Drain semantics follow Envoy v1.38's `--drain-time-s`, with one deliberate
+//! departure (`internal-docs/envoy-divergences.md`, "Drain strategy"): every
+//! drain behaves like Envoy's `immediate` strategy. At drain start the
+//! listener manager closes the listening sockets and each HTTP connection is
+//! told to shut down gracefully (idle keep-alive connections close now,
+//! in-flight requests finish, then `Connection: close` on HTTP/1 or `GOAWAY`
+//! on HTTP/2). Those reactions live in `listener.rs`; this module holds the
+//! state they watch, the per-worker connection registry, and the
+//! control/worker coordination around them.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -23,23 +26,6 @@ use crate::runtime::WorkerId;
 /// connections still open are forcibly closed.
 pub const DEFAULT_DRAIN_TIME: Duration = Duration::from_secs(600);
 
-/// How aggressively requests are encouraged to drain over the drain window.
-///
-/// Rust note: `#[default]` on a variant (stable since Rust 1.62) lets us
-/// derive `Default` while still picking a specific variant -- here, the
-/// Envoy-parity choice that gradual is the default strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DrainStrategy {
-    /// The probability that a response is closed ramps linearly from 0% at
-    /// the start of the drain window to 100% at the deadline. Matches
-    /// Envoy's `--drain-strategy=gradual` (the default).
-    #[default]
-    Gradual,
-    /// All requests are encouraged to drain as soon as the drain sequence
-    /// begins. Matches Envoy's `--drain-strategy=immediate`.
-    Immediate,
-}
-
 /// Drain state broadcast from the control runtime to every worker.
 ///
 /// `Send + Sync` (in fact `Copy`): it crosses control -> worker over a
@@ -52,43 +38,19 @@ pub enum DrainState {
     Draining {
         started: Instant,
         until: Instant,
-        strategy: DrainStrategy,
     },
 }
 
-impl DrainState {
-    /// The probability that an in-flight response should be closed (rather
-    /// than kept alive) at `now`. This is the seam HTTP codecs
-    /// will consult per-response.
-    ///
-    /// Deliberately a pure function of `now` -- no RNG here -- so tests (and
-    /// callers, who supply their own randomness if they want jitter) get
-    /// deterministic behavior.
-    pub fn drain_close_probability(&self, now: Instant) -> f64 {
-        match *self {
-            DrainState::NotDraining => 0.0,
-            DrainState::Draining {
-                started,
-                until,
-                strategy,
-            } => match strategy {
-                DrainStrategy::Immediate => 1.0,
-                DrainStrategy::Gradual => {
-                    if now <= started {
-                        0.0
-                    } else if now >= until {
-                        1.0
-                    } else {
-                        let total = (until - started).as_secs_f64();
-                        let elapsed = (now - started).as_secs_f64();
-                        if total <= 0.0 {
-                            1.0
-                        } else {
-                            (elapsed / total).clamp(0.0, 1.0)
-                        }
-                    }
-                }
-            },
+/// Resolves once `drain` reports [`DrainState::Draining`], immediately if it
+/// already does. Never resolves if the control runtime dropped the sender
+/// without draining, so a torn-down publisher cannot look like a drain.
+pub async fn drain_started(drain: &mut watch::Receiver<DrainState>) {
+    loop {
+        if matches!(*drain.borrow_and_update(), DrainState::Draining { .. }) {
+            return;
+        }
+        if drain.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -230,14 +192,13 @@ impl DrainCoordinator {
 
     /// Broadcast a new draining state to every worker, starting now and
     /// lasting `duration`.
-    pub fn start_drain(&self, duration: Duration, strategy: DrainStrategy) {
+    /// Returns the deadline (`started + duration`) so the caller can wait on
+    /// exactly the same instant the workers use.
+    pub fn start_drain(&self, duration: Duration) -> Instant {
         let started = Instant::now();
         let until = started + duration;
-        let _ = self.drain_tx.send(DrainState::Draining {
-            started,
-            until,
-            strategy,
-        });
+        let _ = self.drain_tx.send(DrainState::Draining { started, until });
+        until
     }
 
     /// Wait until every worker has reported drain_done, or `deadline`
@@ -246,6 +207,12 @@ impl DrainCoordinator {
         let mut reported: HashMap<WorkerId, ()> = HashMap::with_capacity(self.worker_count);
 
         loop {
+            // Consume reports that are already buffered BEFORE judging the
+            // deadline: after an admin drain the workers finish early, and a
+            // signal long past the deadline must still see them as drained.
+            while let Ok(id) = self.done_rx.try_recv() {
+                reported.insert(id, ());
+            }
             if reported.len() >= self.worker_count {
                 return DrainOutcome::Completed;
             }
@@ -313,24 +280,6 @@ pub async fn drain_worker(
     let _ = drain_done.send(id);
 }
 
-/// Control-side convenience: sequences a full graceful shutdown --
-/// `start_drain` -> `wait_drained` -> `shutdown` -> `join`.
-///
-/// SIGTERM/CLI wiring that calls this lives in the binary; this function is
-/// triggered programmatically.
-pub async fn graceful_shutdown(
-    mut publisher: crate::runtime::ConfigPublisher,
-    drain_time: Duration,
-    strategy: DrainStrategy,
-) -> DrainOutcome {
-    publisher.start_drain(drain_time, strategy);
-    let deadline = Instant::now() + drain_time;
-    let outcome = publisher.wait_drained(deadline).await;
-    publisher.shutdown();
-    publisher.join();
-    outcome
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,56 +297,6 @@ mod tests {
 
     fn handles() -> Arc<SnapshotHandles> {
         Arc::new(SnapshotHandles::new())
-    }
-
-    #[test]
-    fn drain_close_probability_not_draining_is_zero() {
-        let state = DrainState::NotDraining;
-        assert_eq!(state.drain_close_probability(Instant::now()), 0.0);
-    }
-
-    #[test]
-    fn drain_close_probability_immediate_is_always_one() {
-        let started = Instant::now();
-        let state = DrainState::Draining {
-            started,
-            until: started + Duration::from_secs(10),
-            strategy: DrainStrategy::Immediate,
-        };
-        assert_eq!(state.drain_close_probability(started), 1.0);
-        assert_eq!(
-            state.drain_close_probability(started + Duration::from_secs(1)),
-            1.0
-        );
-        assert_eq!(
-            state.drain_close_probability(started + Duration::from_secs(100)),
-            1.0
-        );
-    }
-
-    #[test]
-    fn drain_close_probability_gradual_ramps_linearly() {
-        let started = Instant::now();
-        let until = started + Duration::from_secs(10);
-        let state = DrainState::Draining {
-            started,
-            until,
-            strategy: DrainStrategy::Gradual,
-        };
-
-        assert_eq!(state.drain_close_probability(started), 0.0);
-        let mid = state.drain_close_probability(started + Duration::from_secs(5));
-        assert!((mid - 0.5).abs() < 1e-9, "expected ~0.5, got {mid}");
-        assert_eq!(state.drain_close_probability(until), 1.0);
-        assert_eq!(
-            state.drain_close_probability(until + Duration::from_secs(1)),
-            1.0
-        );
-
-        // Monotonic.
-        let p1 = state.drain_close_probability(started + Duration::from_secs(2));
-        let p2 = state.drain_close_probability(started + Duration::from_secs(6));
-        assert!(p1 < p2);
     }
 
     #[test]
@@ -481,7 +380,7 @@ mod tests {
         );
 
         run_local(async {
-            publisher.start_drain(Duration::from_millis(500), DrainStrategy::Gradual);
+            publisher.start_drain(Duration::from_millis(500));
             let deadline = Instant::now() + Duration::from_secs(5);
             let outcome = publisher.wait_drained(deadline).await;
             assert_eq!(outcome, DrainOutcome::Completed);
@@ -524,7 +423,7 @@ mod tests {
             // coordinator-side deadline below, so the coordinator gives up
             // first (with worker 0 still pending) and we exercise
             // `DeadlineExpired` deterministically.
-            publisher.start_drain(Duration::from_secs(5), DrainStrategy::Gradual);
+            publisher.start_drain(Duration::from_secs(5));
             let deadline = Instant::now() + Duration::from_millis(50);
             let outcome = publisher.wait_drained(deadline).await;
             assert_eq!(
@@ -538,33 +437,37 @@ mod tests {
     }
 
     #[test]
-    fn graceful_shutdown_sequences_drain_then_shutdown() {
-        let publisher = WorkerPool::spawn(
-            WorkerPoolConfig {
-                concurrency: 1,
-                pin_cores: false,
-            },
-            snapshot(0),
-            handles(),
-            move |ctx: WorkerContext| async move {
-                let registry = ConnectionRegistry::new();
-                drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
-                // After drain_worker returns, wait for the shutdown
-                // signal too, mirroring how a real worker main composes
-                // both seams.
-                let mut shutdown = ctx.shutdown;
-                let _ = shutdown.changed().await;
-            },
-        );
-
+    fn wait_drained_counts_reports_buffered_before_a_deadline_that_already_passed() {
         run_local(async {
-            let outcome = graceful_shutdown(
-                publisher,
-                Duration::from_millis(20),
-                DrainStrategy::Immediate,
-            )
-            .await;
-            assert_eq!(outcome, DrainOutcome::Completed);
+            let (mut coordinator, _rx) = DrainCoordinator::new(2);
+            let done = coordinator.done_sender();
+            let past = Instant::now();
+            // Both workers drained early (an admin drain); the deadline is
+            // read only afterwards, as when a signal arrives much later.
+            done.send(WorkerId(0)).unwrap();
+            done.send(WorkerId(1)).unwrap();
+
+            let outcome = coordinator.wait_drained(past).await;
+            assert!(
+                matches!(outcome, DrainOutcome::Completed),
+                "everyone had reported: {outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn drain_started_resolves_when_already_draining_and_stays_pending_otherwise() {
+        run_local(async {
+            let (coordinator, mut rx) = DrainCoordinator::new(1);
+            // Not draining: must not resolve.
+            let pending =
+                tokio::time::timeout(Duration::from_millis(50), drain_started(&mut rx)).await;
+            assert!(pending.is_err(), "NotDraining must not look like a drain");
+
+            coordinator.start_drain(Duration::from_secs(60));
+            tokio::time::timeout(Duration::from_secs(5), drain_started(&mut rx))
+                .await
+                .expect("a drain that started before the call must still resolve it");
         });
     }
 }

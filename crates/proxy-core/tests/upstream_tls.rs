@@ -22,7 +22,8 @@ use proxy_config::ir::{
     TlsParametersIR, TlsVersion, UpstreamTlsSpec, ValidationContextIR,
 };
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, ConfigSnapshot, StrictMode};
-use proxy_core::drain::ConnectionRegistry;
+use proxy_core::drain::{ConnectionRegistry, DrainState};
+use proxy_core::lifecycle::LifecycleState;
 use proxy_core::listener::{initial_bind, run_listener_manager};
 use proxy_core::runtime::run_local;
 use proxy_core::runtime::SnapshotHandles;
@@ -255,6 +256,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
     let config = SnapshotHandles::new().register(snapshot.clone());
     let (config_tx, config_rx) = watch::channel(snapshot.version);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_drain_tx, drain_rx) = watch::channel(DrainState::NotDraining);
     let registry = ConnectionRegistry::new();
 
     let cluster_manager = Arc::new(ClusterManager::new(
@@ -330,6 +332,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         &config,
         &registry,
         &shutdown_rx,
+        &drain_rx,
         &cluster_manager,
         &stats,
         &factory_state,
@@ -342,6 +345,8 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         config,
         config_rx,
         shutdown_rx,
+        drain_rx,
+        Arc::new(LifecycleState::new()),
         registry,
         cluster_manager,
         stats,

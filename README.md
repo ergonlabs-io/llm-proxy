@@ -189,7 +189,8 @@ provider on failover. That has been a real key-disclosure bug here twice.
 - **Survives operations.** Configuration reloads on SIGHUP — and a configuration
   that fails to parse leaves the previous one serving, with the error logged
   against its exact field path. SIGTERM drains connections instead of dropping
-  them. A config swap under live traffic is covered by a differential test that
+  them: `/ready` turns 503, the listeners close, idle connections close, and
+  in-flight streams finish until `--drain-time-s`. A config swap under live traffic is covered by a differential test that
   asserts every in-flight SSE stream still reaches its terminal frame.
 
 - **Takes configuration from a control plane.** ADS state-of-the-world for
@@ -422,7 +423,7 @@ Stated plainly, because a feature list without this is not much use:
   at load rather than failing silently.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
-- **`--drain-strategy` has no effect.** It is accepted and warns at startup.
+- **`--drain-strategy` has no effect.** It is accepted and warns at startup; both values drain like Envoy's `immediate`.
 - **No embeddings and no `/v1/models` handling.** A request to any other path
   proxies through, but gets no token metering.
 - **No Kubernetes controller or CRDs.**

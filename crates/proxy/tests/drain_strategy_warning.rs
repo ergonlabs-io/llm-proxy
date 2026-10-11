@@ -1,12 +1,8 @@
-//! Defect 2 (found writing user documentation, 2026-08-09): `--drain-strategy
-//! gradual` and `immediate` behave identically today (`DrainState::
-//! drain_close_probability` has no production call site -- see
-//! `internal-docs/envoy-divergences.md`'s "Drain strategy" section). AGENTS.md invariant 1
-//! forbids leaving that silent, so `serve` emits a startup `tracing::warn!`
-//! instead of wiring up the full per-response close-probability feature
-//! (out of scope for a contained fix -- see the same doc section for why).
-//! This is the end-to-end proof the warning actually reaches an operator's
-//! log, for either `--drain-strategy` value.
+//! `--drain-strategy gradual` and `immediate` are both accepted and both behave
+//! as immediate (`internal-docs/envoy-divergences.md`, "Drain strategy").
+//! AGENTS.md invariant 1 forbids leaving that silent, so `serve` emits a
+//! startup `tracing::warn!` saying so. This is the end-to-end proof the
+//! warning reaches an operator's log, for either `--drain-strategy` value.
 //!
 //! Rust note: same shape as `tests/reload.rs`/`tests/stats_e2e.rs` -- a
 //! separate compiled crate per `tests/*.rs` file, so helpers are duplicated
@@ -98,7 +94,7 @@ static_resources:
 }
 
 /// Runs `llm-proxy serve` with the given `--drain-strategy` value and returns
-/// whether the "not enforced" warning showed up on stderr before `SIGTERM`
+/// whether the "has no effect" warning showed up on stderr before `SIGTERM`
 /// cleans the process up.
 fn drain_strategy_warns(strategy: &str) -> (bool, Vec<String>) {
     let port = free_port();
@@ -127,7 +123,7 @@ fn drain_strategy_warns(strategy: &str) -> (bool, Vec<String>) {
 
     let result = wait_for_line(
         &rx,
-        "--drain-strategy is accepted but not enforced during drain",
+        "--drain-strategy has no effect: `gradual` and `immediate` both behave as immediate",
         STARTUP_TIMEOUT,
     );
 
@@ -151,21 +147,21 @@ fn drain_strategy_warns(strategy: &str) -> (bool, Vec<String>) {
 }
 
 #[test]
-fn gradual_emits_the_not_enforced_warning() {
+fn gradual_emits_the_no_effect_warning() {
     let (found, log) = drain_strategy_warns("gradual");
     assert!(
         found,
-        "expected the --drain-strategy inertness warning on stderr for `gradual`; \
+        "expected the --drain-strategy no-effect warning on stderr for `gradual`; \
          stderr so far: {log:?}"
     );
 }
 
 #[test]
-fn immediate_emits_the_not_enforced_warning() {
+fn immediate_emits_the_no_effect_warning() {
     let (found, log) = drain_strategy_warns("immediate");
     assert!(
         found,
-        "expected the --drain-strategy inertness warning on stderr for `immediate` too -- \
-         the whole point is that both values are equally unenforced; stderr so far: {log:?}"
+        "expected the --drain-strategy no-effect warning on stderr for `immediate` too -- \
+         both values behave the same; stderr so far: {log:?}"
     );
 }

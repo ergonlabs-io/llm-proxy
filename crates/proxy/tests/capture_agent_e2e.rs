@@ -340,6 +340,143 @@ fn declarative_capture_reload_and_emergency_gate_on_existing_keepalive() {
     }
 }
 
+/// Upstream that answers only after `release` is set, so a request can span
+/// SIGTERM. `arrived` counts requests that reached it.
+fn gated_mock(release: Arc<AtomicBool>, arrived: Arc<std::sync::atomic::AtomicUsize>) -> Mock {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let halted = stop.clone();
+    let thread = std::thread::spawn(move || {
+        while !halted.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = stream.read(&mut [0; 4096]);
+                    arrived.fetch_add(1, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) && !halted.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Mock {
+        address,
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// A request that spans SIGTERM completes during the drain and its record is
+/// still delivered to the agent before the process exits: capture delivery is
+/// flushed only after the workers have drained.
+#[test]
+fn a_request_spanning_sigterm_is_captured() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = temp.path().join("agent.sock");
+    let control_socket = temp.path().join("control.sock");
+    let key = temp.path().join("key");
+    std::fs::write(&key, [9; 32]).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let uid = runtime.block_on(async {
+        tokio::net::UnixStream::pair()
+            .unwrap()
+            .0
+            .peer_cred()
+            .unwrap()
+            .uid()
+    });
+    let agent_config = serde_json::json!({
+        "version":1,"mode":"metadata_spool_only","socket_path":socket,"node_id":"test-node",
+        "producers":[{"producer_id":"test-proxy","uid":uid,"tenants":["default"]}],
+        "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,
+            "max_disk_bytes":4194304,"cache_bytes":4194304},
+        "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]
+    });
+    let agent = collector(serde_json::from_value(agent_config.clone()).unwrap());
+    let release = Arc::new(AtomicBool::new(false));
+    let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = gated_mock(release.clone(), arrived.clone());
+    let (listener, admin) = (port(), port());
+    let capture = serde_json::json!({
+        "version":1,"metadata":{"enabled":true,"max_attempts":8},"policy":{"version":"drain"},
+        "endpoint":{"unix_socket_path":socket,"expected_agent_uid":uid,
+            "expected_node_id":"test-node","producer_id":"test-proxy"},
+        "emergency_control":{"unix_socket_path":control_socket,"operator_uid":uid}
+    });
+    let bootstrap = temp.path().join("proxy.yaml");
+    std::fs::write(
+        &bootstrap,
+        declarative_bootstrap(listener, admin, upstream.address.port(), &capture),
+    )
+    .unwrap();
+    let mut proxy = Proxy(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&bootstrap)
+            .args(["--concurrency", "1", "--drain-time-s", "600"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait(|| {
+        assert!(proxy.0.try_wait().unwrap().is_none(), "proxy exited early");
+        control_socket.exists()
+            && TcpStream::connect(("127.0.0.1", listener)).is_ok()
+            && TcpStream::connect(("127.0.0.1", admin)).is_ok()
+    });
+
+    let mut client = TcpStream::connect(("127.0.0.1", listener)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        client,
+        "GET /spanning HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    wait(|| arrived.load(Ordering::SeqCst) == 1);
+
+    assert!(Command::new("kill")
+        .args(["-TERM", &proxy.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    wait(|| get(admin, "/ready").contains("DRAINING"));
+    release.store(true, Ordering::SeqCst);
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    wait(|| proxy.0.try_wait().unwrap().is_some());
+    assert!(proxy.0.try_wait().unwrap().unwrap().success());
+
+    drop(agent);
+    let agent_config: Config = serde_json::from_value(agent_config).unwrap();
+    let (active, recovery) = agent_config.load_keys().unwrap();
+    let spool = MetadataSpool::open(agent_config.spool_config(), active, recovery).unwrap();
+    let records = spool.replay(0, 64, 1048576).unwrap();
+    assert_eq!(records.len(), 1, "the drained request must be captured");
+    let record: proxy_observability::records::RequestRecord =
+        serde_json::from_slice(&records[0].payload).unwrap();
+    assert_eq!(record.status, Some(200));
+}
+
 struct Proxy(Child);
 impl Drop for Proxy {
     fn drop(&mut self) {
