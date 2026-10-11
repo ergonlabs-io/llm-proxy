@@ -3129,3 +3129,5 @@ async fn key_rotation_conflicts_and_api_version_are_explicit() {
         StatusCode::CONFLICT
     );
 }
+
+mod credentials;

@@ -47,10 +47,11 @@ use hyper_util::rt::TokioIo;
 use proxy_core::lifecycle::LifecycleState;
 use proxy_core::WorkerConfigHandle;
 use proxy_filters::auth::{KeyId, TenantId};
-use proxy_filters::control::{ControlPlane, StoreError};
+use proxy_filters::control::{ControlPlane, CredentialStoreError, StoreError};
 use proxy_filters::model_authz::{ModelAccess, ModelPattern};
 use proxy_filters::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
+use proxy_filters::tenant_credential_crypto::TenantSecret;
 use proxy_filters::usage_filter::PricingRegistry;
 use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
@@ -87,6 +88,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}",
     "/tenants/{id}/policy",
     "/tenants/{id}/budget",
+    "/tenants/{id}/provider_credentials",
+    "/tenants/{id}/provider_credentials/{provider}",
     // A READ, but gated like a write -- see
     // `handle`'s route table and `lib.rs`'s module doc for why.
     "/tenants/{id}/spend",
@@ -98,6 +101,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/tenants/{id}",
     "/chains/{stat_prefix}/tenants/{id}/policy",
     "/chains/{stat_prefix}/tenants/{id}/budget",
+    "/chains/{stat_prefix}/tenants/{id}/provider_credentials",
+    "/chains/{stat_prefix}/tenants/{id}/provider_credentials/{provider}",
     "/chains/{stat_prefix}/tenants/{id}/spend",
     "/pricing",
     "/chains/{stat_prefix}/pricing",
@@ -711,6 +716,20 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
             handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
         }
+        WriteRoute::TenantCredentials(id) | WriteRoute::ScopedTenantCredentials(_, id) => {
+            handle_list_tenant_credentials(&control_plane, id)
+        }
+        // `body` moves into the handler (unlike every arm above, which
+        // borrows it) so the handler can wipe the buffer holding the
+        // plaintext key. Only one arm runs, so the move is fine.
+        WriteRoute::TenantCredentialPut(id, provider)
+        | WriteRoute::ScopedTenantCredentialPut(_, id, provider) => {
+            handle_put_tenant_credential(&control_plane, config, id, provider, body)
+        }
+        WriteRoute::TenantCredentialDelete(id, provider)
+        | WriteRoute::ScopedTenantCredentialDelete(_, id, provider) => {
+            handle_delete_tenant_credential(&control_plane, id, provider)
+        }
         WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => {
             handle_set_pricing(factory_state, stat_prefix_opt, &body)
         }
@@ -815,6 +834,16 @@ enum WriteRoute<'a> {
     TenantPolicy(&'a str),
     TenantBudget(&'a str),
     TenantSpend(&'a str),
+    /// `GET /tenants/{id}/provider_credentials` -- metadata only, gated like
+    /// the other identity reads (ADR-0007 decision 9).
+    TenantCredentials(&'a str),
+    /// `PUT /tenants/{id}/provider_credentials/{provider}`.
+    TenantCredentialPut(&'a str, &'a str),
+    /// `DELETE /tenants/{id}/provider_credentials/{provider}`.
+    TenantCredentialDelete(&'a str, &'a str),
+    ScopedTenantCredentials(&'a str, &'a str),
+    ScopedTenantCredentialPut(&'a str, &'a str, &'a str),
+    ScopedTenantCredentialDelete(&'a str, &'a str, &'a str),
     /// `GET /chains/{stat_prefix}/keys` -- the scoped listing.
     ScopedKeyList(&'a str),
     ScopedKeys(&'a str),
@@ -848,6 +877,14 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::TenantPolicy(_) => Method::PUT,
             WriteRoute::TenantBudget(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
+            WriteRoute::TenantCredentials(_) | WriteRoute::ScopedTenantCredentials(..) => {
+                Method::GET
+            }
+            WriteRoute::TenantCredentialPut(..) | WriteRoute::ScopedTenantCredentialPut(..) => {
+                Method::PUT
+            }
+            WriteRoute::TenantCredentialDelete(..)
+            | WriteRoute::ScopedTenantCredentialDelete(..) => Method::DELETE,
             WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => Method::PUT,
             WriteRoute::HealthCheckFail
             | WriteRoute::HealthCheckOk
@@ -886,6 +923,9 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::TenantPolicy(_)
             | WriteRoute::TenantBudget(_)
             | WriteRoute::TenantSpend(_)
+            | WriteRoute::TenantCredentials(_)
+            | WriteRoute::TenantCredentialPut(..)
+            | WriteRoute::TenantCredentialDelete(..)
             | WriteRoute::HealthCheckFail
             | WriteRoute::HealthCheckOk
             | WriteRoute::DrainListeners => None,
@@ -898,7 +938,10 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
             | WriteRoute::ScopedTenantBudget(s, _)
-            | WriteRoute::ScopedTenantSpend(s, _) => Some(s),
+            | WriteRoute::ScopedTenantSpend(s, _)
+            | WriteRoute::ScopedTenantCredentials(s, _)
+            | WriteRoute::ScopedTenantCredentialPut(s, ..)
+            | WriteRoute::ScopedTenantCredentialDelete(s, ..) => Some(s),
             WriteRoute::Pricing => None,
             WriteRoute::ScopedPricing(s) => Some(s),
         }
@@ -945,6 +988,30 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["tenants", id, "budget"] => Some(WriteRoute::TenantBudget(id)),
         // A GET, gated like a write -- see `WriteRoute`'s doc.
         ["tenants", id, "spend"] => Some(WriteRoute::TenantSpend(id)),
+        ["tenants", id, "provider_credentials"] => Some(WriteRoute::TenantCredentials(id)),
+        // DELETE is the only other verb with a route here; any non-DELETE verb
+        // maps to the PUT shape so a wrong verb answers 405 "only accepts PUT".
+        ["tenants", id, "provider_credentials", provider] if *method == Method::DELETE => {
+            Some(WriteRoute::TenantCredentialDelete(id, provider))
+        }
+        ["tenants", id, "provider_credentials", provider] => {
+            Some(WriteRoute::TenantCredentialPut(id, provider))
+        }
+        ["chains", stat_prefix, "tenants", id, "provider_credentials"] => {
+            Some(WriteRoute::ScopedTenantCredentials(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "provider_credentials", provider]
+            if *method == Method::DELETE =>
+        {
+            Some(WriteRoute::ScopedTenantCredentialDelete(
+                stat_prefix,
+                id,
+                provider,
+            ))
+        }
+        ["chains", stat_prefix, "tenants", id, "provider_credentials", provider] => Some(
+            WriteRoute::ScopedTenantCredentialPut(stat_prefix, id, provider),
+        ),
         // The scoped forms, addressed by the chain's
         // operator-chosen `stat_prefix` -- see `WriteRoute`'s doc.
         ["chains", stat_prefix, "keys"] if *method == Method::GET => {
@@ -1570,6 +1637,269 @@ fn handle_delete_tenant(control_plane: &ControlPlane, tenant: &str) -> Response<
             no_content()
         }
         Err(err) => store_error_response("/tenants/{id}", err),
+    }
+}
+
+/// Longest API key `PUT .../provider_credentials/{provider}` accepts. Real
+/// provider keys are well under 300 bytes; the cap bounds what a header value
+/// the router later builds can be.
+const MAX_TENANT_API_KEY_BYTES: usize = 4096;
+
+/// The only `schema_version` this endpoint speaks.
+const TENANT_CREDENTIALS_API_VERSION: u32 = 1;
+
+/// JSON error in the shape the router's own local replies use
+/// (`{"error":{"message":..,"type":..}}`), so a client has one error shape to
+/// parse. Callers pass a fixed message: never format request-body content into
+/// it.
+fn error_json(status: StatusCode, error_type: &str, message: &str) -> Response<Full<Bytes>> {
+    json(
+        status,
+        &serde_json::json!({ "error": { "message": message, "type": error_type } }),
+    )
+}
+
+/// Deserializes straight into a [`TenantSecret`] so the parsed plaintext
+/// lives in a zeroize-on-drop buffer from its first owned form onward.
+///
+/// Rust note: `deserialize_with` points serde at a function instead of the
+/// field type's own `Deserialize` impl; `TenantSecret` deliberately has none.
+fn deserialize_tenant_secret<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<TenantSecret, D::Error> {
+    <String as serde::Deserialize>::deserialize(de).map(TenantSecret::new)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutTenantCredentialRequest {
+    schema_version: u32,
+    #[serde(deserialize_with = "deserialize_tenant_secret")]
+    api_key: TenantSecret,
+}
+
+/// Whether `tenant` exists: created through the store, or implied by a
+/// bootstrap/minted key or a stored policy. Reads the store, not only the
+/// snapshot, because a created tenant with no key or policy yet appears only
+/// there.
+fn tenant_exists(control_plane: &ControlPlane, tenant: &TenantId) -> Result<bool, StoreError> {
+    {
+        let snapshot = control_plane.handle().load();
+        if snapshot.policies.contains_key(tenant.as_str())
+            || snapshot.key_tenants.values().any(|t| t == tenant)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(control_plane.store().load()?.tenants.contains(tenant))
+}
+
+fn tenant_not_found() -> Response<Full<Bytes>> {
+    error_json(StatusCode::NOT_FOUND, "tenant_not_found", "unknown tenant")
+}
+
+/// Wipes `body` when this handle is the only reference to its buffer.
+/// Best effort: if hyper still shares the buffer, `try_into_mut` fails and the
+/// bytes live until the allocator reuses them.
+fn wipe_body(body: Bytes) {
+    if let Ok(mut unique) = body.try_into_mut() {
+        zeroize::Zeroize::zeroize(&mut unique[..]);
+    }
+}
+
+/// `PUT /tenants/{id}/provider_credentials/{provider}`.
+///
+/// Check order: body shape (400), tenant (404), provider enabled on some
+/// cluster (422), then the store (503 when `tenant_credentials` is not
+/// configured). The request body is never logged, echoed, or formatted into an
+/// error message: serde's own errors can quote input, so this handler maps them
+/// to fixed text by [`serde_json::Error::classify`].
+fn handle_put_tenant_credential(
+    control_plane: &ControlPlane,
+    config: &WorkerConfigHandle,
+    tenant: &str,
+    provider: &str,
+    body: Bytes,
+) -> Response<Full<Bytes>> {
+    let response = put_tenant_credential_inner(control_plane, config, tenant, provider, &body);
+    wipe_body(body);
+    response
+}
+
+fn put_tenant_credential_inner(
+    control_plane: &ControlPlane,
+    config: &WorkerConfigHandle,
+    tenant: &str,
+    provider: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    const INVALID: &str = "invalid_request";
+    if tenant.is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, INVALID, "tenant must not be empty");
+    }
+    if provider.is_empty() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            INVALID,
+            "provider must not be empty",
+        );
+    }
+    let request: PutTenantCredentialRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => {
+            let message = match err.classify() {
+                serde_json::error::Category::Data => {
+                    "body must be {\"schema_version\":1,\"api_key\":\"...\"} with no other fields"
+                }
+                _ => "request body is not valid JSON",
+            };
+            return error_json(StatusCode::BAD_REQUEST, INVALID, message);
+        }
+    };
+    if request.schema_version != TENANT_CREDENTIALS_API_VERSION {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            INVALID,
+            "unsupported schema_version; expected 1",
+        );
+    }
+    let key = request.api_key.expose();
+    if key.trim().is_empty() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            INVALID,
+            "api_key must not be empty",
+        );
+    }
+    if key.len() > MAX_TENANT_API_KEY_BYTES {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            INVALID,
+            "api_key exceeds 4096 bytes",
+        );
+    }
+    // The key is later written into an upstream header. `HeaderValue::from_str`
+    // refuses CR/LF and other control bytes but allows obs-text (0x80..=0xFF),
+    // which no provider key uses, so `is_ascii` closes that gap.
+    if !key.is_ascii() || hyper::header::HeaderValue::from_str(key).is_err() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            INVALID,
+            "api_key contains bytes that are not valid in an HTTP header value",
+        );
+    }
+
+    let tenant_id = TenantId::new(tenant);
+    match tenant_exists(control_plane, &tenant_id) {
+        Ok(true) => {}
+        Ok(false) => return tenant_not_found(),
+        Err(err) => return store_error_response("/tenants/{id}/provider_credentials", err),
+    }
+
+    // A credential no cluster slot would ever use is a typo the operator wants
+    // to hear about now, not an inert row.
+    let snapshot = config.load();
+    let enabled = snapshot.clusters.values().any(|cluster| {
+        cluster
+            .provider_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.tenant_credential.as_ref())
+            .is_some_and(|slot| slot.provider == provider)
+    });
+    if !enabled {
+        return error_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "provider_not_enabled",
+            "no configured cluster accepts tenant credentials for this provider",
+        );
+    }
+
+    // The save-time verification probe is deferred (ADR-0007 decision 9).
+    match control_plane.store_tenant_secret(&tenant_id, provider, &request.api_key, false) {
+        Ok(metadata) => {
+            tracing::info!(
+                endpoint = "/tenants/{id}/provider_credentials/{provider}",
+                tenant,
+                provider,
+                "admin: stored a tenant provider credential"
+            );
+            json(StatusCode::OK, &metadata)
+        }
+        Err(CredentialStoreError::NotConfigured) => error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tenant_credentials_not_configured",
+            "tenant credentials are not enabled: `tenant_credentials` is not configured on the auth filter",
+        ),
+        Err(CredentialStoreError::Store(err)) => {
+            store_error_response("/tenants/{id}/provider_credentials/{provider}", err)
+        }
+        Err(CredentialStoreError::Crypto(err)) => {
+            tracing::warn!(error = %err, "admin write failed: could not seal tenant credential");
+            error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential_seal_failed",
+                "could not seal the credential",
+            )
+        }
+    }
+}
+
+/// `GET /tenants/{id}/provider_credentials`: metadata for every credential the
+/// tenant holds. Never decrypts anything.
+fn handle_list_tenant_credentials(
+    control_plane: &ControlPlane,
+    tenant: &str,
+) -> Response<Full<Bytes>> {
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    let tenant_id = TenantId::new(tenant);
+    match tenant_exists(control_plane, &tenant_id) {
+        Ok(true) => {}
+        Ok(false) => return tenant_not_found(),
+        Err(err) => return store_error_response("/tenants/{id}/provider_credentials", err),
+    }
+    match control_plane.tenant_credential_metadata(&tenant_id) {
+        Ok(credentials) => json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "schema_version": TENANT_CREDENTIALS_API_VERSION,
+                "tenant": tenant,
+                "credentials": credentials,
+            }),
+        ),
+        Err(err) => store_error_response("/tenants/{id}/provider_credentials", err),
+    }
+}
+
+/// `DELETE /tenants/{id}/provider_credentials/{provider}`: 204 if the row
+/// existed, 404 if the tenant or the row did not (as `DELETE /keys/{id}` does
+/// for an unknown key).
+fn handle_delete_tenant_credential(
+    control_plane: &ControlPlane,
+    tenant: &str,
+    provider: &str,
+) -> Response<Full<Bytes>> {
+    if tenant.is_empty() || provider.is_empty() {
+        return bad_request("tenant and provider must not be empty");
+    }
+    let tenant_id = TenantId::new(tenant);
+    match tenant_exists(control_plane, &tenant_id) {
+        Ok(true) => {}
+        Ok(false) => return tenant_not_found(),
+        Err(err) => return store_error_response("/tenants/{id}/provider_credentials", err),
+    }
+    match control_plane.delete_tenant_credential(&tenant_id, provider) {
+        Ok(()) => {
+            tracing::info!(
+                endpoint = "/tenants/{id}/provider_credentials/{provider}",
+                tenant,
+                provider,
+                "admin: deleted a tenant provider credential"
+            );
+            no_content()
+        }
+        Err(err) => store_error_response("/tenants/{id}/provider_credentials/{provider}", err),
     }
 }
 

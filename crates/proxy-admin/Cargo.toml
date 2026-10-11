@@ -28,6 +28,9 @@ ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Wipes the buffer that held a tenant API key request body (`wipe_body` in
+# `server.rs`).
+zeroize = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
