@@ -1,4 +1,4 @@
-//! WP-21 acceptance drill: repeated listener and cluster renames while the
+//! Acceptance drill: repeated listener and cluster renames while the
 //! real proxy carries an open-loop 5,000 request/second stream.
 //!
 //! Every bootstrap is an ordinary Envoy-mode document (the same shape used by

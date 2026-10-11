@@ -1,4 +1,4 @@
-//! Process resource sampler (WP-30 phase 2): samples RSS, cumulative CPU
+//! Process resource sampler: samples RSS, cumulative CPU
 //! time (converted to %-of-one-core), and open-fd count for a given PID at
 //! a fixed interval, so a sweep can attribute capacity to a memory/CPU
 //! budget instead of just a request count.

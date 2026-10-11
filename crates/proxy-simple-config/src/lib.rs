@@ -1,4 +1,4 @@
-//! The simple LLM-native config dialect (WP-38).
+//! The simple LLM-native config dialect.
 //!
 //! **Normative schema: `schema/llmproxy-v0.schema.json`** — the single source
 //! of truth for the dialect. User docs, editor autocomplete, and the validator

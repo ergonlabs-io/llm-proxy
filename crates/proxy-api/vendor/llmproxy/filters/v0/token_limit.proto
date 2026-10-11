@@ -1,4 +1,4 @@
-// Token-budget configuration for the llm-proxy data plane (WP-34 / WP-47).
+// Token-budget configuration for the llm-proxy data plane.
 //
 // This owns the limiter's vocabulary instead of borrowing Envoy's
 // RateLimitSettings, whose similarly named fields configure xDS discovery

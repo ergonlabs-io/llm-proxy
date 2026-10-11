@@ -1,4 +1,4 @@
-// Configuration for the llm-proxy usage filter (WP-34 / WP-47).
+// Configuration for the llm-proxy usage filter.
 //
 // This owns the filter's vocabulary instead of borrowing Envoy's DataSource,
 // whose inline_string field used to carry either a dialect or a JSON pricing

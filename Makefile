@@ -237,9 +237,8 @@ validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.ya
 # behind an `#[ignore]`. A target nobody runs is worse than no target, because it
 # reads as coverage.
 #
-# So this has a stated cadence, not just an existence:
-#   - run it before closing WP-20, and
-#   - run it before the v0.3.0 ship gate is declared closed.
+# So this has a stated cadence, not just an existence: run it before the v0.3.0
+# ship gate is declared closed.
 # `internal-docs/MILESTONES.md`'s v0.3.0 gate names it as the verification, which
 # is what keeps the cadence enforceable rather than aspirational.
 
@@ -260,7 +259,7 @@ ifeq ($(DOCKER),)
 	@echo ""
 	@exit 1
 else
-	# WP-20 increment 5: testing/xds-conformance/ builds go-control-plane's own
+	# testing/xds-conformance/ builds go-control-plane's own
 	# cache/server packages into a real ADS server (Dockerfile pins the exact
 	# go-control-plane version -- see its README.md), then runs our real
 	# proxy-xds AdsClient against it over a real loopback socket, on an
@@ -359,7 +358,7 @@ docs-build: ## Production build of the docs site to docs/site/dist/
 # -------------------------------------------------------------------- deps --
 
 .PHONY: deps-check
-deps-check: ## WP-40: fail if any crate declares a dependency nothing references
+deps-check: ## Fail if any crate declares a dependency nothing references
 	python3 scripts/check-deps.py
 
 .PHONY: deps-list
@@ -367,7 +366,7 @@ deps-list: ## Same, but also print the allowlisted suppressions and their reason
 	python3 scripts/check-deps.py --list
 
 # ------------------------------------------------------------------- sweep --
-# WP-30 phase 3. These start real processes and bind real ports -- never run
+# These start real processes and bind real ports -- never run
 # them concurrently with the test suite (AGENTS.md "Running The Product"). The script tears
 # down and reports a pgrep check on every exit path, including failure.
 

@@ -1,7 +1,7 @@
 //! `anthropic`: an Anthropic-Messages-compatible mock upstream (`POST
 //! /v1/messages`), the Anthropic-dialect sibling of `openai`'s chat
 //! completions mock. It exists for the same LLM feature lanes (streaming
-//! metrics WP-33, token metering WP-34, model routing WP-35) and mirrors
+//! metrics, token metering, model routing) and mirrors
 //! `openai.rs`'s structure closely, but gets several wire details
 //! deliberately different to match the real API:
 //!
@@ -50,7 +50,7 @@ pub struct AnthropicConfig {
     /// Anthropic-style error envelope.
     pub require_api_key: Option<String>,
     /// When set, every request gets this `(status, message)` back instead of
-    /// being handled normally — for retry/fallback drills (WP-35).
+    /// being handled normally — for retry/fallback drills.
     pub forced_error: Option<(u16, String)>,
     /// Cache-read input tokens to report in `usage.cache_read_input_tokens`
     /// (a discounted subset served from Anthropic's prompt cache — unlike

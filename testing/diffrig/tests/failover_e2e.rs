@@ -1,6 +1,6 @@
 //! v0.1.0 ship-gate drill (third and last clause): "the proxy fails over
-//! from one provider to another without dropping the request", per WP-35's
-//! own acceptance criteria -- primary 429s, fallback within policy, exact
+//! from one provider to another without dropping the request", per the
+//! failover acceptance criteria -- primary 429s, fallback within policy, exact
 //! attempt accounting, and a credential-isolation test that is not optional
 //! (see below). This is the end-to-end version: the real `llm-proxy`
 //! binary, a real `llmproxy` dialect config with `fallbacks:`, real HTTP
@@ -183,7 +183,7 @@ fn primary_config() -> OpenAiConfig {
 
 /// Serves normally, and only accepts `STANDBY_KEY` -- a request carrying the
 /// primary's key (a credential-isolation leak) would 401 here, which is why
-/// the leak "shows up twice" per the WP-35 acceptance criteria: once as this
+/// the leak "shows up twice" per the acceptance criteria: once as this
 /// 401, and once in Test 2's explicit negative assertion.
 fn standby_config() -> OpenAiConfig {
     OpenAiConfig {
@@ -456,7 +456,7 @@ async fn failover_completes_the_request_on_the_standby_when_primary_429s() {
     drop(scratch);
 }
 
-/// WP-35's credential-isolation criterion, which its own acceptance text
+/// The credential-isolation criterion, which its own acceptance text
 /// marks as "not optional": a request that fails over from the primary to
 /// the standby must carry the STANDBY's `Authorization` and must NOT carry
 /// the PRIMARY's. The negative is asserted explicitly and separately from
@@ -526,7 +526,7 @@ async fn failover_carries_the_standbys_credential_and_never_the_primarys() {
     drop(scratch);
 }
 
-/// WP-35 increment 2c: `host_rewrite_literal` on the route is set from the
+/// `host_rewrite_literal` on the route is set from the
 /// PRIMARY (the route has no way to know which member will actually serve a
 /// given attempt), so the per-cluster header mutation is what corrects the
 /// `Host` header to the member that actually dialled -- here, `standby`.
@@ -579,7 +579,7 @@ async fn failover_rewrites_host_to_the_member_that_served() {
     drop(scratch);
 }
 
-/// WP-64/WP-65 acceptance seam: a primary 429 must fail over before any
+/// Acceptance seam: a primary 429 must fail over before any
 /// response bytes are emitted, and the selected standby must still deliver a
 /// genuine multi-frame SSE response. This guards the no-restart-after-stream
 /// boundary while the existing auth/spend E2E covers key attribution.
@@ -612,7 +612,7 @@ async fn failover_preserves_streaming_on_the_selected_standby() {
     drop(scratch);
 }
 
-/// WP-53/WP-64/WP-65 joined acceptance: the authenticated key survives a
+/// Joined acceptance: the authenticated key survives a
 /// primary 429, the streamed standby usage is charged to that stable key at
 /// the standby cluster's price, and the immutable list-price record uses the
 /// selected provider's rate-card entry/version.

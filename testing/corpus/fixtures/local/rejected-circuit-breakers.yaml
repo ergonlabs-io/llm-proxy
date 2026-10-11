@@ -3,7 +3,7 @@
 # so this fixture exercises a nested-but-unsupported CB field instead. Ground
 # rule #1 says an unhandled field must be rejected with its full dotted path
 # rather than silently dropped — this fixture is the `RejectedWithPath`
-# outcome-class exemplar for the WP-27 scorecard.
+# outcome-class exemplar for the scorecard.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }

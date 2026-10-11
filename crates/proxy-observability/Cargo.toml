@@ -7,32 +7,32 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 http = { workspace = true }
-# WP-24: `%START_TIME(fmt)%` strftime rendering.
+# `%START_TIME(fmt)%` strftime rendering.
 chrono = { workspace = true }
-# WP-24 chunk 2: rate-limited warnings when an access-log sink fails to write.
+# Rate-limited warnings when an access-log sink fails to write.
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# WP-23 increment 5: `stats::Registry` publishes its per-handle metadata and
+# `stats::Registry` publishes its per-handle metadata and
 # shard storage through `ArcSwap<Snapshot>` so resolution can grow the
 # registry under `&self`, surviving a config swap -- the same pattern
 # `ClusterManager` uses for host sets and the auth filter uses for key sets.
 arc-swap = { workspace = true }
-# WP-51 increment 2: TraceContext::new_root/child need random trace/span
+# TraceContext::new_root/child need random trace/span
 # ids. Already a workspace dependency (proxy-cluster's load balancers,
 # proxy-http's request-id generation); this crate had no prior use for it.
 rand = { workspace = true }
 ring = { workspace = true }
 socket2 = { workspace = true }
-# WP-51 increment 2: SpanSink is a worker -> control mpsc handoff, the same
+# SpanSink is a worker -> control mpsc handoff, the same
 # shape as the rest of this crate's stats/access-log control-side plumbing.
-# WP-51 increment 4 adds `time` for `run_metric_exporter`'s own
+# The metric exporter adds `time` for `run_metric_exporter`'s own
 # `tokio::time::interval` tick and its per-export `tokio::time::timeout`
 # deadline. No runtime/macro feature is added: neither exporter task constructs
 # or spawns a runtime -- `crates/proxy/src/main.rs` spawns both onto the
 # control runtime that is already running.
 tokio = { workspace = true, features = ["sync", "time"] }
-# WP-51 increment 3a: the OTLP/gRPC trace exporter -- `proxy-api` for the
+# The OTLP/gRPC trace exporter -- `proxy-api` for the
 # vendored collector/trace/common/resource message types (see its `build.rs`
 # comment on why these cross out of `proxy-api` at all: a hand-rolled
 # exporter over the plain generated types, not the opentelemetry SDK, whose

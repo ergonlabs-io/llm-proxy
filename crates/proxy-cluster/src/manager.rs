@@ -1,6 +1,6 @@
-//! Cluster manager (WP-16 §3): owns per-cluster discovery state and
+//! Cluster manager: owns per-cluster discovery state and
 //! publishes [`HostSet`] snapshots. Built/updated on the control runtime; the
-//! router (WP-13) only ever talks to it through [`ClusterManager::cluster`]'s
+//! router only ever talks to it through [`ClusterManager::cluster`]'s
 //! `Arc<dyn ClusterEntry>` handle, never touching discovery internals.
 //!
 //! Warming ("is this cluster ready to serve") tracking lives here --
@@ -8,11 +8,11 @@
 //! resolution lands, or, for a cluster that never resolves in time,
 //! [`ClusterManager::force_initialize`] mimics Envoy's
 //! `initial_fetch_timeout` "proceed empty" behavior.
-//! [`ClusterManager::warming_clusters`] (WP-21 increment 3) is what a
+//! [`ClusterManager::warming_clusters`] is what a
 //! readiness probe reads; this crate has no opinion on what a caller does
 //! with a non-empty result -- see `proxy-admin`'s `ReadinessProbe` and
 //! `proxy/src/main.rs` for the production wiring, and note this only gates
-//! `/ready`, not request routing (that's WP-58).
+//! `/ready`, not request routing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -115,7 +115,7 @@ struct ManagedCluster {
     initialized: AtomicBool,
     /// S7 host selection: the configured `lb_policy`'s [`LoadBalancer`],
     /// plus the priority-spillover / healthy-panic-threshold logic shared by
-    /// every policy (WP-17). Built once at cluster construction -- see
+    /// every policy. Built once at cluster construction -- see
     /// [`load_balancer::build`] for why `RING_HASH`/`MAGLEV` fail here
     /// instead of falling back to something else.
     ///
@@ -144,7 +144,7 @@ struct ManagedCluster {
     /// aggregate arm's own pool is never actually dialed -- see
     /// `ClusterHandle::http_pool`), fall back to the same Envoy default.
     connect_timeout: std::time::Duration,
-    /// S6 active health checking (WP-18 runtime wiring): built once from
+    /// S6 active health checking: built once from
     /// `config.health_check` at construction, same as `host_picker`/
     /// `transport` above. `None` when the config configures no health check
     /// (Envoy's own default, every host healthy), and always `None` for an
@@ -164,7 +164,7 @@ struct ManagedCluster {
     /// drain, so there's no `.await` under the lock to require the async
     /// variant (same reasoning as `resolver::FakeResolver::records`).
     probes: Mutex<HashMap<SocketAddr, JoinHandle<()>>>,
-    /// S6 passive outlier detection (WP-19), or `None` when the config
+    /// S6 passive outlier detection, or `None` when the config
     /// configures none. Fed one [`RequestResult`] per upstream attempt by the
     /// router (via [`ClusterEntry::report_outlier_result`]); it ejects a host
     /// by setting `failed_outlier_check` on it in this same cluster's
@@ -185,8 +185,8 @@ impl Drop for ManagedCluster {
     /// A dropped `JoinHandle` does **not** abort its task -- it only detaches
     /// from it, and the check loop keeps running with nobody left to stop it.
     /// `ClusterManager::update_from_snapshot` rebuilds a config-sourced
-    /// cluster whenever its config actually changed (WP-59 increment 2 --
-    /// unless it is carried forward unchanged, see that method's own doc),
+    /// cluster whenever its config actually changed
+    /// (unless it is carried forward unchanged, see that method's own doc),
     /// so without this, every rebuild -- and this proxy reloads on SIGHUP in
     /// production -- would leak one permanently-running probe loop per host,
     /// forever.
@@ -235,12 +235,12 @@ impl ManagedCluster {
                 // into `source` below.
                 let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
                 let connect_timeout = config.connect_timeout;
-                // WP-18 runtime wiring: build the engine now, from the
-                // lowered config, same as `policy`/`transport` above --
+                // Build the engine now, from the lowered config, same as
+                // `policy`/`transport` above --
                 // `None` means the config configures no health check at all
                 // (Envoy's own default), not that this cluster is exempt.
                 let health_engine = config.health_check.as_ref().map(HealthCheckEngine::from_ir);
-                // WP-19 runtime wiring: the detector must eject into the SAME
+                // The detector must eject into the SAME
                 // `host_set` the router picks from, so build the `Arc` here
                 // and hand the detector a clone. It ejects by publishing a new
                 // snapshot with `failed_outlier_check` set, which the picker
@@ -277,19 +277,18 @@ impl ManagedCluster {
                 })
             }
             ClusterKind::Aggregate { .. } => {
-                // WP-35 increment 2a: `select_host` never reads this
+                // `select_host` never reads this
                 // cluster's own `host_set`/`host_picker`/`transport`/
                 // `upstream_protocol`/`connect_timeout` for an aggregate --
                 // it resolves straight through to whichever member actually
                 // served the host (see `ClusterHandle::select_aggregate_member`)
                 // -- so `RoundRobin`/`RawTransportSocket`/`Http1` here are
                 // inert placeholders, never real answers. `initialized` starts
-                // `true`: there is
-                // nothing here to resolve, and leaving it `false` would make
-                // WP-21 warming wait forever on a cluster that never runs
-                // discovery -- and, since WP-58, would 503 every request
-                // routed at an aggregate, because the router now refuses an
-                // un-initialized cluster before host selection.
+                // `true`: there is nothing here to resolve, and leaving it `false`
+                // would make warming wait forever on a cluster that never runs
+                // discovery -- and, since the router refuses an un-initialized
+                // cluster before host selection, would 503 every request routed at
+                // an aggregate.
                 // `connect_timeout` is read from the real config anyway (it
                 // costs nothing and stays correct if this arm's pool is ever
                 // actually dialed). `health_engine`
@@ -323,7 +322,7 @@ impl ManagedCluster {
     }
 
     /// Reconcile this cluster's active-health-check probes against a
-    /// membership diff (WP-18 runtime wiring): stop the probe for every
+    /// membership diff: stop the probe for every
     /// `removed` address (aborting its task, not just dropping the handle --
     /// see this type's `Drop` impl for why a drop alone isn't enough), and
     /// start one for every `added` address. `unchanged` addresses are left
@@ -344,7 +343,7 @@ impl ManagedCluster {
             }
         }
         for &addr in &diff.added {
-            // WP-19 gap closed: hand the probe a clone of this cluster's own
+            // Hand the probe a clone of this cluster's own
             // detector (if any) so a recovery here also clears an outlier
             // ejection -- see `HealthCheckEngine::spawn_for_host`'s doc for
             // why this is one-way (active HC recovery -> un-eject, never the
@@ -393,7 +392,7 @@ pub struct ClusterManager {
     // still `.load()`s whatever `update_from_snapshot` most recently
     // published. Late binding matters because `update_from_snapshot`
     // rebuilds a config-sourced cluster whenever its own config changed
-    // (WP-59 increment 2 -- unless it is carried forward unchanged, see that
+    // (unless it is carried forward unchanged, see that
     // method's own doc) -- a member resolved *eagerly*, at the aggregate's
     // own construction time, would keep pointing at a specific
     // `Arc<ManagedCluster>` that a later reload replaces, silently freezing
@@ -448,7 +447,7 @@ impl ClusterManager {
     /// Reconcile against a config snapshot's cluster map and kick off each
     /// current cluster's initial resolution.
     ///
-    /// WP-59 increment 2: a cluster whose config is unchanged from the
+    /// A cluster whose config is unchanged from the
     /// currently-published one is carried forward as the exact same
     /// `Arc<ManagedCluster>` -- host set, health-check engine, outlier
     /// detector and its running task handles all survive untouched -- rather
@@ -464,7 +463,7 @@ impl ClusterManager {
     ///   changes cluster B hands this method the pointer-identical
     ///   `Arc<ClusterConfig>` for cluster A. Statically-declared clusters are
     ///   likewise never re-lowered across a call. This is the motivating
-    ///   scenario in the WP-59 card: a control-plane heartbeat silently
+    ///   scenario: a control-plane heartbeat silently
     ///   clearing ejection state proxy-wide.
     /// - Content equality is what additionally covers a SIGHUP file reload,
     ///   where every `Arc` is freshly lowered from scratch and no pointer
@@ -478,7 +477,7 @@ impl ClusterManager {
     /// rebuild-then-resolve path below, in `next`'s own resolve loop -- only
     /// freshly-built clusters ever reach it now.
     ///
-    /// WP-59 increment 1 (kept from before): every freshly-built cluster is
+    /// Every freshly-built cluster is
     /// resolved *before* the map is published (`self.clusters.store` below),
     /// not after. The previous ordering stored every cluster with an empty
     /// `HostSet` first and resolved them one at a time afterward -- for the
@@ -502,8 +501,8 @@ impl ClusterManager {
     /// any other cluster, and its externally-delivered `host_set` (installed
     /// by [`Self::accept_eds_update`]) rides along on the same `Arc`.
     ///
-    /// A cluster whose `lb_policy` isn't implemented (`RING_HASH`/`MAGLEV`,
-    /// WP-17) is rejected rather than silently substituted with another
+    /// A cluster whose `lb_policy` isn't implemented (`RING_HASH`/`MAGLEV`)
+    /// is rejected rather than silently substituted with another
     /// policy (ground rule #1): it's left out of the resulting cluster set
     /// entirely and its name+error is returned here so the caller can
     /// surface it (e.g. as a config error) instead of it disappearing
@@ -563,7 +562,7 @@ impl ClusterManager {
                 // manager down -- Envoy keeps serving the last-known-good
                 // (here: empty, since this is the first resolution) host set
                 // and logs. Real retry/backoff on DNS failure is a future
-                // refinement, not part of this WP. Crucially, this is scoped
+                // refinement. Crucially, this is scoped
                 // to the ONE cluster that failed -- every other entry in
                 // `next` already resolved (or failed) independently above,
                 // so one bad DNS answer never blocks or fails the reload.
@@ -594,7 +593,7 @@ impl ClusterManager {
         let new_set = HostSet::from_hosts(hosts);
         let old_set = managed.host_set.load();
         let diff = diff_host_sets(&old_set, &new_set);
-        // WP-18 runtime wiring: carry `health_flags` over for every address
+        // Carry `health_flags` over for every address
         // still present, or an active-check flip would be silently erased
         // by the next EDS push -- see `host_set::carry_over_health_flags`.
         let new_set = carry_over_health_flags(&old_set, new_set, &diff);
@@ -615,7 +614,7 @@ impl ClusterManager {
     /// call it directly to drive discovery deterministically instead of
     /// waiting on a real timer.
     ///
-    /// WP-59 increment 1: this method's contract is unchanged -- it still
+    /// This method's contract is unchanged -- it still
     /// looks the cluster up by name in the CURRENTLY PUBLISHED registry and
     /// resolves it there. [`Self::resolve_cluster`] is just this method's
     /// former body, factored out so [`Self::update_from_snapshot`] can run
@@ -645,7 +644,7 @@ impl ClusterManager {
         //
         // An aggregate has no endpoints or discovery of its own.
         //
-        // WP-21 increment 1: an EDS cluster's membership arrives through
+        // An EDS cluster's membership arrives through
         // [`ClusterManager::accept_eds_update`], and short-circuiting matters
         // here. A DNS refresh re-runs this; `discovery::resolve` returns an
         // EMPTY host set for `DiscoveryType::Eds`, so falling through would
@@ -660,7 +659,7 @@ impl ClusterManager {
         let new_set = discovery::resolve(config, self.resolver.as_ref()).await?;
         let old_set = managed.host_set.load();
         let diff = diff_host_sets(&old_set, &new_set);
-        // WP-18 runtime wiring: `discovery::resolve` always builds fresh
+        // `discovery::resolve` always builds fresh
         // `Host`s with `HealthFlags::default()`, so without this a DNS
         // refresh would silently re-mark every unchanged host healthy --
         // see `host_set::carry_over_health_flags`.
@@ -700,7 +699,7 @@ impl ClusterManager {
 
     /// Envoy's `initial_fetch_timeout` "proceed empty" escape hatch: mark a
     /// cluster initialized even though it never resolved, so downstream
-    /// warming (WP-21) doesn't wait on it forever. A no-op for an unknown
+    /// warming doesn't wait on it forever. A no-op for an unknown
     /// cluster name.
     pub fn force_initialize(&self, name: &str) {
         if let Some(managed) = self.clusters.load().get(name) {
@@ -710,7 +709,7 @@ impl ClusterManager {
 
     /// The names of every currently-registered cluster still waiting on its
     /// first resolution/EDS update -- built on [`Self::is_initialized`], not
-    /// a second copy of its logic. WP-21 increment 3: this is what gives
+    /// a second copy of its logic. This is what gives
     /// `is_initialized` a production caller -- `/ready` gates on whether this
     /// is empty (see `proxy-admin`'s `ReadinessProbe` and `proxy/src/main.rs`).
     pub fn warming_clusters(&self) -> Vec<ClusterName> {
@@ -804,7 +803,7 @@ struct ClusterHandle {
 }
 
 impl ClusterHandle {
-    /// The aggregate host-selection algorithm (WP-35): walk `members` in
+    /// The aggregate host-selection algorithm: walk `members` in
     /// config order, skipping any name already in `ctx.attempted_clusters`
     /// (so a retry falls over instead of re-picking the member that just
     /// failed); for each remaining candidate, resolve it against the
@@ -814,8 +813,8 @@ impl ClusterHandle {
     /// [`HostPicker`] for a host from its own host set. The first member
     /// that yields a host wins.
     ///
-    /// A member that is itself an aggregate is never followed -- WP-35
-    /// increment 2a deliberately does not support nested aggregates, and
+    /// A member that is itself an aggregate is never followed. Nested
+    /// aggregates are deliberately unsupported, and
     /// refusing to recurse makes a member cycle structurally impossible
     /// rather than something this loop has to detect.
     ///
@@ -895,7 +894,7 @@ impl ClusterEntry for ClusterHandle {
         // socket (plaintext passthrough, or a TLS handshake). The resulting
         // byte stream is protocol-agnostic -- the router applies h1 or h2c on
         // top by picking the upstream codec -- so `_proto` doesn't change the
-        // pool today. Real h2 multiplexing pools are a WP-15 follow-up.
+        // pool today. Real h2 multiplexing pools are a follow-up.
         let server_name = host
             .hostname
             .clone()
@@ -1001,7 +1000,7 @@ mod tests {
     }
 
     /// Same shape as `cluster_config`, plus a caller-supplied
-    /// `connect_timeout` -- WP-59 increment 2's tests use this to build a
+    /// `connect_timeout`. Tests use this to build a
     /// second config that's a genuine, if inconsequential, content change
     /// from the first (`ClusterConfig` has no `Clone`, only `PartialEq`, so
     /// this is a second constructor rather than a `..base` update).
@@ -1034,7 +1033,7 @@ mod tests {
 
     /// A config-sourced EDS cluster (`discovery: eds`): membership arrives
     /// via [`ClusterManager::accept_eds_update`], never
-    /// `endpoints`/`discovery` resolution. WP-59 increment 2's test for the paragraph in
+    /// `endpoints`/`discovery` resolution. Tests the paragraph in
     /// `update_from_snapshot`'s own doc about this shape surviving a reload.
     fn cluster_config_eds(name: &str) -> Arc<ClusterConfig> {
         Arc::new(ClusterConfig {
@@ -1097,8 +1096,8 @@ mod tests {
         })
     }
 
-    /// An aggregate cluster over `members`, in the given order -- WP-35's
-    /// fallback construct. `endpoints`/`discovery` are unused for an
+    /// An aggregate cluster over `members`, in the given order.
+    /// `endpoints`/`discovery` are unused for an
     /// aggregate (see `ClusterKind::Aggregate`'s doc) but still need
     /// *something* syntactically valid to satisfy `ClusterConfig`'s shape.
     fn aggregate_config(name: &str, members: &[&str]) -> Arc<ClusterConfig> {
@@ -1136,7 +1135,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------- WP-18 runtime wiring --
+    // --------------------------------------------- active health checks --
 
     /// Same shape as `cluster_config` above, plus a `health_check` -- kept
     /// separate rather than adding a parameter to `cluster_config` so the
@@ -1194,8 +1193,8 @@ mod tests {
         }
     }
 
-    /// A cluster carrying BOTH a health check and outlier detection (the last
-    /// WP-19 gap's acceptance shape): `uneject_on_healthy_active_hc` is the
+    /// A cluster carrying BOTH a health check and outlier detection:
+    /// `uneject_on_healthy_active_hc` is the
     /// one field the two tests below vary. `consecutive_5xx: 2`,
     /// `enforcing_consecutive_5xx: 100`, `max_ejection_percent: 100` mirror
     /// `cluster_config_with_outlier` -- enforced deterministically, and able
@@ -1502,7 +1501,7 @@ mod tests {
         assert_eq!(seen.len(), 2);
     }
 
-    // --------------------------------------------------- WP-35 aggregate ---
+    // --------------------------------------------------- aggregate ---
 
     /// Build a manager with two `Endpoints` clusters `"a"`/`"b"` (each one
     /// healthy host) plus an aggregate `"providers"` over `["a", "b"]`.
@@ -1663,12 +1662,10 @@ mod tests {
         assert_eq!(sel.member.unwrap().name, "b");
     }
 
-    // ------------------------------------------------- WP-18 runtime wiring --
+    // --------------------------------------------- active health checks --
 
-    /// The acceptance test named in the WP-18 runtime-wiring brief: before
-    /// this task, no configuration could make an active health check
-    /// actually run. Two static hosts -- one a live listener, one a bound-
-    /// then-dropped port so nothing answers -- with `unhealthy_threshold: 1`
+    /// An active health check must actually run: two static hosts -- one a live
+    /// listener, one a bound-then-dropped port so nothing answers -- with `unhealthy_threshold: 1`
     /// and a short interval; `all_healthy_hosts()` must converge to exactly
     /// the live host.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1717,7 +1714,7 @@ mod tests {
         .await;
     }
 
-    /// The second WP-18 runtime-wiring hazard: `discovery::resolve` builds
+    /// `discovery::resolve` builds
     /// every `Host` fresh with `HealthFlags::default()`, so a naive
     /// `host_set.store(new_set)` on refresh would silently re-mark an
     /// already-unhealthy host healthy on every DNS cycle. Flip a host
@@ -1835,9 +1832,8 @@ mod tests {
     /// A config reload must not leak the previous generation's probes.
     /// `update_from_snapshot` rebuilds a config-sourced `ManagedCluster`
     /// whenever its config actually changed -- reload a single-host config
-    /// several times, each with a genuinely different `interval` (WP-59
-    /// increment 2's carry-forward means reloading the SAME config, as this
-    /// test used to, now skips the rebuild entirely and no probe is ever
+    /// several times, each with a genuinely different `interval`. Reloading the SAME config
+    /// would now hit the carry-forward, which skips the rebuild entirely and no probe is ever
     /// aborted -- it would pass without exercising the `Drop` path it exists
     /// to prove), and confirm the hit rate against that host's listener stays
     /// at roughly one generation's worth, rather than scaling with the number
@@ -1891,11 +1887,10 @@ mod tests {
         );
     }
 
-    /// WP-19 runtime acceptance: a cluster configured with outlier detection
+    /// Acceptance test: a cluster configured with outlier detection
     /// ejects a host once it has returned `consecutive_5xx` consecutive 5xx --
     /// fed through the exact `ClusterEntry::report_outlier_result` seam the
-    /// router uses. Before this wiring, no configuration could produce an
-    /// ejection at all.
+    /// router uses.
     #[tokio::test]
     async fn outlier_detection_ejects_a_host_after_consecutive_5xx() {
         let resolver = Arc::new(FakeResolver::new());
@@ -2013,9 +2008,9 @@ mod tests {
         assert!(healthy, "no detector configured -> reporting is a no-op");
     }
 
-    // ---------------------------- last WP-19 gap: active-HC clears outlier --
+    // ---------------------------- active-HC clears outlier --
 
-    /// The acceptance test for the last WP-19 gap: a host outlier-ejected via
+    /// Active-HC recovery must clear an outlier ejection: a host outlier-ejected via
     /// `report_outlier_result` must be un-ejected once a REAL active health
     /// check against it passes -- not just have `failed_active_hc` flip, but
     /// the whole host must rejoin `all_healthy_hosts()`.
@@ -2187,7 +2182,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------- WP-59 increment 1 --------
+    // -------------------------------------------- reload ordering --------
 
     /// The bug: the old `update_from_snapshot` stored every rebuilt cluster
     /// with an EMPTY `HostSet` first and resolved them one at a time
@@ -2234,7 +2229,7 @@ mod tests {
         // reload open for the whole sampling window below.
         resolver.set_delay("svc.internal", Duration::from_millis(300));
 
-        // WP-59 increment 2: reloading the identical `snapshot` map (as this
+        // Reloading the identical `snapshot` map (as this
         // test used to) now carries BOTH clusters forward by content
         // equality, so `dns-svc` is never rebuilt or resolved and the
         // reload returns near-instantly -- defeating the whole point of this
@@ -2250,7 +2245,7 @@ mod tests {
             Arc::new(ClusterConfig {
                 // Same shape as `cluster_config`'s literal, but a genuinely
                 // different `connect_timeout` -- `ClusterConfig` has no
-                // `Clone` (only `PartialEq`, WP-59 increment 2), so this is
+                // `Clone` (only `PartialEq`), so this is
                 // written out rather than `..base.clone()`.
                 eds: None,
                 name: "dns-svc".to_string(),
@@ -2305,7 +2300,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------- WP-59 increment 2 --------
+    // -------------------------------------------- carry-forward --------
 
     /// The ADS path: `SotwSet::apply` (`proxy-xds/src/store.rs`) keeps the
     /// OLD resource `Arc` for anything a CDS push compares `unchanged`, and
@@ -2415,7 +2410,7 @@ mod tests {
         );
     }
 
-    /// The WP-59 card's own acceptance test and motivating scenario: a
+    /// Acceptance test and motivating scenario for carry-forward: a
     /// control-plane heartbeat that only changes cluster B must not silently
     /// clear an ejection on unrelated cluster A. Eject A's only host, push a
     /// snapshot where only B's config changed, and confirm both that A's

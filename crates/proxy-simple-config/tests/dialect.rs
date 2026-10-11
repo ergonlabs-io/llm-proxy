@@ -1,4 +1,4 @@
-//! WP-38 acceptance tests: dialect parsing, env interpolation, semantic
+//! Acceptance tests: dialect parsing, env interpolation, semantic
 //! validation, and lowering through the full Envoy-mode pipeline
 //! (strict parse + PGV validation + IR build).
 
@@ -32,7 +32,7 @@ fn example_config_lowers_end_to_end() {
     let snapshot = proxy_config::build_snapshot(&loaded).expect("lowered config must build IR");
 
     // providers -> clusters, deterministically named, plus one aggregate per
-    // route that declares `fallbacks` (WP-35 increment 2c). The example's
+    // route that declares `fallbacks`. The example's
     // `gpt-5*` route falls back to `local-vllm`, so it gets
     // `fallback:route-0`.
     let mut names: Vec<_> = snapshot.clusters.keys().cloned().collect();
@@ -95,11 +95,11 @@ fn example_config_lowers_end_to_end() {
         .collect::<Vec<_>>()
         .join(",");
     assert!(all.contains("limits"), "warnings: {all}");
-    // `fallbacks` must NOT warn any more: WP-35 increment 2c implements it,
+    // `fallbacks` must NOT warn any more: fallback lowering implements it,
     // and this route's chain really does lower to the `fallback:route-0`
     // aggregate asserted above. A warning here would mean the feature had
-    // silently regressed to being parsed-and-dropped, which is the state this
-    // increment ended.
+    // silently regressed to being parsed-and-dropped, which is the state fallback
+    // lowering removed.
     assert!(
         !all.contains("fallbacks"),
         "fallbacks are implemented and must not warn; warnings: {all}"
@@ -231,7 +231,7 @@ routes:
 /// being wrong (a drift between this dialect's `HTTP_PROTOCOL_OPTIONS_KEY`
 /// and `proxy_config::lower`'s reader) is exactly the failure this test
 /// exists to catch. This is the on-ramp to `proxy-http::upstream_pool`'s h2
-/// upstream connection cache (WP-15 slice A).
+/// upstream connection cache.
 #[test]
 fn provider_protocol_http2_reaches_the_ir() {
     let config = parse(
@@ -375,7 +375,7 @@ fn provider_auth_headers<'a>(
 /// Auth headers: Bearer for OpenAI-shaped, x-api-key for Anthropic; carried
 /// on the provider's CLUSTER, never the route -- a route-level credential
 /// would leak the primary provider's key to a fallback's endpoint once one
-/// request can reach two providers (WP-35).
+/// request can reach two providers.
 #[test]
 fn auth_headers_per_provider_type() {
     let config = parse(
@@ -412,7 +412,7 @@ routes:
     assert_eq!(anthropic[0]["value"], "sk-test-anthropic");
 
     // Two providers, two clusters: provider A's key must never appear on
-    // provider B's cluster -- this is the increment's whole point.
+    // provider B's cluster -- this is the whole point.
     let openai_values: Vec<_> = openai.iter().map(|h| h["value"].as_str()).collect();
     let anthropic_values: Vec<_> = anthropic.iter().map(|h| h["value"].as_str()).collect();
     assert!(
@@ -808,7 +808,7 @@ observability:
 
 /// No `observability` at all: no `access_log` key on the HCM (not even an
 /// empty array), and no warning naming the `observability` field path — the
-/// stale WP-24 warning this task removes must actually be gone.
+/// stale warning this task removes must actually be gone.
 #[test]
 fn no_observability_emits_no_access_log() {
     let config = parse(
@@ -880,7 +880,7 @@ observability:
     }
 }
 
-// ---------------------------------------------------- WP-51 increment 3: tracing --
+// ---------------------------------------------------- tracing --
 
 /// No `observability.tracing` at all -- the overwhelming majority of
 /// configs -- must mean no `node` key at all on the lowered bootstrap, and
@@ -1048,7 +1048,7 @@ tracing:
     assert!(reason.contains("reserved"), "got: {reason}");
 }
 
-// ------------------------------------------ WP-51 increment 4: metric export --
+// ------------------------------------------ metric export --
 
 /// No `observability` at all means no `node` key on the lowered bootstrap, and
 /// both OTLP surfaces stay `None` all the way through. The metrics mirror of
@@ -1079,7 +1079,7 @@ routes:
     assert_eq!(snapshot.metrics, None);
 }
 
-/// The load-bearing case for the whole increment: `observability.metrics`
+/// The load-bearing case for the whole change: `observability.metrics`
 /// lowers all the way through the real Envoy-mode loader into
 /// `ConfigSnapshot::metrics` with NO `tracing` block present. Before the split
 /// this configuration was inexpressible -- metrics were only ever exported by
@@ -1370,7 +1370,7 @@ node:
     );
 }
 
-// ------------------------------------------------------- WP-33: usage filter --
+// ------------------------------------------------------- usage filter --
 
 /// `lower.rs` duplicates the usage filter's type URL as a literal instead of
 /// importing it, to keep the data plane out of a config crate's production
@@ -1378,7 +1378,7 @@ node:
 /// together — this is that something.
 #[test]
 fn usage_filter_type_url_matches_the_filter() {
-    // `force_usage_reporting` is off, but `routes` is non-empty, so WP-45's
+    // `force_usage_reporting` is off, but `routes` is non-empty, so
     // `needs_body_rewrite_filter` still inserts the body-rewrite filter
     // (disabled, for consumer B only) ahead of the usage filter --
     // `http_filters[1]` is the usage filter under test here. The
@@ -1415,13 +1415,13 @@ observability:
     );
 }
 
-/// WP-33 criteria 4 and 5: the usage filter is in the chain ahead of the
+/// The usage filter is in the chain ahead of the
 /// router, and each route's override names its OWN provider's dialect. A
 /// listener-level dialect cannot express this — it is the whole reason the
 /// override exists.
 #[test]
 fn usage_filter_sits_before_the_router_with_per_route_dialects() {
-    // `force_usage_reporting` is off, but `routes` is non-empty, so WP-45's
+    // `force_usage_reporting` is off, but `routes` is non-empty, so
     // `needs_body_rewrite_filter` still inserts the (disabled) body-rewrite
     // filter ahead of everything else -- it's a decode-path filter and must
     // precede the router in config order regardless of whether consumer A
@@ -1469,7 +1469,7 @@ observability:
     assert_eq!(dialect(1), "anthropic");
 }
 
-/// WP-33 criterion 6: an `openai-compatible` upstream (a `base_url`-only
+/// An `openai-compatible` upstream (a `base_url`-only
 /// provider, e.g. vLLM/Ollama/TGI) speaks OpenAI's response shape, so it gets
 /// the OpenAI dialect — the same `_ =>` fallback `auth_header` uses.
 #[test]
@@ -1568,7 +1568,7 @@ observability:
     }
 }
 
-// ------------------------------------------------------- WP-45: body-rewrite filter --
+// ------------------------------------------------------- body-rewrite filter --
 
 const BASIC_CONFIG: &str = r#"
 version: 0
@@ -1642,7 +1642,7 @@ fn observability_without_the_flag_still_emits_body_rewrite_by_default() {
 /// `force_usage_reporting: false` turns consumer A (the `include_usage`
 /// splice) off, but must NOT remove the filter from the chain: `routes` is
 /// non-empty (a config with no routes fails semantic validation), so
-/// consumer B (body-based model routing, WP-45 decision 3) still needs it
+/// consumer B (body-based model routing) still needs it
 /// present. Pins the specific shape that must survive the flag being off:
 /// the listener-level entry stays, `enabled` flips to `false`, and no
 /// route gets a `typed_per_filter_config` override for it (that override
@@ -1747,7 +1747,7 @@ fn unknown_observability_key_still_errors_with_path() {
 ///
 /// The full Envoy-mode pipeline does. A `typed_per_filter_config` entry naming
 /// a filter that is absent from the chain is a hard build error (that is
-/// WP-33's acceptance criterion 3, and `filter_manager::resolve_per_filter_row`
+/// the usage filter's acceptance criterion, and `filter_manager::resolve_per_filter_row`
 /// is what enforces it), so simply getting through `build_snapshot` with the
 /// override attached proves the emitted chain name and the emitted override
 /// key agree -- a typo in either one turns this red.
@@ -1818,7 +1818,7 @@ routes:
     }
 }
 
-// ------------------------------------------------------- WP-34 increment 3: limits --
+// ------------------------------------------------------- limits --
 
 fn token_limit_names(bootstrap: &serde_json::Value) -> Vec<String> {
     hcm_typed_config(bootstrap)["http_filters"]
@@ -1833,8 +1833,8 @@ fn warning_paths(warnings: &[proxy_config::ConfigWarning]) -> Vec<&str> {
     warnings.iter().map(|w| w.field_path.as_str()).collect()
 }
 
-/// The one shape the thin-slice token limiter (`token_limit_filter`,
-/// increment 2) actually enforces: `key: header:authorization` with
+/// The one shape the thin-slice token limiter (`token_limit_filter`)
+/// actually enforces: `key: header:authorization` with
 /// `tokens_per_minute` set. `100003` is deliberately not a multiple of 60 --
 /// `100003 / 60` is not round, so a `fill_rate` formula that used a wrong
 /// divisor (e.g. `max_tokens` verbatim, or `/ 60` applied to the wrong
@@ -1978,7 +1978,7 @@ fn requests_per_minute_is_not_enforced_and_warns() {
     );
 }
 
-/// `concurrent_sessions` needs WP-37.
+/// `concurrent_sessions` is not enforced yet.
 #[test]
 fn concurrent_sessions_is_not_enforced_and_warns() {
     let config = parse(&format!(
@@ -2063,7 +2063,7 @@ fn token_limit_filter_survives_into_the_ir() {
     assert_eq!(entry.type_url, proxy_filters::token_limit_filter::TYPE_URL);
 }
 
-// -------------------------------------------------------------- WP-49: models --
+// -------------------------------------------------------------- models --
 //
 // The config surface has exactly two nouns: `providers` (the top-level map)
 // and `models`. A `models.<name>.providers` entry is a provider reference,
@@ -2889,7 +2889,7 @@ models:
     );
 }
 
-/// A `models:`-free config lowers exactly as before WP-49: the additive
+/// A `models:`-free config lowers exactly as it did before `models:` existed: the additive
 /// field changes nothing about an existing config's output.
 #[test]
 fn config_without_models_lowers_exactly_as_before() {
@@ -2969,7 +2969,7 @@ observability:
     assert_eq!(got, "anthropic");
 }
 
-// ---------------------------------------------- WP-49 increment 2: wildcards --
+// ---------------------------------------------- wildcards --
 //
 // `models:` catalogue keys now take `*`, matched exact > longest prefix >
 // bare `*` catch-all -- see `lower::model_catalog_order`'s doc for why that
@@ -3119,7 +3119,7 @@ models:
     );
 }
 
-/// Today's behavior, unchanged by this increment: with no `*` anywhere (not
+/// Behavior unchanged by wildcard keys: with no `*` anywhere (not
 /// in `routes:`, not in `models:`), a name matching nothing still falls
 /// through to the synthetic 404 backstop `missing_catch_all_gets_404_backstop`
 /// already covers for `routes:` alone -- this pins the same guarantee when
@@ -3212,9 +3212,9 @@ models:
     );
 }
 
-/// Back-compat, restated for increment 2: a catalogue of ONLY exact names
-/// (no `*` anywhere) lowers in the exact same order as before this
-/// increment -- alphabetical, i.e. whatever `BTreeMap`'s key order already
+/// Back-compat, restated for wildcard keys: a catalogue of ONLY exact names
+/// (no `*` anywhere) lowers in the exact same order as before wildcards
+/// existed -- alphabetical, i.e. whatever `BTreeMap`'s key order already
 /// was. `model_catalog_order` must be a no-op reshuffle for this case.
 #[test]
 fn exact_only_catalog_lowers_in_the_same_order_as_before() {
@@ -3269,7 +3269,7 @@ models:
 /// crate's tests, both green -- leaves the other side looking for a key
 /// nobody emits, and every provider silently loses its credentials. Config
 /// parses, validates, lowers, and the API key evaporates: exactly the
-/// `request_headers_to_add` P0 that WP-39 exists to prevent.
+/// `request_headers_to_add` P0 that this test guards against.
 ///
 /// Verified by mutation on 2026-08-03: changing only the reader-side constant
 /// left all 56 `proxy-simple-config` tests green. This test is what goes red.
@@ -3325,10 +3325,10 @@ routes:
         "anthropic's required version header must reach the IR cluster, got {anthropic:?}"
     );
 
-    // The WP-35 guarantee, asserted on the IR: neither provider's cluster
+    // The per-provider guarantee, asserted on the IR: neither provider's cluster
     // carries the other's key. Assert the ABSENCE -- checking only that the
     // right key is present passes just as well when both are there, which is
-    // precisely the cross-provider leak this increment exists to prevent.
+    // precisely the cross-provider leak this assertion exists to prevent.
     assert!(
         !openai
             .iter()
@@ -3358,9 +3358,9 @@ routes:
     }
 }
 
-// ------------------------------------------------- WP-45: body-based routing e2e --
+// ------------------------------------------------- body-based routing e2e --
 
-/// WP-45 acceptance 5 / decision 6: drives a REAL request, with a `model`
+/// Drives a REAL request, with a `model`
 /// only in the JSON body, through a dialect-lowered config's ENTIRE real
 /// pipeline -- lowering, PGV, IR, a real `FilterRegistry` resolving the
 /// dialect's `http_filters` to the real `proxy-filters` factories, a real
@@ -3459,7 +3459,7 @@ mod body_routing_e2e {
 
         // The REAL registry, with the REAL `proxy-filters` factories --
         // exactly the two filters `proxy-core`'s `filter_registry()`
-        // registers for this WP.
+        // registers.
         let mut registry = FilterRegistry::default();
         registry.register(Arc::new(proxy_filters::usage_filter::UsageFilterFactory));
         registry.register(Arc::new(
@@ -3489,7 +3489,7 @@ mod body_routing_e2e {
             });
         }
 
-        // WP-23 increment 6a: `RouterFilterFactory` now needs a `RouterStats`
+        // `RouterFilterFactory` now needs a `RouterStats`
         // to record into -- mirrors `crates/proxy/src/main.rs`'s boot-time
         // construction, resolved for every cluster in this snapshot.
         let stats_control = StatsControl::new(1);
@@ -3599,7 +3599,6 @@ mod body_routing_e2e {
     }
 }
 
-// ---------------------------------------------------------------- WP-35 --
 // Ground rule #6's third instance: the usage dialect on the CLUSTER.
 
 /// The regression test for the defect this carrier was introduced with: the
@@ -3613,7 +3612,8 @@ mod body_routing_e2e {
 /// mandatory.
 ///
 /// Asserted on the built IR, not the lowered YAML: `ClusterConfig::usage_dialect`
-/// is what a later increment actually reads, so proving the value survives
+/// is the carrier the data plane must read (architecture.md §11, finding H2:
+/// the forward path does not read it yet), so proving the value survives
 /// `metadata.filter_metadata` -> strict loader -> IR is the contract that
 /// matters. Checking the YAML alone would pass even if the Envoy-side
 /// reader dropped it.
@@ -3778,8 +3778,9 @@ fn both_dialect_carriers_agree_on_the_example_config() {
 }
 
 // ---------------------------------------------------------------------------
-// `routes:`-surface dialect resolution (the route carrier's half of WP-35
-// increment 1). `models:` got this check when WP-49 landed; `routes:` did
+// `routes:`-surface dialect resolution (the route carrier's half of the
+// per-provider dialect work). `models:` got this check when it was added;
+// `routes:` did
 // not, and a `ProviderModelRef` is `{ provider, model }` with no `dialect`
 // field, so a Vertex/Bedrock provider reached through `routes:` silently
 // lowered as `openai`.
@@ -3911,7 +3912,7 @@ routes:
     .expect("an anthropic provider derives its own dialect");
 }
 
-// ------------------------------------ WP-51 increment 4: tracing export deadline --
+// ------------------------------------ tracing export deadline --
 
 /// `observability.tracing.export_deadline` lowers with the dialect's own
 /// duration syntax and defaults to 5s when omitted -- the same deadline

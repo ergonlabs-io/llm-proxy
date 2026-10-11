@@ -204,7 +204,7 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
 
     for (name, model) in &config.models {
         let path = format!("models.{name}");
-        // WP-49 increment 2: a catalogue key's `*` placement must be exact,
+        // A catalogue key's `*` placement must be exact,
         // a single trailing wildcard, or the bare `*` -- anything else (a
         // mid-string glob, more than one `*`) is a load error naming this
         // path, never silently treated as a literal or as `routes[].model`'s

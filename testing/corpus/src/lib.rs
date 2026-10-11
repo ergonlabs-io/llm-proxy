@@ -1,4 +1,4 @@
-//! Scorecard core (WP-27): feeds fixture bytes through the *real* loader
+//! Scorecard core: feeds fixture bytes through the *real* loader
 //! pipeline (`proxy_config::parse_bootstrap` + `build_snapshot` — the same
 //! entry points `llm-proxy --mode validate` uses, see `crates/proxy/src/main.rs`)
 //! and classifies the result into one of three outcome classes.
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(local[2].name, "tcp-proxy");
     }
 
-    /// WP-27 chunk B: the scorecard must discover the harvested
+    /// The scorecard must discover the harvested
     /// `envoy-examples` source alongside `local`, and every fixture in it
     /// must classify as `FullySupported` or `RejectedWithPath` — real Envoy
     /// bootstraps should never hit `ParseError` (that class is reserved for

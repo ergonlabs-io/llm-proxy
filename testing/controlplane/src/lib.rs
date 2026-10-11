@@ -1,14 +1,13 @@
-//! Scriptable in-process xDS control-plane harness (WP-28, first chunk):
-//! a puppet SotW ADS server for Lane E integration tests. It does not
+//! Scriptable in-process xDS control-plane harness:
+//! a puppet SotW ADS server for integration tests. It does not
 //! implement any control-plane logic (no diffing, no warming, no reconnect
 //! bookkeeping) — a [`script::Script`] tells it exactly what
 //! `DiscoveryResponse`s to send and when, and it records every
 //! `DiscoveryRequest` it receives so tests can assert on the client's
-//! request/ACK/NACK behavior (WP-20..22).
+//! request/ACK/NACK behavior.
 //!
-//! Later WP-28 chunks add the scenario DSL for NACK-recovery/warming races
-//! and a go-control-plane docker fixture; this chunk is only the core
-//! scriptable server plus its own self-tests.
+//! This crate is the core scriptable server plus its own self-tests; the
+//! go-control-plane reference fixture lives in `testing/xds-conformance`.
 
 pub mod delta;
 pub mod log;

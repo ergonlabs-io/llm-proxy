@@ -1,4 +1,4 @@
-//! WP-30: a lean, standalone, long-lived mock LLM provider for capacity/load
+//! A lean, standalone, long-lived mock LLM provider for capacity/load
 //! testing.
 //!
 //! # Why this exists instead of reusing `testing/diffrig`'s mocks

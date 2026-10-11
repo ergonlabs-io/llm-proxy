@@ -1,7 +1,7 @@
-//! Differential test rig (WP-26): compares llm-proxy against the pinned real
+//! Differential test rig: compares llm-proxy against the pinned real
 //! Envoy image.
 //!
-//! **Landed (WP-26 chunk B):** `config-validate-diff` — the config-loading
+//! **Landed:** `config-validate-diff` — the config-loading
 //! differential: runs a curated set of Envoy bootstrap configs
 //! (`testing/diffrig/configs/`) through both the real Envoy validator (in a
 //! throwaway docker container, `envoyproxy/envoy:v1.38.0` — see

@@ -1,6 +1,6 @@
-//! Self-test for `ScriptedAds` (WP-28): drives the harness with the real
+//! Self-test for `ScriptedAds`: drives the harness with the real
 //! generated ADS *client* stub over a real loopback socket, the same way a
-//! WP-20 test driving llm-proxy's xDS client would, and asserts the
+//! test driving llm-proxy's xDS client would, and asserts the
 //! request log records what the wire exchange actually did.
 
 use std::pin::Pin;
@@ -384,7 +384,7 @@ async fn wait_for_nack_does_not_accept_an_ack_for_the_same_nonce() {
     harness.shutdown().await;
 }
 
-/// The reconnect-resync scenario WP-20's acceptance criteria name and that
+/// The reconnect-resync scenario named in the client acceptance criteria and that
 /// `Step::Send` alone could not express: `DropStream` ends stream 1, the
 /// client opens stream 2, and the script resumes at the step *after*
 /// `DropStream` rather than replaying from the top.

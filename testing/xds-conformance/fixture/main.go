@@ -1,7 +1,7 @@
 // Command xds-conformance-fixture is a minimal ADS server built directly on
 // go-control-plane's own cache and server packages -- not a reimplementation
-// of the xDS wire protocol, which would defeat the entire point of WP-20
-// increment 5 (see testing/xds-conformance/README.md). It serves ONE fixed,
+// of the xDS wire protocol, which would defeat the entire point of the
+// conformance check (see testing/xds-conformance/README.md). It serves ONE fixed,
 // node-scoped CDS snapshot and exits; there is no scripting or reconfiguring
 // at runtime, because this fixture's only job is to be a real third-party
 // ADS server our client either agrees with or doesn't.
@@ -27,7 +27,7 @@ import (
 // The one node ID this fixture's snapshot is set for. go-control-plane's
 // SnapshotCache is keyed by node ID (see cachev3.IDHash{}) and, left to
 // itself, simply never replies to a client announcing any other ID --
-// a silent hang, not a failure. WP-20 increment 4c fixed a real bug where
+// a silent hang, not a failure. A real bug once had
 // our client sent no node at all, and this is precisely the class of
 // mistake a node-scoped snapshot is meant to catch: see nodeGuard below,
 // which turns that silent hang into an immediate, named gRPC error.
@@ -81,7 +81,7 @@ func main() {
 	snapshotCache := cachev3.NewSnapshotCache(false, cachev3.IDHash{}, nil)
 
 	// The one resource this fixture serves: a single STATIC cluster over
-	// CDS. Minimal on purpose -- WP-20 increment 5's bar is "we interop with
+	// CDS. Minimal on purpose -- the bar is "we interop with
 	// a real third-party ADS server", not "we exercise every resource shape".
 	cluster := &clusterv3.Cluster{
 		Name:                 "conformance-cluster",

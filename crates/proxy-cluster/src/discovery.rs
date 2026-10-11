@@ -1,5 +1,5 @@
 //! Discovery: turns a [`ClusterConfig`]'s configured endpoints into a
-//! [`HostSet`] (WP-16 §2).
+//! [`HostSet`].
 //!
 //! `STATIC` needs no I/O -- its endpoints are already literal IPs (enforced
 //! at config lowering, see `proxy-config/src/lower.rs`). `STRICT_DNS` and
@@ -22,11 +22,11 @@ use crate::resolver::HostResolver;
 use crate::{HealthFlags, Host};
 
 /// Envoy's default `dns_refresh_rate` for `STRICT_DNS`/`LOGICAL_DNS`
-/// clusters. TODO(WP-16+): wire `ClusterConfig.dns_refresh_rate` once the IR
+/// clusters. TODO: wire `ClusterConfig.dns_refresh_rate` once the IR
 /// carries it. Nothing in the workspace uses this constant yet.
 pub const DEFAULT_DNS_REFRESH_RATE: Duration = Duration::from_secs(5);
 
-/// Envoy's default `initial_fetch_timeout`: how long cluster warming (WP-21)
+/// Envoy's default `initial_fetch_timeout`: how long cluster warming
 /// waits for a cluster's first resolution/EDS response before proceeding
 /// with an empty host set. The caller (`proxy/src/main.rs`) applies it; the
 /// manual "mark initialized anyway" escape hatch is
@@ -43,7 +43,7 @@ pub async fn resolve(config: &ClusterConfig, resolver: &dyn HostResolver) -> io:
         // arrives through
         // [`crate::manager::ClusterManager::accept_eds_update`]. Empty, not
         // an error: a cluster whose EDS response has not landed yet is the
-        // ordinary startup state, and WP-21's warming is what stops traffic
+        // ordinary startup state, and warming is what stops traffic
         // reaching it meanwhile.
         //
         // **Callers must not reach here for an EDS cluster in the steady
@@ -109,7 +109,7 @@ async fn strict_dns_hosts(
 
 /// `LOGICAL_DNS`: one logical host per configured endpoint, keeping only the
 /// first address from the latest resolution (Envoy semantics -- connect-time
-/// re-resolution belongs to the connection pool, WP-13/15, not here).
+/// re-resolution belongs to the connection pool, not here).
 async fn logical_dns_hosts(
     endpoints: &[EndpointIR],
     resolver: &dyn HostResolver,

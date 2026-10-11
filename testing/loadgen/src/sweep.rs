@@ -1,5 +1,5 @@
 //! Ramp-hold-bisect search for the maximum concurrent-stream count a target
-//! sustains within an SLO (WP-30 phase 2's headline question: "how much
+//! sustains within an SLO (the headline question: "how much
 //! scale can one instance support for a given memory/CPU budget?").
 //!
 //! Deliberately generic over how one level is *driven* -- callers pass an

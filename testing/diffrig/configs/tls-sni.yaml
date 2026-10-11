@@ -1,5 +1,5 @@
 # TLS downstream listener with SNI-based filter-chain matching + tls_inspector:
-# real Envoy accepts this surface end-to-end, and llm-proxy's WP-08 TLS
+# real Envoy accepts this surface end-to-end, and llm-proxy's TLS
 # lowering supports the same fields -- expected verdict: AgreeAccept.
 admin:
   address:

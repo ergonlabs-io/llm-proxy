@@ -1,7 +1,7 @@
 //! Envoy response flags (`%RESPONSE_FLAGS%`). Short codes must match Envoy's
-//! access-log vocabulary exactly — the differential rig compares them (WP-24, S9).
+//! access-log vocabulary exactly — the differential rig compares them (S9).
 //!
-//! # WP-24 acceptance audit (2026-08-22)
+//! # Acceptance audit (2026-08-22)
 //!
 //! "Every variant must be reachable by at least one differential test" was
 //! re-audited flag by flag against what this codebase actually builds, not
@@ -29,7 +29,7 @@
 //! construct the *condition*, so a test that fabricates the error proves the
 //! mapping and nothing else.
 
-/// Why a request ended the way it did. See the module doc's WP-24 audit for
+/// Why a request ended the way it did. See the module doc's audit for
 /// which variants are reachable (and where their test lives) versus
 /// documented-unreachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,7 +127,7 @@ pub enum ResponseFlag {
     /// `response_flags::a_garbled_upstream_response_records_and_renders_the_uc_flag`.
     UpstreamConnectionTermination,
     /// RL: rate limited locally. Reachable: `proxy_filters::token_limit_filter`
-    /// denies a request once its budget is exhausted (WP-24 found this was
+    /// denies a request once its budget is exhausted (an audit found this was
     /// wired nowhere -- zero occurrences of `ResponseFlag` in that file --
     /// despite being that filter's entire reason to exist). Fixed; see its
     /// `tests::a_denied_request_renders_the_rl_response_flag`. Deliberately
@@ -135,12 +135,11 @@ pub enum ResponseFlag {
     /// unreadable usage) -- those admit the request, and `RL` would claim a
     /// refusal that never happened.
     RateLimited,
-    /// UAEX: unauthorized by external authorization service. Unreachable: no
-    /// `ext_authz` filter exists (WP-32, not yet built) to ever produce this
-    /// outcome.
+    /// UAEX: external authorization denial, fail-closed service error, or
+    /// invalid mutation. Explicit fail-open admission does not set this flag.
     UnauthorizedExternalService,
     /// RLSE: rate limit service error. Unreachable: no external gRPC
-    /// rate-limit service (Envoy's RLS protocol, WP-32) is implemented --
+    /// rate-limit service (Envoy's RLS protocol) is implemented --
     /// `token_limit_filter` (`RateLimited`, above) is a local/in-process
     /// limiter with no remote service to fail.
     RateLimitServiceError,
@@ -206,7 +205,7 @@ impl ResponseFlag {
     }
 
     /// Reverse of [`Self::code`] — used to decode
-    /// `ResponseFlagFilter.flags` (WP-24 lowering). `None` for a code Envoy
+    /// `ResponseFlagFilter.flags`. `None` for a code Envoy
     /// defines but we don't model as a distinct flag yet (e.g. `DI`, `FI`);
     /// the lowering pass turns that into a strict-mode config error rather
     /// than silently dropping the filter entry (ground rule #1).

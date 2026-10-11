@@ -1,4 +1,4 @@
-# Trivial WP-26 differential scenario: two requests against a proxy fronting
+# Trivial differential scenario: two requests against a proxy fronting
 # an `echo` upstream. Used by diffrig's own scenario-parse test today; once
 # the proxy driver lands, this is also the rig's self-check fixture.
 name: echo-basic

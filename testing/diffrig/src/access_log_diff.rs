@@ -1,4 +1,4 @@
-//! Stable access-log capture comparison for WP-24/WP-26.
+//! Stable access-log capture comparison.
 //!
 //! Envoy and llm-proxy emit the same semantic access-log fields, but timing,
 //! byte counts, and connection-local addresses vary between runs. This module

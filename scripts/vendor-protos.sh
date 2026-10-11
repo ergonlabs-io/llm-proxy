@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WP-02: vendor the pinned Envoy API protos + their proto dependencies into
+# Vendor the pinned Envoy API protos + their proto dependencies into
 # crates/proxy-api/vendor/. The pins below mirror envoy v1.38.0's
 # api/bazel/repository_locations.bzl exactly — bump them only via a dedicated
 # proto-upgrade change (IMPLEMENTATION_PLAN.md ground rule #1).

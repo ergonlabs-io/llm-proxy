@@ -1,9 +1,9 @@
-//! Outlier detection (WP-19, S6): ejects hosts that are misbehaving --
+//! Outlier detection (S6): ejects hosts that are misbehaving --
 //! consecutive errors or a statistically bad success/failure rate relative to
 //! their peers -- from load-balancer selection, without waiting for active
-//! health checking (WP-18) to notice.
+//! health checking to notice.
 //!
-//! **This module is the detection engine.** As of WP-19 it is fully wired:
+//! **This module is the detection engine.** It is fully wired:
 //! [`crate::manager::ClusterManager`] builds an [`OutlierDetector`] per
 //! cluster from the lowered `outlier_detection` config, spawns its sweep, and
 //! the router feeds it one [`OutlierDetector::report_result`] per upstream
@@ -165,7 +165,7 @@ pub struct OutlierDetectionConfig {
     /// approximation of a reachable config surface.
     pub split_external_local_origin_errors: bool,
     /// Whether a host un-ejects the moment it passes an active health check
-    /// (WP-18), independent of its outlier ejection timer. S6 default: true.
+    /// independent of its outlier ejection timer. S6 default: true.
     /// Envoy *does* expose this as a configurable field --
     /// `envoy.config.cluster.v3.OutlierDetection.successful_active_health_check_uneject_host`
     /// (field 23, a `BoolValue` defaulting to true). It is modeled here so [`OutlierDetector`]
@@ -202,7 +202,7 @@ impl Default for OutlierDetectionConfig {
 }
 
 impl From<&proxy_config::ir::OutlierDetectionIR> for OutlierDetectionConfig {
-    /// WP-19 runtime wiring: the lowered IR is this config minus
+    /// The lowered IR is this config minus
     /// `split_external_local_origin_errors` (which lowering rejects unless
     /// `false` -- see the IR type's doc), so that field always takes its only
     /// implemented value here. Every other field maps 1:1; the two field-name
@@ -302,7 +302,7 @@ pub enum EjectAction {
     Uneject,
 }
 
-/// Envoy's outlier-detection event-log JSON shape (diffable, S6's WP-19
+/// Envoy's outlier-detection event-log JSON shape (diffable, S6's
 /// acceptance criterion). Field names/shape approximate Envoy's real
 /// `EventLoggerImpl` output; exact fidelity (e.g. `secs_since_last_action`,
 /// which needs cluster-wide last-event tracking we don't keep) is left for
@@ -368,7 +368,7 @@ impl OutlierEventSink for TracingEventSink {
 /// clone of "how to un-eject this host" to a detached `tokio::spawn`ed timer
 /// without needing the whole detector wrapped in an `Arc` itself -- unlike
 /// `HealthCheckEngine`, `report_result` is a plain `&self` method (matching
-/// the seam WP-19b's router integration expects), so nothing here requires
+/// the seam the router integration expects), so nothing here requires
 /// callers to hold an `Arc<OutlierDetector>` at all except to call
 /// [`OutlierDetector::spawn`].
 pub struct OutlierDetector {
@@ -698,7 +698,7 @@ impl OutlierDetector {
     /// Detached un-eject timer. Deliberately does not need `Arc<Self>` --
     /// only clones of `host_set`/`sink`/`cluster_name` cross into the
     /// spawned task, so `report_result`/`eject` can stay plain `&self`
-    /// methods (matching the router-facing API shape WP-19b expects) even
+    /// methods (matching the router-facing API shape the router expects) even
     /// though ejection itself needs a background timer.
     fn schedule_uneject(&self, addr: SocketAddr, duration: Duration) {
         let host_set = Arc::clone(&self.host_set);
@@ -1321,7 +1321,7 @@ mod tests {
 
         // Fail active HC directly on the snapshot (no HealthCheckEngine
         // needed for this assertion -- we're testing HealthFlags rendering
-        // and is_healthy(), not WP-18's engine).
+        // and is_healthy(), not the active health check engine).
         host_set.rcu(|current| {
             let updated: Vec<Arc<Host>> = current
                 .all_hosts()

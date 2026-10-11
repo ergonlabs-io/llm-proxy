@@ -1,4 +1,4 @@
-//! Load balancing (WP-17, S7): `ROUND_ROBIN` (smooth weighted),
+//! Load balancing (S7): `ROUND_ROBIN` (smooth weighted),
 //! `LEAST_REQUEST` (power-of-two-choices), `RANDOM`, plus the
 //! priority-spillover / healthy-panic-threshold behavior every policy shares.
 //!
@@ -104,9 +104,9 @@ pub struct RoundRobinLb {
     // left off -- but `LoadBalancer::pick` takes `&self` because one
     // `Arc<dyn LoadBalancer>` is shared across worker threads. `Mutex` is
     // the interior-mutability seam that lets a `&self` method still mutate.
-    // TODO(WP-17 perf): a per-pick lock here is a known contention point
+    // TODO: a per-pick lock here is a known contention point
     // under load; a per-worker LB instance (no cross-thread sharing) would
-    // remove it, but that's a bigger structural change than this WP.
+    // remove it, but that's a bigger structural change than this one.
     swrr: Mutex<Vec<SwrrEntry>>,
 }
 
@@ -236,8 +236,8 @@ const DEFAULT_CHOICE_COUNT: usize = 2;
 
 /// `LEAST_REQUEST` (S7): pick `choice_count` candidates uniformly at random
 /// and take whichever has fewer active requests ("power of two choices" when
-/// `choice_count` is 2, Envoy's default). Until WP-15's connection pool and
-/// the WP-13 router start incrementing/decrementing `Host::active_requests`,
+/// `choice_count` is 2, Envoy's default). Until the connection pool and
+/// the router start incrementing/decrementing `Host::active_requests`,
 /// every host reads 0 and this degrades to uniform random -- which is the
 /// correct behavior for "no signal yet", not a bug.
 pub struct LeastRequestLb {
@@ -338,7 +338,7 @@ impl HostPicker {
     /// is used even if it repeats, exactly as Envoy specifies when no unused
     /// host can be found.
     pub fn pick(&self, host_set: &HostSet, ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
-        // WP-36 endpoint-picker hook: honor an explicit override when it's
+        // Endpoint-picker hook: honor an explicit override when it's
         // actually present in the set; otherwise fall through to normal
         // selection rather than erroring (the override is a *hint*).
         if let Some(addr) = ctx.host_override {
@@ -362,7 +362,7 @@ impl HostPicker {
         let panicking = healthy_count * 100 < total_count * PANIC_THRESHOLD_PERCENT;
 
         let candidates: Vec<Arc<Host>> = if panicking {
-            // TODO(WP-23 stats): count this as `lb_healthy_panic`.
+            // TODO (stats): count this as `lb_healthy_panic`.
             members.to_vec()
         } else {
             members.iter().filter(|h| h.is_healthy()).cloned().collect()
@@ -455,7 +455,7 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), 80)
     }
 
-    // Rust note: these tests predate `HealthFlags` (WP-19) and were written
+    // Rust note: these tests predate `HealthFlags` and were written
     // against the old two-state `HealthStatus` enum; rather than touch every
     // one of the dozens of call sites below, `host()` keeps the old
     // `HealthStatus` parameter and maps it onto the new `failed_active_hc`

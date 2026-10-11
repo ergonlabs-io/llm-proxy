@@ -18,7 +18,7 @@ proxy-filters = { workspace = true }
 proxy-http = { workspace = true }
 proxy-observability = { workspace = true }
 proxy-simple-config = { workspace = true }
-# WP-20 increment 4d-iii: constructs and drives the ADS client from bootstrap
+# Constructs and drives the ADS client from bootstrap
 # `dynamic_resources` (see `run_serve`'s `start_ads`). `proxy-api` moved here
 # from dev-dependencies below in the same increment -- `AggregatedDiscoveryServiceClient`
 # (the concrete gRPC client type `proxy-xds::AdsClient::run` is generic over)
@@ -39,7 +39,7 @@ tempfile = { version = "=3.27.0", default-features = false }
 # generator itself now lives in `proxy_filters::auth::generate_plaintext_key`,
 # which this crate no longer calls outside that test).
 base64 = { workspace = true }
-# tests/keygen.rs's end-to-end proof (WP-50 acceptance test 4) builds a real
+# tests/keygen.rs's end-to-end proof builds a real
 # `HeaderMap` to hand a `VirtualKeyAuthenticator`.
 http = { workspace = true }
 # tests/stats_e2e.rs's `gen_ai.client.token.usage` case needs a real upstream
@@ -52,7 +52,7 @@ http = { workspace = true }
 # than guessing a `target/` layout that a per-worktree `CARGO_TARGET_DIR`
 # (see AGENTS.md "Delegation") could change out from under a hardcoded guess.
 serde_json = { workspace = true }
-# tests/ads_e2e.rs (WP-20 increment 5): the WP-28 puppet ADS server this
+# tests/ads_e2e.rs: the puppet ADS server this
 # scripts a control plane with -- same dev-only dependency as
 # `crates/proxy-xds`'s own tests, not a `workspace.dependencies` entry since
 # nothing outside test code needs it (see that crate's Cargo.toml comment).
@@ -73,8 +73,8 @@ prost-types = { workspace = true }
 # the only way to prove spans actually cross the wire in the shape a real
 # collector expects, rather than asserting against `FinishedSpan` (which
 # `otlp::map_span` already unit-tests without any network at all). `proxy-api`
-# and `tonic` themselves are declared above in `[dependencies]` now (WP-20
-# increment 4d-iii) -- regular dependencies are visible to tests too, so
+# and `tonic` themselves are declared above in `[dependencies]` now -- regular
+# dependencies are visible to tests too, so
 # nothing further is needed here.
 
 [lints]

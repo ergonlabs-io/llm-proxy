@@ -1,4 +1,4 @@
-# corpus (WP-27)
+# corpus
 
 Versioned corpus of real-world Envoy configs and the scorecard tool that
 classifies each as fully-supported / rejected-with-path / parse-error. The

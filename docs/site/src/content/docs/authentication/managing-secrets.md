@@ -20,9 +20,8 @@ that keys every digest. See [Virtual keys](../authentication/virtual-keys/)
 for how verification works internally.
 
 **There is no key store and no admin API today.** Every action below is a
-config-file edit followed by a `SIGHUP` reload or a restart. WP-50
-increment 2b (a persistent/shared `CredentialStore`) and increment 3 (admin
-CRUD for keys) are not built — see
+config-file edit followed by a `SIGHUP` reload or a restart. A persistent,
+shared credential store and admin CRUD for keys are not built — see
 [Virtual keys](../authentication/virtual-keys/#what-is-not-built-yet).
 
 ## The HMAC secret

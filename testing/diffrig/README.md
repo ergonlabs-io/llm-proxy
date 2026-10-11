@@ -1,8 +1,8 @@
-# diffrig (WP-26)
+# diffrig
 
 Side-by-side differential test harness against the pinned real Envoy image.
 
-## Landed: config-validation differential (WP-26 chunk B)
+## Landed: config-validation differential
 
 `cargo run -p diffrig -- config-validate-diff` runs a curated set of Envoy
 bootstrap configs (`configs/`) through both real Envoy's `--mode validate`
@@ -65,7 +65,7 @@ The setup script does not make a 2-vCPU machine a valid 5k-rps host. The
 rename-churn test's `driver_saturated` assertion remains the authority: a
 saturated driver is an invalid capacity result, not a proxy failure.
 
-## Side-by-side Envoy HTTP replay/capture topology (increment 1)
+## Side-by-side Envoy HTTP replay/capture topology
 
 `access_log_diff` defines normalized HTTP captures and field-level comparison.
 `replay` replays a parsed `Scenario` against two already-running targets:

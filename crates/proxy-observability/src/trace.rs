@@ -1,8 +1,8 @@
-//! WP-51 increment 2 foundation: our own span model, plus W3C
+//! Our own span model, plus W3C
 //! `traceparent` parsing/serialization. Pure library code — nothing here is
 //! wired into the request path yet, and nothing here is an OTLP wire type.
-//! A later increment maps [`FinishedSpan`] to `opentelemetry.proto.trace`
-//! (vendored in `proxy-api`, WP-51 increment 1); ground rule #2 keeps that
+//! A later change maps [`FinishedSpan`] to `opentelemetry.proto.trace`
+//! (vendored in `proxy-api`); ground rule #2 keeps that
 //! proto on the far side of the exporter, never handled by the data plane.
 //!
 //! # Two independent pieces

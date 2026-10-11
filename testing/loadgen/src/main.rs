@@ -67,7 +67,7 @@ struct Cli {
     endpoint: Option<Endpoint>,
 
     /// Run a capacity sweep (ramp-hold-bisect for max sustainable
-    /// concurrency, WP-30 phase 2) instead of a single fixed-concurrency
+    /// concurrency) instead of a single fixed-concurrency
     /// or fixed-rate run. Mutually exclusive with --concurrency/--rate.
     #[arg(long)]
     sweep: bool,
@@ -301,7 +301,7 @@ fn build_run_config(args: &Cli, endpoint: Endpoint, targets: Vec<driver::Target>
     }
 }
 
-/// Run a WP-30 phase-2 capacity sweep: ramp-hold-bisect for the largest
+/// Run a capacity sweep: ramp-hold-bisect for the largest
 /// concurrency the target sustains within the configured SLO, sampling the
 /// proxy process's RSS/CPU/fds alongside each held level.
 async fn run_sweep(

@@ -1,4 +1,4 @@
-# WP-30 Docker capacity topology:
+# Docker capacity topology:
 #
 #   loadgen (manual profile, separate cgroup) -> proxy (2 CPU / 1 GiB)
 #                                                   -> mock (private network)

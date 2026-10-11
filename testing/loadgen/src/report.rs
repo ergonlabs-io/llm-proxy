@@ -207,7 +207,7 @@ fn fmt_ms(v: Option<f64>) -> String {
 }
 
 // ---------------------------------------------------------------------
-// Capacity report (WP-30 phase 2): renders a `sweep::SweepReport` into a
+// Capacity report: renders a `sweep::SweepReport` into a
 // concurrency -> throughput/latency/resource-usage table, plus the derived
 // cost model that is this tool's actual headline (see the module doc and
 // the crate's task brief -- a single "max streams" number is far less

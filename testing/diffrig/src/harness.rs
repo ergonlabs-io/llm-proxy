@@ -134,8 +134,8 @@ impl ProxyProcess {
     /// Spawn `llm-proxy -c config_path` (Envoy mode), otherwise identical to
     /// [`Self::spawn`].
     ///
-    /// This exists because some Lane-H filters (e.g. the WP-50 auth filter,
-    /// as of this writing) have no dialect (`llmproxy.yaml`) surface yet --
+    /// This exists because some filters (e.g. the auth filter, as of this
+    /// writing) have no dialect (`llmproxy.yaml`) surface yet --
     /// `--config` only understands the fields `proxy-simple-config` knows
     /// how to lower, so a test that needs `llmproxy.auth` in `http_filters`
     /// must hand the proxy a real Envoy bootstrap document instead. Prefer
@@ -148,8 +148,8 @@ impl ProxyProcess {
     /// Same as [`Self::spawn_envoy`], plus `envs` set in the CHILD's
     /// environment only (via `Command::env`, never `std::env::set_var` --
     /// that call is process-global and would race every other test binary
-    /// running concurrently in this workspace). Added for the WP-50 admin
-    /// write API drill (`admin_e2e.rs`), which must set
+    /// running concurrently in this workspace). Used by the admin write API
+    /// drill (`admin_e2e.rs`), which must set
     /// `LLMPROXY_ADMIN_TOKEN` for the spawned proxy without touching this
     /// test process's own environment.
     pub fn spawn_envoy_with_env(

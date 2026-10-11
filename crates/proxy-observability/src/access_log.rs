@@ -1,4 +1,4 @@
-//! WP-24 (chunk 1): the access-log format-string engine.
+//! The access-log format-string engine.
 //!
 //! Two halves, deliberately separated by cost:
 //!
@@ -11,7 +11,7 @@
 //!   anything, just walks the pre-built op list and writes into a `String`.
 //!
 //! Runtime sink wiring (actually calling `render` from the router/filter
-//! manager and writing the result somewhere) is WP-24 chunk 2, not here.
+//! manager and writing the result somewhere) is the sink's job, not this module's.
 
 use std::fmt::Write as _;
 
@@ -47,7 +47,7 @@ pub enum FormatOp {
     Protocol,
     ResponseCode,
     ResponseFlags,
-    /// WP-58: `%RESPONSE_CODE_DETAILS%` -- the free-text reason a response
+    /// `%RESPONSE_CODE_DETAILS%` -- the free-text reason a response
     /// took the status it did (e.g. `cluster_not_found`, `no_healthy_upstream`,
     /// `cluster_not_warmed`). Distinguishes conditions that share one
     /// [`ResponseFlag`] short code -- see
@@ -60,10 +60,10 @@ pub enum FormatOp {
     UpstreamHost,
     UpstreamCluster,
     DownstreamRemoteAddress,
-    // WP-51 increment 1 was scoped to add OTel-GenAI-semconv-aligned aliases
-    // for these nine operators (e.g. `%GEN_AI_USAGE_INPUT_TOKENS%` next to
-    // `%LLM_INPUT_TOKENS%`). Investigated 2026-08-21 and deliberately NOT
-    // done -- decision recorded here so the next attempt starts from the
+    // OTel-GenAI-semconv-aligned aliases for these nine operators (e.g.
+    // `%GEN_AI_USAGE_INPUT_TOKENS%` next to `%LLM_INPUT_TOKENS%`) were
+    // investigated 2026-08-21 and deliberately NOT added -- decision recorded
+    // here so the next attempt starts from the
     // analysis instead of redoing it and landing the bug this avoided.
     // (Re-scoped 2026-08-24: the same disjoint-vs-inclusive mismatch is why
     // the `llm.client.token.usage` metric in `proxy-observability::stats`
@@ -111,30 +111,30 @@ pub enum FormatOp {
     // `LLM_MAX_STALL`, or `LLM_RESPONSE_CHUNKS`, which are proprietary to
     // this proxy.
     //
-    /// WP-33: `%LLM_INPUT_TOKENS%`.
+    /// `%LLM_INPUT_TOKENS%`.
     LlmInputTokens,
-    /// WP-33: `%LLM_CACHED_TOKENS%`.
+    /// `%LLM_CACHED_TOKENS%`.
     LlmCachedTokens,
-    /// WP-33: `%LLM_CACHE_CREATION_TOKENS%`.
+    /// `%LLM_CACHE_CREATION_TOKENS%`.
     LlmCacheCreationTokens,
-    /// WP-33: `%LLM_OUTPUT_TOKENS%`.
+    /// `%LLM_OUTPUT_TOKENS%`.
     LlmOutputTokens,
-    /// WP-33: `%LLM_TOTAL_TOKENS%` -- the sum of all four buckets above.
+    /// `%LLM_TOTAL_TOKENS%` -- the sum of all four buckets above.
     LlmTotalTokens,
-    /// WP-33: `%LLM_TTFT%` -- time-to-first-token, in milliseconds.
+    /// `%LLM_TTFT%` -- time-to-first-token, in milliseconds.
     LlmTtft,
-    /// WP-46: `%LLM_TPOT%` -- mean time per output token, in milliseconds:
+    /// `%LLM_TPOT%` -- mean time per output token, in milliseconds:
     /// `(duration - ttft) / output_tokens`, computed at render time (see
     /// [`render_op`]'s `LlmTpot` arm for the full guard list).
     LlmTpot,
-    /// WP-46: `%LLM_MAX_STALL%` -- the largest gap between two consecutive
+    /// `%LLM_MAX_STALL%` -- the largest gap between two consecutive
     /// response body chunks, in milliseconds. NOT the same thing as TPOT --
     /// see `LlmTokens`'s sibling field doc on `LogContext::llm_max_stall`.
     LlmMaxStall,
-    /// WP-46: `%LLM_RESPONSE_CHUNKS%` -- number of response body chunks
+    /// `%LLM_RESPONSE_CHUNKS%` -- number of response body chunks
     /// observed for this stream.
     LlmResponseChunks,
-    /// WP-53: `%LLM_LIST_COST%`, in integer nanodollars.
+    /// `%LLM_LIST_COST%`, in integer nanodollars.
     LlmListCost,
     LlmKeyId,
     LlmTenant,
@@ -447,7 +447,7 @@ fn build_op(
 /// `%.3f` instead of the abseil-specific `%E3S`).
 const DEFAULT_START_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
-/// WP-33: provider-reported token usage, in the four billing buckets --
+/// Provider-reported token usage, in the four billing buckets --
 /// mirrors `proxy_http::LlmTokenUsage` field-for-field, but this crate can't
 /// name that type (`proxy-observability` is a *dependency* of `proxy-http`,
 /// not the other way around -- ground rule #2's direction applies to crate
@@ -473,7 +473,7 @@ impl LlmTokens {
 }
 
 /// Everything a request/stream lifecycle knows by the time it's logged.
-/// Built by the caller (chunk 2: the router / filter manager) and handed to
+/// Built by the caller (the router / filter manager) and handed to
 /// [`render`]; this type has no knowledge of how those fields were computed.
 ///
 /// Rust note: `'a` ties every borrowed field to the caller's stack frame —
@@ -495,23 +495,23 @@ pub struct LogContext<'a> {
     pub upstream_host: Option<&'a str>,
     pub upstream_cluster: Option<&'a str>,
     pub downstream_remote_address: Option<&'a str>,
-    /// WP-58: `%RESPONSE_CODE_DETAILS%` -- `None` when whoever finalized the
+    /// `%RESPONSE_CODE_DETAILS%` -- `None` when whoever finalized the
     /// response never set one (most successful responses today), rendered as
     /// `-` like every other absent [`Option`] field in this struct.
     pub response_code_details: Option<&'a str>,
-    /// WP-33: provider-reported token usage. `None` when the response
+    /// Provider-reported token usage. `None` when the response
     /// carried none -- a non-LLM route, or a provider that reported nothing.
     pub llm_tokens: Option<LlmTokens>,
-    /// WP-33: time-to-first-token -- response headers to first body byte.
+    /// Time-to-first-token -- response headers to first body byte.
     pub llm_ttft: Option<std::time::Duration>,
-    /// WP-46: the largest gap between two consecutive response body chunks
+    /// The largest gap between two consecutive response body chunks
     /// -- the tail of the TPOT distribution, NOT the mean (`%LLM_TPOT%`
     /// below computes the mean separately). `None` for a non-streamed
     /// response, or one that never populated `StreamInfo::llm`.
     pub llm_max_stall: Option<std::time::Duration>,
-    /// WP-46: number of response body chunks observed for this stream.
+    /// Number of response body chunks observed for this stream.
     pub llm_response_chunks: u64,
-    /// WP-53's request-time list price. `None` is unpriced/unknown, not zero.
+    /// The request-time list price. `None` is unpriced/unknown, not zero.
     pub llm_list_cost_nanodollars: Option<u64>,
     /// Usage attribution; absent identities and unpriced cards remain absent.
     pub llm_key_id: Option<&'a str>,
@@ -589,7 +589,7 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
             out.push_str(ctx.downstream_remote_address.unwrap_or("-"))
         }
         FormatOp::ResponseCodeDetails => out.push_str(ctx.response_code_details.unwrap_or("-")),
-        // WP-33: these six feed billing, so absent usage must render `-`,
+        // These six feed billing, so absent usage must render `-`,
         // never a confident-looking `0` -- `None` means "the provider told
         // us nothing", not "zero tokens were used".
         FormatOp::LlmInputTokens => match ctx.llm_tokens {
@@ -628,7 +628,7 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
             }
             None => out.push('-'),
         },
-        // WP-46: mean time per output token, in milliseconds --
+        // Mean time per output token, in milliseconds --
         // `(duration - ttft) / output_tokens`. Every guard here renders `-`
         // rather than a garbage number or a panic:
         //   - no usage reported, or output_tokens == 0 (division by zero)
@@ -1085,7 +1085,7 @@ mod tests {
         assert_eq!(render(&fs, &c), "UF,URX");
     }
 
-    // -------------------------------------------- WP-58: RESPONSE_CODE_DETAILS --
+    // -------------------------------------------- RESPONSE_CODE_DETAILS --
 
     #[test]
     fn response_code_details_renders_when_present() {
@@ -1219,7 +1219,7 @@ mod tests {
 
     #[test]
     fn llm_operators_render_dash_when_absent() {
-        // WP-33: absent usage/ttft must render `-`, never a confident `0` --
+        // Absent usage/ttft must render `-`, never a confident `0` --
         // these numbers feed billing, and `0` would falsely claim the
         // provider reported zero tokens.
         let empty = http::HeaderMap::new();
@@ -1237,14 +1237,14 @@ mod tests {
         assert!(e.0.contains("LLM_BOGUS"), "{e}");
     }
 
-    // -------------------------------------------------------- WP-46: TPOT --
+    // -------------------------------------------------------- TPOT --
 
     const LLM_TPOT_FMT: &str = "%LLM_TPOT% %LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%";
 
     /// Deliberately chosen so `duration`, `ttft`, `output_tokens`, the
     /// correct TPOT answer, and `max_inter_chunk` are all distinct numbers --
     /// a formula that accidentally read the wrong field (or rendered
-    /// `max_inter_chunk` under the TPOT label, the exact mistake this WP
+    /// `max_inter_chunk` under the TPOT label, the exact mistake this test
     /// exists to prevent) cannot slip through by coincidence.
     #[test]
     fn llm_tpot_renders_mean_time_per_output_token() {

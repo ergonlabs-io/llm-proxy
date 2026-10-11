@@ -1,4 +1,4 @@
-//! WP-23 increment 4 — Grafana-dashboard conformance test.
+//! Grafana-dashboard conformance test.
 //!
 //! Status: **provisional — not yet checked against Envoy's own dashboard.**
 //!
@@ -25,15 +25,15 @@
 //!    downloadable, and it does download successfully). Its own metadata
 //!    (`orgName: "mischenkovn"`) shows it is a **third-party community
 //!    contribution**, not something published by the Envoy project. Per this
-//!    WP's own instructions — "do NOT invent a dashboard and do NOT fake the
+//!    the brief's own instructions — "do NOT invent a dashboard and do NOT fake the
 //!    test" — an unverified third party's dashboard is treated the same as
 //!    having found nothing: it is not "Envoy's own dashboard", and building
 //!    a conformance test against it would risk exactly the kind of
 //!    unverified artifact this project has been bitten by before.
 //!
 //! **Conclusion: no obtainable artifact satisfies the brief's actual
-//! acceptance criterion.** This file is the honest fallback the WP-23
-//! brief's task description names for exactly this outcome.
+//! acceptance criterion.** This file is the honest fallback the design
+//! brief names for exactly this outcome.
 //!
 //! # What this file asserts instead
 //!
@@ -65,7 +65,7 @@ const EXPECTED_METRIC_FAMILIES: &[&str] = &[
 /// Resolves and records one measurement against every instrument named in
 /// [`EXPECTED_METRIC_FAMILIES`], then asserts the rendered Prometheus output
 /// contains each family name — failing with the list of whichever are
-/// missing, per this WP's brief.
+/// missing, per the brief.
 #[test]
 fn renderer_produces_a_series_for_every_known_instrument() {
     let control = StatsControl::new(1);

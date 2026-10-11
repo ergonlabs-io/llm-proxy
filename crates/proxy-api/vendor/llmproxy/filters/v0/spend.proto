@@ -1,4 +1,4 @@
-// The price table for the spend-budget filter (WP-50 increment 3c-i).
+// The price table for the spend-budget filter.
 //
 // Vendored for its own sake, same reasoning as `auth.proto` and
 // `model_authz.proto`: a price table is a REPEATED STRUCTURED record
@@ -50,7 +50,7 @@ message SpendLimit {
 
   // How long this replica may go without RECONCILING with the shared store
   // before it says so, in seconds. `0` (proto3's implicit default) means the
-  // built-in 60 seconds. WP-62, ADR-0006 section 5.
+  // built-in 60 seconds. ADR-0006 section 5.
   //
   // "Reconciling" means a flush in which every bucket was written and the
   // store handed back the authoritative total -- see
@@ -140,7 +140,7 @@ enum Period {
 // table above. It lives in the control plane
 // (`proxy_filters::control::ControlPlane`, beside `ModelAccess`) and is set
 // through the admin API (`PUT /chains/{stat_prefix}/tenants/{id}/budget`),
-// the same seam WP-50 3b already uses for per-tenant model allow-lists.
+// the same seam the per-tenant model allow-lists use.
 //
 // Two reasons, not one:
 //
@@ -151,8 +151,8 @@ enum Period {
 //   message would then have to keep in sync with the control plane's own.
 // - **A ceiling changes far more often than prices do, in production, by an
 //   operator responding to a specific tenant's usage** -- exactly the "take
-//   effect on the next request with no reload" property WP-50 3b built the
-//   admin write API and `ControlPlaneSnapshot` republish path for. Bootstrap
+//   effect on the next request with no reload" property that the admin write
+//   API and `ControlPlaneSnapshot` republish path exist to deliver. Bootstrap
 //   config is the wrong tool for a value that is expected to change while
 //   the process is running; prices, by contrast, are close to static
 //   deployment facts, which is why they DO belong in `typed_config`.
@@ -161,7 +161,7 @@ enum Period {
 //
 // AGENTS.md invariant 6 ("anything that varies per provider belongs on the
 // cluster, never on the route") has a third instance here, beyond credentials
-// (WP-35 1a) and `host_rewrite_literal` (WP-35 2c): pricing. The same model
+// and `host_rewrite_literal`: pricing. The same model
 // name can be served by two clusters at two different rates -- `gpt-4o`
 // direct versus through a discounted secondary, say -- and a route only picks
 // an *aggregate*; the cluster is the *member* that actually gets dialled. A

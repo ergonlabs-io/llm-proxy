@@ -1,4 +1,4 @@
-//! WP-02 acceptance tests.
+//! Acceptance tests for the descriptor pool.
 //!
 //! Gate (internal-docs/IMPLEMENTATION_PLAN.md): `Bootstrap`, `Listener`, `Cluster`,
 //! `RouteConfiguration`, `ClusterLoadAssignment`, `HttpConnectionManager`,
@@ -98,7 +98,7 @@ fn generated_types_are_usable() {
     assert_eq!(back.node.as_ref().map(|n| n.id.as_str()), Some("test-node"));
 }
 
-/// End-to-end proof of the WP-03 pipeline design: Envoy YAML -> serde_json
+/// End-to-end proof of the pipeline design: Envoy YAML -> serde_json
 /// value -> prost-reflect proto3-JSON deserialize against the pool, including
 /// `Any` resolution by type URL and proto3 JSON durations ("5s").
 #[test]
@@ -137,7 +137,7 @@ fn example_bootstrap_yaml_parses_via_descriptor_pool() {
 }
 
 /// Strict mode foundation (ground rule #2): unknown fields must be detectable
-/// at parse time so WP-03 can reject them with a field path.
+/// at parse time so that the config loader can reject them with a field path.
 #[test]
 fn unknown_fields_are_rejected() {
     use prost_reflect::DynamicMessage;

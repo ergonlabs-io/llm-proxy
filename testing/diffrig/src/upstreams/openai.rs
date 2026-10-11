@@ -1,6 +1,6 @@
 //! `openai`: an OpenAI-chat-completions-compatible mock upstream for the LLM
-//! feature lanes (streaming metrics WP-33, token metering WP-34, model
-//! routing WP-35). Unlike `echo`/`slow` it understands the request body
+//! feature lanes (streaming metrics, token metering, model
+//! routing). Unlike `echo`/`slow` it understands the request body
 //! (`/v1/chat/completions`) well enough to fabricate a plausible completion —
 //! non-streaming JSON or a paced SSE stream — and it records the parsed
 //! request bodies (not just method/path/headers) so scenarios can assert on
@@ -42,7 +42,7 @@ pub struct OpenAiConfig {
     /// 401 OpenAI-style error.
     pub require_api_key: Option<String>,
     /// When set, every request gets this `(status, message)` back instead of
-    /// being handled normally — for retry/fallback drills (WP-35).
+    /// being handled normally — for retry/fallback drills.
     pub forced_error: Option<(u16, String)>,
     /// Cache-read tokens to report as a subset of `prompt_tokens`, under
     /// `usage.prompt_tokens_details.cached_tokens`. Defaults to 0 in scenario
@@ -152,7 +152,7 @@ impl OpenAiUpstream {
 
     /// The TLS-capable twin of `spawn`: serves the same
     /// chat-completions/responses handler behind `tls`'s minted certificate,
-    /// for the hermetic upstream-TLS end-to-end test (WP-26). Bound on both
+    /// for the hermetic upstream-TLS end-to-end test. Bound on both
     /// loopback address families at one port -- see [`TlsServerHandle`]'s
     /// doc comment for why.
     pub async fn spawn_tls(config: OpenAiConfig, tls: &MockTls) -> anyhow::Result<Self> {

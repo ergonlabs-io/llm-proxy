@@ -1,7 +1,6 @@
 # HTTP connection manager + route config + router filter over a static
 # cluster: real Envoy accepts this, and llm-proxy's HCM/route lowering
-# (config-loading only -- the L7 data plane itself is still WP-10) supports
-# the same surface -- expected verdict: AgreeAccept.
+# supports the same surface -- expected verdict: AgreeAccept.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }

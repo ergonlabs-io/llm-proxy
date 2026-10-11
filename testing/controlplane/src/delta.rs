@@ -1,4 +1,4 @@
-//! Minimal delta ADS wire harness used by WP-22 transport tests.
+//! Minimal delta ADS wire harness used by the transport tests.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;

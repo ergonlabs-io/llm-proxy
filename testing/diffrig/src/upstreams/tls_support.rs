@@ -1,5 +1,5 @@
 //! Self-signed TLS support for the mock LLM upstreams (`openai`/`anthropic`),
-//! used by the hermetic TLS end-to-end test (WP-26 / the MVP north-star): a
+//! used by the hermetic TLS end-to-end test (the MVP north-star): a
 //! throwaway CA + leaf certificate minted at runtime with `rcgen`, served
 //! over HTTP/1.1 via `tokio-rustls`, so the proxy's real upstream-TLS path
 //! (SNI + certificate verification, `crates/proxy-core/src/tls`) gets

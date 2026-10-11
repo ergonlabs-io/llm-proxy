@@ -1,4 +1,4 @@
-//! `controlplane` is a library crate consumed by Lane E integration tests
+//! `controlplane` is a library crate consumed by integration tests
 //! (see `internal-docs/IMPLEMENTATION_PLAN.md` WP-28); this binary has nothing to run on
 //! its own.
 

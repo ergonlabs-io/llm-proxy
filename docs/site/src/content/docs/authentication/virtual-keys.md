@@ -90,7 +90,7 @@ must not be conflated:
 - **No credential of this kind** — no `authorization` header, a different
   auth scheme, or a bearer value without the `llmp_` prefix (for example, a
   JWT). This is not a failure of the virtual-key authenticator; it is the
-  seam a future OIDC/JWT authenticator (WP-50 increment 2c, not built) is
+  seam a future OIDC/JWT authenticator (not built) is
   meant to occupy.
 - **A bad credential of this kind** — an `llmp_`-prefixed value whose digest
   matches no configured key (`UnknownKey`), or matches a key marked
@@ -291,8 +291,7 @@ running process; a config reload is not.
 
 - **OIDC/JWT authentication.** The seam exists — a JWT-shaped bearer value is
   treated as `NoCredential`, not `Rejected`, specifically so a second
-  authenticator can claim it later — but there is no JWT validator today
-  (WP-50 increment 2c).
+  authenticator can claim it later — but there is no JWT validator today.
 - **Model allow-lists or budgets from the `llmproxy` dialect's config file.**
   `schema/llmproxy-v0.schema.json`'s `Auth` type has no such field. Setting
   either requires the admin write API or a hand-written Envoy-mode

@@ -1,4 +1,4 @@
-//! The per-cluster host-set snapshot (WP-16 §1).
+//! The per-cluster host-set snapshot.
 //!
 //! `HostSet` is the immutable membership view the cluster manager publishes.
 //! It's built on the control runtime by [`crate::discovery`] and shared with
@@ -8,8 +8,8 @@
 //! mutate in place.
 //!
 //! Envoy itself publishes incremental host-set *deltas* to workers rather
-//! than whole-set swaps. WP-16 v1 always rebuilds the snapshot wholesale (see
-//! [`crate::manager::ClusterManager::refresh_cluster`]) but still exposes the
+//! than whole-set swaps. This implementation always rebuilds the snapshot wholesale
+//! (see [`crate::manager::ClusterManager::refresh_cluster`]) but still exposes the
 //! added/removed/unchanged classification via [`diff_host_sets`], both for
 //! observability and so tests can assert on it.
 
@@ -116,7 +116,7 @@ pub fn diff_host_sets(old: &HostSet, new: &HostSet) -> HostSetDiff {
 }
 
 /// Carry `health_flags` over from `old` to `new` for every address `diff`
-/// calls `unchanged` (WP-18 runtime wiring).
+/// calls `unchanged`.
 ///
 /// `discovery::resolve` builds every `Host` fresh, with `HealthFlags::default()`
 /// -- it has no notion of "this address was already known", so a plain

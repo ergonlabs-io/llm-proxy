@@ -1,4 +1,4 @@
-//! WP-24 (chunk 2): the access-log *writer* half — turning a rendered
+//! The access-log *writer* half — turning a rendered
 //! [`crate::access_log::render`] line into bytes on stdout/stderr/disk.
 //!
 //! [`AccessLogSink`] is defined **here**, not in `proxy-config`'s IR, and the

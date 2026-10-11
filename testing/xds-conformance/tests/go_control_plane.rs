@@ -1,4 +1,4 @@
-//! WP-20 increment 5: run our real ADS client (`proxy_xds::AdsClient`)
+//! Run our real ADS client (`proxy_xds::AdsClient`)
 //! against a real go-control-plane server -- the reference implementation --
 //! instead of `testing/controlplane`'s own puppet, which cannot catch us
 //! agreeing with ourselves about the protocol. See `../README.md` for what
@@ -251,7 +251,7 @@ async fn exchange_one_cds_response(addr: &str, node_id: &str) -> Option<Verdict>
     verdict
 }
 
-/// WP-20 increment 5's minimum bar, all four bullets in one scenario:
+/// The minimum bar, all four bullets in one scenario:
 /// connect, send a `node.id` go-control-plane's snapshot cache actually
 /// routes on, receive a CDS response, and accept it -- which
 /// `AdsClient::run_once` turns into an ACK echoing go-control-plane's own
@@ -280,7 +280,7 @@ async fn our_client_interops_with_real_go_control_plane() {
     );
 }
 
-/// WP-20 increment 5's second bullet, isolated: go-control-plane's snapshot
+/// The node-ID bullet, isolated: go-control-plane's snapshot
 /// cache is keyed by node ID, and its own behavior for an unrecognized node
 /// is to simply never reply -- a silent hang, not an error. The fixture's
 /// `nodeGuard` (see `fixture/main.go`) turns that into an EXPLICIT gRPC

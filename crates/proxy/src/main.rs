@@ -1,13 +1,12 @@
 //! The `llm-proxy` binary.
 //!
-//! Implemented: Envoy bootstrap loading (`-c`, WP-03), PGV validation (WP-04),
-//! IR building (WP-05), the simple dialect (`--config`, WP-38), `--mode
-//! validate` / `--mode translate`, `--mode keygen` (WP-50 increment 2a-iv,
-//! see `keygen`), `init`, serve mode's control runtime, worker pool,
-//! SIGTERM/SIGINT drain sequence (WP-06 chunk C), and the per-worker listener manager
-//! (WP-07 chunk C) that binds sockets and accepts connections. The L4
-//! network filter chain (`tcp_proxy` etc.) is still a stub -- see
-//! `proxy_core::listener`'s `TODO(WP-09)`.
+//! Implemented: Envoy bootstrap loading (`-c`), PGV validation, IR building,
+//! the simple dialect (`--config`), `--mode validate` / `--mode translate`,
+//! `--mode keygen` (see `keygen`), `init`, serve mode's control runtime, worker
+//! pool, SIGTERM/SIGINT drain sequence, and the per-worker listener manager
+//! that binds sockets and accepts connections. The L4 network filter chain
+//! (`tcp_proxy` etc.) is still a stub -- see `proxy_core::listener`'s
+//! `TODO(WP-09)`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -534,7 +533,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     );
 
     // Rust note: the control runtime is a separate, ordinary multi-thread
-    // tokio runtime (2 worker threads per WP-06) -- distinct from the
+    // tokio runtime (2 worker threads) -- distinct from the
     // per-worker `current_thread` runtimes `WorkerPool::spawn` builds. Only
     // the control runtime ever touches the `ConfigPublisher`/signal seam;
     // workers only see it via the channels in `WorkerContext`.
@@ -572,14 +571,14 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
 /// close.
 const INITIAL_BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// WP-51 increment 3a: how many finished spans [`proxy_observability::trace::SpanSink`]
+/// How many finished spans [`proxy_observability::trace::SpanSink`]
 /// buffers between the exporter's batches before [`proxy_observability::trace::SpanSink::emit`]
 /// starts dropping. Generous relative to `otlp::MAX_BATCH` (512) -- several
 /// batches' worth of headroom for a slow or momentarily unreachable
 /// collector, without holding an unbounded amount of memory.
 const SPAN_SINK_CAPACITY: usize = 4096;
 
-/// WP-50 increment 3b-ii, W4: env var carrying the admin write API's bearer
+/// Env var carrying the admin write API's bearer
 /// token, mirroring `keygen`'s own `SECRET_ENV_VAR` (`LLMPROXY_AUTH_SECRET`)
 /// convention -- an operator-supplied credential lives in the environment,
 /// never in the bootstrap config, so a config dump or a checked-in file can
@@ -614,7 +613,7 @@ async fn run_serve(
 ) -> ExitCode {
     // Collected before `snapshot` moves into `WorkerPool::spawn` purely so
     // the startup log line below can name what got bound; each worker binds
-    // its own copy of these sockets independently (WP-07 chunk C).
+    // its own copy of these sockets independently.
     let listener_summary: Vec<String> = snapshot
         .listeners
         .values()
@@ -622,7 +621,7 @@ async fn run_serve(
         .map(|l| format!("{}@{}", l.name, l.address))
         .collect();
 
-    // WP-13: one `ClusterManager` shared across every worker -- control
+    // One `ClusterManager` shared across every worker -- control
     // computes (discovery, EDS updates land here), workers only ever read
     // through `ClusterEntry`/`HttpConnPool`, exactly like Envoy's own
     // cluster manager. Built and populated here, before `WorkerPool::spawn`,
@@ -632,7 +631,7 @@ async fn run_serve(
         Arc::new(proxy_cluster::resolver::TokioResolver),
         proxy_core::tls::transport_socket_builder(),
     ));
-    // ADR-0006 §2 / WP-60 prerequisite: the effective node id, computed
+    // ADR-0006 §2: the effective node id, computed
     // ONCE here so both `factory_state` below and `start_ads` further down
     // use the exact same value -- see `effective_node`'s own doc for the
     // override rule. The bootstrap side of that rule is `snapshot.ads`'s own
@@ -654,21 +653,21 @@ async fn run_serve(
         service_cluster.as_deref(),
     );
 
-    // WP-50 3b-ii part B: one `SharedFactoryState` shared across every
+    // One `SharedFactoryState` shared across every
     // worker, same "control builds it once, workers get a clone of the same
     // instance" shape as `cluster_manager` above. The HTTP filter chain is
     // rebuilt PER WORKER (`proxy_core::listener::build_hcm_handler` runs on
     // each worker's own `LocalSet`, ADR-0003), so a filter factory that needs
     // ONE process-wide singleton registers it in this slot on its first
     // `create()` call and every other worker's `create()` for the same
-    // filter reads the same instance back. WP-60 prerequisite: also carries
+    // filter reads the same instance back. It also carries
     // this process's effective node id (`node.id` above), so a filter that
     // needs to disambiguate itself across replicas (the spend flush token,
     // ADR-0006 §2) can reach it via `FactoryContext::node_id()`.
     let factory_state = Arc::new(proxy_http::filter::SharedFactoryState::for_node(
         node.id.clone(),
     ));
-    // WP-22 increment 2b: the one per-serve `SdsSecretRegistry`, same "control
+    // The one per-serve `SdsSecretRegistry`, same "control
     // builds it once, workers/`start_ads` get a clone of the same instance"
     // shape as `factory_state` just above -- see `proxy_core::tls::
     // SdsSecretRegistry`'s own doc for what it does. Every worker's
@@ -692,7 +691,7 @@ async fn run_serve(
         return ExitCode::FAILURE;
     }
 
-    // WP-23 increment 6a: one `StatsControl`/`Registry` shared across every
+    // One `StatsControl`/`Registry` shared across every
     // worker, same "control computes, workers `load`" shape as
     // `cluster_manager` above -- and a `StatHandles` table resolved, once,
     // for every cluster this boot snapshot names. `StatsControl` itself
@@ -703,14 +702,14 @@ async fn run_serve(
     // a cluster a later config only introduces then, via
     // `StatHandles::resolve_missing`. `registry` (a plain `Arc<Registry>`
     // clone) is what both the admin server and every worker's `RouterStats`
-    // actually hold. See `proxy_observability::stats`'s module doc,
-    // "Increment 5", for why the two are split.
+    // actually hold. See `proxy_observability::stats`'s module doc for
+    // why the two are split.
     let stats_control = proxy_observability::stats::StatsControl::new(concurrency);
     let stat_handles = Arc::new(proxy_http::stat_handles::StatHandles::build(
         &stats_control,
         snapshot.clusters.keys().map(String::as_str),
     ));
-    // WP-23 increment 6b: `DownstreamStatHandles`'s counterpart to
+    // `DownstreamStatHandles`'s counterpart to
     // `stat_handles` above, resolved once at boot for every listener this
     // boot snapshot names (rather than every cluster) -- see
     // `proxy_http::stat_handles`'s module doc for why the two tables mirror
@@ -720,7 +719,7 @@ async fn run_serve(
         &stats_control,
         snapshot.listeners.keys().map(String::as_str),
     ));
-    // WP-23 increment 6b: `TokenUsageStatHandles`'s counterpart to
+    // `TokenUsageStatHandles`'s counterpart to
     // `stat_handles` above -- resolved once at boot for every cluster (a
     // provider, per ground rule #6, is a cluster, never a route), same
     // cadence as `stat_handles`. `FilterChainHandler::with_token_stats`'s doc
@@ -855,7 +854,7 @@ async fn run_serve(
                 }
             });
 
-    // WP-51 increment 4: metric export, spawned INDEPENDENTLY of the trace
+    // Metric export, spawned INDEPENDENTLY of the trace
     // exporter above. `snapshot.metrics` is a separate IR field precisely so
     // this block is reachable with `snapshot.tracing` set to `None` -- before
     // the split, a config with no `tracing` block exported no OTLP metrics at
@@ -922,7 +921,7 @@ async fn run_serve(
     // -- see that type's doc in `proxy-core`'s `runtime.rs`.
     let snapshot_handles = Arc::new(SnapshotHandles::new());
 
-    // WP-21 increment 3: `/ready`'s readiness probe, built here (not inside
+    // `/ready`'s readiness probe, built here (not inside
     // `start_admin`) because it needs `cluster_manager`, which `start_admin`
     // deliberately has no dependency on -- `proxy-admin` only ever sees the
     // `proxy_admin::ReadinessProbe` seam, never `proxy-cluster` itself (see
@@ -939,7 +938,7 @@ async fn run_serve(
     let readiness =
         build_readiness_probe(cluster_manager.clone(), readiness_timeout, Instant::now());
 
-    // WP-57 keeps proxy-admin free of data-plane/proto dependencies: this
+    // proxy-admin stays free of data-plane/proto dependencies: this
     // binary is the narrow adapter from ClusterManager's plain runtime view
     // to the admin crate's equally plain input view. The manager filters by
     // the exact config snapshot passed by `/clusters`, so manager-first
@@ -970,7 +969,7 @@ async fn run_serve(
             .collect()
     });
 
-    // WP-50 increment 1: the read-only admin surface. Opt-in -- only binds
+    // The read-only admin surface. Opt-in -- only binds
     // when the config names an `admin` address -- and, like a listener's
     // `initial_bind`, a bind failure here is a startup error, not a silent
     // skip (see `start_admin`'s doc comment). Started before the worker pool
@@ -1036,7 +1035,7 @@ async fn run_serve(
     };
     let mut current_version = snapshot.version;
 
-    // WP-20 increment 4d-iii: build the ADS client, if bootstrap
+    // Build the ADS client, if bootstrap
     // `dynamic_resources` asks for one, from this same boot snapshot --
     // before `snapshot` moves into `WorkerPool::spawn` just below. `None`
     // means nothing was started; see `start_ads`'s own doc for the three
@@ -1165,7 +1164,7 @@ async fn run_serve(
     }
 
     // Runs until a shutdown signal arrives; a SIGHUP along the way triggers a
-    // config reload, and an ADS-applied snapshot (WP-20 increment 4d-iii)
+    // config reload, and an ADS-applied snapshot
     // does likewise, and both loop back to waiting, exactly like Envoy's own
     // hot-reload trigger. See `reload`'s doc for what "reload" does and does
     // not apply, and requirement 1's test (`sighup_with_a_broken_config_...`
@@ -1285,7 +1284,7 @@ async fn run_serve(
         }
     }
 
-    // WP-51 increment 4: ask the metric exporter for one last snapshot and WAIT
+    // Ask the metric exporter for one last snapshot and WAIT
     // for it, AFTER `graceful_shutdown` has returned -- so the final
     // cumulative figures include everything the drain period itself served, and
     // so a slow collector's deadline can never delay the drain. An earlier
@@ -1568,7 +1567,7 @@ async fn reload(
 
 // --------------------------------------------------------------------- ads --
 //
-// WP-20 increment 4d-iii: the ADS client is the *second* producer of
+// The ADS client is the *second* producer of
 // `Arc<ConfigSnapshot>` `apply_snapshot`'s doc comment predicted -- everything
 // below is what actually constructs it from bootstrap `dynamic_resources` and
 // wires its output back into `run_serve`'s own control loop, instead of
@@ -2037,7 +2036,7 @@ fn start_ads(
         })
     });
 
-    // WP-21 increment 2b-iii: an accepted EDS endpoint update goes straight
+    // An accepted EDS endpoint update goes straight
     // to `ClusterManager::accept_eds_update` -- an `arc_swap` store on the
     // cluster's own `HostSet`, nothing more -- rather than through the
     // `apply_tx`/`Publish` channel above. That channel exists because a
@@ -2061,7 +2060,7 @@ fn start_ads(
         })
     });
 
-    // WP-22 increment 2b: an accepted SDS secret goes straight to
+    // An accepted SDS secret goes straight to
     // `SdsSecretRegistry::publish` -- same "no round trip through this
     // function's control loop" shape as `endpoint_sink` just above, and for
     // the same reason: the registry is already live shared state (an
@@ -2288,7 +2287,7 @@ async fn wait_for_initial_binds(
     Ok(())
 }
 
-/// WP-21 increment 3: builds the `/ready` readiness probe `run_serve` wires
+/// Builds the `/ready` readiness probe `run_serve` wires
 /// into [`start_admin`], which passes it straight through to
 /// `proxy_admin::serve`. Reads [`proxy_cluster::manager::ClusterManager::warming_clusters`]
 /// fresh on every call -- no caching, since the whole point is that warming
@@ -2300,10 +2299,11 @@ async fn wait_for_initial_binds(
 /// **This only changes what `/ready` says -- it never calls
 /// `ClusterManager::force_initialize` and never touches `is_initialized`.**
 /// A cluster that never resolved stays un-initialized forever; the deadline
-/// only stops that fact from gating readiness. WP-58 is what makes a request
+/// only stops that fact from gating readiness. The router refuses an
+/// un-initialized cluster before host selection, which is what makes a request
 /// to a still-warming cluster behave differently from one to a cluster whose
-/// hosts are all ejected, and it needs `is_initialized` to keep telling those
-/// two states apart -- see this crate's [`run_serve`] doc for where `timeout`
+/// hosts are all ejected; it needs `is_initialized` to keep telling those two
+/// states apart -- see this crate's [`run_serve`] doc for where `timeout`
 /// itself is resolved (`AdsConfig::initial_fetch_timeout`, falling back to
 /// [`proxy_cluster::discovery::DEFAULT_INITIAL_FETCH_TIMEOUT`]).
 ///
@@ -2347,7 +2347,7 @@ fn build_readiness_probe(
     })
 }
 
-/// Starts the read-only admin server (`proxy-admin`, WP-50 increment 1) when
+/// Starts the read-only admin server (`proxy-admin`) when
 /// `admin` names a bind address; binds nothing and returns `Ok(None)`
 /// otherwise -- the admin surface is opt-in, never automatic.
 ///
@@ -2365,9 +2365,8 @@ fn build_readiness_probe(
 /// `registry` is the same [`proxy_observability::stats::Registry`]
 /// `run_serve` hands to every worker's [`RouterStats`](proxy_http::stat_handles::RouterStats)
 /// -- built once, from a single [`StatsControl`](proxy_observability::stats::StatsControl),
-/// in `run_serve` itself (not here any more, since increment 6a's workers
-/// need the exact same registry, not a second, disconnected one). As of
-/// WP-23 increment 6a, `/stats` reports real `upstream_rq`/`upstream_rq_time`
+/// in `run_serve` itself, because the workers need the exact same registry,
+/// not a second, disconnected one. `/stats` reports real `upstream_rq`/`upstream_rq_time`
 /// traffic for every cluster the boot snapshot named, and `reload`'s call to
 /// `StatHandles::resolve_missing` keeps that true for a cluster a later
 /// config reload introduces too -- see `proxy_http::stat_handles`'s module
@@ -2442,7 +2441,7 @@ async fn start_admin(
 }
 
 /// Each worker composes three concurrent seams over one shared
-/// `ConnectionRegistry` (WP-07 chunk C): the listener manager (binds
+/// `ConnectionRegistry`: the listener manager (binds
 /// sockets, accepts, matches filter chains), the drain routine (reports back
 /// once the registry empties or the drain deadline passes), and a final wait
 /// on the plain shutdown signal so the worker thread doesn't exit before the
@@ -2456,7 +2455,7 @@ async fn start_admin(
 /// runtime's `shutdown` signal, which `run_serve` sends promptly once it
 /// sees the failure.
 // Rust note: a spawn entrypoint handed one worker every boot-resolved
-// dependency it needs. It already sat at clippy's 7-arg ceiling before WP-51;
+// dependency it needs. It already sat at clippy's 7-arg ceiling;
 // the optional `tracing_handles` (8th) tips it over. These are each a
 // distinct per-worker handle with no shared identity to bundle under -- the
 // three stat tables are already bundled for `reload` via `StatHandleTables`,
@@ -2474,18 +2473,18 @@ async fn worker_main(
     token_usage_stat_handles: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
     tracing_handles: Option<proxy_core::listener::TracingHandles>,
     metadata_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
-    // WP-50 3b-ii part B: this worker's clone of the ONE per-serve
+    // This worker's clone of the ONE per-serve
     // `SharedFactoryState` -- see `run_serve`'s own comment on the Arc this
     // is cloned from.
     factory_state: Arc<proxy_http::filter::SharedFactoryState>,
-    // WP-22 increment 2b: this worker's clone of the ONE per-serve
+    // This worker's clone of the ONE per-serve
     // `SdsSecretRegistry` -- see `run_serve`'s own comment on the Arc this is
     // cloned from.
     secret_registry: Arc<SdsSecretRegistry>,
 ) {
     startup_gate.wait().await;
     let registry = ConnectionRegistry::new();
-    // WP-23 increment 6a: built fresh per worker -- `stats_registry`/
+    // Built fresh per worker -- `stats_registry`/
     // `stat_handles` are the SAME shared, config-scoped state every worker
     // gets (plain `Arc` clones), but `WorkerId` is this worker's own, so
     // `RouterStats` (which bakes a `WorkerId` in at construction, see its
@@ -2501,7 +2500,7 @@ async fn worker_main(
         stat_handles,
         proxy_observability::stats::WorkerId(ctx.id.0),
     ));
-    // WP-23 increment 6b: `DownstreamStats`'s counterpart to `router_stats`
+    // `DownstreamStats`'s counterpart to `router_stats`
     // above, same per-worker `WorkerId` and same shared `stats_registry` --
     // this is what `crate::listener::spawn_accept_loop` calls once per
     // accepted connection.
@@ -2510,7 +2509,7 @@ async fn worker_main(
         downstream_stat_handles,
         proxy_observability::stats::WorkerId(ctx.id.0),
     ));
-    // WP-23 increment 6b: `GenAiTokenStats`'s counterpart to `router_stats`
+    // `GenAiTokenStats`'s counterpart to `router_stats`
     // above -- this is what `crate::listener::build_hcm_handler` wires into
     // every real `FilterChainHandler` it builds, via `.with_token_stats`.
     let token_stats = Arc::new(proxy_http::stat_handles::GenAiTokenStats::new(
@@ -2857,7 +2856,7 @@ mod tests {
         Arc::new(manager)
     }
 
-    // ---- WP-21 increment 3: the readiness probe's deadline -----------------
+    // ---- The readiness probe's deadline -----------------
     //
     // Both tests drive `build_readiness_probe` directly (per the task's own
     // acceptance note) rather than sleeping past a real timeout -- the
@@ -3096,10 +3095,9 @@ routes:
 
     // ---- effective_node: --service-node/--service-cluster overrides -------
     //
-    // WP-20 increment 4d-iii closes the ⚠️ outstanding item on the plan's
-    // WP-20 checklist: these two flags used to reach only the startup log
-    // line. Covered here as unit tests against the pure function rather than
-    // a spawned-process test, same reasoning as `ConfigSource`'s tests above.
+    // These two flags feed the effective node id. Covered here as unit tests
+    // against the pure function rather than a spawned-process test, same
+    // reasoning as `ConfigSource`'s tests above.
 
     fn node(id: &str, cluster: &str) -> NodeIdentity {
         NodeIdentity {
@@ -3154,7 +3152,7 @@ routes:
         );
     }
 
-    // ---- ADR-0006 §2 / WP-60 prerequisite: node id reaches
+    // ---- ADR-0006 §2: node id reaches
     // `SharedFactoryState` ---------------------------------------------------
     //
     // Mirrors `run_serve`'s own three-step pipeline (bootstrap node id ->

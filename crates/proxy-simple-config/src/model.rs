@@ -27,7 +27,7 @@ pub struct SimpleConfig {
     pub listen: Option<Listen>,
     #[serde(default)]
     pub admin: Option<String>,
-    /// Downstream authentication (WP-50 increment 2a-iii). Absent means the
+    /// Downstream authentication. Absent means the
     /// proxy admits every request unauthenticated, same as today. Present,
     /// even with `keys: []`, switches the listener to fail-closed.
     #[serde(default)]
@@ -35,10 +35,10 @@ pub struct SimpleConfig {
     /// Rust note: `BTreeMap` (not `HashMap`) keeps providers sorted by name,
     /// making the lowered Envoy config deterministic — same input, same output.
     pub providers: BTreeMap<String, Provider>,
-    /// Logical models (WP-49): a client-facing name mapped to an ordered
+    /// Logical models: a client-facing name mapped to an ordered
     /// list of backends able to serve it. Each entry gets an implicit route
-    /// matching its name (exactly, or by wildcard precedence -- WP-49
-    /// increment 2, see `lower::model_catalog_order`), in addition to
+    /// matching its name (exactly, or by wildcard precedence -- see
+    /// `lower::model_catalog_order`), in addition to
     /// whatever `routes` express. `BTreeMap` for the same determinism reason
     /// as `providers`; `deserialize_with` on top of that catches a literal
     /// duplicate key, which a plain `BTreeMap` deserialize would otherwise
@@ -57,7 +57,7 @@ pub struct SimpleConfig {
 }
 
 /// Deserializes `models:` into a `BTreeMap`, erroring on a literal duplicate
-/// key instead of silently keeping only the last one (WP-49 increment 2:
+/// key instead of silently keeping only the last one (the rule is:
 /// "a genuine tie ... is a config-load error naming both offenders, never a
 /// silent pick" -- ground rule #1 applies to ambiguity, not just unknown
 /// fields). `serde`'s own blanket `BTreeMap` deserialize can't tell us this:
@@ -202,7 +202,7 @@ pub struct Provider {
 /// `providers.<name>.protocol`: which HTTP version the proxy dials this
 /// provider's cluster with. `http1` connects once per request; `http2`
 /// reaches the per-worker upstream connection cache
-/// (`proxy_http::upstream_pool`, WP-15 slice A), multiplexing every
+/// (`proxy_http::upstream_pool`), multiplexing every
 /// concurrent request over one connection per (cluster, address). Most
 /// hosted providers support it; many local/self-hosted plaintext servers do
 /// not.
@@ -213,7 +213,7 @@ pub enum UpstreamProtocol {
     Http2,
 }
 
-/// `auth`: downstream authentication (WP-50 increment 2a-iii). Mirrors the
+/// `auth`: downstream authentication. Mirrors the
 /// `api_key`/`api_key_file` shape on [`Provider`] -- exactly one of
 /// `hmac_secret`/`hmac_secret_file` -- for the same reason: a secret belongs
 /// in the environment or a mounted file, never inlined twice with two
@@ -286,15 +286,13 @@ impl ProviderType {
 
     /// Whether this type serves more than one wire format, so a `models:`
     /// backend of this type must set `dialect` explicitly instead of
-    /// deriving it (WP-49). Only `vertex` and `bedrock` today.
+    /// deriving it. Only `vertex` and `bedrock` today.
     pub fn dialect_is_ambiguous(self) -> bool {
         matches!(self, ProviderType::Vertex | ProviderType::Bedrock)
     }
 }
 
-/// `models.<name>`: one logical model and the providers able to serve it
-/// (WP-49). Naming and data model only in this increment -- which entry
-/// actually gets picked (fallback / weighted split / cost-aware) is WP-35.
+/// `models.<name>`: one logical model and the providers able to serve it.
 /// There is deliberately no separate noun for an entry here: the config
 /// surface has exactly two -- `providers` (the top-level map) and `models`
 /// -- so an entry in this list is just a provider reference, the same
@@ -303,10 +301,10 @@ impl ProviderType {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDef {
-    /// Tried in priority order. WP-49 increment 1: only `providers[0]` is
-    /// ever selected to serve traffic -- every later entry is still
-    /// validated (a bad one still fails to load, ground rule #1) but gets a
-    /// translate-time warning instead of being used.
+    /// Tried in priority order. A multi-provider model lowers to an ordered
+    /// aggregate cluster, and each retry advances to the next provider (see
+    /// `lower_model`). Every entry is validated; a bad one fails the load
+    /// (ground rule #1).
     pub providers: Vec<ModelProviderRef>,
 }
 
@@ -358,7 +356,7 @@ pub struct ModelProvider {
     /// Upstream model ID at this provider, if different from the model's
     /// own catalogue name (e.g. Anthropic's dated model IDs). Recorded;
     /// substituting it into the request body needs the request-body
-    /// rewriter (WP-35), so this produces a translate-time warning until
+    /// rewriter, so this produces a translate-time warning until
     /// then and the client's original model name is forwarded as-is.
     #[serde(default)]
     pub model: Option<String>,
@@ -450,7 +448,7 @@ pub struct Observability {
     /// -- see `default_force_usage_reporting`.
     #[serde(default = "default_force_usage_reporting")]
     pub force_usage_reporting: bool,
-    /// OTLP trace export (WP-51 increment 3): config surface only, see
+    /// OTLP trace export: config surface only, see
     /// `proxy_config::ir::TracingConfig`'s doc for what does (and does not)
     /// consume this yet. `None` -- both when this key is absent and when the
     /// whole `observability` block is absent -- means tracing is off.
@@ -567,7 +565,7 @@ pub(crate) fn default_force_usage_reporting() -> bool {
     true
 }
 
-/// Strict WP-53 rate-card configuration. Exactly one source is required so a
+/// Strict rate-card configuration. Exactly one source is required so a
 /// file can never silently override an inline list (or vice versa).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -765,7 +763,7 @@ pub enum LimitKey {
     Global,
     ClientIp,
     Header(String),
-    /// One bucket per authenticated tenant (WP-50 increment 2a-iii).
+    /// One bucket per authenticated tenant.
     /// Requires an `auth:` block -- without one, nothing would authenticate
     /// a tenant, so configuring this key is a load error rather than a
     /// silent fallback to bucketing on a client-supplied header.

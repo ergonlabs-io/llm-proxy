@@ -1,4 +1,4 @@
-//! End-user telemetry metadata contracts (design Increment 2).
+//! End-user telemetry metadata contracts.
 //!
 //! These types are owned by the observability boundary so the data plane can
 //! submit an owned, bounded event without knowing about ClickHouse, object

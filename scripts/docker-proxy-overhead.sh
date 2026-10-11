@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WP-30 Docker proxy-overhead baseline. Topology:
+# Docker proxy-overhead baseline. Topology:
 #
 #   loadgen (separate cgroup) -> proxy (2 CPUs / 1 GiB) -> mock upstream
 #   loadgen (same separate cgroup) -----------------------> mock upstream

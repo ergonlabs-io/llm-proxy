@@ -15,7 +15,7 @@ related:
 llm-proxy can receive its cluster and listener configuration dynamically,
 over xDS/ADS, from bootstrap `dynamic_resources`
 (`crates/proxy-config/src/lower.rs`'s `convert_dynamic_resources`,
-`crates/proxy/src/main.rs`'s ADS client wiring — WP-20). `make
+`crates/proxy/src/main.rs`'s ADS client wiring). `make
 xds-conformance` runs the real client, `proxy_xds::AdsClient`, against a real
 **go-control-plane** server — the reference xDS implementation, the same one
 a production Envoy talks to — instead of `testing/controlplane`'s own
@@ -33,12 +33,9 @@ the protocol itself, not just about internal consistency.
 ## Why it is not part of `make ci`
 
 It needs `docker` and a working daemon, and `make ci` is meant to stay
-hermetic. So this is an opt-in target with a stated cadence instead:
-
-- run it before closing WP-20, and
-- run it before the v0.3.0 ship gate is declared closed
-  (`internal-docs/MILESTONES.md`'s v0.3.0 section names this target as the
-  gate's verification).
+hermetic. So this is an opt-in target with a stated cadence instead: run it
+before the v0.3.0 ship gate is declared closed (`internal-docs/MILESTONES.md`'s
+v0.3.0 section names this target as the gate's verification).
 
 An opt-in target nobody runs reads as coverage it does not provide — the
 Makefile records this reasoning directly above the target, next to the

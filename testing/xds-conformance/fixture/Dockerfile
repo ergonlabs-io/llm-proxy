@@ -1,4 +1,4 @@
-# WP-20 increment 5's conformance fixture: a real go-control-plane ADS
+# Conformance fixture: a real go-control-plane ADS
 # server, built directly on go-control-plane's own cache/server packages
 # (see main.go's top-of-file comment for why that -- and not a
 # reimplementation -- is the point).

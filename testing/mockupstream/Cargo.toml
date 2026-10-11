@@ -21,7 +21,7 @@ futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
-# WP-30: this crate is the only one in the workspace that needs the `auto`
+# This crate is the only one in the workspace that needs the `auto`
 # protocol-detecting server builder (h2c prior-knowledge over plaintext --
 # see `--protocol` in `main.rs`), so the extra features are additive here
 # rather than promoted onto the workspace default.

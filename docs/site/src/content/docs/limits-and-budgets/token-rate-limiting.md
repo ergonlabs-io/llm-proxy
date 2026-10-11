@@ -151,10 +151,10 @@ outcome than a visible failure
 - **No history.** It reports only the current fixed window — the same
   numbers a live budget check would see at that instant. There is no way to
   ask it for last hour's or last week's usage. A historical export is a
-  separate, not-yet-built feature (WP-55).
+  separate, not-yet-built feature.
 - **No cost.** The response has no dollar or currency field. Converting
   tokens to cost needs a price-per-token rate card, which does not exist yet
-  (WP-53). If you need cost today, multiply `used` by your own rate outside
+  (not built). If you need cost today, multiply `used` by your own rate outside
   the proxy.
 
 ## Bootstrap configuration

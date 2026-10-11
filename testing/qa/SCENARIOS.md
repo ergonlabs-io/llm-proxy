@@ -36,10 +36,10 @@ in the way:
    llmproxy dialect"_. `crates/proxy-simple-config/src/lower.rs` used to emit
    only a warning (_"access logging is recorded but not emitted yet (WP-24)"_)
    and never add an `access_log` entry to the HCM. That warning was **stale**:
-   WP-24 had landed and access logging worked fully in Envoy mode; only the
+   Access logging had landed and worked fully in Envoy mode; only the
    dialect lowering was missing, so a proxy configured the way users actually
    configure it produced **no access logs whatsoever**.
-2. ~~**WP-33 — the usage filter isn't in the dialect's generated
+2. ~~**The usage filter isn't in the dialect's generated
    `http_filters`**, so every `%LLM_*_TOKENS%` operator renders as the
    absent-value `-`.~~ **FIXED 2026-08-01** — commits _"Teach the usage filter
    to read a per-route dialect"_ (`7e296e3`) and _"Emit the usage filter from
@@ -49,18 +49,18 @@ in the way:
    is what lets one proxy meter OpenAI and Anthropic correctly from one config.
    See `internal-docs/IMPLEMENTATION_PLAN.md`.
 
-Gap 1 was not anticipated by the code review that produced the WP-33 brief —
+Gap 1 was not anticipated by the code review that produced the usage-filter brief —
 an independently written black-box test found it from the outside. That is the
 argument for this suite existing, and it arrived on day one.
 
 **QA-1's current shape.** Rather than being all-or-nothing on the token counts,
-it asserts everything that did not depend on WP-33 — two log lines, one per
+it asserts everything that did not depend on the usage filter — two log lines, one per
 route, correct `path`, `response_code` 200, `bytes_sent` > 0 — and degraded to
-a loud `t.Skip` naming WP-33 only for the token assertions. The access-log file
+a loud `t.Skip` naming the usage filter only for the token assertions. The access-log file
 failing to appear is a hard failure, since that is a regression of the fix
 above.
 
-**It tightened automatically when WP-33 landed**, which was the point of
+**It tightened automatically when the usage filter landed**, which was the point of
 building it that way: no edit was needed on 2026-08-01: the skip simply stopped
 firing and the case began asserting `111/222` on the OpenAI route and `444/555`
 on the Anthropic one. Keep the degrade-to-skip shape for future cases blocked
@@ -402,8 +402,8 @@ nothing to configure black-box), retry budgets (unimplemented), ALPN defaults
 
 **Why:** v0.1.0's ship gate names these explicitly — "token counts _and
 TTFT/TPOT_ reach the access log for live traffic" — and until 2026-08-08 the
-TPOT half could not be satisfied at all through the `llmproxy` dialect: WP-46
-built `%LLM_TPOT%`, `%LLM_MAX_STALL%` and `%LLM_RESPONSE_CHUNKS%`, and no
+TPOT half could not be satisfied at all through the `llmproxy` dialect: the operators
+`%LLM_TPOT%`, `%LLM_MAX_STALL%` and `%LLM_RESPONSE_CHUNKS%` were built, but no
 dialect log format ever emitted them. QA-1 reads the token fields out of the
 same log line and never looks at the latency ones.
 

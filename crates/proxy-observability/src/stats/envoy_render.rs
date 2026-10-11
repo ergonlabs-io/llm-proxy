@@ -1,6 +1,6 @@
-//! WP-23 increment 3 — renders a [`Registry`] into Envoy's flat `/stats`
-//! text format, and nothing else: no Prometheus (increment 4), no OTLP
-//! (WP-51). See `internal-docs/IMPLEMENTATION_PLAN.md`'s Decision 4 for the
+//! Renders a [`Registry`] into Envoy's flat `/stats`
+//! text format, and nothing else: no Prometheus, no OTLP. See
+//! `internal-docs/IMPLEMENTATION_PLAN.md`'s Decision 4 for the
 //! naming rules this module implements.
 //!
 //! # Name rendering: one-to-many, and some render to nothing
@@ -40,9 +40,9 @@
 //!
 //! # The histogram line format — CONFIRMED against Envoy's own source, 2026-08-09
 //!
-//! Increment 3 shipped this as an unverified recollection (`P<n>(a,b)`
+//! This was first written as an unverified recollection (`P<n>(a,b)`
 //! space-separated pairs) because nothing in this repo could confirm or
-//! refute it. Increment 4's research had network access to
+//! refute it. The later research had network access to
 //! `envoyproxy/envoy` itself, so this is now settled rather than guessed:
 //! fetched directly from `source/common/stats/histogram_impl.cc` and
 //! `source/server/admin/stats_render.cc` at commit
@@ -82,7 +82,7 @@
 //! over the fixed quantile set `{0, 0.25, 0.5, 0.75, 0.90, 0.95, 0.99,
 //! 0.995, 0.999, 1}` — i.e. exactly [`ENVOY_STATS_TEXT_PERCENTILES`].
 //!
-//! **So increment 3's recollection was RIGHT**, both in the pair shape and in
+//! **So the original recollection was RIGHT**, both in the pair shape and in
 //! the space-joining, and it is confirmed here rather than replaced. An
 //! earlier pass at this section read `histogram_impl.cc` alone, concluded the
 //! pair shape was wrong, rewrote [`render_histogram_line`] to
@@ -206,6 +206,11 @@ fn attr<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// — see the module doc for why that split matters.
 fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Option<String> {
     match instrument.name {
+        "ext_authz" => Some(format!(
+            "http.{}.{}",
+            attr(attrs, "scope")?,
+            attr(attrs, "outcome")?
+        )),
         "upstream_rq" => {
             let cluster = attr(attrs, "cluster")?;
             match attr(attrs, "status_class") {
@@ -300,7 +305,7 @@ mod tests {
     fn attribute_expansion_produces_one_to_many_envoy_names() {
         // The production UPSTREAM_RQ const (stats.rs) only carries
         // `cluster` today (no call site resolves it with `status_class`
-        // yet — that's increment 6's job). Rendering only depends on
+        // yet — that comes later). Rendering only depends on
         // instrument.name and the attrs actually present on a handle (see
         // this module's doc), so a locally-defined instrument sharing the
         // same OTel name is enough to exercise the status_class expansion
@@ -339,7 +344,7 @@ mod tests {
 
     // ---- 2b: the listener family ------------------------------------------
 
-    /// WP-23 increment 6b follow-up: `downstream_cx_total` is a real Envoy
+    /// `downstream_cx_total` is a real Envoy
     /// stat, and until this case existed it rendered to nothing on `/stats`
     /// while appearing normally on `/stats/prometheus` -- so the Envoy-text
     /// endpoint silently under-reported. Keyed by listener NAME, which is a

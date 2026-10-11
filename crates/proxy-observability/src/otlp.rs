@@ -1,4 +1,4 @@
-//! WP-51 increment 3a: the OTLP/gRPC trace exporter -- drains a
+//! The OTLP/gRPC trace exporter -- drains a
 //! [`crate::trace::SpanSink`]'s [`Receiver`](tokio::sync::mpsc::Receiver) and
 //! ships batches of [`FinishedSpan`] to a real collector.
 //!
@@ -7,7 +7,7 @@
 //! ("protos never escape `proxy-config`/`proxy-xds`") is about *Envoy
 //! config* protos never reaching request-handling code -- see `ir.rs`'s own
 //! module doc for why that boundary matters (strict-mode field coverage,
-//! IR as the one API surface every lane codes against). OTLP export is a
+//! IR as the one API surface every workstream codes against). OTLP export is a
 //! different protocol serving a different purpose: [`run_trace_exporter`] and
 //! [`run_metric_exporter`] run entirely on the CONTROL runtime
 //! (`crates/proxy/src/main.rs`'s `run_serve`, next to the config-publisher

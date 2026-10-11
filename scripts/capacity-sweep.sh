@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WP-30 phase 3: drive one capacity sweep end to end and leave a report behind.
+# Drive one capacity sweep end to end and leave a report behind.
 #
 # Topology:  loadgen  ->  llm-proxy  ->  mock-upstream
 #            (this box)  (this box)      (this box)
@@ -13,8 +13,9 @@
 # it.
 #
 # The `--upstream-protocol` flag is the point of the exercise. HTTP/1.1
-# upstreams are connect-per-request (WP-15 slice B is unbuilt), so the
-# proxy->mock hop burns an ephemeral port per stream and the run tips into
+# upstreams are connect-per-request (connection reuse for HTTP/1.1 is not
+# built), so the proxy->mock hop burns an ephemeral port per stream and the run
+# tips into
 # harness-bound early. HTTP/2 upstreams go through the per-worker connection
 # cache in crates/proxy-http/src/upstream_pool.rs -- one connection, every
 # stream multiplexed over it. Running both and diffing them is what turns

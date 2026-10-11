@@ -1,6 +1,6 @@
 //! Request log: every `DiscoveryRequest` a [`crate::server::ScriptedAds`]
 //! receives, in arrival order, classified as Initial/Ack/Nack the way
-//! WP-20's client-behavior tests need to assert against.
+//! client-behavior tests need to assert against.
 
 use std::sync::{Arc, Mutex};
 

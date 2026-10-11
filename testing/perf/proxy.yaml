@@ -1,4 +1,4 @@
-# WP-30 Docker capacity topology. Compose substitutes only the upstream
+# Docker capacity topology. Compose substitutes only the upstream
 # protocol line at startup; this default remains a valid standalone config.
 version: 0
 

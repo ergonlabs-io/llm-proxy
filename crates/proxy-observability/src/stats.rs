@@ -1,11 +1,11 @@
-//! WP-23 increments 1–2 and 5 — the stats registry core: instruments,
+//! The stats registry core: instruments,
 //! [`Handle`]/[`HistogramHandle`] resolution, sharded, summed counters and
 //! histograms, and the [`Registry`]/[`StatsControl`] split that lets
 //! resolution survive a config swap. Pure library: no HTTP, no `/stats`
-//! rendering, no Prometheus, no instrumentation call sites — rendering is
-//! increment 3 (`envoy_render`, this crate), and call sites are increment 6
-//! (`internal-docs/IMPLEMENTATION_PLAN.md`, which is normative for every
-//! decision below).
+//! rendering, no Prometheus, no instrumentation call sites — rendering lives in
+//! `envoy_render` (this crate), and call sites live in the crates that own the
+//! request path (`internal-docs/IMPLEMENTATION_PLAN.md`, which is normative for
+//! every decision below).
 //!
 //! # Decision 1 — the hot path increments an index, not a name
 //!
@@ -18,7 +18,8 @@
 //!
 //! // Control side, once, when a cluster/listener/route enters the config
 //! // snapshot. `StatsControl` is the only thing that can `resolve` -- see
-//! // "Increment 5" below for why that is a type, not a receiver, split.
+//! // "Resolution survives a config swap" below for why that is a type, not a
+//! // receiver, split.
 //! let control = StatsControl::new(1);
 //! let h = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "provider:openai")]);
 //!
@@ -62,9 +63,9 @@
 //! landing mid-increment is allowed to observe either the old or the new
 //! value — it must not be a fence on the request path.
 //!
-//! # Increment 5 — resolution survives a config swap: split the API by TYPE
+//! # Resolution survives a config swap: split the API by TYPE
 //!
-//! Increment 1's `Registry::resolve` took `&mut self`, on the theory that
+//! The original `Registry::resolve` took `&mut self`, on the theory that
 //! "resolution cannot race an increment" should be a compiler-checked
 //! property. That reasoning was sound and the conclusion was still wrong: the
 //! registry is shared as `Arc<Registry>` from process start
@@ -83,7 +84,7 @@
 //!   holding only `Arc<Registry>` cannot grow the registry for an
 //!   attribute value this process's OWN config didn't already name at boot,
 //!   and that is checked by the compiler rather than by a debug assertion
-//!   or a comment. [`Registry::resolve_capped`] (WP-55) is the one deliberate,
+//!   or a comment. [`Registry::resolve_capped`] is the one deliberate,
 //!   narrow exception — see its own doc for why: it exists for exactly one
 //!   dimension (`tenant`, on `llm.client.token.usage`) whose values are NOT
 //!   this process's own config, and it is capped rather than general.
@@ -198,7 +199,7 @@
 //! with a dashboard built on these names, it is exactly that — and belongs
 //! in the CHANGELOG under a heading that says so.
 //!
-//! # Increment 2 — histograms
+//! # Histograms
 //!
 //! ## Storage: non-cumulative bucket counts, `sum`, and `count`
 //!
@@ -213,7 +214,7 @@
 //! the hot path to save O(n) work in the renderer, which runs orders of
 //! magnitude less often. Cumulative (`le`) counts are a prefix-sum over
 //! `bucket_counts`, computed where they're needed — [`Registry::percentile`]
-//! here, the increment-3/4 renderers later — never stored.
+//! here, the renderers later — never stored.
 //!
 //! ## The overflow bucket
 //!
@@ -252,7 +253,7 @@
 //! P25, P50, P75, P90, P95, P99, P99.5, P99.9, P100), not raw buckets. The
 //! interpolation arithmetic is a pure function of bucket counts and belongs
 //! next to the data structure that owns them — [`Registry::percentile`] —
-//! rather than being reinvented inside increment 3's string formatting.
+//! rather than being reinvented inside the renderer's string formatting.
 //!
 //! ## The handle-space question: histogram handles are their own type
 //!
@@ -292,7 +293,7 @@
 //! buckets), so nothing here assumes one global unit. **This module never
 //! converts between them.** A future seconds-based semconv histogram would
 //! carry OTel's own default boundaries under its own `unit`, unconverted.
-//! Reconciling the two into one rendered number (if increments 3/4 ever need
+//! Reconciling the two into one rendered number (if the renderers ever need
 //! to) is the *renderer's* problem, not the registry's — this comment is
 //! here so whoever writes that renderer finds the warning instead of
 //! rediscovering the bug.
@@ -304,22 +305,22 @@ use std::sync::{Arc, Mutex};
 // Rust note: `ArcSwap<Snapshot>` is the same "control computes, workers
 // `load`" pattern `proxy_cluster::manager::ClusterManager` uses for
 // `HostSet`, and the auth filter uses for its key set -- see the module
-// doc's "Increment 5" section for why plain `&mut self` couldn't survive a
+// doc's "Resolution survives a config swap" section for why plain `&mut self` couldn't survive a
 // config swap once this registry is shared as `Arc<Registry>`.
 use arc_swap::ArcSwap;
 
-/// WP-23 increment 3: renders a [`Registry`] into Envoy's flat `/stats` text
+/// Renders a [`Registry`] into Envoy's flat `/stats` text
 /// format. See the module's own doc comment for what is and is not verified
 /// about that format.
 pub mod envoy_render;
 
-/// WP-23 increment 4: renders a [`Registry`] into Prometheus text exposition
+/// Renders a [`Registry`] into Prometheus text exposition
 /// format, with Envoy's own name-mangling/label-escaping rules. See the
 /// module's own doc comment for how this deliberately differs from
 /// [`envoy_render`]'s per-attribute-value name expansion.
 pub mod prometheus_render;
 
-/// WP-23 increment 4's Grafana-dashboard conformance test -- provisional,
+/// Grafana-dashboard conformance test -- provisional,
 /// see the module's own doc comment for why.
 #[cfg(test)]
 mod prometheus_conformance;
@@ -373,7 +374,7 @@ pub enum InstrumentKind {
     UpDownCounter,
     /// Bucketed observations. [`Registry::resolve_histogram`] and
     /// [`Registry::observe`] are the only ways to build and move one — see
-    /// the module doc's "Increment 2" section for the storage and handle-
+    /// the module doc's "Histograms" section for the storage and handle-
     /// space design.
     Histogram,
 }
@@ -411,8 +412,8 @@ pub struct Instrument {
 }
 
 /// A small starter set of instruments — enough to exercise the resolve/incr/
-/// value/observe model end to end, not the full Envoy stats surface (that is
-/// increment 5). Named `instruments` so call sites read as
+/// value/observe model end to end, not the full Envoy stats surface. Named
+/// `instruments` so call sites read as
 /// `instruments::UPSTREAM_RQ`, matching the design brief's own examples.
 pub mod instruments {
     use super::{
@@ -427,7 +428,7 @@ pub mod instruments {
     /// counter (`http.client.request.duration`'s histogram implies a count,
     /// but does not name one). The name mirrors Envoy's own `upstream_rq`
     /// stat family directly (see the design brief, Decision 4) so the
-    /// increment-3 `/stats` renderer has an obvious mapping:
+    /// `/stats` renderer has an obvious mapping:
     /// `cluster.<name>.upstream_rq_total`.
     pub const UPSTREAM_RQ: Instrument = Instrument {
         name: "upstream_rq",
@@ -452,10 +453,10 @@ pub mod instruments {
 
     /// Tokens consumed by a GenAI request/response exchange. **Has no Envoy
     /// equivalent** — Envoy predates LLM gateways — so this renders to
-    /// nothing in the increment-3 `/stats` text output; it exists in
+    /// nothing in the `/stats` text output; it exists in
     /// Prometheus/OTLP output only (design brief, Decision 4, point 2).
     ///
-    /// WP-51 increment 1: this is deliberately our own `llm.*` name, not the
+    /// This is deliberately our own `llm.*` name, not the
     /// OTel GenAI semconv name for the equivalent instrument. Semconv's
     /// `gen_ai.usage.input_tokens` attribute is INCLUSIVE of the cached
     /// portion; our `type="input"` bucket (like `TokenUsage::input_tokens`,
@@ -471,15 +472,15 @@ pub mod instruments {
     /// The upstream semconv equivalent is defined as a *histogram* (a
     /// per-request token count distribution), not a counter. This starter
     /// still models it as a running-total `Counter` rather than switching it
-    /// to a `Histogram` now that increment 2 has landed — that switch needs
+    /// to a `Histogram` now that histogram support has landed — that switch needs
     /// its own bucket boundaries (OTel doesn't mandate Envoy's millisecond
-    /// `rq_time` set for a token count) and is increment 5's call, not this
+    /// `rq_time` set for a token count) and is a call for later, not this
     /// one's. Keeping it a `Counter` here avoids guessing at that number
     /// now. Attribute keys (`provider`, `type`) match the design brief's own
     /// table rather than semconv's fully qualified attribute names; the
-    /// increment-4 Prometheus renderer is where full key names matter.
+    /// Prometheus renderer is where full key names matter.
     ///
-    /// WP-55: `tenant` is the third attribute key, added so operators can
+    /// `tenant` is the third attribute key, added so operators can
     /// build per-tenant usage dashboards over OTel export (the owner's
     /// (a)-export-only decision — see `internal-docs/IMPLEMENTATION_PLAN.md`
     /// WP-55 — this proxy never owns a usage datastore). Named `tenant`, not
@@ -559,7 +560,7 @@ pub mod instruments {
     ///
     /// Mirrors Envoy's own `upstream_rq_time` stat family directly (see the
     /// design brief, Decision 4), carrying Envoy's default `rq_time` bucket
-    /// boundaries so the increment-3 `/stats` renderer's percentile output
+    /// boundaries so the `/stats` renderer's percentile output
     /// (`cluster.<name>.upstream_rq_time` P50/P90/P99/...) matches what
     /// Envoy itself would report for the same distribution. See the module
     /// doc's "unit mismatch" note: this is milliseconds, not the OTel
@@ -959,7 +960,7 @@ pub enum CaptureDrop {
 /// depends on `proxy-config`, which depends on this crate
 /// (`proxy-observability`), for [`crate::ResponseFlag`] and the access-log
 /// format string type — so `proxy-observability -> proxy-core` would close a
-/// dependency cycle. A later increment's call sites (living in `proxy-core`
+/// dependency cycle. Call sites (living in `proxy-core`
 /// or above, where the real `WorkerId` is in scope) convert with `.0` when
 /// calling into this registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1020,7 +1021,7 @@ pub struct HistogramHandle(usize);
 type ResolveKey = (&'static str, Vec<(String, String)>);
 
 /// Width, in slots, of one counter growth block — see the module doc's
-/// "Growth must not move or copy a live atomic" section (Increment 5) for why
+/// "Growth must not move or copy a live atomic" section for why
 /// counters grow in fixed-size blocks rather than one `AtomicU64` at a time.
 /// A round power of two comfortably larger than a cache line (64 `u64`s = 512
 /// bytes), so a block amortizes its allocation over many handles without
@@ -1116,7 +1117,8 @@ pub struct HistogramSnapshot {
 }
 
 /// The immutable, versioned bundle [`Registry::published`] hands out to every
-/// reader — see the module doc's "Increment 5" section. Metadata (`resolved`,
+/// reader — see the module doc's "Resolution survives a config swap" section.
+/// Metadata (`resolved`,
 /// `resolved_attrs`, ...) and shard storage live in the same struct
 /// deliberately: a `Snapshot` a worker `load()`s always describes one
 /// consistent generation, so it can never show a new handle's metadata
@@ -1185,7 +1187,7 @@ impl Snapshot {
 /// Control-side-only state behind [`Registry::control`]'s `Mutex`: the dedup
 /// maps [`Registry::resolve`]/[`Registry::resolve_histogram`] check before
 /// growing anything. Nothing on the request path ever locks this -- see the
-/// module doc's "Increment 5" section.
+/// module doc's "Resolution survives a config swap" section.
 #[derive(Default)]
 struct ControlState {
     /// Dedup key -> already-resolved `Handle`, so resolving the same
@@ -1205,7 +1207,7 @@ struct ControlState {
 
 /// The stats registry: the shared, hot-path type every worker holds as
 /// `Arc<Registry>`. Every method here takes `&self`, and **there is no
-/// public `resolve`** -- see the module doc's "Increment 5" section for why
+/// public `resolve`** -- see the module doc's "Resolution survives a config swap" section for why
 /// that is a type-level guarantee (a worker holding only `Arc<Registry>`
 /// cannot reach resolution, full stop) rather than a runtime check.
 /// [`StatsControl`] is the only way to grow one.
@@ -1230,9 +1232,9 @@ impl Registry {
     /// [`StatsControl::new`] is the only public constructor -- building a
     /// bare `Registry` from outside this module would hand out the shared
     /// type without the control-side gate, defeating the point of the
-    /// `Registry`/`StatsControl` split (module doc, "Increment 5").
+    /// `Registry`/`StatsControl` split (module doc, "Resolution survives a config swap").
     /// `num_workers` is a config-time constant (`WorkerPoolConfig::concurrency`,
-    /// in `proxy-core`) -- this increment does not support growing the
+    /// in `proxy-core`) -- this code path does not support growing the
     /// worker count after construction.
     fn empty(num_workers: usize) -> Self {
         Self {
@@ -1248,7 +1250,7 @@ impl Registry {
 
     /// Control side only -- reachable exclusively through
     /// [`StatsControl::resolve`] (defined in this same module; see the
-    /// module doc's "Increment 5" section for why this method itself is not
+    /// module doc's "Resolution survives a config swap" section for why this method itself is not
     /// `pub`). Resolving the same `(instrument, attrs)` twice (attribute
     /// order does not matter) returns the same [`Handle`].
     ///
@@ -1402,7 +1404,7 @@ impl Registry {
     }
 
     /// A single, deliberately narrow exception to "no public resolve" above
-    /// (module doc, "Increment 5") — WP-55's tenant dimension. Every other
+    /// (module doc, "Resolution survives a config swap") — the tenant dimension. Every other
     /// instrument's attribute values are this process's OWN config (cluster
     /// names, listener names), known and bounded at boot, which is exactly
     /// why the general `resolve`/`resolve_histogram` stay control-side-only:
@@ -1416,7 +1418,7 @@ impl Registry {
     /// plain `Arc<Registry>` (unlike `resolve`), but growth stops the moment
     /// `instrument` already has `ceiling` or more resolved series — every
     /// call past that point resolves `overflow_attrs` instead of `attrs`.
-    /// That is the WP-55 hazard note's own framing: drop the DIMENSION
+    /// That is the hazard note's own framing: drop the DIMENSION
     /// (fold into one shared series) rather than the MEASUREMENT (still
     /// recorded) or the alternative of letting a caller-chosen string grow
     /// the registry without bound.
@@ -1638,14 +1640,14 @@ impl Registry {
 
     /// Every resolved counter/up-down-counter handle, paired with its
     /// instrument identity, resolved attributes, and already-summed value —
-    /// everything an exporter (WP-23 increment 3's `/stats` text renderer,
-    /// increment 4's Prometheus renderer) needs to render one line, and
+    /// everything an exporter (the `/stats` text renderer,
+    /// the Prometheus renderer) needs to render one line, and
     /// nothing more: no by-name lookup, no shard-level figure (see the
     /// module doc's Decision 1/2). Control-side/scrape-side use only, same
     /// as [`Self::value`] itself, which this calls once per handle.
     ///
     /// Rust note: returns owned `Vec<(String, String)>` attrs rather than a
-    /// `&self`-borrowed slice. Before this increment the underlying data
+    /// `&self`-borrowed slice. Previously the underlying data
     /// lived directly on `Registry`, so a borrow tied to `&self` was safe;
     /// now it lives behind an `ArcSwap`-published `Snapshot` that a
     /// concurrent `resolve` could replace the instant this call returns, so
@@ -1783,7 +1785,7 @@ impl Registry {
     /// The `p`-th percentile (`p` in `[0, 100]`) of `handle`'s observations,
     /// summed across every worker shard, using **linear interpolation
     /// within the landing bucket** — what Envoy's `/stats` text format
-    /// reports for P0/P25/.../P100, and increment 3's job to *render*, not
+    /// reports for P0/P25/.../P100, and the renderer's job to *render*, not
     /// to compute (see the module doc).
     ///
     /// Defined edge cases, so none of them are an accidental `NaN` or panic:
@@ -1862,7 +1864,7 @@ impl Registry {
 /// The control-side owner of a [`Registry`]: the only type able to
 /// [`resolve`](StatsControl::resolve)/
 /// [`resolve_histogram`](StatsControl::resolve_histogram) new handles — see
-/// the module doc's "Increment 5" section for why that is worth a whole
+/// the module doc's "Resolution survives a config swap" section for why that is worth a whole
 /// second type rather than a flag or a debug assertion.
 ///
 /// Deliberately **not `Clone`**: there is exactly one control side per
@@ -1887,7 +1889,7 @@ impl StatsControl {
     /// A clone of the `Arc<Registry>` this control side owns — what gets
     /// handed to workers (and to `/stats` scrape handlers). The clone can
     /// `incr`/`value`/`observe`/etc., but has no way to reach `resolve`: see
-    /// the module doc's "Increment 5" section.
+    /// the module doc's "Resolution survives a config swap" section.
     pub fn registry(&self) -> Arc<Registry> {
         Arc::clone(&self.registry)
     }
@@ -1954,7 +1956,7 @@ mod tests {
     fn missing_expected_attribute_key_is_rejected_loudly() {
         let control = StatsControl::new(1);
         // LLM_CLIENT_TOKEN_USAGE expects "provider", "type", AND "tenant"
-        // (WP-55) -- "tenant" is missing here.
+        // "tenant" is missing here.
         control.resolve(
             &instruments::LLM_CLIENT_TOKEN_USAGE,
             &[("provider", "openai"), ("type", "input")],
@@ -2058,7 +2060,7 @@ mod tests {
 
     #[test]
     fn up_down_counter_handles_negative_deltas() {
-        // No starter UpDownCounter const exists yet (increment 1's set is
+        // No starter UpDownCounter const exists yet (the original set is
         // all Counters), so build one locally to exercise the shape.
         static CX_ACTIVE: Instrument = Instrument {
             name: "downstream_cx_active",
@@ -2108,7 +2110,7 @@ mod tests {
         assert_eq!(SEMCONV_VERSION, "1.27.0");
     }
 
-    // ==== Increment 2: histograms ==========================================
+    // ==== Histograms ==========================================
 
     // ---- 9: all nineteen Envoy default boundaries are pinned -------------
 
@@ -2343,9 +2345,9 @@ mod tests {
         control.resolve_histogram(&instruments::UPSTREAM_RQ, &[("cluster", "x")]);
     }
 
-    // ==== Increment 5: resolution survives a config swap ===================
+    // ==== Resolution survives a config swap ===================
     //
-    // Before this increment, `Registry::resolve` took `&mut self`, which
+    // Previously, `Registry::resolve` took `&mut self`, which
     // simply would not compile once `registry` below is shared as
     // `Arc<Registry>` and moved into a worker thread -- there would be no
     // way to reach `&mut self` through it. The tests in this section are
@@ -2371,9 +2373,8 @@ mod tests {
         worker.join().unwrap();
 
         // The control side resolves a NEW handle -- the exact scenario that
-        // could never happen once the registry was shared, before this
-        // increment (WP-23's ship-gate: a config swap that introduces a new
-        // cluster must be able to register its counters).
+        // could never happen once the registry was shared: a config swap
+        // that introduces a new cluster must be able to register its counters.
         let fresh = control.resolve(
             &instruments::DOWNSTREAM_CX_TOTAL,
             &[("listener", "ingress")],
@@ -2584,7 +2585,7 @@ mod tests {
         );
     }
 
-    // ---- WP-55: Registry::resolve_capped ---------------------------------
+    // ---- Registry::resolve_capped ---------------------------------
 
     #[test]
     fn resolve_capped_below_ceiling_behaves_like_a_plain_resolve() {

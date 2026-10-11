@@ -1,4 +1,4 @@
-//! `mock-upstream`: the WP-30 standalone mock LLM provider binary. See the
+//! `mock-upstream`: the standalone mock LLM provider binary. See the
 //! `mockupstream` crate doc (`src/lib.rs`) for why this exists as its own
 //! process instead of reusing `testing/diffrig`'s in-process mocks.
 //!
@@ -48,7 +48,7 @@ impl std::fmt::Display for Protocol {
     }
 }
 
-/// A lean, standalone mock LLM provider for capacity/load testing (WP-30).
+/// A lean, standalone mock LLM provider for capacity/load testing.
 /// Speaks the OpenAI Chat Completions and Anthropic Messages wire shapes,
 /// streaming and non-streaming, with configurable per-token timing.
 #[derive(Parser)]

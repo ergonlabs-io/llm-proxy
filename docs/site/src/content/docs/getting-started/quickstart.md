@@ -175,7 +175,7 @@ invalid value at `routes[0].fallbacks[0]`: `anthropic` speaks the
 `openai` -- a `openai`-shaped request body is not valid for a `anthropic`
 upstream, and its response would be parsed for tokens by the wrong
 dialect's parser (silently wrong billing numbers); cross-dialect fallback
-needs request/response translation, which is later WP-35 scope.
+needs request/response translation, which is not built yet.
 Same-dialect fallbacks (e.g. openai -> an openai-compatible provider) are
 supported.
 ```

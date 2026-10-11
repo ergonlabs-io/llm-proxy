@@ -1,6 +1,6 @@
-//! WP-23 increment 6a/6b acceptance: real traffic through the real
+//! Acceptance: real traffic through the real
 //! `llm-proxy` binary shows up in `/stats`/`/stats/prometheus`. This is the
-//! load-bearing test for both increments -- an assertion against
+//! load-bearing test -- an assertion against
 //! `Registry::value` (or anything short of the actual admin-endpoint HTTP
 //! response) would pass even if the renderer never saw what the recording
 //! side wrote. See `crates/proxy-http/src/stat_handles.rs` and
@@ -285,11 +285,10 @@ fn spawn_mock_llm_upstream(prompt_tokens: u32, completion_tokens: u32) -> (Child
     (ChildGuard(child), addr)
 }
 
-/// The load-bearing WP-23 increment 6a test: two requests through a real
+/// The load-bearing test: two requests through a real
 /// `llm-proxy` listener to a real (mock) upstream, then a real HTTP scrape of
 /// `/stats` on the real admin server -- and the rendered text must show
-/// exactly what happened, not an empty body (the pre-increment-6a gap this
-/// closes) and not a fabricated reading.
+/// exactly what happened, not an empty body and not a fabricated reading.
 #[test]
 fn served_requests_are_reflected_in_stats() {
     check_metadata_delivery(false);
@@ -364,7 +363,7 @@ static_resources:
     let records_path = config_path.with_extension("records.jsonl");
 
     // `ChildGuard` (not a bare `Child`): this function gained several more
-    // assertions in WP-23 increment 6b, each a new chance to panic before
+    // assertions, each a new chance to panic before
     // reaching the manual `kill` at the bottom -- see `ChildGuard`'s doc.
     // Inherit an ignored SIGXFSZ and a one-block file size limit to produce a
     // real append error on a regular file, without filesystem-global changes.
@@ -471,7 +470,7 @@ static_resources:
          (full response: {stats_response})"
     );
 
-    // WP-23 increment 6b, task 1: `DOWNSTREAM_CX_TOTAL{listener}` -- the two
+    // `DOWNSTREAM_CX_TOTAL{listener}` -- the two
     // `get()` calls above each connect-then-close a fresh TCP connection
     // (`Connection: close`, no keep-alive reuse), so they are two ACCEPTED
     // connections on `ingress_http`'s accept loop -- PLUS one more from
@@ -561,7 +560,7 @@ fn chrono_timestamp_is_rfc3339(value: &str) -> bool {
     value.contains('T') && value.contains('-') && value.ends_with("+00:00")
 }
 
-/// WP-23 increment 6b, task 2: `LLM_CLIENT_TOKEN_USAGE{provider,type}`
+/// `LLM_CLIENT_TOKEN_USAGE{provider,type}`
 /// through the same real-binary/real-upstream/rendered-body shape as
 /// [`served_requests_are_reflected_in_stats`] above. This needs a real
 /// upstream that returns an OpenAI-shaped `usage` object (the plain
@@ -576,7 +575,7 @@ fn chrono_timestamp_is_rfc3339(value: &str) -> bool {
 /// non-empty -- see `crates/proxy-http/src/filter_manager.rs`'s `handle`. A
 /// listener with `llmproxy.usage` configured but no `access_log` would
 /// silently never record token usage at all, same shape as the gap this
-/// whole increment closes for `downstream_cx_total`.
+/// test closes for `downstream_cx_total`.
 #[test]
 fn token_usage_is_reflected_in_stats_prometheus() {
     const PROMPT_TOKENS: u32 = 37;
@@ -718,7 +717,7 @@ static_resources:
         .split("\r\n\r\n")
         .nth(1)
         .expect("response has a body separated from headers by a blank line");
-    // WP-55: `tenant` is a third label on this instrument now. This config
+    // `tenant` is a third label on this instrument now. This config
     // has no `auth` filter, so every series carries the no-tenant sentinel,
     // and the label order is the renderer's own sorted order (provider,
     // tenant, type) -- not the order they are declared in.

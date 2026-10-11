@@ -303,8 +303,8 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
   "Not decided here"). Today `concurrent_sessions` in the `limits:` dialect
   block is not enforced at all yet, by any replica count — it is recorded
   and produces a load-time warning (`schema/llmproxy-v0.schema.json`, the
-  `concurrent_sessions` field description; landing with WP-37). When it does
-  land, do not expect the shared store above to cover it.
+  `concurrent_sessions` field description). Enforcement is not built yet. When
+  it is, do not expect the shared store above to cover it.
 - **Usage history is export-only.** The shared store holds current-window
   spend counters and nothing else — never per-request history. That lives in
   access logs and the usage filter, and stays there by owner decision:

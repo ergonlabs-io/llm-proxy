@@ -1,4 +1,4 @@
-//! Async DNS resolution abstraction (WP-16 §2).
+//! Async DNS resolution abstraction.
 //!
 //! `STRICT_DNS`/`LOGICAL_DNS` discovery goes through this trait instead of
 //! calling `tokio::net::lookup_host` directly, so unit tests can simulate

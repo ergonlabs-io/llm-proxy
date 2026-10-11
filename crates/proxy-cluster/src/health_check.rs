@@ -1,4 +1,4 @@
-//! Active health checking (WP-18): periodically probes hosts and flips
+//! Active health checking: periodically probes hosts and flips
 //! [`HealthStatus`] on consecutive pass/fail runs, publishing the transition
 //! as a fresh [`HostSet`] snapshot rather than mutating a `Host` in place --
 //! the same "control computes, workers swap" model discovery already uses
@@ -6,7 +6,7 @@
 //! control runtime; the only thing that crosses to workers is the `Arc<Host>`
 //! snapshot itself.
 //!
-//! **IR wiring landed (WP-18 runtime wiring).** `proxy_config::ir::ClusterConfig`
+//! **IR wiring landed.** `proxy_config::ir::ClusterConfig`
 //! carries `health_check: Option<HealthCheckIR>`; [`HealthCheckConfig`]/
 //! [`HealthCheckKind`] are still defined here rather than in the IR (ground
 //! rule #2 keeps proto/IR types from leaking past `proxy-config`), and
@@ -42,12 +42,12 @@ pub const DEFAULT_EXPECTED_HTTP_STATUS: u16 = 200;
 /// Envoy's default `no_traffic_interval`: the interval used for a host that
 /// hasn't received any traffic since its last check.
 ///
-/// TODO(WP-18 follow-up): this constant exists so the config surface is
+/// TODO: this constant exists so the config surface is
 /// complete, but nothing in this engine actually switches to it yet --
 /// "has this host received traffic recently" is a signal `Host` doesn't
 /// carry today (`active_requests` is a live gauge, not a
 /// since-last-check-count), and wiring it correctly is the router/pool's
-/// job (WP-13/WP-15), not this one. Every check loop here always sleeps
+/// job, not this one. Every check loop here always sleeps
 /// `interval` (+ jitter). Getting `no_traffic_interval` right without a real
 /// traffic signal would mean guessing, which ground rule #1's spirit
 /// (no silent approximations) argues against -- better to leave it unwired
@@ -72,7 +72,7 @@ pub enum HealthCheckKind {
     /// TCP connect the whole check (Envoy allows this too -- it's the
     /// "just prove something's listening" mode).
     Tcp { send: Vec<u8>, expect: Vec<u8> },
-    // TODO(WP-18 follow-up, out of scope here): `grpc.health.v1.Health/Check`.
+    // TODO (out of scope here): `grpc.health.v1.Health/Check`.
     // Deliberately not a variant yet -- a stub that always reports healthy
     // would be worse than refusing the config outright (ground rule #1), and
     // a real implementation needs an h2 client call, which this crate's pool
@@ -117,7 +117,7 @@ struct ConsecutiveTracker {
 
 impl ConsecutiveTracker {
     /// A tracked host starts `Healthy`, matching `Host::health`'s own default
-    /// -- WP-18 doesn't introduce a separate "unknown" initial state.
+    /// -- there is no separate "unknown" initial state.
     fn new(healthy_threshold: u32, unhealthy_threshold: u32) -> Self {
         Self {
             healthy_threshold: healthy_threshold.max(1),
@@ -173,7 +173,7 @@ impl HealthCheckEngine {
         Arc::new(Self { config, kind })
     }
 
-    /// Builds an engine from the lowered IR (WP-18 runtime wiring): the
+    /// Builds an engine from the lowered IR: the
     /// module doc's wiring plan, now that `ClusterConfig::health_check`
     /// exists. This is the one place `proxy_config::ir::HealthCheckIR`/
     /// `HealthCheckKindIR` convert to this module's own
@@ -218,8 +218,8 @@ impl HealthCheckEngine {
     /// `ManagedCluster::reconcile_probes` aborts the handle of a host that
     /// leaves membership (see the module doc's IR-wiring note).
     ///
-    /// `outlier_detector` is the last WP-19 gap: active HC (this module,
-    /// WP-18) and outlier detection (WP-19) are otherwise independent, but a
+    /// `outlier_detector` links active HC (this module) and outlier detection,
+    /// which are otherwise independent, but a
     /// host that recovers here should also clear an outlier ejection --
     /// [`OutlierDetector::on_active_health_check_pass`] already implements
     /// that (including its own `uneject_on_healthy_active_hc` check), it
@@ -308,7 +308,7 @@ impl HealthCheckEngine {
 /// result, but only if the address is still present and that flag actually
 /// differs -- a no-op store would just be needless churn for every reader
 /// watching this `ArcSwap`. The outlier-detection flag
-/// (`failed_outlier_check`, WP-19) is carried over untouched: active HC and
+/// (`failed_outlier_check`) is carried over untouched: active HC and
 /// outlier detection are independent axes (see [`crate::HealthFlags`]), so a
 /// health-check transition must never clobber an outlier ejection that's
 /// concurrently in effect.

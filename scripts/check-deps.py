@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""WP-40: fail if a crate declares a dependency nothing references.
+"""Fail if a crate declares a dependency nothing references.
 
 Why this exists rather than `cargo-udeps`: udeps needs a nightly toolchain and
-a full build, and `cargo-machete` is not installed here either. This is the
-"or equivalent" the WP's acceptance criteria allow. It is a heuristic scanner,
-so it is deliberately paired with an ALLOWLIST carrying a written reason for
-every entry -- an unexplained suppression is how a checker stops meaning
-anything.
+a full build, and `cargo-machete` is not installed here either. This is a
+heuristic scanner, so it is deliberately paired with an ALLOWLIST carrying a
+written reason for every entry -- an unexplained suppression is how a checker
+stops meaning anything.
 
 The check is source-text based: a dependency is "used" if its crate identifier
 appears as a word anywhere in the sources that section covers. That over-counts

@@ -1,10 +1,10 @@
-//! Cluster subsystem: cluster manager & discovery (WP-16), load balancers (WP-17),
-//! active health checking (WP-18), outlier detection (WP-19), and upstream
-//! connection pools + circuit breakers (WP-15).
+//! Cluster subsystem: cluster manager & discovery, load balancers,
+//! active health checking, outlier detection, and upstream
+//! connection pools + circuit breakers.
 //!
-//! [`ClusterEntry`] / [`HttpConnPool`] are THE seam between the HTTP lane (router,
-//! WP-13) and the cluster lane — changes to these traits require cross-lane review
-//! (ground rule #4).
+//! [`ClusterEntry`] / [`HttpConnPool`] are THE seam between the HTTP router and
+//! the cluster subsystem — changes to these traits require review from both
+//! sides (ground rule #4).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -63,8 +63,8 @@ pub enum HealthStatus {
 }
 
 /// A host's health as two independent axes, matching Envoy's own
-/// `Host::HealthFlag` bitset model: active health checking (WP-18) and
-/// outlier detection (WP-19) each fail/clear a host *independently* --  a
+/// `Host::HealthFlag` bitset model: active health checking and
+/// outlier detection each fail/clear a host *independently* --  a
 /// host can be ejected by the outlier detector while still passing its
 /// active health check (or vice versa), and either one alone is enough to
 /// make the host unusable for new traffic.
@@ -95,7 +95,7 @@ impl HealthFlags {
 }
 
 impl std::fmt::Display for HealthFlags {
-    /// Envoy-compatible rendering for the admin endpoint (WP-25) and the
+    /// Envoy-compatible rendering for the admin endpoint and the
     /// diff rig: `""` when healthy, else each failing flag's
     /// `/failed_active_hc`/`/failed_outlier_check` token concatenated in
     /// that fixed order (Envoy always lists `FAILED_ACTIVE_HC` before
@@ -111,7 +111,7 @@ impl std::fmt::Display for HealthFlags {
     }
 }
 
-/// An upstream endpoint. Host sets are built on the control runtime (WP-16) and
+/// An upstream endpoint. Host sets are built on the control runtime and
 /// shared with workers as immutable snapshots.
 #[derive(Debug)]
 pub struct Host {
@@ -134,16 +134,16 @@ pub struct Host {
     pub weight: u32,
     /// Failover priority this host belongs to; 0 = primary (S5/S7).
     pub priority: u32,
-    /// Active-health-check state (WP-18) and outlier-ejection state
-    /// (WP-19), tracked independently -- see [`HealthFlags`].
+    /// Active-health-check state and outlier-ejection state, tracked
+    /// independently -- see [`HealthFlags`].
     pub health_flags: HealthFlags,
     /// In-flight request count, read by `LEAST_REQUEST`'s power-of-two-choices
-    /// pick (WP-17, S7). TODO(WP-15/WP-13): the connection pool and router
+    /// pick (S7). TODO: the connection pool and router
     /// are what actually `fetch_add`/`fetch_sub` this as requests start and
     /// finish; until those land it stays 0 for every host, which just makes
     /// `LEAST_REQUEST` degrade to uniform random.
     pub active_requests: AtomicU64,
-    // TODO(WP-16+): locality.
+    // TODO: locality.
 }
 
 impl Host {
@@ -166,7 +166,8 @@ impl Host {
 
     /// Test seam for [`crate::load_balancer`]'s `LEAST_REQUEST` tests: set
     /// the counter directly instead of going through fetch_add/fetch_sub
-    /// (which is what real callers, once WP-15/WP-13 land, will use).
+    /// (which real callers will use once the connection pool and router
+    /// increment it).
     #[cfg(test)]
     pub(crate) fn set_active_requests_for_test(&self, n: u64) {
         self.active_requests.store(n, Ordering::Relaxed);
@@ -178,10 +179,10 @@ impl Host {
 pub struct LoadBalancerContext {
     /// Result of the route's `hash_policy` chain, if any (ring hash / Maglev).
     pub hash: Option<u64>,
-    /// Host override from an endpoint picker (`x-gateway-destination-endpoint`, WP-36).
+    /// Host override from an endpoint picker (`x-gateway-destination-endpoint`).
     pub host_override: Option<SocketAddr>,
-    /// Cluster names an earlier attempt of this same request already dialed
-    /// (WP-35). An aggregate skips these when choosing a member, so a retry
+    /// Cluster names an earlier attempt of this same request already dialed.
+    /// An aggregate skips these when choosing a member, so a retry
     /// falls over to the next provider instead of re-picking the one that
     /// just failed. Empty on the first attempt; ignored by non-aggregate
     /// clusters, which have no members to skip among.
@@ -244,8 +245,8 @@ enum RetryLimit {
 struct BudgetHandle {
     active: Arc<std::sync::atomic::AtomicU32>,
     limit: u32,
-    /// Wakes a parked waiter when a slot frees (WP-15: `max_pending_requests`
-    /// as a real parking queue in front of `max_connections`). `Some` only
+    /// Wakes a parked waiter when a slot frees. `max_pending_requests` is a
+    /// real parking queue in front of `max_connections`. `Some` only
     /// for the `connections` budget -- `pending`/`requests`/`retries` have no
     /// parking behaviour, so a `Notify` nobody ever `.notified()`s would just
     /// be dead weight on every guard.
@@ -322,7 +323,7 @@ impl BudgetHandle {
 #[derive(Debug)]
 pub struct CbGuard {
     active: Arc<std::sync::atomic::AtomicU32>,
-    /// Set only on a `max_connections` slot (WP-15's pending queue): wakes
+    /// Set only on a `max_connections` slot: wakes
     /// one parked waiter after this guard's `Drop` frees the slot. `None`
     /// for every other budget's guard.
     notify: Option<Arc<tokio::sync::Notify>>,
@@ -384,7 +385,7 @@ impl CircuitBreakerState {
         self.connections.try_acquire()
     }
 
-    /// The `max_pending_requests` budget (WP-15): a bounded parking queue in
+    /// The `max_pending_requests` budget: a bounded parking queue in
     /// front of `max_connections`. [`pool::ConnectPool::new_stream`] acquires
     /// this only after `try_acquire_connection` fails, holds it only for the
     /// duration of the park, and drops it the instant a connection slot
@@ -394,7 +395,7 @@ impl CircuitBreakerState {
         self.pending.try_acquire()
     }
 
-    /// A clone of the `connections` budget's wake channel (WP-15). A caller
+    /// A clone of the `connections` budget's wake channel. A caller
     /// that fails `try_acquire_connection` clones this out *before* parking
     /// and awaits `.notified()` on its own clone, so a later
     /// `CbGuard::Drop` on that same budget (releasing a connection slot)
@@ -471,7 +472,7 @@ pub struct UpstreamStream {
     /// helpers, or a caller that never runs `new_stream` through a
     /// `ConnectPool`) -- every real dial sets it.
     pub cb_guard: Option<CbGuard>,
-    // TODO(WP-15): (for keep-alive reuse on the h1 path) hold the codec
+    // TODO: (for keep-alive reuse on the h1 path) hold the codec
     // `SendRequest` handle rather than a raw transport -- at which point
     // this seam changes shape. The pool-guard half of this TODO is done.
 }
@@ -484,9 +485,9 @@ pub struct UpstreamStream {
 /// `dyn AsyncRead + AsyncWrite + Unpin` is not a legal trait object (only one
 /// non-auto trait per object), so we declare a single trait with the three as
 /// supertraits and blanket-impl it for everything that qualifies.
-// Rust note: `Send` (WP-10 S10 increment 2b) is required by hyper's low-level
+// Rust note: `Send` (S10) is required by hyper's low-level
 // CLIENT upgrade API (`http1::Connection::with_upgrades`), symmetric to
-// increment 2a adding it to the downstream `serve_http1`. It is a pure
+// the bound on the downstream `serve_http1`. It is a pure
 // bound-widening, not an ADR-0003 breach: `UpstreamTransportSocket::wrap` only
 // ever boxes a `TcpStream` or a rustls-wrapped `TcpStream` (both already
 // `Send`), and ADR-0003's `!Send` rule governs handler/body/filter STATE (the
@@ -533,14 +534,14 @@ pub enum PoolError {
     ResetBeforeHeaders,
 }
 
-/// Per-worker, per-host, per-protocol connection pool (WP-15).
+/// Per-worker, per-host, per-protocol connection pool.
 pub trait HttpConnPool: Send + Sync {
     /// Resolves when a stream slot is available (may open a new connection,
     /// subject to circuit breakers).
     fn new_stream(&self) -> BoxFuture<'static, Result<UpstreamStream, PoolError>>;
 }
 
-/// One attempt's host selection: the picked host, plus (WP-35) the cluster
+/// One attempt's host selection: the picked host, plus the cluster
 /// that actually owns it.
 #[derive(Debug)]
 pub struct HostSelection {
@@ -551,7 +552,7 @@ pub struct HostSelection {
     /// non-aggregate cluster -- so the common path allocates nothing.
     ///
     /// The owning cluster, not the routed one, is what supplies the
-    /// transport socket, the upstream protocol, and (WP-35) the provider
+    /// transport socket, the upstream protocol, and the provider
     /// credentials. A caller that ignores this field sends the aggregate's
     /// (empty) credentials to a real provider.
     pub member: Option<SelectedMember>,
@@ -577,10 +578,10 @@ impl std::fmt::Debug for SelectedMember {
     }
 }
 
-/// What the router (WP-13) sees of a cluster.
+/// What the router sees of a cluster.
 pub trait ClusterEntry: Send + Sync {
     /// Load-balancer host pick (S7: policy, panic threshold, priority
-    /// spillover), plus the cluster that owns the picked host (WP-35: an
+    /// spillover), plus the cluster that owns the picked host (an
     /// aggregate's members are different providers with different
     /// credentials, so "which cluster owns this host" is no longer always
     /// the entry the caller already holds).
@@ -622,7 +623,7 @@ pub trait ClusterEntry: Send + Sync {
     fn usage_dialect(&self) -> Option<proxy_config::ir::UsageDialect>;
 
     /// Feed one upstream attempt's outcome to this cluster's S6 outlier
-    /// detector (WP-19). `addr` is the host the attempt actually dialed. A
+    /// detector. `addr` is the host the attempt actually dialed. A
     /// no-op when the cluster configures no outlier detection, so the router
     /// can call it unconditionally after every attempt. Takes `&self` (not
     /// `&mut`) because the detector owns its own interior locking -- the

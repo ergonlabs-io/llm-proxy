@@ -1,4 +1,4 @@
-//! WP-51 increments 2 + 3a + 4 acceptance: real traffic through the real
+//! Acceptance: real traffic through the real
 //! `llm-proxy` binary produces real distributed-trace spans, propagates a
 //! W3C `traceparent` to the upstream leg, and exports the finished spans
 //! over a real OTLP/gRPC connection to a collector -- a mock one, but a real
@@ -131,7 +131,7 @@ impl Drop for ChildGuard {
 /// injection were dropped, this would instead capture the DOWNSTREAM
 /// caller's own inbound `traceparent` (unmodified, since `attempt_head`
 /// starts as a clone of it) -- a different value from the child span's, so
-/// the mismatch is exactly the WP-51 increment-2 propagation mutation this
+/// the mismatch is exactly the propagation mutation this
 /// file's task brief calls out.
 fn spawn_capturing_mock_upstream() -> (SocketAddr, Arc<Mutex<Option<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
@@ -191,7 +191,7 @@ fn spawn_slow_mock_upstream(delay: Duration) -> SocketAddr {
 }
 
 /// Sends `GET <path>` with no `traceparent` at all. Same shape as
-/// `get_with_traceparent` minus the header -- used by the increment-4 tests,
+/// `get_with_traceparent` minus the header -- used by the exporter independence tests,
 /// where a `traceparent` would make a failure ambiguous between "the trace
 /// export is wrongly on" and "the traceparent join is broken", and the two
 /// need to be distinguishable.
@@ -245,7 +245,7 @@ fn get_with_traceparent(addr: SocketAddr, path: &str, host: &str, traceparent: &
 #[derive(Clone, Default)]
 struct MockCollector {
     spans: Arc<Mutex<Vec<Span>>>,
-    // WP-51 increment 3b: same capture, for the parallel `MetricsService`
+    // Same capture, for the parallel `MetricsService`
     // implementation below -- one `ResourceMetrics` per export call, kept
     // whole (rather than flattened like `spans`) because a test needs to
     // read a specific named `Metric` back out of its `scope_metrics`.
@@ -287,7 +287,7 @@ impl MetricsService for MockCollector {
 /// "reserve, then let the real server rebind" pattern `free_port` documents
 /// elsewhere in this file), then spawns the mock collector on the current
 /// (multi-thread) tokio runtime. Returns the collector's shared span buffer,
-/// its shared `ResourceMetrics` buffer (WP-51 increment 3b), and its
+/// its shared `ResourceMetrics` buffer, and its
 /// address. Both `TraceService` and `MetricsService` are registered on the
 /// SAME `tonic` router/port -- exactly what a real OTLP/gRPC collector
 /// exposes (one endpoint, multiple services multiplexed by gRPC method
@@ -548,7 +548,7 @@ async fn wait_for_spans(spans: &Arc<Mutex<Vec<Span>>>, min_count: usize, deadlin
 /// `node.metadata` namespace keys the `llmproxy` dialect's carriers use
 /// (`convert_tracing_metadata` and `convert_metrics_metadata` in
 /// `proxy-config`). They are separate arguments rather than one endpoint for
-/// both because the whole point of WP-51 increment 4 is that they can differ --
+/// both because the whole point of the split is that they can differ --
 /// see the module doc's "The two exporters are independent" section.
 #[derive(Debug, Clone, Default)]
 struct OtlpEndpoints {
@@ -666,7 +666,7 @@ impl OtlpEndpoints {
 }
 
 /// Writes a bootstrap config: one listener routing to an aggregate cluster
-/// `agg` (`primary` then `fallback`, WP-35's failover order) with a retry
+/// `agg` (`primary` then `fallback`, the failover order) with a retry
 /// policy that retries a connect failure, plus whichever of the two
 /// `node.metadata` OTLP blocks `endpoints` names.
 ///
@@ -865,7 +865,7 @@ fn terminate(child: &mut ChildGuard) {
     }
 }
 
-/// The load-bearing WP-51 test: a real request through a real aggregate
+/// The load-bearing test: a real request through a real aggregate
 /// fallback, with a synthetic inbound `traceparent`, produces --
 /// - exactly one SERVER span whose trace_id equals the INBOUND trace_id
 ///   (the JOIN: preserved, not replaced by a fresh root);
@@ -1045,7 +1045,7 @@ fn hex(bytes: &[u8]) -> String {
 /// nothing on either signal -- no `SpanSink` is ever built, no exporter task
 /// ever runs, so there is nothing to connect with in the first place.
 ///
-/// The metrics half of that assertion is WP-51 increment 4's and is the
+/// The metrics half of that assertion is the
 /// stricter one: before the split, "no collector traffic" was trivially true
 /// because metrics rode inside the trace exporter, so this test could not have
 /// distinguished "metrics off" from "metrics configured but broken". Now the
@@ -1117,7 +1117,7 @@ async fn no_otlp_surfaces_configured_sends_nothing_to_the_collector() {
     terminate(&mut child);
 }
 
-/// WP-51 increment 3b acceptance, restated for increment 4: the same real
+/// Acceptance restated for exporter independence: the same real
 /// proxy, driven by the same real traffic as
 /// `traceparent_join_and_fallback_produce_the_right_span_tree` above, also
 /// exports OTLP **metrics** to the collector. `upstream_rq`
@@ -1251,7 +1251,7 @@ async fn served_traffic_exports_upstream_rq_metric_to_the_collector() {
     terminate(&mut child);
 }
 
-// ------------------------------- WP-51 increment 4: exporter independence --
+// ------------------------------- Exporter independence --
 
 /// The headline acceptance criterion, stated as a test: **metrics export works
 /// with tracing entirely off.** A config naming only `io.llmproxy.metrics`

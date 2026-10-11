@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WP-30 Docker capacity baseline. Topology:
+# Docker capacity baseline. Topology:
 #
 #   loadgen (separate cgroup) -> proxy (2 CPUs / 1 GiB) -> mock upstream
 #

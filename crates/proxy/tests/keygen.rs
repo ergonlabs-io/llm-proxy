@@ -1,4 +1,4 @@
-//! Integration tests for `llm-proxy --mode keygen` (WP-50 increment 2a-iv).
+//! Integration tests for `llm-proxy --mode keygen`.
 //!
 //! Test 4 (`printed_key_and_digest_authenticate_together_end_to_end`) is the
 //! one that matters: it proves the generator (this command) and the

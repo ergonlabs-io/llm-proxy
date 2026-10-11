@@ -1,4 +1,4 @@
-//! Generated Envoy v3 API protos + embedded `FileDescriptorSet` (WP-02).
+//! Generated Envoy v3 API protos + embedded `FileDescriptorSet`.
 //!
 //! This crate is the ONLY place Envoy protos are generated. It pins the Envoy
 //! API version for the whole project (internal-docs/IMPLEMENTATION_PLAN.md ground rule #1);
@@ -44,7 +44,7 @@ use std::sync::OnceLock;
 use prost_reflect::DescriptorPool;
 
 /// The pinned Envoy API release this build targets. Bump only via a dedicated
-/// proto-upgrade change that re-runs the WP-05 exhaustive field checklists.
+/// proto-upgrade change that re-runs the exhaustive field checklists.
 pub const PINNED_ENVOY_API_TAG: &str = "v1.38.0";
 
 /// The serialized `FileDescriptorSet` for every vendored proto we compile

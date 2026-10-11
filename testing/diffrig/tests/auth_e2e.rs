@@ -1,4 +1,4 @@
-//! WP-50 increment 2a end-to-end acceptance test: proves the downstream
+//! End-to-end acceptance test: proves the downstream
 //! authentication filter (`crates/proxy-filters/src/auth_filter.rs`) works
 //! inside the REAL filter manager, driving a REAL `llm-proxy` process, over a
 //! real socket -- not just against the `TestCallbacks` double its unit tests
@@ -392,8 +392,8 @@ async fn no_authorization_header_gets_401_and_the_upstream_is_never_contacted() 
     drop(scratch);
 }
 
-/// 5. The upstream sees the PROVIDER credential, never the virtual key. WP-50
-/// acceptance criterion and ground rule #6: a per-provider credential belongs
+/// 5. The upstream sees the PROVIDER credential, never the virtual key. This
+/// is an acceptance criterion and ground rule #6: a per-provider credential belongs
 /// on the cluster (the member actually dialled), never the route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_upstream_sees_the_provider_credential_never_the_virtual_key() {
@@ -509,13 +509,12 @@ async fn all_three_failure_modes_are_byte_identical_on_the_wire() {
 /// 7. Two different virtual keys on the same tenant share ONE token budget.
 ///
 /// **This is the v0.1.0 ship-gate clause "a token-based rate limit is
-/// enforced", proven end to end.** Before WP-50, `token_limit_filter`
-/// bucketed on `hash_credential(<the client's raw `authorization` header>)`,
-/// so presenting a second, distinct header value got a fresh budget -- the
-/// limit was advisory by construction. WP-50 increment 2a re-keys the
-/// limiter onto `StreamInfo::auth.tenant`, an identity the CALLER cannot
-/// choose, so two keys belonging to the same tenant now draw from the same
-/// bucket. This test is the only place in the suite that would catch a
+/// enforced", proven end to end.** The limiter is keyed on
+/// `StreamInfo::auth.tenant`, an identity the CALLER cannot choose, so two
+/// keys belonging to the same tenant draw from the same bucket. Keying on the
+/// client's raw `authorization` header (`hash_credential(...)`) would make the
+/// limit advisory by construction: a second, distinct header value would get a
+/// fresh budget. This test is the only place in the suite that would catch a
 /// regression back to keying on the raw header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_virtual_keys_on_the_same_tenant_share_one_token_budget() {

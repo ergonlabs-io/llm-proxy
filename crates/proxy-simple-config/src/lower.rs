@@ -1,6 +1,6 @@
 //! Lowering: dialect -> Envoy bootstrap resources.
 //!
-//! Deterministic rules (WP-38):
+//! Deterministic rules:
 //! - each provider -> one cluster `provider:<name>` (STATIC for IP hosts,
 //!   LOGICAL_DNS for hostnames), upstream TLS + SNI for https, host rewrite
 //!   and auth-header injection on the routes that target it;
@@ -27,7 +27,7 @@ use crate::model::*;
 use crate::parse::parse_host_port;
 
 /// The request header the route table matches models against. Populated
-/// from the request BODY by the body-rewrite filter (WP-45's consumer B,
+/// from the request BODY by the body-rewrite filter (body-based routing,
 /// `proxy_filters::body_rewrite_filter`) before routing runs -- overwriting
 /// or removing any client-supplied value, never trusting it (see that
 /// filter's module doc). `needs_body_rewrite_filter` below is what actually
@@ -127,10 +127,9 @@ const FILE_ACCESS_LOG_TYPE_URL: &str =
 /// `%LLM_TPOT%` is here, not just `%LLM_TTFT%`, and that is the point of the
 /// pair: TTFT says how long the user waited to see *anything*, TPOT says how
 /// fast it then streamed. Either alone hides the failure the other catches.
-/// (Added 2026-08-08: WP-46 built `%LLM_TPOT%`, `%LLM_MAX_STALL%` and
-/// `%LLM_RESPONSE_CHUNKS%`, but no dialect format ever emitted them — so a
-/// user configuring this proxy through its own dialect could not get TPOT at
-/// any setting, which the v0.1.0 gate requires.)
+/// The dialect picks only `text` or `json`, with no custom format string, so
+/// if this line omitted `%LLM_TPOT%`, `%LLM_MAX_STALL%` or
+/// `%LLM_RESPONSE_CHUNKS%`, a dialect user could not get them at all.
 const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" ",
     "%RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% ",
@@ -202,7 +201,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     for (i, rule) in config.routes.iter().enumerate() {
         let (route, aggregate_cluster) = lower_route(config, i, rule, &mut warnings)?;
         routes.push(route);
-        // WP-35 increment 2c: a route with `fallbacks` lowers an extra
+        // A route with `fallbacks` lowers an extra
         // `envoy.clusters.aggregate` cluster alongside its provider
         // clusters -- declaration order doesn't matter (Envoy resolves the
         // member graph after every cluster is assembled; see
@@ -214,9 +213,9 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         }
         has_catch_all |= rule.model == "*";
     }
-    // `models:` entries (WP-49) each get an implicit route on their own
+    // `models:` entries each get an implicit route on their own
     // name, evaluated after the explicit `routes:` list (first match wins,
-    // same S1 rule) and before the 404 backstop. WP-49 increment 2:
+    // same S1 rule) and before the 404 backstop.
     // `model_catalog_order` puts them in exact > longest-prefix > `*`
     // precedence order rather than the catalogue's alphabetical key order.
     for (name, model) in model_catalog_order(config) {
@@ -226,7 +225,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             clusters.push(aggregate_cluster);
         }
     }
-    // A bare `*` catalogue entry (increment 2's empty-prefix tier) is just
+    // A bare `*` catalogue entry (the empty-prefix tier) is just
     // as much a catch-all as a `routes:` rule with `model: "*"` -- it also
     // needs to suppress the synthetic 404 below, or that 404 becomes a dead,
     // never-reached route sitting after it (harmless, but confusing output).
@@ -263,7 +262,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         routes.insert(index, catalog_route);
     }
 
-    // WP-45: the body-rewrite filter (inserted below by
+    // The body-rewrite filter (inserted below by
     // `needs_body_rewrite_filter`) now scans the request body and publishes
     // `MODEL_HEADER` from it before routing runs, so `routes`/`models`
     // matching that header is body-derived, not merely a header the client
@@ -638,7 +637,7 @@ fn lower_provider(
     }
 
     // `protocol: http2` is the on-ramp to `proxy-http::upstream_pool`'s h2
-    // upstream connection cache (WP-15 slice A) -- see this cluster's own
+    // upstream connection cache -- see this cluster's own
     // `UpstreamProtocol` doc. `http1` (the default, `None` here) emits
     // NOTHING: `proxy_config::lower::convert_upstream_protocol` already reads
     // an empty/absent `typed_extension_protocol_options` map as `Http1`
@@ -675,13 +674,13 @@ fn lower_provider(
     // provider used by five routes/models still gets exactly one set of
     // warnings, not five identical copies.
     let mut headers_to_add = provider_headers_to_add(name, provider, warnings)?;
-    // WP-35 increment 2c: the Host header follows the CLUSTER, not the
+    // The Host header follows the CLUSTER, not the
     // route. A route with fallbacks can fail over to a different provider
     // cluster (see `lower_route`'s aggregate-cluster handling), and
     // `host_rewrite_literal` on the ROUTE would still carry the PRIMARY
     // provider's host to whichever member actually serves the request --
     // the exact "value pinned to the routing decision instead of the
-    // connection" bug class WP-35 increment 1a existed to kill. Setting it
+    // connection" bug class this code exists to kill. Setting it
     // here too means the member that actually dials the request always
     // supplies its own Host, exactly like its credentials
     // (`router.rs`'s `apply_header_mutations` call applies cluster-level
@@ -691,11 +690,11 @@ fn lower_provider(
     // identical value via `host_rewrite_literal`, so this is a no-op there,
     // and one rule is simpler than two.
     headers_to_add.push(json!({ "key": "host", "value": up.host }));
-    // WP-35 increment 1 (ground rule #6's third instance, AGENTS.md invariant 6): the
+    // This is ground rule #6's third instance (AGENTS.md invariant 6): the
     // usage-filter dialect is per-provider too, so it rides onto the CLUSTER
     // alongside credentials and `Host` above rather than staying only on the
     // route's `typed_per_filter_config` -- that route-level copy is left
-    // completely unchanged by this increment (both carriers must agree; see
+    // completely unchanged by this change (both carriers must agree; see
     // `dialect.rs`'s test for that), and the usage filter itself does not
     // read this one yet. This runs once per provider, exactly like the
     // credential/Host headers above, so a provider used by five routes still
@@ -1041,7 +1040,7 @@ fn usage_dialect(name: &str, provider: &Provider) -> &'static str {
     }
 }
 
-/// A `models:` provider entry's effective dialect (WP-49): an explicit
+/// A `models:` provider entry's effective dialect: an explicit
 /// `dialect` always wins; otherwise it is derived via [`usage_dialect`] --
 /// but only for provider types whose wire format the type alone determines.
 /// `None` means "ambiguous type, no explicit `dialect`" -- `validate_semantics`
@@ -1081,8 +1080,8 @@ fn force_usage_reporting(config: &SimpleConfig) -> bool {
         })
 }
 
-/// Whether the body-rewrite filter needs to be in the chain at all (WP-45
-/// decision 3): either `force_usage_reporting` wants the `include_usage`
+/// Whether the body-rewrite filter needs to be in the chain at all: either
+/// `force_usage_reporting` wants the `include_usage`
 /// splice, or the config has `routes`/`models` to route among -- body-based
 /// model routing (consumer B) depends on this filter unconditionally, since
 /// it's the only thing that ever reads the request body. Both reasons are
@@ -1097,8 +1096,8 @@ fn needs_body_rewrite_filter(config: &SimpleConfig) -> bool {
 /// Owned `llmproxy.filters.v0.BodyRewrite` `typed_config` for the body-rewrite
 /// filter: `enabled` is the on/off switch for consumer A (the
 /// `include_usage` splice) ONLY -- consumer B (body-based model routing)
-/// reads the filter's presence in the chain, never this field (WP-45
-/// decision 3). `dialect` carries the dialect. Shared by the
+/// reads the filter's presence in the chain, never this field. `dialect` carries
+/// the dialect. Shared by the
 /// listener-level entry and every per-route override so the two can never
 /// drift in shape.
 fn body_rewrite_typed_config(enabled: bool, dialect: &str) -> Value {
@@ -1142,8 +1141,8 @@ const AGGREGATE_CLUSTER_CONFIG_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig";
 
 /// Lower `rule.provider` + `rule.fallbacks` into the route's `route.cluster`
-/// and, if there are fallbacks, the extra aggregate cluster that names them
-/// (WP-35 increment 2c). Returns `(route, aggregate_cluster)`; the caller
+/// and, if there are fallbacks, the extra aggregate cluster that names them.
+/// Returns `(route, aggregate_cluster)`; the caller
 /// appends `aggregate_cluster` to the bootstrap's `clusters` list alongside
 /// the provider clusters.
 fn lower_route(
@@ -1171,7 +1170,7 @@ fn lower_route(
         ));
     }
 
-    // WP-35 increment 2c: `provider:{name}` for the primary, then each
+    // `provider:{name}` for the primary, then each
     // fallback in listed order -- listed order IS the failover order an
     // aggregate cluster fails over in.
     let mut member_clusters = vec![format!("provider:{provider_name}")];
@@ -1188,7 +1187,7 @@ fn lower_route(
         // scanned for tokens by the wrong dialect's parser -- silently
         // producing wrong billing numbers, not just a broken request. The
         // request/response translation that would make a cross-dialect
-        // chain work is explicitly later WP-35 scope; failing here at
+        // chain work is explicitly deferred work; failing here at
         // config time is ground rule #1's shape, not laziness.
         if fallback_dialect != primary_dialect {
             return Err(ConfigError::InvalidValue {
@@ -1227,7 +1226,7 @@ fn lower_route(
         .unwrap_or(SimpleDuration(std::time::Duration::from_secs(90)));
 
     // A route with no fallbacks targets its provider cluster directly, same
-    // as before this increment. A route WITH fallbacks targets a fresh
+    // as before fallbacks existed. A route WITH fallbacks targets a fresh
     // aggregate cluster instead -- named `fallback:route-{index}`, which
     // cannot collide with a provider cluster's `provider:{name}` (different
     // prefix).
@@ -1267,7 +1266,7 @@ fn lower_route(
     // S3, LLM-safe: retry only what is certainly unserved. Envoy's router
     // never retries once response bytes have streamed downstream.
     let attempts = rule.retries.as_ref().map_or(1, |r| r.attempts);
-    // WP-35 increment 2c: `LoadBalancerContext::attempted_clusters` makes
+    // `LoadBalancerContext::attempted_clusters` makes
     // each retry against an aggregate pick the NEXT member, so reaching the
     // last of N members needs at least N-1 retries -- below that, a
     // configured fallback would silently never see traffic, which is
@@ -1324,8 +1323,8 @@ fn lower_route(
 /// from [`lower_provider`] -- these headers now travel on the provider's
 /// CLUSTER (`metadata.filter_metadata["io.llmproxy.provider_auth"]`), not
 /// the route, so every route/model entry that targets this provider shares
-/// exactly the same credential regardless of which one reached it (WP-35;
-/// see `ClusterConfig::request_headers_to_add`'s doc comment in
+/// exactly the same credential regardless of which one reached it
+/// (see `ClusterConfig::request_headers_to_add`'s doc comment in
 /// `proxy-config/src/ir.rs`).
 ///
 /// Each entry is a plain `{key, value}` object -- the shape
@@ -1373,7 +1372,7 @@ fn provider_headers_to_add(
 
 // -------------------------------------------------------------------- models --
 
-/// A `models:` catalogue key's shape (WP-49 increment 2). The only two legal
+/// A `models:` catalogue key's shape. The only two legal
 /// shapes both fall out of where a trailing `*` sits, so classifying and
 /// validating are the same pass -- see [`classify_model_key`].
 ///
@@ -1383,7 +1382,7 @@ fn provider_headers_to_add(
 /// length, and the empty one sorts last for free. See `model_catalog_order`.
 ///
 /// **Shared semantics, not shared code.** `proxy_filters::model_authz::ModelPattern`
-/// (WP-50 3a, per-tenant model allow-lists) matches trailing-`*` globs with
+/// (per-tenant model allow-lists) matches trailing-`*` globs with
 /// the identical rule -- exact, or `prefix*` via `str::starts_with`. This
 /// crate cannot depend on `proxy-filters` in production code (it is a
 /// dev-dependency only, kept out of the dialect's dependency tree -- see
@@ -1424,7 +1423,7 @@ pub(crate) fn classify_model_key(name: &str) -> Result<ModelKeyShape, String> {
     }
 }
 
-/// `models:` entries in WP-49 increment 2's precedence order: exact match
+/// `models:` entries in precedence order: exact match
 /// wins, then the longest matching prefix, then the (empty-prefix) catch-all
 /// -- see [`ModelKeyShape`]'s doc for why that is one sort rule, not two.
 ///
@@ -1607,8 +1606,8 @@ fn validate_digest(digest: &str, path: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// `auth` -> at most one `llmproxy.auth` `http_filters` entry (WP-50
-/// increment 2a-iii). All validation happens HERE, with dialect paths
+/// `auth` -> at most one `llmproxy.auth` `http_filters` entry. All validation
+/// happens HERE, with dialect paths
 /// (`auth.keys[0].digest`) -- never `auth_filter::parse_config`'s proto paths
 /// (`typed_config.virtual_keys[0].digest_hex`), which the operator's document
 /// doesn't have a `typed_config` to point into. This is also why the file
@@ -1756,7 +1755,7 @@ fn lower_auth(
 /// `limits` -> at most one `llmproxy.token_limit` `http_filters` entry.
 ///
 /// The dialect's `limits` surface is richer than what `token_limit_filter`
-/// (WP-34 increment 2) enforces today: that filter is a thin slice — a
+/// enforces today: that filter is a thin slice — a
 /// single global token-total budget, bucketed on `(route name, the
 /// `authorization` header)`, no per-descriptor config. So exactly one shape
 /// lowers for real: `key: header:authorization` with `tokens_per_minute`
@@ -2123,7 +2122,7 @@ fn lower_listener(
 
     let mut http_filters = Vec::new();
     if let Some(auth_filter) = auth_filter {
-        // FIRST, ahead of everything else Lane-H adds -- see
+        // FIRST, ahead of everything else added to the chain below -- see
         // `AUTH_FILTER_NAME`'s doc for why (an unauthenticated request must
         // be refused before the body-peek filter buffers it, and the token
         // limiter must see `StreamInfo::auth.tenant` already written).
@@ -2135,7 +2134,7 @@ fn lower_listener(
         // filter placed after the router never runs at all. `enabled` here
         // gates ONLY consumer A (the `include_usage` splice): a config with
         // `routes`/`models` but `force_usage_reporting: false` still needs
-        // this filter present, just with the splice off -- WP-45 decision 3.
+        // this filter present, just with the splice off.
         http_filters.push(json!({
             "name": BODY_REWRITE_FILTER_NAME,
             "typed_config": body_rewrite_typed_config(force_usage_reporting(config), default_dialect),

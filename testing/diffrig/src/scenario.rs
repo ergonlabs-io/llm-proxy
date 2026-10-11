@@ -1,9 +1,8 @@
-//! Scenario file model for the differential rig (WP-26): a scenario names a
+//! Scenario file model for the differential rig: a scenario names a
 //! bootstrap config, an ordered request script to replay against the proxy
 //! under test, and an upstream script describing which scriptable upstream
 //! backs it. This module only parses and validates the shape; actually
-//! spinning up proxies/upstreams and comparing captures is a later WP-26
-//! chunk.
+//! spinning up proxies/upstreams and comparing captures is left for later.
 //!
 //! Strict-mode mindset: unknown fields are always errors, same standard as
 //! the rest of the repo's config surfaces.

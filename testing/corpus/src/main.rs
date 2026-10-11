@@ -1,4 +1,4 @@
-//! Config-corpus scorecard (WP-27): feeds every fixture under
+//! Config-corpus scorecard: feeds every fixture under
 //! `testing/corpus/fixtures/` through `proxy_config`'s real loader pipeline
 //! (`lib.rs`) and classifies each as fully-supported / rejected-with-path /
 //! parse-error. Emits `corpus-report.md` — the project's headline
@@ -7,9 +7,9 @@
 //! A rejected fixture is *data*, not a tool failure: this binary only exits
 //! nonzero on I/O/internal errors (bad fixtures dir, can't write the report).
 //!
-//! `fixtures/envoy-examples/` (WP-27 chunk B) harvests real static bootstraps
+//! `fixtures/envoy-examples/` harvests real static bootstraps
 //! from the pinned `envoyproxy/envoy` release tag — see its `SOURCES.md` for
-//! provenance. TODO(WP-27 next chunk): also harvest Envoy Gateway translator
+//! provenance. TODO: also harvest Envoy Gateway translator
 //! output, istioctl dumps, and Gloo/Contour examples into further
 //! `fixtures/<source>/` directories; CI wiring to post the report as a PR
 //! comment.

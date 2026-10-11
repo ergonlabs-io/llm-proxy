@@ -1,4 +1,4 @@
-//! WP-50 increment 2a-iii acceptance tests: the dialect's `auth:` block
+//! Acceptance tests: the dialect's `auth:` block
 //! lowers to a real `llmproxy.auth` `http_filters` entry that
 //! `proxy_filters::auth_filter::parse_config` actually accepts, with strict
 //! validation -- done entirely in this crate, naming DIALECT paths
@@ -38,7 +38,7 @@ fn digest_hex(secret: &[u8], plaintext: &str) -> String {
     digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A minimal config with no `auth:` block at all -- the pre-WP-50 shape,
+/// A minimal config with no `auth:` block at all -- the shape from before `auth:` existed,
 /// kept as a regression fixture (test 12).
 const NO_AUTH_CONFIG: &str = r#"
 version: 0

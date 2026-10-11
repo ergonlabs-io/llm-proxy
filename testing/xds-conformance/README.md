@@ -1,4 +1,4 @@
-# xds-conformance -- WP-20 increment 5
+# xds-conformance
 
 `make xds-conformance` runs our real ADS client (`proxy_xds::AdsClient`) against a
 real **go-control-plane** server -- the reference implementation -- instead of
@@ -18,7 +18,7 @@ talks to in production.
    node ID (`fixture/main.go`'s `expectedNodeID`), and a `nodeGuard` callback turns
    a wrong or absent ID into an explicit, immediate gRPC error instead of a hang
    (`wrong_node_id_produces_a_named_rejection_not_a_hang`), which is exactly the
-   class of bug WP-20 increment 4c already found once (our client sending no node
+   class of bug already found once (our client sending no node
    at all).
 3. We receive a CDS response and accept it.
 4. go-control-plane observes that acceptance as an ACK, not a NACK -- proven
@@ -30,10 +30,10 @@ talks to in production.
 
 ## What this does NOT check
 
-- **LDS, RDS, EDS, or SDS.** The fixture serves one CDS resource. WP-20's own
-  scope is CDS/LDS; RDS is WP-21's, EDS is explicitly deferred (see
-  `internal-docs/IMPLEMENTATION_PLAN.md`), and SDS is WP-22's.
-- **Reconnect, resync, or backoff** (`AdsClient::run`, increment 3b). This fixture
+- **LDS, RDS, EDS, or SDS.** The fixture serves one CDS resource. LDS, RDS and SDS are
+  outside its scope, and EDS is explicitly deferred (see
+  `internal-docs/IMPLEMENTATION_PLAN.md`).
+- **Reconnect, resync, or backoff** (`AdsClient::run`). This fixture
   drives exactly one stream via `AdsClient::run_once`; it does not drop the
   connection or assert on `Reconnect`'s jittered delay.
 - **The real binary's wiring** (bootstrap parsing, `ConfigPublisher::publish`,
@@ -49,7 +49,7 @@ talks to in production.
 
 ## Why the library route, not the real binary
 
-WP-20 increment 5's brief offers two options: drive `proxy-xds` directly, or boot
+Two options were considered: drive `proxy-xds` directly, or boot
 the real `llm-proxy` binary against a bootstrap with `dynamic_resources`. This
 fixture uses the **library route** (`proxy_xds::AdsClient` directly, the same
 public API `crates/proxy-xds/tests/client.rs` already drives against
@@ -84,7 +84,6 @@ Preserved from the Makefile's own comment above the `xds-conformance` target,
 because AGENTS.md "Coverage" records exactly this shape (`local_openai_smoke.rs`)
 quietly going stale for a whole work package while the suite stayed green:
 
-- run it before closing WP-20, and
 - run it before the v0.3.0 ship gate is declared closed.
 
 An opt-in target nobody runs is worse than no target -- it reads as coverage it

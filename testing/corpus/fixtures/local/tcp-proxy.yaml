@@ -1,6 +1,6 @@
 # Phase 1 target config (Gate G1): a plain Envoy bootstrap that llm-proxy must
 # accept unmodified — static TCP proxy, round-robin between two upstreams.
-# Envoy accepts this file as-is; the WP-27 scorecard and WP-26 diff rig use it.
+# Envoy accepts this file as-is; the scorecard and the diff rig use it.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }

@@ -60,7 +60,7 @@ use serde_json::json;
 /// with `api_key: ${VAR}` so the real secret is interpolated from this
 /// process's environment at load time and never appears in the file on
 /// disk. Deliberately omits `limits:`/`fallbacks:` -- the dialect does not
-/// yet accept either (WP-34/WP-35).
+/// yet accept either.
 fn dialect_config(listener_port: u16) -> String {
     format!(
         r#"

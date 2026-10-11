@@ -1,11 +1,11 @@
-//! v1 upstream connection pool (WP-15, first slice): connect-per-stream, no
+//! v1 upstream connection pool: connect-per-stream, no
 //! reuse. [`ConnectPool::new_stream`] dials a fresh TCP connection for every
 //! call, hands it to the cluster's transport socket (plaintext passthrough or
 //! a TLS handshake), and returns the resulting byte stream as an
 //! [`UpstreamStream`] -- the router runs the h1/h2 codec over it.
 //!
 //! There is no keep-alive reuse, no h2 multiplexing, and no connection-level
-//! circuit breaking yet; all of that is WP-15 follow-up (see the `TODO(WP-15)`
+//! circuit breaking yet; all of that is follow-up work (see the `TODO`
 //! on [`UpstreamStream`]). The pool is protocol-agnostic: it produces bytes,
 //! and the router picks the codec from the cluster's `upstream_protocol`.
 
@@ -42,8 +42,8 @@ pub struct ConnectPool {
     /// TCP-only timeout; wrapping both phases in the same deadline closes
     /// that gap.
     connect_timeout: Duration,
-    /// The cluster's S5 `max_connections` AND `max_pending_requests` budgets
-    /// (WP-15). A whole [`CircuitBreakerState`] clone, not a borrow -- it
+    /// The cluster's S5 `max_connections` AND `max_pending_requests` budgets.
+    /// A whole [`CircuitBreakerState`] clone, not a borrow -- it
     /// shares the same underlying gauge (`CircuitBreakerState` is
     /// `Clone`-and-shared, see its own doc), so every per-call `ConnectPool`
     /// built for a cluster (`ClusterHandle::http_pool` makes a fresh one per
@@ -113,7 +113,7 @@ impl HttpConnPool for ConnectPool {
         let connect_timeout = self.connect_timeout;
         let connections = self.connections.clone();
         Box::pin(async move {
-            // S5's `max_connections` and `max_pending_requests` (WP-15): a
+            // S5's `max_connections` and `max_pending_requests`: a
             // connection slot is claimed before the dial so an over-budget
             // cluster never opens the socket, but a caller that loses that
             // race no longer overflows immediately -- it parks, holding a
@@ -133,7 +133,7 @@ impl HttpConnPool for ConnectPool {
             // pending request by the *request* timeout, not the connect
             // timeout, so a request configured with a long request timeout
             // but a short `connect_timeout` will shed load here sooner than
-            // Envoy would. Flagged for a later increment, not a gap anyone
+            // Envoy would. Flagged for later work, not a gap anyone
             // is meant to rely on.
             let (guard, connected) = tokio::time::timeout(connect_timeout, async {
                 let guard = match connections.try_acquire_connection() {
@@ -448,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_connections_is_enforced_at_dial_and_released_on_drop() {
-        // S5's `max_connections` (WP-15): a cluster with a budget of 1 must
+        // S5's `max_connections`: a cluster with a budget of 1 must
         // reject a second concurrent dial with `PoolError::Overflow`, and
         // must accept a new dial again once the first connection is dropped
         // -- acquire, reject-at-limit, and release-on-drop, in one test.
@@ -509,7 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_request_parks_then_completes_when_a_connection_slot_frees() {
-        // WP-15: with the connection budget saturated but a pending slot
+        // With the connection budget saturated but a pending slot
         // free, a second concurrent request must PARK rather than overflow
         // immediately, and must complete once the first connection's
         // `CbGuard` drops and wakes it.
@@ -555,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn third_concurrent_request_overflows_once_pending_queue_is_also_full() {
-        // WP-15: connections AND pending both saturated (1 held, 1 parked)
+        // Connections AND pending both saturated (1 held, 1 parked)
         // must shed a third concurrent request immediately with
         // `PoolError::Overflow`, not grow the waiter list further.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

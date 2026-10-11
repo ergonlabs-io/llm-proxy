@@ -1,4 +1,4 @@
-//! Integration tests for the `llm-proxy` binary's CLI surface (WP-06 chunk C):
+//! Integration tests for the `llm-proxy` binary's CLI surface:
 //! `--mode validate` exit codes and the SIGTERM drain-then-exit sequence.
 //!
 //! Rust note: `env!("CARGO_BIN_EXE_llm-proxy")` is filled in by cargo at build
@@ -442,7 +442,7 @@ static_resources:
 
 #[test]
 fn serve_mode_fails_startup_when_a_listener_has_a_bad_cert() {
-    // WP-08 chunk C3: a `transport_socket` whose cert PEM won't parse must
+    // A `transport_socket` whose cert PEM won't parse must
     // fail startup exactly like a socket that won't bind (`initial_bind`'s
     // TLS-build path is fatal, same as its socket-bind path) -- Envoy itself
     // fails a static listener's warm-up on a bad cert.

@@ -1,4 +1,4 @@
-//! WP-20 increment 5 acceptance: boot the REAL `llm-proxy` binary against a
+//! Acceptance: boot the REAL `llm-proxy` binary against a
 //! scripted control plane (`testing/controlplane`'s `Harness`) and prove the
 //! ADS pipeline works end to end in the shipped process.
 //!
@@ -851,8 +851,8 @@ const TEST_D_EDS_CLUSTER: &str = "eds_backend";
 /// cluster -- its membership arrives only over an ADS-delivered
 /// `ClusterLoadAssignment`, never `load_assignment` (`proxy-config`'s own
 /// EDS-cluster check forbids setting both). `dynamic_resources` still needs
-/// `cds_config` set: `convert_dynamic_resources` (WP-21 increment 1, not this
-/// increment's to change) only accepts `ads_config` when at least one of
+/// `cds_config` set: `convert_dynamic_resources` (not this test's to change)
+/// only accepts `ads_config` when at least one of
 /// `lds_config`/`cds_config` also subscribes over it -- EDS has no bootstrap
 /// flag of its own, it rides on a `Cluster`'s own `eds_cluster_config`. The
 /// harness script below never answers the resulting CDS subscription; it
@@ -922,7 +922,7 @@ static_resources:
     )
 }
 
-/// WP-21 increment 2b-iii's own acceptance test: an ADS-delivered
+/// Acceptance test: an ADS-delivered
 /// `ClusterLoadAssignment` reaches `ClusterManager::accept_eds_update` in the
 /// real binary, and the statically-declared EDS cluster it feeds becomes
 /// routable by real traffic -- the same "observe through a real request, one
@@ -1095,7 +1095,7 @@ static_resources:
 }
 
 /// A TLS-certificate SDS resource with inline PEM, the only secret shape
-/// WP-22 accepts at this boundary. The returned DER is also installed in the
+/// The SDS path accepts at this boundary. The returned DER is also installed in the
 /// test client's trust store, so its successful handshake proves the proxy
 /// installed this exact delivered certificate rather than merely accepting an
 /// arbitrary TLS connection.
@@ -1134,7 +1134,7 @@ fn minted_sds_certificate() -> (tls_v3::Secret, rustls::pki_types::CertificateDe
     )
 }
 
-/// WP-22's delivered-secret path is only useful if `start_ads` initially
+/// The delivered-secret path is only useful if `start_ads` initially
 /// subscribes to an SDS-only listener's named certificate. `ResourceApplier`
 /// unit tests already prove it can derive this name after an LDS update, but
 /// the static boot snapshot has no update to trigger that path; this is the
@@ -1198,7 +1198,7 @@ async fn an_sds_only_listener_subscribes_to_its_certificate_at_boot() {
     harness.shutdown().await;
 }
 
-/// WP-22's crate-level tests prove subscriptions, secret decoding, and the
+/// The crate-level tests prove subscriptions, secret decoding, and the
 /// registry separately. This proves the real binary connects those seams:
 /// its SDS-only listener requests the named secret, the scripted control
 /// plane delivers it, and a client trusting only that secret completes TLS
@@ -1484,7 +1484,7 @@ async fn an_rds_delivered_route_binds_and_serves_a_static_listener() {
 
 /// One static EDS cluster whose control-plane connection stays open but never
 /// delivers endpoints. The configured timeout belongs to `cds_config`'s
-/// `ConfigSource`: WP-21's bootstrap lowering carries that ADS-wide deadline
+/// `ConfigSource`: the bootstrap lowering carries that ADS-wide deadline
 /// into the readiness probe.
 fn bootstrap_never_warmed_eds_cluster(
     listener_port: u16,
@@ -1788,7 +1788,7 @@ async fn wait_for_ack(
     }
 }
 
-/// WP-21's make-before-break negative path. A replacement generation gets a
+/// The make-before-break negative path. A replacement generation gets a
 /// new cluster and listener name, but its listener waits on a not-yet-delivered
 /// RDS table. The old generation must keep serving when the control plane
 /// disappears in that window; dropping it because the listener name changed

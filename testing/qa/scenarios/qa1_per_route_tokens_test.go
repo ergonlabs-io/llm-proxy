@@ -72,7 +72,7 @@ observability:
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	// llm-proxy routes purely on the x-llmproxy-model header — it does not
-	// translate between providers' native API paths (WP-35's model-router
+	// translate between providers' native API paths (a model-router
 	// filter is what will eventually let a client speak one dialect and be
 	// routed to another). So each request must hit the path its target
 	// provider's mock actually serves.
@@ -88,7 +88,7 @@ observability:
 			t.Fatalf("QA-1: build request for model %s: %v", model, err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		// Routing is by the x-llmproxy-model header today (WP-35, body-based
+		// Routing is by the x-llmproxy-model header today (body-based
 		// extraction, is not yet in place — see lower.rs's routes warning).
 		req.Header.Set("x-llmproxy-model", model)
 
@@ -139,7 +139,7 @@ observability:
 	}
 
 	// Correlate by request path, not by model: the dialect's JSON log format
-	// has no model field yet. Emitting one is part of WP-33 (the usage filter
+	// has no model field yet. Emitting one is part of the usage filter's work (the usage filter
 	// is what knows the model), so until that lands, path is the only
 	// per-route discriminator in the line — and it is a real one, since the
 	// two routes target different providers on different paths.
@@ -170,7 +170,7 @@ observability:
 		return n, true
 	}
 
-	// The parts that do not depend on WP-33 are asserted unconditionally, so
+	// The parts that do not depend on the usage filter are asserted unconditionally, so
 	// this case guards routing and log emission today rather than being
 	// all-or-nothing on the token counts.
 	type route struct {
@@ -196,7 +196,7 @@ observability:
 			t.Errorf("QA-1: %s: want bytes_sent > 0, got %v (line: %v)", r.path, line["bytes_sent"], line)
 		}
 
-		// WP-33 gap: with no usage filter in the dialect's generated
+		// Token gap: with no usage filter in the dialect's generated
 		// http_filters, nothing populates the token buckets, so the formatter
 		// renders every %LLM_*_TOKENS% operator as the absent-value "-".
 		// Collect rather than assert, so the token half degrades to a loud

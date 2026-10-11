@@ -1,4 +1,4 @@
-//! Scenario request replay for WP-26.
+//! Scenario request replay.
 //!
 //! The process topology is owned by the caller (Docker Envoy and llm-proxy
 //! can be started independently), while this module guarantees that each

@@ -1,4 +1,4 @@
-//! WP-23 increment 4 — renders a [`Registry`] into Prometheus text exposition
+//! Renders a [`Registry`] into Prometheus text exposition
 //! format. See `internal-docs/IMPLEMENTATION_PLAN.md`'s Decision 4 for the naming
 //! rules this module implements, and [`envoy_render`](super::envoy_render)
 //! for the sibling renderer this one deliberately does *not* copy the shape
@@ -75,8 +75,8 @@
 //!
 //! No periodic flush, no `?filter=`/`?histogram_buckets=` query parameters,
 //! no protobuf exposition format, no OpenMetrics. All out of scope per the
-//! design brief's "what this brief does not decide" and this WP's own
-//! increment boundary.
+//! design brief's "what this brief does not decide" and this module's own
+//! scope.
 
 use std::collections::BTreeMap;
 

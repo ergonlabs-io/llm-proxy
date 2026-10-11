@@ -1,11 +1,9 @@
-//! Config-validation differential engine (WP-26 chunk B): runs Envoy
+//! Config-validation differential engine: runs Envoy
 //! bootstrap configs through both the real pinned Envoy binary (inside a
 //! throwaway docker container) and llm-proxy's own `--mode validate`, and
-//! classifies whether the two agree. This is the config-loading slice of
-//! WP-26's differential-testing mission — llm-proxy only does config-loading
-//! plus an L4 `tcp_proxy`/TLS data plane today, so the HTTP traffic-replay
-//! topology (`scenario.rs`'s scenario model) is deferred until WP-10 lands an
-//! HTTP data plane; see `main.rs`'s module doc.
+//! classifies whether the two agree. This is the config-loading half of the
+//! differential rig; request-level comparison is `replay.rs`, driven by
+//! `scenario.rs`'s scenario model.
 //!
 //! `GapWeReject` (Envoy accepts, we reject) is expected and is *data*, not a
 //! bug — it names a real compat gap, per ground rule #2. `BugWeAccept`

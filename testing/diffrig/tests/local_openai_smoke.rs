@@ -22,7 +22,7 @@
 //! Ollama serves **both** compatibility surfaces -- OpenAI at
 //! `/v1/chat/completions` and Anthropic at `/v1/messages` -- so both dialects
 //! are covered here, streaming and not, plus a real upstream-TLS hop and the
-//! per-route dialect selection that WP-33 criterion 7 is about.
+//! per-route dialect selection that acceptance criterion 7 is about.
 //!
 //! **It does not close the v0.0.1 ship gate and must never be described as
 //! doing so.** The gate names *real provider endpoints*; what remains unseen
@@ -34,7 +34,7 @@
 //!
 //! Token counts. Ollama emits a genuine `usage` block -- in the JSON body
 //! when non-streaming, and (given `stream_options.include_usage`) in the
-//! final SSE frame when streaming. So this exercises the WP-33 usage filter
+//! final SSE frame when streaming. So this exercises the usage filter
 //! end to end against numbers **we did not choose**: the proxy's access log
 //! must agree with what the upstream independently reported. A mock proves
 //! the extractor can read a body we wrote; this proves it can read one we
@@ -110,7 +110,7 @@ fn dialect_config(
     // BOTH providers point at the same Ollama, which serves an
     // OpenAI-compatible API at /v1/chat/completions AND an
     // Anthropic-compatible one at /v1/messages. That makes this a real
-    // per-route-dialect test (WP-33 criterion 7) against a third-party server:
+    // per-route-dialect test (acceptance criterion 7) against a third-party server:
     // one proxy, one config, two response shapes, and the token counts have to
     // come out right for both.
     //
@@ -705,7 +705,7 @@ async fn anthropic_non_streaming_round_trip_extracts_third_party_token_counts() 
 /// split across `message_start` (input) and `message_delta` (output), and no
 /// `[DONE]` sentinel. Note there is NO opt-in equivalent to
 /// `stream_options.include_usage` here: Anthropic reports usage
-/// unconditionally, which is why WP-45 scopes forced usage reporting to the
+/// unconditionally, which is why forced usage reporting is scoped to the
 /// OpenAI dialect only. This test is what makes that claim checkable rather
 /// than asserted.
 #[tokio::test]
@@ -789,7 +789,7 @@ async fn anthropic_streaming_extracts_usage_split_across_start_and_delta() {
     drop(scratch);
 }
 
-/// Proves WP-33 criterion 7 against a third-party server: **one proxy, one
+/// Proves acceptance criterion 7 against a third-party server: **one proxy, one
 /// config, both dialects, correct numbers for each.**
 ///
 /// The existing dialect unit tests prove the right `inline_string` is emitted

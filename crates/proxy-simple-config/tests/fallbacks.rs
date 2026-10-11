@@ -1,4 +1,4 @@
-//! WP-35 increment 2c acceptance tests: `routes[i].fallbacks` lowers to an
+//! Acceptance tests: `routes[i].fallbacks` lowers to an
 //! `envoy.clusters.aggregate` cluster that the Envoy-mode strict loader
 //! actually accepts (`cluster_type` + `lb_policy: CLUSTER_PROVIDED`, and none
 //! of the five fields an aggregate forbids), with the route's `cluster`

@@ -1,5 +1,5 @@
 # Deliberately its OWN workspace (the empty [workspace] table below), not a
-# member of the root Cargo.toml's workspace. WP-20 increment 5's whole point
+# member of the root Cargo.toml's workspace. The crate's whole point
 # is an opt-in, docker-gated check (`make xds-conformance`) that `make ci`
 # must never reach -- see README.md. Keeping this crate physically outside
 # the root workspace's `members` list means `cargo build --workspace` /

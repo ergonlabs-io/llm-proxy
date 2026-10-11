@@ -47,7 +47,7 @@
 //! A real provider cannot be forced to fail on demand, so there is no way to
 //! build this test against two live endpoints. The primary here is a closed
 //! `127.0.0.1` port -- nothing listening, a real connect failure, one of the
-//! two retriable failure modes WP-35's chain is built to fail over on. This
+//! two retriable failure modes the failover chain is built to fail over on. This
 //! proves *failover reaches a real provider*: the request that lands at
 //! OpenAI genuinely went through the aggregate-cluster failover mechanism,
 //! not a route pointed at OpenAI directly. It does **not** prove *failover
@@ -70,11 +70,11 @@
 //!
 //! ## Why every request is `x-llmproxy-model`-free
 //!
-//! Earlier e2e files set an `x-llmproxy-model` header explicitly. WP-45
-//! consumer B made that redundant: `body_rewrite_filter` derives the routing
-//! header from the request body's own `model` field (and strips any
-//! client-supplied one -- WP-45 decision 4, since trusting a client header
-//! for routing would let a client route itself around a fallback chain), so
+//! Earlier e2e files set an `x-llmproxy-model` header explicitly. That became
+//! redundant once `body_rewrite_filter` started deriving the routing header
+//! from the request body's own `model` field (and stripping any
+//! client-supplied one, since trusting a client header for routing would let a
+//! client route itself around a fallback chain), so
 //! every request below routes on `"model"` in its JSON body alone, the same
 //! way `auth_e2e.rs` already does.
 

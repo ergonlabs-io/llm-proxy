@@ -1,4 +1,4 @@
-// Request-body rewrite configuration for the llm-proxy data plane (WP-45 / WP-47).
+// Request-body rewrite configuration for the llm-proxy data plane.
 //
 // This message owns fields used by `llmproxy.body_rewrite`. The old
 // RuntimeFeatureFlag carrier remains accepted by a compatibility decoder for
