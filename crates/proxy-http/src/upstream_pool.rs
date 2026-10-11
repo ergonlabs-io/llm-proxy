@@ -18,9 +18,9 @@
 //! pool dials a fresh connection per stream), so h2 pooling was costing up
 //! to 5x peak concurrency versus h1 for the identical workload.
 //!
-//! The fix is a bounded *set* of connections (see [`MAX_CONNECTIONS_PER_KEY`])
+//! The fix is a bounded *set* of connections (see `MAX_CONNECTIONS_PER_KEY`)
 //! plus our own accounting of how many streams are in flight on each one
-//! (see [`SOFT_STREAMS_PER_CONNECTION`], [`StreamGuard`]) -- **not** hyper's
+//! (see `SOFT_STREAMS_PER_CONNECTION`, `StreamGuard`) -- **not** hyper's
 //! `SendRequest::poll_ready`/`is_ready`/`is_closed`. Read those three
 //! methods in `hyper-1.11.0/src/client/conn/http2.rs` before reaching for
 //! them here: for the h2 client they only ever report whether the
@@ -197,7 +197,7 @@ struct PooledConn {
 /// worker thread.
 type Slot = Rc<tokio::sync::Mutex<Vec<PooledConn>>>;
 
-/// A leased h2 sender plus the [`StreamGuard`] that must ride along with
+/// A leased h2 sender plus the `StreamGuard` that must ride along with
 /// whatever response body this stream produces -- see [`Self::send`].
 /// Returned by [`UpstreamConnCache::get_or_connect`] instead of a bare
 /// `SendRequest` (what the original single-connection design returned) so the router can't accidentally
@@ -210,7 +210,7 @@ pub struct PooledSendRequest {
 
 impl PooledSendRequest {
     /// Send `req` over this leased connection and keep this stream counted
-    /// as in-flight (see [`StreamGuard`]) for as long as the *response body*
+    /// as in-flight (see `StreamGuard`) for as long as the *response body*
     /// lives, not just until `codec::send_on_http2`'s `.await` resolves at
     /// the response head. LLM responses are commonly long-lived SSE streams,
     /// so "in flight" has to mean the whole stream duration or this cache's
@@ -320,7 +320,7 @@ impl Body for GuardedBody {
 /// `FilterChainHandler`'s `request_id_rng` gives for its own `RefCell`), so
 /// there is no cross-*thread* contention to guard against, only the
 /// single-threaded aliasing rule `RefCell` exists for. Each individual
-/// [`Slot`] is the one place this module needs a real async lock -- see
+/// `Slot` is the one place this module needs a real async lock -- see
 /// below.
 pub struct UpstreamConnCache {
     slots: RefCell<HashMap<ConnKey, Slot>>,
@@ -341,14 +341,14 @@ impl UpstreamConnCache {
 
     /// Return a leased h2 sender for `key`: a clone from whichever cached
     /// connection currently looks least busy, dialing a fresh one first if
-    /// none exist yet, none has room under [`SOFT_STREAMS_PER_CONNECTION`],
+    /// none exist yet, none has room under `SOFT_STREAMS_PER_CONNECTION`,
     /// or the set is empty because every prior occupant died (hazard 2:
     /// GOAWAY / upstream-initiated close). On a failed dial or handshake the
     /// cache is left holding no *new* entry for `key` (hazard 4) -- the
     /// caller's own retry, if any, or the next request simply tries again
     /// rather than getting stuck behind a poisoned one. Never returns an
     /// error purely because every existing connection is busy: once the set
-    /// is at [`MAX_CONNECTIONS_PER_KEY`], this hands out the least-loaded
+    /// is at `MAX_CONNECTIONS_PER_KEY`, this hands out the least-loaded
     /// member anyway and lets hyper's own per-connection queue (see this
     /// module's doc) absorb the rest, exactly as the original single connection
     /// already did for everything past its one connection's real capacity.
@@ -365,7 +365,7 @@ impl UpstreamConnCache {
     /// dial their own connection -- exactly the thundering-herd this whole
     /// cache exists to prevent (see the router's `two concurrent requests
     /// open exactly one connection` test, which still holds: under
-    /// [`SOFT_STREAMS_PER_CONNECTION`] load this still converges on one
+    /// `SOFT_STREAMS_PER_CONNECTION` load this still converges on one
     /// connection). The lock is scoped to one key (`Rc`-shared per `ConnKey`
     /// entry, not one lock for the whole cache), so two different clusters'
     /// dials never wait on each other, and it's held for this whole call
@@ -588,7 +588,7 @@ impl IdleH1Conn {
 /// still mid-flight (or that ended in an error, or that the caller gave up
 /// reading before EOF) would let the next request's bytes land while the
 /// peer is still mid-write of the previous response -- a real
-/// response/request desync, not just a wasted connection. See [`H1ReuseBody`]
+/// response/request desync, not just a wasted connection. See `H1ReuseBody`
 /// for where that decision is made, and why it's made in `Drop`.
 pub struct H1ConnCache {
     slots: RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>,
@@ -610,7 +610,7 @@ impl H1ConnCache {
     /// Return a leased h1 connection for `key`: the front of the idle queue
     /// if it holds anything still open, dialing (and handshaking) a fresh
     /// one otherwise. Every dead entry encountered while scanning (`sender.
-    /// is_closed()`) is discarded on the way past -- see [`IdleH1Conn::discard`]
+    /// is_closed()`) is discarded on the way past -- see `IdleH1Conn::discard`
     /// -- rather than left in the queue to be found again.
     ///
     /// Rust note: `self: Rc<Self>`, not `&self` -- this is one of Rust's
@@ -681,7 +681,7 @@ impl H1ConnCache {
 /// A leased h1 connection, ready to carry exactly one request -- returned by
 /// [`H1ConnCache::get_or_connect_h1`] instead of a bare `SendRequest` so the
 /// cache/key/task travel with it, for [`Self::send`] to hand to
-/// [`H1ReuseBody`] once the response comes back.
+/// `H1ReuseBody` once the response comes back.
 pub struct LeasedH1 {
     sender: Http1SendRequest<StreamBody>,
     conn_task: tokio::task::JoinHandle<()>,
