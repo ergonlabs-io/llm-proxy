@@ -180,14 +180,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   TcpProxyConfig's own field is ever touched.",
     },
     AllowlistEntry {
-        struct_name: "TenantCredentialSlot",
-        field_name: "verify_path",
-        kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "crates/proxy-admin/src/server.rs, put_tenant_credential_inner, \
-                 reads this field to pick the save-time probe cluster (ADR-0007 \
-                 decision 10). proxy-admin is control-side and outside RUNTIME_CRATES.",
-    },
-    AllowlistEntry {
         struct_name: "RetryOn",
         field_name: "envoy_ratelimited",
         kind: EntryKind::KnownInert,

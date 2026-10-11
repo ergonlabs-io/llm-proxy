@@ -64,7 +64,9 @@ fn a_stored_tenant_key_replaces_the_operator_key_and_survives_a_restart() {
         let stored = proxy.admin_ok(
             "PUT",
             &format!("/tenants/{TENANT}/provider_credentials/openrouter"),
-            &format!(r#"{{"schema_version":1,"api_key":"{TENANT_SENTINEL}"}}"#),
+            // Storage and restart are under test here, not the save-time
+            // probe (`tenant_credential_verify_e2e.rs`), so skip it.
+            &format!(r#"{{"schema_version":1,"api_key":"{TENANT_SENTINEL}","verify":false}}"#),
             200,
         );
         assert!(!stored.to_string().contains(TENANT_SENTINEL));
