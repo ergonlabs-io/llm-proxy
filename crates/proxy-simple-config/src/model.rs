@@ -238,6 +238,12 @@ pub struct Provider {
     /// keeps every config predating this field byte-identical in behavior.
     #[serde(default)]
     pub protocol: Option<UpstreamProtocol>,
+    /// Opts this provider into tenant provider credentials (ADR-0007). Its
+    /// cluster then carries a tenant credential slot with the same header the
+    /// operator key uses, so a tenant holding a key for this provider sends
+    /// that key instead. Requires `auth.tenant_credentials`. Default `false`.
+    #[serde(default)]
+    pub tenant_credentials: bool,
 }
 
 /// `providers.<name>.protocol`: which HTTP version the proxy dials this
@@ -277,6 +283,48 @@ pub struct Auth {
     /// before this field existed lowers unchanged.
     #[serde(default)]
     pub store: Option<AuthStore>,
+    /// The key ring that seals tenant provider credentials at rest
+    /// (ADR-0007 decision 2). Absent means the proxy cannot seal or open them.
+    #[serde(default)]
+    pub tenant_credentials: Option<TenantCredentials>,
+}
+
+/// `auth.tenant_credentials`: the key-encryption keys for tenant provider
+/// credentials. Mirrors `llmproxy.filters.v0.TenantCredentials`. Only key
+/// file paths appear here; the key bytes are read by the proxy from 0600
+/// files, never inlined.
+///
+/// Rust note: the required fields are `Option`s, not plain `String`s, so a
+/// missing one is reported by `lower.rs` at its full dotted path
+/// (`auth.tenant_credentials.encryption_key_id`). serde's own missing-field
+/// error would name only the enclosing struct.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantCredentials {
+    /// Path to the 32-byte key that new tenant credentials are sealed under.
+    /// Required and non-empty.
+    #[serde(default)]
+    pub encryption_key_file: Option<String>,
+    /// Names `encryption_key_file`'s key. It is stored in plaintext beside
+    /// each sealed credential. Required and non-empty.
+    #[serde(default)]
+    pub encryption_key_id: Option<String>,
+    /// Retired keys, kept decrypt-only so credentials sealed before a
+    /// rotation still open. May be empty.
+    #[serde(default)]
+    pub previous_keys: Vec<PreviousCredentialKey>,
+}
+
+/// One entry in `auth.tenant_credentials.previous_keys`. Both fields are
+/// required and non-empty; see [`TenantCredentials`] for why they are
+/// `Option`s.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousCredentialKey {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 /// `auth.store`: exactly one of three members, mirroring the `store` oneof on

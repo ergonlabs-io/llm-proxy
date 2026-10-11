@@ -155,6 +155,10 @@
         "store": {
           "description": "Where minted keys, revocations, and tenant policy live. Absent means `in_memory`, which keeps them only for the life of the process. Exactly one of the three shapes below, the same three the Envoy-mode `llmproxy.auth` filter accepts. The store is fixed at startup: changing it takes a restart, not a `SIGHUP` reload.",
           "$ref": "#/$defs/AuthStore"
+        },
+        "tenant_credentials": {
+          "$ref": "#/$defs/AuthTenantCredentials",
+          "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials."
         }
       },
       "oneOf": [
@@ -199,6 +203,40 @@
         { "required": ["url"], "not": { "required": ["url_file"] } },
         { "required": ["url_file"], "not": { "required": ["url"] } }
       ]
+    },
+    "AuthTenantCredentials": {
+      "type": "object",
+      "description": "Key-encryption keys that seal tenant provider credentials at rest. Each key is a 0600 file holding exactly 32 raw bytes. Required when any provider sets `tenant_credentials: true`.",
+      "additionalProperties": false,
+      "required": ["encryption_key_file", "encryption_key_id"],
+      "properties": {
+        "encryption_key_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to the key that new tenant credentials are sealed under. Read by the proxy at startup; the key bytes never appear in configuration."
+        },
+        "encryption_key_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Names `encryption_key_file`'s key. It is stored in plaintext beside each sealed credential so the proxy can pick the right key to open it."
+        },
+        "previous_keys": {
+          "type": "array",
+          "default": [],
+          "description": "Retired keys, kept decrypt-only so credentials sealed before a key rotation still open. Ids must be unique across this list and `encryption_key_id`.",
+          "items": { "$ref": "#/$defs/AuthTenantCredentialKey" }
+        }
+      }
+    },
+    "AuthTenantCredentialKey": {
+      "type": "object",
+      "description": "One retired key-encryption key.",
+      "additionalProperties": false,
+      "required": ["id", "file"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "Names this key. Stored beside each credential it sealed." },
+        "file": { "type": "string", "minLength": 1, "description": "Path to the retired key file. Same file rules as `encryption_key_file`." }
+      }
     },
     "AuthKey": {
       "type": "object",
@@ -343,6 +381,11 @@
           "description": "Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse: the proxy keeps one multiplexed connection per worker to this provider instead of connecting fresh on every request. Most hosted providers (OpenAI, Anthropic, and most OpenAI-compatible APIs) support it; many local/self-hosted plaintext servers do not. Defaults to `http1`.",
           "enum": ["http1", "http2"],
           "default": "http1"
+        },
+        "tenant_credentials": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let tenants with their own key for this provider send it instead of the operator key. Requires `auth.tenant_credentials`. Only header API-key provider types qualify: `openai`, `anthropic`, `openai-compatible`, `openrouter`, and `azure-openai`. `vertex` and `bedrock` are rejected."
         }
       },
       "not": {

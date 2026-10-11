@@ -734,6 +734,13 @@ fn lower_provider(
         "headers": headers_to_add,
         "models": provider_model_rewrites(config, name),
     });
+    // The tenant slot sits in the same object as the operator key, so the
+    // router reads both from one cluster. It is computed before the
+    // provider-type match so an opted-in Vertex/Bedrock provider is reported
+    // at the opt-in field, not at its missing OAuth2 or SigV4 secret.
+    if provider.tenant_credentials {
+        provider_auth["tenant_credential"] = tenant_credential_slot(config, name, provider_type)?;
+    }
     let mut path_template = None;
     match provider_type {
         ProviderType::Vertex => {
@@ -944,11 +951,60 @@ fn auth_header(
         (None, None) => return Ok(None),
         (Some(_), Some(_)) => unreachable!("validated: not both"),
     };
-    Ok(Some(match provider.effective_type(name) {
-        ProviderType::Anthropic => ("x-api-key".to_string(), key),
-        ProviderType::AzureOpenai => ("api-key".to_string(), key),
-        _ => ("authorization".to_string(), format!("Bearer {key}")),
-    }))
+    let (header, prefix) = api_key_header(provider.effective_type(name));
+    Ok(Some((header.to_string(), format!("{prefix}{key}"))))
+}
+
+/// The header and value prefix a provider type takes its API key in. Shared
+/// by the operator key ([`auth_header`]) and the tenant credential slot
+/// ([`tenant_credential_slot`]), so a tenant key is sent exactly where the
+/// operator key would have gone (ADR-0007 decision 1).
+fn api_key_header(provider_type: ProviderType) -> (&'static str, &'static str) {
+    match provider_type {
+        ProviderType::Anthropic => ("x-api-key", ""),
+        ProviderType::AzureOpenai => ("api-key", ""),
+        _ => ("authorization", "Bearer "),
+    }
+}
+
+/// The `tenant_credential` slot under `io.llmproxy.provider_auth` for a
+/// provider that set `tenant_credentials: true` (ADR-0007 decision 1). The
+/// slot names the provider label and the header shape from
+/// [`api_key_header`]. A cluster can carry a slot only when its credential
+/// is a header API key, so Vertex (OAuth2) and Bedrock (SigV4) are rejected
+/// here, at the opt-in field. The slot also needs the key ring, because a
+/// tenant key cannot be stored without it (ADR-0007 decision 2).
+fn tenant_credential_slot(
+    config: &SimpleConfig,
+    name: &str,
+    provider_type: ProviderType,
+) -> Result<Value, ConfigError> {
+    let field_path = format!("providers.{name}.tenant_credentials");
+    if matches!(provider_type, ProviderType::Vertex | ProviderType::Bedrock) {
+        return Err(ConfigError::InvalidValue {
+            field_path,
+            reason: format!(
+                "not supported for `{}` providers: they authenticate with OAuth2 or SigV4, \
+                 not a header API key, so their cluster cannot carry a tenant credential",
+                provider_type.as_str()
+            ),
+        });
+    }
+    if config
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.tenant_credentials.as_ref())
+        .is_none()
+    {
+        return Err(ConfigError::InvalidValue {
+            field_path,
+            reason: "requires `auth.tenant_credentials` (the key ring that seals tenant \
+                     credentials at rest); none is configured"
+                .to_string(),
+        });
+    }
+    let (header, prefix) = api_key_header(provider_type);
+    Ok(json!({ "provider": name, "header": header, "prefix": prefix }))
 }
 
 /// The token-extraction dialect this provider's responses speak.
@@ -1780,6 +1836,11 @@ fn lower_auth(
     if let Some((member, value)) = lower_auth_store(auth.store.as_ref())? {
         typed_config[member] = value;
     }
+    // Same rule as `store`: absent adds no field, so configs written before
+    // this block existed lower byte-identically.
+    if let Some(ring) = &auth.tenant_credentials {
+        typed_config["tenant_credentials"] = lower_tenant_credentials(ring)?;
+    }
 
     Ok(Some(json!({
         "name": AUTH_FILTER_NAME,
@@ -1855,6 +1916,55 @@ fn lower_auth_store(
             field_path: "auth.store".to_string(),
             reason: "set exactly one of in_memory, persistent, or shared".to_string(),
         }),
+    }
+}
+
+/// `auth.tenant_credentials` -> `llmproxy.filters.v0.TenantCredentials`,
+/// lowered verbatim. Only presence and non-emptiness are checked here. Key
+/// file contents, permissions, and size are checked by the auth filter when
+/// it opens the ring, and the key bytes are never read or echoed by this
+/// function.
+fn lower_tenant_credentials(ring: &TenantCredentials) -> Result<Value, ConfigError> {
+    let encryption_key_file = required_non_empty(
+        ring.encryption_key_file.as_deref(),
+        "auth.tenant_credentials.encryption_key_file",
+    )?;
+    let encryption_key_id = required_non_empty(
+        ring.encryption_key_id.as_deref(),
+        "auth.tenant_credentials.encryption_key_id",
+    )?;
+    let mut previous_keys = Vec::with_capacity(ring.previous_keys.len());
+    for (i, key) in ring.previous_keys.iter().enumerate() {
+        let id = required_non_empty(
+            key.id.as_deref(),
+            &format!("auth.tenant_credentials.previous_keys[{i}].id"),
+        )?;
+        let file = required_non_empty(
+            key.file.as_deref(),
+            &format!("auth.tenant_credentials.previous_keys[{i}].file"),
+        )?;
+        previous_keys.push(json!({ "id": id, "file": file }));
+    }
+    Ok(json!({
+        "encryption_key_file": encryption_key_file,
+        "encryption_key_id": encryption_key_id,
+        "previous_keys": previous_keys,
+    }))
+}
+
+/// A required string field: absent and empty are both errors, named at
+/// `field_path`.
+fn required_non_empty(value: Option<&str>, field_path: &str) -> Result<String, ConfigError> {
+    match value {
+        None => Err(ConfigError::InvalidValue {
+            field_path: field_path.to_string(),
+            reason: "is required".to_string(),
+        }),
+        Some("") => Err(ConfigError::InvalidValue {
+            field_path: field_path.to_string(),
+            reason: "must not be empty".to_string(),
+        }),
+        Some(value) => Ok(value.to_string()),
     }
 }
 
