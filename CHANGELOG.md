@@ -11,6 +11,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-11
+
+Follow-ups to tenant provider credentials: a configurable request body limit, a
+save-time key check, and tenant credentials on the Redis `shared` store. The
+"Dynamic configuration" milestone gate is still open; this tag does not close it.
+
 ### Added
 
 - `listen.max_request_body_bytes` in the `llmproxy` config file sets the largest
@@ -35,6 +41,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   several replicas can use them. A key stored through one replica reaches the
   others at their next policy poll. Every replica needs the same key-encryption
   key files. Tenant credentials still refuse the `in_memory` store.
+
+### Fixed
+
+- The ext_authz fail-open warning is logged once per process. Before, each worker
+  and each config reload logged it again.
+- An ext_authz call that runs past its deadline is reported as a timeout, not as a
+  transport error, when the authorization service cancels it first.
 
 ## [0.3.2] - 2026-10-11
 
