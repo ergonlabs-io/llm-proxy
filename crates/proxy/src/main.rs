@@ -2432,6 +2432,7 @@ async fn start_admin(
             readiness: runtime.readiness,
             cluster_state: runtime.cluster_state,
             ui,
+            lifecycle: None,
         },
     )
     .await

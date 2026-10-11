@@ -12,7 +12,9 @@
 //! [`server::ReadinessProbe`] was wired AND reports still-warming clusters,
 //! in which case it is `503 "INITIALIZING"` -- see that type's doc for the
 //! injected-closure seam and `crates/proxy/src/main.rs` for the production
-//! probe and its warming deadline.
+//! probe and its warming deadline. A third state, `503 "DRAINING"`, covers
+//! both a failed health check and a started drain (one shared
+//! [`proxy_core::lifecycle::LifecycleState`], read by that same probe).
 //!
 //! **Two READS are nonetheless gated exactly like writes: `GET
 //! /tenants/{id}/spend` and the key listing `GET
@@ -68,9 +70,17 @@
 //! operator-chosen `stat_prefix` for why `stat_prefix`, not the internal
 //! positional chain identity, is the externally-addressable name.
 //!
+//! Three more POST endpoints sit behind the same token gate and drive the
+//! shared lifecycle state: `/healthcheck/fail` (`/ready` answers DRAINING),
+//! `/healthcheck/ok` (clears that, but never undoes a drain), and
+//! `/drain_listeners` (starts the same drain as SIGTERM; the process keeps
+//! running until a signal arrives; `?graceful` and `?inboundonly` are accepted
+//! with no extra effect, any other query parameter is a 400). Without a wired
+//! lifecycle they answer 404. See `internal-docs/envoy-divergences.md`.
+//!
 //! Everything else 404s, naming the endpoints that exist. `/quitquitquit`,
-//! `/drain_listeners`, and `/logging` (Envoy's own admin mutating
-//! endpoints) are not part of this API and stay 404.
+//! `/logging`, and `/listeners` (Envoy admin endpoints) are not part of this
+//! API and stay 404.
 //!
 //! The single-page admin UI (`admin-ui/`, built by `make ui-build`) is served
 //! from memory under `GET /ui`, `GET /ui/`, and `GET /ui/<asset>` when the

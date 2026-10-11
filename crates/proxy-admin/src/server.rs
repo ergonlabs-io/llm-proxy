@@ -44,6 +44,7 @@ use hyper::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use proxy_core::lifecycle::LifecycleState;
 use proxy_core::WorkerConfigHandle;
 use proxy_filters::auth::{KeyId, TenantId};
 use proxy_filters::control::{ControlPlane, StoreError};
@@ -67,6 +68,10 @@ use crate::dump::{
 /// strings.
 const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/ready",
+    // Gated lifecycle writes (POST); see `handle_lifecycle`.
+    "/healthcheck/fail",
+    "/healthcheck/ok",
+    "/drain_listeners",
     "/config_dump",
     "/clusters",
     "/server_info",
@@ -126,6 +131,11 @@ pub enum Readiness {
     /// probe's owner, `crates/proxy/src/main.rs`, which knows when the
     /// deadline fires and can suppress repeats).
     Initializing { warming: Vec<String> },
+    /// The process is out of rotation, either because `/healthcheck/fail`
+    /// was called or because a drain started (SIGTERM or
+    /// `POST /drain_listeners`): `/ready` returns `503 "DRAINING"`, Envoy's
+    /// server-state text for the same condition.
+    Draining,
 }
 
 /// Where `/ready` gets its answer. A plain synchronous closure (not `async`,
@@ -188,6 +198,12 @@ pub struct AdminRuntime {
     /// answers 404 with a hint instead of an empty 200 -- the same honesty
     /// rule as the unwired-`/stats` 404 above.
     pub ui: Option<Arc<UiAssets>>,
+    /// Shared lifecycle state behind `POST /healthcheck/fail`,
+    /// `/healthcheck/ok`, and `/drain_listeners`. `None` makes those three
+    /// answer 404 (after the token gate), the same honesty rule as the
+    /// unwired `/stats`. The admin server only WRITES this state; `/ready`
+    /// is still answered solely by [`ReadinessProbe`].
+    pub lifecycle: Option<Arc<LifecycleState>>,
 }
 
 /// One static file served under `/ui/`.
@@ -451,6 +467,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
                 Some(Readiness::Initializing { .. }) => {
                     text(StatusCode::SERVICE_UNAVAILABLE, "INITIALIZING")
                 }
+                Some(Readiness::Draining) => text(StatusCode::SERVICE_UNAVAILABLE, "DRAINING"),
             };
         }
         "/config_dump" => {
@@ -586,6 +603,12 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         return unauthorized("missing or invalid bearer token");
     }
 
+    // Lifecycle routes need no ControlPlane, so they leave after the same two
+    // gates every other write passes (one gate, not a second copy of it).
+    if let Some(action) = route.lifecycle_action() {
+        return handle_lifecycle(action, runtime.lifecycle.as_deref(), req.uri().query());
+    }
+
     // Gate 3: does the control plane exist, and is it unambiguous which one
     // this write means?
     //
@@ -691,7 +714,67 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => {
             handle_set_pricing(factory_state, stat_prefix_opt, &body)
         }
+        WriteRoute::HealthCheckFail | WriteRoute::HealthCheckOk | WriteRoute::DrainListeners => {
+            unreachable!("lifecycle routes return before the control-plane gate")
+        }
     }
+}
+
+/// The three lifecycle writes, split out of [`WriteRoute`] so
+/// [`handle_lifecycle`] matches on a type with no control-plane variants.
+#[derive(Clone, Copy)]
+enum LifecycleAction {
+    FailHealthCheck,
+    RestoreHealthCheck,
+    DrainListeners,
+}
+
+/// `POST /healthcheck/fail`, `/healthcheck/ok`, `/drain_listeners`. Callers
+/// have already passed the token gate.
+///
+/// `/drain_listeners` accepts the Envoy flags `graceful` and `inboundonly`
+/// (istio sends `?inboundonly&graceful`); both are accepted with no extra
+/// effect because the drain is always the full graceful one. Any other query
+/// parameter is a 400 naming it, so a typo'd flag is never silently dropped.
+/// Logs carry no credentials: only the action and whether it changed state.
+fn handle_lifecycle(
+    action: LifecycleAction,
+    lifecycle: Option<&LifecycleState>,
+    query: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let Some(lifecycle) = lifecycle else {
+        return text(
+            StatusCode::NOT_FOUND,
+            "lifecycle control is not configured for this admin server instance",
+        );
+    };
+    match action {
+        LifecycleAction::FailHealthCheck => {
+            lifecycle.fail_health_check();
+            tracing::info!("admin: health check set to fail; /ready now answers DRAINING");
+        }
+        LifecycleAction::RestoreHealthCheck => {
+            lifecycle.restore_health_check();
+            tracing::info!("admin: health check restored (a started drain is not undone)");
+        }
+        LifecycleAction::DrainListeners => {
+            for param in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+                let name = param.split('=').next().unwrap_or(param);
+                if name != "graceful" && name != "inboundonly" {
+                    return bad_request(&format!(
+                        "unsupported query parameter '{name}' on /drain_listeners; \
+                         accepted: graceful, inboundonly"
+                    ));
+                }
+            }
+            if lifecycle.request_drain() {
+                tracing::info!("admin: drain requested via /drain_listeners");
+            } else {
+                tracing::info!("admin: /drain_listeners called while already draining");
+            }
+        }
+    }
+    text(StatusCode::OK, "OK")
 }
 
 /// One of the write-capable paths this server recognizes, with the path
@@ -745,6 +828,12 @@ enum WriteRoute<'a> {
     ScopedTenantSpend(&'a str, &'a str),
     Pricing,
     ScopedPricing(&'a str),
+    /// `POST /healthcheck/fail`, `/healthcheck/ok`, `/drain_listeners`: gated
+    /// like a write but they touch no `ControlPlane`; see
+    /// [`Self::lifecycle_action`].
+    HealthCheckFail,
+    HealthCheckOk,
+    DrainListeners,
 }
 
 impl<'a> WriteRoute<'a> {
@@ -760,12 +849,24 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::TenantBudget(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
             WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => Method::PUT,
+            WriteRoute::HealthCheckFail
+            | WriteRoute::HealthCheckOk
+            | WriteRoute::DrainListeners => Method::POST,
             WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
             WriteRoute::ScopedKeyBudget(..) => Method::PUT,
             WriteRoute::ScopedKeySpend(..) => Method::GET,
             WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
             WriteRoute::ScopedTenantBudget(..) => Method::PUT,
+        }
+    }
+
+    fn lifecycle_action(&self) -> Option<LifecycleAction> {
+        match self {
+            WriteRoute::HealthCheckFail => Some(LifecycleAction::FailHealthCheck),
+            WriteRoute::HealthCheckOk => Some(LifecycleAction::RestoreHealthCheck),
+            WriteRoute::DrainListeners => Some(LifecycleAction::DrainListeners),
+            _ => None,
         }
     }
 
@@ -784,7 +885,10 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::TenantById(_)
             | WriteRoute::TenantPolicy(_)
             | WriteRoute::TenantBudget(_)
-            | WriteRoute::TenantSpend(_) => None,
+            | WriteRoute::TenantSpend(_)
+            | WriteRoute::HealthCheckFail
+            | WriteRoute::HealthCheckOk
+            | WriteRoute::DrainListeners => None,
             WriteRoute::ScopedKeyList(s)
             | WriteRoute::ScopedKeys(s)
             | WriteRoute::ScopedTenants(s)
@@ -868,6 +972,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
             Some(WriteRoute::ScopedTenantSpend(stat_prefix, id))
         }
         ["pricing"] => Some(WriteRoute::Pricing),
+        ["healthcheck", "fail"] => Some(WriteRoute::HealthCheckFail),
+        ["healthcheck", "ok"] => Some(WriteRoute::HealthCheckOk),
+        ["drain_listeners"] => Some(WriteRoute::DrainListeners),
         ["chains", stat_prefix, "pricing"] => Some(WriteRoute::ScopedPricing(stat_prefix)),
         _ => None,
     }

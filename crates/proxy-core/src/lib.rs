@@ -5,6 +5,7 @@
 pub mod drain;
 pub mod filter_chain;
 pub mod header_mutation_filter;
+pub mod lifecycle;
 pub mod listener;
 pub mod net_filter;
 pub mod runtime;

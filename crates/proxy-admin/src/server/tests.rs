@@ -18,6 +18,7 @@ use proxy_config::ir::{
     LbPolicy, ListenerConfig, NetworkFilterSpec, PathMatch, RouteActionIR, RouteEntry,
     RouteMatcher, RouteTable, SnapshotVersion, UpstreamProtocol, VirtualHostIR,
 };
+use proxy_core::lifecycle::LifecycleState;
 use proxy_core::runtime::SnapshotHandles;
 use proxy_filters::auth::{
     AuthError, AuthOutcome, Authenticator, HmacSecret, KeyId, KeySet, TenantId,
@@ -422,6 +423,7 @@ async fn start_full_with_readiness(
             readiness,
             cluster_state: None,
             ui: None,
+            lifecycle: None,
         },
     )
     .await
@@ -449,6 +451,7 @@ async fn start_with_cluster_state(
             readiness: None,
             cluster_state: Some(cluster_state),
             ui: None,
+            lifecycle: None,
         },
     )
     .await
@@ -985,15 +988,184 @@ async fn stats_prometheus_body_is_the_summed_value_across_workers() {
     );
 }
 
-/// The mutating endpoints Envoy names (`/quitquitquit`, `/drain_listeners`,
-/// `/logging`) are not part of this API at all -- unlike `/keys`/`/tenants`
-/// below, they must not accidentally work.
+/// The Envoy admin endpoints we deliberately do not implement
+/// (`/quitquitquit`, `/logging`, `/listeners`; see envoy-divergences.md)
+/// must not accidentally work, so adding one has to be a decision. Probed
+/// with a wired lifecycle and a valid token, the most permissive setup.
 #[tokio::test]
-async fn mutating_endpoints_are_404() {
-    let (_server, addr) = start(snapshot_with_secret()).await;
-    for path in ["/quitquitquit", "/drain_listeners", "/logging"] {
-        let (status, _) = get(addr, path).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "path {path} should 404");
+async fn unimplemented_envoy_admin_endpoints_are_404() {
+    let (_server, addr, _state) = start_lifecycle(Some(ADMIN_TOKEN)).await;
+    for path in ["/quitquitquit", "/logging", "/listeners"] {
+        for method in ["GET", "POST"] {
+            let (status, _, _) = request(addr, method, path, Some(ADMIN_TOKEN), "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path} should 404");
+        }
+    }
+}
+
+/// Starts an admin server whose `/ready` probe reads the same
+/// [`LifecycleState`] the lifecycle endpoints write -- the production wiring
+/// shape (the binary builds the probe), so tests prove the shared-state
+/// contract at the HTTP boundary.
+async fn start_lifecycle(
+    admin_token: Option<&str>,
+) -> (AdminServer, SocketAddr, Arc<LifecycleState>) {
+    let state = Arc::new(LifecycleState::new());
+    let probe_state = Arc::clone(&state);
+    let probe: ReadinessProbe = Arc::new(move || {
+        if probe_state.out_of_rotation() {
+            Readiness::Draining
+        } else {
+            Readiness::Live
+        }
+    });
+    let config = SnapshotHandles::new().register(snapshot_with_secret());
+    let server = serve(
+        "127.0.0.1:0".parse().unwrap(),
+        AdminRuntime {
+            config,
+            registry: None,
+            started_at: Instant::now(),
+            factory_state: Arc::new(SharedFactoryState::default()),
+            admin_token: admin_token.map(str::to_string),
+            readiness: Some(probe),
+            cluster_state: None,
+            ui: None,
+            lifecycle: Some(Arc::clone(&state)),
+        },
+    )
+    .await
+    .expect("admin server bind");
+    let addr = server.local_addr();
+    (server, addr, state)
+}
+
+async fn ready(addr: SocketAddr) -> (StatusCode, String) {
+    get(addr, "/ready").await
+}
+
+#[tokio::test]
+async fn healthcheck_fail_and_ok_toggle_ready() {
+    let (_server, addr, state) = start_lifecycle(Some(ADMIN_TOKEN)).await;
+    assert_eq!(ready(addr).await, (StatusCode::OK, "LIVE".to_string()));
+
+    let (status, _, body) = request(addr, "POST", "/healthcheck/fail", Some(ADMIN_TOKEN), "").await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "OK"));
+    assert_eq!(
+        ready(addr).await,
+        (StatusCode::SERVICE_UNAVAILABLE, "DRAINING".to_string())
+    );
+    assert!(
+        !state.is_draining(),
+        "a health-check failure is not a drain"
+    );
+
+    let (status, _, body) = request(addr, "POST", "/healthcheck/ok", Some(ADMIN_TOKEN), "").await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "OK"));
+    assert_eq!(ready(addr).await, (StatusCode::OK, "LIVE".to_string()));
+}
+
+#[tokio::test]
+async fn drain_listeners_is_one_way_and_idempotent() {
+    let (_server, addr, state) = start_lifecycle(Some(ADMIN_TOKEN)).await;
+
+    // Two calls: the second is also 200, not an error.
+    for _ in 0..2 {
+        let (status, _, body) =
+            request(addr, "POST", "/drain_listeners", Some(ADMIN_TOKEN), "").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "OK"));
+    }
+    assert_eq!(
+        ready(addr).await,
+        (StatusCode::SERVICE_UNAVAILABLE, "DRAINING".to_string())
+    );
+
+    // /healthcheck/ok must not reopen a drained process.
+    let (status, _, _) = request(addr, "POST", "/healthcheck/ok", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ready(addr).await,
+        (StatusCode::SERVICE_UNAVAILABLE, "DRAINING".to_string())
+    );
+
+    assert!(state.is_draining());
+    tokio::time::timeout(Duration::from_secs(5), state.drain_requested())
+        .await
+        .expect("the signal loop's wake-up must fire");
+}
+
+/// Fail-closed gate for the lifecycle writes: no token configured -> 403,
+/// wrong token -> 401, wrong verb -> 405, and in every case the state is
+/// untouched (asserting the negative: a gate that answers 403 after acting
+/// would still pass a status-only check).
+#[tokio::test]
+async fn lifecycle_writes_refused_by_the_gate_change_nothing() {
+    for (configured, presented, method, expected) in [
+        (None, Some(ADMIN_TOKEN), "POST", StatusCode::FORBIDDEN),
+        (
+            Some(ADMIN_TOKEN),
+            Some("wrong-token"),
+            "POST",
+            StatusCode::UNAUTHORIZED,
+        ),
+        (Some(ADMIN_TOKEN), None, "POST", StatusCode::UNAUTHORIZED),
+        (
+            Some(ADMIN_TOKEN),
+            Some(ADMIN_TOKEN),
+            "GET",
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ] {
+        let (_server, addr, state) = start_lifecycle(configured).await;
+        for path in ["/healthcheck/fail", "/healthcheck/ok", "/drain_listeners"] {
+            let (status, _, _) = request(addr, method, path, presented, "").await;
+            assert_eq!(
+                status, expected,
+                "{method} {path} configured={configured:?}"
+            );
+        }
+        assert_eq!(ready(addr).await, (StatusCode::OK, "LIVE".to_string()));
+        assert!(!state.is_draining());
+        assert!(!state.out_of_rotation());
+    }
+}
+
+#[tokio::test]
+async fn drain_listeners_query_flags_are_strict() {
+    for (query, expected, drains) in [
+        ("?inboundonly&graceful", StatusCode::OK, true),
+        ("?graceful", StatusCode::OK, true),
+        ("?bogus", StatusCode::BAD_REQUEST, false),
+        ("?graceful&bogus=1", StatusCode::BAD_REQUEST, false),
+    ] {
+        let (_server, addr, state) = start_lifecycle(Some(ADMIN_TOKEN)).await;
+        let path = format!("/drain_listeners{query}");
+        let (status, _, body) = request(addr, "POST", &path, Some(ADMIN_TOKEN), "").await;
+        assert_eq!(status, expected, "{query}: {body}");
+        if !drains {
+            assert!(
+                body.contains("bogus"),
+                "400 must name the parameter: {body}"
+            );
+        }
+        assert_eq!(state.is_draining(), drains, "{query}");
+    }
+}
+
+/// With no lifecycle wired (the admin server used standalone) the endpoints
+/// are an honest 404, not a 200 that did nothing.
+#[tokio::test]
+async fn lifecycle_writes_without_a_wired_lifecycle_are_404() {
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        Arc::new(SharedFactoryState::default()),
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    for path in ["/healthcheck/fail", "/healthcheck/ok", "/drain_listeners"] {
+        let (status, _, _) = request(addr, "POST", path, Some(ADMIN_TOKEN), "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
 }
 
@@ -2789,6 +2961,7 @@ async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::Pa
             readiness: None,
             cluster_state: None,
             ui: Some(Arc::new(ui)),
+            lifecycle: None,
         },
     )
     .await
