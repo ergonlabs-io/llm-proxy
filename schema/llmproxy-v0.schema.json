@@ -166,7 +166,7 @@
         },
         "tenant_credentials": {
           "$ref": "#/$defs/AuthTenantCredentials",
-          "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials."
+          "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials. Requires a durable `store`, `persistent` or `shared`; with `store` absent or `in_memory` this block is a load error."
         }
       },
       "oneOf": [

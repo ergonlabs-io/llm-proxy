@@ -31,6 +31,10 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   request body limit, as in Envoy, not a fixed 1 MiB. Before, a listener with a
   raised limit never retried a body over 1 MiB.
 - `VERSION` matches the Cargo workspace version, and `make ci` checks it.
+- The Redis `shared` store holds tenant provider credentials, so a proxy with
+  several replicas can use them. A key stored through one replica reaches the
+  others at their next policy poll. Every replica needs the same key-encryption
+  key files. Tenant credentials still refuse the `in_memory` store.
 
 ## [0.3.2] - 2026-10-11
 
