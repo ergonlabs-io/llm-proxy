@@ -528,6 +528,11 @@ struct InMemoryState {
     // Independent of `policies` above -- see
     // `StoredControlPlane::budgets`'s doc.
     budgets: HashMap<TenantId, TenantBudget>,
+    // Credential rows keyed by `(tenant, provider)` -- the exact
+    // create-or-replace identity `put_tenant_credential` names (ADR-0007
+    // §2). A map rather than a `Vec` so a second put for the same pair
+    // replaces in place and `load` can never return duplicates for it.
+    tenant_credentials: HashMap<(TenantId, String), StoredTenantCredential>,
     // Keyed on the full `(stat_prefix, tenant,
     // period)` triple as one tuple key -- there is no `load()`-style
     // wholesale read for spend (each row is read/written independently by
@@ -568,6 +573,7 @@ impl InMemoryControlPlaneStore {
                 keys: HashMap::new(),
                 policies: HashMap::new(),
                 budgets: HashMap::new(),
+                tenant_credentials: HashMap::new(),
                 spend: HashMap::new(),
                 spend_seq: HashMap::new(),
                 generation: 0,
@@ -598,7 +604,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             keys: state.keys.values().cloned().collect(),
             policies: state.policies.clone(),
             budgets: state.budgets.clone(),
-            tenant_credentials: Vec::new(),
+            tenant_credentials: state.tenant_credentials.values().cloned().collect(),
         })
     }
 
@@ -633,8 +639,65 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         // with it, the same "a deleted tenant carries no leftover
         // configuration" rule `set_policy`'s removal already follows.
         state.budgets.remove(tenant);
+        // A deleted tenant takes its credential rows with it too (ADR-0007
+        // §2), under this SAME lock acquisition so the single generation
+        // bump below covers the whole deletion -- a reader never observes
+        // the tenant gone while one of its credential rows is still there
+        // to be applied upstream.
+        state.tenant_credentials.retain(|(t, _), _| t != tenant);
         state.generation += 1;
         Ok(())
+    }
+
+    // No tenant-existence check, exactly like `set_policy` and `put_key`
+    // above: both write their row for any tenant id without consulting
+    // `state.tenants` first, so the row is valid the moment it is written
+    // and credential rows follow the same rule (ADR-0007 §2).
+    fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
+        // Reject an unknown schema_version BEFORE any write: a row stamped
+        // by a future build must never enter a store this build's `load`
+        // would then refuse to read back (ADR-0007 §2). Nothing was
+        // written, so there is NO generation bump -- see
+        // `ControlPlaneStore::policy_generation`'s doc.
+        if rec.schema_version != TENANT_CREDENTIALS_SCHEMA_VERSION {
+            return Err(StoreError::Conflict(
+                "unsupported tenant credential schema_version".into(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        state
+            .tenant_credentials
+            .insert((rec.tenant.clone(), rec.provider.clone()), rec.clone());
+        state.generation += 1;
+        Ok(())
+    }
+
+    fn delete_tenant_credential(
+        &self,
+        tenant: &TenantId,
+        provider: &str,
+    ) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        match state
+            .tenant_credentials
+            .remove(&(tenant.clone(), provider.to_string()))
+        {
+            // A successful delete is a tier-2 write and bumps like every
+            // other one -- see `ControlPlaneStore::policy_generation`'s doc.
+            Some(_) => {
+                state.generation += 1;
+                Ok(())
+            }
+            // Nothing was written -- must NOT bump, mirroring
+            // `revoke_key`'s NotFound arm above.
+            None => Err(StoreError::NotFound),
+        }
     }
 
     fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
@@ -835,6 +898,15 @@ const SPEND_SEQ_TABLE: TableDefinition<(&str, &str, &str, &str), u64> =
 // `insert` regardless of which of the six tier-2 tables the accompanying
 // write actually touched.
 const GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("generation");
+// A tenant's own provider credential row (ADR-0007 §2), keyed
+// `(tenant, provider)` -- the same create-or-replace identity
+// `ControlPlaneStore::put_tenant_credential` names. A tuple key like
+// `SPEND_TABLE`'s (redb implements `Key` for tuples natively), and the
+// pair lets `delete_tenant` sweep one tenant's rows by filtering on the
+// first component without a reverse index. The value is JSON bytes, same
+// encoding as every other table here -- see [`EncodedKeyRow`]'s doc.
+const TENANT_CREDENTIALS_TABLE: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("tenant_credentials");
 
 /// One `keys` row, exactly as `redb` stores it -- everything a [`StoredKey`]
 /// carries except `key_id`, which is already the table's key and would just
@@ -978,6 +1050,147 @@ impl From<EncodedTenantBudget> for TenantBudget {
     }
 }
 
+/// Only version this build understands for a tenant credential row
+/// (ADR-0007 §2). A row stamped by a future build fails closed on load
+/// rather than being half-read -- see [`decode_tenant_credential_row`].
+const TENANT_CREDENTIALS_SCHEMA_VERSION: u16 = 1;
+
+/// One `tenant_credentials` row, exactly as `redb` stores it -- a private
+/// mirror, following [`EncodedKeyRow`]'s precedent: `tenant` and `provider`
+/// are NOT repeated in the value because the table's composite key already
+/// holds them, and a second, independently-editable copy of the same fact
+/// could disagree with the key it is filed under.
+///
+/// Two deliberate differences from the public [`StoredTenantCredential`],
+/// both about the stored form being inert bytes-in-JSON:
+/// - `nonce` and `ciphertext` are LOWERCASE hex strings, not raw byte
+///   arrays: JSON strings must be valid UTF-8, so arbitrary ciphertext
+///   bytes cannot ride in them unescaped, and hex keeps a row readable in
+///   a dump with no binary codec (the same rendering `auth::digest_hex`
+///   uses for digests).
+/// - serde lives only on THIS type; [`StoredTenantCredential`] stays a
+///   plain data struct whose serialization this store alone defines.
+///
+/// `schema_version` rides along for the fail-closed check in
+/// [`decode_tenant_credential_row`] -- see [`EncodedKeyRow`]'s
+/// `schema_version` for the same convention on key rows.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EncodedTenantCredentialRow {
+    schema_version: u16,
+    key_id: String,
+    nonce: String,
+    ciphertext: String,
+    last4: String,
+    fingerprint: String,
+    created_at: String,
+    updated_at: String,
+    verified_at: Option<String>,
+}
+
+impl From<&StoredTenantCredential> for EncodedTenantCredentialRow {
+    fn from(rec: &StoredTenantCredential) -> Self {
+        EncodedTenantCredentialRow {
+            schema_version: rec.schema_version,
+            key_id: rec.key_id.clone(),
+            nonce: encode_hex_lower(&rec.nonce),
+            ciphertext: encode_hex_lower(&rec.ciphertext),
+            last4: rec.last4.clone(),
+            fingerprint: rec.fingerprint.clone(),
+            created_at: rec.created_at.clone(),
+            updated_at: rec.updated_at.clone(),
+            verified_at: rec.verified_at.clone(),
+        }
+    }
+}
+
+/// Lowercase hex rendering of `bytes` -- the encoding
+/// [`EncodedTenantCredentialRow`] stores `nonce`/`ciphertext` in.
+fn encode_hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Inverse of [`encode_hex_lower`]. Deliberately accepts ONLY `0-9a-f`:
+/// the store writes lowercase, so an uppercase digit in a stored row means
+/// it was written by something other than this code path, and failing
+/// closed on that beats silently accepting two spellings of one value
+/// (the same "must be lowercase hex" rule
+/// `auth_filter::parse_digest_hex` enforces). `None` on any violation --
+/// the caller builds the error, which must never quote the value itself.
+fn decode_hex_lower(hex: &str) -> Option<Vec<u8>> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    let raw = hex.as_bytes();
+    // `as_chunks` gives the pairs plus whatever trailing half-pair remains;
+    // an odd-length string is exactly a non-empty remainder.
+    let (pairs, remainder) = raw.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
+/// Decodes one stored credential row, failing CLOSED with a message that
+/// names the tenant and provider -- always known here, since they come from
+/// the table's own key -- and nothing else about the row.
+///
+/// Every failure path (unparseable JSON, a `schema_version` that is not
+/// [`TENANT_CREDENTIALS_SCHEMA_VERSION`], bad hex, a wrong-length nonce)
+/// returns [`StoreError::Unavailable`] for the WHOLE [`ControlPlaneStore::load`]:
+/// a row this build cannot fully understand is not a row to skip, because
+/// silently loading the other rows would drop a tenant's credential from
+/// the snapshot and let that tenant fall back to the platform key
+/// (ADR-0007 §3). The serde error text is deliberately NOT propagated --
+/// a serde message can echo the offending field's value, and the one thing
+/// that must never render here is ciphertext (AGENTS.md "Fail-open
+/// controls": check what the log line renders).
+fn decode_tenant_credential_row(
+    tenant: &str,
+    provider: &str,
+    value: &[u8],
+) -> Result<StoredTenantCredential, StoreError> {
+    let bad = |detail: String| {
+        StoreError::Unavailable(format!(
+            "tenant credential row for tenant {tenant:?} provider {provider:?} {detail}; \
+             refusing the whole control-plane load"
+        ))
+    };
+    let row: EncodedTenantCredentialRow = serde_json::from_slice(value)
+        .map_err(|_| bad("does not parse as a tenant credential row".to_string()))?;
+    if row.schema_version != TENANT_CREDENTIALS_SCHEMA_VERSION {
+        return Err(bad(format!(
+            "has schema_version {}, but only {TENANT_CREDENTIALS_SCHEMA_VERSION} is supported",
+            row.schema_version
+        )));
+    }
+    let nonce: [u8; 12] = decode_hex_lower(&row.nonce)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| bad("has a nonce that is not exactly 12 lowercase hex bytes".into()))?;
+    let ciphertext = decode_hex_lower(&row.ciphertext)
+        .ok_or_else(|| bad("has a ciphertext that is not lowercase hex".into()))?;
+    Ok(StoredTenantCredential {
+        schema_version: row.schema_version,
+        tenant: TenantId::new(tenant),
+        provider: provider.to_string(),
+        key_id: row.key_id,
+        nonce,
+        ciphertext,
+        last4: row.last4,
+        fingerprint: row.fingerprint,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        verified_at: row.verified_at,
+    })
+}
+
 pub(crate) fn encode_json<T: serde::Serialize>(value: &T) -> Vec<u8> {
     // Rust note: `.expect`, not `?` -- every value passed here is one of
     // this module's own plain-data types (`EncodedKeyRow`, `EncodedModelAccess`,
@@ -1064,8 +1277,8 @@ impl RedbControlPlaneStore {
         Ok(store)
     }
 
-    /// Creates all tables if they do not already exist -- seven (`SPEND_TABLE`,
-    /// `GENERATION_TABLE` and `SPEND_SEQ_TABLE` are the most recent three).
+    /// Creates all tables if they do not already exist -- nine
+    /// (`TENANT_CREDENTIALS_TABLE` is the newest).
     ///
     /// Rust note: this runs a WRITE transaction even though it inserts no
     /// rows -- `WriteTransaction::open_table` is the only `redb` API that
@@ -1074,7 +1287,11 @@ impl RedbControlPlaneStore {
     /// Doing this once at construction means [`Self::load`] (always a read
     /// transaction) never has to tell "table exists and is empty" apart from
     /// "table was never created" -- both read back as empty, which is what a
-    /// freshly-opened store should report either way.
+    /// freshly-opened store should report either way. It is also what makes
+    /// an EXISTING database file from before a newer table existed still
+    /// openable: `open_table` creates the missing table rather than erroring
+    /// on it, so the file gains the table on first open (pinned by
+    /// `redb_opens_a_database_file_created_before_the_tenant_credentials_table_existed`).
     fn ensure_tables(&self) -> Result<(), StoreError> {
         let txn = self.db.begin_write().map_err(store_err)?;
         txn.open_table(TENANTS_TABLE).map_err(store_err)?;
@@ -1082,6 +1299,8 @@ impl RedbControlPlaneStore {
         txn.open_table(KEYS_BY_TENANT_TABLE).map_err(store_err)?;
         txn.open_table(POLICIES_TABLE).map_err(store_err)?;
         txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
+        txn.open_table(TENANT_CREDENTIALS_TABLE)
+            .map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
         txn.open_table(GENERATION_TABLE).map_err(store_err)?;
@@ -1220,12 +1439,30 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             budgets.insert(TenantId::new(key.value()), encoded.into());
         }
 
+        // Credential rows decode through their own fail-closed helper: one
+        // row this build cannot fully understand makes the WHOLE load an
+        // `Err`, so a half-understood store never becomes a snapshot that
+        // silently drops a tenant's credential (ADR-0007 §2-3).
+        let credentials_table = txn
+            .open_table(TENANT_CREDENTIALS_TABLE)
+            .map_err(store_err)?;
+        let mut tenant_credentials = Vec::new();
+        for entry in credentials_table.iter().map_err(store_err)? {
+            let (key, value) = entry.map_err(store_err)?;
+            let (tenant, provider) = key.value();
+            tenant_credentials.push(decode_tenant_credential_row(
+                tenant,
+                provider,
+                value.value(),
+            )?);
+        }
+
         Ok(StoredControlPlane {
             tenants,
             keys,
             policies,
             budgets,
-            tenant_credentials: Vec::new(),
+            tenant_credentials,
         })
     }
 
@@ -1263,10 +1500,106 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             let mut budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
             budgets_table.remove(tenant.as_str()).map_err(store_err)?;
         }
+        {
+            // A deleted tenant's credential rows go with it (ADR-0007 §2),
+            // inside this SAME write transaction so the single
+            // `bump_generation` below covers the whole deletion -- a reader
+            // never observes the tenant gone with its rows still filed (or
+            // the reverse). The table is keyed `(tenant, provider)` and
+            // redb has no prefix-delete, so collect this tenant's keys
+            // first -- the read guards must drop before `remove` can take
+            // the table mutably -- then remove them. The range starts at
+            // `(tenant, "")`: `""` sorts before every provider name, so
+            // the bound covers all of this tenant's rows, and because keys
+            // sort by tenant first, the first row past this tenant ends
+            // the scan instead of walking the rest of the table.
+            let mut table = txn
+                .open_table(TENANT_CREDENTIALS_TABLE)
+                .map_err(store_err)?;
+            let mut doomed: Vec<(String, String)> = Vec::new();
+            for entry in table.range((tenant.as_str(), "")..).map_err(store_err)? {
+                let (key, _value) = entry.map_err(store_err)?;
+                let (row_tenant, provider) = key.value();
+                if row_tenant != tenant.as_str() {
+                    break;
+                }
+                doomed.push((row_tenant.to_string(), provider.to_string()));
+            }
+            for (row_tenant, provider) in &doomed {
+                table
+                    .remove((row_tenant.as_str(), provider.as_str()))
+                    .map_err(store_err)?;
+            }
+        }
         // Matches `InMemoryControlPlaneStore::delete_tenant` exactly: `keys`
         // and `keys_by_tenant` are left untouched. A tenant's keys outliving
         // the tenant row is the existing, deliberate InMemory behavior this
         // store must not silently diverge from -- see the parity test below.
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
+        // Reject an unknown schema_version BEFORE any write -- before the
+        // write transaction even begins: a row stamped by a future build
+        // must never enter a store this build's `load` would then refuse
+        // to read back (ADR-0007 §2). Nothing was written, so the
+        // generation is NOT bumped -- see
+        // `ControlPlaneStore::policy_generation`'s doc.
+        if rec.schema_version != TENANT_CREDENTIALS_SCHEMA_VERSION {
+            return Err(StoreError::Conflict(
+                "unsupported tenant credential schema_version".into(),
+            ));
+        }
+        // No tenant-existence check, exactly like `set_policy` and
+        // `put_key` below: neither consults `TENANTS_TABLE` first, so the
+        // row is valid the moment it is written and credential rows follow
+        // the same rule (ADR-0007 §2).
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn
+                .open_table(TENANT_CREDENTIALS_TABLE)
+                .map_err(store_err)?;
+            let encoded = EncodedTenantCredentialRow::from(rec);
+            // redb's insert is last-writer-wins on an existing composite
+            // key, which IS the required create-or-replace semantics.
+            table
+                .insert(
+                    (rec.tenant.as_str(), rec.provider.as_str()),
+                    encode_json(&encoded).as_slice(),
+                )
+                .map_err(store_err)?;
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn delete_tenant_credential(
+        &self,
+        tenant: &TenantId,
+        provider: &str,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn
+                .open_table(TENANT_CREDENTIALS_TABLE)
+                .map_err(store_err)?;
+            // `remove` reports `None` for a key never written. Matches
+            // `InMemoryControlPlaneStore::delete_tenant_credential`: that is
+            // `NotFound` with NOTHING written and NO bump -- returning
+            // before `bump_generation` and dropping `txn` uncommitted
+            // leaves the generation table untouched. See
+            // `ControlPlaneStore::policy_generation`'s doc.
+            if table
+                .remove((tenant.as_str(), provider))
+                .map_err(store_err)?
+                .is_none()
+            {
+                return Err(StoreError::NotFound);
+            }
+        }
         Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
@@ -1998,6 +2331,40 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Creates or replaces `rec`'s credential row -- keyed
+    /// (`rec.tenant`, `rec.provider`) -- then republishes. Store-then-
+    /// `rebuild()`, exactly the shape [`Self::set_policy`] and
+    /// [`Self::set_budget`] use, so the write lands before any snapshot
+    /// that could claim to reflect it (see the module doc's boot-vs-refresh
+    /// section).
+    ///
+    /// Republish deliberately does NOT decrypt the row yet: ADR-0007 §3's
+    /// decryption into [`ControlPlaneSnapshot::tenant_credentials`] lands as
+    /// its own change, and until then `rebuild` leaves that map empty -- so
+    /// today's rebuild has only one honest job: keeping `last_generation`
+    /// in step with the store, exactly as every other wrapper's republish
+    /// does.
+    pub fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
+        self.store.put_tenant_credential(rec)?;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Deletes one credential row (keyed (`tenant`, `provider`)), then
+    /// republishes. [`StoreError::NotFound`] propagates exactly as the
+    /// store returned it, with no rebuild -- the `?` returns first, and a
+    /// row that was never there is nothing to republish (see
+    /// [`ControlPlaneStore::delete_tenant_credential`]).
+    pub fn delete_tenant_credential(
+        &self,
+        tenant: &TenantId,
+        provider: &str,
+    ) -> Result<(), StoreError> {
+        self.store.delete_tenant_credential(tenant, provider)?;
+        self.rebuild();
+        Ok(())
+    }
+
     /// Sets or clears a budget for an existing stable key identity. The
     /// special durable row is private to this module; tenant budgets remain
     /// readable for migration but are no longer consumed by spend_limit.
@@ -2387,6 +2754,16 @@ mod tests {
         fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
             self.0.delete_tenant(tenant)
         }
+        fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
+            self.0.put_tenant_credential(rec)
+        }
+        fn delete_tenant_credential(
+            &self,
+            tenant: &TenantId,
+            provider: &str,
+        ) -> Result<(), StoreError> {
+            self.0.delete_tenant_credential(tenant, provider)
+        }
         fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
             self.0.put_key(rec)
         }
@@ -2477,6 +2854,16 @@ mod tests {
         fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
             self.inner.delete_tenant(tenant)
         }
+        fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
+            self.inner.put_tenant_credential(rec)
+        }
+        fn delete_tenant_credential(
+            &self,
+            tenant: &TenantId,
+            provider: &str,
+        ) -> Result<(), StoreError> {
+            self.inner.delete_tenant_credential(tenant, provider)
+        }
         fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
             self.inner.put_key(rec)
         }
@@ -2554,6 +2941,16 @@ mod tests {
             Ok(())
         }
         fn delete_tenant(&self, _tenant: &TenantId) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn put_tenant_credential(&self, _rec: &StoredTenantCredential) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn delete_tenant_credential(
+            &self,
+            _tenant: &TenantId,
+            _provider: &str,
+        ) -> Result<(), StoreError> {
             Ok(())
         }
         fn put_key(&self, _rec: &StoredKey) -> Result<(), StoreError> {
@@ -3610,6 +4007,25 @@ mod tests {
         a_budgets.sort_by_key(|(t, _)| *t);
         b_budgets.sort_by_key(|(t, _)| *t);
         assert_eq!(a_budgets, b_budgets, "budgets must match");
+
+        // Credential rows, ordered by their `(tenant, provider)` identity
+        // (neither store's `load` promises vector order).
+        let mut a_credentials: Vec<(&str, &str, &StoredTenantCredential)> = a
+            .tenant_credentials
+            .iter()
+            .map(|r| (r.tenant.as_str(), r.provider.as_str(), r))
+            .collect();
+        let mut b_credentials: Vec<(&str, &str, &StoredTenantCredential)> = b
+            .tenant_credentials
+            .iter()
+            .map(|r| (r.tenant.as_str(), r.provider.as_str(), r))
+            .collect();
+        a_credentials.sort_by_key(|(t, p, _)| (*t, *p));
+        b_credentials.sort_by_key(|(t, p, _)| (*t, *p));
+        assert_eq!(
+            a_credentials, b_credentials,
+            "tenant_credentials must match"
+        );
     }
 
     // --- redb: put_key then load() round-trips digest/tenant/revoked
@@ -4746,6 +5162,564 @@ mod tests {
                 .last_flush_seq(&prefix, &tenant, &period, "idle")
                 .unwrap(),
             1
+        );
+    }
+
+    // --- tenant provider credential rows (ADR-0007 §2) -------------------
+    //
+    // The shared-store pattern is the same one
+    // `redb_and_inmemory_produce_the_same_snapshot_from_the_same_writes`
+    // uses: one test body over `[&dyn ControlPlaneStore; 2]`, because the
+    // trait promises ONE contract and a divergence between the two backends
+    // is the bug shape this file pins tests to.
+
+    /// A credential row for `(tenant, provider)` with `marker` stamped into
+    /// every field a replace must overwrite -- so "the second put replaced
+    /// the first" fails loudly if ANY field survives from the earlier row.
+    /// The bytes are opaque to these tests on purpose: the store must
+    /// persist ciphertext, never interpret it (ADR-0007 §2).
+    fn credential_row(tenant: &str, provider: &str, marker: &str) -> StoredTenantCredential {
+        let mut nonce = [0u8; 12];
+        nonce[0] = marker.as_bytes()[0];
+        StoredTenantCredential {
+            schema_version: 1,
+            tenant: TenantId::new(tenant),
+            provider: provider.to_string(),
+            key_id: format!("kek-{marker}"),
+            nonce,
+            ciphertext: format!("ciphertext-{marker}").into_bytes(),
+            last4: format!("last4-{marker}"),
+            fingerprint: format!("fp-{marker}"),
+            created_at: "2026-10-11T00:00:00Z".to_string(),
+            updated_at: "2026-10-11T00:00:01Z".to_string(),
+            verified_at: None,
+        }
+    }
+
+    #[test]
+    fn tenant_credential_put_then_load_round_trips_and_replaces_by_tenant_and_provider() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            // No `create_tenant` first, deliberately: `set_policy` and
+            // `put_key` both write for an UNKNOWN tenant with no existence
+            // check in either store, and credential rows follow that same
+            // rule rather than inventing a stricter one.
+            let first = credential_row("tenant-a", "provider-x", "first");
+            store.put_tenant_credential(&first).unwrap();
+            let loaded = store.load().unwrap();
+            assert_eq!(
+                loaded.tenant_credentials,
+                vec![first.clone()],
+                "put then load must return exactly the row that was written"
+            );
+
+            // A second provider is a second row, not a replacement...
+            store
+                .put_tenant_credential(&credential_row("tenant-a", "provider-y", "other"))
+                .unwrap();
+            // ...while the SAME (tenant, provider) replaces in place.
+            let second = credential_row("tenant-a", "provider-x", "second");
+            store.put_tenant_credential(&second).unwrap();
+
+            let loaded = store.load().unwrap();
+            assert_eq!(
+                loaded.tenant_credentials.len(),
+                2,
+                "a put for an existing (tenant, provider) must replace, not append"
+            );
+            let replaced = loaded
+                .tenant_credentials
+                .iter()
+                .find(|r| r.provider == "provider-x")
+                .expect("the replaced row must still be present");
+            assert_eq!(
+                replaced, &second,
+                "the second put must fully replace the first row"
+            );
+            assert_ne!(
+                replaced.ciphertext, first.ciphertext,
+                "the replacement's ciphertext must be the new one, not the original's"
+            );
+            assert_ne!(replaced.last4, first.last4);
+            assert_ne!(replaced.fingerprint, first.fingerprint);
+            assert!(
+                loaded
+                    .tenant_credentials
+                    .iter()
+                    .any(|r| r.provider == "provider-y"),
+                "the other provider's row must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn tenant_credential_delete_removes_the_row_and_an_absent_delete_is_not_found_without_a_bump() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            let tenant = TenantId::new("tenant-a");
+            store
+                .put_tenant_credential(&credential_row("tenant-a", "provider-x", "one"))
+                .unwrap();
+            let before = store.policy_generation().unwrap();
+
+            store
+                .delete_tenant_credential(&tenant, "provider-x")
+                .expect("deleting an existing row must succeed");
+            assert!(
+                store.load().unwrap().tenant_credentials.is_empty(),
+                "a deleted credential row must be gone from load()"
+            );
+            assert_eq!(
+                store.policy_generation().unwrap(),
+                before + 1,
+                "a successful delete is a tier-2 write and bumps exactly once"
+            );
+
+            assert_eq!(
+                store.delete_tenant_credential(&tenant, "provider-x"),
+                Err(StoreError::NotFound),
+                "deleting the same row a second time must be NotFound"
+            );
+            assert_eq!(
+                store.delete_tenant_credential(&tenant, "never-written"),
+                Err(StoreError::NotFound)
+            );
+            assert_eq!(
+                store.policy_generation().unwrap(),
+                before + 1,
+                "a NotFound delete wrote nothing and must not bump -- see the trait's \
+                 `policy_generation` doc"
+            );
+        }
+    }
+
+    #[test]
+    fn each_tenant_credential_write_bumps_the_generation_by_exactly_as_much_as_any_other_write() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            let tenant = TenantId::new("tenant-a");
+            let base = store.policy_generation().unwrap();
+
+            store
+                .put_tenant_credential(&credential_row("tenant-a", "provider-x", "one"))
+                .unwrap();
+            assert_eq!(store.policy_generation().unwrap(), base + 1);
+
+            // A replacing put bumps unconditionally -- the trait forbids
+            // read-before-write "did this change anything" checks.
+            store
+                .put_tenant_credential(&credential_row("tenant-a", "provider-x", "two"))
+                .unwrap();
+            assert_eq!(store.policy_generation().unwrap(), base + 2);
+
+            // `set_policy` is the yardstick: a credential write must move
+            // the stamp by exactly what any other tier-2 write does.
+            store.set_policy(&tenant, &ModelAccess::All).unwrap();
+            let after_set_policy = store.policy_generation().unwrap();
+            assert_eq!(after_set_policy, base + 3);
+
+            store
+                .delete_tenant_credential(&tenant, "provider-x")
+                .unwrap();
+            assert_eq!(store.policy_generation().unwrap(), after_set_policy + 1);
+        }
+    }
+
+    #[test]
+    fn delete_tenant_removes_that_tenants_credential_rows_and_leaves_other_tenants() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            store
+                .put_tenant_credential(&credential_row("tenant-a", "provider-x", "ax"))
+                .unwrap();
+            store
+                .put_tenant_credential(&credential_row("tenant-a", "provider-y", "ay"))
+                .unwrap();
+            store
+                .put_tenant_credential(&credential_row("tenant-b", "provider-x", "bx"))
+                .unwrap();
+            let before = store.policy_generation().unwrap();
+
+            store.delete_tenant(&TenantId::new("tenant-a")).unwrap();
+
+            let loaded = store.load().unwrap();
+            assert_eq!(
+                loaded.tenant_credentials.len(),
+                1,
+                "only tenant-b's row may survive tenant-a's deletion"
+            );
+            assert_eq!(
+                loaded.tenant_credentials[0].tenant,
+                TenantId::new("tenant-b")
+            );
+            assert_eq!(loaded.tenant_credentials[0].provider, "provider-x");
+            assert_eq!(
+                store.policy_generation().unwrap(),
+                before + 1,
+                "one delete_tenant bumps exactly once no matter how many rows it removed -- \
+                 the deletion and its rows are one write"
+            );
+        }
+    }
+
+    #[test]
+    fn put_tenant_credential_rejects_a_schema_version_this_build_does_not_understand() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            let before = store.policy_generation().unwrap();
+            // The shape of a row a NEWER build would write -- rejected at
+            // the write, so this build never stores something its own
+            // `load` would then refuse to read back.
+            let mut future = credential_row("tenant-a", "provider-x", "future");
+            future.schema_version = 2;
+
+            assert_eq!(
+                store.put_tenant_credential(&future),
+                Err(StoreError::Conflict(
+                    "unsupported tenant credential schema_version".into()
+                )),
+                "a schema_version this build does not understand must be Conflict"
+            );
+            assert_eq!(
+                store.policy_generation().unwrap(),
+                before,
+                "a rejected put wrote nothing and must not bump the generation"
+            );
+            let loaded = store.load().expect("the store must still load");
+            assert!(
+                loaded.tenant_credentials.is_empty(),
+                "the rejected row must not have been stored: {:?}",
+                loaded.tenant_credentials
+            );
+        }
+    }
+
+    // --- redb-only: durability and fail-closed decoding ------------------
+
+    #[test]
+    fn redb_tenant_credentials_survive_closing_and_reopening_the_database_file() {
+        let path = temp_db_path("tenant-credential-persists-across-reopen");
+        let row = credential_row("tenant-a", "provider-x", "one");
+
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            store.put_tenant_credential(&row).unwrap();
+            // `store` (and its `redb::Database`) drops here -- redb's Drop
+            // flushes and releases the file, same as the other reopen tests.
+        }
+
+        let reopened = RedbControlPlaneStore::open(&path).unwrap();
+        let loaded = reopened.load().unwrap();
+        assert_eq!(
+            loaded.tenant_credentials,
+            vec![row],
+            "a reopened store must still see the credential row"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn redb_opens_a_database_file_created_before_the_tenant_credentials_table_existed() {
+        let path = temp_db_path("pre-tenant-credentials-table");
+
+        // Build the fixture with raw `redb`, not through the store under
+        // test: every table the PREVIOUS code opened, and deliberately NOT
+        // `TENANT_CREDENTIALS_TABLE`, so the file is exactly what an
+        // existing deployment's database looks like on first start after
+        // this change.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut tenants = txn.open_table(TENANTS_TABLE).unwrap();
+                tenants.insert("tenant-a", [].as_slice()).unwrap();
+            }
+            txn.open_table(KEYS_TABLE).unwrap();
+            txn.open_table(KEYS_BY_TENANT_TABLE).unwrap();
+            txn.open_table(POLICIES_TABLE).unwrap();
+            txn.open_table(BUDGETS_TABLE).unwrap();
+            txn.open_table(SPEND_TABLE).unwrap();
+            txn.open_table(SPEND_SEQ_TABLE).unwrap();
+            txn.open_table(GENERATION_TABLE).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Opening through the store must succeed: `ensure_tables` creates
+        // the missing table on open rather than erroring on it.
+        let store = RedbControlPlaneStore::open(&path).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded
+                .tenants
+                .iter()
+                .map(TenantId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["tenant-a"],
+            "the pre-existing tenant row must survive the open that adds the new table"
+        );
+        assert!(loaded.tenant_credentials.is_empty());
+
+        // ...and the newly created table is fully usable afterwards.
+        let row = credential_row("tenant-a", "provider-x", "one");
+        store.put_tenant_credential(&row).unwrap();
+        assert_eq!(store.load().unwrap().tenant_credentials, vec![row]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn redb_a_tenant_credential_row_with_schema_version_2_makes_the_whole_load_unavailable() {
+        let path = temp_db_path("tenant-credential-schema-version-2");
+        let store = RedbControlPlaneStore::open(&path).unwrap();
+        store
+            .put_tenant_credential(&credential_row("tenant-a", "provider-x", "good"))
+            .unwrap();
+
+        // Write a future-version row directly, bypassing
+        // `put_tenant_credential` -- the shape of a row written by a NEWER
+        // build, which this build must refuse to half-read.
+        let mut future = credential_row("tenant-b", "provider-y", "future");
+        future.schema_version = 2;
+        let future_hex = encode_hex_lower(&future.ciphertext);
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(TENANT_CREDENTIALS_TABLE).unwrap();
+                let encoded = EncodedTenantCredentialRow::from(&future);
+                table
+                    .insert(("tenant-b", "provider-y"), encode_json(&encoded).as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let err = match store.load() {
+            Err(err) => err,
+            Ok(_) => panic!("a schema_version 2 row must fail the WHOLE load, not be skipped"),
+        };
+        let StoreError::Unavailable(msg) = &err else {
+            panic!("expected StoreError::Unavailable; got {err:?}");
+        };
+        assert!(
+            msg.contains("tenant-b"),
+            "the error must name the tenant: {msg}"
+        );
+        assert!(
+            msg.contains("provider-y"),
+            "the error must name the provider: {msg}"
+        );
+        // Never the row's content -- see `decode_tenant_credential_row`'s
+        // doc and AGENTS.md "Fail-open controls" (check what the log line
+        // renders).
+        assert!(
+            !msg.contains(&future_hex) && !msg.contains("ciphertext-future"),
+            "the error must not render ciphertext: {msg}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn redb_a_tenant_credential_row_with_an_11_byte_nonce_makes_the_whole_load_unavailable() {
+        let store = RedbControlPlaneStore::in_memory();
+        let row = credential_row("tenant-a", "provider-x", "short-nonce");
+        let ciphertext_hex = encode_hex_lower(&row.ciphertext);
+
+        // Written raw, bypassing `put_tenant_credential` (which only ever
+        // writes valid rows) -- the shape of a hand-edited or corrupted
+        // file: a nonce of 11 bytes, not the 12 the store requires.
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(TENANT_CREDENTIALS_TABLE).unwrap();
+                let mut encoded = EncodedTenantCredentialRow::from(&row);
+                encoded.nonce = encode_hex_lower(&[7u8; 11]);
+                table
+                    .insert(("tenant-a", "provider-x"), encode_json(&encoded).as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let err = match store.load() {
+            Err(err) => err,
+            Ok(_) => panic!("a wrong-length-nonce row must fail the WHOLE load, not be skipped"),
+        };
+        let StoreError::Unavailable(msg) = &err else {
+            panic!("expected StoreError::Unavailable; got {err:?}");
+        };
+        assert!(
+            msg.contains("tenant-a"),
+            "the error must name the tenant: {msg}"
+        );
+        assert!(
+            msg.contains("provider-x"),
+            "the error must name the provider: {msg}"
+        );
+        // Never the row's content -- see `decode_tenant_credential_row`'s
+        // doc and AGENTS.md "Fail-open controls" (check what the log line
+        // renders).
+        assert!(
+            !msg.contains(&ciphertext_hex) && !msg.contains("ciphertext-short-nonce"),
+            "the error must not render ciphertext: {msg}"
+        );
+    }
+
+    #[test]
+    fn redb_a_tenant_credential_row_with_uppercase_hex_ciphertext_makes_the_whole_load_unavailable()
+    {
+        let store = RedbControlPlaneStore::in_memory();
+        let row = credential_row("tenant-a", "provider-x", "upper");
+        let ciphertext_hex = encode_hex_lower(&row.ciphertext);
+        let uppercase_hex = ciphertext_hex.to_uppercase();
+
+        // Written raw, bypassing `put_tenant_credential` -- uppercase hex
+        // is not the encoding this store writes, so it marks a row written
+        // by something other than this code path.
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(TENANT_CREDENTIALS_TABLE).unwrap();
+                let mut encoded = EncodedTenantCredentialRow::from(&row);
+                encoded.ciphertext = uppercase_hex.clone();
+                table
+                    .insert(("tenant-a", "provider-x"), encode_json(&encoded).as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let err = match store.load() {
+            Err(err) => err,
+            Ok(_) => panic!("an uppercase-hex ciphertext row must fail the WHOLE load"),
+        };
+        let StoreError::Unavailable(msg) = &err else {
+            panic!("expected StoreError::Unavailable; got {err:?}");
+        };
+        assert!(
+            msg.contains("tenant-a"),
+            "the error must name the tenant: {msg}"
+        );
+        assert!(
+            msg.contains("provider-x"),
+            "the error must name the provider: {msg}"
+        );
+        // Never the row's content, in either spelling -- see
+        // `decode_tenant_credential_row`'s doc and AGENTS.md "Fail-open
+        // controls" (check what the log line renders).
+        assert!(
+            !msg.contains(&uppercase_hex)
+                && !msg.contains(&ciphertext_hex)
+                && !msg.contains("ciphertext-upper"),
+            "the error must not render ciphertext: {msg}"
+        );
+    }
+
+    #[test]
+    fn redb_an_unparseable_tenant_credential_row_makes_the_whole_load_unavailable() {
+        let store = RedbControlPlaneStore::in_memory();
+
+        // Bytes that are not a credential row at all -- a hand-edited or
+        // corrupted file. Written raw, bypassing the API (which only ever
+        // writes valid rows).
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(TENANT_CREDENTIALS_TABLE).unwrap();
+                table
+                    .insert(
+                        ("tenant-a", "provider-x"),
+                        b"definitely not json".as_slice(),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let err = match store.load() {
+            Err(err) => err,
+            Ok(_) => panic!("an unparseable credential row must fail the whole load"),
+        };
+        let StoreError::Unavailable(msg) = &err else {
+            panic!("expected StoreError::Unavailable; got {err:?}");
+        };
+        assert!(
+            msg.contains("tenant-a"),
+            "the error must name the tenant: {msg}"
+        );
+        assert!(
+            msg.contains("provider-x"),
+            "the error must name the provider: {msg}"
+        );
+        assert!(
+            !msg.contains("definitely not json"),
+            "the error must not echo the row's raw bytes: {msg}"
+        );
+    }
+
+    // --- the ControlPlane wrappers, same store-then-rebuild shape as
+    //     `delete_tenant`/`set_budget`
+
+    #[test]
+    fn control_plane_tenant_credential_wrappers_write_delete_and_republish() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"operator-secret"),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+
+        let rec = credential_row("tenant-a", "provider-x", "one");
+        cp.put_tenant_credential(&rec)
+            .expect("put_tenant_credential must succeed against a healthy store");
+        assert_eq!(
+            cp.store().load().unwrap().tenant_credentials,
+            vec![rec.clone()],
+            "the wrapper must reach the store, not merely return Ok"
+        );
+        // The wrapper's own rebuild recorded the POST-write generation
+        // stamp, so the next poll has nothing left to do. A wrapper that
+        // skipped `rebuild()` would leave the boot stamp behind and this
+        // would be `Ok(true)` -- the same mutation pin as the other
+        // wrappers' republish tests.
+        assert_eq!(
+            cp.poll_once(),
+            Ok(false),
+            "put_tenant_credential must republish exactly like set_policy/set_budget"
+        );
+        // Decryption into the snapshot is deliberately NOT wired yet
+        // (ADR-0007 §3 lands as its own change) -- this pins that rebuild
+        // keeps leaving `tenant_credentials` empty rather than half-filling
+        // it with rows it never decrypted.
+        assert!(
+            cp.handle().load().tenant_credentials.is_empty(),
+            "ControlPlaneSnapshot.tenant_credentials must stay empty until decryption lands"
+        );
+
+        cp.delete_tenant_credential(&TenantId::new("tenant-a"), "provider-x")
+            .expect("delete_tenant_credential must succeed");
+        assert!(cp.store().load().unwrap().tenant_credentials.is_empty());
+
+        assert_eq!(
+            cp.delete_tenant_credential(&TenantId::new("tenant-a"), "provider-x"),
+            Err(StoreError::NotFound),
+            "the wrapper must propagate the store's NotFound unchanged"
         );
     }
 }
