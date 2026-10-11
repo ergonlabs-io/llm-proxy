@@ -2,7 +2,7 @@
 title: Access logs
 summary: The format-string engine behind observability.access_logs, the
   operators it supports, and when a line is actually written.
-last_updated: 2026-08-09
+last_updated: 2026-10-11
 related:
   - ../configuration/configuration-file/
   - ../observability/metrics-and-stats/
@@ -101,6 +101,7 @@ is a load error, never silently dropped or emitted as literal text.
 | `%PROTOCOL%` | The HTTP protocol version. |
 | `%RESPONSE_CODE%` | The HTTP status code, or `-` if none was ever produced. |
 | `%RESPONSE_FLAGS%` | Comma-joined response flags (see below), or `-` if none fired. |
+| `%RESPONSE_CODE_DETAILS%` | The reason string set by the filter or router that ended the response, for example `cluster_not_found`. `-` when none was set. |
 | `%DURATION%` | Total request duration, in milliseconds. |
 | `%BYTES_RECEIVED%` / `%BYTES_SENT%` | Request/response body byte counts. |
 | `%UPSTREAM_HOST%` / `%UPSTREAM_CLUSTER%` | The dialed upstream host and the cluster it belongs to. |
@@ -113,6 +114,11 @@ is a load error, never silently dropped or emitted as literal text.
 | `%LLM_RESPONSE_CHUNKS%` | Number of response body chunks observed. |
 | `%LLM_TENANT%` | The authenticated tenant id the auth filter resolved. `-` when the request is not authenticated. |
 | `%LLM_CREDENTIAL_SOURCE%` | The source of the last provider credential applied to this request: `platform` (the operator's) or `tenant` (the tenant's own key). `-` when no credential was applied, for example after a `403 tenant_credential_missing`. See [Tenant provider credentials](../authentication/tenant-provider-credentials/#access-log). |
+| `%LLM_KEY_ID%` | The `key_id` of the credential the auth filter resolved. This is the key's configured identifier, not the key itself. `-` when the request is not authenticated. |
+| `%LLM_USER_ID%` | Always `-` in this release. The proxy does not yet publish an authenticated user, so there is no value to render. |
+| `%LLM_REQUESTED_MODEL%` | The `model` value the body-rewrite filter read from the request body, before any provider model mapping. `-` when no filter set it. |
+| `%LLM_SELECTED_MODEL%` | The model name sent to the provider that served the response, after any provider model mapping. If no mapping matches, it is the requested model. `-` when there is no requested model. |
+| `%LLM_RATE_CARD_VERSION%` | The version of the rate card used for `%LLM_LIST_COST%`. `-` when no list cost was computed. |
 
 A literal `%` is written as `%%`.
 
