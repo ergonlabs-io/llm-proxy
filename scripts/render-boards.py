@@ -21,10 +21,10 @@ That keeps the design byte-identical to what is already live -- these are
 working instruments the owner reads at a glance, and a re-render that quietly
 restyles them is a regression even when it looks nicer.
 
-`internal-docs/boards/backlog.yaml` holds only STATE (id, status, priority, milestone,
-lane, the card's bullet lines). Normative prose stays in
-`internal-docs/IMPLEMENTATION_PLAN.md`, joined on the WP id. Duplicating the prose here would
-create two things to drift.
+`internal-docs/boards/backlog.yaml` is the single home for planned work: state (id,
+status, priority, milestone, lane, bullets) plus each WP's spec fields (goal, build,
+depends, acceptance, caveats, findings; see `internal-docs/boards/README.md`). The board
+renders the state fields.
 
 Usage:  make boards          (or: python3 scripts/render-boards.py)
         make boards-check    (verify committed HTML matches the YAML)
