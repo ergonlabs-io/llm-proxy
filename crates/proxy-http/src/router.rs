@@ -81,6 +81,7 @@ use proxy_cluster::{
 use proxy_config::ir::{
     DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher, UpgradeConfig,
 };
+use proxy_observability::stats::instruments;
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, TraceContext};
 use proxy_observability::ResponseFlag;
 
@@ -675,6 +676,12 @@ impl RouterHandler {
         let sel = match select_host_for_request(entry.as_ref(), &mut ctx) {
             Ok(sel) => sel,
             Err(NoHost::Ineligible(provider)) => {
+                self.stats.record_tenant_credential(
+                    provider
+                        .as_deref()
+                        .unwrap_or(instruments::TENANT_CREDENTIAL_NO_PROVIDER),
+                    instruments::TENANT_CREDENTIAL_MISSING,
+                );
                 dcb.stream_info().response_code_details =
                     Some("tenant_credential_missing".to_string());
                 return tenant_credential_missing_reply(provider.as_deref());
@@ -701,7 +708,12 @@ impl RouterHandler {
                 Ok(plan) => plan,
                 Err(refusal) => {
                     let mut info = dcb.stream_info();
-                    return credential_refusal_reply(&mut info, attempt_cluster, &refusal);
+                    return credential_refusal_reply(
+                        &mut info,
+                        &self.stats,
+                        attempt_cluster,
+                        &refusal,
+                    );
                 }
             };
         let proto = attempt_entry.upstream_protocol();
@@ -785,6 +797,10 @@ impl RouterHandler {
             );
         }
         dcb.stream_info().credential_source = Some(source);
+        if let AttemptCredentials::Tenant(slot, _) = &credentials {
+            self.stats
+                .record_tenant_credential(&slot.provider, instruments::TENANT_CREDENTIAL_APPLIED);
+        }
 
         // Bypass BOTH connection caches: `pool.new_stream()` dials a
         // connection this tunnel will own exclusively (see this method's
@@ -1173,6 +1189,12 @@ impl RouterHandler {
                 let sel = match select_host_for_request(entry.as_ref(), &mut ctx) {
                     Ok(sel) => sel,
                     Err(NoHost::Ineligible(provider)) => {
+                        self.stats.record_tenant_credential(
+                            provider
+                                .as_deref()
+                                .unwrap_or(instruments::TENANT_CREDENTIAL_NO_PROVIDER),
+                            instruments::TENANT_CREDENTIAL_MISSING,
+                        );
                         dcb.stream_info().response_code_details =
                             Some("tenant_credential_missing".to_string());
                         return tenant_credential_missing_reply(provider.as_deref());
@@ -1217,7 +1239,12 @@ impl RouterHandler {
                     Ok(plan) => plan,
                     Err(refusal) => {
                         let mut info = dcb.stream_info();
-                        return credential_refusal_reply(&mut info, attempt_cluster, &refusal);
+                        return credential_refusal_reply(
+                            &mut info,
+                            &self.stats,
+                            attempt_cluster,
+                            &refusal,
+                        );
                     }
                 };
                 // Record this attempt's cluster so a retry that falls back
@@ -1529,6 +1556,12 @@ impl RouterHandler {
                     );
                 }
                 dcb.stream_info().credential_source = Some(source);
+                if let AttemptCredentials::Tenant(slot, _) = &credentials {
+                    self.stats.record_tenant_credential(
+                        &slot.provider,
+                        instruments::TENANT_CREDENTIAL_APPLIED,
+                    );
+                }
                 if let Some(info) = &attempt_info {
                     info.borrow_mut().credential_source = Some(source);
                 }
@@ -2703,16 +2736,24 @@ fn plan_attempt_credentials<'a>(
 /// Final local reply for a refused tenant credential. Never names a secret.
 fn credential_refusal_reply(
     info: &mut crate::StreamInfo,
+    stats: &RouterStats,
     cluster: &str,
     refusal: &CredentialRefusal,
 ) -> HttpResponseParts {
     match refusal {
         CredentialRefusal::Missing(provider) => {
+            stats.record_tenant_credential(
+                provider
+                    .as_deref()
+                    .unwrap_or(instruments::TENANT_CREDENTIAL_NO_PROVIDER),
+                instruments::TENANT_CREDENTIAL_MISSING,
+            );
             tracing::warn!(cluster = %cluster, provider = ?provider, "tenant has no credential slot match for the selected cluster");
             info.response_code_details = Some("tenant_credential_missing".to_string());
             tenant_credential_missing_reply(provider.as_deref())
         }
         CredentialRefusal::Unusable(provider) => {
+            stats.record_tenant_credential(provider, instruments::TENANT_CREDENTIAL_UNUSABLE);
             tracing::warn!(cluster = %cluster, provider = %provider, "tenant credential is unusable (decryption failed); failing closed");
             info.set_response_flag(ResponseFlag::UpstreamConnectionFailure);
             local_reply(

@@ -16,9 +16,12 @@
 //! bounded by `tokio::time::timeout`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::Read;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
@@ -26,10 +29,11 @@ use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::resolver::FakeResolver;
 use proxy_config::ir::{
-    ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, ForwardAction,
-    ForwardTarget, HeaderAppendAction, HeaderMutation, LbPolicy, PathMatch, ProviderRuntimeConfig,
-    RetryBackOff, RetryOn, RetryPolicyIR, RouteActionIR, RouteEntry, RouteMatcher, RouteTable,
-    TenantCredentialSlot, UpgradeConfig, VirtualHostIR,
+    AccessLogFormat, AccessLogIR, AccessLogSink, ClusterConfig, ClusterKind, ClusterName,
+    DiscoveryType, EndpointIR, ForwardAction, ForwardTarget, HeaderAppendAction, HeaderMutation,
+    LbPolicy, PathMatch, ProviderRuntimeConfig, RetryBackOff, RetryOn, RetryPolicyIR,
+    RouteActionIR, RouteEntry, RouteMatcher, RouteTable, TenantCredentialSlot, UpgradeConfig,
+    VirtualHostIR,
 };
 use proxy_http::filter::{
     DecoderCallbacks, FilterHeadersStatus, FilterInstanceFactory, HttpFilter, RequestHeaders,
@@ -42,8 +46,9 @@ use proxy_http::stat_handles::{RouterStats, StatHandles};
 use proxy_http::tenant_credentials::{
     CredentialSource, TenantCredential, TenantCredentialSet, TenantSecret,
 };
+use proxy_observability::access_log::parse_format;
 use proxy_observability::records::{BoundedRecordSink, RequestRecord};
-use proxy_observability::stats::{StatsControl, WorkerId};
+use proxy_observability::stats::{instruments, Registry, StatsControl, WorkerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -213,6 +218,9 @@ fn aggregate(members: &[&str]) -> ClusterConfig {
 struct Fixture {
     handler: FilterChainHandler,
     records: mpsc::Receiver<RequestRecord>,
+    /// The registry the router's `RouterStats` writes into, so a test can
+    /// read the tenant-credential counter back.
+    registry: Arc<Registry>,
 }
 
 /// One route, `/` -> cluster `target`. `tenant` installs the stand-in auth
@@ -222,6 +230,18 @@ async fn build(
     target: &str,
     tenant: Option<TenantCredentialSet>,
     retry_on: Option<&str>,
+) -> Fixture {
+    build_with_access_logs(clusters, target, tenant, retry_on, &[]).await
+}
+
+/// [`build`], plus the given access loggers wired into the handler, so a test
+/// can read back what the router's own `StreamInfo` rendered.
+async fn build_with_access_logs(
+    clusters: Vec<ClusterConfig>,
+    target: &str,
+    tenant: Option<TenantCredentialSet>,
+    retry_on: Option<&str>,
+    access_logs: &[AccessLogIR],
 ) -> Fixture {
     let names: Vec<String> = clusters.iter().map(|c| c.name.clone()).collect();
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
@@ -280,7 +300,8 @@ async fn build(
     let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let control = StatsControl::new(1);
     let handles = Arc::new(StatHandles::build(&control, name_refs.iter().copied()));
-    let stats = Arc::new(RouterStats::new(control.registry(), handles, WorkerId(0)));
+    let registry = control.registry();
+    let stats = Arc::new(RouterStats::new(registry.clone(), handles, WorkerId(0)));
     let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> = Arc::new(
         RouterFilterFactory::new(Arc::new(manager), stats).with_upgrade_configs(vec![
             UpgradeConfig {
@@ -293,18 +314,53 @@ async fn build(
         Some(set) => vec![Arc::new(InstallTenantCredentials(Arc::new(set)))],
         None => Vec::new(),
     };
-    let handler = FilterChainHandler::new(
+    let handler = FilterChainHandler::new_with_access_logs(
         filters,
         terminal_factory,
         Arc::new(route_table),
         false,
         false,
         0,
-    );
+        access_logs,
+    )
+    .expect("test access-log sink (temp file) always opens cleanly");
     let (sink, records) = BoundedRecordSink::new(4);
     Fixture {
         handler: handler.with_request_record_sink(Arc::new(sink)),
         records,
+        registry,
+    }
+}
+
+/// A unique path under the OS temp dir for a file access logger. Same
+/// technique as `router_aggregate.rs`'s `temp_path`.
+fn temp_path(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "proxy-http-tenant-credentials-test-{}-{}-{}",
+        std::process::id(),
+        name,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    p
+}
+
+fn read_to_string(path: &Path) -> String {
+    let mut s = String::new();
+    File::open(path).unwrap().read_to_string(&mut s).unwrap();
+    s
+}
+
+fn text_logger(path: &Path, format: &str) -> AccessLogIR {
+    AccessLogIR {
+        sink: AccessLogSink::File {
+            path: path.to_string_lossy().into_owned(),
+        },
+        format: AccessLogFormat::Text(parse_format(format).unwrap()),
+        filter: None,
     }
 }
 
@@ -355,6 +411,44 @@ async fn send(fixture: &Fixture, upgrade: bool) -> (StatusCode, String) {
     (status, body)
 }
 
+/// Provider label values these tests can produce: the cluster slots' names,
+/// plus `-` for a refusal whose cluster has no slot.
+const CREDENTIAL_PROVIDERS: [&str; 3] = ["openai", "anthropic", "-"];
+const CREDENTIAL_OUTCOMES: [&str; 3] = [
+    instruments::TENANT_CREDENTIAL_APPLIED,
+    instruments::TENANT_CREDENTIAL_MISSING,
+    instruments::TENANT_CREDENTIAL_UNUSABLE,
+];
+
+/// Reads one `(provider, outcome)` series through the public `resolve_capped`
+/// dedup path. An existing series returns its own handle, so this does not
+/// grow the registry for a series that is already there.
+fn credential_requests(registry: &Registry, provider: &str, outcome: &str) -> u64 {
+    let handle = registry.resolve_capped(
+        &instruments::TENANT_CREDENTIAL_REQUESTS,
+        &[("provider", provider), ("outcome", outcome)],
+        usize::MAX,
+        &[],
+    );
+    registry.value(handle)
+}
+
+/// Asserts that `expected` reads exactly 1 and every other pair in the label
+/// grid reads 0. `None` asserts that the whole grid is zero, which is what a
+/// platform-mode request must leave behind.
+fn assert_credential_counts(registry: &Registry, expected: Option<(&str, &str)>) {
+    for provider in CREDENTIAL_PROVIDERS {
+        for outcome in CREDENTIAL_OUTCOMES {
+            let want = u64::from(expected == Some((provider, outcome)));
+            assert_eq!(
+                credential_requests(registry, provider, outcome),
+                want,
+                "tenant_credential_requests({provider}, {outcome})"
+            );
+        }
+    }
+}
+
 fn only_record(fixture: &mut Fixture) -> RequestRecord {
     fixture.records.try_recv().expect("one request record")
 }
@@ -393,6 +487,7 @@ async fn tenant_key_replaces_operator_key_for_each_header_shape() {
                 .await;
                 let (status, _) = send(&fixture, false).await;
                 assert_eq!(status, StatusCode::OK);
+                assert_credential_counts(&fixture.registry, Some(("openai", "applied")));
 
                 let got = requests(&seen);
                 assert_eq!(got.len(), 1);
@@ -489,6 +584,7 @@ async fn aggregate_with_no_eligible_member_is_403_and_dials_nothing() {
             .await;
             let (status, body) = send(&fixture, false).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_credential_counts(&fixture.registry, Some(("openai", "missing")));
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(json["error"]["type"], "tenant_credential_missing");
             assert!(
@@ -535,7 +631,15 @@ async fn aggregate_with_no_healthy_host_stays_503_in_tenant_mode() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn plain_cluster_without_matching_slot_is_403_without_dialling() {
-    for slot in [None, Some(("openai", "authorization", "Bearer "))] {
+    // No slot: the refusal names no provider, so it counts under `-`. A slot
+    // the tenant lacks: the refusal names that slot's provider.
+    for (slot, expected) in [
+        (None, ("-", instruments::TENANT_CREDENTIAL_MISSING)),
+        (
+            Some(("openai", "authorization", "Bearer ")),
+            ("openai", instruments::TENANT_CREDENTIAL_MISSING),
+        ),
+    ] {
         LocalSet::new()
             .run_until(async {
                 let (addr, seen) = spawn_upstream(200).await;
@@ -550,6 +654,7 @@ async fn plain_cluster_without_matching_slot_is_403_without_dialling() {
                 assert_eq!(status, StatusCode::FORBIDDEN);
                 assert!(body.contains("tenant_credential_missing"));
                 assert!(requests(&seen).is_empty());
+                assert_credential_counts(&fixture.registry, Some(expected));
             })
             .await;
     }
@@ -578,6 +683,10 @@ async fn unusable_credential_fails_closed_with_503_and_no_credential_sent() {
             // Nothing reached any upstream, so no request carried the
             // operator credential as a fallback.
             assert!(requests(&seen).is_empty());
+            assert_credential_counts(
+                &fixture.registry,
+                Some(("anthropic", instruments::TENANT_CREDENTIAL_UNUSABLE)),
+            );
         })
         .await;
 }
@@ -638,6 +747,7 @@ async fn platform_mode_keeps_operator_credential_and_records_platform_source() {
                 .await;
                 let (status, _) = send(&fixture, false).await;
                 assert_eq!(status, StatusCode::OK);
+                assert_credential_counts(&fixture.registry, None);
                 let a = requests(&a_seen);
                 assert_eq!(a.len(), 1);
                 assert!(a[0].contains("authorization: operator-key-for-a"));
@@ -649,6 +759,52 @@ async fn platform_mode_keeps_operator_credential_and_records_platform_source() {
                     record.attempts[0].credential_source,
                     Some(CredentialSource::Platform)
                 );
+            })
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn access_log_renders_the_credential_source_the_router_chose() {
+    // Tenant mode with a usable credential, tenant mode refused (no slot
+    // match, so the router never sets a source), and platform mode.
+    let cases = [
+        (
+            "tenant",
+            Some(tenant_set(vec![("openai", Some("tenant-secret"))])),
+            StatusCode::OK,
+            "tenant\n",
+        ),
+        (
+            "refused",
+            Some(tenant_set(vec![("anthropic", Some("tenant-secret"))])),
+            StatusCode::FORBIDDEN,
+            "-\n",
+        ),
+        ("platform", None, StatusCode::OK, "platform\n"),
+    ];
+    for (name, tenant, expected_status, expected) in cases {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, _seen) = spawn_upstream(200).await;
+                let log_path = temp_path(name);
+                let fixture = build_with_access_logs(
+                    vec![member(
+                        "up",
+                        addr,
+                        "authorization",
+                        Some(("openai", "authorization", "Bearer ")),
+                    )],
+                    "up",
+                    tenant,
+                    None,
+                    &[text_logger(&log_path, "%LLM_CREDENTIAL_SOURCE%\n")],
+                )
+                .await;
+                let (status, _) = send(&fixture, false).await;
+                assert_eq!(status, expected_status, "{name}");
+                assert_eq!(read_to_string(&log_path), expected, "{name}");
+                let _ = std::fs::remove_file(&log_path);
             })
             .await;
     }
@@ -674,6 +830,7 @@ async fn websocket_upgrade_applies_the_tenant_credential() {
             // The tunnel never completes (the synthetic `OnUpgrade` never
             // resolves), so only the upstream's view matters here.
             let _ = timeout(BOUND, fixture.handler.handle(request(true))).await;
+            assert_credential_counts(&fixture.registry, Some(("anthropic", "applied")));
             let got = requests(&seen);
             assert_eq!(got.len(), 1);
             assert!(got[0].contains("upgrade: websocket"));
@@ -704,6 +861,7 @@ async fn websocket_upgrade_without_a_matching_credential_is_403() {
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert!(body.contains("tenant_credential_missing"));
             assert!(requests(&seen).is_empty());
+            assert_credential_counts(&fixture.registry, Some(("openai", "missing")));
         })
         .await;
 }

@@ -52,6 +52,7 @@ use crate::handler::{BodyError, StreamBody};
 use crate::router::idle::IdleTimeoutError;
 use crate::stat_handles::{GenAiLatencyStats, GenAiTokenStats};
 use crate::stream_info::StreamInfo;
+use crate::tenant_credentials::CredentialSource;
 
 /// One configured logger, resolved at HCM-bind time (mirrors
 /// `proxy-core::listener::build_listener_hcm`'s own "compiled once, rebuilt
@@ -864,6 +865,13 @@ impl LoggingBody {
             llm_list_cost_nanodollars,
             llm_key_id: usage_attribution.0.as_deref(),
             llm_tenant: tenant.as_deref(),
+            // `CredentialSource::as_str` is `&'static str`, so this borrow
+            // needs no `Ref` kept alive past this struct literal.
+            llm_credential_source: ctx
+                .stream_info
+                .borrow()
+                .credential_source
+                .map(CredentialSource::as_str),
             llm_user_id: None,
             llm_requested_model: requested_model.as_deref(),
             llm_selected_model: usage_attribution.1.as_deref(),
@@ -1053,6 +1061,13 @@ mod tests {
     /// `AccessLogContext` -> the rendered line), not from a hand-built
     /// `LogContext`.
     async fn render_one_fmt(fmt: &str, llm: crate::stream_info::LlmStats) -> String {
+        render_with_stream_info(fmt, move |info| info.llm = llm).await
+    }
+
+    /// Same as [`render_one_fmt`], but the caller shapes the `StreamInfo`
+    /// (through the same `Rc<RefCell<..>>` the router writes to) before the
+    /// body is driven to end-of-stream.
+    async fn render_with_stream_info(fmt: &str, configure: impl FnOnce(&mut StreamInfo)) -> String {
         let capture = Arc::new(CaptureSink::default());
         let fmt = parse_format(fmt).unwrap();
         let logger = AccessLoggerRuntime {
@@ -1062,7 +1077,7 @@ mod tests {
         };
 
         let mut stream_info = StreamInfo::default();
-        stream_info.llm = llm;
+        configure(&mut stream_info);
 
         let ctx = AccessLogContext {
             loggers: Rc::new(vec![logger]),
@@ -1096,6 +1111,31 @@ mod tests {
         let mut lines = capture.0.lock().unwrap();
         assert_eq!(lines.len(), 1, "expected exactly one rendered line");
         lines.remove(0)
+    }
+
+    #[tokio::test]
+    async fn credential_source_reaches_the_rendered_access_log_line() {
+        // The router sets `StreamInfo::credential_source` at the credential
+        // step; the access log must render that value, not a re-derived one.
+        assert_eq!(
+            render_with_stream_info("%LLM_CREDENTIAL_SOURCE%", |info| {
+                info.credential_source = Some(CredentialSource::Tenant);
+            })
+            .await,
+            "tenant"
+        );
+        assert_eq!(
+            render_with_stream_info("%LLM_CREDENTIAL_SOURCE%", |info| {
+                info.credential_source = Some(CredentialSource::Platform);
+            })
+            .await,
+            "platform"
+        );
+        // A request that never reached the credential step renders `-`.
+        assert_eq!(
+            render_with_stream_info("%LLM_CREDENTIAL_SOURCE%", |_| {}).await,
+            "-"
+        );
     }
 
     #[tokio::test]

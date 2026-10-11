@@ -486,6 +486,7 @@ mod tests {
             llm_list_cost_nanodollars: None,
             llm_key_id: None,
             llm_tenant: None,
+            llm_credential_source: None,
             llm_user_id: None,
             llm_requested_model: None,
             llm_selected_model: None,

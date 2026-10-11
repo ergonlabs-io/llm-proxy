@@ -138,6 +138,10 @@ pub enum FormatOp {
     LlmListCost,
     LlmKeyId,
     LlmTenant,
+    /// `%LLM_CREDENTIAL_SOURCE%` -- `platform` or `tenant`, whose credential
+    /// the final attempt was sent with (ADR-0007). `-` when no attempt got
+    /// as far as the credential step.
+    LlmCredentialSource,
     LlmUserId,
     LlmRequestedModel,
     LlmSelectedModel,
@@ -415,6 +419,10 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmTenant
         }
+        "LLM_CREDENTIAL_SOURCE" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmCredentialSource
+        }
         "LLM_USER_ID" => {
             bare(name, args, truncate, input)?;
             FormatOp::LlmUserId
@@ -516,6 +524,9 @@ pub struct LogContext<'a> {
     /// Usage attribution; absent identities and unpriced cards remain absent.
     pub llm_key_id: Option<&'a str>,
     pub llm_tenant: Option<&'a str>,
+    /// `CredentialSource::as_str()` of the final attempt, `None` when the
+    /// request never reached the credential step.
+    pub llm_credential_source: Option<&'a str>,
     pub llm_user_id: Option<&'a str>,
     pub llm_requested_model: Option<&'a str>,
     pub llm_selected_model: Option<&'a str>,
@@ -682,6 +693,9 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         }
         FormatOp::LlmKeyId => out.push_str(ctx.llm_key_id.unwrap_or("-")),
         FormatOp::LlmTenant => out.push_str(ctx.llm_tenant.unwrap_or("-")),
+        FormatOp::LlmCredentialSource => {
+            out.push_str(ctx.llm_credential_source.unwrap_or("-"));
+        }
         FormatOp::LlmUserId => out.push_str(ctx.llm_user_id.unwrap_or("-")),
         FormatOp::LlmRequestedModel => out.push_str(ctx.llm_requested_model.unwrap_or("-")),
         FormatOp::LlmSelectedModel => out.push_str(ctx.llm_selected_model.unwrap_or("-")),
@@ -984,6 +998,7 @@ mod tests {
             llm_list_cost_nanodollars: None,
             llm_key_id: None,
             llm_tenant: None,
+            llm_credential_source: None,
             llm_user_id: None,
             llm_requested_model: None,
             llm_selected_model: None,
@@ -1012,6 +1027,20 @@ mod tests {
             "stable-key tenant-a - alias provider-model card-v2"
         );
         assert!(parse_format("%LLM_KEY_ID(secret)%").is_err());
+    }
+
+    #[test]
+    fn renders_credential_source_and_dash_when_no_attempt_reached_it() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%LLM_CREDENTIAL_SOURCE% %LLM_TENANT%");
+        assert_eq!(render(&fs, &c), "- -");
+        c.llm_credential_source = Some("tenant");
+        c.llm_tenant = Some("tenant-a");
+        assert_eq!(render(&fs, &c), "tenant tenant-a");
+        c.llm_credential_source = Some("platform");
+        assert_eq!(render(&fs, &c), "platform tenant-a");
+        assert!(parse_format("%LLM_CREDENTIAL_SOURCE(x)%").is_err());
     }
 
     #[test]

@@ -703,6 +703,35 @@ pub mod instruments {
     pub const METADATA_ADMISSION_ACCEPTED: &str = "accepted";
     pub const METADATA_ADMISSION_CAPACITY_EXCEEDED: &str = "capacity_exceeded";
     pub const METADATA_ADMISSION_CLOSED: &str = "closed";
+
+    /// Tenant-mode credential decisions at the router's credential step
+    /// (ADR-0007). Only tenant-mode requests reach this counter; a
+    /// platform-mode request never touches it. `provider` is the cluster
+    /// slot's provider name from operator config, so its values are bounded
+    /// by config. It is `-` when a refused cluster has no slot. No tenant
+    /// label: tenant ids are unbounded and belong in usage records, not
+    /// metric labels.
+    pub const TENANT_CREDENTIAL_REQUESTS: Instrument = Instrument {
+        name: "llmproxy_tenant_credential_requests_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["provider", "outcome"],
+        buckets: None,
+    };
+    /// The tenant's own secret was applied to the attempt.
+    pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
+    /// Refused with `403 tenant_credential_missing`: no slot on the cluster,
+    /// or the tenant holds nothing for its provider.
+    pub const TENANT_CREDENTIAL_MISSING: &str = "missing";
+    /// Refused with `503`: the tenant's stored row could not be decrypted.
+    pub const TENANT_CREDENTIAL_UNUSABLE: &str = "unusable";
+    /// `provider` value for a refusal whose cluster has no slot to name.
+    pub const TENANT_CREDENTIAL_NO_PROVIDER: &str = "-";
+    /// Ceiling on `TENANT_CREDENTIAL_REQUESTS` series. Provider values come
+    /// from config, so this is a backstop against a config that names an
+    /// unreasonable number of providers, not an expected limit.
+    pub const TENANT_CREDENTIAL_SERIES_CEILING: usize = 256;
+    pub const TENANT_CREDENTIAL_SERIES_OVERFLOW: &str = "-cardinality-overflow-";
     pub const CAPTURE_STATE_ADMISSION: Instrument = Instrument {
         name: "llmproxy_capture_state_admission",
         kind: InstrumentKind::Counter,
@@ -791,6 +820,39 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+}
+
+/// Counts one tenant-mode credential decision on `TENANT_CREDENTIAL_REQUESTS`.
+///
+/// Unlike the boot-resolved counters above, `provider` is only known from
+/// the cluster the router is about to dial, so the series is resolved here,
+/// per call, through [`Registry::resolve_capped`]. That is the same bounded
+/// path `GenAiTokenStats` uses for its per-tenant series: the first call for a
+/// `(provider, outcome)` pair grows the registry, and every later call is a
+/// dedup hit. Past the ceiling, new pairs fold into the overflow series.
+///
+/// Callers must pass a `'static` outcome from `instruments::TENANT_CREDENTIAL_*`.
+/// Platform-mode requests never call this.
+pub fn record_tenant_credential_request(
+    registry: &Registry,
+    worker: WorkerId,
+    provider: &str,
+    outcome: &'static str,
+) {
+    // Rust note: `outcome` is `&'static str` rather than `&str`, so the
+    // compiler only accepts string literals or consts here, never a `&str`
+    // borrowed from a request. Labels built from request data would be a
+    // cardinality leak.
+    let handle = registry.resolve_capped(
+        &instruments::TENANT_CREDENTIAL_REQUESTS,
+        &[("provider", provider), ("outcome", outcome)],
+        instruments::TENANT_CREDENTIAL_SERIES_CEILING,
+        &[
+            ("provider", instruments::TENANT_CREDENTIAL_SERIES_OVERFLOW),
+            ("outcome", outcome),
+        ],
+    );
+    registry.incr(worker, handle, 1);
 }
 
 /// Pre-resolved operational signals for the best-effort request-record
@@ -2802,6 +2864,120 @@ mod tests {
                 ("type", "input"),
                 ("tenant", "OVERFLOW"),
             ],
+        );
+    }
+
+    // ---- tenant credential requests -----------------------------------
+
+    /// Reads one series back through the public `resolve_capped` dedup path:
+    /// resolving an existing `(provider, outcome)` returns its own handle, so
+    /// this never grows the registry for a series that is already there.
+    fn tenant_credential_count(registry: &Registry, provider: &str, outcome: &str) -> u64 {
+        let handle = registry.resolve_capped(
+            &instruments::TENANT_CREDENTIAL_REQUESTS,
+            &[("provider", provider), ("outcome", outcome)],
+            usize::MAX,
+            &[],
+        );
+        registry.value(handle)
+    }
+
+    fn tenant_credential_series(registry: &Registry) -> usize {
+        registry
+            .published
+            .load()
+            .resolved
+            .iter()
+            .filter(|i| i.name == instruments::TENANT_CREDENTIAL_REQUESTS.name)
+            .count()
+    }
+
+    #[test]
+    fn tenant_credential_requests_count_per_provider_and_outcome() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let w = WorkerId(0);
+        record_tenant_credential_request(
+            &registry,
+            w,
+            "openai",
+            instruments::TENANT_CREDENTIAL_APPLIED,
+        );
+        record_tenant_credential_request(
+            &registry,
+            w,
+            "openai",
+            instruments::TENANT_CREDENTIAL_APPLIED,
+        );
+        record_tenant_credential_request(
+            &registry,
+            w,
+            instruments::TENANT_CREDENTIAL_NO_PROVIDER,
+            instruments::TENANT_CREDENTIAL_MISSING,
+        );
+        record_tenant_credential_request(
+            &registry,
+            w,
+            "anthropic",
+            instruments::TENANT_CREDENTIAL_UNUSABLE,
+        );
+
+        assert_eq!(tenant_credential_count(&registry, "openai", "applied"), 2);
+        assert_eq!(tenant_credential_count(&registry, "-", "missing"), 1);
+        assert_eq!(
+            tenant_credential_count(&registry, "anthropic", "unusable"),
+            1
+        );
+        assert_eq!(
+            tenant_credential_series(&registry),
+            3,
+            "one series per (provider, outcome) pair"
+        );
+    }
+
+    #[test]
+    fn tenant_credential_requests_fold_new_providers_into_overflow_past_the_ceiling() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let w = WorkerId(0);
+        for i in 0..instruments::TENANT_CREDENTIAL_SERIES_CEILING {
+            record_tenant_credential_request(
+                &registry,
+                w,
+                &format!("p{i}"),
+                instruments::TENANT_CREDENTIAL_APPLIED,
+            );
+        }
+        assert_eq!(
+            tenant_credential_series(&registry),
+            instruments::TENANT_CREDENTIAL_SERIES_CEILING
+        );
+
+        record_tenant_credential_request(
+            &registry,
+            w,
+            "one-too-many",
+            instruments::TENANT_CREDENTIAL_APPLIED,
+        );
+        record_tenant_credential_request(
+            &registry,
+            w,
+            "one-too-many-too",
+            instruments::TENANT_CREDENTIAL_APPLIED,
+        );
+        assert_eq!(
+            tenant_credential_count(
+                &registry,
+                instruments::TENANT_CREDENTIAL_SERIES_OVERFLOW,
+                "applied"
+            ),
+            2,
+            "both overflowing providers must land on the one shared overflow series"
+        );
+        assert_eq!(
+            tenant_credential_series(&registry),
+            instruments::TENANT_CREDENTIAL_SERIES_CEILING + 1,
+            "growth stops at the ceiling plus the one overflow series"
         );
     }
 }

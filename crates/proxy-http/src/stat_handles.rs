@@ -73,7 +73,8 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use proxy_observability::access_log::LlmTokens;
 use proxy_observability::stats::{
-    instruments, Handle, HistogramHandle, Registry, StatsControl, WorkerId,
+    instruments, record_tenant_credential_request, Handle, HistogramHandle, Registry, StatsControl,
+    WorkerId,
 };
 
 /// One cluster's pre-resolved handles: the `upstream_rq` counter and the
@@ -231,6 +232,15 @@ impl RouterStats {
     /// through `proxy-admin`'s `/stats` route, not through this accessor.
     pub fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
+    }
+
+    /// Counts one tenant-mode credential decision (`applied`, `missing`, or
+    /// `unusable`) against `provider`. Called only from the router's
+    /// tenant-mode credential steps, so platform-mode requests never reach
+    /// it. See `proxy_observability::stats::record_tenant_credential_request`
+    /// for why the series is resolved per call.
+    pub fn record_tenant_credential(&self, provider: &str, outcome: &'static str) {
+        record_tenant_credential_request(&self.registry, self.worker, provider, outcome);
     }
 
     /// Records one upstream attempt dispatched to `cluster` -- see
