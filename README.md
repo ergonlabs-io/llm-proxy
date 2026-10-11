@@ -192,8 +192,8 @@ provider on failover. That has been a real key-disclosure bug here twice.
   backoff, and last-good config retained on failure. Conformance is checked
   against go-control-plane (`make xds-conformance`), not only against our own
   harness — a harness we wrote both sides of cannot catch us agreeing with
-  ourselves and both being wrong. See [Roadmap](#roadmap) for where v0.3.0
-  stands.
+  ourselves and both being wrong. See [Roadmap](#roadmap) for where the v0.3.2
+  gate stands.
 
 ## Build
 
@@ -362,7 +362,10 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.0.1** | First light — pass-through to OpenAI and Anthropic, streaming and not | Shipped 2026-08-01 |
 | **v0.1.0** | LLM gateway — token metering, rate limits, provider failover | Shipped 2026-08-08 |
 | **v0.2.0** | Production-ready serving — capacity report, admin endpoints, swap-under-load | Shipped 2026-08-29 |
-| **v0.3.0** | Dynamic configuration — ADS/xDS | Released 2026-09-29; gate follow-up remains |
+| **v0.3.0** | ADS/xDS delivery | Shipped 2026-09-29; tagged with the dynamic-configuration gate still open |
+| **v0.3.1** | Follow-up fixes, OpenRouter defaults, local metadata capture | Shipped 2026-10-09 (latest release) |
+| **v0.3.2** | Dynamic configuration — the open ADS/xDS gate, plus live-defect fixes | Current; gate open |
+| **v0.3.3** | Hardening — production hardening from the 2026-10-10 design review | Planned |
 | **v0.4.0** | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Planned |
 | **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
 
@@ -388,7 +391,7 @@ Stated plainly, because a feature list without this is not much use:
   serving, and ADS initial-fetch timeout is honored. Delta xDS runs end to end
   for strict incremental updates; file transport, init-manager sequencing, SDS
   removal, and full 5k-rps differential rename-churn verification remain open
-  (`v0.3.0`). SDS supports downstream certificate and validation-context
+  (`v0.3.2`). SDS supports downstream certificate and validation-context
   delivery with inline data sources. Static config plus SIGHUP remains
   supported.
 - **File-sourced credentials and certificates are read once.** `api_key_file`,
