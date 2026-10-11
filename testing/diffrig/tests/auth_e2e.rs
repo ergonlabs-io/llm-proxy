@@ -478,9 +478,36 @@ async fn all_three_failure_modes_are_byte_identical_on_the_wire() {
     // Rust note: sort each response's headers before comparing so the
     // assertion doesn't depend on wire order (which this codec happens to
     // keep stable, but the PROPERTY under test is "the same set of headers",
-    // not "the same order").
+    // not "the same order"). `date` is excluded: it is per-response by
+    // design, so two replies straddling a second boundary legitimately
+    // differ. Its presence and IMF-fixdate shape are asserted separately so
+    // excluding it from the comparison does not stop covering it.
+    for (name, res) in [
+        ("no-credential", &no_credential),
+        ("unknown", &unknown),
+        ("revoked", &revoked),
+    ] {
+        let dates: Vec<&str> = res
+            .headers
+            .iter()
+            .filter(|(n, _)| n == "date")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(dates.len(), 1, "{name}: expected exactly one date header");
+        // IMF-fixdate (RFC 9110 5.6.7), e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
+        assert!(
+            dates[0].len() == 29 && dates[0].ends_with(" GMT"),
+            "{name}: date header {:?} is not IMF-fixdate",
+            dates[0]
+        );
+    }
     let sorted = |res: &RawResponse| {
-        let mut headers = res.headers.clone();
+        let mut headers: Vec<_> = res
+            .headers
+            .iter()
+            .filter(|(n, _)| n != "date")
+            .cloned()
+            .collect();
         headers.sort();
         headers
     };
