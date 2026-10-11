@@ -11,6 +11,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-11
+
+Tenant provider credentials, plus security and drain fixes. The "Dynamic configuration"
+milestone gate (ADS ACK/NACK and warming) is still open; this tag does not close it.
+
 ### Added
 
 - Tenant provider credentials (bring your own key). A tenant stores its own key
@@ -27,12 +32,32 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `llmproxy_tenant_credential_requests_total` counter, and a `credential_source`
   field on request and attempt records.
 - Admin budget routes accept `credential_source` (`platform` or `tenant`).
+- `envoy.filters.http.ext_authz` (gRPC service only) in static and xDS config. It
+  fails closed by default; `failure_mode_allow` is explicit, warns once, and counts.
+- Admin `POST /healthcheck/fail`, `/healthcheck/ok`, and `/drain_listeners`.
+- The installer runs under POSIX `sh` (`curl ... | sh`), and by default installs and
+  starts the proxy as a launchd agent or systemd unit.
 
 ### Changed
 
 - Spend budgets are scoped to one credential source. Existing budgets are
   platform-scoped. A budget counts only the spend in its scope, so tenant-mode
   spend is not counted against a platform-scoped budget.
+- Tenant spend budgets are enforced alongside key budgets. When any spend budget is
+  configured, a request with no tenant or key identity gets `403 spend_identity_missing`.
+- Drain: the first `SIGTERM`/`SIGINT` or `POST /drain_listeners` makes `/ready` answer
+  `503 DRAINING`, closes the listening sockets, and closes idle keep-alive connections.
+  Upgraded (tunnel) connections keep the drain open until they close or the deadline.
+- A listener `per_connection_buffer_limit_bytes: 0` is a load error (a NACK over LDS).
+
+### Security
+
+- Every HTTP request body is capped at the listener's `per_connection_buffer_limit_bytes`
+  (default 1 MiB) before any filter runs. A larger body gets `413`. Before, the default
+  filter chain buffered an unauthenticated body with no cap.
+- `llmproxy.auth` removes the `Authorization` header after it verifies a virtual key.
+  Before, providers that take their key in another header (Anthropic) and keyless
+  providers (Ollama, vLLM) received the client's virtual key.
 
 ### Known limitations
 

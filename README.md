@@ -395,9 +395,9 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.1.0** | LLM gateway — token metering, rate limits, provider failover | Shipped 2026-08-08 |
 | **v0.2.0** | Production-ready serving — capacity report, admin endpoints, swap-under-load | Shipped 2026-08-29 |
 | **v0.3.0** | ADS/xDS delivery | Shipped 2026-09-29; tagged with the dynamic-configuration gate still open |
-| **v0.3.1** | Follow-up fixes, OpenRouter defaults, local metadata capture | Shipped 2026-10-09 (latest release) |
+| **v0.3.1** | Follow-up fixes, OpenRouter defaults, local metadata capture | Shipped 2026-10-09 |
 | **v0.3.2** | Dynamic configuration — the open ADS/xDS gate, plus live-defect fixes | Current; gate open |
-| **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Planned |
+| **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2 (latest release) |
 | **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Planned |
 | **v0.4.0** | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Planned |
 | **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
