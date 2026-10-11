@@ -436,6 +436,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             keys,
             policies,
             budgets,
+            tenant_credentials: Vec::new(),
         })
     }
 

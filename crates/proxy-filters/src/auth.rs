@@ -708,6 +708,7 @@ impl VirtualKeyAuthenticator {
             policies: crate::model_authz::TenantPolicyMap::new(),
             key_budgets: Default::default(),
             key_tenants: Default::default(),
+            tenant_credentials: HashMap::new(),
         })));
         VirtualKeyAuthenticator { secret, snapshot }
     }

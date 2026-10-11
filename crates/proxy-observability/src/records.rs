@@ -37,6 +37,29 @@ pub enum Termination {
     Unknown,
 }
 
+/// Whose provider credential an attempt was sent with (ADR-0007).
+///
+/// Records carry it as an optional field under schema version 1. A reader
+/// that finds it missing must assume `Platform`: every record written before
+/// tenant credentials existed was sent on the operator's credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// The cluster's own credential, configured by the operator.
+    Platform,
+    /// The authenticated tenant's stored credential for the cluster's provider.
+    Tenant,
+}
+
+impl CredentialSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialSource::Platform => "platform",
+            CredentialSource::Tenant => "tenant",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageCompleteness {
@@ -86,6 +109,9 @@ pub struct AttemptRecord {
     pub bytes_response: u64,
     pub usage: Option<Usage>,
     pub cost: Option<Cost>,
+    /// `None` when the attempt never reached the credential step.
+    #[serde(default)]
+    pub credential_source: Option<CredentialSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +151,10 @@ pub struct RequestRecord {
     pub physical_attempt_count: u64,
     pub attempts: Vec<AttemptRecord>,
     pub attempts_truncated: bool,
+    /// The selected (final) attempt's source; `None` when no attempt reached
+    /// the credential step.
+    #[serde(default)]
+    pub credential_source: Option<CredentialSource>,
 }
 
 impl RequestRecord {
@@ -488,6 +518,7 @@ pub(crate) mod tests {
             physical_attempt_count: 0,
             attempts: vec![],
             attempts_truncated: false,
+            credential_source: None,
         }
     }
 

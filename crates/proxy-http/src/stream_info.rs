@@ -168,6 +168,9 @@ pub struct AttemptInfo {
     pub retry_reason: Option<String>,
     pub bytes_request: Option<u64>,
     pub bytes_response: u64,
+    /// Set by the router at the credential step; `None` if the attempt
+    /// never got there.
+    pub credential_source: Option<crate::tenant_credentials::CredentialSource>,
 }
 
 impl AttemptInfo {
@@ -236,6 +239,15 @@ pub struct StreamInfo {
     /// auth filter is configured — see [`AuthInfo`] for why that case must
     /// never be papered over with a default identity.
     pub auth: AuthInfo,
+    /// The authenticated tenant's own provider credentials (ADR-0007), set by
+    /// the auth filter from the snapshot it authenticated against. `None`
+    /// means platform mode. The request keeps this `Arc` for its lifetime, so
+    /// a credential change applies to the next request, not to in-flight ones.
+    pub tenant_credentials: Option<std::sync::Arc<crate::tenant_credentials::TenantCredentialSet>>,
+    /// Whose credential the most recent attempt was sent with. Kept here as
+    /// well as on `AttemptInfo` because attempt snapshots exist only while
+    /// metadata capture is on, and access logs need it regardless.
+    pub credential_source: Option<crate::tenant_credentials::CredentialSource>,
     /// The request body's `model` field, published by
     /// the body_rewrite filter (`proxy_filters::body_rewrite_filter`) on the
     /// decode path once it has scanned the body -- the same scan that filter
@@ -300,6 +312,8 @@ impl Default for StreamInfo {
             bytes_sent: 0,
             llm: LlmStats::default(),
             auth: AuthInfo::default(),
+            tenant_credentials: None,
+            credential_source: None,
             requested_model: None,
             selected_model: None,
             attempts: Vec::new(),
@@ -370,6 +384,7 @@ impl StreamInfo {
             }),
             bytes_request: Some(0),
             bytes_response: 0,
+            credential_source: None,
         }));
         self.attempts.push(attempt.clone());
         Some(attempt)

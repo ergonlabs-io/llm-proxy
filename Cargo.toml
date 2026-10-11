@@ -86,6 +86,7 @@ tls-parser = "0.12"
 # something that was being built anyway -- and it keeps the same "no cmake/NASM
 # toolchain" property the rustls feature choice above was made for.
 ring = "0.17"
+zeroize = "1"
 # base64url encoding of the generated virtual key
 # (`llm-proxy --mode keygen`). Already compiled into the tree as a transitive
 # dependency (rcgen, tonic-build, ...), so this promotes an existing build

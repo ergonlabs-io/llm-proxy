@@ -664,6 +664,9 @@ impl LoggingBody {
                 attempt_count: attempts.len().min(u16::MAX as usize) as u16,
                 physical_attempt_count: ctx.stream_info.borrow().physical_attempt_count,
                 attempts_truncated: ctx.stream_info.borrow().attempts_truncated,
+                // The router overwrites this on every attempt, so it holds the
+                // final (selected) attempt's source.
+                credential_source: ctx.stream_info.borrow().credential_source,
                 attempts: attempts
                     .into_iter()
                     .map(|attempt| proxy_observability::records::AttemptRecord {
@@ -693,6 +696,7 @@ impl LoggingBody {
                         bytes_response: attempt.bytes_response,
                         usage: None,
                         cost: None,
+                        credential_source: attempt.credential_source,
                     })
                     .collect(),
             };

@@ -105,6 +105,24 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
+    // --- Tenant provider credentials (ADR-0007). The IR shape lands on its
+    //     own, ahead of its reader, because it is a shared interface
+    //     (AGENTS.md invariant 8). The router's credential step reads both
+    //     fields; when it does, these entries go stale and must be deleted.
+    AllowlistEntry {
+        struct_name: "ProviderRuntimeConfig",
+        field_name: "tenant_credential",
+        kind: EntryKind::KnownInert,
+        reason: "ADR-0007: the router's per-attempt credential step will read \
+                 this slot to apply a tenant's own key; nothing reads it yet.",
+    },
+    AllowlistEntry {
+        struct_name: "TenantCredentialSlot",
+        field_name: "value_prefix",
+        kind: EntryKind::KnownInert,
+        reason: "ADR-0007: written before the tenant secret by the router's \
+                 credential step, which does not exist yet.",
+    },
     // --- The ADS config surface, lowered but not yet consumed. One of the
     //     original five has left: `AdsConfig.node` now reaches the wire, and
     //     the change that noticed found this entry's own reason had been

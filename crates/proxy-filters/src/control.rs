@@ -95,6 +95,31 @@ impl std::fmt::Debug for StoredKey {
     }
 }
 
+/// One tenant provider credential exactly as a [`ControlPlaneStore`]
+/// persists it (ADR-0007). Only ciphertext is stored: [`ControlPlane::rebuild`]
+/// decrypts rows into the snapshot, and nothing on the request path sees a
+/// `StoredTenantCredential`.
+///
+/// The encryption fields are plain bytes rather than the crypto module's own
+/// type, so the storage format does not change when that code does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTenantCredential {
+    pub schema_version: u16,
+    pub tenant: TenantId,
+    pub provider: String,
+    /// Id of the key-encryption key that sealed `ciphertext`.
+    pub key_id: String,
+    pub nonce: [u8; 12],
+    /// AES-256-GCM output, tag included.
+    pub ciphertext: Vec<u8>,
+    pub last4: String,
+    pub fingerprint: String,
+    /// RFC 3339 timestamps, as written by the admin API.
+    pub created_at: String,
+    pub updated_at: String,
+    pub verified_at: Option<String>,
+}
+
 /// Everything one [`ControlPlaneStore::load`] call returns -- the whole
 /// control-plane state, read in one shot so a rebuild is one I/O round trip
 /// rather than N.
@@ -108,6 +133,9 @@ pub struct StoredControlPlane {
     // them by tenant rather than assuming one row implies the other. See
     // that function's doc for why this is deliberate, not an oversight.
     pub budgets: HashMap<TenantId, TenantBudget>,
+    /// Every tenant credential row. A store that does not support them yet
+    /// returns an empty list here and refuses writes.
+    pub tenant_credentials: Vec<StoredTenantCredential>,
 }
 
 /// Version 2 uses stable key budget subjects; absent versions are legacy version 1.
@@ -293,6 +321,30 @@ pub trait ControlPlaneStore: Send + Sync {
     // API does, off the request path.
     fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
     fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
+    /// Creates or replaces the credential row for (`rec.tenant`,
+    /// `rec.provider`) and bumps the generation. Deleting a tenant must also
+    /// delete its credential rows in the same write.
+    ///
+    /// The default refuses the write. A store without credential support
+    /// therefore fails closed instead of accepting a key it cannot hold.
+    fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
+        let _ = rec;
+        Err(StoreError::Unavailable(
+            "tenant credentials are not supported by this store".into(),
+        ))
+    }
+    /// Deletes one credential row and bumps the generation.
+    /// [`StoreError::NotFound`] if there was no such row, without a bump.
+    fn delete_tenant_credential(
+        &self,
+        tenant: &TenantId,
+        provider: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (tenant, provider);
+        Err(StoreError::Unavailable(
+            "tenant credentials are not supported by this store".into(),
+        ))
+    }
     /// Creates or rotates a stable key atomically. Ownership is immutable;
     /// revoked IDs are permanent tombstones. Updating an active key's digest
     /// immediately replaces its secret with no overlap, preserving budget/spend.
@@ -449,6 +501,12 @@ pub struct ControlPlaneSnapshot {
     /// Ownership copied from the durable key rows so admin writes can reject
     /// budgets for unknown keys without a hot-path store lookup.
     pub key_tenants: HashMap<KeyId, TenantId>,
+    /// Decrypted tenant provider credentials (ADR-0007). A tenant with no
+    /// entry is in platform mode. A row that failed to decrypt is present as
+    /// `TenantCredential::Unusable`, never absent, so that tenant fails
+    /// closed.
+    pub tenant_credentials:
+        HashMap<TenantId, Arc<proxy_http::tenant_credentials::TenantCredentialSet>>,
 }
 
 /// In-memory [`ControlPlaneStore`]. Backed by a `Mutex` because the trait's write methods
@@ -540,6 +598,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             keys: state.keys.values().cloned().collect(),
             policies: state.policies.clone(),
             budgets: state.budgets.clone(),
+            tenant_credentials: Vec::new(),
         })
     }
 
@@ -1166,6 +1225,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             keys,
             policies,
             budgets,
+            tenant_credentials: Vec::new(),
         })
     }
 
@@ -2143,6 +2203,7 @@ impl ControlPlane {
             policies,
             key_budgets,
             key_tenants,
+            tenant_credentials: HashMap::new(),
         }
     }
 }
@@ -2277,6 +2338,7 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         policies: TenantPolicyMap::new(),
         key_budgets: HashMap::new(),
         key_tenants: HashMap::new(),
+        tenant_credentials: HashMap::new(),
     })))
 }
 

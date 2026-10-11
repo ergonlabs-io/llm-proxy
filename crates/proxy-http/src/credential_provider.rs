@@ -317,6 +317,7 @@ mod tests {
             }),
             path_template: None,
             model_rewrites: Vec::new(),
+            tenant_credential: None,
         };
         let mut request = RequestHeaders {
             method: Method::POST,
@@ -353,6 +354,7 @@ mod tests {
             }),
             path_template: None,
             model_rewrites: Vec::new(),
+            tenant_credential: None,
         };
         let mut request = RequestHeaders {
             method: Method::POST,

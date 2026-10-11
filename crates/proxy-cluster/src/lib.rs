@@ -203,6 +203,16 @@ pub struct LoadBalancerContext {
     /// rest of the per-request selection input.
     pub avoid_previous_hosts: bool,
     pub host_selection_retry_max_attempts: u32,
+    /// When `Some`, the request may only be sent on a tenant's own
+    /// credential, and these are the provider names it holds one for
+    /// (ADR-0007). An aggregate skips a member whose tenant-credential slot
+    /// names a provider not in this list, or that has no slot. `None` means
+    /// no such restriction.
+    ///
+    /// Rust note: `Arc<[String]>` rather than `Vec` -- the list is built once
+    /// per control-plane snapshot and shared by every request of that tenant,
+    /// so each request clones a pointer, not the strings.
+    pub credential_providers: Option<std::sync::Arc<[String]>>,
 }
 
 /// Circuit-breaker accounting for one (cluster, priority) — S5's four

@@ -2094,6 +2094,22 @@ pub struct ProviderRuntimeConfig {
     /// fallback must send the selected member's upstream model, not the
     /// primary member's model.
     pub model_rewrites: Vec<ProviderModelRewrite>,
+    /// Present when this cluster accepts a tenant's own credential for
+    /// `provider` (ADR-0007). It lives here, not on the route, because the
+    /// credential must follow the member actually dialled (invariant 6).
+    pub tenant_credential: Option<TenantCredentialSlot>,
+}
+
+/// Where a tenant credential goes on a request to this cluster. Header API-key
+/// shapes only: Vertex OAuth2 and Bedrock SigV4 clusters cannot carry one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantCredentialSlot {
+    /// Operator-chosen provider name the tenant's credential is stored under.
+    pub provider: String,
+    /// Lowercase header name the credential replaces, e.g. `authorization`.
+    pub header: String,
+    /// Prefix written before the secret, e.g. `Bearer `; empty for raw keys.
+    pub value_prefix: String,
 }
 
 /// A validated TLS certificate/validation-context secret (static or

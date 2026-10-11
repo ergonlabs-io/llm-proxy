@@ -4261,6 +4261,7 @@ fn convert_provider_runtime_metadata(
             credential,
             path_template,
             model_rewrites,
+            tenant_credential: None,
         }))
     }
 }
