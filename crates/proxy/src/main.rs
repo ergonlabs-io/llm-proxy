@@ -975,6 +975,9 @@ async fn run_serve(
             factory_state: factory_state.clone(),
             readiness: Some(readiness),
             cluster_state: Some(cluster_state),
+            credential_probe: Some(Arc::new(
+                proxy_http::credential_probe::ClusterCredentialProbe::new(cluster_manager.clone()),
+            )),
             lifecycle: lifecycle.clone(),
         },
     )
@@ -2537,6 +2540,7 @@ struct AdminStartRuntime<'a> {
     factory_state: Arc<proxy_http::filter::SharedFactoryState>,
     readiness: Option<proxy_admin::ReadinessProbe>,
     cluster_state: Option<proxy_admin::ClusterStateProvider>,
+    credential_probe: Option<Arc<dyn proxy_http::credential_probe::TenantCredentialProbe>>,
     lifecycle: Arc<LifecycleState>,
 }
 
@@ -2580,7 +2584,7 @@ async fn start_admin(
             cluster_state: runtime.cluster_state,
             ui,
             lifecycle: Some(runtime.lifecycle),
-            credential_probe: None,
+            credential_probe: runtime.credential_probe,
         },
     )
     .await
@@ -2883,6 +2887,7 @@ mod tests {
                 factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
                 readiness: None,
                 cluster_state: None,
+                credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
             },
         )
@@ -2913,6 +2918,7 @@ mod tests {
                 factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
                 readiness: None,
                 cluster_state: None,
+                credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
             },
         )
@@ -2948,6 +2954,7 @@ mod tests {
                 factory_state: Arc::new(proxy_http::filter::SharedFactoryState::default()),
                 readiness: None,
                 cluster_state: None,
+                credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
             },
         )
