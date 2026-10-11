@@ -363,8 +363,8 @@ impl OutlierEventSink for TracingEventSink {
 /// only runs on the control runtime (the interval loop is a `tokio::spawn`ed
 /// task) but is `Send + Sync` so [`OutlierDetector::report_result`] can be
 /// called from any worker thread that just finished a request. The `Arc`
-/// wrapping [`OutlierDetector::host_set`]/[`OutlierDetector::sink`] (rather
-/// than borrowing) is what lets [`OutlierDetector::eject`] hand a cheap
+/// wrapping `OutlierDetector::host_set`/`OutlierDetector::sink` (rather
+/// than borrowing) is what lets `OutlierDetector::eject` hand a cheap
 /// clone of "how to un-eject this host" to a detached `tokio::spawn`ed timer
 /// without needing the whole detector wrapped in an `Arc` itself -- unlike
 /// `HealthCheckEngine`, `report_result` is a plain `&self` method (matching
