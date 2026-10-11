@@ -1,0 +1,62 @@
+# Header-only gRPC v3 subset. Authorization listens on 127.0.0.1:9001;
+# application upstream listens on 127.0.0.1:9002. TLS and dynamic LDS are deferred.
+static_resources:
+  listeners:
+    - name: authorized_http
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 9000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: authorized_http
+                route_config:
+                  name: application_routes
+                  virtual_hosts:
+                    - name: application
+                      domains: ['*']
+                      routes:
+                        - match: { prefix: / }
+                          route: { cluster: application }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      '@type': type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      grpc_service:
+                        envoy_grpc: { cluster_name: authorization }
+                        timeout: 0.2s
+                      transport_api_version: V3
+                      encode_raw_headers: true
+                      validate_mutations: true
+                      enable_dynamic_metadata_ingestion: false
+                      charge_cluster_response_stats: false
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: authorization
+      type: STATIC
+      connect_timeout: 0.2s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: authorization
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 9001 }
+    - name: application
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: application
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 9002 }

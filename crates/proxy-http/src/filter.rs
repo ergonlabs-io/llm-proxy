@@ -165,6 +165,17 @@ pub trait DecoderCallbacks {
         details: &str,
     );
 
+    /// Send a protocol-provided body verbatim, without text formatting.
+    fn send_local_reply_exact(
+        &mut self,
+        code: StatusCode,
+        body: &str,
+        modify_headers: Option<HeaderMutationFn>,
+        details: &str,
+    ) {
+        self.send_local_reply(code, body, modify_headers, details);
+    }
+
     /// Resume iteration at the NEXT filter, replaying buffered body then trailers.
     fn continue_decoding(&mut self);
 
@@ -329,6 +340,10 @@ pub trait EncoderCallbacks {
 /// Only the config-time plumbing that DOES cross threads — [`FilterInstanceFactory`],
 /// [`HttpFilterFactory`], [`PerRouteConfig`] — carries `Send + Sync`.
 pub trait HttpFilter {
+    /// Body-independent admission prefix, executed before polling downstream data.
+    fn decode_before_body(&self) -> bool {
+        false
+    }
     fn decode_headers(
         &mut self,
         _cb: &mut dyn DecoderCallbacks,
@@ -457,6 +472,9 @@ pub trait TerminalFilterInstanceFactory: Send + Sync {
 
 /// Marker trait for parsed per-route filter config (`typed_per_filter_config`).
 pub trait PerRouteConfig: Send + Sync {
+    fn merge_from(&self, _less_specific: &dyn PerRouteConfig) -> Option<Arc<dyn PerRouteConfig>> {
+        None
+    }
     /// Rust note: trait objects have no built-in way to recover their
     /// concrete type; `dyn PerRouteConfig` alone can't be downcast. Each
     /// implementor forwards this to `self` (`fn as_any(&self) -> &dyn Any {
@@ -747,6 +765,15 @@ pub trait FilterInstanceFactory: Send + Sync {
 /// (e.g. `type.googleapis.com/envoy.extensions.filters.http.router.v3.Router`).
 /// Lane H extensions register under `type.llmproxy.dev/...`.
 pub trait HttpFilterFactory: Send + Sync {
+    fn parse_ext_authz_per_route(
+        &self,
+        _config: &proxy_config::authorization::ExtAuthzPerRoute,
+    ) -> Result<Arc<dyn PerRouteConfig>, ConfigError> {
+        Err(ConfigError::Unimplemented {
+            field_path: "typed_per_filter_config".into(),
+            reason: "typed authorization overrides unsupported by this filter".into(),
+        })
+    }
     fn type_url(&self) -> &'static str;
 
     /// Parse + validate this filter's `typed_config` and return an instance factory.

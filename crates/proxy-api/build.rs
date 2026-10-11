@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // must be roots, not merely vendored files: the descriptor pool is
         // what lets strict lowering decode their Any payloads.
         "envoy/extensions/filters/http/cors/v3/cors.proto",
+        "envoy/extensions/filters/http/ext_authz/v3/ext_authz.proto",
+        "envoy/service/auth/v3/external_auth.proto",
         "envoy/extensions/filters/http/local_ratelimit/v3/local_rate_limit.proto",
         "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.proto",
         "envoy/extensions/filters/listener/tls_inspector/v3/tls_inspector.proto",

@@ -212,26 +212,28 @@ impl PerRouteTable {
     /// (built by [`FilterChainHandler::new`], which has no filter NAMES to
     /// resolve against) must behave as "no override anywhere", not panic.
     fn lookup(&self, route: &RouteEntry, filter_index: usize) -> Option<Arc<dyn PerRouteConfig>> {
-        if let Some(cfg) = self
-            .route
-            .get(route.route_index)
-            .and_then(|row| row.get(filter_index))
-            .and_then(|slot| slot.clone())
-        {
-            return Some(cfg);
+        let vhost = self.route_to_vhost.get(route.route_index).copied();
+        let levels = [
+            self.route_config.get(filter_index).and_then(|x| x.clone()),
+            vhost
+                .and_then(|i| self.virtual_host.get(i))
+                .and_then(|r| r.get(filter_index))
+                .and_then(|x| x.clone()),
+            self.route
+                .get(route.route_index)
+                .and_then(|r| r.get(filter_index))
+                .and_then(|x| x.clone()),
+        ];
+        let mut merged: Option<Arc<dyn PerRouteConfig>> = None;
+        for config in levels.into_iter().flatten() {
+            merged = Some(match merged {
+                Some(ref less) => config
+                    .merge_from(less.as_ref())
+                    .unwrap_or_else(|| config.clone()),
+                None => config,
+            });
         }
-        if let Some(cfg) = self
-            .route_to_vhost
-            .get(route.route_index)
-            .and_then(|&vhost_idx| self.virtual_host.get(vhost_idx))
-            .and_then(|row| row.get(filter_index))
-            .and_then(|slot| slot.clone())
-        {
-            return Some(cfg);
-        }
-        self.route_config
-            .get(filter_index)
-            .and_then(|slot| slot.clone())
+        merged
     }
 }
 
@@ -271,7 +273,17 @@ fn resolve_per_filter_row(
                 ),
             });
         };
+        if let Some(config) = &cfg.ext_authz {
+            row[idx] = Some(factories[idx].parse_ext_authz_per_route(config)?);
+            continue;
+        }
         if cfg.disabled {
+            if factories[idx].type_url() == proxy_config::authorization::TYPE_URL {
+                row[idx] = Some(factories[idx].parse_ext_authz_per_route(
+                    &proxy_config::authorization::ExtAuthzPerRoute::Disabled,
+                )?);
+                continue;
+            }
             return Err(ConfigError::Unimplemented {
                 field_path,
                 reason: format!(
@@ -744,6 +756,7 @@ impl StreamHandler for FilterChainHandler {
             // every filter (including an encode filter's end-of-stream
             // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
+            stream_info.borrow_mut().downstream = Some(req.downstream);
             if let Some(sink) = &self.request_record_sink {
                 #[cfg(unix)]
                 let admission = sink.try_admit();
@@ -1252,6 +1265,7 @@ fn per_route_config_for(
 struct LocalReply {
     code: http::StatusCode,
     body: String,
+    exact_body: bool,
     /// Rust note: [`HeaderMutationFn`] is `FnOnce` (callable exactly once,
     /// consuming it) — a field can't be *called* through `&mut self`, only
     /// moved out of. That's why every use site below takes it out of the
@@ -1271,6 +1285,7 @@ impl LocalReply {
         Self {
             code,
             body: body.to_string(),
+            exact_body: false,
             modify_headers: None,
             details: details.to_string(),
         }
@@ -1320,40 +1335,87 @@ impl FilterManager {
         // matters.
         *ctx.request_headers_snapshot.borrow_mut() = Some(snapshot_request(&req.head));
 
-        // --- collect the request body (buffered model) ---
-        let (mut head, req_trailers, mut body) = match collect_request(req).await {
-            Ok(parts) => parts,
-            // A downstream body read error is a client problem: 400. (Streaming
-            // will surface this mid-flight instead; chunk 1 sees it up front.)
-            // S2.5: routed through the encoder chain like any other response —
-            // no filters have run yet, but the still-fresh `filters`/`ctx` are
-            // exactly what `respond_with_local_reply` needs.
-            Err(err) => {
-                // WP-24 `DC`: a `BodyError::Downstream` means the CLIENT's
-                // connection failed while its request body was being read --
-                // Envoy's "downstream connection termination". Any other
-                // variant is a malformed body, which is a plain 400 with no
-                // flag. This is the only site that can tell them apart: the
-                // distinction exists in `codec.rs`, and before the error was
-                // propagated out of `collect_request` it was destroyed here.
-                //
-                // Set before `respond_with_local_reply` so a `%RESPONSE_FLAGS%`
-                // logger reading `StreamInfo` afterwards already sees it --
-                // the same ordering `router.rs` uses for its own flags.
-                if matches!(err, BodyError::Downstream(_)) {
-                    tracing::debug!(response_flag = "DC", "downstream request body read failed");
-                    ctx.stream_info.borrow_mut().set_response_flag(
-                        proxy_observability::ResponseFlag::DownstreamConnectionTermination,
-                    );
-                }
+        let early = filters
+            .iter()
+            .take_while(|f| f.decode_before_body())
+            .count();
+        let mut req = req;
+        if early > 0 {
+            let end_stream = req.body.is_end_stream();
+            let mut empty_body = Bytes::new();
+            if let Err(status) = drive_decode(
+                &mut filters[..early],
+                &mut ctx,
+                buffer_limit,
+                &mut req.head,
+                &mut empty_body,
+                None,
+                DecodeStart {
+                    index: 0,
+                    header_end_stream: Some(end_stream),
+                },
+            )
+            .await
+            {
                 let reply = LocalReply::new(
-                    http::StatusCode::BAD_REQUEST,
-                    "invalid request body",
-                    "request_body_read_error",
+                    status,
+                    "request rejected by filter chain",
+                    "decode_buffer_overflow",
                 );
                 return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
             }
-        };
+            if let Some(reply) = ctx.local_reply.take() {
+                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            }
+        }
+        // --- collect the request body (buffered model) ---
+        let (mut head, req_trailers, mut body) =
+            match collect_request(req, if early > 0 { Some(buffer_limit) } else { None }).await {
+                Ok(parts) => parts,
+                // A downstream body read error is a client problem: 400. (Streaming
+                // will surface this mid-flight instead; chunk 1 sees it up front.)
+                // S2.5: routed through the encoder chain like any other response —
+                // no filters have run yet, but the still-fresh `filters`/`ctx` are
+                // exactly what `respond_with_local_reply` needs.
+                Err(RequestCollectionError::TooLarge) => {
+                    let reply = LocalReply::new(
+                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body exceeds buffer limit",
+                        "decode_buffer_overflow",
+                    );
+                    return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply)
+                        .await;
+                }
+                Err(RequestCollectionError::Body(err)) => {
+                    // WP-24 `DC`: a `BodyError::Downstream` means the CLIENT's
+                    // connection failed while its request body was being read --
+                    // Envoy's "downstream connection termination". Any other
+                    // variant is a malformed body, which is a plain 400 with no
+                    // flag. This is the only site that can tell them apart: the
+                    // distinction exists in `codec.rs`, and before the error was
+                    // propagated out of `collect_request` it was destroyed here.
+                    //
+                    // Set before `respond_with_local_reply` so a `%RESPONSE_FLAGS%`
+                    // logger reading `StreamInfo` afterwards already sees it --
+                    // the same ordering `router.rs` uses for its own flags.
+                    if matches!(err, BodyError::Downstream(_)) {
+                        tracing::debug!(
+                            response_flag = "DC",
+                            "downstream request body read failed"
+                        );
+                        ctx.stream_info.borrow_mut().set_response_flag(
+                            proxy_observability::ResponseFlag::DownstreamConnectionTermination,
+                        );
+                    }
+                    let reply = LocalReply::new(
+                        http::StatusCode::BAD_REQUEST,
+                        "invalid request body",
+                        "request_body_read_error",
+                    );
+                    return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply)
+                        .await;
+                }
+            };
 
         // --- decode chain (config order) ---
         if let Err(status) = drive_decode(
@@ -1363,6 +1425,10 @@ impl FilterManager {
             &mut head,
             &mut body,
             req_trailers.as_ref(),
+            DecodeStart {
+                index: early,
+                header_end_stream: None,
+            },
         )
         .await
         {
@@ -1602,7 +1668,12 @@ async fn respond_with_local_reply(
         status: reply.code,
         headers,
     };
-    let mut body = bytes_to_seam_body(Bytes::from(format!("{}\n", reply.body)), None);
+    let body_bytes = if reply.exact_body {
+        reply.body
+    } else {
+        format!("{}\n", reply.body)
+    };
+    let mut body = bytes_to_seam_body(Bytes::from(body_bytes), None);
 
     match encode_headers_phase(&mut filters, &mut ctx, buffer_limit, &mut head, &mut body).await {
         Ok(hold) => {
@@ -2570,6 +2641,11 @@ async fn wait_for_decode_resume(ctx: &ChainCtx) {
 /// [`DecodeContinueHandle::continue_decoding`] releases it. Plain
 /// `StopIteration` keeps today's fallthrough (still-open, separate gap — see
 /// the module doc); only the StopAll statuses changed here.
+struct DecodeStart {
+    index: usize,
+    header_end_stream: Option<bool>,
+}
+
 async fn drive_decode(
     filters: &mut [Box<dyn HttpFilter>],
     ctx: &mut ChainCtx,
@@ -2577,10 +2653,13 @@ async fn drive_decode(
     head: &mut RequestHeaders,
     body: &mut Bytes,
     trailers: Option<&RequestTrailers>,
+    start: DecodeStart,
 ) -> Result<(), http::StatusCode> {
     // Mutable: a filter returning `ContinueAndDontEndStream` (S2.2 I1) clears
     // it for everyone after it -- see `DirectionState::dont_end_stream`.
-    let mut end_stream_on_headers = body.is_empty() && trailers.is_none();
+    let mut end_stream_on_headers = start
+        .header_end_stream
+        .unwrap_or(body.is_empty() && trailers.is_none());
     let mut data_consumed = vec![false; filters.len()];
     // ADR-0004 step 2: how many times each filter has been given an async
     // resumption so far, this direction — see `poll_async_resumption`'s doc
@@ -2588,8 +2667,8 @@ async fn drive_decode(
     let mut resumptions = vec![0u32; filters.len()];
     // `header_reach`: one past the last filter that received (and continued on)
     // headers. Filters `[0, header_reach)` get data in the trailing phase.
-    let mut header_reach = 0;
-    let mut idx = 0;
+    let mut header_reach = start.index;
+    let mut idx = start.index;
     while idx < filters.len() {
         // Split borrow: `&mut filters[idx]`, `&mut *head`, and an adapter over
         // `&mut *ctx` are three disjoint borrows (module doc).
@@ -3115,9 +3194,26 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
         self.ctx.local_reply = Some(LocalReply {
             code,
             body: body.to_string(),
+            exact_body: false,
             modify_headers,
             details: details.to_string(),
         });
+    }
+
+    fn send_local_reply_exact(
+        &mut self,
+        code: http::StatusCode,
+        body: &str,
+        modify_headers: Option<HeaderMutationFn>,
+        details: &str,
+    ) {
+        let already_pending = self.ctx.local_reply.is_some();
+        self.send_local_reply(code, body, modify_headers, details);
+        if !already_pending {
+            if let Some(reply) = &mut self.ctx.local_reply {
+                reply.exact_body = true;
+            }
+        }
     }
 
     fn continue_decoding(&mut self) {
@@ -3279,9 +3375,15 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
 // --- body plumbing ---------------------------------------------------------
 
 /// Collect a request into head + optional trailers + buffered body bytes.
+enum RequestCollectionError {
+    TooLarge,
+    Body(BodyError),
+}
+
 async fn collect_request(
     req: HttpRequestParts,
-) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), BodyError> {
+    limit: Option<usize>,
+) -> Result<(RequestHeaders, Option<RequestTrailers>, Bytes), RequestCollectionError> {
     // `downstream` is only used by `FilterChainHandler::handle` (XFF/S9,
     // access-log peer address), all of which runs before `FilterManager::run`
     // is even called -- this function only needs head + body. `on_upgrade`
@@ -3300,7 +3402,23 @@ async fn collect_request(
     // to be discarded here, which is what made `DC` unreachable -- by the
     // time the caller saw the failure there was nothing left to say whether
     // the client had gone away or the body was merely malformed.
-    let collected = body.collect().await?;
+    let collected = if let Some(limit) = limit {
+        http_body_util::Limited::new(body, limit)
+            .collect()
+            .await
+            .map_err(|error| {
+                if error.is::<http_body_util::LengthLimitError>() {
+                    RequestCollectionError::TooLarge
+                } else {
+                    match error.downcast::<BodyError>() {
+                        Ok(error) => RequestCollectionError::Body(*error),
+                        Err(error) => RequestCollectionError::Body(BodyError::Downstream(error)),
+                    }
+                }
+            })?
+    } else {
+        body.collect().await.map_err(RequestCollectionError::Body)?
+    };
     let trailers = collected.trailers().cloned().map(RequestTrailers);
     Ok((head, trailers, collected.to_bytes()))
 }

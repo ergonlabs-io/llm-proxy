@@ -38,3 +38,6 @@ controlplane = { path = "../../testing/controlplane" }
 
 [lints]
 workspace = true
+
+[features]
+test-support = []

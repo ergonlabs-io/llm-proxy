@@ -677,6 +677,7 @@ pub enum ComparisonOp {
 /// owns per-filter parsing, not the IR).
 #[derive(Debug)]
 pub struct PerFilterConfig {
+    pub ext_authz: Option<crate::authorization::ExtAuthzPerRoute>,
     /// Type URL of the *inner* config (after any `FilterConfig` unwrapping).
     pub type_url: String,
     /// `None` when `disabled` is set (Envoy allows a bare disable with no config).
@@ -700,6 +701,7 @@ pub struct PerFilterConfig {
 /// parsing).
 #[derive(Debug)]
 pub struct HttpFilterSpec {
+    pub ext_authz: Option<crate::authorization::ExtAuthzConfig>,
     /// Envoy filter name, e.g. `envoy.filters.http.router`.
     pub name: String,
     /// `typed_config` type URL, the registry key.

@@ -100,6 +100,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         route_table,
         rds_route_config_name: None,
         http_filters: vec![HttpFilterSpec {
+            ext_authz: None,
             name: "envoy.filters.http.router".to_string(),
             type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
                 .to_string(),
@@ -289,6 +290,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         route_table: inlined,
         rds_route_config_name: None,
         http_filters: vec![HttpFilterSpec {
+            ext_authz: None,
             name: "envoy.filters.http.router".to_string(),
             type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
                 .to_string(),

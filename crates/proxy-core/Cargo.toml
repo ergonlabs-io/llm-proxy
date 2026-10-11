@@ -13,6 +13,7 @@ proxy-cluster = { workspace = true }
 # WP-33a (Lane H): the usage/token filter, registered into the shared
 # FilterRegistry below so a `typed_config` can reach it.
 proxy-filters = { workspace = true }
+proxy-xds = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
 core_affinity = { workspace = true }
@@ -34,6 +35,9 @@ tracing = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+hyper = { workspace = true }
+http-body-util = { workspace = true }
+proxy-xds = { workspace = true, features = ["test-support"] }
 proxy-api = { workspace = true }
 # WP-23 increment 6a: test helpers build a `StatsControl` to resolve the
 # `RouterStats` `initial_bind`/`build_listener_hcm` now require -- production

@@ -11,6 +11,7 @@
 //! config with backoff — never NACK-storm, never shed state.
 
 pub mod apply;
+pub mod authorization;
 pub mod backoff;
 pub mod client;
 pub mod delta_client;

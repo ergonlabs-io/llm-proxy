@@ -191,6 +191,7 @@ impl AttemptInfo {
 /// stream end, not at header-flush time).
 #[derive(Debug)]
 pub struct StreamInfo {
+    pub downstream: Option<crate::handler::DownstreamInfo>,
     /// Monotonic baseline established when this stream enters the HCM. Kept
     /// private to this crate; filters publish only derived durations so no
     /// cross-crate API can accidentally compare `Instant`s from unrelated
@@ -287,6 +288,7 @@ impl Default for StreamInfo {
     fn default() -> Self {
         Self {
             request_started_at: Instant::now(),
+            downstream: None,
             response_flags: Vec::new(),
             response_code_details: None,
             is_local_reply: false,

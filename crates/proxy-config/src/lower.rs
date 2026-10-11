@@ -176,6 +176,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
             }
         }
     }
+    validate_ext_authz_clusters(&mut snapshot)?;
     snapshot.ads = ads_pending;
     Ok(snapshot)
 }
@@ -268,7 +269,21 @@ pub fn lower_dynamic_listener(
     path: &str,
 ) -> Result<ListenerConfig, ConfigError> {
     let l: listener_v3::Listener = lower_dynamic_any(any, path, DYNAMIC_LISTENER_TYPE)?;
-    convert_listener(&l, path)
+    let listener = convert_listener(&l, path)?;
+    for chain in listener
+        .filter_chains
+        .iter()
+        .chain(listener.default_filter_chain.iter())
+    {
+        for network in &chain.filters {
+            if let NetworkFilterSpec::HttpConnectionManager(hcm) = network {
+                if let Some(cfg) = hcm.http_filters.iter().find_map(|f| f.ext_authz.as_ref()) {
+                    return Err(unsupported(&cfg.field_path, "ext_authz is bootstrap-only until authorization cluster warming is implemented"));
+                }
+            }
+        }
+    }
+    Ok(listener)
 }
 
 /// Lower one ADS-delivered RDS resource. Like CDS/LDS lowering, this uses the
@@ -338,7 +353,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "envoy.config.core.v3.ApiConfigSource" => {
             &["api_type", "transport_api_version", "grpc_services"]
         }
-        "envoy.config.core.v3.GrpcService" => &["envoy_grpc"],
+        "envoy.config.core.v3.GrpcService" => &["envoy_grpc", "timeout"],
         "envoy.config.core.v3.GrpcService.EnvoyGrpc" => &["cluster_name"],
         "envoy.config.bootstrap.v3.Admin" => &["address"],
         "envoy.config.bootstrap.v3.Bootstrap.StaticResources" => &["listeners", "clusters"],
@@ -664,6 +679,14 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             &["name", "typed_config"]
         }
         "envoy.extensions.filters.http.router.v3.Router" => &[],
+        "envoy.extensions.filters.http.ext_authz.v3.ExtAuthz" => &[
+            "grpc_service", "transport_api_version", "failure_mode_allow",
+            "failure_mode_allow_header_add", "status_on_error", "clear_route_cache",
+            "stat_prefix", "encode_raw_headers", "validate_mutations",
+            "enable_dynamic_metadata_ingestion", "charge_cluster_response_stats",
+        ],
+        "envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute" => &["disabled", "check_settings"],
+        "envoy.extensions.filters.http.ext_authz.v3.CheckSettings" => &["context_extensions"],
         // WP-24: access logging.
         "envoy.config.accesslog.v3.AccessLog" => &["name", "filter", "typed_config"],
         "envoy.config.accesslog.v3.AccessLogFilter" => {
@@ -825,6 +848,15 @@ fn check_supported_surface(msg: &DynamicMessage, path: &mut String) -> Result<()
     }
     if full_name.starts_with("google.protobuf.") {
         return Ok(()); // well-known leaf types
+    }
+    if full_name == "envoy.config.core.v3.GrpcService"
+        && !path.ends_with(".grpc_service")
+        && msg.has_field_by_name("timeout")
+    {
+        return Err(unsupported(
+            format!("{path}.timeout"),
+            "discovery gRPC timeout is not implemented",
+        ));
     }
     let allowed = allowed_fields(&full_name);
 
@@ -1020,6 +1052,220 @@ fn decode_http_filter_config(
 /// [`convert_typed_per_filter_config`]).
 const FILTER_CONFIG_TYPE: &str = "envoy.config.route.v3.FilterConfig";
 
+fn convert_ext_authz(
+    msg: &DynamicMessage,
+    path: &str,
+) -> Result<crate::authorization::ExtAuthzConfig, ConfigError> {
+    use proxy_api::envoy::extensions::filters::http::ext_authz::v3::ExtAuthz;
+    let cfg: ExtAuthz = msg
+        .transcode_to()
+        .map_err(|e| invalid(path, e.to_string()))?;
+    if cfg.transport_api_version != 2 {
+        return Err(unsupported(
+            format!("{path}.transport_api_version"),
+            "explicit V3 is required",
+        ));
+    }
+    if !cfg.encode_raw_headers || !cfg.validate_mutations {
+        let field = if !cfg.encode_raw_headers {
+            "encode_raw_headers"
+        } else {
+            "validate_mutations"
+        };
+        return Err(unsupported(
+            format!("{path}.{field}"),
+            "this subset requires true",
+        ));
+    }
+    for (field, value) in [
+        (
+            "enable_dynamic_metadata_ingestion",
+            cfg.enable_dynamic_metadata_ingestion,
+        ),
+        (
+            "charge_cluster_response_stats",
+            cfg.charge_cluster_response_stats,
+        ),
+    ] {
+        if value != Some(false) {
+            return Err(unsupported(
+                format!("{path}.{field}"),
+                "this subset requires explicit false",
+            ));
+        }
+    }
+    let grpc = match cfg.services {
+        Some(proxy_api::envoy::extensions::filters::http::ext_authz::v3::ext_authz::Services::GrpcService(g)) => g,
+        _ => return Err(invalid(format!("{path}.grpc_service"), "gRPC service is required")),
+    };
+    let cluster = match grpc.target_specifier {
+        Some(core_v3::grpc_service::TargetSpecifier::EnvoyGrpc(g))
+            if !g.cluster_name.is_empty() =>
+        {
+            g.cluster_name
+        }
+        _ => {
+            return Err(invalid(
+                format!("{path}.grpc_service.envoy_grpc.cluster_name"),
+                "nonempty Envoy gRPC cluster is required",
+            ))
+        }
+    };
+    let timeout = match grpc.timeout {
+        None => StdDuration::from_millis(200),
+        Some(d)
+            if d.seconds >= 0
+                && d.nanos >= 0
+                && d.nanos < 1_000_000_000
+                && d.nanos % 1_000_000 == 0 =>
+        {
+            StdDuration::from_secs(d.seconds as u64) + StdDuration::from_nanos(d.nanos as u64)
+        }
+        _ => {
+            return Err(invalid(
+                format!("{path}.grpc_service.timeout"),
+                "timeout must be a whole number of milliseconds",
+            ))
+        }
+    };
+    if timeout < StdDuration::from_millis(1) || timeout > StdDuration::from_secs(30) {
+        return Err(invalid(
+            format!("{path}.grpc_service.timeout"),
+            "timeout must be 1ms..=30s",
+        ));
+    }
+    let status = cfg.status_on_error.map(|s| s.code).unwrap_or(403);
+    if !(200..=511).contains(&status) {
+        return Err(invalid(
+            format!("{path}.status_on_error.code"),
+            "final HTTP status must be 200..=511",
+        ));
+    }
+    if cfg.stat_prefix.len() > 64
+        || !cfg
+            .stat_prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(invalid(
+            format!("{path}.stat_prefix"),
+            "stat prefix must contain at most 64 alphanumeric, underscore or hyphen bytes",
+        ));
+    }
+    Ok(crate::authorization::ExtAuthzConfig {
+        cluster,
+        endpoint: None,
+        timeout,
+        connect_timeout: StdDuration::from_secs(5),
+        failure_mode_allow: cfg.failure_mode_allow,
+        failure_mode_allow_header_add: cfg.failure_mode_allow_header_add,
+        status_on_error: status as u16,
+        clear_route_cache: cfg.clear_route_cache,
+        stat_prefix: cfg.stat_prefix,
+        field_path: path.to_owned(),
+    })
+}
+
+fn convert_ext_authz_per_route(
+    msg: &DynamicMessage,
+    path: &str,
+) -> Result<crate::authorization::ExtAuthzPerRoute, ConfigError> {
+    use proxy_api::envoy::extensions::filters::http::ext_authz::v3::{
+        ext_authz_per_route::Override, ExtAuthzPerRoute,
+    };
+    let cfg: ExtAuthzPerRoute = msg
+        .transcode_to()
+        .map_err(|e| invalid(path, e.to_string()))?;
+    match cfg.r#override {
+        Some(Override::Disabled(true)) => Ok(crate::authorization::ExtAuthzPerRoute::Disabled),
+        Some(Override::CheckSettings(c)) => {
+            if c.context_extensions.len() > 64
+                || c.context_extensions
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len())
+                    .sum::<usize>()
+                    > 16 * 1024
+            {
+                return Err(invalid(
+                    format!("{path}.check_settings.context_extensions"),
+                    "context extensions exceed limits",
+                ));
+            }
+            Ok(crate::authorization::ExtAuthzPerRoute::Check {
+                context_extensions: c.context_extensions.into_iter().collect(),
+            })
+        }
+        _ => Err(invalid(
+            format!("{path}.disabled"),
+            "set disabled: true or check_settings",
+        )),
+    }
+}
+
+/// Cross-resource check for an ext_authz authorization cluster. Today its only
+/// caller is `validate_ext_authz_clusters`, which runs at bootstrap only;
+/// listener rebuilds after xDS updates reuse the endpoint resolved here.
+pub fn ext_authz_endpoint(
+    cfg: &crate::authorization::ExtAuthzConfig,
+    cluster: &ClusterConfig,
+) -> Result<SocketAddr, ConfigError> {
+    let path = format!("{}.grpc_service.envoy_grpc.cluster_name", cfg.field_path);
+    if cluster.discovery != DiscoveryType::Static
+        || !matches!(cluster.kind, ClusterKind::Endpoints)
+        || cluster.endpoints.len() != 1
+        || cluster.transport_socket.is_some()
+        || cluster.upstream_protocol != UpstreamProtocol::Http2
+        || cluster.health_check.is_some()
+        || cluster.outlier_detection.is_some()
+        || !cluster.request_headers_to_add.is_empty()
+        || cluster.provider_runtime.is_some()
+        || cluster.request_path_rewrite.is_some()
+        || cluster.usage_dialect.is_some()
+        || cluster.circuit_breakers != CircuitBreakers::default()
+        || cluster.per_connection_buffer_limit_bytes != 1024 * 1024
+    {
+        return Err(unsupported(path, "authorization requires one STATIC plaintext HTTP/2 endpoint without health, outlier or provider behavior"));
+    }
+    let endpoint = &cluster.endpoints[0];
+    let ip: IpAddr = endpoint
+        .host
+        .parse()
+        .map_err(|_| invalid(&path, "authorization endpoint must be an IP address"))?;
+    Ok(SocketAddr::new(ip, endpoint.port))
+}
+
+fn validate_ext_authz_clusters(snapshot: &mut ConfigSnapshot) -> Result<(), ConfigError> {
+    for listener in snapshot.listeners.values_mut() {
+        let listener = Arc::get_mut(listener).expect("fresh bootstrap listener");
+        for chain in listener
+            .filter_chains
+            .iter_mut()
+            .chain(listener.default_filter_chain.iter_mut())
+        {
+            for network in &mut chain.filters {
+                if let NetworkFilterSpec::HttpConnectionManager(hcm) = network {
+                    for filter in &mut hcm.http_filters {
+                        if let Some(cfg) = &mut filter.ext_authz {
+                            let cluster = snapshot.clusters.get(&cfg.cluster).ok_or_else(|| {
+                                invalid(
+                                    format!(
+                                        "{}.grpc_service.envoy_grpc.cluster_name",
+                                        cfg.field_path
+                                    ),
+                                    "authorization cluster is not defined",
+                                )
+                            })?;
+                            cfg.endpoint = Some(ext_authz_endpoint(cfg, cluster)?);
+                            cfg.connect_timeout = cluster.connect_timeout;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Lower one level of Envoy's `typed_per_filter_config` map (present on
 /// `Route`, `VirtualHost`, and `RouteConfiguration`) into IR
 /// [`PerFilterConfig`] entries, keyed by filter name. `path` is the dotted
@@ -1064,6 +1310,7 @@ fn convert_typed_per_filter_config(
                         &format!("{entry_path}.config.typed_config"),
                     )?;
                     PerFilterConfig {
+                        ext_authz: None,
                         type_url: inner.type_url.clone(),
                         config: Some(config),
                         is_optional: wrapper.is_optional,
@@ -1071,6 +1318,7 @@ fn convert_typed_per_filter_config(
                     }
                 }
                 (false, true) => PerFilterConfig {
+                    ext_authz: None,
                     type_url: String::new(),
                     config: None,
                     is_optional: wrapper.is_optional,
@@ -1080,12 +1328,23 @@ fn convert_typed_per_filter_config(
         } else {
             let config = decode_http_filter_config(any, &entry_path)?;
             PerFilterConfig {
+                ext_authz: None,
                 type_url: any.type_url.clone(),
                 config: Some(config),
                 is_optional: false,
                 disabled: false,
             }
         };
+        let mut per = per;
+        if per.type_url == crate::authorization::PER_ROUTE_TYPE_URL {
+            let msg = per.config.take().expect("decoded per-route message");
+            let config_path = if type_name(any) == FILTER_CONFIG_TYPE {
+                format!("{entry_path}.config.typed_config")
+            } else {
+                entry_path.clone()
+            };
+            per.ext_authz = Some(convert_ext_authz_per_route(&msg, &config_path)?);
+        }
         out.insert(name.clone(), per);
     }
     Ok(out)
@@ -1604,7 +1863,7 @@ fn convert_hcm(
         // other filter's `typed_config` is decoded reflectively here — the
         // registry (`proxy-http::FilterRegistry`), not this lowering pass,
         // is what actually understands the bytes (ground rule #2).
-        let config = if is_router {
+        let mut config = if is_router {
             None
         } else {
             Some(decode_http_filter_config(
@@ -1612,7 +1871,22 @@ fn convert_hcm(
                 &format!("{f_path}.typed_config"),
             )?)
         };
+        let ext_authz = if any.type_url == crate::authorization::TYPE_URL {
+            if i != 0 {
+                return Err(unsupported(
+                    format!("{f_path}.typed_config"),
+                    "this header-only increment requires ext_authz first in the decoder chain",
+                ));
+            }
+            Some(convert_ext_authz(
+                &config.take().expect("decoded config"),
+                &format!("{f_path}.typed_config"),
+            )?)
+        } else {
+            None
+        };
         http_filters.push(HttpFilterSpec {
+            ext_authz,
             name: f.name.clone(),
             type_url: any.type_url.clone(),
             config,
@@ -5346,6 +5620,46 @@ fn convert_route_table(
         &rc.typed_per_filter_config,
         &format!("{path}.typed_per_filter_config"),
     )?;
+    for (i, vhost) in vhosts.iter().enumerate() {
+        for (j, route) in vhost.routes.iter().enumerate() {
+            let levels = [
+                &rc_typed_per_filter_config,
+                &vhost.typed_per_filter_config,
+                &route.typed_per_filter_config,
+            ];
+            let names: std::collections::BTreeSet<_> =
+                levels.iter().flat_map(|level| level.keys()).collect();
+            for name in names {
+                let mut context = BTreeMap::new();
+                for level in levels {
+                    if let Some(per) = level.get(name) {
+                        if per.disabled {
+                            context.clear();
+                            continue;
+                        }
+                        match &per.ext_authz {
+                            Some(crate::authorization::ExtAuthzPerRoute::Check {
+                                context_extensions,
+                            }) => context.extend(context_extensions.clone()),
+                            Some(crate::authorization::ExtAuthzPerRoute::Disabled) => {
+                                context.clear()
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                if context.len() > 64
+                    || context
+                        .iter()
+                        .map(|(k, v)| k.len() + v.len())
+                        .sum::<usize>()
+                        > crate::authorization::MAX_MUTATION_BYTES
+                {
+                    return Err(invalid(format!("{path}.virtual_hosts[{i}].routes[{j}].typed_per_filter_config[{name}].check_settings.context_extensions"), "merged context extensions exceed limits"));
+                }
+            }
+        }
+    }
     RouteTable::new(rc.name.clone(), vhosts, rc_typed_per_filter_config).map_err(|dup| {
         invalid(
             format!("{path}.virtual_hosts"),

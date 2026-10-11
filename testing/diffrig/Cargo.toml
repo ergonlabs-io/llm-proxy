@@ -33,6 +33,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 
 [dev-dependencies]
+proxy-xds = { workspace = true, features = ["test-support"] }
 # Auth e2e (auth_e2e.rs): compute virtual-key digests
 # (hex(HMAC-SHA256(secret, plaintext_key))) at test run time, matching
 # `proxy-filters::auth_filter`'s own derivation -- never hardcode a digest,

@@ -2650,6 +2650,7 @@ fn string_value(tag: &str) -> prost_reflect::DynamicMessage {
 /// A `typed_per_filter_config` entry carrying `tag` (see [`string_value`]).
 fn tag_override(tag: &str) -> PerFilterConfig {
     PerFilterConfig {
+        ext_authz: None,
         type_url: "type.googleapis.com/google.protobuf.StringValue".to_string(),
         config: Some(string_value(tag)),
         is_optional: false,
@@ -3085,6 +3086,7 @@ fn per_route_config_absent_filter_is_a_build_error_unless_optional() {
     overrides.insert(
         "not-in-chain".to_string(),
         PerFilterConfig {
+            ext_authz: None,
             type_url: String::new(),
             config: None,
             is_optional: false,
@@ -3103,6 +3105,7 @@ fn per_route_config_absent_filter_is_a_build_error_unless_optional() {
     overrides.insert(
         "not-in-chain".to_string(),
         PerFilterConfig {
+            ext_authz: None,
             type_url: String::new(),
             config: None,
             is_optional: true,
@@ -3186,6 +3189,7 @@ fn per_route_config_disabled_is_a_build_error_mentioning_not_implemented() {
     overrides.insert(
         "configured-filter".to_string(),
         PerFilterConfig {
+            ext_authz: None,
             type_url: String::new(),
             config: None,
             is_optional: false,

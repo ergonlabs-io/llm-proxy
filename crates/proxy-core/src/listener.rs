@@ -70,6 +70,7 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
     REGISTRY.get_or_init(|| {
         let mut registry = FilterRegistry::default();
         registry.register(Arc::new(HeaderMutationFactory));
+        registry.register(Arc::new(proxy_filters::ext_authz::ExtAuthzFactory));
         // WP-31: CORS policies live on the route through
         // `typed_per_filter_config`; registration only makes a configured
         // policy buildable, never enables CORS on an unrelated route.
@@ -317,7 +318,13 @@ fn build_listener_hcm(
         let handler = match chain.filters.last() {
             Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
                 let context = format!("listener '{}' filter_chains[{i}]", listener.name);
-                Some(build_hcm_handler(hcm, runtime.routes, &context, runtime)?)
+                Some(build_hcm_handler(
+                    hcm,
+                    runtime.routes,
+                    &context,
+                    listener.per_connection_buffer_limit_bytes,
+                    runtime,
+                )?)
             }
             _ => None,
         };
@@ -330,7 +337,13 @@ fn build_listener_hcm(
     {
         Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
             let context = format!("listener '{}' default_filter_chain", listener.name);
-            Some(build_hcm_handler(hcm, runtime.routes, &context, runtime)?)
+            Some(build_hcm_handler(
+                hcm,
+                runtime.routes,
+                &context,
+                listener.per_connection_buffer_limit_bytes,
+                runtime,
+            )?)
         }
         _ => None,
     };
@@ -1286,6 +1299,7 @@ fn build_hcm_handler(
     hcm: &HttpConnectionManagerConfig,
     routes: &HashMap<String, Arc<proxy_config::ir::RouteTable>>,
     context: &str,
+    buffer_limit_bytes: u32,
     runtime: &HcmRuntime<'_>,
 ) -> Result<Rc<dyn StreamHandler>, HttpFilterChainBuildError> {
     let registry = filter_registry();
@@ -1320,6 +1334,39 @@ fn build_hcm_handler(
         // Invariant enforced by `proxy-config`'s lowering: `config` is `None`
         // only for the router filter, which the `continue` above already
         // skipped -- every other entry carries a decoded `typed_config`.
+        if let Some(config) = &f.ext_authz {
+            let endpoint = config.endpoint.ok_or_else(|| HttpFilterChainBuildError {
+                context: context.to_string(),
+                reason: format!(
+                    "{}.grpc_service: authorization endpoint was not validated",
+                    config.field_path
+                ),
+            })?;
+            let client = Arc::new(proxy_xds::authorization::GrpcAuthorizationClient::new(
+                endpoint,
+                config.timeout,
+                config.connect_timeout,
+            ));
+            let scope = if config.stat_prefix.is_empty() {
+                format!("{}.ext_authz", hcm.stat_prefix)
+            } else {
+                format!("{}.ext_authz.{}", hcm.stat_prefix, config.stat_prefix)
+            };
+            let stats = Arc::new(proxy_filters::ext_authz::ExtAuthzStats::new(
+                runtime.router_stats.registry(),
+                &scope,
+            ));
+            filters.push(ConfiguredHttpFilter {
+                name: f.name.clone(),
+                instance_factory: Arc::new(proxy_filters::ext_authz::ExtAuthzInstanceFactory {
+                    config: config.clone(),
+                    client,
+                    stats,
+                }),
+                factory: factory.clone(),
+            });
+            continue;
+        }
         let config = f
             .config
             .as_ref()
@@ -1412,7 +1459,10 @@ fn build_hcm_handler(
         context: context.to_string(),
         reason: format!("failed to build filter chain: {e}"),
     })?
-    .with_token_stats(runtime.token_stats.clone());
+    .with_token_stats(runtime.token_stats.clone())
+    // The listener's `per_connection_buffer_limit_bytes` (Envoy default 1 MiB,
+    // applied at lowering) bounds request-body collection and filter buffering.
+    .with_buffer_limit(buffer_limit_bytes as usize);
     handler = handler.with_gen_ai_latency_stats(runtime.latency_stats.clone());
     if let Some(sink) = runtime.metadata {
         handler = handler.with_request_record_sink(sink.clone());
@@ -1757,6 +1807,10 @@ pub async fn run_listener_manager(
 }
 
 #[cfg(test)]
+#[path = "listener_ext_authz_tests.rs"]
+mod ext_authz_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::run_local;
@@ -2007,12 +2061,14 @@ mod tests {
             rds_route_config_name: None,
             http_filters: vec![
                 proxy_config::ir::HttpFilterSpec {
+                    ext_authz: None,
                     name: "llmproxy.header_mutation".to_string(),
                     type_url: TYPE_URL.to_string(),
                     config: Some(header_value_option(header_name, header_value)),
                     is_router: false,
                 },
                 proxy_config::ir::HttpFilterSpec {
+                    ext_authz: None,
                     name: "envoy.filters.http.router".to_string(),
                     type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
                         .to_string(),
@@ -2264,7 +2320,7 @@ mod tests {
     /// tests panicking with "index out of bounds" the first time
     /// `downstream_stats_for`/`token_stats_for` each built their own private
     /// `StatsControl`).
-    fn router_stats_for(
+    pub(super) fn router_stats_for(
         control: &proxy_observability::stats::StatsControl,
         snapshot: &ConfigSnapshot,
     ) -> Arc<RouterStats> {
@@ -2301,7 +2357,7 @@ mod tests {
     /// see that function's doc for why this shares `control` rather than
     /// building its own. Resolved for every cluster (= provider, ground
     /// rule #6) in `snapshot`.
-    fn token_stats_for(
+    pub(super) fn token_stats_for(
         control: &proxy_observability::stats::StatsControl,
         snapshot: &ConfigSnapshot,
     ) -> Arc<GenAiTokenStats> {
@@ -2316,7 +2372,7 @@ mod tests {
         ))
     }
 
-    fn latency_stats_for(
+    pub(super) fn latency_stats_for(
         control: &proxy_observability::stats::StatsControl,
     ) -> Arc<GenAiLatencyStats> {
         Arc::new(GenAiLatencyStats::new(
@@ -3988,12 +4044,14 @@ mod tests {
             rds_route_config_name: None,
             http_filters: vec![
                 proxy_config::ir::HttpFilterSpec {
+                    ext_authz: None,
                     name: "llmproxy.header_mutation".to_string(),
                     type_url: TYPE_URL.to_string(),
                     config: Some(header_value_option(header_name, header_value)),
                     is_router: false,
                 },
                 proxy_config::ir::HttpFilterSpec {
+                    ext_authz: None,
                     name: "envoy.filters.http.router".to_string(),
                     type_url: "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
                         .to_string(),
