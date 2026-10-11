@@ -54,6 +54,7 @@ use proxy_filters::spend_limit_filter::SharedSpendLimitState;
 use proxy_filters::tenant_credential_crypto::TenantSecret;
 use proxy_filters::usage_filter::PricingRegistry;
 use proxy_http::filter::SharedFactoryState;
+use proxy_http::tenant_credentials::CredentialSource;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -1457,6 +1458,11 @@ struct BudgetSpec {
     /// precisely than a price.
     max_usd: String,
     period: PeriodSpec,
+    /// `"platform"` or `"tenant"`; absent means `"platform"`. Kept a plain
+    /// string so an unknown value gets this module's fixed 400 message
+    /// instead of serde's, which would echo the rejected input back.
+    #[serde(default)]
+    credential_source: Option<String>,
 }
 
 /// External representation of [`Period`] over the wire -- `"daily"` or
@@ -1537,6 +1543,7 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
                     "max_micro_usd": budget.max_micros.as_micros(),
                     "max_usd": render_micro_usd(budget.max_micros.as_micros()),
                     "period": PeriodSpec::from(budget.period),
+                    "credential_source": budget.credential_source.as_str(),
                 })),
             })
         })
@@ -1949,6 +1956,32 @@ fn handle_set_policy(
     }
 }
 
+/// Turns a request's [`BudgetSpec`] into the stored [`TenantBudget`]. Both
+/// budget writes use it, so their validation cannot drift apart.
+// See `parse_json_body`'s identical `#[allow]` -- same cold admin-write path,
+// same "large" `Err` variant by design.
+#[allow(clippy::result_large_err)]
+fn budget_from_spec(spec: BudgetSpec) -> Result<TenantBudget, Response<Full<Bytes>>> {
+    let max_micros = parse_micro_usd(&spec.max_usd)
+        .map_err(|err| bad_request(&format!("invalid `max_usd`: {err}")))?;
+    let credential_source = match spec.credential_source.as_deref() {
+        // Absent means platform so existing budgets keep their meaning
+        // (ADR-0007 decision 8).
+        None | Some("platform") => CredentialSource::Platform,
+        Some("tenant") => CredentialSource::Tenant,
+        Some(_) => {
+            return Err(bad_request(
+                "invalid `credential_source`: expected \"platform\" or \"tenant\"",
+            ))
+        }
+    };
+    Ok(TenantBudget {
+        max_micros,
+        period: spec.period.into(),
+        credential_source,
+    })
+}
+
 /// `PUT /tenants/{id}/budget`. `{"budget": null}`
 /// clears the tenant's ceiling (reverts to unlimited); `{"budget": {...}}`
 /// sets it, parsing `max_usd` with [`parse_micro_usd`] -- the SAME parser a
@@ -1969,17 +2002,9 @@ fn handle_set_budget(
 
     let budget = match request.budget {
         None => None,
-        Some(spec) => match parse_micro_usd(&spec.max_usd) {
-            Ok(max_micros) => Some(TenantBudget {
-                max_micros,
-                period: spec.period.into(),
-                // The admin API cannot choose a scope yet, so every budget
-                // it writes keeps its existing meaning (ADR-0007 decision 8).
-                credential_source: proxy_http::tenant_credentials::CredentialSource::Platform,
-            }),
-            Err(err) => {
-                return bad_request(&format!("invalid `max_usd`: {err}"));
-            }
+        Some(spec) => match budget_from_spec(spec) {
+            Ok(budget) => Some(budget),
+            Err(response) => return response,
         },
     };
 
@@ -2014,15 +2039,9 @@ fn handle_set_key_budget(
     };
     let budget = match request.budget {
         None => None,
-        Some(spec) => match parse_micro_usd(&spec.max_usd) {
-            Ok(max_micros) => Some(TenantBudget {
-                max_micros,
-                period: spec.period.into(),
-                // The admin API cannot choose a scope yet, so every budget
-                // it writes keeps its existing meaning (ADR-0007 decision 8).
-                credential_source: proxy_http::tenant_credentials::CredentialSource::Platform,
-            }),
-            Err(err) => return bad_request(&format!("invalid `max_usd`: {err}")),
+        Some(spec) => match budget_from_spec(spec) {
+            Ok(budget) => Some(budget),
+            Err(response) => return response,
         },
     };
     match control_plane.set_key_budget(&KeyId::new(key_id), budget.as_ref()) {
@@ -2192,6 +2211,9 @@ fn handle_get_spend(
             "spend_usd": render_micro_usd(report.total_micros),
             "budget_micro_usd": budget_micros,
             "remaining_micro_usd": remaining_micros,
+            // `null` with no budget, like the two fields above: there is no
+            // scope to report for an unlimited subject.
+            "credential_source": budget.map(|b| b.credential_source.as_str()),
             "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
             "journal_checkpoint_at": report.journal_checkpoint_at.map(|dt| dt.to_rfc3339()),
             "journal_pending_micro_usd": report.journal_pending_micro_usd,
@@ -2261,6 +2283,9 @@ fn handle_get_key_spend(
             "spend_usd": render_micro_usd(report.total_micros),
             "budget_micro_usd": budget_micros,
             "remaining_micro_usd": remaining_micros,
+            // `null` with no budget, like the two fields above: there is no
+            // scope to report for an unlimited subject.
+            "credential_source": budget.map(|b| b.credential_source.as_str()),
             "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
             "journal_checkpoint_at": report.journal_checkpoint_at.map(|dt| dt.to_rfc3339()),
             "journal_pending_micro_usd": report.journal_pending_micro_usd,
