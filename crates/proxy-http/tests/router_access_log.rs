@@ -68,6 +68,11 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 fn read_to_string(path: &Path) -> String {
+    // Access-log writes are asynchronous (background writer thread); wait
+    // for everything queued so far instead of sleeping.
+    assert!(proxy_observability::sink::flush_all_queued(
+        Duration::from_secs(5)
+    ));
     let mut s = String::new();
     File::open(path).unwrap().read_to_string(&mut s).unwrap();
     s

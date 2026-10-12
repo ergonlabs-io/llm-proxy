@@ -3647,6 +3647,10 @@ fn temp_log_path(name: &str) -> std::path::PathBuf {
 }
 
 fn read_log(path: &std::path::Path) -> String {
+    // Access-log writes are asynchronous; wait for the queue to drain.
+    assert!(proxy_observability::sink::flush_all_queued(
+        std::time::Duration::from_secs(5)
+    ));
     std::fs::read_to_string(path).unwrap_or_default()
 }
 

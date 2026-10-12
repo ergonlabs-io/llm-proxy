@@ -12,13 +12,13 @@
 //! are both out of scope here; this module only has to make "write a line
 //! to the configured destination, and support logrotate-style reopen" true.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Where a rendered access-log line is written. Re-exported by the config IR
 /// as `proxy_config::ir::AccessLogSink` — see the module doc for why it is
@@ -267,17 +267,310 @@ impl AccessLogWriter for FileSink {
     }
 }
 
+// ------------------------------------------------------------ queued sink --
+
+/// Upper bound on bytes waiting in one [`QueuedSink`]. Bytes, not lines,
+/// because line size varies by an order of magnitude between a text format
+/// and a JSON format with many fields. 8 MiB is roughly 40k typical lines:
+/// several seconds of buffering at thousands of requests per second, enough
+/// to ride out a logrotate hiccup or a short collector stall, small enough
+/// that a destination that never recovers costs a bounded, known amount of
+/// memory per destination rather than growing with traffic.
+const QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long the blocking control calls (`flush`, `reopen`) wait for the
+/// writer thread. Bounded so a destination stuck in a kernel write cannot
+/// hang shutdown or a SIGUSR1 handler forever.
+const CONTROL_WAIT: Duration = Duration::from_secs(5);
+
+/// One unit of work for the writer thread. Lines and control messages share
+/// one FIFO so a `flush`/`reopen` is ordered after every line queued before
+/// it.
+enum Item {
+    Line(String),
+    Flush(mpsc::Sender<()>),
+    Reopen(mpsc::Sender<io::Result<()>>),
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: VecDeque<Item>,
+    /// Bytes held by `Item::Line`s only; control items are tiny and must
+    /// never be refused, or shutdown could not flush a full queue.
+    line_bytes: usize,
+    /// Set when the owning [`QueuedSink`] is dropped: the writer drains what
+    /// is left and exits.
+    closed: bool,
+    /// Set by the writer under the lock just before it exits, so a late
+    /// control request fails fast instead of waiting for an ack that never
+    /// comes.
+    exited: bool,
+}
+
+struct QueueShared {
+    state: Mutex<QueueState>,
+    wake: Condvar,
+    dropped: AtomicU64,
+    limiter: RateLimiter,
+    label: String,
+    max_bytes: usize,
+}
+
+/// Lines dropped by every [`QueuedSink`] in the process since start.
+static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Every live writer thread's shared state, so shutdown can flush them all
+/// without holding the sinks themselves (workers drop their handlers, and
+/// with them the sinks, before the main thread gets to flush).
+static LIVE_QUEUES: Mutex<Vec<Weak<QueueShared>>> = Mutex::new(Vec::new());
+
+/// Total lines dropped because a queue was full, across all destinations.
+pub fn dropped_lines_total() -> u64 {
+    DROPPED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Flush every live [`QueuedSink`], waiting at most `timeout` overall.
+/// Returns `false` if some writer did not catch up in time (the lines stay
+/// queued; the caller is exiting anyway). Shutdown/control paths only.
+pub fn flush_all_queued(timeout: Duration) -> bool {
+    let live: Vec<Arc<QueueShared>> = {
+        let mut guard = LIVE_QUEUES.lock().unwrap();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(Weak::upgrade).collect()
+    };
+    // Enqueue every barrier first so slow destinations drain in parallel.
+    let acks: Vec<mpsc::Receiver<()>> = live
+        .iter()
+        .filter_map(|q| {
+            let (tx, rx) = mpsc::channel();
+            q.submit_control(Item::Flush(tx)).then_some(rx)
+        })
+        .collect();
+    let deadline = Instant::now() + timeout;
+    let mut all = true;
+    for rx in acks {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // A disconnected sender means the writer exited after draining.
+        if matches!(rx.recv_timeout(left), Err(mpsc::RecvTimeoutError::Timeout)) {
+            all = false;
+        }
+    }
+    all
+}
+
+impl QueueShared {
+    /// Queue a control item. `false` if the writer thread has already gone.
+    fn submit_control(&self, item: Item) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if st.exited {
+            return false;
+        }
+        st.items.push_back(item);
+        drop(st);
+        self.wake.notify_one();
+        true
+    }
+}
+
+/// Makes any [`AccessLogWriter`] non-blocking for the caller.
+///
+/// `write_line` copies the line into a bounded queue and returns; a
+/// dedicated OS thread (`access-log-writer`) drains it in batches, writes
+/// each line to the inner sink, and flushes once per batch. A stalled stdout
+/// pipe or slow disk therefore stalls only that thread, never a request
+/// worker (and never the other workers, which previously serialized on the
+/// sink's lock).
+///
+/// Drop policy (fail-open, loud): when the queue is full the NEW line is
+/// dropped and counted. Dropping the newest keeps the queue contents in
+/// order and costs nothing on the healthy path. Each drop bumps
+/// [`QueuedSink::dropped`] and the process-wide [`dropped_lines_total`]; a
+/// `tracing::warn!` names the destination and the running count, at most once
+/// per [`RATE_LIMIT_SECS`]. The limiter is only consulted after the queue has
+/// already refused a line, so the healthy path never touches it.
+///
+/// Semantics of the trait methods:
+/// - `flush()` BLOCKS (up to 5s) until the writer has written and flushed
+///   everything queued before the call. Call it from shutdown/control paths
+///   only, never per request.
+/// - `reopen()` is a control message ordered after earlier lines, so it
+///   cannot race in-flight writes; it returns the inner result.
+/// - Dropping the sink lets the writer drain the remainder and exit but does
+///   not wait; use [`flush_all_queued`] before process exit.
+pub struct QueuedSink {
+    shared: Arc<QueueShared>,
+}
+
+impl QueuedSink {
+    /// Wrap `inner`, labelling warnings with `label` (e.g. `"stdout"`).
+    pub fn new(label: impl Into<String>, inner: Arc<dyn AccessLogWriter>) -> Self {
+        Self::with_capacity(label, inner, QUEUE_MAX_BYTES)
+    }
+
+    /// As [`QueuedSink::new`] with an explicit byte bound (tests).
+    pub fn with_capacity(
+        label: impl Into<String>,
+        inner: Arc<dyn AccessLogWriter>,
+        max_bytes: usize,
+    ) -> Self {
+        let shared = Arc::new(QueueShared {
+            state: Mutex::new(QueueState::default()),
+            wake: Condvar::new(),
+            dropped: AtomicU64::new(0),
+            limiter: RateLimiter::new(),
+            label: label.into(),
+            max_bytes,
+        });
+        let worker = shared.clone();
+        // Rust note: `move` hands the thread its own `Arc` clones; the
+        // thread keeps the queue alive after the `QueuedSink` handle drops,
+        // which is what lets it drain the remainder.
+        std::thread::Builder::new()
+            .name("access-log-writer".to_string())
+            .spawn(move || writer_loop(&worker, inner.as_ref()))
+            .expect("spawn access-log-writer thread");
+        {
+            let mut live = LIVE_QUEUES.lock().unwrap();
+            live.retain(|w| w.strong_count() > 0);
+            live.push(Arc::downgrade(&shared));
+        }
+        Self { shared }
+    }
+
+    /// Lines dropped by this sink because its queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.shared.dropped.load(Ordering::Relaxed)
+    }
+}
+
+fn writer_loop(shared: &QueueShared, inner: &dyn AccessLogWriter) {
+    loop {
+        // Take the whole backlog in one lock acquisition so producers are
+        // never blocked behind inner-sink I/O.
+        let batch = {
+            let mut st = shared.state.lock().unwrap();
+            while st.items.is_empty() && !st.closed {
+                st = shared.wake.wait(st).unwrap();
+            }
+            if st.items.is_empty() {
+                st.exited = true;
+                return;
+            }
+            st.line_bytes = 0;
+            std::mem::take(&mut st.items)
+        };
+        let mut dirty = false;
+        for item in batch {
+            match item {
+                Item::Line(line) => {
+                    inner.write_line(&line);
+                    dirty = true;
+                }
+                Item::Flush(ack) => {
+                    inner.flush();
+                    dirty = false;
+                    let _ = ack.send(());
+                }
+                Item::Reopen(ack) => {
+                    let _ = ack.send(inner.reopen());
+                }
+            }
+        }
+        if dirty {
+            inner.flush();
+        }
+    }
+}
+
+impl AccessLogWriter for QueuedSink {
+    fn write_line(&self, line: &str) {
+        let mut st = self.shared.state.lock().unwrap();
+        if st.line_bytes + line.len() > self.shared.max_bytes {
+            drop(st);
+            let n = self.shared.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            if self.shared.limiter.should_warn() {
+                tracing::warn!(
+                    destination = %self.shared.label,
+                    dropped_total = n,
+                    "access-log queue full: dropping log lines because the destination is not \
+                     keeping up (requests are unaffected; lines are lost); further drops in the \
+                     next {RATE_LIMIT_SECS}s are suppressed"
+                );
+            }
+            return;
+        }
+        st.line_bytes += line.len();
+        st.items.push_back(Item::Line(line.to_string()));
+        drop(st);
+        self.shared.wake.notify_one();
+    }
+
+    fn flush(&self) {
+        let (tx, rx) = mpsc::channel();
+        if self.shared.submit_control(Item::Flush(tx)) {
+            let _ = rx.recv_timeout(CONTROL_WAIT);
+        }
+    }
+
+    fn reopen(&self) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel();
+        if !self.shared.submit_control(Item::Reopen(tx)) {
+            return Err(io::Error::other("access-log writer thread has exited"));
+        }
+        rx.recv_timeout(CONTROL_WAIT).unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "access-log writer did not service reopen in time",
+            ))
+        })
+    }
+}
+
+impl Drop for QueuedSink {
+    fn drop(&mut self) {
+        self.shared.state.lock().unwrap().closed = true;
+        self.shared.wake.notify_one();
+    }
+}
+
+/// One shared queued sink per process for stdout and for stderr: they are
+/// process-wide resources, so a second writer thread would only add
+/// interleaving. `None` for file sinks.
+fn shared_stdio(sink: &AccessLogSink) -> Option<Arc<dyn AccessLogWriter>> {
+    static STDOUT: OnceLock<Arc<QueuedSink>> = OnceLock::new();
+    static STDERR: OnceLock<Arc<QueuedSink>> = OnceLock::new();
+    match sink {
+        AccessLogSink::Stdout => Some(
+            STDOUT
+                .get_or_init(|| Arc::new(QueuedSink::new("stdout", Arc::new(StdoutSink::new()))))
+                .clone(),
+        ),
+        AccessLogSink::Stderr => Some(
+            STDERR
+                .get_or_init(|| Arc::new(QueuedSink::new("stderr", Arc::new(StderrSink::new()))))
+                .clone(),
+        ),
+        AccessLogSink::File { .. } => None,
+    }
+}
+
 // -------------------------------------------------------------- build_sink --
 
-/// Build a single, non-shared writer for `sink`. AGENTS.md invariant 1: every
+/// Build a single writer for `sink`, queued so callers never block on I/O
+/// (stdout/stderr share one process-wide queue). AGENTS.md invariant 1: every
 /// [`AccessLogSink`] variant is matched explicitly, so adding a variant
 /// without updating this function is a compile error, not a silent
 /// stdout-fallback.
 pub fn build_sink(sink: &AccessLogSink) -> io::Result<Arc<dyn AccessLogWriter>> {
     Ok(match sink {
-        AccessLogSink::Stdout => Arc::new(StdoutSink::new()),
-        AccessLogSink::Stderr => Arc::new(StderrSink::new()),
-        AccessLogSink::File { path } => Arc::new(FileSink::new(path)?),
+        AccessLogSink::Stdout | AccessLogSink::Stderr => {
+            shared_stdio(sink).expect("stdio variants always have a shared sink")
+        }
+        AccessLogSink::File { path } => Arc::new(QueuedSink::new(
+            path.clone(),
+            Arc::new(FileSink::new(path)?),
+        )),
     })
 }
 
@@ -311,7 +604,7 @@ fn canonical_key(path: &Path) -> PathBuf {
 /// different locks for two different concerns — registration is rare
 /// (config-load time), writes are per-request.
 pub struct SinkRegistry {
-    files: Mutex<HashMap<PathBuf, Arc<FileSink>>>,
+    files: Mutex<HashMap<PathBuf, Arc<QueuedSink>>>,
 }
 
 impl SinkRegistry {
@@ -325,17 +618,21 @@ impl SinkRegistry {
     /// not deduplicated — only file destinations need shared buffering.
     pub fn build(&self, sink: &AccessLogSink) -> io::Result<Arc<dyn AccessLogWriter>> {
         match sink {
-            AccessLogSink::Stdout => Ok(Arc::new(StdoutSink::new())),
-            AccessLogSink::Stderr => Ok(Arc::new(StderrSink::new())),
+            AccessLogSink::Stdout | AccessLogSink::Stderr => {
+                Ok(shared_stdio(sink).expect("stdio variants always have a shared sink"))
+            }
             AccessLogSink::File { path } => {
                 let key = canonical_key(Path::new(path));
                 let mut files = self.files.lock().unwrap();
                 if let Some(existing) = files.get(&key) {
-                    return Ok(existing.clone() as Arc<dyn AccessLogWriter>);
+                    return Ok(existing.clone());
                 }
-                let sink = Arc::new(FileSink::new(path)?);
+                let sink = Arc::new(QueuedSink::new(
+                    path.clone(),
+                    Arc::new(FileSink::new(path)?),
+                ));
                 files.insert(key, sink.clone());
-                Ok(sink as Arc<dyn AccessLogWriter>)
+                Ok(sink)
             }
         }
     }
@@ -409,6 +706,155 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&renamed).unwrap();
+    }
+
+    /// Inner sink that parks in `write_line` until the test sends on `gate`,
+    /// recording what it wrote.
+    struct GatedSink {
+        gate: Mutex<mpsc::Receiver<()>>,
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AccessLogWriter for GatedSink {
+        fn write_line(&self, line: &str) {
+            let _ = self.gate.lock().unwrap().recv();
+            self.lines.lock().unwrap().push(line.to_string());
+        }
+        fn flush(&self) {}
+        fn reopen(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn gated(max_bytes: usize) -> (QueuedSink, mpsc::Sender<()>, Arc<Mutex<Vec<String>>>) {
+        let (open, gate) = mpsc::channel();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(GatedSink {
+            gate: Mutex::new(gate),
+            lines: lines.clone(),
+        });
+        (
+            QueuedSink::with_capacity("gated", inner, max_bytes),
+            open,
+            lines,
+        )
+    }
+
+    #[test]
+    fn queued_sink_never_blocks_and_drops_exactly_the_overflow() {
+        // Room for exactly four two-byte lines.
+        let (sink, open, lines) = gated(8);
+        let before = dropped_lines_total();
+        // Park the writer inside the inner sink on line "a": once the queue
+        // has been taken (items empty) the writer holds "a" and blocks on the
+        // gate. flush() can't be used here, it would queue behind the write.
+        sink.write_line("a\n");
+        loop {
+            if sink.shared.state.lock().unwrap().items.is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        // The inner sink is blocked, yet every write_line returns at once:
+        // 4 fit, the other 6 overflow.
+        for i in 0..10 {
+            sink.write_line(&format!("{i}\n"));
+        }
+        assert_eq!(sink.dropped(), 6);
+        // Global counter is shared with parallel tests, so only a lower bound.
+        assert!(dropped_lines_total() - before >= 6);
+        for _ in 0..5 {
+            open.send(()).unwrap();
+        }
+        sink.flush();
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec!["a\n", "0\n", "1\n", "2\n", "3\n"],
+            "non-dropped lines arrive in order, newest lines are the ones dropped"
+        );
+    }
+
+    #[test]
+    fn queued_sink_flush_waits_for_every_queued_line() {
+        let path = temp_path("queued-flush");
+        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap()));
+        for i in 0..1000 {
+            sink.write_line(&format!("line {i}\n"));
+        }
+        sink.flush();
+        let text = read_to_string(&path);
+        assert_eq!(text.lines().count(), 1000);
+        assert!(text.starts_with("line 0\n"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn flush_all_queued_drains_a_sink_that_was_already_dropped() {
+        // Shutdown case: workers drop their handlers (and sinks) before the
+        // main thread flushes. Lines queued before the drop must still land.
+        let path = temp_path("queued-dropped");
+        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap()));
+        for i in 0..100 {
+            sink.write_line(&format!("{i}\n"));
+        }
+        drop(sink);
+        assert!(flush_all_queued(Duration::from_secs(5)));
+        // If the writer finished its last batch before our barrier was
+        // queued there is nothing to wait for; otherwise the barrier ordered
+        // us after the lines. Either way the file is complete now, except in
+        // the narrow window where the thread is mid-final-batch, so poll
+        // instead of asserting on the first read.
+        let mut n = 0;
+        for _ in 0..200 {
+            n = read_to_string(&path).lines().count();
+            if n == 100 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(n, 100);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn queued_sink_reopen_is_ordered_after_earlier_lines() {
+        let path = temp_path("queued-rotate");
+        let renamed = temp_path("queued-rotate-renamed");
+        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap()));
+
+        sink.write_line("before rotate\n");
+        sink.flush();
+        std::fs::rename(&path, &renamed).unwrap();
+        // Queued before reopen, so it must land via the OLD file handle.
+        sink.write_line("queued before reopen\n");
+        sink.reopen().unwrap();
+        sink.write_line("after rotate\n");
+        sink.flush();
+
+        assert_eq!(read_to_string(&path), "after rotate\n");
+        assert_eq!(
+            read_to_string(&renamed),
+            "before rotate\nqueued before reopen\n"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&renamed).unwrap();
+    }
+
+    #[test]
+    fn queued_sink_reopen_returns_the_inner_error() {
+        struct FailingReopen;
+        impl AccessLogWriter for FailingReopen {
+            fn write_line(&self, _: &str) {}
+            fn flush(&self) {}
+            fn reopen(&self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope"))
+            }
+        }
+        let sink = QueuedSink::new("failing", Arc::new(FailingReopen));
+        assert_eq!(
+            sink.reopen().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

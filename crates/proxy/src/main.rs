@@ -1295,6 +1295,22 @@ async fn run_serve(
     publisher.shutdown();
     publisher.join();
 
+    // Access-log lines are written by background threads, so a process that
+    // exits right after the workers would lose whatever is still queued.
+    // Workers are gone, so nothing can add more; bounded so a stuck
+    // destination (a blocked stdout pipe) cannot hang exit.
+    let log_flush_budget = if fast_exit {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(5)
+    };
+    if !proxy_observability::sink::flush_all_queued(log_flush_budget) {
+        tracing::warn!(
+            budget_ms = log_flush_budget.as_millis() as u64,
+            "access-log writers did not drain before the shutdown budget; queued lines are lost"
+        );
+    }
+
     // Capture admissions close only now, after the drain, so a request that
     // completed inside the drain window was still admitted and recorded;
     // stopping them first dropped every record from the window.

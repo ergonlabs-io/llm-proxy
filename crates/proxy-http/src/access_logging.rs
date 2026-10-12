@@ -127,9 +127,10 @@ impl AccessLoggerRuntime {
         if !self.passes(ctx) {
             return;
         }
+        // Non-blocking by contract: production sinks are `QueuedSink`s whose
+        // writer thread batches and flushes, so no per-request flush here
+        // (a flush would block this worker until the writer caught up).
         self.sink.write_line(&self.render_line(ctx));
-        // Flush makes buffered output visible; it is not a durability barrier.
-        self.sink.flush();
     }
 }
 
@@ -1069,9 +1070,22 @@ mod tests {
     /// body is driven to end-of-stream.
     async fn render_with_stream_info(fmt: &str, configure: impl FnOnce(&mut StreamInfo)) -> String {
         let capture = Arc::new(CaptureSink::default());
+        drive_one_response(capture.clone() as Arc<dyn AccessLogWriter>, fmt, configure).await;
+        let mut lines = capture.0.lock().unwrap();
+        assert_eq!(lines.len(), 1, "expected exactly one rendered line");
+        lines.remove(0)
+    }
+
+    /// Drive one response body to end-of-stream through a `LoggingBody`
+    /// logging to `sink` (the real finish path, not a hand-built context).
+    async fn drive_one_response(
+        sink: Arc<dyn AccessLogWriter>,
+        fmt: &str,
+        configure: impl FnOnce(&mut StreamInfo),
+    ) {
         let fmt = parse_format(fmt).unwrap();
         let logger = AccessLoggerRuntime {
-            sink: capture.clone() as Arc<dyn AccessLogWriter>,
+            sink,
             format: AccessLogFormat::Text(fmt),
             filter: None,
         };
@@ -1107,10 +1121,60 @@ mod tests {
         let logging_body = LoggingBody::new(body, ctx);
         // Drain to end-of-stream, which is what triggers `finish()`.
         let _ = logging_body.collect().await.unwrap();
+    }
 
-        let mut lines = capture.0.lock().unwrap();
-        assert_eq!(lines.len(), 1, "expected exactly one rendered line");
-        lines.remove(0)
+    /// An inner sink whose `write_line` parks until the test opens the gate,
+    /// standing in for a stalled stdout pipe or a hung disk.
+    struct GatedSink {
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AccessLogWriter for GatedSink {
+        fn write_line(&self, line: &str) {
+            // Blocks until the test sends (or drops the sender).
+            let _ = self.gate.lock().unwrap().recv();
+            self.lines.lock().unwrap().push(line.to_string());
+        }
+        fn flush(&self) {}
+        fn reopen(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Worker-level proof that a blocked log destination cannot stall request
+    // completion: three responses finish on one single-threaded runtime while
+    // the inner sink's first write is parked, then every line arrives in order
+    // once the destination recovers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocked_log_destination_does_not_stall_responses_on_the_worker() {
+        let (open_gate, gate) = std::sync::mpsc::channel();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(GatedSink {
+            gate: Mutex::new(gate),
+            lines: lines.clone(),
+        });
+        let sink: Arc<dyn AccessLogWriter> =
+            Arc::new(proxy_observability::sink::QueuedSink::new("gated", inner));
+
+        for _ in 0..3 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                drive_one_response(sink.clone(), "%RESPONSE_CODE%\n", |_| {}),
+            )
+            .await
+            .expect("response must complete while the log destination is blocked");
+        }
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "the destination is still parked, nothing was written"
+        );
+
+        for _ in 0..3 {
+            open_gate.send(()).unwrap();
+        }
+        sink.flush();
+        assert_eq!(*lines.lock().unwrap(), vec!["200\n"; 3]);
     }
 
     #[tokio::test]
