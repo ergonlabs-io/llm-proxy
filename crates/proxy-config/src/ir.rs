@@ -84,6 +84,12 @@ pub struct ConfigSnapshot {
     /// [`Self::listeners`]) because it is bootstrap-level: it describes where
     /// resources come FROM, not a resource.
     pub ads: Option<AdsConfig>,
+    /// Global cap on concurrently open downstream connections, lowered from
+    /// bootstrap `overload_manager` resource monitor
+    /// `envoy.resource_monitors.global_downstream_max_connections`. `None`
+    /// (Envoy's default) means unlimited. Bootstrap-scoped like [`Self::ads`]:
+    /// xDS listener/cluster deliveries carry it forward unchanged.
+    pub max_downstream_connections: Option<u64>,
     pub version: SnapshotVersion,
 }
 
@@ -170,6 +176,7 @@ impl ConfigSnapshot {
             end_user_capture: self.end_user_capture.clone(),
             end_user_capture_configured: self.end_user_capture_configured,
             ads: self.ads.clone(),
+            max_downstream_connections: self.max_downstream_connections,
             version,
         }
     }
@@ -352,6 +359,10 @@ pub struct ListenerConfig {
     pub tcp_backlog_size: Option<u32>,
     /// Envoy default: true.
     pub bind_to_port: bool,
+    /// `Listener.ignore_global_conn_limit`: when true, this listener's
+    /// connections neither count against nor are refused by
+    /// [`ConfigSnapshot::max_downstream_connections`]. Envoy default: false.
+    pub ignore_global_conn_limit: bool,
 }
 
 /// A listener filter (`envoy.config.listener.v3.ListenerFilter`), resolved
@@ -554,6 +565,14 @@ pub struct HttpConnectionManagerConfig {
     /// chains (`UpgradeConfig.filters`) are rejected at lowering as
     /// unimplemented — the current tunnel is transparent (S10.2 deferred).
     pub upgrade_configs: Vec<UpgradeConfig>,
+    /// HCM `request_headers_timeout`: max time from the first byte of a
+    /// request until its headers are complete. `None` (unset or `0s`) disables
+    /// it, which is Envoy's default.
+    pub request_headers_timeout: Option<std::time::Duration>,
+    /// HCM `request_timeout`: max time from the first byte of a request until
+    /// the whole request (headers and body) is received. `None` (unset or
+    /// `0s`) disables it, which is Envoy's default.
+    pub request_timeout: Option<std::time::Duration>,
 }
 
 impl ListenerConfig {

@@ -30,6 +30,7 @@ use proxy_api::envoy::extensions::clusters::aggregate::v3 as aggregate_cluster_v
 use proxy_api::envoy::extensions::filters::listener::tls_inspector::v3 as tls_inspector_v3;
 use proxy_api::envoy::extensions::filters::network::http_connection_manager::v3 as hcm_v3;
 use proxy_api::envoy::extensions::filters::network::tcp_proxy::v3 as tcp_proxy_v3;
+use proxy_api::envoy::extensions::resource_monitors::downstream_connections::v3 as downstream_connections_v3;
 use proxy_api::envoy::extensions::transport_sockets::tls::v3 as tls_v3;
 use proxy_api::envoy::extensions::upstreams::http::v3 as upstream_http_v3;
 use proxy_api::envoy::r#type::matcher::v3 as matcher_v3;
@@ -97,6 +98,9 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
             "declarative capture policy is not implemented; use the boot-only metadata-agent CLI",
         ));
     }
+
+    snapshot.max_downstream_connections =
+        convert_overload_manager(b.overload_manager.as_ref(), "overload_manager")?;
 
     // Lowered before `static_resources` so the ADS
     // cluster-existence check below can run against the finished cluster map.
@@ -345,8 +349,20 @@ pub fn lower_dynamic_endpoints(
 fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
     Some(match message {
         "envoy.config.bootstrap.v3.Bootstrap" => {
-            &["node", "admin", "static_resources", "dynamic_resources"]
+            &[
+                "node",
+                "admin",
+                "static_resources",
+                "dynamic_resources",
+                // Only the global downstream connection cap is lowered; see
+                // `convert_overload_manager`.
+                "overload_manager",
+            ]
         }
+        // Everything else (`refresh_interval`, `actions`, `loadshed_points`,
+        // `buffer_factory_config`) is refused by this allow-list.
+        "envoy.config.overload.v3.OverloadManager" => &["resource_monitors"],
+        "envoy.config.overload.v3.ResourceMonitor" => &["name", "typed_config"],
         "envoy.config.bootstrap.v3.Bootstrap.DynamicResources" => {
             &["lds_config", "cds_config", "ads_config"]
         }
@@ -366,6 +382,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "per_connection_buffer_limit_bytes",
             "tcp_backlog_size",
             "bind_to_port",
+            "ignore_global_conn_limit",
         ],
         "envoy.config.listener.v3.ListenerFilter" => &["name", "typed_config"],
         "envoy.config.listener.v3.FilterChain" => {
@@ -640,6 +657,9 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "use_remote_address",
             "xff_num_trusted_hops",
             "access_log",
+            // Downstream admission deadlines; see `convert_hcm`.
+            "request_headers_timeout",
+            "request_timeout",
             // Listed so a config setting it gets
             // `convert_hcm`'s specific "not implemented, see the dialect"
             // message instead of the generic surface-check one -- see
@@ -970,6 +990,21 @@ fn to_std_duration(d: &prost_types::Duration, path: &str) -> Result<StdDuration,
         return Err(invalid(path, "duration must not be negative"));
     }
     Ok(StdDuration::new(d.seconds as u64, d.nanos as u32))
+}
+
+/// Envoy "unset or `0s` disables" timeout (HCM `request_headers_timeout` and
+/// `request_timeout`): zero lowers to `None`, negative is an error.
+fn convert_optional_timeout(
+    d: Option<&prost_types::Duration>,
+    path: &str,
+) -> Result<Option<StdDuration>, ConfigError> {
+    match d {
+        None => Ok(None),
+        Some(d) => {
+            let v = to_std_duration(d, path)?;
+            Ok((!v.is_zero()).then_some(v))
+        }
+    }
 }
 
 fn is_zero(d: &prost_types::Duration) -> bool {
@@ -1456,7 +1491,70 @@ fn convert_listener(l: &listener_v3::Listener, path: &str) -> Result<ListenerCon
         tcp_backlog_size: l.tcp_backlog_size,
         // Envoy default: true.
         bind_to_port: l.bind_to_port.unwrap_or(true),
+        ignore_global_conn_limit: l.ignore_global_conn_limit,
     })
+}
+
+const GLOBAL_DOWNSTREAM_MAX_CONNECTIONS_MONITOR: &str =
+    "envoy.resource_monitors.global_downstream_max_connections";
+const DOWNSTREAM_CONNECTIONS_TYPE: &str =
+    "envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig";
+
+/// Lower bootstrap `overload_manager` into the global downstream connection
+/// cap. Only one `resource_monitors` entry is supported:
+/// `envoy.resource_monitors.global_downstream_max_connections`. The surface
+/// walk already refused every other `OverloadManager` field; unknown monitor
+/// names, duplicates and a zero limit (the proto requires `> 0`) are refused
+/// here with the offending field's path.
+fn convert_overload_manager(
+    om: Option<&proxy_api::envoy::config::overload::v3::OverloadManager>,
+    path: &str,
+) -> Result<Option<u64>, ConfigError> {
+    use proxy_api::envoy::config::overload::v3::resource_monitor::ConfigType;
+    let Some(om) = om else { return Ok(None) };
+    let mut limit: Option<u64> = None;
+    let mut first_at = 0usize;
+    for (i, monitor) in om.resource_monitors.iter().enumerate() {
+        let m_path = format!("{path}.resource_monitors[{i}]");
+        if monitor.name != GLOBAL_DOWNSTREAM_MAX_CONNECTIONS_MONITOR {
+            return Err(unsupported(
+                format!("{m_path}.name"),
+                format!(
+                    "resource monitor `{}` is not implemented; only `{GLOBAL_DOWNSTREAM_MAX_CONNECTIONS_MONITOR}` is supported",
+                    monitor.name
+                ),
+            ));
+        }
+        if limit.is_some() {
+            return Err(invalid(
+                &m_path,
+                format!("duplicate `{GLOBAL_DOWNSTREAM_MAX_CONNECTIONS_MONITOR}` monitor; already configured at resource_monitors[{first_at}]"),
+            ));
+        }
+        let t_path = format!("{m_path}.typed_config");
+        let Some(ConfigType::TypedConfig(any)) = &monitor.config_type else {
+            return Err(invalid(&t_path, "resource monitor requires typed_config"));
+        };
+        if type_name(any) != DOWNSTREAM_CONNECTIONS_TYPE {
+            return Err(ConfigError::UnknownTypeUrl {
+                field_path: t_path,
+                type_url: any.type_url.clone(),
+            });
+        }
+        let cfg: downstream_connections_v3::DownstreamConnectionsConfig = decode_any(any, &t_path)?;
+        let max = u64::try_from(cfg.max_active_downstream_connections)
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                invalid(
+                    format!("{t_path}.max_active_downstream_connections"),
+                    "must be greater than 0 (Envoy requires an explicit positive limit)",
+                )
+            })?;
+        first_at = i;
+        limit = Some(max);
+    }
+    Ok(limit)
 }
 
 /// Convert `Listener.listener_filters` (pre-connection filters run against
@@ -2013,6 +2111,14 @@ fn convert_hcm(
         access_logs,
         xff_num_trusted_hops,
         upgrade_configs,
+        request_headers_timeout: convert_optional_timeout(
+            hcm.request_headers_timeout.as_ref(),
+            &format!("{path}.request_headers_timeout"),
+        )?,
+        request_timeout: convert_optional_timeout(
+            hcm.request_timeout.as_ref(),
+            &format!("{path}.request_timeout"),
+        )?,
     })
 }
 

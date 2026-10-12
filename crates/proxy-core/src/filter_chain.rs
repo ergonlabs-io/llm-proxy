@@ -368,6 +368,7 @@ mod tests {
             per_connection_buffer_limit_bytes: 1024 * 1024,
             tcp_backlog_size: None,
             bind_to_port: true,
+            ignore_global_conn_limit: false,
         }
     }
 

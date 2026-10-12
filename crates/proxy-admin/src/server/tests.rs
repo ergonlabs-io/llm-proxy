@@ -114,6 +114,8 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         xff_num_trusted_hops: 0,
         access_logs: vec![],
         upgrade_configs: vec![],
+        request_headers_timeout: None,
+        request_timeout: None,
     };
 
     let listener = ListenerConfig {
@@ -130,6 +132,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         per_connection_buffer_limit_bytes: 1024 * 1024,
         tcp_backlog_size: None,
         bind_to_port: true,
+        ignore_global_conn_limit: false,
     };
 
     let cluster = ClusterConfig {
@@ -181,6 +184,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         // This fixture is a static-config snapshot, which
         // is what `None` means -- no control plane is involved.
         ads: None,
+        max_downstream_connections: None,
         version: SnapshotVersion(1),
     })
 }
@@ -304,6 +308,8 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         xff_num_trusted_hops: 0,
         access_logs: vec![],
         upgrade_configs: vec![],
+        request_headers_timeout: None,
+        request_timeout: None,
     };
     let listener = ListenerConfig {
         name: "listener_0".to_string(),
@@ -319,6 +325,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         per_connection_buffer_limit_bytes: 1024 * 1024,
         tcp_backlog_size: None,
         bind_to_port: true,
+        ignore_global_conn_limit: false,
     };
 
     Arc::new(ConfigSnapshot {
@@ -334,6 +341,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         end_user_capture: None,
         end_user_capture_configured: false,
         ads: None,
+        max_downstream_connections: None,
         version: SnapshotVersion(1),
     })
 }

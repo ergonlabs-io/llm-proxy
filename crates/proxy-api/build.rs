@@ -32,6 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "envoy/service/auth/v3/external_auth.proto",
         "envoy/extensions/filters/http/local_ratelimit/v3/local_rate_limit.proto",
         "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.proto",
+        // Overload manager's global downstream connection cap; the type URL
+        // under `overload_manager.resource_monitors[].typed_config` must resolve.
+        "envoy/extensions/resource_monitors/downstream_connections/v3/downstream_connections.proto",
         "envoy/extensions/filters/listener/tls_inspector/v3/tls_inspector.proto",
         "envoy/extensions/transport_sockets/tls/v3/tls.proto",
         "envoy/extensions/upstreams/http/v3/http_protocol_options.proto",

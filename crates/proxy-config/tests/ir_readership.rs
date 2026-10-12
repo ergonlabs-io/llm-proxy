@@ -105,6 +105,32 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
+    // --- Downstream admission limits: the IR lands first (shared interface), the
+    //     listener/codec enforcement follows. Delete these entries when it does.
+    AllowlistEntry {
+        struct_name: "ConfigSnapshot",
+        field_name: "max_downstream_connections",
+        kind: EntryKind::KnownInert,
+        reason: "Lowered from bootstrap overload_manager; the accept loop does not enforce it yet.",
+    },
+    AllowlistEntry {
+        struct_name: "ListenerConfig",
+        field_name: "ignore_global_conn_limit",
+        kind: EntryKind::KnownInert,
+        reason: "Exempts a listener from max_downstream_connections; inert until that cap is enforced.",
+    },
+    AllowlistEntry {
+        struct_name: "HttpConnectionManagerConfig",
+        field_name: "request_headers_timeout",
+        kind: EntryKind::KnownInert,
+        reason: "Lowered from the HCM; the codec does not enforce the header deadline yet.",
+    },
+    AllowlistEntry {
+        struct_name: "HttpConnectionManagerConfig",
+        field_name: "request_timeout",
+        kind: EntryKind::KnownInert,
+        reason: "Lowered from the HCM; the request deadline is not enforced yet.",
+    },
     // --- The ADS config surface, lowered but not yet consumed. One of the
     //     original five has left: `AdsConfig.node` now reaches the wire, and
     //     the change that noticed found this entry's own reason had been

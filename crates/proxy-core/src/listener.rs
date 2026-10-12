@@ -2096,6 +2096,8 @@ mod tests {
             xff_num_trusted_hops: 0,
             access_logs: vec![],
             upgrade_configs: vec![],
+            request_headers_timeout: None,
+            request_timeout: None,
         })
     }
 
@@ -2176,6 +2178,8 @@ mod tests {
             xff_num_trusted_hops: 0,
             access_logs: vec![],
             upgrade_configs: vec![],
+            request_headers_timeout: None,
+            request_timeout: None,
         })
     }
 
@@ -2201,6 +2205,7 @@ mod tests {
             per_connection_buffer_limit_bytes: 1024 * 1024,
             tcp_backlog_size: None,
             bind_to_port: true,
+            ignore_global_conn_limit: false,
         }
     }
 
@@ -2334,6 +2339,7 @@ mod tests {
             per_connection_buffer_limit_bytes: 1024 * 1024,
             tcp_backlog_size: None,
             bind_to_port: true,
+            ignore_global_conn_limit: false,
         }
     }
 
@@ -3139,6 +3145,8 @@ mod tests {
             xff_num_trusted_hops: 0,
             access_logs: vec![],
             upgrade_configs: vec![],
+            request_headers_timeout: None,
+            request_timeout: None,
         })
     }
 
@@ -4167,6 +4175,8 @@ mod tests {
             xff_num_trusted_hops: 0,
             access_logs: vec![],
             upgrade_configs: vec![],
+            request_headers_timeout: None,
+            request_timeout: None,
         })
     }
 
