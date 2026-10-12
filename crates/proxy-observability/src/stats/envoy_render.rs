@@ -236,6 +236,10 @@ fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Op
             let listener = attr(attrs, "listener")?;
             Some(format!("listener.{listener}.downstream_cx_total"))
         }
+        "downstream_global_cx_overflow" => {
+            let listener = attr(attrs, "listener")?;
+            Some(format!("listener.{listener}.downstream_global_cx_overflow"))
+        }
         // Everything else (llm.*, and any future counter this table
         // hasn't been taught about yet) has no Envoy /stats equivalent —
         // omitted, not invented. See the module doc's Rule 2.

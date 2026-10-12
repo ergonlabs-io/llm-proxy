@@ -2,6 +2,7 @@
 //! listener manager + filter-chain matching, transport sockets,
 //! and the L4 network filter framework.
 
+pub mod admission;
 pub mod drain;
 pub mod filter_chain;
 pub mod header_mutation_filter;

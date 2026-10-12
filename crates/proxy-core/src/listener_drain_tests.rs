@@ -237,6 +237,7 @@ async fn start_worker(initial: Arc<ConfigSnapshot>) -> Worker {
         latency: tests::latency_stats_for(&control),
         tracing: None,
         metadata: None,
+        connection_limiter: crate::admission::ConnectionLimiter::default(),
     };
     let factory_state = Arc::new(SharedFactoryState::default());
     let secret_registry = Arc::new(SdsSecretRegistry::new());

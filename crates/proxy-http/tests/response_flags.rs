@@ -881,7 +881,10 @@ async fn a_client_that_dies_mid_upload_records_and_renders_the_dc_flag() {
                 let _ = proxy_http::codec::serve_http1(
                     server,
                     std::rc::Rc::new(handler) as std::rc::Rc<dyn StreamHandler>,
-                    proxy_http::codec::Http1Options { keep_alive: true },
+                    proxy_http::codec::Http1Options {
+                        keep_alive: true,
+                        header_read_timeout: None,
+                    },
                     std::future::pending::<()>(),
                     DownstreamInfo::loopback(),
                 )

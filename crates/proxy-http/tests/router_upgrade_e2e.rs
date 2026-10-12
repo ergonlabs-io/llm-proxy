@@ -299,7 +299,10 @@ async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
                 let _ = serve_http1(
                     server_io,
                     handler,
-                    Http1Options { keep_alive: true },
+                    Http1Options {
+                        keep_alive: true,
+                        header_read_timeout: None,
+                    },
                     async {
                         let _ = shutdown_rx.await;
                     },

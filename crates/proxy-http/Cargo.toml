@@ -44,7 +44,7 @@ h2 = "0.4"
 # Rust note: these power the hyper capability spike
 # (tests/hyper_spike.rs) only -- the real data-plane dependency surface above
 # is untouched.
-tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time", "test-util"] }
 
 [lints]
 workspace = true

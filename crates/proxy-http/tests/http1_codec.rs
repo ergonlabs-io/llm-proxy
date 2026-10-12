@@ -65,7 +65,10 @@ fn get_returns_fixed_response() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: true },
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -114,7 +117,10 @@ fn post_body_is_echoed_back() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: true },
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -211,7 +217,10 @@ fn early_flush_streaming_head_and_first_chunk_arrive_before_pause_elapses() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: true },
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -284,7 +293,10 @@ fn keep_alive_true_serves_two_requests_on_one_connection() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: true },
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -331,7 +343,10 @@ fn keep_alive_false_closes_connection_after_one_response() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: false },
+                Http1Options {
+                    keep_alive: false,
+                    header_read_timeout: None,
+                },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -461,7 +476,10 @@ fn upgrade_shaped_request_hands_handler_a_some_on_upgrade() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: true },
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -513,7 +531,10 @@ fn plain_request_hands_handler_a_none_on_upgrade() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: true },
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -563,7 +584,10 @@ fn drain_completes_in_flight_request_then_closes() {
             serve_http1(
                 server_io,
                 handler,
-                Http1Options { keep_alive: true },
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
                 shutdown,
                 DownstreamInfo::loopback(),
             )
@@ -600,5 +624,115 @@ fn drain_completes_in_flight_request_then_closes() {
             .unwrap()
             .expect("connection closes cleanly after graceful shutdown drains it");
         client_conn.await.unwrap().ok();
+    });
+}
+
+// --- HCM `request_headers_timeout` (`Http1Options::header_read_timeout`) ----
+//
+// Driven on tokio's paused clock: the runtime auto-advances virtual time
+// whenever every task is idle, so a 30-second default or a 5-second deadline
+// resolves instantly and the assertions are on outcomes, not wall-clock.
+
+/// Like `run_local` but with tokio's clock paused.
+fn run_local_paused<F: Future<Output = ()>>(fut: F) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    LocalSet::new().block_on(&rt, fut);
+}
+
+fn spawn_fixed_server(
+    server_io: tokio::io::DuplexStream,
+    header_read_timeout: Option<Duration>,
+) -> tokio::task::JoinHandle<()> {
+    let handler: Rc<dyn StreamHandler> = Rc::new(FixedResponseHandler {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        body: Bytes::from_static(b"ok"),
+    });
+    tokio::task::spawn_local(async move {
+        let _ = serve_http1(
+            server_io,
+            handler,
+            Http1Options {
+                keep_alive: true,
+                header_read_timeout,
+            },
+            never_shutdown(),
+            DownstreamInfo::loopback(),
+        )
+        .await;
+    })
+}
+
+#[test]
+fn unset_header_timeout_does_not_inherit_hypers_30s_default() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    run_local_paused(async {
+        let (mut client, server_io) = duplex(64 * 1024);
+        let _server = spawn_fixed_server(server_io, None);
+
+        // Two virtual minutes of silence: with hyper's default 30s header
+        // timeout active, the connection would be gone by now.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("connection must still be open");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    });
+}
+
+#[test]
+fn header_timeout_closes_a_connection_whose_request_head_stalls() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    run_local_paused(async {
+        let (mut client, server_io) = duplex(64 * 1024);
+        let server = spawn_fixed_server(server_io, Some(Duration::from_secs(5)));
+
+        client.write_all(b"GET / HT").await.unwrap();
+        // EOF with no bytes: hyper drops the connection without a 408.
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            response.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        server.await.unwrap();
+    });
+}
+
+#[test]
+fn header_timeout_does_not_fire_for_a_request_that_arrives_in_time() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    run_local_paused(async {
+        let (mut client, server_io) = duplex(64 * 1024);
+        let _server = spawn_fixed_server(server_io, Some(Duration::from_secs(5)));
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: t\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        client
+            .write_all(b"Connection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
     });
 }

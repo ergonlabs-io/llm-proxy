@@ -2701,6 +2701,7 @@ async fn worker_main(
         latency: latency_stats,
         tracing: tracing_handles,
         metadata: metadata_sink,
+        connection_limiter: ctx.connection_limiter.clone(),
     };
 
     let bound = match initial_bind(

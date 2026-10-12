@@ -314,10 +314,12 @@ impl RouterStats {
     }
 }
 
-/// One listener's pre-resolved `downstream_cx_total` handle.
+/// One listener's pre-resolved `downstream_cx_total` and
+/// `downstream_global_cx_overflow` handles.
 #[derive(Debug, Clone, Copy)]
 pub struct ListenerStatHandles {
     pub cx_total: Handle,
+    pub global_cx_overflow: Handle,
 }
 
 /// Listener name -> [`ListenerStatHandles`], mirroring [`StatHandles`]'s
@@ -368,7 +370,17 @@ impl DownstreamStatHandles {
             }
             let cx_total =
                 control.resolve(&instruments::DOWNSTREAM_CX_TOTAL, &[("listener", name)]);
-            next.insert(name.to_string(), ListenerStatHandles { cx_total });
+            let global_cx_overflow = control.resolve(
+                &instruments::DOWNSTREAM_GLOBAL_CX_OVERFLOW,
+                &[("listener", name)],
+            );
+            next.insert(
+                name.to_string(),
+                ListenerStatHandles {
+                    cx_total,
+                    global_cx_overflow,
+                },
+            );
             changed = true;
         }
         if changed {
@@ -419,6 +431,17 @@ impl DownstreamStats {
     pub fn record_connection_accepted(&self, listener: &str) {
         match self.handles.for_listener(listener) {
             Some(h) => self.registry.incr(self.worker, h.cx_total, 1),
+            None => self.warn_unknown_listener_once(listener),
+        }
+    }
+
+    /// Records one connection closed at accept because the global
+    /// downstream connection limit was reached (Envoy's
+    /// `downstream_global_cx_overflow`). Such a connection is never passed
+    /// to [`Self::record_connection_accepted`].
+    pub fn record_global_cx_overflow(&self, listener: &str) {
+        match self.handles.for_listener(listener) {
+            Some(h) => self.registry.incr(self.worker, h.global_cx_overflow, 1),
             None => self.warn_unknown_listener_once(listener),
         }
     }

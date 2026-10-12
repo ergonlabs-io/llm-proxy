@@ -140,7 +140,10 @@ async fn spawn_tls_http_upstream(
                 let _ = serve_http1(
                     tls_stream,
                     handler,
-                    Http1Options { keep_alive: false },
+                    Http1Options {
+                        keep_alive: false,
+                        header_read_timeout: None,
+                    },
                     std::future::pending(),
                     DownstreamInfo::loopback(),
                 )
@@ -322,6 +325,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         latency: latency_stats,
         tracing: None,
         metadata: None,
+        connection_limiter: proxy_core::admission::ConnectionLimiter::default(),
     };
 
     let factory_state = Arc::new(SharedFactoryState::default());

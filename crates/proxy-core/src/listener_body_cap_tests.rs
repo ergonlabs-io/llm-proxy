@@ -207,7 +207,10 @@ static_resources:
                 let _ = serve_http1(
                     stream,
                     handler,
-                    Http1Options { keep_alive: true },
+                    Http1Options {
+                        keep_alive: true,
+                        header_read_timeout: None,
+                    },
                     std::future::pending::<()>(),
                     DownstreamInfo::loopback(),
                 )

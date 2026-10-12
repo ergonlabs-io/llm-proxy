@@ -47,6 +47,16 @@ pub struct Http1Options {
     /// needs -- disable it on a connection about to be drained rather than
     /// flipping a process-global setting).
     pub keep_alive: bool,
+    /// Downstream only (ignored by `send_upstream_http1`): HCM
+    /// `request_headers_timeout`. `None` disables the timeout, as Envoy does
+    /// when the field is unset or 0s.
+    ///
+    /// hyper starts this timer when it begins waiting for the next request
+    /// head, including on a new or idle keep-alive connection, whereas Envoy
+    /// starts it on the first header byte; on expiry hyper closes the
+    /// connection without a 408. Both are recorded in
+    /// `internal-docs/envoy-divergences.md`.
+    pub header_read_timeout: Option<std::time::Duration>,
 }
 
 /// Connection-level codec failures -- distinct from a per-request handler
@@ -111,6 +121,12 @@ where
 
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.keep_alive(options.keep_alive);
+    // hyper only runs `header_read_timeout` when a `Timer` is installed, and
+    // with a timer installed it defaults the timeout to 30s. Setting the
+    // value explicitly on every connection, `None` included, keeps Envoy's
+    // "disabled unless configured" default instead of hyper's.
+    builder.timer(hyper_util::rt::TokioTimer::new());
+    builder.header_read_timeout(options.header_read_timeout);
     // Rust note: `.with_upgrades()` wraps the `Connection` future so that, if
     // `serve_one` pulled an `OnUpgrade` handle out of a request (below), that
     // handle actually resolves once hyper finishes writing the 101 response

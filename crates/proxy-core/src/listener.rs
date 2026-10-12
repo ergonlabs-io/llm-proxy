@@ -450,6 +450,10 @@ pub struct StatsRecorders {
     /// builds costs nothing extra per request (see those methods' own docs).
     pub tracing: Option<TracingHandles>,
     pub metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
+    /// The process-wide downstream connection counter shared by every
+    /// worker's accept loops. Not a stats recorder, but it rides in this
+    /// bundle for the same argument-count reason the recorders do.
+    pub connection_limiter: crate::admission::ConnectionLimiter,
 }
 
 /// [`StatsRecorders::tracing`]'s payload: a span sink plus the head-sampling
@@ -499,6 +503,9 @@ struct WorkerShared<'a> {
     /// factory since the instrument it records is about the accept loop
     /// itself, not routing.
     downstream_stats: &'a Arc<DownstreamStats>,
+    /// The process-wide downstream connection counter; see
+    /// [`StatsRecorders::connection_limiter`].
+    connection_limiter: &'a crate::admission::ConnectionLimiter,
     /// This worker's `llm.client.token.usage` recorder -- same per-worker
     /// cadence and construction site as `router_stats`, threaded down to
     /// [`build_hcm_handler`], which wires it into the built
@@ -571,6 +578,7 @@ fn spawn_bound(
             cluster_manager: shared.cluster_manager.clone(),
             router_stats: shared.router_stats.clone(),
             downstream_stats: shared.downstream_stats.clone(),
+            connection_limiter: shared.connection_limiter.clone(),
             token_stats: shared.token_stats.clone(),
             latency_stats: shared.latency_stats.clone(),
             tracing_handles: shared.tracing.clone(),
@@ -642,6 +650,7 @@ pub fn initial_bind(
         cluster_manager,
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
+        connection_limiter: &stats.connection_limiter,
         token_stats: &stats.token,
         latency_stats: &stats.latency,
         tracing: &stats.tracing,
@@ -703,6 +712,8 @@ struct AcceptLoopShared {
     /// This worker's `downstream_cx_total` recorder --
     /// see [`WorkerShared::downstream_stats`].
     downstream_stats: Arc<DownstreamStats>,
+    /// See [`WorkerShared::connection_limiter`].
+    connection_limiter: crate::admission::ConnectionLimiter,
     /// This worker's `llm.client.token.usage` recorder -- see
     /// [`WorkerShared::token_stats`]; needed here (not just at
     /// [`spawn_bound`] time) because the accept loop's own runtime HCM
@@ -753,6 +764,7 @@ fn spawn_accept_loop(
         cluster_manager,
         router_stats,
         downstream_stats,
+        connection_limiter,
         token_stats,
         latency_stats,
         tracing_handles,
@@ -777,6 +789,15 @@ fn spawn_accept_loop(
                     Ok(pair) => pair,
                     Err(err) => {
                         tracing::warn!(listener = %name, error = %err, "accept() failed");
+                        // Back off before retrying: when accept() fails
+                        // persistently (EMFILE/ENFILE at fd exhaustion) the
+                        // listener stays readable, so an immediate retry
+                        // would spin this worker at 100% CPU. Shutdown still
+                        // interrupts the pause.
+                        tokio::select! {
+                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                            _ = shutdown.changed() => return,
+                        }
                         continue;
                     }
                 },
@@ -785,12 +806,6 @@ fn spawn_accept_loop(
                 }
             };
 
-            // Counted once per successfully accepted
-            // connection, and only here -- the `Err(err)` arm above already
-            // `continue`d before reaching this line, so a failed `accept()`
-            // never contributes to `downstream_cx_total`.
-            downstream_stats.record_connection_accepted(&name);
-
             // Rust note: the snapshot is reloaded here, once per *accepted
             // connection*, not once for the whole lifetime of this accept
             // loop. That is deliberate: it's what lets `run_listener_manager`
@@ -798,6 +813,31 @@ fn spawn_accept_loop(
             // filter chains change but its address doesn't (see its doc
             // comment) -- the next connection simply sees the new snapshot.
             let snapshot = config.load();
+
+            // Global downstream connection limit, taken before any other
+            // per-connection work so an over-limit connection costs one
+            // accept and one close. Envoy accepts and then closes too, and
+            // does not count the rejected socket in `downstream_cx_total`.
+            // The limit and the listener's `ignore_global_conn_limit` come
+            // from the snapshot loaded just above, so a reload applies to the
+            // next accept.
+            let current = current_listener(&snapshot, &name, addr);
+            let exempt = current.is_some_and(|(_, l)| l.ignore_global_conn_limit);
+            let Some(connection_slot) =
+                connection_limiter.try_acquire(snapshot.max_downstream_connections, exempt)
+            else {
+                let stat_name = current.map_or(name.as_str(), |(n, _)| n.as_str());
+                downstream_stats.record_global_cx_overflow(stat_name);
+                tracing::debug!(listener = %stat_name, peer = %peer, "global downstream connection limit reached; closing connection");
+                drop(stream);
+                continue;
+            };
+
+            // Counted once per successfully accepted and admitted
+            // connection, and only here -- the `Err(err)` arm above already
+            // `continue`d before reaching this line, so a failed `accept()`
+            // never contributes to `downstream_cx_total`.
+            downstream_stats.record_connection_accepted(&name);
 
             // The accept loop's own TLS factory cache goes stale exactly when
             // the snapshot version does: a chain-only config
@@ -816,18 +856,8 @@ fn spawn_accept_loop(
             // per-connection work done *inline* in the accept loop; it's
             // synchronous (no `.await`), so it can't stall new accepts.
             if snapshot.version != tls_version {
-                let current_listener = snapshot
-                    .listeners
-                    .get(&name)
-                    .map(|listener| (name.clone(), listener))
-                    .or_else(|| {
-                        snapshot
-                            .listeners
-                            .iter()
-                            .find(|(_, listener)| listener.bind_to_port && listener.address == addr)
-                            .map(|(name, listener)| (name.clone(), listener))
-                    });
-                if let Some((current_name, l)) = current_listener {
+                if let Some((current_name, l)) = current {
+                    let current_name = current_name.clone();
                     if name != current_name {
                         tracing::info!(old_listener = %name, new_listener = %current_name, %addr, "accept loop adopted renamed listener");
                         name = current_name;
@@ -884,8 +914,41 @@ fn spawn_accept_loop(
                 registry: registry.clone(),
                 shutdown: shutdown.clone(),
                 drain: drain.clone(),
+                _connection_slot: connection_slot,
             }));
         }
+    })
+}
+
+/// `request_headers_timeout` is enforced for HTTP/1 only (hyper's h2 server
+/// exposes no per-stream header progress). Say so once per process when an
+/// HTTP/2 connection meets a listener that configured it, so the gap is
+/// visible rather than silent (AGENTS.md invariant 1).
+fn warn_h2_header_timeout_not_enforced_once(listener: &str) {
+    // Rust note: `Once::call_once` runs its closure exactly once per process
+    // across all threads, with no lock on the later fast path.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(%listener, "request_headers_timeout is not enforced on HTTP/2 connections; it applies to HTTP/1 only (internal-docs/envoy-divergences.md)");
+    });
+}
+
+/// How long an accept loop pauses after `accept()` fails, so a persistent
+/// error such as fd exhaustion does not become a hot loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The listener this accept loop currently serves, by name first, then by
+/// bound address (a rename at an unchanged address keeps the same socket).
+fn current_listener<'a>(
+    snapshot: &'a ConfigSnapshot,
+    name: &ListenerName,
+    addr: SocketAddr,
+) -> Option<(&'a ListenerName, &'a Arc<ListenerConfig>)> {
+    snapshot.listeners.get_key_value(name).or_else(|| {
+        snapshot
+            .listeners
+            .iter()
+            .find(|(_, listener)| listener.bind_to_port && listener.address == addr)
     })
 }
 
@@ -913,6 +976,9 @@ struct ServeConnection {
     registry: ConnectionRegistry,
     shutdown: watch::Receiver<bool>,
     drain: watch::Receiver<DrainState>,
+    /// Held for the connection task's whole life; dropping it (on any exit
+    /// path) frees the global connection-limit slot.
+    _connection_slot: crate::admission::ConnectionSlot,
 }
 
 async fn serve_connection(conn: ServeConnection) {
@@ -926,6 +992,7 @@ async fn serve_connection(conn: ServeConnection) {
         registry,
         shutdown,
         drain,
+        _connection_slot,
     } = conn;
 
     let local_addr = stream.local_addr().unwrap_or(peer);
@@ -1022,9 +1089,11 @@ async fn serve_connection(conn: ServeConnection) {
     // it has one (a `tcp_proxy` chain has no HCM and so no codec to pick --
     // `Auto` there is inert, never read, since the `(false, _)` arm below
     // only consults it when `filter` is actually `TerminalFilter::Http`).
-    let codec_type = match matched.filters.last() {
-        Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => hcm.codec_type,
-        Some(NetworkFilterSpec::TcpProxy(_)) | None => CodecType::Auto,
+    let (codec_type, request_headers_timeout) = match matched.filters.last() {
+        Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
+            (hcm.codec_type, hcm.request_headers_timeout)
+        }
+        Some(NetworkFilterSpec::TcpProxy(_)) | None => (CodecType::Auto, None),
     };
 
     let factory = matched
@@ -1069,6 +1138,7 @@ async fn serve_connection(conn: ServeConnection) {
                         name: &name,
                         downstream,
                         codec,
+                        request_headers_timeout,
                     },
                 )
                 .await;
@@ -1118,6 +1188,7 @@ async fn serve_connection(conn: ServeConnection) {
                     name: &name,
                     downstream,
                     codec,
+                    request_headers_timeout,
                 },
             )
             .await
@@ -1500,7 +1571,8 @@ fn build_hcm_handler(
     // applied at lowering) caps request-body collection for every HTTP request,
     // before any filter runs, as well as filter buffering. A larger body gets a
     // 413 (`decode_buffer_overflow`).
-    .with_buffer_limit(buffer_limit_bytes as usize);
+    .with_buffer_limit(buffer_limit_bytes as usize)
+    .with_request_timeout(hcm.request_timeout);
     handler = handler.with_gen_ai_latency_stats(runtime.latency_stats.clone());
     if let Some(sink) = runtime.metadata {
         handler = handler.with_request_record_sink(sink.clone());
@@ -1535,6 +1607,10 @@ struct RunTerminalFilterCtx<'a> {
     // (see `downstream_codec_for_alpn`). Ignored by the `TcpProxy`/`None`
     // arms below, which have no HTTP codec to pick.
     codec: DownstreamCodec,
+    /// The matched HCM's `request_headers_timeout`. Applied to HTTP/1 only;
+    /// hyper's h2 server exposes no per-stream header progress, so it is not
+    /// enforced there (internal-docs/envoy-divergences.md).
+    request_headers_timeout: Option<Duration>,
 }
 
 /// Dispatch to the matched chain's terminal L4 filter. On the `TcpProxy` and
@@ -1556,6 +1632,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
         name,
         downstream,
         codec,
+        request_headers_timeout,
     } = ctx;
     let peer = downstream.remote;
     match filter {
@@ -1604,7 +1681,10 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
 
             match codec {
                 DownstreamCodec::Http1 => {
-                    let options = Http1Options { keep_alive: true };
+                    let options = Http1Options {
+                        keep_alive: true,
+                        header_read_timeout: request_headers_timeout,
+                    };
                     if let Err(err) =
                         serve_http1(stream, handler, options, shutdown_fut, downstream).await
                     {
@@ -1612,6 +1692,9 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
                     }
                 }
                 DownstreamCodec::Http2 => {
+                    if request_headers_timeout.is_some() {
+                        warn_h2_header_timeout_not_enforced_once(name);
+                    }
                     if let Err(err) = serve_http2(stream, handler, shutdown_fut, downstream).await {
                         tracing::debug!(listener = %name, peer = %peer, error = %err, "http/2 connection ended with an error");
                     }
@@ -1669,6 +1752,7 @@ fn reconcile(
         cluster_manager,
         router_stats: &stats.router,
         downstream_stats: &stats.downstream,
+        connection_limiter: &stats.connection_limiter,
         token_stats: &stats.token,
         latency_stats: &stats.latency,
         tracing: &stats.tracing,
@@ -1896,6 +1980,10 @@ pub async fn run_listener_manager(
 #[cfg(test)]
 #[path = "listener_ext_authz_tests.rs"]
 mod ext_authz_tests;
+
+#[cfg(test)]
+#[path = "listener_admission_tests.rs"]
+mod admission_tests;
 
 #[cfg(test)]
 #[path = "listener_body_cap_tests.rs"]
@@ -2498,6 +2586,7 @@ mod tests {
             latency: latency_stats_for(&stats_control),
             tracing: None,
             metadata: None,
+            connection_limiter: crate::admission::ConnectionLimiter::default(),
         };
         let factory_state = Arc::new(SharedFactoryState::default());
         let secret_registry = Arc::new(SdsSecretRegistry::new());
@@ -3619,6 +3708,7 @@ mod tests {
                 latency: latency_stats_for(&stats_control),
                 tracing: None,
                 metadata: None,
+                connection_limiter: crate::admission::ConnectionLimiter::default(),
             };
             let factory_state = Arc::new(SharedFactoryState::default());
             let secret_registry = Arc::new(SdsSecretRegistry::new());
@@ -4205,7 +4295,10 @@ mod tests {
                     let _ = serve_http1(
                         stream,
                         handler,
-                        Http1Options { keep_alive: false },
+                        Http1Options {
+                            keep_alive: false,
+                            header_read_timeout: None,
+                        },
                         std::future::pending(),
                         DownstreamInfo::loopback(),
                     )

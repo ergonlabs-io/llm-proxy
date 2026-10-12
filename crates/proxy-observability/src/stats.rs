@@ -461,6 +461,18 @@ pub mod instruments {
         buckets: None,
     };
 
+    /// Downstream connections closed at accept because the process-wide
+    /// `global_downstream_max_connections` limit was reached. Envoy's own
+    /// listener stat of the same name; a rejected connection is not counted
+    /// in [`DOWNSTREAM_CX_TOTAL`].
+    pub const DOWNSTREAM_GLOBAL_CX_OVERFLOW: Instrument = Instrument {
+        name: "downstream_global_cx_overflow",
+        kind: InstrumentKind::Counter,
+        unit: "{connection}",
+        attribute_keys: &["listener"],
+        buckets: None,
+    };
+
     /// Tokens consumed by a GenAI request/response exchange. **Has no Envoy
     /// equivalent** — Envoy predates LLM gateways — so this renders to
     /// nothing in the `/stats` text output; it exists in

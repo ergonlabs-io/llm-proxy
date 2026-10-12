@@ -225,6 +225,7 @@ async fn run_streaming(
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: Box::new(terminal),
         buffer_limit,
+        request_deadline: None,
     };
     mgr.run(request(b"req")).await
 }
@@ -245,6 +246,7 @@ async fn run_streaming_with_headers(
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: Box::new(terminal),
         buffer_limit,
+        request_deadline: None,
     };
     mgr.run(request(b"req")).await
 }

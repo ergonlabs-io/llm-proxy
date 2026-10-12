@@ -340,6 +340,7 @@ async fn run_chain_req(
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: Box::new(terminal),
         buffer_limit,
+        request_deadline: None,
     };
     let resp = mgr.run(req).await;
     let status = resp.head.status;
@@ -372,6 +373,7 @@ async fn run_chain_req_with_route_table(
             .with_route_table(route_table),
         terminal: Box::new(terminal),
         buffer_limit: DEFAULT_BUFFER_LIMIT,
+        request_deadline: None,
     };
     let resp = mgr.run(req).await;
     let status = resp.head.status;
@@ -534,6 +536,7 @@ async fn run_chain(
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: Box::new(terminal),
         buffer_limit,
+        request_deadline: None,
     };
     let resp = mgr.run(request(body)).await;
     let status = resp.head.status;
@@ -570,6 +573,7 @@ async fn run_chain_watermark(
         ctx,
         terminal: Box::new(terminal),
         buffer_limit,
+        request_deadline: None,
     };
     let resp = mgr.run(request(body)).await;
     let status = resp.head.status;
@@ -1875,6 +1879,7 @@ fn continue_and_dont_end_stream_also_reaches_the_terminal() {
             ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
             terminal: Box::new(EndStreamRecordingTerminal { seen: seen.clone() }),
             buffer_limit: DEFAULT_BUFFER_LIMIT,
+            request_deadline: None,
         };
         let resp = mgr.run(request(b"")).await;
         assert_eq!(resp.head.status, StatusCode::OK);
@@ -2918,6 +2923,7 @@ async fn run_chain_req_with_route_and_per_route(
             .with_per_route(Arc::new(per_route)),
         terminal: Box::new(terminal),
         buffer_limit: DEFAULT_BUFFER_LIMIT,
+        request_deadline: None,
     };
     let resp = mgr.run(req).await;
     let status = resp.head.status;
@@ -4074,6 +4080,7 @@ async fn run_chain_req_capturing_headers(
         ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
         terminal: Box::new(terminal),
         buffer_limit: DEFAULT_BUFFER_LIMIT,
+        request_deadline: None,
     };
     let resp = mgr.run(req).await;
     let status = resp.head.status;
@@ -4141,6 +4148,7 @@ fn probe_direct_and_seam_mutations_coexist() {
             ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
             terminal: Box::new(terminal),
             buffer_limit: DEFAULT_BUFFER_LIMIT,
+            request_deadline: None,
         };
         let resp = mgr.run(request(b"hi")).await;
         let _ = resp.body.collect().await;
@@ -4401,6 +4409,7 @@ fn modify_decoded_headers_is_a_no_op_once_headers_are_forwarded() {
             ctx: ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default()))),
             terminal: Box::new(terminal),
             buffer_limit: DEFAULT_BUFFER_LIMIT,
+            request_deadline: None,
         };
         let resp = mgr.run(request(b"hi")).await;
         assert_eq!(resp.head.status, StatusCode::OK);

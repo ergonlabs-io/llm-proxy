@@ -49,6 +49,8 @@ proxy-api = { workspace = true }
 rcgen = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "io-util"] }
+# Captures the once-only "no connection limit" warning in admission.rs tests.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

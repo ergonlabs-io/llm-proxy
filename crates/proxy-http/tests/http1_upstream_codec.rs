@@ -37,7 +37,10 @@ async fn spawn_upstream(handler: Rc<dyn StreamHandler>) -> std::net::SocketAddr 
         serve_http1(
             io,
             handler,
-            Http1Options { keep_alive: true },
+            Http1Options {
+                keep_alive: true,
+                header_read_timeout: None,
+            },
             std::future::pending(),
             DownstreamInfo::loopback(),
         )
@@ -80,9 +83,16 @@ async fn get_returns_fixed_response() {
                 on_upgrade: None,
             };
 
-            let response = send_upstream_http1(io, req, Http1Options { keep_alive: true })
-                .await
-                .expect("send_upstream_http1");
+            let response = send_upstream_http1(
+                io,
+                req,
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
+            )
+            .await
+            .expect("send_upstream_http1");
             assert_eq!(response.head.status, StatusCode::OK);
             assert_eq!(
                 response
@@ -132,9 +142,16 @@ async fn post_body_is_streamed_and_echoed_back() {
                 on_upgrade: None,
             };
 
-            let response = send_upstream_http1(io, req, Http1Options { keep_alive: true })
-                .await
-                .expect("send_upstream_http1");
+            let response = send_upstream_http1(
+                io,
+                req,
+                Http1Options {
+                    keep_alive: true,
+                    header_read_timeout: None,
+                },
+            )
+            .await
+            .expect("send_upstream_http1");
             assert_eq!(response.head.status, StatusCode::OK);
             let bytes = response
                 .body
@@ -179,7 +196,15 @@ async fn connect_to_nothing_yields_handshake_error() {
                     downstream: DownstreamInfo::loopback(),
                     on_upgrade: None,
                 };
-                let result = send_upstream_http1(io, req, Http1Options { keep_alive: true }).await;
+                let result = send_upstream_http1(
+                    io,
+                    req,
+                    Http1Options {
+                        keep_alive: true,
+                        header_read_timeout: None,
+                    },
+                )
+                .await;
                 assert!(matches!(
                     result,
                     Err(UpstreamCodecError::Handshake(_)) | Err(UpstreamCodecError::Send(_))

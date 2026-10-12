@@ -429,6 +429,10 @@ pub struct FilterChainHandler {
     /// `FilterManager::run`) can match against it.
     route_table: Arc<RouteTable>,
     buffer_limit: usize,
+    /// HCM `request_timeout`: how long a request may take to arrive in full,
+    /// measured from when this handler receives the request head. `None`
+    /// (Envoy's default) disables it.
+    request_timeout: Option<std::time::Duration>,
     /// S9/HCM: generate `x-request-id` when the request lacks one (Envoy
     /// default true).
     generate_request_id: bool,
@@ -517,6 +521,7 @@ impl FilterChainHandler {
             terminal_factory,
             route_table,
             buffer_limit: DEFAULT_BUFFER_LIMIT,
+            request_timeout: None,
             generate_request_id,
             use_remote_address,
             xff_num_trusted_hops,
@@ -633,6 +638,15 @@ impl FilterChainHandler {
 
     pub fn with_buffer_limit(mut self, limit: usize) -> Self {
         self.buffer_limit = limit;
+        self
+    }
+
+    /// Sets HCM `request_timeout`: the deadline for receiving the whole
+    /// request (head already in hand, so body only). It stops once the body
+    /// is collected, so a response that streams for longer is not cut. `None`
+    /// disables it.
+    pub fn with_request_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -841,6 +855,7 @@ impl StreamHandler for FilterChainHandler {
                     .with_per_route(self.per_route.clone()),
                 terminal,
                 buffer_limit: self.buffer_limit,
+                request_deadline: self.request_timeout.map(|t| start_instant + t),
             };
             // Rust note: `mgr` is still a plain local value here (not yet
             // moved into `run()`), so its `ctx.request_headers_snapshot` --
@@ -1314,6 +1329,8 @@ struct FilterManager {
     ctx: ChainCtx,
     terminal: Box<dyn TerminalHttpFilter>,
     buffer_limit: usize,
+    /// When the whole request must have arrived by (HCM `request_timeout`).
+    request_deadline: Option<Instant>,
 }
 
 impl FilterManager {
@@ -1323,6 +1340,7 @@ impl FilterManager {
             mut ctx,
             mut terminal,
             buffer_limit,
+            request_deadline,
         } = self;
         ctx.buffer_limit = buffer_limit;
 
@@ -1377,8 +1395,33 @@ impl FilterManager {
         // make a worker buffer an unbounded body before any decode filter
         // (auth included) has run. Envoy streams the body under flow control
         // instead; see `internal-docs/envoy-divergences.md`.
-        let (mut head, req_trailers, mut body) = match collect_request(req, buffer_limit).await {
+        //
+        // `request_timeout` bounds this collection and nothing after it: once
+        // the last request byte is in, the timer is disarmed (Envoy), so a
+        // long-streaming LLM response is never cut by it. The deadline is
+        // absolute, so the time already spent before this point counts.
+        let collected = match request_deadline {
+            Some(deadline) => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                collect_request(req, buffer_limit),
+            )
+            .await
+            .unwrap_or(Err(RequestCollectionError::Timeout)),
+            None => collect_request(req, buffer_limit).await,
+        };
+        let (mut head, req_trailers, mut body) = match collected {
             Ok(parts) => parts,
+            // The body future was dropped mid-read, so hyper sees an unread
+            // request body and closes an HTTP/1 connection after this reply
+            // instead of reusing it, same as the 413 path below.
+            Err(RequestCollectionError::Timeout) => {
+                let reply = LocalReply::new(
+                    http::StatusCode::REQUEST_TIMEOUT,
+                    "request timeout",
+                    "request_overall_timeout",
+                );
+                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            }
             // A downstream body read error is a client problem: 400. (Streaming
             // will surface this mid-flight instead; chunk 1 sees it up front.)
             // S2.5: routed through the encoder chain like any other response —
@@ -3383,6 +3426,8 @@ impl EncoderCallbacks for EncoderCallbacksAdapter<'_> {
 /// Collect a request into head + optional trailers + buffered body bytes.
 enum RequestCollectionError {
     TooLarge,
+    /// HCM `request_timeout` expired before the request was fully received.
+    Timeout,
     Body(BodyError),
 }
 

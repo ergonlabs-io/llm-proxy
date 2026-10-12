@@ -67,6 +67,9 @@ pub struct WorkerContext {
     /// The worker reports here (via `drain_worker`) once its connection
     /// registry has emptied or its drain deadline has passed.
     pub drain_done: mpsc::UnboundedSender<WorkerId>,
+    /// The one process-wide downstream connection counter, a clone of the
+    /// same handle every sibling worker gets.
+    pub connection_limiter: crate::admission::ConnectionLimiter,
 }
 
 /// Every live [`WorkerConfigHandle`] that must observe a republished
@@ -192,8 +195,10 @@ impl WorkerPool {
         let (drain_coordinator, drain_rx) = DrainCoordinator::new(config.concurrency);
         let drain_done_tx = drain_coordinator.done_sender();
 
+        let connection_limiter = crate::admission::ConnectionLimiter::default();
         for i in 0..config.concurrency {
             let id = WorkerId(i);
+            let connection_limiter = connection_limiter.clone();
             // `register` both builds this worker's handle AND enrolls it in
             // `snapshot_handles` -- no separate `handles.push(..)` needed
             // (or possible to forget) the way a bare `WorkerConfigHandle::new`
@@ -232,6 +237,7 @@ impl WorkerPool {
                         shutdown: shutdown_rx,
                         drain: drain_rx,
                         drain_done: drain_done_tx,
+                        connection_limiter,
                     };
 
                     // Rust note: `new_current_thread` + `LocalSet` is the
