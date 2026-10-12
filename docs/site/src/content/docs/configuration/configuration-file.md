@@ -269,6 +269,13 @@ explicitly — the shorthand string form cannot carry it:
 | `tls.cert_file` | string (path) | yes, if `tls` is set | — | PEM certificate chain. |
 | `tls.key_file` | string (path) | yes, if `tls` is set | — | PEM private key. |
 | `max_request_body_bytes` | integer, 1 to 4294967295 | no | `1048576` (1 MiB) | The largest request body the listener accepts, in bytes. See [Request body size limit](#request-body-size-limit). |
+| `max_connections` | integer, at least 1 | no | `50000` | The most client connections held open at once, across the whole proxy. |
+| `request_headers_timeout` | `Duration` | no | `10s` | Time allowed from a request's first byte to its complete headers. `0s` disables it. |
+| `request_timeout` | `Duration` | no | `60s` | Time allowed to receive the whole request, headers and body. Does not bound the response. `0s` disables it. |
+
+The three limits above default to Envoy's edge-proxy guidance and apply even
+when `listen` is the shorthand `host:port` form. Envoy-mode config keeps
+Envoy's defaults, which are disabled.
 
 ### Request body size limit
 

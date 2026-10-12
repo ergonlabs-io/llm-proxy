@@ -128,6 +128,23 @@
           "default": 1048576,
           "examples": [20971520]
         },
+        "max_connections": {
+          "description": "The most client connections the proxy holds open at once, across the whole process. Connections over the limit are closed on accept. Default: 50000 (Envoy's edge-proxy guidance). Must be greater than 0. Lowers to the bootstrap `overload_manager` monitor `envoy.resource_monitors.global_downstream_max_connections`.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 50000,
+          "examples": [10000]
+        },
+        "request_headers_timeout": {
+          "description": "Time allowed from the first byte of a request to its complete headers. Slow clients that exceed it are disconnected. Default: 10s (Envoy's edge-proxy guidance). `0s` disables the timeout. Lowers to the HTTP connection manager's `request_headers_timeout`.",
+          "$ref": "#/$defs/Duration",
+          "default": "10s"
+        },
+        "request_timeout": {
+          "description": "Time allowed to receive the whole request, headers and body. It does not bound the response, so long generations and streams are unaffected. Default: 60s (Envoy's edge-proxy guidance). `0s` disables the timeout. Raise it if clients upload very large bodies slowly. Lowers to the HTTP connection manager's `request_timeout`.",
+          "$ref": "#/$defs/Duration",
+          "default": "60s"
+        },
         "tls": {
           "description": "Terminate TLS for client connections. Certificate files are read once at startup; a renewed certificate needs a restart to be served. The hot-swap mechanism exists internally but nothing watches the files yet, so do not plan renewal around it.",
           "type": "object",

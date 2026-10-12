@@ -163,7 +163,25 @@ pub struct ListenerSpec {
     /// default. A larger body gets `413`.
     #[serde(default)]
     pub max_request_body_bytes: Option<u32>,
+    /// Cap on simultaneously open client connections for the whole proxy.
+    /// Unset means [`DEFAULT_MAX_CONNECTIONS`]; must be greater than 0.
+    #[serde(default)]
+    pub max_connections: Option<u64>,
+    /// Time allowed from a request's first byte to its complete headers.
+    /// Unset means 10s; `0s` disables the timeout.
+    #[serde(default)]
+    pub request_headers_timeout: Option<SimpleDuration>,
+    /// Time allowed to receive the complete request (headers and body).
+    /// Unset means 60s; `0s` disables the timeout.
+    #[serde(default)]
+    pub request_timeout: Option<SimpleDuration>,
 }
+
+/// Safe edge-proxy defaults for the admission limits, from Envoy's edge
+/// best-practices guidance. Envoy mode keeps Envoy's own (disabled) defaults.
+pub const DEFAULT_MAX_CONNECTIONS: u64 = 50_000;
+pub const DEFAULT_REQUEST_HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

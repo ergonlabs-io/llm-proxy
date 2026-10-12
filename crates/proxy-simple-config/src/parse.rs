@@ -329,6 +329,17 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                 reason: "must be greater than 0; 0 would reject every request body".to_string(),
             });
         }
+        if let Listen::Full(ListenerSpec {
+            max_connections: Some(0),
+            ..
+        }) = listen
+        {
+            // Envoy's DownstreamConnectionsConfig requires a positive limit.
+            return Err(ConfigError::InvalidValue {
+                field_path: "listen.max_connections".to_string(),
+                reason: "must be greater than 0".to_string(),
+            });
+        }
     }
     if let Some(admin) = &config.admin {
         parse_host_port(admin, "admin")?;

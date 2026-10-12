@@ -63,6 +63,7 @@ use crate::parse::parse_host_port;
 /// against.
 pub const MODEL_HEADER: &str = "x-llmproxy-model";
 
+const DOWNSTREAM_CONNECTIONS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig";
 const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
 const ROUTER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router";
 
@@ -321,6 +322,15 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             "listeners": [listener],
             "clusters": clusters,
         }
+    });
+    bootstrap["overload_manager"] = json!({
+        "resource_monitors": [ {
+            "name": "envoy.resource_monitors.global_downstream_max_connections",
+            "typed_config": {
+                "@type": DOWNSTREAM_CONNECTIONS_TYPE_URL,
+                "max_active_downstream_connections": max_connections(config),
+            }
+        } ]
     });
     if let Some(admin) = &config.admin {
         let (host, port) = parse_host_port(admin, "admin")?;
@@ -2402,6 +2412,7 @@ fn lower_listener(
             spec.max_request_body_bytes,
         ),
     };
+    let (headers_timeout, request_timeout) = request_timeouts(config);
 
     // The listener-level dialect is a fallback that is, in practice,
     // unreachable: every route lowered above carries its own
@@ -2483,6 +2494,10 @@ fn lower_listener(
             "http_filters": http_filters,
         }
     });
+    // Always emitted: the dialect ships safe defaults, and `0s` is how an
+    // operator disables one (Envoy reads `0s` as disabled).
+    hcm["typed_config"]["request_headers_timeout"] = json!(headers_timeout.to_string());
+    hcm["typed_config"]["request_timeout"] = json!(request_timeout.to_string());
     if let Some(access_log) = access_log {
         hcm["typed_config"]["access_log"] = json!([access_log]);
     }
@@ -2512,6 +2527,34 @@ fn lower_listener(
         listener["per_connection_buffer_limit_bytes"] = json!(limit);
     }
     Ok(listener)
+}
+
+/// The listener spec when `listen` is the object form (the only form that can
+/// carry overrides); the shorthand string and an absent `listen` use defaults.
+fn listener_spec(config: &SimpleConfig) -> Option<&crate::model::ListenerSpec> {
+    match &config.listen {
+        Some(Listen::Full(spec)) => Some(spec),
+        _ => None,
+    }
+}
+
+/// (request_headers_timeout, request_timeout) with the dialect's defaults.
+fn request_timeouts(config: &SimpleConfig) -> (SimpleDuration, SimpleDuration) {
+    let spec = listener_spec(config);
+    (
+        spec.and_then(|s| s.request_headers_timeout)
+            .unwrap_or(SimpleDuration(
+                crate::model::DEFAULT_REQUEST_HEADERS_TIMEOUT,
+            )),
+        spec.and_then(|s| s.request_timeout)
+            .unwrap_or(SimpleDuration(crate::model::DEFAULT_REQUEST_TIMEOUT)),
+    )
+}
+
+fn max_connections(config: &SimpleConfig) -> u64 {
+    listener_spec(config)
+        .and_then(|s| s.max_connections)
+        .unwrap_or(crate::model::DEFAULT_MAX_CONNECTIONS)
 }
 
 fn warning(field_path: impl Into<String>, message: impl Into<String>) -> ConfigWarning {
