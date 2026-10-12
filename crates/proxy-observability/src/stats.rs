@@ -823,6 +823,18 @@ pub mod instruments {
         buckets: None,
     };
 
+    /// Access-log lines dropped because a destination's queue was full
+    /// (`sink::QueuedSink`). **No Envoy equivalent** (Envoy's file logger
+    /// blocks or errors instead of queueing), so it renders to Prometheus and
+    /// OTLP only; recorded in `internal-docs/envoy-divergences.md`.
+    pub const ACCESS_LOG_DROPPED_LINES: Instrument = Instrument {
+        name: "llmproxy_access_log_dropped_lines",
+        kind: InstrumentKind::Counter,
+        unit: "{line}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+
     /// Collector serialization/write or unconfirmed-delivery failures. Legacy
     /// write failures close admission; agent mode can reconnect on later events.
     pub const METADATA_WRITE_FAILURES: Instrument = Instrument {

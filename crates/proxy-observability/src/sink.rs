@@ -329,6 +329,35 @@ pub fn dropped_lines_total() -> u64 {
     DROPPED_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Where drops are also counted as a stat, set by
+/// [`register_dropped_lines_counter`].
+static DROP_STAT: std::sync::RwLock<Option<(Arc<crate::stats::Registry>, crate::stats::Handle)>> =
+    std::sync::RwLock::new(None);
+
+/// Count every future dropped line in `llmproxy_access_log_dropped_lines`.
+/// Call once at boot, after the stats control exists. Registering again
+/// (tests, a second `run_serve` in one process) replaces the destination.
+/// Lines dropped before registration are not back-filled; sinks open at
+/// config load and a queue cannot overflow before traffic starts.
+///
+/// The drop path takes this read lock, which is fine: it only runs once a
+/// queue is already overflowing, never on the healthy path.
+pub fn register_dropped_lines_counter(control: &crate::stats::StatsControl) {
+    let handle = control.resolve(&crate::stats::instruments::ACCESS_LOG_DROPPED_LINES, &[]);
+    // Rust note: a poisoned lock only means another thread panicked while
+    // holding it; the data (an `Option` we overwrite whole) is still valid.
+    *DROP_STAT.write().unwrap_or_else(|e| e.into_inner()) = Some((control.registry(), handle));
+}
+
+fn record_drop_stat() {
+    if let Some((registry, handle)) = DROP_STAT.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        // Shard 0 for every writer thread: counters are atomic, and this is a
+        // process-level signal, not worker traffic (same convention as
+        // `MetadataDeliveryStats`).
+        registry.incr(crate::stats::WorkerId(0), *handle, 1);
+    }
+}
+
 /// Flush every live [`QueuedSink`], waiting at most `timeout` overall.
 /// Returns `false` if some writer did not catch up in time (the lines stay
 /// queued; the caller is exiting anyway). Shutdown/control paths only.
@@ -489,6 +518,7 @@ impl AccessLogWriter for QueuedSink {
             drop(st);
             let n = self.shared.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            record_drop_stat();
             if self.shared.limiter.should_warn() {
                 tracing::warn!(
                     destination = %self.shared.label,
@@ -738,6 +768,40 @@ mod tests {
             open,
             lines,
         )
+    }
+
+    #[test]
+    fn drops_are_counted_in_the_registered_stat_and_rendered() {
+        let control = crate::stats::StatsControl::new(1);
+        // Resolved before registering so the series exists (explicit zero)
+        // for an idle process.
+        register_dropped_lines_counter(&control);
+        let handle = control.resolve(&crate::stats::instruments::ACCESS_LOG_DROPPED_LINES, &[]);
+        assert_eq!(control.registry().value(handle), 0);
+
+        let (sink, open, _lines) = gated(8);
+        sink.write_line("a\n");
+        loop {
+            if sink.shared.state.lock().unwrap().items.is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        for i in 0..10 {
+            sink.write_line(&format!("{i}\n"));
+        }
+        assert_eq!(sink.dropped(), 6);
+        // `>=`: other tests in the same process may also overflow a sink.
+        assert!(control.registry().value(handle) >= 6);
+        let rendered = crate::stats::prometheus_render::render(&control.registry());
+        assert!(
+            rendered.contains("llmproxy_access_log_dropped_lines"),
+            "{rendered}"
+        );
+        for _ in 0..5 {
+            open.send(()).unwrap();
+        }
+        sink.flush();
     }
 
     #[test]

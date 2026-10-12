@@ -686,6 +686,9 @@ async fn run_serve(
     // actually hold. See `proxy_observability::stats`'s module doc for
     // why the two are split.
     let stats_control = proxy_observability::stats::StatsControl::new(concurrency);
+    // Count access-log lines dropped by a full queue; see
+    // `proxy_observability::sink::register_dropped_lines_counter`.
+    proxy_observability::sink::register_dropped_lines_counter(&stats_control);
     let stat_handles = Arc::new(proxy_http::stat_handles::StatHandles::build(
         &stats_control,
         snapshot.clusters.keys().map(String::as_str),
