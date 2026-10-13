@@ -98,12 +98,15 @@ outside the producer grant are declined before storage.
 
 The agent admits at most eight connections and has an eight-event writer queue.
 Each connection has one in-flight record; a semaphore also bounds tasks. The
-single spool writer commits up to eight records after at most a 50 ms grouping
-window. Handshakes/receipts have two-second deadlines; idle reads expire after
-30 seconds. Frame buffers, queue payloads and batching are each bounded, but
-JSON parsing/serialization and spool crypto add transient allocations. Enforce
-an independently provisioned process memory/CPU limit; no measured RSS or
-5,000-RPS performance claim is made.
+single spool writer takes the first queued record, adds whatever else is
+already queued (eight at most), and commits that batch at once. It never waits
+for a fuller batch, because a connection sends nothing more until its receipt
+arrives. Records that arrive during one commit's fsync form the next batch, and
+collecting a batch is capped at 50 ms. Handshakes/receipts have two-second
+deadlines; idle reads expire after 30 seconds. Frame buffers, queue payloads
+and batching are each bounded, but JSON parsing/serialization and spool crypto
+add transient allocations. Enforce an independently provisioned process
+memory/CPU limit; no measured RSS or 5,000-RPS performance claim is made.
 
 In spool-only mode, repeated commits can exhaust the disk budget; size it for
 the intended finite run/outage and observe declines. One durable checkpoint reserves the

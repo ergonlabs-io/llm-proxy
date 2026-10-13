@@ -22,7 +22,10 @@ use tokio::{
 
 const MAX_CLIENTS: usize = 8;
 const DEADLINE: Duration = Duration::from_secs(2);
-const COMMIT_INTERVAL: Duration = Duration::from_millis(50);
+/// Ceiling on how long the writer spends collecting one batch. Collection only
+/// takes jobs that are already queued (see `next_batch`), so this is an upper
+/// bound on a pathological pause, not a window the writer waits out.
+const MAX_BATCH_HOLD: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 pub struct Health {
@@ -80,7 +83,7 @@ impl Agent {
         if let Err(error) = std::thread::Builder::new()
             .name("metadata-spool".into())
             .spawn(move || {
-                writer(spool, receiver, &node_id, &writer_health);
+                writer(spool, receiver, &node_id, &writer_health, MAX_BATCH_HOLD);
                 let _ = done_tx.send(());
             })
         {
@@ -200,20 +203,44 @@ async fn serve(mut stream: UnixStream, config: &Config, jobs: mpsc::Sender<Job>)
     }
 }
 
-fn writer(mut spool: MetadataSpool, mut jobs: mpsc::Receiver<Job>, node_id: &str, health: &Health) {
-    while let Some(first) = jobs.blocking_recv() {
-        let deadline = Instant::now() + COMMIT_INTERVAL;
-        let mut batch = vec![first];
-        // At most one frame per admitted connection. Polling is isolated in the agent writer.
-        while batch.len() < MAX_CLIENTS && Instant::now() < deadline {
-            match jobs.try_recv() {
-                Ok(job) => batch.push(job),
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    std::thread::park_timeout(Duration::from_millis(2))
-                }
-            }
-        }
+/// Blocks for the next job and returns it with whatever else is already queued,
+/// at most `MAX_CLIENTS` in all. `None` means every sender is gone and the
+/// queue is drained.
+///
+/// It never waits for jobs that have not arrived. A connection sends nothing
+/// more until its receipt returns, so with fewer than `MAX_CLIENTS` producers a
+/// batch cannot fill, and waiting for one would charge every record the whole
+/// window. Under load the queue refills while the previous batch is in fsync,
+/// so batches grow with the backlog without a timer. `max_hold` only caps
+/// collection time.
+fn next_batch(jobs: &mut mpsc::Receiver<Job>, max_hold: Duration) -> Option<Vec<Job>> {
+    // Rust note: `?` on an `Option` returns `None` early, the way it returns
+    // `Err` early from a function that returns `Result`.
+    let first = jobs.blocking_recv()?;
+    let started = Instant::now();
+    let mut batch = Vec::with_capacity(MAX_CLIENTS);
+    batch.push(first);
+    // The cap must stay within the spool's eight pending records: the spool
+    // refuses a larger append batch, and that refusal stops this writer.
+    while batch.len() < MAX_CLIENTS && started.elapsed() < max_hold {
+        // Rust note: `let ... else` binds on success and otherwise runs a block
+        // that must diverge (`break` here). `try_recv` never blocks; its two
+        // errors, queue empty and every sender dropped, both mean no job is
+        // ready now. The caller's next `blocking_recv` reports a closed channel.
+        let Ok(job) = jobs.try_recv() else { break };
+        batch.push(job);
+    }
+    Some(batch)
+}
+
+fn writer(
+    mut spool: MetadataSpool,
+    mut jobs: mpsc::Receiver<Job>,
+    node_id: &str,
+    health: &Health,
+    max_hold: Duration,
+) {
+    while let Some(batch) = next_batch(&mut jobs, max_hold) {
         let mut prepared = Vec::with_capacity(MAX_CLIENTS);
         let mut fatal = false;
         for job in batch {
@@ -375,3 +402,6 @@ fn supported_shape(source: &serde_json::Value, canonical: &serde_json::Value) ->
         _ => true,
     }
 }
+
+#[cfg(test)]
+mod writer_tests;
