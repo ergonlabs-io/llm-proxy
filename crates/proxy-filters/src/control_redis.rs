@@ -35,6 +35,7 @@
 //! {ns}:policies                             HASH tenant -> encode_json(EncodedModelAccess)
 //! {ns}:budgets                              HASH tenant -> encode_json(EncodedTenantBudget)
 //! {ns}:tenant_credentials                   HASH <esc(tenant)>|<esc(provider)> -> encode_json(EncodedTenantCredentialRow)
+//! {ns}:rate_cards                           HASH chain (the usage filter's stat_prefix) -> encode_json(EncodedRateCardRow)
 //! {ns}:generation                           STRING, INCR
 //! {ns}:spend:{<prefix>|<tenant>|<period>}   STRING, micros
 //! {ns}:seq:{<prefix>|<tenant>|<period>}     HASH node_id -> highest accepted seq
@@ -47,6 +48,12 @@
 //! [`RedisControlPlaneStore::hash_tag`]'s doc for why they are a Redis
 //! Cluster hash tag, not decoration, and [`escape_component`]'s doc for why
 //! the three components must be escaped before they are joined.
+//!
+//! The `rate_cards` field is the chain name as it is: one component, so there
+//! is no separator to protect. The row holds the pricing document as an opaque
+//! string, which this store never parses. Writing a card and bumping
+//! `{ns}:generation` are one `MULTI`/`EXEC` (replace) or one script (seed if
+//! absent), so a poller never sees the stamp move without the card.
 //!
 //! The `tenant_credentials` field is the escaped tenant and the escaped
 //! provider joined by `|`. `escape_component` rewrites every `|` inside a
@@ -63,9 +70,10 @@ use redis::{Client, Connection, Script};
 use crate::auth::{KeyId, TenantId};
 use crate::control::decode_tenant_credential_row;
 use crate::control::{
-    decode_json, encode_json, store_err, ControlPlaneStore, EncodedKeyRow, EncodedModelAccess,
-    EncodedTenantBudget, EncodedTenantCredentialRow, FlushToken, StoreError, StoredControlPlane,
-    StoredKey, StoredTenantCredential, SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION,
+    decode_json, decode_rate_card_row, encode_json, store_err, ControlPlaneStore, EncodedKeyRow,
+    EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget, EncodedTenantCredentialRow,
+    FlushToken, StoreError, StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential,
+    SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION,
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
@@ -218,6 +226,26 @@ redis.call('INCR', KEYS[5])
 return 1
 "#;
 
+/// [`ControlPlaneStore::put_rate_card_if_absent`] as one script: `HSETNX`
+/// writes the field only if it does not exist and says which happened, and the
+/// generation is bumped only on the write. `KEYS[1]` = the rate cards hash,
+/// `KEYS[2]` = the generation counter, `ARGV[1]` = the chain, `ARGV[2]` = the
+/// row. Returns `1` (written and bumped) or `0` (a row was already there:
+/// nothing written, no bump).
+///
+/// A script rather than a pipeline for the reason [`ADD_SPEND_LUA`] gives: the
+/// bump depends on what `HSETNX` returned, and a `MULTI` block cannot branch on
+/// a reply it has not seen. Unconditional replacement
+/// ([`ControlPlaneStore::put_rate_card`]) has no such dependency and stays a
+/// plain `MULTI`/`EXEC`.
+const PUT_RATE_CARD_IF_ABSENT_LUA: &str = r#"
+if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2]) == 0 then
+  return 0
+end
+redis.call('INCR', KEYS[2])
+return 1
+"#;
+
 /// Percent-encodes the four bytes that would otherwise let two DIFFERENT
 /// `(stat_prefix, tenant, period)` triples build the SAME Redis key: `%`
 /// itself (so the encoding cannot be ambiguous), `|` (the delimiter
@@ -332,6 +360,7 @@ pub struct RedisControlPlaneStore {
     revoke_key_script: Script,
     delete_tenant_credential_script: Script,
     delete_tenant_script: Script,
+    put_rate_card_if_absent_script: Script,
 }
 
 impl RedisControlPlaneStore {
@@ -365,6 +394,7 @@ impl RedisControlPlaneStore {
             revoke_key_script: Script::new(REVOKE_KEY_LUA),
             delete_tenant_credential_script: Script::new(DELETE_TENANT_CREDENTIAL_LUA),
             delete_tenant_script: Script::new(DELETE_TENANT_LUA),
+            put_rate_card_if_absent_script: Script::new(PUT_RATE_CARD_IF_ABSENT_LUA),
         })
     }
 
@@ -444,6 +474,10 @@ impl RedisControlPlaneStore {
         format!("{}:tenant_credentials", self.namespace)
     }
 
+    fn rate_cards_key(&self) -> String {
+        format!("{}:rate_cards", self.namespace)
+    }
+
     /// Hash field for one credential row: `<esc(tenant)>|<esc(provider)>`.
     fn credential_field(tenant: &str, provider: &str) -> String {
         format!(
@@ -499,10 +533,10 @@ impl RedisControlPlaneStore {
     }
 }
 
-/// The five replies [`RedisControlPlaneStore::load`]'s single pipeline comes
+/// The six replies [`RedisControlPlaneStore::load`]'s single pipeline comes
 /// back with, in the order the commands were queued: the tenant set, then
-/// the keys, policies, budgets and tenant credentials hashes as raw
-/// `encode_json` bytes.
+/// the keys, policies, budgets, tenant credentials and rate cards hashes as
+/// raw `encode_json` bytes.
 ///
 /// Rust note: this annotation is not decoration. `redis`'s `query` is
 /// generic over `FromRedisValue`, and a pipeline's reply decodes into a
@@ -517,11 +551,12 @@ type LoadReply = (
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
+    HashMap<String, Vec<u8>>,
 );
 
 impl ControlPlaneStore for RedisControlPlaneStore {
     /// One pipeline: `SMEMBERS tenants`, then `HGETALL` of keys, policies,
-    /// budgets and tenant credentials -- run inside `MULTI`/`EXEC`
+    /// budgets, tenant credentials and rate cards -- run inside `MULTI`/`EXEC`
     /// (`.atomic()`) so a rebuild sees one consistent point-in-time snapshot,
     /// the same property `RedbControlPlaneStore::load`'s single read
     /// transaction gives for free. Runs on [`Lane::Control`].
@@ -546,8 +581,9 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let budgets_key = self.budgets_key();
 
         let credentials_key = self.tenant_credentials_key();
+        let rate_cards_key = self.rate_cards_key();
 
-        let (tenants_raw, keys_raw, policies_raw, budgets_raw, credentials_raw): LoadReply =
+        let (tenants_raw, keys_raw, policies_raw, budgets_raw, credentials_raw, rate_cards_raw): LoadReply =
             self.with_connection(Lane::Control, |conn| {
                 redis::pipe()
                     .atomic()
@@ -561,6 +597,8 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                     .arg(&budgets_key)
                     .cmd("HGETALL")
                     .arg(&credentials_key)
+                    .cmd("HGETALL")
+                    .arg(&rate_cards_key)
                     .query(conn)
             })?;
         let fetched = started.elapsed();
@@ -575,13 +613,15 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             + hash_bytes(&keys_raw)
             + hash_bytes(&policies_raw)
             + hash_bytes(&budgets_raw)
-            + hash_bytes(&credentials_raw);
-        let (n_tenants, n_keys, n_policies, n_budgets, n_credentials) = (
+            + hash_bytes(&credentials_raw)
+            + hash_bytes(&rate_cards_raw);
+        let (n_tenants, n_keys, n_policies, n_budgets, n_credentials, n_rate_cards) = (
             tenants_raw.len(),
             keys_raw.len(),
             policies_raw.len(),
             budgets_raw.len(),
             credentials_raw.len(),
+            rate_cards_raw.len(),
         );
 
         let tenants = tenants_raw.into_iter().map(TenantId::new).collect();
@@ -626,6 +666,13 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             tenant_credentials.push(decode_tenant_credential_row(&tenant, &provider, &bytes)?);
         }
 
+        // A rate card row this build cannot read is skipped and logged, not a
+        // load error: see `decode_rate_card_row`.
+        let rate_cards = rate_cards_raw
+            .into_iter()
+            .filter_map(|(chain, bytes)| decode_rate_card_row(&chain, &bytes))
+            .collect();
+
         tracing::info!(
             duration_ms = started.elapsed().as_millis() as u64,
             fetch_ms = fetched.as_millis() as u64,
@@ -634,6 +681,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             policies = n_policies,
             budgets = n_budgets,
             tenant_credentials = n_credentials,
+            rate_cards = n_rate_cards,
             payload_bytes,
             "loaded control-plane state from redis"
         );
@@ -644,6 +692,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             policies,
             budgets,
             tenant_credentials,
+            rate_cards,
         })
     }
 
@@ -843,6 +892,48 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                     .query::<()>(conn)
             }),
         }
+    }
+
+    /// The card and the generation bump are one `MULTI`/`EXEC` on
+    /// [`Lane::Control`], like `set_policy`: Redis applies a transaction as a
+    /// unit, so a poller that sees the new stamp also finds the card, and a
+    /// connection that dies before `EXEC` leaves neither behind.
+    fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
+        let rate_cards_key = self.rate_cards_key();
+        let generation_key = self.generation_key();
+        let row = encode_json(&EncodedRateCardRow::from(card));
+        self.with_connection(Lane::Control, |conn| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&rate_cards_key)
+                .arg(&card.chain)
+                .arg(&row)
+                .ignore()
+                .cmd("INCR")
+                .arg(&generation_key)
+                .ignore()
+                .query::<()>(conn)
+        })
+    }
+
+    /// See [`PUT_RATE_CARD_IF_ABSENT_LUA`]'s doc for why this one is a script.
+    fn put_rate_card_if_absent(&self, card: &StoredRateCard) -> Result<bool, StoreError> {
+        let row = encode_json(&EncodedRateCardRow::from(card));
+        let written: i64 = self.with_connection(Lane::Control, |conn| {
+            self.put_rate_card_if_absent_script
+                .key(self.rate_cards_key())
+                .key(self.generation_key())
+                .arg(&card.chain)
+                .arg(&row)
+                .invoke::<i64>(conn)
+        })?;
+        Ok(written == 1)
+    }
+
+    /// Redis is the shared store: it is meant to outlive any replica.
+    fn is_durable(&self) -> bool {
+        true
     }
 
     /// See [`ADD_SPEND_LUA`]'s doc -- this is the whole method: build the two
@@ -1081,6 +1172,54 @@ mod tests {
         assert_eq!(store.policy_generation().unwrap(), generation);
         assert!(store.load().unwrap().keys[0].revoked);
         assert_eq!(store.load_spend("chain", &subject, &period).unwrap(), 7);
+    }
+
+    #[test]
+    fn put_rate_card_if_absent_script_bumps_only_after_a_successful_hsetnx() {
+        let hsetnx = PUT_RATE_CARD_IF_ABSENT_LUA
+            .find("HSETNX")
+            .expect("the script writes with HSETNX");
+        let incr = PUT_RATE_CARD_IF_ABSENT_LUA
+            .find("INCR")
+            .expect("the script bumps the generation");
+        assert!(
+            hsetnx < incr,
+            "the bump must come after the conditional write, never before it"
+        );
+        assert!(
+            PUT_RATE_CARD_IF_ABSENT_LUA.contains("return 0"),
+            "a seed that finds a card must return before the bump"
+        );
+    }
+
+    #[test]
+    fn the_redis_store_claims_durability() {
+        let store = RedisControlPlaneStore::open("redis://127.0.0.1:6390").unwrap();
+        assert!(store.is_durable());
+    }
+
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_rate_cards_round_trip_replace_and_seed_with_one_bump_each() {
+        let store = test_store("rate-cards");
+        let card = |marker: &str| StoredRateCard {
+            chain: "chain-a".into(),
+            version: format!("v-{marker}"),
+            card_json: format!(r#"{{"marker":"{marker}"}}"#),
+        };
+        let base = store.policy_generation().unwrap();
+
+        assert_eq!(store.put_rate_card_if_absent(&card("seed")), Ok(true));
+        assert_eq!(store.policy_generation().unwrap(), base + 1);
+        assert_eq!(store.put_rate_card_if_absent(&card("again")), Ok(false));
+        assert_eq!(store.policy_generation().unwrap(), base + 1);
+        assert_eq!(store.load().unwrap().rate_cards, vec![card("seed")]);
+
+        store.put_rate_card(&card("published")).unwrap();
+        assert_eq!(store.policy_generation().unwrap(), base + 2);
+        assert_eq!(store.load().unwrap().rate_cards, vec![card("published")]);
+        assert_eq!(store.put_rate_card_if_absent(&card("later")), Ok(false));
+        assert_eq!(store.load().unwrap().rate_cards, vec![card("published")]);
     }
 
     #[test]

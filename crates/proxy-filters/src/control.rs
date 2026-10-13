@@ -148,6 +148,45 @@ impl std::fmt::Debug for StoredTenantCredential {
     }
 }
 
+/// One filter chain's rate card exactly as a [`ControlPlaneStore`] persists
+/// it (ADR-0006 §1 puts price in tier 2: read per request, written rarely,
+/// and versioned).
+///
+/// The store treats the card as an opaque document. `card_json` is the
+/// validated pricing document that `PUT /pricing` accepts and `GET /pricing`
+/// serves, and only `crate::usage_filter` parses it. That keeps price
+/// arithmetic out of the storage layer and lets a store hold a card that a
+/// newer or older build would read differently.
+///
+/// Keyed by `chain`, the usage filter's `stat_prefix`: the registry is per
+/// chain, so one global card would re-price chains that were configured
+/// differently on purpose.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredRateCard {
+    /// The chain's operator-chosen `stat_prefix`.
+    pub chain: String,
+    /// The card's `rate_card_version` as the writer computed it. Informational
+    /// for a reader: each build recomputes the version from `card_json`, so
+    /// two builds that hash differently still agree on the content.
+    pub version: String,
+    /// The pricing document, as compact JSON.
+    pub card_json: String,
+}
+
+// Rust note: hand-written, not derived. A derived `Debug` would print the
+// whole document, which for the shipped OpenRouter card is a quarter of a
+// megabyte inside every failed assertion; the length is enough to tell two
+// cards apart in a test failure.
+impl std::fmt::Debug for StoredRateCard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredRateCard")
+            .field("chain", &self.chain)
+            .field("version", &self.version)
+            .field("card_json_len", &self.card_json.len())
+            .finish()
+    }
+}
+
 /// Everything one [`ControlPlaneStore::load`] call returns -- the whole
 /// control-plane state, read in one shot so a rebuild is one I/O round trip
 /// rather than N.
@@ -164,6 +203,11 @@ pub struct StoredControlPlane {
     /// Every tenant credential row. A store that does not support them yet
     /// returns an empty list here and refuses writes.
     pub tenant_credentials: Vec<StoredTenantCredential>,
+    /// Every readable rate card, one per chain. A row this build cannot read
+    /// is left out and logged; it never fails the load (see
+    /// [`decode_rate_card_row`] for why a price must not hold up a
+    /// revocation). A store without rate card support returns an empty list.
+    pub rate_cards: Vec<StoredRateCard>,
 }
 
 /// Version 2 uses stable key budget subjects; absent versions are legacy version 1.
@@ -318,7 +362,8 @@ pub trait ControlPlaneStore: Send + Sync {
     fn load(&self) -> Result<StoredControlPlane, StoreError>;
 
     /// A monotonic counter bumped by every TIER-2 write -- tenants, keys,
-    /// policies, budgets -- and NEVER by a spend write (ADR-0006 §3).
+    /// policies, budgets, tenant credentials, rate cards -- and NEVER by a
+    /// spend write (ADR-0006 §3).
     /// [`ControlPlane`]'s poller reads only this value on every tick and does
     /// the full [`Self::load`] + republish ONLY when it has moved, which is
     /// what lets N replicas notice a revocation without every replica
@@ -408,6 +453,59 @@ pub trait ControlPlaneStore: Send + Sync {
         tenant: &TenantId,
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError>;
+
+    /// Creates or replaces the rate card for `card.chain` and bumps the
+    /// generation, in one atomic write. Price is tier-2 state (ADR-0006 §1),
+    /// so it propagates like a policy: the other replicas notice the bump on
+    /// their next poll and re-read (§3).
+    ///
+    /// The card and the bump land together or not at all. A card without a
+    /// bump is never noticed by another replica's poller, which compares only
+    /// the stamp. A bump without the card makes every replica rebuild for
+    /// nothing. Redis does both in one `MULTI`/`EXEC`, redb in one write
+    /// transaction, and the in-memory store under one lock.
+    ///
+    /// Bumps unconditionally, even when the stored card is byte-identical, for
+    /// the reason [`Self::policy_generation`] gives: a missed bump never
+    /// propagates, a spurious one costs one rebuild.
+    ///
+    /// The default refuses the write. A store without rate card support
+    /// therefore fails closed instead of accepting a card it cannot hold,
+    /// which is the rule [`Self::put_tenant_credential`] follows.
+    fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
+        let _ = card;
+        Err(StoreError::Unavailable(
+            "rate cards are not supported by this store".into(),
+        ))
+    }
+
+    /// As [`Self::put_rate_card`], but writes only when the store has no row
+    /// for `card.chain`. Returns `Ok(true)` when it wrote, and `Ok(false)`
+    /// when a row was already there, in which case nothing is written and the
+    /// generation does not move. A row this build cannot read still counts as
+    /// there: it is somebody's card, and overwriting it would hide it.
+    ///
+    /// This is how a configured card seeds the store at boot, the way
+    /// `ControlPlane::seed_bootstrap_policies` seeds policies. The check and
+    /// the write must be one atomic step. With a separate read first, a
+    /// replica booting at the same moment an operator publishes a card could
+    /// overwrite the operator's card with its configured one.
+    ///
+    /// The default refuses, for the reason [`Self::put_rate_card`] gives.
+    fn put_rate_card_if_absent(&self, card: &StoredRateCard) -> Result<bool, StoreError> {
+        let _ = card;
+        Err(StoreError::Unavailable(
+            "rate cards are not supported by this store".into(),
+        ))
+    }
+
+    /// Whether what this store holds survives a restart of this process. The
+    /// admin API uses it to say honestly whether a published rate card was
+    /// persisted. `false` is the safe default: claiming durability a store
+    /// does not have is the one wrong answer.
+    fn is_durable(&self) -> bool {
+        false
+    }
 
     // Spend rows, keyed `(stat_prefix, tenant,
     // period)`. `stat_prefix` is a plain `&str` (not this crate's
@@ -575,6 +673,9 @@ struct InMemoryState {
     // §2). A map rather than a `Vec` so a second put for the same pair
     // replaces in place and `load` can never return duplicates for it.
     tenant_credentials: HashMap<(TenantId, String), StoredTenantCredential>,
+    // Rate cards keyed by chain (`stat_prefix`): one row per chain, replaced
+    // in place by a second put for the same chain.
+    rate_cards: HashMap<String, StoredRateCard>,
     // Keyed on the full `(stat_prefix, tenant,
     // period)` triple as one tuple key -- there is no `load()`-style
     // wholesale read for spend (each row is read/written independently by
@@ -616,6 +717,7 @@ impl InMemoryControlPlaneStore {
                 policies: HashMap::new(),
                 budgets: HashMap::new(),
                 tenant_credentials: HashMap::new(),
+                rate_cards: HashMap::new(),
                 spend: HashMap::new(),
                 spend_seq: HashMap::new(),
                 generation: 0,
@@ -647,6 +749,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             policies: state.policies.clone(),
             budgets: state.budgets.clone(),
             tenant_credentials: state.tenant_credentials.values().cloned().collect(),
+            rate_cards: state.rate_cards.values().cloned().collect(),
         })
     }
 
@@ -803,6 +906,38 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         Ok(())
     }
 
+    fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        // The card and the bump share this one lock acquisition, so no
+        // reader sees the new stamp without the card it stands for.
+        state.rate_cards.insert(card.chain.clone(), card.clone());
+        state.generation += 1;
+        Ok(())
+    }
+
+    fn put_rate_card_if_absent(&self, card: &StoredRateCard) -> Result<bool, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        if state.rate_cards.contains_key(&card.chain) {
+            // Nothing written, so nothing for a poller to notice: no bump.
+            return Ok(false);
+        }
+        state.rate_cards.insert(card.chain.clone(), card.clone());
+        state.generation += 1;
+        Ok(true)
+    }
+
+    // Rust note: an explicit override rather than the trait default, so the
+    // fact that this store dies with the process is stated where it is true.
+    fn is_durable(&self) -> bool {
+        false
+    }
+
     fn add_spend(
         &self,
         stat_prefix: &str,
@@ -949,6 +1084,9 @@ const GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("gener
 // encoding as every other table here -- see [`EncodedKeyRow`]'s doc.
 const TENANT_CREDENTIALS_TABLE: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("tenant_credentials");
+// A chain's rate card, keyed by the chain's `stat_prefix`. JSON bytes like
+// every other table here -- see `EncodedRateCardRow`.
+const RATE_CARDS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("rate_cards");
 
 /// One `keys` row, exactly as `redb` stores it -- everything a [`StoredKey`]
 /// carries except `key_id`, which is already the table's key and would just
@@ -1279,6 +1417,77 @@ pub(crate) fn decode_tenant_credential_row(
     })
 }
 
+/// Only version this build understands for a rate card row.
+pub(crate) const RATE_CARD_SCHEMA_VERSION: u16 = 1;
+
+/// One `rate_cards` row as the persistent stores keep it. The chain is the
+/// table key (redb) or hash field (Redis), so it is not repeated in the value,
+/// where a second copy could disagree with the key it is filed under.
+///
+/// `card` is the pricing document as a JSON string inside the JSON row, not
+/// as nested JSON. The store never looks inside it, and nothing at the storage
+/// layer can reorder its keys or re-render its numbers; what `usage_filter`
+/// wrote is what it reads back.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EncodedRateCardRow {
+    schema_version: u16,
+    version: String,
+    card: String,
+}
+
+impl From<&StoredRateCard> for EncodedRateCardRow {
+    fn from(card: &StoredRateCard) -> Self {
+        EncodedRateCardRow {
+            schema_version: RATE_CARD_SCHEMA_VERSION,
+            version: card.version.clone(),
+            card: card.card_json.clone(),
+        }
+    }
+}
+
+/// Decodes one stored rate card row. A row this build cannot read is logged
+/// and left out: `None`, never an error for the whole load.
+///
+/// That is the opposite of [`decode_tenant_credential_row`], and on purpose.
+/// Dropping a credential row would let that tenant fall back to the platform
+/// key, so one unreadable row has to fail the load closed. Dropping a rate
+/// card only leaves this replica on the card it already has, and failing the
+/// load for it would stop key revocations and policy changes from reaching
+/// the replica, over a price list. The loss is not silent: the warning names
+/// the chain, and requests the missing card would have priced are reported by
+/// the spend filter's unpriced warning where a budget applies.
+///
+/// The log line carries the chain and a fixed reason only. A serde message
+/// can echo a field's value, and nothing about a row is worth risking in a
+/// log (AGENTS.md "Fail-open controls": check what the log line renders).
+pub(crate) fn decode_rate_card_row(chain: &str, value: &[u8]) -> Option<StoredRateCard> {
+    let row: EncodedRateCardRow = match serde_json::from_slice(value) {
+        Ok(row) => row,
+        Err(_) => {
+            tracing::warn!(
+                chain,
+                "stored rate card row does not parse as a rate card row; ignoring it"
+            );
+            return None;
+        }
+    };
+    if row.schema_version != RATE_CARD_SCHEMA_VERSION {
+        tracing::warn!(
+            chain,
+            schema_version = row.schema_version,
+            supported = RATE_CARD_SCHEMA_VERSION,
+            "stored rate card row has a schema_version this build does not understand; \
+             ignoring it"
+        );
+        return None;
+    }
+    Some(StoredRateCard {
+        chain: chain.to_string(),
+        version: row.version,
+        card_json: row.card,
+    })
+}
+
 pub(crate) fn encode_json<T: serde::Serialize>(value: &T) -> Vec<u8> {
     // Rust note: `.expect`, not `?` -- every value passed here is one of
     // this module's own plain-data types (`EncodedKeyRow`, `EncodedModelAccess`,
@@ -1365,8 +1574,8 @@ impl RedbControlPlaneStore {
         Ok(store)
     }
 
-    /// Creates all tables if they do not already exist -- nine
-    /// (`TENANT_CREDENTIALS_TABLE` is the newest).
+    /// Creates all tables if they do not already exist -- ten
+    /// (`RATE_CARDS_TABLE` is the newest).
     ///
     /// Rust note: this runs a WRITE transaction even though it inserts no
     /// rows -- `WriteTransaction::open_table` is the only `redb` API that
@@ -1379,7 +1588,8 @@ impl RedbControlPlaneStore {
     /// an EXISTING database file from before a newer table existed still
     /// openable: `open_table` creates the missing table rather than erroring
     /// on it, so the file gains the table on first open (pinned by
-    /// `redb_opens_a_database_file_created_before_the_tenant_credentials_table_existed`).
+    /// `redb_opens_a_database_file_created_before_the_tenant_credentials_table_existed`
+    /// and `redb_opens_a_database_file_created_before_the_rate_cards_table_existed`).
     fn ensure_tables(&self) -> Result<(), StoreError> {
         let txn = self.db.begin_write().map_err(store_err)?;
         txn.open_table(TENANTS_TABLE).map_err(store_err)?;
@@ -1389,6 +1599,7 @@ impl RedbControlPlaneStore {
         txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
         txn.open_table(TENANT_CREDENTIALS_TABLE)
             .map_err(store_err)?;
+        txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
         txn.open_table(GENERATION_TABLE).map_err(store_err)?;
@@ -1545,12 +1756,24 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             )?);
         }
 
+        // Rate cards are the opposite case: a row this build cannot read is
+        // skipped and logged, never an `Err` -- see `decode_rate_card_row`.
+        let rate_cards_table = txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
+        let mut rate_cards = Vec::new();
+        for entry in rate_cards_table.iter().map_err(store_err)? {
+            let (key, value) = entry.map_err(store_err)?;
+            if let Some(card) = decode_rate_card_row(key.value(), value.value()) {
+                rate_cards.push(card);
+            }
+        }
+
         Ok(StoredControlPlane {
             tenants,
             keys,
             policies,
             budgets,
             tenant_credentials,
+            rate_cards,
         })
     }
 
@@ -1802,6 +2025,54 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
+    }
+
+    fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
+        // The row and the bump share one write transaction: they commit
+        // together or not at all.
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
+            table
+                .insert(
+                    card.chain.as_str(),
+                    encode_json(&EncodedRateCardRow::from(card)).as_slice(),
+                )
+                .map_err(store_err)?;
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn put_rate_card_if_absent(&self, card: &StoredRateCard) -> Result<bool, StoreError> {
+        // redb serializes write transactions, so the existence check and the
+        // insert below cannot interleave with another writer's.
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
+            if table.get(card.chain.as_str()).map_err(store_err)?.is_some() {
+                // Nothing to write and no bump. Dropping `txn` without a
+                // commit rolls the empty transaction back.
+                return Ok(false);
+            }
+            table
+                .insert(
+                    card.chain.as_str(),
+                    encode_json(&EncodedRateCardRow::from(card)).as_slice(),
+                )
+                .map_err(store_err)?;
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(true)
+    }
+
+    fn is_durable(&self) -> bool {
+        // Both file-backed stores survive a restart; the in-memory `redb`
+        // backend `in_memory()` builds for tests does not, but only tests
+        // can construct it.
+        true
     }
 
     fn add_spend(
@@ -3138,6 +3409,92 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         key_tenants: HashMap::new(),
         tenant_credentials: HashMap::new(),
     })))
+}
+
+/// Captures `tracing` events for tests that assert on what a log line says,
+/// which the crate's fail-open rules ask for (AGENTS.md "Fail-open controls":
+/// check what the log line renders). Shared by this crate's test modules, like
+/// [`test_snapshot_handle`].
+#[cfg(test)]
+pub(crate) mod log_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One captured event: its level and every field rendered to a string. The
+    /// message is the field named `message`.
+    pub(crate) type Event = (tracing::Level, BTreeMap<String, String>);
+
+    /// Records every event emitted on the current thread (`set_default` is
+    /// thread-local, so an event from the policy poller's own thread is not
+    /// seen; tests that need one call the function the poller calls).
+    #[derive(Default)]
+    pub(crate) struct Capture {
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl Capture {
+        /// Starts capturing on this thread until the guard drops.
+        pub(crate) fn start() -> (Arc<Capture>, tracing::subscriber::DefaultGuard) {
+            let capture = Arc::new(Capture::default());
+            let guard = tracing::subscriber::set_default(Arc::clone(&capture));
+            (capture, guard)
+        }
+
+        pub(crate) fn events(&self) -> Vec<Event> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// Every captured event at `level` or more severe, with its fields
+        /// joined into one string: what an operator would read on one line.
+        pub(crate) fn rendered_at_or_above(&self, level: tracing::Level) -> Vec<String> {
+            self.events()
+                .into_iter()
+                .filter(|(event_level, _)| *event_level <= level)
+                .map(|(_, fields)| {
+                    fields
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            // Rust note: `Visit`'s typed `record_u64`, `record_str` and friends
+            // all default to calling `record_debug`, so implementing that one
+            // method renders every field, whatever its type.
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), fields.0));
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
 }
 
 #[cfg(test)]
@@ -6540,5 +6897,303 @@ mod tests {
         );
         drop(cp);
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- rate card rows (ADR-0006 §1: price is tier-2 state) --------------
+    //
+    // The same pattern as the credential rows above: one test body over both
+    // embedded backends, because the trait promises ONE contract.
+
+    /// A rate card for `chain` with `marker` stamped into every field a
+    /// replace must overwrite. The document is opaque to the store, so a
+    /// placeholder object is enough.
+    fn rate_card(chain: &str, marker: &str) -> StoredRateCard {
+        StoredRateCard {
+            chain: chain.to_string(),
+            version: format!("version-{marker}"),
+            card_json: format!(r#"{{"marker":"{marker}"}}"#),
+        }
+    }
+
+    fn sorted_by_chain(mut cards: Vec<StoredRateCard>) -> Vec<StoredRateCard> {
+        cards.sort_by(|a, b| a.chain.cmp(&b.chain));
+        cards
+    }
+
+    #[test]
+    fn a_rate_card_round_trips_and_a_second_put_for_the_same_chain_replaces_it() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            let first = rate_card("chain-a", "first");
+            store.put_rate_card(&first).unwrap();
+            assert_eq!(
+                store.load().unwrap().rate_cards,
+                vec![first.clone()],
+                "put then load must return exactly the card that was written"
+            );
+
+            // Another chain is another row; the same chain replaces in place.
+            store.put_rate_card(&rate_card("chain-b", "other")).unwrap();
+            let second = rate_card("chain-a", "second");
+            store.put_rate_card(&second).unwrap();
+
+            let loaded = sorted_by_chain(store.load().unwrap().rate_cards);
+            assert_eq!(
+                loaded,
+                vec![second, rate_card("chain-b", "other")],
+                "a put for an existing chain must replace its card and leave the \
+                 other chain's card alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rate_card_write_that_lands_bumps_the_generation_once_and_one_that_does_not_does_not() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            let base = store.policy_generation().unwrap();
+
+            store.put_rate_card(&rate_card("chain-a", "one")).unwrap();
+            assert_eq!(store.policy_generation().unwrap(), base + 1);
+
+            // A byte-identical replacement bumps too: the trait forbids
+            // read-before-write "did this change anything" checks.
+            store.put_rate_card(&rate_card("chain-a", "one")).unwrap();
+            assert_eq!(store.policy_generation().unwrap(), base + 2);
+
+            // A seed that lands bumps once.
+            assert_eq!(
+                store.put_rate_card_if_absent(&rate_card("chain-b", "seed")),
+                Ok(true)
+            );
+            assert_eq!(store.policy_generation().unwrap(), base + 3);
+
+            // A seed that finds a card writes nothing, so nothing is bumped.
+            assert_eq!(
+                store.put_rate_card_if_absent(&rate_card("chain-b", "again")),
+                Ok(false)
+            );
+            assert_eq!(
+                store.policy_generation().unwrap(),
+                base + 3,
+                "a seed that wrote nothing must not move the stamp"
+            );
+
+            // The yardstick: a rate card write moves the stamp by exactly what
+            // any other tier-2 write does.
+            store
+                .set_policy(&TenantId::new("tenant-a"), &ModelAccess::All)
+                .unwrap();
+            assert_eq!(store.policy_generation().unwrap(), base + 4);
+        }
+    }
+
+    /// The restart case at the store level: the configured card seeds an
+    /// empty store once, an operator publishes a replacement, and a later
+    /// boot's seed must find the published card and leave it.
+    #[test]
+    fn seeding_never_overwrites_a_card_that_is_already_stored() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            let configured = rate_card("chain-a", "configured");
+            assert_eq!(store.put_rate_card_if_absent(&configured), Ok(true));
+            let published = rate_card("chain-a", "published");
+            store.put_rate_card(&published).unwrap();
+
+            assert_eq!(
+                store.put_rate_card_if_absent(&configured),
+                Ok(false),
+                "the second boot's seed must report that a card was already there"
+            );
+            assert_eq!(
+                store.load().unwrap().rate_cards,
+                vec![published],
+                "the published card must survive the later seed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rate_card_write_leaves_every_other_kind_of_row_alone() {
+        let redb_store = RedbControlPlaneStore::in_memory();
+        let inmemory_store = InMemoryControlPlaneStore::default();
+        let stores: [&dyn ControlPlaneStore; 2] = [&redb_store, &inmemory_store];
+
+        for store in stores {
+            store.put_rate_card(&rate_card("chain-a", "one")).unwrap();
+            let loaded = store.load().unwrap();
+            assert!(loaded.tenants.is_empty());
+            assert!(loaded.keys.is_empty());
+            assert!(loaded.policies.is_empty());
+            assert!(loaded.budgets.is_empty());
+            assert!(loaded.tenant_credentials.is_empty());
+
+            // And the reverse: deleting a tenant does not touch a chain's card.
+            store.delete_tenant(&TenantId::new("tenant-a")).unwrap();
+            assert_eq!(store.load().unwrap().rate_cards.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_store_without_rate_card_support_refuses_the_write_and_does_not_claim_durability() {
+        // `FailingStore` implements none of the rate card methods, so this
+        // pins the trait defaults: a store that cannot hold a card says so
+        // instead of accepting one it would lose.
+        let store = FailingStore;
+        assert!(matches!(
+            store.put_rate_card(&rate_card("chain-a", "one")),
+            Err(StoreError::Unavailable(_))
+        ));
+        assert!(matches!(
+            store.put_rate_card_if_absent(&rate_card("chain-a", "one")),
+            Err(StoreError::Unavailable(_))
+        ));
+        assert!(!store.is_durable());
+    }
+
+    #[test]
+    fn only_a_store_that_outlives_the_process_reports_durability() {
+        assert!(!InMemoryControlPlaneStore::default().is_durable());
+
+        let path = temp_db_path("durability-claim");
+        assert!(RedbControlPlaneStore::open(&path).unwrap().is_durable());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn redb_rate_cards_survive_closing_and_reopening_the_database_file() {
+        let path = temp_db_path("rate-card-persists-across-reopen");
+        let card = rate_card("chain-a", "one");
+
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            store.put_rate_card(&card).unwrap();
+        }
+
+        let reopened = RedbControlPlaneStore::open(&path).unwrap();
+        assert_eq!(reopened.load().unwrap().rate_cards, vec![card]);
+        assert_eq!(
+            reopened.policy_generation().unwrap(),
+            1,
+            "the bump that accompanied the card is durable too"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn redb_opens_a_database_file_created_before_the_rate_cards_table_existed() {
+        let path = temp_db_path("pre-rate-cards-table");
+
+        // Raw `redb`, not the store under test: every table the PREVIOUS code
+        // opened and deliberately not `RATE_CARDS_TABLE`, so the file is what
+        // an existing deployment's database looks like on first start after
+        // this change.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut tenants = txn.open_table(TENANTS_TABLE).unwrap();
+                tenants.insert("tenant-a", [].as_slice()).unwrap();
+            }
+            txn.open_table(KEYS_TABLE).unwrap();
+            txn.open_table(KEYS_BY_TENANT_TABLE).unwrap();
+            txn.open_table(POLICIES_TABLE).unwrap();
+            txn.open_table(BUDGETS_TABLE).unwrap();
+            txn.open_table(TENANT_CREDENTIALS_TABLE).unwrap();
+            txn.open_table(SPEND_TABLE).unwrap();
+            txn.open_table(SPEND_SEQ_TABLE).unwrap();
+            txn.open_table(GENERATION_TABLE).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let store = RedbControlPlaneStore::open(&path).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.tenants.len(), 1, "the existing rows must survive");
+        assert!(loaded.rate_cards.is_empty());
+
+        let card = rate_card("chain-a", "one");
+        store.put_rate_card(&card).unwrap();
+        assert_eq!(store.load().unwrap().rate_cards, vec![card]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A rate card row this build cannot read must not fail the load: that
+    /// would hold a key revocation hostage to a price list. It is skipped
+    /// loudly instead, and the warning must not carry the row.
+    #[test]
+    fn redb_a_rate_card_row_this_build_cannot_read_is_skipped_and_logged_not_fatal() {
+        let store = RedbControlPlaneStore::in_memory();
+        let good = rate_card("chain-good", "good");
+        store.put_rate_card(&good).unwrap();
+        store
+            .put_key(&StoredKey {
+                key_id: KeyId::new("k1"),
+                digest: [1; 32],
+                tenant: TenantId::new("tenant-a"),
+                revoked: true,
+            })
+            .unwrap();
+
+        // Written raw, bypassing `put_rate_card`: a hand-edited row, and the
+        // shape of one a NEWER build would write.
+        let future = br#"{"schema_version":2,"version":"v9","card":"FUTURE-CARD-CONTENT"}"#;
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(RATE_CARDS_TABLE).unwrap();
+                table
+                    .insert("chain-garbage", b"GARBAGE-ROW-CONTENT".as_slice())
+                    .unwrap();
+                table.insert("chain-future", future.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let (capture, guard) = log_capture::Capture::start();
+        let loaded = store
+            .load()
+            .expect("an unreadable rate card must not fail the whole load");
+        drop(guard);
+
+        assert_eq!(
+            loaded.rate_cards,
+            vec![good],
+            "only the readable card loads"
+        );
+        assert_eq!(
+            loaded.keys.len(),
+            1,
+            "the rest of the control-plane state still loads"
+        );
+
+        let warnings = capture.rendered_at_or_above(tracing::Level::WARN);
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per unreadable row: {warnings:?}"
+        );
+        for chain in ["chain-garbage", "chain-future"] {
+            assert!(
+                warnings.iter().any(|line| line.contains(chain)),
+                "the warning must name the chain {chain}: {warnings:?}"
+            );
+        }
+        for line in &warnings {
+            assert!(
+                !line.contains("GARBAGE-ROW-CONTENT") && !line.contains("FUTURE-CARD-CONTENT"),
+                "a warning must not render the row: {line}"
+            );
+        }
     }
 }

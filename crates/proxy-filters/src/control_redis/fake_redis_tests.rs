@@ -16,7 +16,7 @@
 //! prove WHICH CONNECTION each store call travels on and what the others do
 //! while one is stuck. What a real Redis stores is the other tests' business.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -24,6 +24,7 @@ use std::sync::{Arc, Condvar, MutexGuard};
 use std::thread;
 
 use super::*;
+use crate::control::log_capture::Capture;
 use crate::spend::{MicroUsd, Period};
 use proxy_http::tenant_credentials::CredentialSource;
 
@@ -60,6 +61,13 @@ struct State {
     /// `(connection id, command)` in the order the server read them. The
     /// client library's own connect-time `CLIENT` commands are not logged.
     log: Vec<(usize, String)>,
+    /// The same commands with their arguments, so a test can assert what was
+    /// actually sent (which keys, in which order, inside which transaction)
+    /// and not only which command it was.
+    wire: Vec<(usize, Vec<String>)>,
+    /// Replies to the next scripts that write rate cards, oldest first. An
+    /// empty queue answers `1`, like every other script call.
+    rate_card_script_replies: VecDeque<i64>,
     /// Gates whose commands are parked instead of answered.
     held: HashSet<Gate>,
     /// How many commands are parked at each gate right now.
@@ -94,6 +102,7 @@ struct Rows {
     policies: Vec<(String, Vec<u8>)>,
     budgets: Vec<(String, Vec<u8>)>,
     credentials: Vec<(String, Vec<u8>)>,
+    rate_cards: Vec<(String, Vec<u8>)>,
 }
 
 fn sample_credential() -> StoredTenantCredential {
@@ -120,10 +129,21 @@ fn sample_budget() -> TenantBudget {
     }
 }
 
+/// A rate card for `chain`. The document is opaque to the store, so a
+/// placeholder object stands in for a real one.
+fn sample_rate_card(chain: &str) -> StoredRateCard {
+    StoredRateCard {
+        chain: chain.into(),
+        version: format!("version-{chain}"),
+        card_json: format!(r#"{{"chain":"{chain}"}}"#),
+    }
+}
+
 impl Rows {
-    /// Two tenants, three keys (one revoked), one policy, one budget and one
-    /// sealed credential: a different count for every kind, so a count
-    /// reported under the wrong name cannot pass.
+    /// Two tenants, three keys (one revoked), one policy, one budget, one
+    /// sealed credential and four rate card rows (three readable, one not):
+    /// a different count for most kinds, so a count reported under the wrong
+    /// name cannot pass.
     fn sample() -> Rows {
         let key_row = |tenant: &str, revoked: bool, fill: u8| {
             encode_json(&EncodedKeyRow {
@@ -152,6 +172,22 @@ impl Rows {
                 RedisControlPlaneStore::credential_field("tenant-a", "openai"),
                 encode_json(&EncodedTenantCredentialRow::from(&sample_credential())),
             )],
+            rate_cards: vec![
+                (
+                    "chain-a".into(),
+                    encode_json(&EncodedRateCardRow::from(&sample_rate_card("chain-a"))),
+                ),
+                (
+                    "chain-b".into(),
+                    encode_json(&EncodedRateCardRow::from(&sample_rate_card("chain-b"))),
+                ),
+                (
+                    "chain-c".into(),
+                    encode_json(&EncodedRateCardRow::from(&sample_rate_card("chain-c"))),
+                ),
+                // A row no build could read: `load()` skips it and carries on.
+                ("chain-broken".into(), b"not a rate card row".to_vec()),
+            ],
         }
     }
 
@@ -160,24 +196,36 @@ impl Rows {
     /// rather than by the code under test.
     fn payload_bytes(&self) -> usize {
         let tenants: usize = self.tenants.iter().map(String::len).sum();
-        let hashes: usize = [&self.keys, &self.policies, &self.budgets, &self.credentials]
-            .into_iter()
-            .flatten()
-            .map(|(field, value)| field.len() + value.len())
-            .sum();
+        let hashes: usize = [
+            &self.keys,
+            &self.policies,
+            &self.budgets,
+            &self.credentials,
+            &self.rate_cards,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(field, value)| field.len() + value.len())
+        .sum();
         tenants + hashes
     }
 
-    /// The `EXEC` reply to `load()`'s pipeline: an array of five replies.
+    /// The `EXEC` reply to `load()`'s pipeline: an array of six replies.
     fn exec_reply(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        array_len(&mut out, 5);
+        array_len(&mut out, 6);
         array_len(&mut out, self.tenants.len());
         for tenant in &self.tenants {
             bulk(&mut out, tenant.as_bytes());
         }
         // An `HGETALL` reply is flat: field, value, field, value, ...
-        for hash in [&self.keys, &self.policies, &self.budgets, &self.credentials] {
+        for hash in [
+            &self.keys,
+            &self.policies,
+            &self.budgets,
+            &self.credentials,
+            &self.rate_cards,
+        ] {
             array_len(&mut out, hash.len() * 2);
             for (field, value) in hash {
                 bulk(&mut out, field.as_bytes());
@@ -297,6 +345,16 @@ fn answer(
             }
             format!(":{SPEND_TOTAL}\r\n").into_bytes()
         }
+        // The script that seeds a rate card if the chain has none: `1` when
+        // it wrote, `0` when a card was already there.
+        "EVALSHA" if mentions(":rate_cards") => {
+            let reply = shared
+                .lock()
+                .rate_card_script_replies
+                .pop_front()
+                .unwrap_or(1);
+            format!(":{reply}\r\n").into_bytes()
+        }
         "EVALSHA" => b":1\r\n".to_vec(),
         "GET" if mentions(":generation") => bulk_number(GENERATION),
         "GET" => bulk_number(STORED_SPEND),
@@ -319,7 +377,14 @@ fn serve(shared: Arc<Shared>, conn: usize, stream: TcpStream) {
     while let Some(args) = read_command(&mut reader) {
         let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
         if name != "CLIENT" {
-            shared.lock().log.push((conn, name.clone()));
+            let mut state = shared.lock();
+            state.log.push((conn, name.clone()));
+            state.wire.push((
+                conn,
+                args.iter()
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect(),
+            ));
         }
         let Some(reply) = answer(&shared, &name, &args, &mut queued) else {
             // Hang up: returning drops both halves, which closes the socket.
@@ -630,6 +695,18 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
             "delete_tenant_credential",
             Box::new(|| store.delete_tenant_credential(&tenant, "openai").is_ok()),
         ),
+        (
+            "put_rate_card",
+            Box::new(|| store.put_rate_card(&sample_rate_card("chain-a")).is_ok()),
+        ),
+        (
+            "put_rate_card_if_absent",
+            Box::new(|| {
+                store
+                    .put_rate_card_if_absent(&sample_rate_card("chain-a"))
+                    .is_ok()
+            }),
+        ),
     ];
     let spend_calls: Vec<Call> = vec![
         (
@@ -743,56 +820,22 @@ fn a_failed_call_resets_only_its_own_lane_and_that_lane_reconnects() {
 // The load log line
 // ---------------------------------------------------------------------------
 
-/// Records every event emitted on the current thread (`set_default` is
-/// thread-local) with each field rendered to a string.
-#[derive(Default)]
-struct Capture {
-    events: Mutex<Vec<(tracing::Level, BTreeMap<String, String>)>>,
-}
-
-impl tracing::Subscriber for Capture {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
-        // Rust note: `Visit`'s typed `record_u64`, `record_str` and friends
-        // all default to calling `record_debug`, so implementing that one
-        // method renders every field, whatever its type.
-        struct Fields(BTreeMap<String, String>);
-        impl tracing::field::Visit for Fields {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0
-                    .insert(field.name().to_string(), format!("{value:?}"));
-            }
-        }
-        let mut fields = Fields(BTreeMap::new());
-        event.record(&mut fields);
-        self.events
-            .lock()
-            .unwrap()
-            .push((*event.metadata().level(), fields.0));
-    }
-    fn enter(&self, _span: &tracing::span::Id) {}
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
 #[test]
 fn a_load_logs_its_duration_and_size_and_never_row_content() {
     let fake = FakeRedis::start();
     let store = fake.store();
 
-    let capture = Arc::new(Capture::default());
-    let guard = tracing::subscriber::set_default(Arc::clone(&capture));
+    let (capture, guard) = Capture::start();
     let loaded = store.load().expect("the fake serves a well-formed load");
     drop(guard);
     assert_eq!(loaded.keys.len(), 3, "the rows decoded as served");
+    assert_eq!(
+        loaded.rate_cards.len(),
+        3,
+        "the unreadable rate card row is skipped, not fatal"
+    );
 
-    let events = capture.events.lock().unwrap();
+    let events = capture.events();
     let load_lines: Vec<_> = events
         .iter()
         .filter(|(_, fields)| fields.contains_key("payload_bytes"))
@@ -809,6 +852,7 @@ fn a_load_logs_its_duration_and_size_and_never_row_content() {
         ("policies", "1"),
         ("budgets", "1"),
         ("tenant_credentials", "1"),
+        ("rate_cards", "4"),
     ] {
         assert_eq!(fields[field], want, "{field}");
     }
@@ -828,4 +872,90 @@ fn a_load_logs_its_duration_and_size_and_never_row_content() {
             "field {name} is not a number: {value}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rate cards: the card and the generation bump travel together
+// ---------------------------------------------------------------------------
+
+impl FakeRedis {
+    /// The commands the server read after the first `skip`, as
+    /// `(connection, arguments)`.
+    fn wire_since(&self, skip: usize) -> Vec<(usize, Vec<String>)> {
+        self.shared.lock().wire[skip..].to_vec()
+    }
+
+    fn wire_len(&self) -> usize {
+        self.shared.lock().wire.len()
+    }
+}
+
+#[test]
+fn a_rate_card_and_its_generation_bump_are_one_transaction_on_the_control_connection() {
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    // Open the control connection first so the write below is the only thing
+    // after the mark.
+    store.policy_generation().expect("policy_generation");
+    let control = fake.last_conn();
+    let mark = fake.wire_len();
+
+    let card = sample_rate_card("chain-a");
+    store.put_rate_card(&card).expect("put_rate_card");
+
+    // Exactly MULTI, HSET, INCR, EXEC, and nothing in between: Redis applies
+    // a transaction as a unit, so a poller cannot see the new stamp without
+    // the card, and a connection that dies before EXEC leaves neither. An
+    // HSET and an INCR sent as two plain commands would pass every other test
+    // here and lose that property.
+    let sent = fake.wire_since(mark);
+    assert!(
+        sent.iter().all(|(conn, _)| *conn == control),
+        "the whole write must travel on the control connection: {sent:?}"
+    );
+    let commands: Vec<&[String]> = sent.iter().map(|(_, args)| args.as_slice()).collect();
+    assert_eq!(commands.len(), 4, "MULTI, HSET, INCR, EXEC: {commands:?}");
+    assert_eq!(commands[0], ["MULTI"]);
+    assert_eq!(commands[1][..3], ["HSET", "lanes:rate_cards", "chain-a"]);
+    assert_eq!(commands[2], ["INCR", "lanes:generation"]);
+    assert_eq!(commands[3], ["EXEC"]);
+
+    // The row that went out is the card, and reads back as the same card.
+    assert_eq!(
+        decode_rate_card_row("chain-a", commands[1][3].as_bytes()),
+        Some(card)
+    );
+}
+
+#[test]
+fn seeding_a_rate_card_is_one_script_that_names_the_card_and_the_generation() {
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    store.policy_generation().expect("policy_generation");
+    let mark = fake.wire_len();
+
+    let card = sample_rate_card("chain-a");
+    assert_eq!(store.put_rate_card_if_absent(&card), Ok(true));
+
+    // One EVALSHA carrying both keys, and no separate HSETNX/INCR: the check,
+    // the write and the bump are one atomic step on the server.
+    let sent = fake.wire_since(mark);
+    assert_eq!(sent.len(), 1, "one script call and nothing else: {sent:?}");
+    let args = &sent[0].1;
+    assert_eq!(args[0], "EVALSHA");
+    assert_eq!(args[2], "2", "two keys");
+    assert_eq!(args[3], "lanes:rate_cards");
+    assert_eq!(args[4], "lanes:generation");
+    assert_eq!(args[5], "chain-a");
+    assert_eq!(
+        decode_rate_card_row("chain-a", args[6].as_bytes()),
+        Some(card)
+    );
+
+    // The script's `0` means a card was already there.
+    fake.shared.lock().rate_card_script_replies.push_back(0);
+    assert_eq!(
+        store.put_rate_card_if_absent(&sample_rate_card("chain-a")),
+        Ok(false)
+    );
 }
