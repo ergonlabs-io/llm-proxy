@@ -122,6 +122,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         name: "listener_0".to_string(),
         address: "127.0.0.1:0".parse().unwrap(),
         filter_chains: vec![FilterChainSpec {
+            transport_socket_connect_timeout: None,
             name: Some("default".to_string()),
             match_criteria: FilterChainMatch::default(),
             transport_socket: None,
@@ -315,6 +316,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         name: "listener_0".to_string(),
         address: "127.0.0.1:0".parse().unwrap(),
         filter_chains: vec![FilterChainSpec {
+            transport_socket_connect_timeout: None,
             name: Some("default".to_string()),
             match_criteria: FilterChainMatch::default(),
             transport_socket: None,

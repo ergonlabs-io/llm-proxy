@@ -411,6 +411,12 @@ pub struct FilterChainSpec {
     pub match_criteria: FilterChainMatch,
     /// Downstream TLS termination, when configured.
     pub transport_socket: Option<DownstreamTlsSpec>,
+    /// `FilterChain.transport_socket_connect_timeout`: the deadline for the
+    /// downstream transport-socket (TLS) handshake. `None` is unset, which
+    /// the listener bounds with its own default (see
+    /// `internal-docs/envoy-divergences.md`); `Some(Duration::ZERO)` is an
+    /// explicit "no deadline".
+    pub transport_socket_connect_timeout: Option<Duration>,
     /// Ordered network filters; the last one is terminal.
     pub filters: Vec<NetworkFilterSpec>,
 }

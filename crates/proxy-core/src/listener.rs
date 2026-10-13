@@ -193,6 +193,35 @@ impl ListenerTls {
     }
 }
 
+/// Handshake deadline applied when a chain leaves
+/// `transport_socket_connect_timeout` unset. Envoy applies none; this proxy
+/// holds a connection admission slot for the whole handshake, so an unbounded
+/// one lets stalled clients exhaust `max_downstream_connections`
+/// (`internal-docs/envoy-divergences.md`).
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The handshake deadline for `chain`: its configured value, the default when
+/// unset, and `None` (no deadline) for an explicit `0s`.
+fn tls_handshake_deadline(chain: &proxy_config::ir::FilterChainSpec) -> Option<Duration> {
+    match chain.transport_socket_connect_timeout {
+        None => Some(DEFAULT_TLS_HANDSHAKE_TIMEOUT),
+        Some(d) if d.is_zero() => None,
+        Some(d) => Some(d),
+    }
+}
+
+/// An explicit `0s` removes the handshake bound, so a stalled client holds an
+/// admission slot indefinitely. The owner chose availability; say so loudly
+/// (AGENTS.md "Fail-open controls"). Called once per chain per TLS build.
+fn warn_if_handshake_unbounded(chain: &proxy_config::ir::FilterChainSpec, context: &str) {
+    if chain.transport_socket.is_some() && tls_handshake_deadline(chain).is_none() {
+        tracing::warn!(
+            "{context}: transport_socket_connect_timeout is 0s, so the TLS handshake is unbounded \
+             and a stalled client holds a connection slot until it disconnects"
+        );
+    }
+}
+
 /// Build the compiled TLS factories for every `filter_chains[i]` (and the
 /// `default_filter_chain`) of `listener` whose `transport_socket` is
 /// configured. `None` transport_socket -> `None` slot (plaintext); a build
@@ -216,6 +245,7 @@ fn build_listener_tls(
         let factory = match &chain.transport_socket {
             Some(spec) => {
                 let context = format!("listener '{}' filter_chains[{i}]", listener.name);
+                warn_if_handshake_unbounded(chain, &context);
                 let factory = Arc::new(DownstreamTlsFactory::build(spec, &context)?);
                 if !spec.certificate_sds_names.is_empty() {
                     secret_registry.register(&spec.certificate_sds_names, &factory, &context)?;
@@ -236,6 +266,9 @@ fn build_listener_tls(
     {
         Some(spec) => {
             let context = format!("listener '{}' default_filter_chain", listener.name);
+            if let Some(chain) = &listener.default_filter_chain {
+                warn_if_handshake_unbounded(chain, &context);
+            }
             let factory = Arc::new(DownstreamTlsFactory::build(spec, &context)?);
             if !spec.certificate_sds_names.is_empty() {
                 secret_registry.register(&spec.certificate_sds_names, &factory, &context)?;
@@ -981,6 +1014,18 @@ struct ServeConnection {
     _connection_slot: crate::admission::ConnectionSlot,
 }
 
+/// Run `handshake` under `deadline`; a `None` deadline means unbounded.
+/// Returns `None` when the deadline expired.
+async fn handshake_with_deadline<F: std::future::Future>(
+    deadline: Option<Duration>,
+    handshake: F,
+) -> Option<F::Output> {
+    match deadline {
+        Some(d) => tokio::time::timeout(d, handshake).await.ok(),
+        None => Some(handshake.await),
+    }
+}
+
 async fn serve_connection(conn: ServeConnection) {
     let ServeConnection {
         stream,
@@ -1105,48 +1150,58 @@ async fn serve_connection(conn: ServeConnection) {
         });
 
     match (matched.transport_socket.is_some(), factory) {
-        (true, Some(factory)) => match factory.wrap(stream).await {
-            Ok(tls_stream) => {
-                // An explicit `codec_type` (`Http1`/`Http2`) is
-                // unconditional -- the operator has said what the client
-                // speaks, so there's nothing to negotiate. Only `Auto` (the
-                // Envoy default) falls back to reading what ALPN actually
-                // negotiated -- see `downstream_codec_for_alpn`'s doc comment
-                // for why that has to happen *here* (post-handshake) rather
-                // than be assumed from config.
-                let codec = match codec_type {
-                    CodecType::Http1 => DownstreamCodec::Http1,
-                    CodecType::Http2 => DownstreamCodec::Http2,
-                    CodecType::Auto => downstream_codec_for_alpn(&tls_stream),
-                };
-                // Can't `reset` (SO_LINGER) a `TlsStream` the way we can a
-                // bare `TcpStream` -- `run_terminal_filter` hands the stream
-                // back on the no-op paths so the *unimplemented*/no-filter
-                // cases just drop it and let the close be a clean FIN.
-                let downstream = DownstreamInfo {
-                    remote: peer,
-                    is_tls: true,
-                };
-                let _ = run_terminal_filter(
-                    tls_stream,
-                    filter,
-                    snapshot,
-                    RunTerminalFilterCtx {
-                        registry: &registry,
-                        shutdown,
-                        drain,
-                        name: &name,
-                        downstream,
-                        codec,
-                        request_headers_timeout,
-                    },
-                )
-                .await;
+        (true, Some(factory)) => {
+            match handshake_with_deadline(tls_handshake_deadline(matched), factory.wrap(stream))
+                .await
+            {
+                // Rust note: the outer `Option` is "did the deadline expire"
+                // (`None`); the inner `Result` is the handshake's own outcome.
+                None => {
+                    // Returning drops the stream and, with it, the admission slot.
+                    tracing::debug!(listener = %name, peer = %peer, "TLS handshake timed out; closing connection");
+                }
+                Some(Ok(tls_stream)) => {
+                    // An explicit `codec_type` (`Http1`/`Http2`) is
+                    // unconditional -- the operator has said what the client
+                    // speaks, so there's nothing to negotiate. Only `Auto` (the
+                    // Envoy default) falls back to reading what ALPN actually
+                    // negotiated -- see `downstream_codec_for_alpn`'s doc comment
+                    // for why that has to happen *here* (post-handshake) rather
+                    // than be assumed from config.
+                    let codec = match codec_type {
+                        CodecType::Http1 => DownstreamCodec::Http1,
+                        CodecType::Http2 => DownstreamCodec::Http2,
+                        CodecType::Auto => downstream_codec_for_alpn(&tls_stream),
+                    };
+                    // Can't `reset` (SO_LINGER) a `TlsStream` the way we can a
+                    // bare `TcpStream` -- `run_terminal_filter` hands the stream
+                    // back on the no-op paths so the *unimplemented*/no-filter
+                    // cases just drop it and let the close be a clean FIN.
+                    let downstream = DownstreamInfo {
+                        remote: peer,
+                        is_tls: true,
+                    };
+                    let _ = run_terminal_filter(
+                        tls_stream,
+                        filter,
+                        snapshot,
+                        RunTerminalFilterCtx {
+                            registry: &registry,
+                            shutdown,
+                            drain,
+                            name: &name,
+                            downstream,
+                            codec,
+                            request_headers_timeout,
+                        },
+                    )
+                    .await;
+                }
+                Some(Err(err)) => {
+                    tracing::debug!(listener = %name, peer = %peer, error = %err, "TLS handshake failed; dropping connection");
+                }
             }
-            Err(err) => {
-                tracing::debug!(listener = %name, peer = %peer, error = %err, "TLS handshake failed; dropping connection");
-            }
-        },
+        }
         (true, None) => {
             // The matched chain needs TLS termination but no factory is
             // available (a runtime rebuild failed -- see `spawn_accept_loop`);
@@ -2283,6 +2338,7 @@ mod tests {
             name: name.to_string(),
             address: addr,
             filter_chains: vec![FilterChainSpec {
+                transport_socket_connect_timeout: None,
                 name: Some("default".to_string()),
                 match_criteria: FilterChainMatch::default(),
                 transport_socket: None,
@@ -2413,6 +2469,7 @@ mod tests {
             name: name.to_string(),
             address: addr,
             filter_chains: vec![FilterChainSpec {
+                transport_socket_connect_timeout: None,
                 name: Some("sni-only".to_string()),
                 match_criteria: FilterChainMatch {
                     server_names: vec!["example.com".to_string()],
@@ -3118,6 +3175,7 @@ mod tests {
                 proxy_config::ir::TlsInspectorConfig::default(),
             )],
             filter_chains: vec![FilterChainSpec {
+                transport_socket_connect_timeout: None,
                 name: Some("tls".to_string()),
                 match_criteria: FilterChainMatch::default(),
                 transport_socket: Some(downstream_tls_spec(&cert, &key)),
@@ -3147,6 +3205,7 @@ mod tests {
             )],
             filter_chains: vec![
                 FilterChainSpec {
+                    transport_socket_connect_timeout: None,
                     name: Some("a".to_string()),
                     match_criteria: FilterChainMatch {
                         server_names: vec![host_a.to_string()],
@@ -3156,6 +3215,7 @@ mod tests {
                     filters: vec![tcp_proxy_filter("unused")],
                 },
                 FilterChainSpec {
+                    transport_socket_connect_timeout: None,
                     name: Some("b".to_string()),
                     match_criteria: FilterChainMatch {
                         server_names: vec![host_b.to_string()],
@@ -3270,6 +3330,7 @@ mod tests {
             tls_spec.alpn_protocols = vec!["h2".to_string(), "http/1.1".to_string()];
             let listener_ir = IrListenerConfig {
                 filter_chains: vec![FilterChainSpec {
+                    transport_socket_connect_timeout: None,
                     name: Some("tls-hcm".to_string()),
                     match_criteria: FilterChainMatch::default(),
                     transport_socket: Some(tls_spec),
@@ -3587,6 +3648,139 @@ mod tests {
 
             harness.shutdown().await;
         });
+    }
+
+    /// A match-all TLS listener on `addr` with the handshake deadline
+    /// `timeout`, and a connection cap of one. The `tls_inspector` is dropped
+    /// so a client that sends nothing stalls in the handshake itself.
+    fn capped_tls_snapshot(
+        addr: SocketAddr,
+        upstream_addr: SocketAddr,
+        timeout: Option<Duration>,
+    ) -> Arc<ConfigSnapshot> {
+        let (mut listener_ir, _cert) = tls_chain_listener("l1", addr, "server.example.com", "up");
+        listener_ir.listener_filters.clear();
+        listener_ir.filter_chains[0].transport_socket_connect_timeout = timeout;
+        let cluster = static_cluster("up", upstream_addr);
+        Arc::new(ConfigSnapshot {
+            listeners: HashMap::from([(listener_ir.name.clone(), Arc::new(listener_ir))]),
+            clusters: HashMap::from([(cluster.name.clone(), Arc::new(cluster))]),
+            version: SnapshotVersion(1),
+            max_downstream_connections: Some(1),
+            ..Default::default()
+        })
+    }
+
+    /// True once the peer has closed `stream` (EOF or reset), bounded so a
+    /// connection that is never closed fails the test instead of hanging it.
+    async fn closed_within(stream: &mut TcpStream, bound: Duration) -> bool {
+        let mut buf = [0u8; 8];
+        match tokio::time::timeout(bound, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => true,
+            Ok(Ok(_)) | Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn stalled_tls_handshake_is_closed_at_the_deadline_and_frees_the_slot() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let harness = spawn_manager(capped_tls_snapshot(
+                addr,
+                upstream_addr,
+                Some(Duration::from_secs(1)),
+            ))
+            .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // A client that connects and never sends a byte holds the only slot.
+            let mut stalled = TcpStream::connect(addr).await.expect("connect");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // The cap is full, so a second connection is closed on accept.
+            let mut overflow = TcpStream::connect(addr).await.expect("connect");
+            assert!(
+                closed_within(&mut overflow, Duration::from_millis(500)).await,
+                "the second connection should be refused while the first holds the slot"
+            );
+
+            // The proxy, not the client, ends the stalled handshake.
+            assert!(
+                closed_within(&mut stalled, Duration::from_secs(5)).await,
+                "a stalled TLS handshake must be closed by the handshake deadline"
+            );
+
+            // The slot is free again: a real TLS client completes a handshake.
+            let tcp = TcpStream::connect(addr).await.expect("connect");
+            let client = client_factory_with_sni("server.example.com");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.wrap(tcp, "server.example.com"),
+            )
+            .await
+            .expect("handshake should not stall")
+            .expect("TLS handshake should complete after the slot is freed");
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn handshake_deadline_does_not_apply_after_the_handshake_completes() {
+        run_local(async {
+            let port = free_port().await;
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let upstream_addr = spawn_holding_upstream().await;
+            let harness = spawn_manager(capped_tls_snapshot(
+                addr,
+                upstream_addr,
+                Some(Duration::from_millis(300)),
+            ))
+            .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let tcp = TcpStream::connect(addr).await.expect("connect");
+            let client = client_factory_with_sni("server.example.com");
+            let mut tls = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.wrap(tcp, "server.example.com"),
+            )
+            .await
+            .expect("handshake should not stall")
+            .expect("TLS handshake should complete");
+
+            // Stay connected well past the handshake deadline: the open
+            // session must not be cut by it.
+            let mut buf = [0u8; 8];
+            let held = tokio::time::timeout(Duration::from_millis(900), tls.read(&mut buf)).await;
+            assert!(
+                held.is_err(),
+                "a completed handshake must outlive the handshake deadline, got {held:?}"
+            );
+
+            harness.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn handshake_deadline_defaults_when_unset_and_zero_disables_it() {
+        let mut chain = FilterChainSpec {
+            transport_socket_connect_timeout: None,
+            name: None,
+            match_criteria: FilterChainMatch::default(),
+            transport_socket: None,
+            filters: vec![],
+        };
+        assert_eq!(
+            tls_handshake_deadline(&chain),
+            Some(DEFAULT_TLS_HANDSHAKE_TIMEOUT)
+        );
+        chain.transport_socket_connect_timeout = Some(Duration::from_secs(3));
+        assert_eq!(tls_handshake_deadline(&chain), Some(Duration::from_secs(3)));
+        chain.transport_socket_connect_timeout = Some(Duration::ZERO);
+        assert_eq!(tls_handshake_deadline(&chain), None);
     }
 
     #[test]

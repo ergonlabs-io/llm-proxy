@@ -351,6 +351,7 @@ mod tests {
 
     fn chain(name: &str, m: FilterChainMatch) -> FilterChainSpec {
         FilterChainSpec {
+            transport_socket_connect_timeout: None,
             name: Some(name.to_string()),
             match_criteria: m,
             transport_socket: None,

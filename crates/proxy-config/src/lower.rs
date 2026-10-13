@@ -386,7 +386,13 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         ],
         "envoy.config.listener.v3.ListenerFilter" => &["name", "typed_config"],
         "envoy.config.listener.v3.FilterChain" => {
-            &["name", "filter_chain_match", "filters", "transport_socket"]
+            &[
+            "name",
+            "filter_chain_match",
+            "filters",
+            "transport_socket",
+            "transport_socket_connect_timeout",
+        ]
         }
         "envoy.config.listener.v3.FilterChainMatch" => &[
             "destination_port",
@@ -1686,6 +1692,14 @@ fn convert_filter_chain(
         .map(|ts| convert_downstream_tls(ts, &format!("{path}.transport_socket")))
         .transpose()?;
 
+    // Unset stays `None` (the listener applies its default); an explicit
+    // `0s` is kept as `Some(ZERO)` so "no deadline" is a deliberate choice.
+    let transport_socket_connect_timeout = fc
+        .transport_socket_connect_timeout
+        .as_ref()
+        .map(|d| to_std_duration(d, &format!("{path}.transport_socket_connect_timeout")))
+        .transpose()?;
+
     if fc.filters.is_empty() {
         return Err(invalid(
             format!("{path}.filters"),
@@ -1708,6 +1722,7 @@ fn convert_filter_chain(
         name: (!fc.name.is_empty()).then(|| fc.name.clone()),
         match_criteria,
         transport_socket,
+        transport_socket_connect_timeout,
         filters,
     })
 }
