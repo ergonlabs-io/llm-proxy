@@ -109,8 +109,8 @@
 //! ```
 //!
 //! `Snapshot` (private) is an immutable, versioned bundle of *everything* a
-//! reader needs: the per-handle instrument metadata (`resolved`,
-//! `resolved_attrs`, `resolved_histograms`, `resolved_histogram_attrs`) and
+//! reader needs: the per-slot series metadata (`counters`, `histograms`:
+//! instrument, attributes, generation) and
 //! the shard storage itself. Bundling both together means a `Snapshot` a
 //! worker loads is always internally consistent — it can never see a new
 //! handle's metadata without also seeing that handle's shard slot, or vice
@@ -174,8 +174,8 @@
 //! - **Counters are worker-major and block-chunked**
 //!   (`counter_shards: Vec<Vec<Arc<Vec<AtomicU64>>>>`, indexed
 //!   `[worker][block]`, each block exactly [`COUNTER_BLOCK_LEN`] slots wide).
-//!   A [`Handle`] indexes as `block = handle.0 / COUNTER_BLOCK_LEN`,
-//!   `slot = handle.0 % COUNTER_BLOCK_LEN`. Growing by one handle clones the
+//!   A [`Handle`] indexes as `block = index / COUNTER_BLOCK_LEN`,
+//!   `slot = index % COUNTER_BLOCK_LEN`. Growing by one handle clones the
 //!   outer `Vec<Vec<Arc<..>>>` (copying only `Arc` pointers — every existing
 //!   `AtomicU64` stays at the exact address it was at, still receiving
 //!   increments from any thread holding the old `Snapshot`) and, only when
@@ -311,8 +311,8 @@
 //! This is the same argument as the `Registry`/`StatsControl` type split
 //! above: making a mistake *impossible* is strictly better than making it
 //! *loud*, when the type system can carry the whole cost at zero runtime
-//! price (a `HistogramHandle` is exactly as cheap as a `Handle` — one
-//! `usize`). A
+//! price (a `HistogramHandle` is exactly as cheap as a `Handle` — an index
+//! and a generation, 8 bytes). A
 //! shared handle space was the other defensible option (it would mean one
 //! index space and a runtime `kind` check inside `incr`/`observe`), but it
 //! trades a compile-time guarantee for a runtime one for no benefit, since
@@ -1262,14 +1262,22 @@ pub struct WorkerId(pub usize);
 /// An opaque handle to one resolved `(counter/up-down-counter instrument,
 /// attribute set)` pair. Returned by [`StatsControl::resolve`]; carries no
 /// name, no attributes — that is the point (see the module doc's Decision
-/// 1). The inner `usize` is private to this module: outside it, a `Handle`
-/// can only be obtained from `resolve` and only used by handing it back to
+/// 1). Its fields are private to this module: outside it, a `Handle` can only
+/// be obtained from `resolve` and only used by handing it back to
 /// `incr`/`add`/`value`.
+///
+/// `index` names a slot and `gen` the series living in it. A handle reads
+/// and writes its slot only while the slot's generation still matches; a
+/// stale one writes nothing and reads zero. [`Registry::is_current`] tells a
+/// holder whether to re-resolve.
 ///
 /// **Not the same type as [`HistogramHandle`]** — see the module doc's
 /// "handle-space question" section for why they are deliberately distinct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Handle(usize);
+pub struct Handle {
+    index: u32,
+    gen: u32,
+}
 
 /// An opaque handle to one resolved `(histogram instrument, attribute set)`
 /// pair. Returned by [`StatsControl::resolve_histogram`]; used only with
@@ -1302,9 +1310,18 @@ pub struct Handle(usize);
 /// ```
 ///
 /// See the module doc's "handle-space question" section for why this was
-/// chosen over a shared index space with a runtime `kind` check.
+/// chosen over a shared index space with a runtime `kind` check. Carries a
+/// generation for the same reason [`Handle`] does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HistogramHandle(usize);
+pub struct HistogramHandle {
+    index: u32,
+    gen: u32,
+}
+
+/// The slot index a new series gets when it is appended at `len`.
+fn next_index(len: usize) -> u32 {
+    u32::try_from(len).expect("stats: more than u32::MAX series of one kind")
+}
 
 /// Dedup key for [`Registry::resolve`]/[`Registry::resolve_histogram`]: an
 /// instrument's name plus its attributes, sorted into a stable order. Named
@@ -1415,8 +1432,8 @@ pub struct HistogramSnapshot {
 
 /// The immutable, versioned bundle [`Registry::published`] hands out to every
 /// reader — see the module doc's "Resolution survives a config swap" section.
-/// Metadata (`resolved`,
-/// `resolved_attrs`, ...) and shard storage live in the same struct
+/// Metadata (`counters`,
+/// `histograms`) and shard storage live in the same struct
 /// deliberately: a `Snapshot` a worker `load()`s always describes one
 /// consistent generation, so it can never show a new handle's metadata
 /// without also showing that handle's freshly-grown shard slot, or vice
@@ -1430,34 +1447,42 @@ pub struct HistogramSnapshot {
 /// address afterwards, still receiving increments from any thread still
 /// holding the *old* `Snapshot`.
 struct Snapshot {
-    /// Indexed by `Handle`'s inner `usize`. Kept so `incr`/`add` can look up
-    /// an instrument's kind (to enforce "Counters don't decrement") and
-    /// `envoy_render` can look up name/unit/attrs for rendering.
-    resolved: Vec<&'static Instrument>,
-    /// Indexed in lockstep with `resolved`: the sorted `(key, value)` attrs
-    /// each handle was resolved with. `envoy_render` reads this to expand
-    /// attribute values into Envoy `/stats` name segments (e.g. a
-    /// `status_class` attribute becomes `..._2xx`/`..._5xx`) -- see
-    /// [`Registry::counters`].
-    resolved_attrs: Vec<Vec<(String, String)>>,
+    /// Indexed by [`Handle`]'s `index`. Kept so `incr`/`add` can check a
+    /// handle's generation and look up an instrument's kind (to enforce
+    /// "Counters don't decrement"), and `envoy_render` can look up
+    /// name/unit/attrs for rendering.
+    counters: Vec<SeriesMeta>,
     /// `counter_shards[worker.0][block]` is that worker's block for that
     /// block index; `counter_shards[worker.0][block][slot]` is one
-    /// [`Handle`]'s `AtomicU64`, where `block = handle.0 /
-    /// COUNTER_BLOCK_LEN` and `slot = handle.0 % COUNTER_BLOCK_LEN` -- see
-    /// the module doc's "Growth must not move or copy a live atomic" section
-    /// for why counters are block-chunked rather than one `Arc` per slot.
+    /// [`Handle`]'s `AtomicU64`, where `block = index / COUNTER_BLOCK_LEN`
+    /// and `slot = index % COUNTER_BLOCK_LEN` -- see the module doc's
+    /// "Growth must not move or copy a live atomic" section for why counters
+    /// are block-chunked rather than one `Arc` per slot.
     counter_shards: Vec<Vec<Arc<Vec<AtomicU64>>>>,
-    /// Same role as `resolved`, for [`HistogramHandle`]s. A separate `Vec`
+    /// Same role as `counters`, for [`HistogramHandle`]s. A separate `Vec`
     /// in its own index space — see the module doc's "handle-space
     /// question".
-    resolved_histograms: Vec<&'static Instrument>,
-    /// Same role as `resolved_attrs`, for [`HistogramHandle`]s.
-    resolved_histogram_attrs: Vec<Vec<(String, String)>>,
-    /// `histogram_shards[worker.0][handle.0]` is that worker's
-    /// [`HistogramShard`] for that histogram handle -- one `Arc` per
-    /// `(worker, handle)` pair, unblocked (see the module doc for why
+    histograms: Vec<SeriesMeta>,
+    /// `histogram_shards[worker.0][index]` is that worker's
+    /// [`HistogramShard`] for that histogram slot -- one `Arc` per
+    /// `(worker, slot)` pair, unblocked (see the module doc for why
     /// histograms don't share the counter's block scheme).
     histogram_shards: Vec<Vec<Arc<HistogramShard>>>,
+}
+
+/// One slot's metadata in a [`Snapshot`].
+#[derive(Clone)]
+struct SeriesMeta {
+    instrument: &'static Instrument,
+    /// The sorted `(key, value)` attrs the series was resolved with.
+    /// `envoy_render` reads these to expand attribute values into Envoy
+    /// `/stats` name segments (e.g. a `status_class` attribute becomes
+    /// `..._2xx`/`..._5xx`) -- see [`Registry::counters`].
+    attrs: Vec<(String, String)>,
+    /// The generation of the series in this slot. Plain data, not an atomic:
+    /// a writer checks it in the same snapshot whose storage it then writes,
+    /// so the check and the write always describe one published view.
+    gen: u32,
 }
 
 impl Snapshot {
@@ -1465,8 +1490,7 @@ impl Snapshot {
     /// either kind resolved yet.
     fn empty(num_workers: usize) -> Self {
         Self {
-            resolved: Vec::new(),
-            resolved_attrs: Vec::new(),
+            counters: Vec::new(),
             // Rust note: `vec![x; n]` needs `x: Clone`. `Vec<Arc<..>>` is
             // `Clone` even though the `Arc`'s payload (`Vec<AtomicU64>` /
             // `HistogramShard`) is not, because `Arc<T>: Clone` holds for
@@ -1474,11 +1498,32 @@ impl Snapshot {
             // touches what it points to. That is exactly the property the
             // rest of this module leans on for lock-free growth.
             counter_shards: vec![Vec::new(); num_workers],
-            resolved_histograms: Vec::new(),
-            resolved_histogram_attrs: Vec::new(),
+            histograms: Vec::new(),
             histogram_shards: vec![Vec::new(); num_workers],
         }
     }
+
+    /// The metadata of the counter series `handle` names, or `None` if the
+    /// handle is stale.
+    fn counter(&self, handle: Handle) -> Option<&SeriesMeta> {
+        self.counters
+            .get(handle.index as usize)
+            .filter(|meta| meta.gen == handle.gen)
+    }
+
+    /// The histogram counterpart of [`Self::counter`].
+    fn histogram(&self, handle: HistogramHandle) -> Option<&SeriesMeta> {
+        self.histograms
+            .get(handle.index as usize)
+            .filter(|meta| meta.gen == handle.gen)
+    }
+}
+
+/// `(block, slot)` of counter slot `index` -- see the module doc's "Growth
+/// must not move or copy a live atomic".
+fn counter_position(index: u32) -> (usize, usize) {
+    let index = index as usize;
+    (index / COUNTER_BLOCK_LEN, index % COUNTER_BLOCK_LEN)
 }
 
 /// State behind [`Registry::control`]'s `Mutex`: the dedup maps resolution
@@ -1697,6 +1742,19 @@ impl Registry {
         self.published.load().counter_shards.len()
     }
 
+    /// Whether `handle` still names a live slot's series. A holder that keeps
+    /// handles across config changes (a [`HandleMemo`], a per-name handle
+    /// table) re-resolves a handle for which this is `false`; recording to it
+    /// would be dropped.
+    pub fn is_current(&self, handle: Handle) -> bool {
+        self.published.load().counter(handle).is_some()
+    }
+
+    /// The histogram counterpart of [`Self::is_current`].
+    pub fn is_current_histogram(&self, handle: HistogramHandle) -> bool {
+        self.published.load().histogram(handle).is_some()
+    }
+
     /// Control side only -- reachable exclusively through
     /// [`StatsControl::resolve`] (defined in this same module; see the
     /// module doc's "Resolution survives a config swap" section for why this method itself is not
@@ -1749,12 +1807,17 @@ impl Registry {
         }
 
         let old = self.published.load();
-        let handle = Handle(old.resolved.len());
+        let handle = Handle {
+            index: next_index(old.counters.len()),
+            gen: 0,
+        };
 
-        let mut resolved = old.resolved.clone();
-        resolved.push(instrument);
-        let mut resolved_attrs = old.resolved_attrs.clone();
-        resolved_attrs.push(key.1.clone());
+        let mut counters = old.counters.clone();
+        counters.push(SeriesMeta {
+            instrument,
+            attrs: key.1.clone(),
+            gen: handle.gen,
+        });
 
         // Growth: clone the outer Vec<Vec<Arc<..>>> (copies only Arc
         // pointers -- every existing AtomicU64 stays exactly where it is,
@@ -1766,7 +1829,7 @@ impl Registry {
         // instead of sharing the same atomics would lose any increment that
         // landed between the read and the swap, below.
         let mut counter_shards = old.counter_shards.clone();
-        if handle.0.is_multiple_of(COUNTER_BLOCK_LEN) {
+        if (handle.index as usize).is_multiple_of(COUNTER_BLOCK_LEN) {
             for worker_blocks in &mut counter_shards {
                 worker_blocks.push(Arc::new(
                     (0..COUNTER_BLOCK_LEN).map(|_| AtomicU64::new(0)).collect(),
@@ -1778,11 +1841,9 @@ impl Registry {
             *control.live_counts.entry(instrument.name).or_default() += 1;
         }
         self.published.store(Arc::new(Snapshot {
-            resolved,
-            resolved_attrs,
+            counters,
             counter_shards,
-            resolved_histograms: old.resolved_histograms.clone(),
-            resolved_histogram_attrs: old.resolved_histogram_attrs.clone(),
+            histograms: old.histograms.clone(),
             histogram_shards: old.histogram_shards.clone(),
         }));
         control.lookup.insert(key, handle);
@@ -1845,12 +1906,17 @@ impl Registry {
         }
 
         let old = self.published.load();
-        let handle = HistogramHandle(old.resolved_histograms.len());
+        let handle = HistogramHandle {
+            index: next_index(old.histograms.len()),
+            gen: 0,
+        };
 
-        let mut resolved_histograms = old.resolved_histograms.clone();
-        resolved_histograms.push(instrument);
-        let mut resolved_histogram_attrs = old.resolved_histogram_attrs.clone();
-        resolved_histogram_attrs.push(key.1.clone());
+        let mut histograms = old.histograms.clone();
+        histograms.push(SeriesMeta {
+            instrument,
+            attrs: key.1.clone(),
+            gen: handle.gen,
+        });
 
         // Nineteen boundaries means twenty slots -- see the module doc's
         // "overflow bucket" section. One freshly-allocated
@@ -1866,11 +1932,9 @@ impl Registry {
             *control.live_counts.entry(instrument.name).or_default() += 1;
         }
         self.published.store(Arc::new(Snapshot {
-            resolved: old.resolved.clone(),
-            resolved_attrs: old.resolved_attrs.clone(),
+            counters: old.counters.clone(),
             counter_shards: old.counter_shards.clone(),
-            resolved_histograms,
-            resolved_histogram_attrs,
+            histograms,
             histogram_shards,
         }));
         control.histogram_lookup.insert(key, handle);
@@ -2130,14 +2194,9 @@ impl Registry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = self.published.load();
         let mut counts: HashMap<&'static str, usize> = HashMap::new();
-        let counters = state.resolved.iter().zip(&state.resolved_attrs);
-        let histograms = state
-            .resolved_histograms
-            .iter()
-            .zip(&state.resolved_histogram_attrs);
-        for (instrument, attrs) in counters.chain(histograms) {
-            if scope.is_live(attrs) {
-                *counts.entry(instrument.name).or_default() += 1;
+        for meta in state.counters.iter().chain(&state.histograms) {
+            if scope.is_live(&meta.attrs) {
+                *counts.entry(meta.instrument.name).or_default() += 1;
             }
         }
         control.live_counts = counts;
@@ -2186,12 +2245,16 @@ impl Registry {
     /// [`InstrumentKind::UpDownCounter`] handles. See [`Self::add`] for the
     /// signed-delta counterpart `UpDownCounter` handles also get.
     ///
+    /// A stale `handle` (see [`Handle`]) records nothing.
+    ///
     /// Panics if `worker` is out of range for this registry's `num_workers`
     /// — a config-time invariant, not something a real request can trigger.
     pub fn incr(&self, worker: WorkerId, handle: Handle, delta: u64) {
         let state = self.published.load();
-        let block = handle.0 / COUNTER_BLOCK_LEN;
-        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        if state.counter(handle).is_none() {
+            return;
+        }
+        let (block, slot) = counter_position(handle.index);
         state.counter_shards[worker.0][block][slot].fetch_add(delta, Ordering::Relaxed);
     }
 
@@ -2207,17 +2270,22 @@ impl Registry {
     /// as the true running total never leaves `u64`'s range, which holds for
     /// every legitimate use of an `UpDownCounter` here (e.g. "connections
     /// currently open" never truly goes negative).
+    ///
+    /// A stale `handle` records nothing, and is checked before the kind: its
+    /// slot may now hold a series of another instrument.
     pub fn add(&self, worker: WorkerId, handle: Handle, delta: i64) {
         let state = self.published.load();
-        let instrument = state.resolved[handle.0];
+        let Some(meta) = state.counter(handle) else {
+            return;
+        };
+        let instrument = meta.instrument;
         assert_eq!(
             instrument.kind,
             InstrumentKind::UpDownCounter,
             "stats::Registry::add: {} is a Counter, which has no decrement -- use incr()",
             instrument.name
         );
-        let block = handle.0 / COUNTER_BLOCK_LEN;
-        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        let (block, slot) = counter_position(handle.index);
         state.counter_shards[worker.0][block][slot].fetch_add(delta as u64, Ordering::Relaxed);
     }
 
@@ -2227,11 +2295,13 @@ impl Registry {
     ///
     /// `Relaxed` load, same justification as `incr`/`add`: a scrape must not
     /// be a fence on the request path, and observing a slightly-stale value
-    /// mid-increment is fine for a counter.
+    /// mid-increment is fine for a counter. A stale `handle` reads zero.
     pub fn value(&self, handle: Handle) -> u64 {
         let state = self.published.load();
-        let block = handle.0 / COUNTER_BLOCK_LEN;
-        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        if state.counter(handle).is_none() {
+            return 0;
+        }
+        let (block, slot) = counter_position(handle.index);
         state
             .counter_shards
             .iter()
@@ -2246,8 +2316,7 @@ impl Registry {
     #[cfg(test)]
     pub(crate) fn shard_values_for_debugging(&self, handle: Handle) -> Vec<u64> {
         let state = self.published.load();
-        let block = handle.0 / COUNTER_BLOCK_LEN;
-        let slot = handle.0 % COUNTER_BLOCK_LEN;
+        let (block, slot) = counter_position(handle.index);
         state
             .counter_shards
             .iter()
@@ -2278,7 +2347,7 @@ impl Registry {
     ) -> impl Iterator<Item = (&'static Instrument, Vec<(String, String)>, u64)> {
         let state = self.published.load_full();
         let live = self.live.load_full();
-        let n = state.resolved.len();
+        let n = state.counters.len();
         // Hidden series (see `LiveScope`) are skipped here and nowhere else:
         // `value` on a handle still reads them, since a worker may hold one.
         // Rust note: two closures each need the snapshot, and `move` gives the
@@ -2286,7 +2355,7 @@ impl Registry {
         // refcount bump).
         let for_filter = Arc::clone(&state);
         (0..n)
-            .filter(move |&i| live.is_live(&for_filter.resolved_attrs[i]))
+            .filter(move |&i| live.is_live(&for_filter.counters[i].attrs))
             .map(move |i| {
                 let block = i / COUNTER_BLOCK_LEN;
                 let slot = i % COUNTER_BLOCK_LEN;
@@ -2295,7 +2364,8 @@ impl Registry {
                     .iter()
                     .map(|worker_blocks| worker_blocks[block][slot].load(Ordering::Relaxed))
                     .fold(0u64, u64::wrapping_add);
-                (state.resolved[i], state.resolved_attrs[i].clone(), value)
+                let meta = &state.counters[i];
+                (meta.instrument, meta.attrs.clone(), value)
             })
     }
 
@@ -2310,11 +2380,15 @@ impl Registry {
     /// or the overflow bucket (index `boundaries.len()`) if `value` exceeds
     /// every boundary.
     ///
+    /// A stale `handle` records nothing.
+    ///
     /// Panics if `worker` is out of range, same as `incr`/`add`.
     pub fn observe(&self, worker: WorkerId, handle: HistogramHandle, value: f64) {
         let state = self.published.load();
-        let instrument = state.resolved_histograms[handle.0];
-        let boundaries = instrument.buckets.expect(
+        let Some(meta) = state.histogram(handle) else {
+            return;
+        };
+        let boundaries = meta.instrument.buckets.expect(
             "stats::Registry::observe: instrument has no bucket boundaries -- \
              resolve_histogram should have rejected this at resolve time",
         );
@@ -2323,7 +2397,7 @@ impl Registry {
             .position(|&boundary| value <= boundary)
             .unwrap_or(boundaries.len());
 
-        let shard = &state.histogram_shards[worker.0][handle.0];
+        let shard = &state.histogram_shards[worker.0][handle.index as usize];
         shard.bucket_counts[bucket_index].fetch_add(1, Ordering::Relaxed);
         atomic_add_f64(&shard.sum_bits, value);
         shard.count.fetch_add(1, Ordering::Relaxed);
@@ -2332,10 +2406,19 @@ impl Registry {
     /// Summed across every worker shard. **The only read** for histogram
     /// data. The unsummed per-shard view, `histogram_shard_snapshots_for_debugging`,
     /// is `#[cfg(test)]` and crate-private. `Relaxed` loads throughout, same
-    /// justification as `value`.
+    /// justification as `value`. A stale `handle` reads as empty: no buckets,
+    /// no observations.
     pub fn histogram_snapshot(&self, handle: HistogramHandle) -> HistogramSnapshot {
         let state = self.published.load();
-        let num_buckets = state.resolved_histograms[handle.0]
+        let Some(meta) = state.histogram(handle) else {
+            return HistogramSnapshot {
+                bucket_counts: Vec::new(),
+                sum: 0.0,
+                count: 0,
+            };
+        };
+        let num_buckets = meta
+            .instrument
             .buckets
             .expect("stats::Registry::histogram_snapshot: instrument has no bucket boundaries")
             .len()
@@ -2345,7 +2428,7 @@ impl Registry {
         let mut sum = 0.0f64;
         let mut count = 0u64;
         for worker_shards in &state.histogram_shards {
-            let shard = &worker_shards[handle.0];
+            let shard = &worker_shards[handle.index as usize];
             for (i, bucket) in shard.bucket_counts.iter().enumerate() {
                 bucket_counts[i] = bucket_counts[i].wrapping_add(bucket.load(Ordering::Relaxed));
             }
@@ -2371,7 +2454,7 @@ impl Registry {
             .histogram_shards
             .iter()
             .map(|worker_shards| {
-                let shard = &worker_shards[handle.0];
+                let shard = &worker_shards[handle.index as usize];
                 HistogramSnapshot {
                     bucket_counts: shard
                         .bucket_counts
@@ -2399,15 +2482,19 @@ impl Registry {
     ) -> impl Iterator<Item = (HistogramHandle, &'static Instrument, Vec<(String, String)>)> {
         let state = self.published.load_full();
         let live = self.live.load_full();
-        let n = state.resolved_histograms.len();
+        let n = state.histograms.len();
         let for_filter = Arc::clone(&state);
         (0..n)
-            .filter(move |&i| live.is_live(&for_filter.resolved_histogram_attrs[i]))
+            .filter(move |&i| live.is_live(&for_filter.histograms[i].attrs))
             .map(move |i| {
+                let meta = &state.histograms[i];
                 (
-                    HistogramHandle(i),
-                    state.resolved_histograms[i],
-                    state.resolved_histogram_attrs[i].clone(),
+                    HistogramHandle {
+                        index: next_index(i),
+                        gen: meta.gen,
+                    },
+                    meta.instrument,
+                    meta.attrs.clone(),
                 )
             })
     }
@@ -2451,8 +2538,13 @@ impl Registry {
         }
 
         let state = self.published.load();
-        let instrument = state.resolved_histograms[handle.0];
-        let boundaries = instrument
+        // `count > 0` above means the handle was current a moment ago; a
+        // retirement in between reads as empty, like a stale handle.
+        let Some(meta) = state.histogram(handle) else {
+            return 0.0;
+        };
+        let boundaries = meta
+            .instrument
             .buckets
             .expect("stats::Registry::percentile: instrument has no bucket boundaries");
 
@@ -3539,9 +3631,9 @@ mod tests {
         registry
             .published
             .load()
-            .resolved
+            .counters
             .iter()
-            .filter(|i| i.name == instruments::TENANT_CREDENTIAL_REQUESTS.name)
+            .filter(|meta| meta.instrument.name == instruments::TENANT_CREDENTIAL_REQUESTS.name)
             .count()
     }
 
