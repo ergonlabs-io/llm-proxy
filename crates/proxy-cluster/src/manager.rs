@@ -861,6 +861,17 @@ impl ClusterManager {
         })
     }
 
+    /// Whether the currently published cluster `name` has a host at `addr`.
+    /// `false` for an unknown cluster. Reads the live registry, not a
+    /// generation snapshot, so the upstream pool sees DNS and EDS membership
+    /// changes and drains connections to removed endpoints as Envoy does.
+    pub fn has_host(&self, name: &str, addr: SocketAddr) -> bool {
+        self.clusters
+            .load()
+            .get(name)
+            .is_some_and(|managed| managed.host_set.load().contains_address(addr))
+    }
+
     /// Whether a cluster's first resolution/EDS update has landed (or it was
     /// force-initialized, see [`Self::force_initialize`]). `false` for an
     /// unknown cluster name.
@@ -1589,6 +1600,33 @@ mod tests {
             vec![SocketAddr::new(IpAddr::from([10, 0, 0, 5]), 80)]
         );
         assert!(manager.is_initialized("eds-svc"));
+    }
+
+    /// The upstream pool's drain oracle: an endpoint EDS replaces stops
+    /// being a member at once, the replacement starts being one, and an
+    /// unknown cluster has no members.
+    #[tokio::test]
+    async fn has_host_follows_an_eds_replacement() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert("eds-svc".to_string(), cluster_config_eds("eds-svc"));
+        manager.update_from_snapshot(&snapshot).await;
+        let a = SocketAddr::new(IpAddr::from([10, 0, 0, 5]), 80);
+        let b = SocketAddr::new(IpAddr::from([10, 0, 0, 6]), 80);
+
+        manager
+            .accept_eds_update("eds-svc", &[endpoint("10.0.0.5", 80)])
+            .unwrap();
+        assert!(manager.has_host("eds-svc", a));
+        assert!(!manager.has_host("eds-svc", b));
+
+        manager
+            .accept_eds_update("eds-svc", &[endpoint("10.0.0.6", 80)])
+            .unwrap();
+        assert!(!manager.has_host("eds-svc", a), "replaced endpoint is gone");
+        assert!(manager.has_host("eds-svc", b));
+        assert!(!manager.has_host("no-such-cluster", b));
     }
 
     /// The admin seam must snapshot what EDS installed, including the

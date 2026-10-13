@@ -39,6 +39,13 @@ impl HostSet {
         Self { by_priority }
     }
 
+    /// Whether any priority level has a host at `addr`.
+    pub fn contains_address(&self, addr: SocketAddr) -> bool {
+        self.by_priority
+            .values()
+            .any(|hosts| hosts.iter().any(|h| h.address == addr))
+    }
+
     /// The member hosts of one priority level; empty slice if the priority
     /// has no members (or doesn't exist).
     pub fn hosts_for_priority(&self, priority: u32) -> &[Arc<Host>] {

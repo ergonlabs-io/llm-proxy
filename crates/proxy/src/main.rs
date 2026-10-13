@@ -2682,6 +2682,18 @@ async fn worker_main(
     secret_registry: Arc<SdsSecretRegistry>,
 ) {
     startup_gate.wait().await;
+    // The upstream pool's sweep closes idle connections to endpoints that
+    // left their cluster, so a replaced DNS or EDS endpoint does not hold
+    // `max_connections` slots until the idle timeout. The caches are
+    // per-worker thread locals, so each worker installs its own oracle.
+    {
+        let cluster_manager = Arc::clone(&cluster_manager);
+        proxy_http::upstream_pool::set_worker_membership(std::rc::Rc::new(
+            move |cluster: &str, addr: std::net::SocketAddr| {
+                cluster_manager.has_host(cluster, addr)
+            },
+        ));
+    }
     let registry = ConnectionRegistry::new();
     // Built fresh per worker -- `stats_registry`/
     // `stat_handles` are the SAME shared, config-scoped state every worker
