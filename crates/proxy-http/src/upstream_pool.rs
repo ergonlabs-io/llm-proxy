@@ -191,6 +191,34 @@ const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// reclaim does almost no work.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Answers "is `addr` still a host of `cluster`?" for the sweep. Supplied by
+/// whoever owns cluster membership (see [`UpstreamConnCache::set_membership`]).
+/// It runs inside the sweep, under the cache map's borrow, so it must be cheap
+/// and must not call back into the cache; loading the cluster's host set and
+/// looking the address up is the intended shape. A cluster the oracle does not
+/// know answers `false`: its connections are drained too.
+///
+/// Rust note: `Rc<dyn Fn(..)>` is a shared, type-erased closure. `dyn` hides the
+/// closure's concrete type so the cache need not be generic over it, and `Rc`
+/// (not `Arc`) because every cache is worker-local (ADR-0003).
+pub type MembershipOracle = Rc<dyn Fn(&str, SocketAddr) -> bool>;
+
+/// The oracle slot a cache and its sweep task share. `None` means no oracle was
+/// set, and the sweep then only reclaims closed and idle-expired connections.
+type Membership = Rc<RefCell<Option<MembershipOracle>>>;
+
+/// Has the oracle (if any) said `key`'s endpoint left its cluster? Envoy drains
+/// a host's connection pools when the host is removed; without this, an idle
+/// socket to a replaced endpoint would hold a slot of the cluster-wide
+/// `max_connections` budget for up to [`UPSTREAM_IDLE_TIMEOUT`] and could
+/// starve dials to its replacement.
+fn endpoint_removed(membership: &Membership, key: &ConnKey) -> bool {
+    membership
+        .borrow()
+        .as_ref()
+        .is_some_and(|is_member| !is_member(&key.cluster, key.addr))
+}
+
 /// What one sweep took out of a cache. The periodic task logs it when it is
 /// not empty, and the tests read it, so an operator and a test see the same
 /// account of what was reclaimed.
@@ -218,10 +246,12 @@ struct SweepReport {
 /// interval after the one that was just delivered.
 fn spawn_sweeper<S: 'static>(
     entries: &Rc<RefCell<S>>,
+    membership: &Membership,
     cache: &'static str,
-    sweep: fn(&RefCell<S>, Instant) -> SweepReport,
+    sweep: fn(&RefCell<S>, Instant, &Membership) -> SweepReport,
 ) {
     let entries: Weak<RefCell<S>> = Rc::downgrade(entries);
+    let membership = membership.clone();
     tokio::task::spawn_local(async move {
         let mut ticks = tokio::time::interval_at(Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -230,7 +260,7 @@ fn spawn_sweeper<S: 'static>(
             let Some(entries) = entries.upgrade() else {
                 return;
             };
-            let report = sweep(&entries, Instant::now());
+            let report = sweep(&entries, Instant::now(), &membership);
             if report != SweepReport::default() {
                 tracing::debug!(
                     cache,
@@ -565,6 +595,8 @@ pub struct UpstreamConnCache {
     /// anything to sweep, and which is also known to be inside a `LocalSet`
     /// (the handshake just spawned onto it).
     sweeper_started: Cell<bool>,
+    /// Cluster-membership oracle shared with the sweep task.
+    membership: Membership,
 }
 
 impl Default for UpstreamConnCache {
@@ -578,12 +610,22 @@ impl UpstreamConnCache {
         Self {
             slots: Rc::new(RefCell::new(HashMap::new())),
             sweeper_started: Cell::new(false),
+            membership: Membership::default(),
         }
+    }
+
+    /// Install the cluster-membership oracle the sweep consults. From the next
+    /// sweep on, every connection to an endpoint the oracle reports as no
+    /// longer in its cluster is dropped from the cache: idle ones close at
+    /// once, and one carrying a stream is left to finish it (the same
+    /// mechanism as [`Self::invalidate`]) and closes after.
+    pub fn set_membership(&self, oracle: MembershipOracle) {
+        *self.membership.borrow_mut() = Some(oracle);
     }
 
     fn ensure_sweeper(&self) {
         if !self.sweeper_started.replace(true) {
-            spawn_sweeper(&self.slots, "h2", sweep_h2);
+            spawn_sweeper(&self.slots, &self.membership, "h2", sweep_h2);
         }
     }
 
@@ -592,9 +634,10 @@ impl UpstreamConnCache {
     /// none exist yet, none has room under `SOFT_STREAMS_PER_CONNECTION`,
     /// or the set is empty because every prior occupant died (hazard 2:
     /// GOAWAY / upstream-initiated close). On a failed dial or handshake the
-    /// cache is left holding no *new* entry for `key` (hazard 4) -- the
-    /// caller's own retry, if any, or the next request simply tries again
-    /// rather than getting stuck behind a poisoned one. Never returns an
+    /// key's slot is removed again if it is still empty and no other checkout
+    /// holds it (hazard 4), so a failure leaves neither a poisoned entry nor
+    /// an empty one for the sweep to find -- the caller's own retry, if any,
+    /// or the next request simply tries again. Never returns an
     /// error purely because every existing connection is busy: once the set
     /// is at `MAX_CONNECTIONS_PER_KEY`, this hands out the least-loaded
     /// member anyway and lets hyper's own per-connection queue (see this
@@ -624,12 +667,17 @@ impl UpstreamConnCache {
         key: ConnKey,
         pool: &dyn HttpConnPool,
     ) -> Result<PooledSendRequest, PoolError> {
-        let slot: Slot = self
-            .slots
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(Vec::new())))
-            .clone();
+        // Look up first and clone the key only on a miss, so the common
+        // (cached) path allocates nothing.
+        let existing = self.slots.borrow().get(&key).cloned();
+        let slot: Slot = match existing {
+            Some(slot) => slot,
+            None => {
+                let slot: Slot = Rc::new(tokio::sync::Mutex::new(Vec::new()));
+                self.slots.borrow_mut().insert(key.clone(), slot.clone());
+                slot
+            }
+        };
 
         let mut conns = slot.lock().await;
 
@@ -657,22 +705,38 @@ impl UpstreamConnCache {
             // (`SlotIo`), so it is released when the socket is, not when this
             // cache happens to evict the entry. A failed handshake drops the
             // stream, and with it the slot, right here.
-            let io = SlotIo::new(pool.new_stream().await?);
-            // A handshake failure is folded into `PoolError::TlsHandshake`:
-            // there's no dedicated pool-error variant for "connected, but
-            // the h2 preface/settings exchange failed" (`PoolError` lives in
-            // `proxy-cluster`, out of scope this batch), and it belongs in
-            // the same "never got a usable connection" bucket the retry
-            // engine already treats a real TLS handshake failure as
-            // (`AttemptOutcome::from_pool_error`).
-            let sender = handshake_upstream_http2(io)
-                .await
-                .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))?;
+            // Started before the dial, not after it: a worker whose dials all
+            // fail must still sweep.
+            self.ensure_sweeper();
+            let dialed = async {
+                let io = SlotIo::new(pool.new_stream().await?);
+                // A handshake failure is folded into `PoolError::TlsHandshake`:
+                // there's no dedicated pool-error variant for "connected, but
+                // the h2 preface/settings exchange failed" (`PoolError` lives in
+                // `proxy-cluster`, out of scope this batch), and it belongs in
+                // the same "never got a usable connection" bucket the retry
+                // engine already treats a real TLS handshake failure as
+                // (`AttemptOutcome::from_pool_error`).
+                handshake_upstream_http2(io)
+                    .await
+                    .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))
+            }
+            .await;
+            let sender = match dialed {
+                Ok(sender) => sender,
+                Err(err) => {
+                    let unused = conns.is_empty();
+                    drop(conns);
+                    if unused {
+                        self.remove_unused_slot(&key, &slot);
+                    }
+                    return Err(err);
+                }
+            };
             conns.push(PooledConn {
                 sender,
                 activity: Rc::new(ConnActivity::new()),
             });
-            self.ensure_sweeper();
             let conn = conns.last().expect("just pushed one line above");
             return Ok(lease(conn));
         }
@@ -688,6 +752,24 @@ impl UpstreamConnCache {
             .min_by_key(|c| c.activity.in_flight.get())
             .expect("MAX_CONNECTIONS_PER_KEY > 0, so the set is non-empty by branch 2");
         Ok(lease(conn))
+    }
+
+    /// Take `key` out of the map after a failed dial, if `slot` is still the
+    /// map's entry for it, holds no connection, and nobody else has a handle to
+    /// it. A second checkout parked on the slot's lock holds a clone, so a
+    /// reference count above two (the map's plus the caller's) means someone
+    /// may be about to dial into it, and removing the key would strand what
+    /// they produce. The caller has already released the slot's lock, and this
+    /// is synchronous on a single-threaded worker, so nothing can slip in
+    /// between the check and the removal.
+    fn remove_unused_slot(&self, key: &ConnKey, slot: &Slot) {
+        let mut slots = self.slots.borrow_mut();
+        let still_ours = slots
+            .get(key)
+            .is_some_and(|mapped| Rc::ptr_eq(mapped, slot));
+        if still_ours && Rc::strong_count(slot) == 2 {
+            slots.remove(key);
+        }
     }
 
     /// Evict every cached connection for `key`, if any. For a caller that
@@ -739,8 +821,9 @@ fn lease(conn: &PooledConn) -> PooledSendRequest {
 }
 
 /// One pass of the h2 cache's sweep: drop every connection that is closed or
-/// has been idle for [`UPSTREAM_IDLE_TIMEOUT`] as of `now`, then every key left
-/// with no connection. A free function over the shared map (not a method) so
+/// has been idle for [`UPSTREAM_IDLE_TIMEOUT`] as of `now` or belongs to an
+/// endpoint `membership` says has left its cluster, then every key left with no
+/// connection. A free function over the shared map (not a method) so
 /// the periodic task can call it through a `Weak` -- see [`spawn_sweeper`].
 ///
 /// A key whose slot a checkout currently holds is skipped, closed connections
@@ -754,16 +837,26 @@ fn lease(conn: &PooledConn) -> PooledSendRequest {
 /// Evicted connections are dropped only after the map's `RefCell` borrow has
 /// ended, so nothing a destructor does can reach back into the cache while it
 /// is borrowed.
-fn sweep_h2(slots: &RefCell<HashMap<ConnKey, Slot>>, now: Instant) -> SweepReport {
+fn sweep_h2(
+    slots: &RefCell<HashMap<ConnKey, Slot>>,
+    now: Instant,
+    membership: &Membership,
+) -> SweepReport {
     let mut report = SweepReport::default();
     let mut evicted: Vec<PooledConn> = Vec::new();
-    slots.borrow_mut().retain(|_key, slot| {
+    slots.borrow_mut().retain(|key, slot| {
         let Ok(mut conns) = slot.try_lock() else {
             return true;
         };
+        // Every connection to a removed endpoint goes, in flight or not.
+        // Dropping the cache's handle is enough for one carrying a stream:
+        // the stream's own sender keeps the socket (and its slot) until it
+        // ends, then the connection closes -- the eviction path
+        // `invalidate` relies on.
+        let removed = endpoint_removed(membership, key);
         let (gone, live): (Vec<PooledConn>, Vec<PooledConn>) = std::mem::take(&mut *conns)
             .into_iter()
-            .partition(|conn| conn.sender.is_closed() || conn.idle_expired(now));
+            .partition(|conn| removed || conn.sender.is_closed() || conn.idle_expired(now));
         *conns = live;
         report.connections += gone.len();
         evicted.extend(gone);
@@ -795,6 +888,14 @@ thread_local! {
 /// need to hold the cache across `.await` points.
 pub fn worker_conn_cache() -> Rc<UpstreamConnCache> {
     WORKER_CONN_CACHE.with(Rc::clone)
+}
+
+/// Install `oracle` on this worker's h2 and h1 caches, so their sweeps drain
+/// connections to endpoints that have left their cluster. Call once per
+/// worker, at startup.
+pub fn set_worker_membership(oracle: MembershipOracle) {
+    worker_conn_cache().set_membership(oracle.clone());
+    worker_h1_conn_cache().set_membership(oracle);
 }
 
 // ---------------------------------------------------------------------
@@ -859,7 +960,8 @@ impl IdleH1Conn {
 }
 
 /// One pass of the h1 cache's sweep: discard every idle connection that is
-/// closed or has waited [`UPSTREAM_IDLE_TIMEOUT`] as of `now`, then every key
+/// closed, has waited [`UPSTREAM_IDLE_TIMEOUT`] as of `now`, or belongs to an
+/// endpoint `membership` says has left its cluster, then every key
 /// left with an empty queue. Only idle connections are ever in this cache, so
 /// unlike the h2 sweep there is no "carrying a stream" case to protect: a
 /// leased connection is not here to be swept.
@@ -871,13 +973,18 @@ impl IdleH1Conn {
 ///
 /// As in [`sweep_h2`], discarded connections are dropped after the map's
 /// borrow ends.
-fn sweep_h1(slots: &RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>, now: Instant) -> SweepReport {
+fn sweep_h1(
+    slots: &RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>,
+    now: Instant,
+    membership: &Membership,
+) -> SweepReport {
     let mut report = SweepReport::default();
     let mut evicted: Vec<IdleH1Conn> = Vec::new();
-    slots.borrow_mut().retain(|_key, idle| {
+    slots.borrow_mut().retain(|key, idle| {
+        let removed = endpoint_removed(membership, key);
         let (gone, live): (VecDeque<IdleH1Conn>, VecDeque<IdleH1Conn>) = std::mem::take(idle)
             .into_iter()
-            .partition(|conn| conn.sender.is_closed() || conn.idle_expired(now));
+            .partition(|conn| removed || conn.sender.is_closed() || conn.idle_expired(now));
         *idle = live;
         report.connections += gone.len();
         evicted.extend(gone);
@@ -924,6 +1031,8 @@ pub struct H1ConnCache {
     /// Whether this cache's sweep task has been started -- see
     /// [`UpstreamConnCache::sweeper_started`].
     sweeper_started: Cell<bool>,
+    /// Cluster-membership oracle shared with the sweep task.
+    membership: Membership,
 }
 
 impl Default for H1ConnCache {
@@ -937,12 +1046,20 @@ impl H1ConnCache {
         Self {
             slots: Rc::new(RefCell::new(HashMap::new())),
             sweeper_started: Cell::new(false),
+            membership: Membership::default(),
         }
+    }
+
+    /// Install the cluster-membership oracle the sweep consults; idle
+    /// connections to an endpoint it reports as removed are closed on the next
+    /// sweep. See [`UpstreamConnCache::set_membership`].
+    pub fn set_membership(&self, oracle: MembershipOracle) {
+        *self.membership.borrow_mut() = Some(oracle);
     }
 
     fn ensure_sweeper(&self) {
         if !self.sweeper_started.replace(true) {
-            spawn_sweeper(&self.slots, "h1", sweep_h1);
+            spawn_sweeper(&self.slots, &self.membership, "h1", sweep_h1);
         }
     }
 
@@ -1773,8 +1890,8 @@ mod tests {
 
         fn sweep(&self, protocol: UpstreamProtocol, now: Instant) -> SweepReport {
             match protocol {
-                UpstreamProtocol::Http2 => sweep_h2(&self.h2.slots, now),
-                UpstreamProtocol::Http1 => sweep_h1(&self.h1.slots, now),
+                UpstreamProtocol::Http2 => sweep_h2(&self.h2.slots, now, &self.h2.membership),
+                UpstreamProtocol::Http1 => sweep_h1(&self.h1.slots, now, &self.h1.membership),
             }
         }
     }
@@ -1915,6 +2032,10 @@ mod tests {
                     .get_or_connect(key.clone(), &dead_pool)
                     .await
                     .expect_err("nothing is listening yet");
+                assert!(
+                    cache.slots.borrow().is_empty(),
+                    "a failed dial leaves no entry for the key"
+                );
 
                 // A listener now comes up at the SAME address (hazard 4:
                 // the failed dial above must not have poisoned the entry).
@@ -1942,6 +2063,11 @@ mod tests {
                     .get_or_connect(key, &dead_pool)
                     .await
                     .expect_err("the dead-address key must still fail cleanly, not hang or panic");
+                assert_eq!(
+                    cache.slots.borrow().len(),
+                    1,
+                    "only the live key is cached; the dead one left nothing behind again"
+                );
             })
             .await;
     }
@@ -2340,6 +2466,224 @@ mod tests {
             .await;
     }
 
+    /// Membership oracle for tests: every endpoint is a member except the one
+    /// stored in the returned cell.
+    fn all_but(removed: &Rc<std::cell::Cell<Option<SocketAddr>>>) -> MembershipOracle {
+        let removed = removed.clone();
+        Rc::new(move |_cluster, addr| removed.get() != Some(addr))
+    }
+
+    fn install_membership(caches: &Caches, oracle: &MembershipOracle) {
+        caches.h2.set_membership(oracle.clone());
+        caches.h1.set_membership(oracle.clone());
+    }
+
+    /// An idle connection to an endpoint that left its cluster is closed by the
+    /// next sweep and gives its `max_connections` slot back, an hour before the
+    /// idle timeout would. An idle connection to a member endpoint is kept.
+    async fn a_removed_endpoints_idle_connection_is_closed_at_the_next_sweep(
+        protocol: UpstreamProtocol,
+    ) {
+        let gone = Upstream::spawn(protocol).await;
+        let alive = Upstream::spawn(protocol).await;
+        let (gone_budget, alive_budget) = (one_connection_budget(), one_connection_budget());
+        let caches = Caches::new();
+        let removed = Rc::new(std::cell::Cell::new(None));
+        install_membership(&caches, &all_but(&removed));
+        let gone_key = key_on("up", gone.addr, protocol, &gone_budget);
+        let alive_key = key_on("up", alive.addr, protocol, &alive_budget);
+        let alive_pool = pool_on(alive.addr, &alive_budget);
+        caches
+            .round_trip(gone_key, &pool_on(gone.addr, &gone_budget))
+            .await
+            .unwrap();
+        caches
+            .round_trip(alive_key.clone(), &alive_pool)
+            .await
+            .unwrap();
+        assert!(
+            gone_budget.try_acquire_connection().is_none(),
+            "premise: the idle connection holds the slot"
+        );
+
+        let soon = Instant::now() + Duration::from_secs(61);
+        assert_eq!(
+            caches.sweep(protocol, soon),
+            SweepReport::default(),
+            "while both endpoints are members nothing is reclaimed"
+        );
+
+        removed.set(Some(gone.addr));
+        assert_eq!(
+            caches.sweep(protocol, soon),
+            SweepReport {
+                connections: 1,
+                keys: 1
+            },
+            "only the removed endpoint's connection and key go, long before the idle timeout"
+        );
+        eventually("the removed endpoint's slot to come back", || {
+            gone_budget.try_acquire_connection().is_some()
+        })
+        .await;
+        eventually("the upstream to see the proxy close the connection", || {
+            gone.closed_by_client() == 1
+        })
+        .await;
+
+        assert_eq!(alive.closed_by_client(), 0);
+        caches
+            .round_trip(alive_key, &alive_pool)
+            .await
+            .expect("the member endpoint's connection is still usable");
+        assert_eq!(alive.accepted(), 1, "and was reused, not redialed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h1_removed_endpoints_idle_connection_is_closed_at_the_next_sweep() {
+        LocalSet::new()
+            .run_until(
+                a_removed_endpoints_idle_connection_is_closed_at_the_next_sweep(
+                    UpstreamProtocol::Http1,
+                ),
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_removed_endpoints_idle_connection_is_closed_at_the_next_sweep() {
+        LocalSet::new()
+            .run_until(
+                a_removed_endpoints_idle_connection_is_closed_at_the_next_sweep(
+                    UpstreamProtocol::Http2,
+                ),
+            )
+            .await;
+    }
+
+    /// A stream already running on a removed endpoint's h2 connection is not
+    /// cut by the sweep: the connection leaves the cache (nothing new is placed
+    /// on it) but keeps its slot until the stream ends, and then closes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_removed_endpoints_h2_stream_in_flight_finishes_before_the_connection_closes() {
+        LocalSet::new()
+            .run_until(async {
+                let host = Upstream::spawn_holding(UpstreamProtocol::Http2, Hold::Body).await;
+                let budget = one_connection_budget();
+                let caches = Caches::new();
+                let removed = Rc::new(std::cell::Cell::new(None));
+                install_membership(&caches, &all_but(&removed));
+                let key = key_on("up", host.addr, UpstreamProtocol::Http2, &budget);
+                let response = caches
+                    .h2
+                    .get_or_connect(key, &pool_on(host.addr, &budget))
+                    .await
+                    .expect("dial")
+                    .send(get_request())
+                    .await
+                    .expect("the response head arrives; its body is still streaming");
+
+                removed.set(Some(host.addr));
+                assert_eq!(
+                    caches.sweep(UpstreamProtocol::Http2, Instant::now()),
+                    SweepReport {
+                        connections: 1,
+                        keys: 1
+                    },
+                    "the connection leaves the cache so nothing new is placed on it"
+                );
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    budget.try_acquire_connection().is_none(),
+                    "the stream on it is not cut, so the connection keeps its slot"
+                );
+
+                host.release(1);
+                response
+                    .body
+                    .collect()
+                    .await
+                    .expect("the stream finishes on the removed endpoint's connection");
+                eventually("the finished connection to close and free its slot", || {
+                    budget.try_acquire_connection().is_some()
+                })
+                .await;
+            })
+            .await;
+    }
+
+    /// A refused dial leaves nothing in the map -- checked without the sweep
+    /// having run -- and a checkout that was queued behind the failed one still
+    /// lands its connection in the map, where the next request finds it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_dial_removes_its_slot_but_not_one_another_checkout_is_waiting_on() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dead_addr = listener.local_addr().unwrap();
+                drop(listener);
+                let host = Upstream::spawn(UpstreamProtocol::Http2).await;
+                let cache = Rc::new(UpstreamConnCache::new());
+                let key = test_key("up", host.addr, UpstreamProtocol::Http2);
+
+                cache
+                    .get_or_connect(key.clone(), &plaintext_pool(dead_addr))
+                    .await
+                    .expect_err("nothing is listening");
+                assert!(
+                    cache.slots.borrow().is_empty(),
+                    "the failed dial's empty slot is removed, with no sweep needed"
+                );
+
+                // Checkout 1 parks in a dial that will fail; checkout 2 queues
+                // on the same key's lock with a pool that works.
+                let gate = Arc::new(Notify::new());
+                let failing = GatedPool {
+                    inner: plaintext_pool(dead_addr),
+                    gate: gate.clone(),
+                };
+                let first = tokio::task::spawn_local({
+                    let (cache, key) = (cache.clone(), key.clone());
+                    async move { cache.get_or_connect(key, &failing).await.map(|_| ()) }
+                });
+                settle("checkout 1 to take the key's lock and park", || {
+                    cache.slots.borrow().len() == 1
+                })
+                .await;
+                let second = tokio::task::spawn_local({
+                    let (cache, key) = (cache.clone(), key.clone());
+                    let live = plaintext_pool(host.addr);
+                    async move { cache.get_or_connect(key, &live).await.map(|_| ()) }
+                });
+                settle("checkout 2 to queue on the slot", || {
+                    cache.slots.borrow().values().map(Rc::strong_count).max() == Some(3)
+                })
+                .await;
+
+                gate.notify_one();
+                first.await.unwrap().expect_err("checkout 1's dial fails");
+                second
+                    .await
+                    .unwrap()
+                    .expect("checkout 2 dials and succeeds");
+                assert_eq!(cache.slots.borrow().len(), 1, "checkout 2's slot is kept");
+
+                cache
+                    .get_or_connect(key, &plaintext_pool(host.addr))
+                    .await
+                    .expect("third checkout");
+                assert_eq!(
+                    host.accepted(),
+                    1,
+                    "the third checkout reuses checkout 2's connection; a second one means \
+                     checkout 1's cleanup removed the slot checkout 2 was dialing into"
+                );
+            })
+            .await;
+    }
+
     /// The whole production path for idle expiry, timer included: the cache
     /// starts its own sweep task when it dials, the task wakes every
     /// `SWEEP_INTERVAL`, and a connection idle for `UPSTREAM_IDLE_TIMEOUT` is
@@ -2436,7 +2780,7 @@ mod tests {
                 tokio::time::pause();
                 tokio::time::advance(2 * UPSTREAM_IDLE_TIMEOUT).await;
                 assert_eq!(
-                    sweep_h2(&caches.h2.slots, Instant::now()),
+                    caches.sweep(UpstreamProtocol::Http2, Instant::now()),
                     SweepReport::default(),
                     "a connection carrying a stream is not idle, however old it is"
                 );
@@ -2455,21 +2799,21 @@ mod tests {
 
                 let just_idle = Instant::now();
                 assert_eq!(
-                    sweep_h2(&caches.h2.slots, just_idle),
+                    caches.sweep(UpstreamProtocol::Http2, just_idle),
                     SweepReport::default(),
                     "a connection that has only just gone idle is kept, though it was dialed \
                      two hours ago"
                 );
                 assert_eq!(
-                    sweep_h2(
-                        &caches.h2.slots,
+                    caches.sweep(
+                        UpstreamProtocol::Http2,
                         just_idle + UPSTREAM_IDLE_TIMEOUT - Duration::from_secs(60)
                     ),
                     SweepReport::default()
                 );
                 assert_eq!(
-                    sweep_h2(
-                        &caches.h2.slots,
+                    caches.sweep(
+                        UpstreamProtocol::Http2,
                         just_idle + UPSTREAM_IDLE_TIMEOUT + Duration::from_secs(60)
                     ),
                     SweepReport {
@@ -2557,7 +2901,7 @@ mod tests {
                 .await;
 
                 assert_eq!(
-                    sweep_h2(&caches.h2.slots, Instant::now()),
+                    caches.sweep(UpstreamProtocol::Http2, Instant::now()),
                     SweepReport::default(),
                     "a key with a checkout in flight is not empty-and-unused"
                 );
