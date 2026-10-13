@@ -664,4 +664,163 @@ mod tests {
         drop(accumulator);
         std::fs::remove_file(path).unwrap();
     }
+
+    // --- eviction, journal side --------------------------------------------
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    /// Settled buckets are out of the set the flusher copies and journals, so
+    /// neither the copy under the request-path mutex nor the checkpoint grows
+    /// with them. Forty settled buckets sit in memory; the checkpoint holds
+    /// the one live row.
+    ///
+    /// Mutation: have `journal_snapshot` clone `active` and `settled` alike.
+    #[test]
+    fn settled_buckets_are_not_copied_or_journaled() {
+        let path = path();
+        let store = ProbeStore::new();
+        let live = TenantId::new("live");
+        {
+            let accumulator = journaled_accumulator(&store, &path);
+            let old = at(2026, 9, 3, 12, 0);
+            for i in 0..40 {
+                accumulator.record(
+                    &TenantId::new(format!("old-{i}")),
+                    old,
+                    Period::Daily,
+                    Charge::Priced(MicroUsd::from_micros(5)),
+                    None,
+                    None,
+                );
+            }
+            charge(&accumulator, &live, 1);
+            // Reconciles the ended period and settles it inside the grace.
+            accumulator.inner.flush_at(at(2026, 9, 4, 0, 30)).unwrap();
+            assert_eq!(accumulator.inner.buckets.lock().unwrap().counts(), (1, 40));
+            let journal = accumulator.inner.journal.as_ref().unwrap();
+            assert_eq!(
+                journal.saved_rows().len(),
+                41,
+                "that tick's commit predates the settling"
+            );
+
+            accumulator.inner.flush_at(at(2026, 9, 4, 0, 35)).unwrap();
+
+            let rows = journal.saved_rows();
+            assert_eq!(rows.len(), 1, "the next commit carries the live row only");
+            assert_eq!(rows[0].0, live);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// An evicted bucket is gone from the journal, and a restart restores
+    /// only what was still live. The old period here is far in the past, so
+    /// the first tick delivers, settles and evicts it; the second tick's
+    /// commit is the one that no longer carries it.
+    ///
+    /// Mutation: skip the eviction step at the end of `flush_at` (the
+    /// settled bucket then lingers, and so does the journal row's absence
+    /// check on the in-memory side).
+    #[test]
+    fn restart_replay_restores_only_live_buckets() {
+        let path = path();
+        let store = ProbeStore::new();
+        let live = TenantId::new("live");
+        let old_tenant = TenantId::new("old");
+        let old_key = Period::Daily.key_for(at(2020, 1, 5, 12, 0));
+        {
+            let accumulator = journaled_accumulator(&store, &path);
+            accumulator.record(
+                &old_tenant,
+                at(2020, 1, 5, 12, 0),
+                Period::Daily,
+                Charge::Priced(MicroUsd::from_micros(10)),
+                None,
+                None,
+            );
+            charge(&accumulator, &live, 5);
+
+            accumulator.flush_now().unwrap();
+            assert_eq!(accumulator.inner.buckets.lock().unwrap().counts(), (1, 0));
+            accumulator.flush_now().unwrap();
+            let rows = accumulator.inner.journal.as_ref().unwrap().saved_rows();
+            assert!(
+                rows.iter().all(|(tenant, _, _)| *tenant != old_tenant),
+                "the evicted bucket is no longer in the journal"
+            );
+        }
+        let restarted = journaled_accumulator(&store, &path);
+        let (active, settled) = restarted.inner.buckets.lock().unwrap().counts();
+        assert_eq!(active + settled, 1, "only the live bucket was restored");
+        assert_eq!(
+            restarted.current_total(&live, &Period::Daily.key_for_now()),
+            5
+        );
+        assert_eq!(
+            store
+                .inner
+                .load_spend("chain", &old_tenant, &old_key)
+                .unwrap(),
+            10,
+            "and the evicted period's spend is still in the store"
+        );
+        drop(restarted);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A journal written before eviction existed holds every period the
+    /// process ever saw. Replaying it must prune them: each historical row
+    /// is reconciled once, settled, and evicted, and the live row survives
+    /// with its pending spend delivered.
+    ///
+    /// Mutation: make `BucketMap::from_restored` leave `period_end` unset
+    /// (the historical rows then never end and never leave).
+    #[test]
+    fn a_journal_from_before_eviction_is_pruned_on_replay() {
+        let path = path();
+        let store = ProbeStore::new();
+        let live = TenantId::new("live");
+        let (journal, _) = Journal::open(&path, "chain", "node").unwrap();
+        let mut rows = HashMap::new();
+        for day in 1..=3 {
+            rows.insert(
+                (
+                    TenantId::new("old"),
+                    Period::Daily.key_for(at(2020, 1, day, 12, 0)),
+                ),
+                Bucket::default(),
+            );
+        }
+        rows.insert(
+            (live.clone(), Period::Daily.key_for_now()),
+            Bucket {
+                pending_delta_micros: 9,
+                ..Bucket::default()
+            },
+        );
+        journal.save(&rows).unwrap();
+        drop(journal);
+
+        let recovered = journaled_accumulator(&store, &path);
+
+        let (active, settled) = recovered.inner.buckets.lock().unwrap().counts();
+        assert_eq!(active + settled, 1, "the three historical rows were pruned");
+        assert_eq!(
+            store
+                .inner
+                .load_spend("chain", &live, &Period::Daily.key_for_now())
+                .unwrap(),
+            9
+        );
+        recovered.flush_now().unwrap();
+        assert_eq!(
+            recovered.inner.journal.as_ref().unwrap().saved_rows().len(),
+            1
+        );
+        drop(recovered);
+        std::fs::remove_file(path).unwrap();
+    }
 }

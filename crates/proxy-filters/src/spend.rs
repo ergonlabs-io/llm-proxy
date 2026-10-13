@@ -580,6 +580,28 @@ impl PeriodKey {
         &self.0
     }
 
+    /// The UTC instant the period this key names ends (exclusive), or `None`
+    /// for a string that is not one of the two shapes [`Period::key_for`]
+    /// renders. Parsed rather than carried so a key read back from a journal
+    /// or the store needs no side channel; callers cache the result.
+    fn ends_at(&self) -> Option<DateTime<Utc>> {
+        let (period, start) = match self.0.len() {
+            10 => (
+                Period::Daily,
+                NaiveDate::parse_from_str(&self.0, "%Y-%m-%d").ok()?,
+            ),
+            7 => (
+                Period::Monthly,
+                NaiveDate::parse_from_str(&format!("{}-01", self.0), "%Y-%m-%d").ok()?,
+            ),
+            _ => return None,
+        };
+        let start = start.and_hms_opt(0, 0, 0)?.and_utc();
+        // chrono accepts spellings like "2026-8-1"; only the canonical one
+        // names this period, so reject anything `key_for` would not render.
+        (period.key_for(start) == *self).then(|| period.next_boundary(start))
+    }
+
     /// Test-only: builds a `PeriodKey` directly from an already-rendered
     /// string, bypassing [`Period::key_for`]'s calendar logic. Exists for
     /// `control.rs`'s store parity test, which needs to write/read a spend
@@ -777,6 +799,163 @@ struct Bucket {
     /// tells a later reader "there were more pairs than this set shows"
     /// without growing the set itself.
     unpriced_pairs_truncated: bool,
+    /// When this bucket's period ends, derived from its key when the bucket
+    /// enters the map (`None` for a key that is not one `Period::key_for`
+    /// renders, which then never ends and is never evicted). Not journaled:
+    /// it is a function of the key, recomputed on restore.
+    #[serde(skip)]
+    period_end: Option<DateTime<Utc>>,
+    /// Whether a flush has reconciled this bucket with the store at a time
+    /// when its period had already ended. Not journaled: after a restart the
+    /// first flush simply does it again.
+    #[serde(skip)]
+    reconciled_after_end: bool,
+}
+
+/// How long a settled bucket stays readable in memory after its period ends.
+/// One hour.
+///
+/// A charge is stamped with the time its request completes, so a stream that
+/// began before midnight is charged to the NEW period. What can still reach
+/// an ended period is a caller that stamps a charge with an earlier time, a
+/// wall clock that steps back over the boundary, and a `record` that built
+/// its key just before the boundary and took the mutex just after it. Those
+/// are seconds to minutes; an hour also covers a long completion should
+/// charging ever be attributed by request start, and costs one extra
+/// period's buckets for 1/24 of a day.
+///
+/// Nothing depends on the number for correctness. A charge that arrives
+/// after eviction recreates the bucket, seeds its flush sequence from the
+/// store's `last_flush_seq`, and is delivered under a fresh sequence, so the
+/// store total stays exact: nothing is delivered twice (the evicted bucket
+/// owed nothing) and nothing is dropped as a replay. The grace only saves
+/// that reseed and keeps reads of the just-ended period in memory.
+const SETTLED_BUCKET_GRACE_SECS: i64 = 60 * 60;
+
+type BucketKey = (TenantId, PeriodKey);
+
+impl Bucket {
+    fn new(base_micros: u64, period_key: &PeriodKey) -> Self {
+        Bucket {
+            base_micros,
+            period_end: period_key.ends_at(),
+            ..Bucket::default()
+        }
+    }
+
+    fn is_ended(&self, now: DateTime<Utc>) -> bool {
+        self.period_end.is_some_and(|end| end <= now)
+    }
+
+    /// Nothing left to deliver or learn: the period has ended, every charge
+    /// is confirmed by the store (no pending delta, no frozen attempt), and a
+    /// reconciliation has happened since the period ended, so the figure held
+    /// here is final. A settled bucket is never visited by the flusher.
+    fn is_settled(&self, now: DateTime<Utc>) -> bool {
+        self.is_ended(now)
+            && self.pending_delta_micros == 0
+            && self.attempt.is_none()
+            && self.reconciled_after_end
+    }
+}
+
+/// Every bucket in memory, split by whether the flusher still owes the store
+/// a call for it.
+///
+/// Two collections rather than one map and a flag: the flusher walks `active`
+/// on every tick under the mutex every completed request needs, so keeping
+/// settled buckets out of it is what stops that hold growing with them.
+#[derive(Default)]
+struct BucketMap {
+    /// Buckets the flusher visits every tick: any whose period has not
+    /// ended, plus ended ones still owing a delta or their one final
+    /// reconciliation.
+    active: HashMap<BucketKey, Bucket>,
+    settled: SettledBuckets,
+}
+
+impl BucketMap {
+    fn from_restored(restored: HashMap<BucketKey, Bucket>) -> Self {
+        let mut map = BucketMap::default();
+        for (key, mut bucket) in restored {
+            bucket.period_end = key.1.ends_at();
+            map.active.insert(key, bucket);
+        }
+        map
+    }
+
+    /// Looks in both collections; never creates or moves anything.
+    fn get(&self, key: &BucketKey) -> Option<&Bucket> {
+        self.active.get(key).or_else(|| self.settled.get(key))
+    }
+
+    /// Moves a bucket the flusher has just settled out of `active`.
+    fn settle(&mut self, key: &BucketKey) {
+        if let Some((key, bucket)) = self.active.remove_entry(key) {
+            self.settled.insert(key, bucket);
+        }
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        (self.active.len(), self.settled.len())
+    }
+}
+
+/// Settled buckets grouped by the period end they share, so eviction moves
+/// whole groups out in one step instead of visiting buckets, and the groups
+/// are then dropped after the mutex is released.
+#[derive(Default)]
+struct SettledBuckets {
+    by_period_end: std::collections::BTreeMap<DateTime<Utc>, HashMap<BucketKey, Bucket>>,
+}
+
+impl SettledBuckets {
+    fn insert(&mut self, key: BucketKey, bucket: Bucket) {
+        let end = bucket
+            .period_end
+            .expect("a settled bucket has ended, so its period end is known");
+        self.by_period_end
+            .entry(end)
+            .or_default()
+            .insert(key, bucket);
+    }
+
+    // Only a handful of groups exist at once (the period ends inside the
+    // grace window), so scanning them beats parsing the key to find one.
+    fn get(&self, key: &BucketKey) -> Option<&Bucket> {
+        self.by_period_end.values().find_map(|group| group.get(key))
+    }
+
+    fn take(&mut self, key: &BucketKey) -> Option<Bucket> {
+        self.by_period_end
+            .values_mut()
+            .find_map(|group| group.remove(key))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_period_end.values().map(HashMap::len).sum()
+    }
+
+    /// Removes every group whose period ended at least the grace ago.
+    fn evict_due(&mut self, now: DateTime<Utc>) -> Vec<HashMap<BucketKey, Bucket>> {
+        let grace = chrono::Duration::seconds(SETTLED_BUCKET_GRACE_SECS);
+        let mut due = Vec::new();
+        // Rust note: `first_entry` borrows the map's smallest key mutably;
+        // `remove` consumes the entry and hands back the group.
+        while let Some(group) = self.by_period_end.first_entry() {
+            let ripe = group
+                .key()
+                .checked_add_signed(grace)
+                .is_some_and(|ripe_at| ripe_at <= now);
+            if !ripe {
+                break;
+            }
+            due.push(group.remove());
+        }
+        due
+    }
 }
 
 impl Bucket {
@@ -842,7 +1021,7 @@ struct Inner {
     /// Never consulted for a tenant `record` is called with an explicit
     /// period for.
     default_period: Period,
-    buckets: Mutex<HashMap<(TenantId, PeriodKey), Bucket>>,
+    buckets: Mutex<BucketMap>,
     /// When [`Inner::flush_now`] last wrote every
     /// bucket to the store WITHOUT ERROR, as Unix milliseconds, or
     /// [`NEVER_FLUSHED`] until the first such flush. A FAILED flush (see
@@ -894,39 +1073,59 @@ impl Inner {
     /// error, per AGENTS.md "Fail-open controls" ("a security control that fails open
     /// must be loud") -- the same "metering must not refuse traffic"
     /// precedent `token_limit`'s missing-usage path already sets.
+    ///
+    /// The bucket comes back in `active`. A bucket that had settled (its
+    /// period ended and the flusher stopped visiting it) is moved back, so a
+    /// straggler charge lands on the same base and sequence it left off
+    /// with. One that was already evicted is created fresh: its base comes
+    /// from the store (or is zero for request workers, which the next flush
+    /// corrects) and its flush sequence is seeded from the store at the next
+    /// flush, which is what keeps that late charge from being dropped as a
+    /// replay of an earlier one. Readers that must not disturb a settled
+    /// bucket look it up with [`BucketMap::get`] first.
     fn get_or_load_bucket<'a>(
         &self,
-        buckets: &'a mut HashMap<(TenantId, PeriodKey), Bucket>,
+        buckets: &'a mut BucketMap,
         tenant: &TenantId,
         period_key: &PeriodKey,
     ) -> &'a mut Bucket {
-        buckets
-            .entry((tenant.clone(), period_key.clone()))
-            .or_insert_with(|| {
-                let total_micros = if self.memory_only_requests.load(Ordering::Relaxed) {
+        use std::collections::hash_map::Entry;
+        // Rust note: `active` and `settled` are borrowed through separate
+        // fields, which the borrow checker accepts at the same time; going
+        // through a `&mut self` method on `BucketMap` would not be.
+        match buckets.active.entry((tenant.clone(), period_key.clone())) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let bucket = buckets
+                    .settled
+                    .take(entry.key())
+                    .unwrap_or_else(|| self.load_new_bucket(tenant, period_key));
+                entry.insert(bucket)
+            }
+        }
+    }
+
+    fn load_new_bucket(&self, tenant: &TenantId, period_key: &PeriodKey) -> Bucket {
+        let total_micros = if self.memory_only_requests.load(Ordering::Relaxed) {
+            0
+        } else {
+            match self.store.load_spend(&self.stat_prefix, tenant, period_key) {
+                Ok(total) => total,
+                Err(err) => {
+                    tracing::warn!(
+                        stat_prefix = %self.stat_prefix,
+                        tenant = tenant.as_str(),
+                        period = period_key.as_str(),
+                        error = %err,
+                        "spend accumulator: failed to load the stored total for a new \
+                         period; resuming from zero in this process rather than \
+                         refusing the request"
+                    );
                     0
-                } else {
-                    match self.store.load_spend(&self.stat_prefix, tenant, period_key) {
-                        Ok(total) => total,
-                        Err(err) => {
-                            tracing::warn!(
-                                stat_prefix = %self.stat_prefix,
-                                tenant = tenant.as_str(),
-                                period = period_key.as_str(),
-                                error = %err,
-                                "spend accumulator: failed to load the stored total for a new \
-                                 period; resuming from zero in this process rather than \
-                                 refusing the request"
-                            );
-                            0
-                        }
-                    }
-                };
-                Bucket {
-                    base_micros: total_micros,
-                    ..Bucket::default()
                 }
-            })
+            }
+        };
+        Bucket::new(total_micros, period_key)
     }
 
     /// How long since the last flush in which EVERY bucket was written --
@@ -946,13 +1145,18 @@ impl Inner {
         Duration::from_millis(u64::try_from(elapsed).unwrap_or(0))
     }
 
-    /// Copies every bucket for a journal checkpoint, or returns `None` when
-    /// no journal is configured so the common configuration never pays for
-    /// the copy. This is the only place a flush clones the map, and a flush
-    /// calls it once. The copy is made under the buckets mutex because a
-    /// consistent view is the point: serialising and fsyncing it (the slow
-    /// part) then happens with the mutex released.
-    fn journal_snapshot(&self) -> Option<HashMap<(TenantId, PeriodKey), Bucket>> {
+    /// Copies the `active` buckets for a journal checkpoint, or returns
+    /// `None` when no journal is configured so the common configuration
+    /// never pays for the copy. This is the only place a flush clones
+    /// buckets, and a flush calls it once. The copy is made under the buckets
+    /// mutex because a consistent view is the point: serialising and fsyncing
+    /// it (the slow part) then happens with the mutex released.
+    ///
+    /// Settled buckets are left out on purpose. They owe the store nothing,
+    /// so a restart loses nothing by not finding them (a late charge reseeds
+    /// from the store), and leaving them out is what keeps both this copy
+    /// and the journal from growing with them.
+    fn journal_snapshot(&self) -> Option<HashMap<BucketKey, Bucket>> {
         self.journal.as_ref()?;
         #[cfg(test)]
         self.snapshots_taken.fetch_add(1, Ordering::Relaxed);
@@ -960,6 +1164,7 @@ impl Inner {
             self.buckets
                 .lock()
                 .expect("spend accumulator mutex poisoned")
+                .active
                 .clone(),
         )
     }
@@ -1006,13 +1211,24 @@ impl Inner {
     /// against its own spend alone, which is the old non-additive behaviour wearing
     /// a new signature.
     ///
-    /// A bucket with NOTHING to add is flushed anyway, with a delta of zero.
-    /// That is deliberate and is not a wasted call: a replica serving no
-    /// traffic still has to learn what the others spent, or it admits
-    /// requests against a ceiling it thinks is empty. There is likewise no
-    /// single-replica short circuit -- the embedded store implements the
-    /// same contract, and skipping the path in embedded mode would leave the
-    /// multi-replica path exercised only in production (ADR-0006 §5).
+    /// A bucket in a LIVE period with NOTHING to add is flushed anyway, with
+    /// a delta of zero. That is deliberate and is not a wasted call: a
+    /// replica serving no traffic still has to learn what the others spent,
+    /// or it admits requests against a ceiling it thinks is empty. There is
+    /// likewise no single-replica short circuit -- the embedded store
+    /// implements the same contract, and skipping the path in embedded mode
+    /// would leave the multi-replica path exercised only in production
+    /// (ADR-0006 §5).
+    ///
+    /// That reason stops at the period boundary. Nothing is admitted against
+    /// an ended period, so once one has no delta to deliver and has been
+    /// reconciled once since it ended (making the figure kept for reads
+    /// final), the bucket is SETTLED: moved out of the set the flusher
+    /// visits, kept readable for the grace, then evicted. A settled bucket
+    /// costs the store no calls, and the per-tick work scales with live
+    /// buckets rather than with every period the process has ever seen. A
+    /// charge that arrives late puts it back and it is delivered like any
+    /// other.
     ///
     /// # At most once per flush window
     ///
@@ -1067,6 +1283,16 @@ impl Inner {
     /// claimed a flush just succeeded when it did not would be a durability
     /// lie.
     fn flush_now(&self) -> Result<(), StoreError> {
+        self.flush_at(Utc::now())
+    }
+
+    /// [`Self::flush_now`] against a clock the caller supplies. `now` decides
+    /// which periods have ended, so rollover, settling and eviction can be
+    /// driven without waiting on the wall clock; production reaches this only
+    /// through `flush_now`, so the tests exercise the same code. The
+    /// operational timestamps (`last_flush_at`, checkpoint time) stay on the
+    /// real clock because operators read them against it.
+    fn flush_at(&self, now: DateTime<Utc>) -> Result<(), StoreError> {
         // Serialize deliveries, but never hold the request buckets lock across I/O.
         let _flush = self
             .flush_lock
@@ -1086,7 +1312,9 @@ impl Inner {
                 .buckets
                 .lock()
                 .expect("spend accumulator mutex poisoned");
-            for (key, bucket) in buckets.iter_mut() {
+            // Everything in `active` owes the store a call; settled buckets
+            // are not here, so this pass does not grow with them.
+            for (key, bucket) in buckets.active.iter_mut() {
                 match bucket.next_seq {
                     Some(u64::MAX) => {
                         first_err.get_or_insert_with(sequence_exhausted);
@@ -1120,7 +1348,7 @@ impl Inner {
                 .buckets
                 .lock()
                 .expect("spend accumulator mutex poisoned");
-            let bucket = buckets.get_mut(&key).expect("known bucket");
+            let bucket = buckets.active.get_mut(&key).expect("known bucket");
             bucket.next_seq = Some(seq);
             let attempt = bucket.freeze(seq);
             drop(buckets);
@@ -1169,12 +1397,19 @@ impl Inner {
                         .buckets
                         .lock()
                         .expect("spend accumulator mutex poisoned");
-                    let bucket = buckets.get_mut(&key).expect("known bucket");
+                    let bucket = buckets.active.get_mut(&key).expect("known bucket");
                     bucket.base_micros = total;
                     bucket.pending_delta_micros =
                         bucket.pending_delta_micros.saturating_sub(attempt.delta);
                     bucket.next_seq = attempt.seq.checked_add(1);
                     bucket.attempt = None;
+                    // Measured against the tick's start, so it can only
+                    // under-claim: a bucket reconciled after the boundary
+                    // inside a long tick is simply reconciled once more.
+                    bucket.reconciled_after_end = bucket.is_ended(now);
+                    if bucket.is_settled(now) {
+                        buckets.settle(&key);
+                    }
                 }
                 Err(err) => {
                     first_err.get_or_insert(err);
@@ -1197,6 +1432,15 @@ impl Inner {
                 Ordering::Relaxed,
             );
         }
+        // Step 5. Eviction is a handful of group moves under the mutex;
+        // freeing the buckets happens after it is released.
+        let evicted = self
+            .buckets
+            .lock()
+            .expect("spend accumulator mutex poisoned")
+            .settled
+            .evict_due(now);
+        drop(evicted);
         match first_err {
             Some(err) => Err(err),
             None => {
@@ -1362,7 +1606,7 @@ impl SpendAccumulator {
                 store,
                 node_id,
                 default_period,
-                buckets: Mutex::new(HashMap::new()),
+                buckets: Mutex::new(BucketMap::default()),
                 last_flush_millis: AtomicI64::new(NEVER_FLUSHED),
                 created_at_millis: Utc::now().timestamp_millis(),
                 reconciliation,
@@ -1380,7 +1624,7 @@ impl SpendAccumulator {
         *inner
             .buckets
             .get_mut()
-            .expect("spend accumulator mutex poisoned") = buckets;
+            .expect("spend accumulator mutex poisoned") = BucketMap::from_restored(buckets);
         inner.journal = Some(journal);
         // Replay before serving when possible. An outage retains the journal for the flusher.
         if let Err(err) = inner.flush_now() {
@@ -1414,16 +1658,13 @@ impl SpendAccumulator {
             for period in [Period::Daily, Period::Monthly] {
                 for date in [now, now + chrono::Duration::days(1)] {
                     let row = (subject.clone(), period.key_for(date));
-                    if let std::collections::hash_map::Entry::Vacant(entry) = buckets.entry(row) {
-                        let row = entry.key();
+                    if buckets.get(&row).is_none() {
                         let total =
                             self.inner
                                 .store
                                 .load_spend(&self.inner.stat_prefix, &row.0, &row.1)?;
-                        entry.insert(Bucket {
-                            base_micros: total,
-                            ..Bucket::default()
-                        });
+                        let bucket = Bucket::new(total, &row.1);
+                        buckets.active.insert(row, bucket);
                     }
                 }
             }
@@ -1579,6 +1820,20 @@ impl SpendAccumulator {
             .buckets
             .lock()
             .expect("spend accumulator mutex poisoned");
+        // A bucket already in memory answers from where it is, settled or
+        // not, so a read never moves one back into the set the flusher
+        // visits. Only a miss creates, as a first touch always has. A miss
+        // for an ENDED period that was evicted creates a bucket whose base
+        // is zero for request workers until the next flush adopts the store's
+        // total and evicts it again; nothing on the request path asks about
+        // an ended period (enforcement uses the period `now` falls in), and
+        // `report` answers such a period from the store instead.
+        let key = (tenant.clone(), period.clone());
+        if let Some(bucket) = buckets.get(&key) {
+            return bucket
+                .base_micros
+                .saturating_add(bucket.pending_delta_micros);
+        }
         let bucket = self.inner.get_or_load_bucket(&mut buckets, tenant, period);
         // Everything the store has confirmed, plus what this replica has
         // recorded since. Enforcement reads THIS, not the store -- see this
@@ -1692,42 +1947,102 @@ impl SpendAccumulator {
     /// [`ControlPlaneStore::load_spend`]'s doc) rather than treating "never
     /// spent" as a failure. An operator asking about a tenant that has not
     /// made a request yet gets a valid, boring answer.
+    ///
+    /// # A period that has ended and been evicted
+    ///
+    /// Nothing in the admin API asks about one (it reports the period `now`
+    /// falls in), but this method takes any key. A bucket for an ended period
+    /// is evicted an hour after it settles, and recreating it here would
+    /// answer zero in request-worker mode, which is silently wrong. So for an
+    /// ended period with no bucket in memory the total is read from the
+    /// store, no bucket is created, and a store failure is logged and read as
+    /// zero, the same loud fail-open the first touch of a live period uses.
+    /// What does NOT survive eviction is the unpriced-request detail
+    /// (`unpriced_requests`, `unpriced_pairs`): it lives only in the bucket
+    /// and the store never held it, so those fields read empty for such a
+    /// period.
     pub fn report(&self, tenant: &TenantId, period: &PeriodKey) -> SpendReport {
-        let now = Utc::now();
-        let mut buckets = self
-            .inner
-            .buckets
-            .lock()
-            .expect("spend accumulator mutex poisoned");
-        let bucket = self.inner.get_or_load_bucket(&mut buckets, tenant, period);
-        // Rust note: `unpriced_pairs` is a `BTreeSet`, so iterating it is
-        // ALREADY in sorted order -- no separate `.sort()` needed to satisfy
-        // the stable-output requirement.
-        let unpriced_pairs: Vec<(String, String)> = bucket.unpriced_pairs.iter().cloned().collect();
-        let report = SpendReport {
+        self.report_at(tenant, period, Utc::now())
+    }
+
+    /// [`Self::report`] against a clock the caller supplies; `now` decides
+    /// whether `period` has ended.
+    fn report_at(&self, tenant: &TenantId, period: &PeriodKey, now: DateTime<Utc>) -> SpendReport {
+        struct View {
+            total_micros: u64,
+            unpriced_requests: u64,
+            unpriced_pairs: Vec<(String, String)>,
+            unpriced_pairs_truncated: bool,
+        }
+        let view = |bucket: &Bucket| View {
+            total_micros: bucket
+                .base_micros
+                .saturating_add(bucket.pending_delta_micros),
+            unpriced_requests: bucket.unpriced_requests,
+            // Rust note: `unpriced_pairs` is a `BTreeSet`, so iterating it is
+            // ALREADY in sorted order -- no separate `.sort()` needed to
+            // satisfy the stable-output requirement.
+            unpriced_pairs: bucket.unpriced_pairs.iter().cloned().collect(),
+            unpriced_pairs_truncated: bucket.unpriced_pairs_truncated,
+        };
+        let from_memory = {
+            let mut buckets = self
+                .inner
+                .buckets
+                .lock()
+                .expect("spend accumulator mutex poisoned");
+            let key = (tenant.clone(), period.clone());
+            if let Some(bucket) = buckets.get(&key) {
+                Some(view(bucket))
+            } else if period.ends_at().is_some_and(|end| end <= now) {
+                None
+            } else {
+                Some(view(self.inner.get_or_load_bucket(
+                    &mut buckets,
+                    tenant,
+                    period,
+                )))
+            }
+        };
+        // The store is read with the buckets mutex released.
+        let view = from_memory.unwrap_or_else(|| {
+            let total_micros = self
+                .inner
+                .store
+                .load_spend(&self.inner.stat_prefix, tenant, period)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        stat_prefix = %self.inner.stat_prefix,
+                        tenant = tenant.as_str(),
+                        period = period.as_str(),
+                        error = %err,
+                        "spend report: failed to read the stored total of an ended period \
+                         that is no longer in memory; reporting zero"
+                    );
+                    0
+                });
+            View {
+                total_micros,
+                unpriced_requests: 0,
+                unpriced_pairs: Vec::new(),
+                unpriced_pairs_truncated: false,
+            }
+        });
+        SpendReport {
             journal_checkpoint_at: DateTime::<Utc>::from_timestamp_millis(
                 self.inner.journal_checkpoint_millis.load(Ordering::Acquire),
             ),
             journal_pending_micro_usd: self.inner.journal_pending_micros.load(Ordering::Relaxed),
             journal_pending_rows: self.inner.journal_pending_rows.load(Ordering::Relaxed),
-            total_micros: bucket
-                .base_micros
-                .saturating_add(bucket.pending_delta_micros),
-            unpriced_requests: bucket.unpriced_requests,
-            unpriced_pairs,
-            unpriced_pairs_truncated: bucket.unpriced_pairs_truncated,
-            // `last_flush_at` locks a DIFFERENT mutex than `buckets` above,
-            // so reading it while still holding `buckets`'s guard is not a
-            // self-deadlock -- called here (rather than after `buckets`
-            // drops) only so every field of `report` is assembled in one
-            // place.
+            total_micros: view.total_micros,
+            unpriced_requests: view.unpriced_requests,
+            unpriced_pairs: view.unpriced_pairs,
+            unpriced_pairs_truncated: view.unpriced_pairs_truncated,
             last_flush_at: self.last_flush_at(),
             reconciliation_age_seconds: self.reconciliation_age(now).as_secs(),
             reconciliation_expired: !self.is_reconciled(now),
             unreconciled_admissions: self.unreconciled_admissions(),
-        };
-        drop(buckets);
-        report
+        }
     }
 
     /// Starts the background flush thread, ticking every `interval`. See
@@ -2545,8 +2860,8 @@ mod tests {
             Some("cluster-a"),
             Some("model-a"),
         );
-        accumulator.flush_now().unwrap();
-        accumulator.flush_now().unwrap();
+        accumulator.inner.flush_at(now).unwrap();
+        accumulator.inner.flush_at(now).unwrap();
 
         let total = store
             .load_spend("test-chain", &tenant, &PeriodKey::for_test("2026-08-31"))
@@ -3044,7 +3359,7 @@ mod tests {
             Some("cluster-b"),
             Some("unpriced-model"),
         );
-        accumulator.flush_now().expect("flush must succeed");
+        accumulator.inner.flush_at(now).expect("flush must succeed");
 
         let report = accumulator.report(&tenant, &period_key);
 
@@ -3148,8 +3463,8 @@ mod tests {
         assert_eq!(replica_a.current_total(&tenant, &period_key), 10_000_000);
         assert_eq!(replica_b.current_total(&tenant, &period_key), 5_000_000);
 
-        replica_a.flush_now().unwrap();
-        replica_b.flush_now().unwrap();
+        replica_a.inner.flush_at(now).unwrap();
+        replica_b.inner.flush_at(now).unwrap();
 
         assert_eq!(
             store
@@ -3169,13 +3484,13 @@ mod tests {
 
         // One more tick and A, which has recorded nothing since, has caught
         // up too. A replica converges by FLUSHING, not by serving traffic.
-        replica_a.flush_now().unwrap();
+        replica_a.inner.flush_at(now).unwrap();
         assert_eq!(replica_a.current_total(&tenant, &period_key), 15_000_000);
 
         // And converged means STABLE: flushing again must not re-add either
         // replica's own contribution on top of the total it adopted.
-        replica_a.flush_now().unwrap();
-        replica_b.flush_now().unwrap();
+        replica_a.inner.flush_at(now).unwrap();
+        replica_b.inner.flush_at(now).unwrap();
         assert_eq!(
             store
                 .load_spend("test-chain", &tenant, &period_key)
@@ -3202,12 +3517,12 @@ mod tests {
         let idle = accumulator_on(&store, "node-idle", Period::Daily);
 
         record_micros(&busy, &tenant, now, 9_000_000);
-        busy.flush_now().unwrap();
+        busy.inner.flush_at(now).unwrap();
 
         // Touch the row on the idle replica so it has a bucket at all, then
         // flush with nothing of its own to contribute.
         assert_eq!(idle.current_total(&tenant, &period_key), 9_000_000);
-        idle.flush_now().unwrap();
+        idle.inner.flush_at(now).unwrap();
 
         assert_eq!(
             store
@@ -3234,14 +3549,14 @@ mod tests {
         {
             let before_restart = accumulator_on(&store, "node-a", Period::Daily);
             record_micros(&before_restart, &tenant, now, 3_000_000);
-            before_restart.flush_now().unwrap();
+            before_restart.inner.flush_at(now).unwrap();
             // A second tick, so the pre-restart sequence is provably past 1.
-            before_restart.flush_now().unwrap();
+            before_restart.inner.flush_at(now).unwrap();
         }
 
         let after_restart = accumulator_on(&store, "node-a", Period::Daily);
         record_micros(&after_restart, &tenant, now, 4_000_000);
-        after_restart.flush_now().unwrap();
+        after_restart.inner.flush_at(now).unwrap();
 
         assert_eq!(
             store
@@ -3920,8 +4235,8 @@ mod tests {
             record_micros(&accumulator, &TenantId::new(tenant), now, 1_000);
         }
 
-        accumulator.flush_now().unwrap();
-        accumulator.flush_now().unwrap();
+        accumulator.inner.flush_at(now).unwrap();
+        accumulator.inner.flush_at(now).unwrap();
 
         assert_eq!(
             accumulator
@@ -3936,5 +4251,387 @@ mod tests {
             6,
             "and the tick still delivered: 3 buckets x 2 ticks, zero deltas included"
         );
+    }
+
+    // --- settling and eviction ---------------------------------------------
+    //
+    // Time is driven through `Inner::flush_at` (and `report_at`): `record`
+    // already takes its own timestamp, and the flush takes the tick's clock,
+    // so a month of rollovers runs without a single wait. `flush_now` is
+    // `flush_at(Utc::now())`, so these exercise the production flush.
+
+    /// `(active, settled)` bucket counts.
+    fn counts(accumulator: &SpendAccumulator) -> (usize, usize) {
+        accumulator.inner.buckets.lock().unwrap().counts()
+    }
+
+    fn record_unpriced(accumulator: &SpendAccumulator, tenant: &TenantId, at: DateTime<Utc>) {
+        accumulator.record(
+            tenant,
+            at,
+            Period::Daily,
+            Charge::Unpriced,
+            Some("cluster-z"),
+            Some("model-z"),
+        );
+    }
+
+    /// Growth is bounded by the live set, not by how many periods have gone
+    /// by. Fourteen daily and six monthly rollovers; after the grace the map
+    /// is back to exactly the live buckets, and inside the grace it holds at
+    /// most one extra period, never more.
+    ///
+    /// Mutation: skip the `settle` call after a confirmed delivery in
+    /// `flush_at` (buckets then stay in `active` forever).
+    #[test]
+    fn memory_returns_to_the_live_set_across_many_period_rollovers() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        let daily: Vec<TenantId> = (0..5)
+            .map(|i| TenantId::new(format!("daily-{i}")))
+            .collect();
+        let monthly: Vec<TenantId> = (0..3)
+            .map(|i| TenantId::new(format!("monthly-{i}")))
+            .collect();
+        for day in 1..=14u32 {
+            // Half an hour into the day: yesterday's buckets have ended, get
+            // their one final reconciliation, and wait out the grace.
+            accumulator
+                .inner
+                .flush_at(dt(2026, 9, day, 0, 30, 0))
+                .unwrap();
+            if day > 1 {
+                assert_eq!(counts(&accumulator), (0, 5), "settled, still readable");
+            }
+            for tenant in &daily {
+                record_micros(&accumulator, tenant, dt(2026, 9, day, 12, 0, 0), 1_000);
+            }
+            accumulator
+                .inner
+                .flush_at(dt(2026, 9, day, 12, 30, 0))
+                .unwrap();
+            assert_eq!(
+                counts(&accumulator),
+                (5, 0),
+                "after the grace only today's buckets remain"
+            );
+        }
+        for month in 1..=6u32 {
+            accumulator
+                .inner
+                .flush_at(dt(2027, month, 1, 0, 30, 0))
+                .unwrap();
+            for tenant in &monthly {
+                accumulator.record(
+                    tenant,
+                    dt(2027, month, 15, 12, 0, 0),
+                    Period::Monthly,
+                    Charge::Priced(MicroUsd::from_micros(2_000)),
+                    None,
+                    None,
+                );
+            }
+            accumulator
+                .inner
+                .flush_at(dt(2027, month, 15, 12, 30, 0))
+                .unwrap();
+            // The last daily bucket ended long ago and is gone; only this
+            // month's three remain.
+            assert_eq!(counts(&accumulator), (3, 0));
+        }
+
+        // Eviction removed memory, not money.
+        for day in 1..=14u32 {
+            for tenant in &daily {
+                let key = Period::Daily.key_for(dt(2026, 9, day, 12, 0, 0));
+                assert_eq!(
+                    store.inner.load_spend("test-chain", tenant, &key).unwrap(),
+                    1_000
+                );
+            }
+        }
+        for tenant in &monthly {
+            let key = Period::Monthly.key_for(dt(2027, 3, 15, 0, 0, 0));
+            assert_eq!(
+                store.inner.load_spend("test-chain", tenant, &key).unwrap(),
+                2_000
+            );
+        }
+    }
+
+    /// A charge for a period that has already been evicted recreates the
+    /// bucket, reseeds its sequence from the store, and lands exactly once.
+    /// Run as request workers run: memory-only, so the recreated bucket's base
+    /// is zero and the total can only be right if the flush adopts the
+    /// store's.
+    ///
+    /// The negatives carry the weight: 100 would mean the late charge was
+    /// dropped as a replay of an old sequence, and 200 or 214 would mean the
+    /// evicted bucket's spend was delivered again.
+    ///
+    /// Mutation: in `Bucket::new`, start `next_seq` at `Some(1)` instead of
+    /// leaving it unseeded.
+    #[test]
+    fn a_late_charge_after_eviction_reseeds_from_the_store_and_lands_exactly_once() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        accumulator.prepare_tenant_request_workers(&[]).unwrap();
+        let tenant = TenantId::new("tenant-a");
+        let day = dt(2026, 9, 3, 12, 0, 0);
+        let key = Period::Daily.key_for(day);
+
+        record_micros(&accumulator, &tenant, day, 100);
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 3, 12, 30, 0))
+            .unwrap();
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 4, 0, 30, 0))
+            .unwrap();
+        assert_eq!(counts(&accumulator), (0, 1), "settled, inside the grace");
+        accumulator.inner.flush_at(dt(2026, 9, 4, 2, 0, 0)).unwrap();
+        assert_eq!(counts(&accumulator), (0, 0), "evicted after the grace");
+        let seq_before = store
+            .inner
+            .last_flush_seq("test-chain", &tenant, &key, "test-node")
+            .unwrap();
+
+        // A straggler stamped with the old period.
+        record_micros(&accumulator, &tenant, day, 7);
+        assert_eq!(counts(&accumulator), (1, 0), "recreated");
+        accumulator.inner.flush_at(dt(2026, 9, 4, 3, 0, 0)).unwrap();
+
+        assert_eq!(
+            store.inner.load_spend("test-chain", &tenant, &key).unwrap(),
+            107,
+            "100 + 7: not 100 (late charge dropped as a replay), not 207 or 214 \
+             (the evicted bucket's spend delivered again)"
+        );
+        assert_eq!(
+            store
+                .inner
+                .last_flush_seq("test-chain", &tenant, &key, "test-node")
+                .unwrap(),
+            seq_before + 1,
+            "the recreated bucket continued the sequence instead of restarting it"
+        );
+        assert_eq!(counts(&accumulator), (0, 0), "and was evicted again");
+    }
+
+    /// Live periods keep the zero-delta call (an idle replica must still learn
+    /// what the others spent); an ended period gets exactly one final
+    /// reconciliation and then costs the store nothing.
+    ///
+    /// Mutation: make `reconciled_after_end` always true, so the final
+    /// reconciliation is skipped and the bucket is never settled.
+    #[test]
+    fn an_ended_bucket_with_nothing_to_deliver_makes_no_store_call() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        let tenant = TenantId::new("tenant-a");
+        record_micros(&accumulator, &tenant, dt(2026, 9, 3, 12, 0, 0), 5);
+
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 3, 12, 30, 0))
+            .unwrap();
+        assert_eq!(store.add_spend_calls(), 1);
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 3, 12, 35, 0))
+            .unwrap();
+        assert_eq!(store.add_spend_calls(), 2, "live and idle: still syncs");
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 4, 0, 10, 0))
+            .unwrap();
+        assert_eq!(store.add_spend_calls(), 3, "one final reconciliation");
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 4, 0, 15, 0))
+            .unwrap();
+        accumulator.inner.flush_at(dt(2026, 9, 4, 6, 0, 0)).unwrap();
+        assert_eq!(store.add_spend_calls(), 3, "settled, then gone: no calls");
+        assert_eq!(counts(&accumulator), (0, 0));
+    }
+
+    /// A past-period bucket that could not deliver keeps its spend, is not
+    /// evicted, and the spend lands exactly once when the store returns,
+    /// including when the first attempt landed and only its response was lost.
+    ///
+    /// Mutation: drop the `attempt.is_none()` term from `Bucket::is_settled`
+    /// and clear `attempt` on a failed delivery.
+    #[test]
+    fn a_past_period_bucket_that_failed_to_flush_keeps_its_spend_until_the_store_confirms() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        let tenant = TenantId::new("tenant-a");
+        let day = dt(2026, 9, 3, 12, 0, 0);
+        let key = Period::Daily.key_for(day);
+        record_micros(&accumulator, &tenant, day, 40);
+
+        store.fail_add_spend.store(true, SeqCst);
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 6, 0, 0, 0))
+            .unwrap_err();
+        assert_eq!(counts(&accumulator), (1, 0), "not evicted: it owes 40");
+        assert_eq!(
+            store.inner.load_spend("test-chain", &tenant, &key).unwrap(),
+            0
+        );
+
+        store.fail_add_spend.store(false, SeqCst);
+        store.lose_next_response.store(true, SeqCst);
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 6, 0, 1, 0))
+            .unwrap_err();
+        assert_eq!(counts(&accumulator), (1, 0), "landed but unconfirmed");
+        assert_eq!(
+            store.inner.load_spend("test-chain", &tenant, &key).unwrap(),
+            40
+        );
+
+        accumulator.inner.flush_at(dt(2026, 9, 6, 0, 2, 0)).unwrap();
+        assert_eq!(
+            store.inner.load_spend("test-chain", &tenant, &key).unwrap(),
+            40,
+            "the retry reused its sequence, so it was recognised, not charged again"
+        );
+        assert_eq!(
+            counts(&accumulator),
+            (0, 0),
+            "confirmed, settled and evicted"
+        );
+    }
+
+    /// A charge that arrives while the bucket is mid-delivery must not be
+    /// evicted with it. The store double records one from inside `add_spend`,
+    /// after the delta applied and before the flusher takes the mutex to
+    /// settle the bucket: the real interleaving, not a staged state.
+    ///
+    /// Mutation: remove `self.pending_delta_micros == 0` from
+    /// `Bucket::is_settled`; the 3 is then evicted unsent and the final
+    /// assertion reads 40.
+    #[test]
+    fn a_charge_recorded_during_a_delivery_is_not_evicted_with_the_bucket() {
+        let store = ProbeStore::new();
+        let accumulator = Arc::new(accumulator_over(&store));
+        let tenant = TenantId::new("tenant-a");
+        let day = dt(2026, 9, 3, 12, 0, 0);
+        let key = Period::Daily.key_for(day);
+        record_micros(&accumulator, &tenant, day, 40);
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 3, 12, 30, 0))
+            .unwrap();
+        {
+            // `Weak`: the store would otherwise own the accumulator that owns it.
+            let weak = Arc::downgrade(&accumulator);
+            let tenant = tenant.clone();
+            let fired = std::sync::atomic::AtomicBool::new(false);
+            *store.after_add_spend.lock().unwrap() = Some(Box::new(move || {
+                if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    record_micros(&weak.upgrade().unwrap(), &tenant, day, 3);
+                }
+            }));
+        }
+
+        // The final reconciliation of the ended period is where it lands.
+        accumulator.inner.flush_at(dt(2026, 9, 4, 6, 0, 0)).unwrap();
+        *store.after_add_spend.lock().unwrap() = None;
+        assert_eq!(counts(&accumulator), (1, 0), "it still owes the 3");
+        assert_eq!(
+            store.inner.load_spend("test-chain", &tenant, &key).unwrap(),
+            40
+        );
+
+        accumulator.inner.flush_at(dt(2026, 9, 4, 6, 5, 0)).unwrap();
+        assert_eq!(
+            store.inner.load_spend("test-chain", &tenant, &key).unwrap(),
+            43
+        );
+        assert_eq!(counts(&accumulator), (0, 0));
+    }
+
+    /// Reports for an ended period: from memory while the bucket is settled
+    /// (unpriced detail included, and the read does not put the bucket back
+    /// in the flusher's set), from the store once it is evicted, without
+    /// creating a bucket. The evicted case runs memory-only, where recreating
+    /// the bucket would answer 0. The unpriced detail does not survive
+    /// eviction; that is the documented change.
+    ///
+    /// Mutation: have `report_at` always call `get_or_load_bucket`.
+    #[test]
+    fn a_report_for_an_ended_period_answers_from_memory_then_from_the_store() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        accumulator.prepare_tenant_request_workers(&[]).unwrap();
+        let tenant = TenantId::new("tenant-a");
+        let day = dt(2026, 9, 3, 12, 0, 0);
+        let key = Period::Daily.key_for(day);
+        record_micros(&accumulator, &tenant, day, 100);
+        record_unpriced(&accumulator, &tenant, day);
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 3, 12, 30, 0))
+            .unwrap();
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 4, 0, 30, 0))
+            .unwrap();
+
+        let settled = accumulator.report_at(&tenant, &key, dt(2026, 9, 4, 0, 40, 0));
+        assert_eq!(settled.total_micros, 100);
+        assert_eq!(settled.unpriced_requests, 1);
+        assert_eq!(
+            settled.unpriced_pairs,
+            vec![("cluster-z".to_string(), "model-z".to_string())]
+        );
+        assert_eq!(
+            counts(&accumulator),
+            (0, 1),
+            "a read does not reactivate it"
+        );
+
+        accumulator.inner.flush_at(dt(2026, 9, 4, 2, 0, 0)).unwrap();
+        let evicted = accumulator.report_at(&tenant, &key, dt(2026, 9, 4, 2, 10, 0));
+        assert_eq!(
+            evicted.total_micros, 100,
+            "from the store, not a fresh zero"
+        );
+        assert_eq!(
+            evicted.unpriced_requests, 0,
+            "the detail lived in the bucket"
+        );
+        assert!(evicted.unpriced_pairs.is_empty());
+        assert_eq!(counts(&accumulator), (0, 0), "and a read created nothing");
+
+        // The current period is unchanged: a live miss still creates.
+        let live_key = Period::Daily.key_for(dt(2026, 9, 4, 2, 10, 0));
+        let live = accumulator.report_at(&tenant, &live_key, dt(2026, 9, 4, 2, 10, 0));
+        assert_eq!(live.total_micros, 0);
+        assert_eq!(counts(&accumulator), (1, 0));
+    }
+
+    #[test]
+    fn a_period_key_knows_when_its_period_ends() {
+        let end = |key: &str| PeriodKey::for_test(key).ends_at();
+        assert_eq!(end("2026-08-31"), Some(dt(2026, 9, 1, 0, 0, 0)));
+        assert_eq!(end("2026-12"), Some(dt(2027, 1, 1, 0, 0, 0)));
+        assert_eq!(end("2028-02-29"), Some(dt(2028, 3, 1, 0, 0, 0)));
+        for malformed in [
+            "",
+            "2026",
+            "2026-8-1",
+            "2026-13",
+            "2026-02-30",
+            "not-a-date!",
+        ] {
+            assert_eq!(end(malformed), None, "{malformed:?}");
+        }
     }
 }
