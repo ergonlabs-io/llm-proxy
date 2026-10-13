@@ -154,3 +154,25 @@ fn ext_authz_context_hierarchy_bounds_and_wrapper_paths_are_validated_before_tra
         .to_string();
     assert!(error.contains("typed_per_filter_config[external_auth].config.typed_config.check_settings.context_extensions"), "{error}");
 }
+
+#[test]
+fn ext_authz_after_another_http_filter_is_rejected_with_its_path() {
+    let block_start = EXAMPLE
+        .find("                  - name: envoy.filters.http.ext_authz")
+        .unwrap();
+    let block_end = EXAMPLE
+        .find("                  - name: envoy.filters.http.router")
+        .unwrap();
+    let ext_authz_block = &EXAMPLE[block_start..block_end];
+    let second = EXAMPLE.replacen(
+        "                  - name: envoy.filters.http.router",
+        &format!("{ext_authz_block}                  - name: envoy.filters.http.router"),
+        1,
+    );
+    let error = load(&second).unwrap_err().to_string();
+    assert!(error.contains("http_filters[1].typed_config"), "{error}");
+    assert!(
+        error.contains("ext_authz must be the first HTTP filter"),
+        "{error}"
+    );
+}

@@ -1,11 +1,11 @@
-//! JWT verification against a STATICALLY configured
-//! JWKS.
+//! JWT verification against a cached JWKS snapshot.
 //!
-//! **Library only**, exactly like [`crate::auth`]: this
-//! module is a second `impl` [`crate::auth::Authenticator`] and is not wired
-//! into [`crate::auth_filter`]'s `AuthenticatorChain` here -- see this
-//! module's closing section, "What this module does not build", for why
-//! and for what is still owed.
+//! This module is a second `impl` [`crate::auth::Authenticator`].
+//! [`crate::auth_filter`] pushes one [`JwtAuthenticator`] per configured JWT
+//! provider onto its `AuthenticatorChain`, after the virtual-key
+//! authenticator. The key set is either static (from config) or kept fresh
+//! over HTTPS by [`crate::jwks_refresh`]; see this module's closing section,
+//! "What this module does not build", for the split.
 //!
 //! # Which algorithms this authenticator accepts, and only these
 //!
@@ -75,11 +75,10 @@
 //!
 //! # What this module does not build
 //!
-//! No network JWKS fetch, no refresh timer, no `ArcSwap` snapshot *here* --
-//! but the open question this section used to pose is now settled: the
-//! synchronous [`crate::auth::Authenticator`] trait accommodates
-//! asynchronous refresh with no reshaping, because refresh publishes and
-//! verification only ever loads. [`crate::jwks_refresh`] owns the OIDC
+//! No network JWKS fetch and no refresh timer *here*. The synchronous
+//! [`crate::auth::Authenticator`] trait accommodates asynchronous refresh
+//! with no reshaping, because refresh publishes and verification only ever
+//! loads. [`crate::jwks_refresh`] owns the OIDC
 //! discovery document fetch, the JWKS fetch, the background thread, and the
 //! shared snapshot; this module only ever `load()`s it. Filter wiring
 //! (`auth_filter`'s `AuthenticatorChain`, `typed_config` parsing including

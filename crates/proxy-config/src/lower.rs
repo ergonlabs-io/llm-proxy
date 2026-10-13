@@ -2022,7 +2022,7 @@ fn convert_hcm(
             if i != 0 {
                 return Err(unsupported(
                     format!("{f_path}.typed_config"),
-                    "this header-only increment requires ext_authz first in the decoder chain",
+                    "ext_authz must be the first HTTP filter in the decoder chain",
                 ));
             }
             Some(convert_ext_authz(

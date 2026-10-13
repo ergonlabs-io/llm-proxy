@@ -1182,13 +1182,10 @@ impl HttpFilter for AuthFilterInstance {
                 self.deny(cb, "auth_revoked_key");
                 FilterHeadersStatus::Continue
             }
-            // `crate::jwt_auth::JwtAuthenticator`'s
-            // rejection reasons. No `JwtAuthenticator` is pushed onto this
-            // filter's chain yet (that wiring is 2c-ii), so these arms are
-            // unreachable today -- they exist only because `AuthError` is
-            // matched exhaustively here, and each still gets its own
-            // `details` string now so the wiring step does not also have to
-            // touch this match.
+            // `crate::jwt_auth::JwtAuthenticator`'s rejection reasons. Each
+            // configured JWT provider is pushed onto this filter's chain
+            // after the virtual-key authenticator (see the factory above), so
+            // each reason gets its own `details` string.
             AuthOutcome::Rejected(AuthError::JwtMalformed) => {
                 self.deny(cb, "auth_jwt_malformed");
                 FilterHeadersStatus::Continue
