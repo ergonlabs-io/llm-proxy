@@ -21,7 +21,6 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -352,13 +351,11 @@ fn apply_health_transition(host_set: &ArcSwap<HostSet>, addr: SocketAddr, status
                             failed_active_hc,
                             failed_outlier_check: h.health_flags.failed_outlier_check,
                         },
-                        // Carried over, not reset -- a health flip must not
-                        // erase in-flight accounting that `LeastRequestLb`
-                        // reads. (A concurrent increment landing between this
-                        // read and the swap is still lost; that is inherent to
-                        // rebuilding an immutable `Host` and is transient
-                        // counter drift, not lost health state.)
-                        active_requests: AtomicU64::new(h.active_request_count()),
+                        // Shared, not copied -- a health flip must not erase
+                        // in-flight accounting that `LeastRequestLb` reads,
+                        // and a guard holding the old snapshot must decrement
+                        // the counter the new snapshot reads.
+                        active_requests: Arc::clone(&h.active_requests),
                     })
                 } else {
                     h
@@ -445,8 +442,26 @@ mod tests {
             weight: 1,
             priority,
             health_flags: HealthFlags::default(),
-            active_requests: AtomicU64::new(0),
+            active_requests: Default::default(),
         })
+    }
+
+    #[test]
+    fn health_transition_rebuild_shares_the_in_flight_counter() {
+        let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let host_set = ArcSwap::from_pointee(HostSet::from_hosts(vec![host(a, 0)]));
+        let guard = host_set.load().all_hosts()[0].begin_request();
+
+        apply_health_transition(&host_set, a, HealthStatus::Unhealthy);
+        let rebuilt = host_set.load().all_hosts()[0].clone();
+        assert!(
+            !rebuilt.is_healthy(),
+            "the transition really rebuilt the host"
+        );
+        assert_eq!(rebuilt.active_request_count(), 1);
+
+        drop(guard);
+        assert_eq!(rebuilt.active_request_count(), 0, "not stuck at 1");
     }
 
     // -------------------------------------------- ConsecutiveTracker (pure) --

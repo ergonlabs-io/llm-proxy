@@ -136,25 +136,28 @@ pub fn carry_over_health_flags(old: &HostSet, new: HostSet, diff: &HostSetDiff) 
     if diff.unchanged.is_empty() {
         return new;
     }
-    let old_flags: HashMap<SocketAddr, HealthFlags> = old
+    // Flags and the in-flight counter both come from the host the traffic is
+    // already running against: a fresh discovery `Host` has a zeroed counter,
+    // and guards held by in-flight requests decrement the old one.
+    let old_state: HashMap<SocketAddr, (HealthFlags, Arc<AtomicU64>)> = old
         .all_hosts()
         .iter()
-        .map(|h| (h.address, h.health_flags))
+        .map(|h| (h.address, (h.health_flags, Arc::clone(&h.active_requests))))
         .collect();
     let hosts: Vec<Arc<Host>> = new
         .all_hosts()
         .into_iter()
-        .map(|h| match old_flags.get(&h.address) {
-            Some(flags) if *flags != h.health_flags => Arc::new(Host {
+        .map(|h| match old_state.get(&h.address) {
+            Some((flags, counter)) => Arc::new(Host {
                 address: h.address,
                 hostname: h.hostname.clone(),
                 metadata: h.metadata.clone(),
                 weight: h.weight,
                 priority: h.priority,
                 health_flags: *flags,
-                active_requests: AtomicU64::new(h.active_request_count()),
+                active_requests: Arc::clone(counter),
             }),
-            _ => h,
+            None => h,
         })
         .collect();
     HostSet::from_hosts(hosts)
@@ -173,7 +176,7 @@ mod tests {
             weight: 1,
             priority,
             health_flags: crate::HealthFlags::default(),
-            active_requests: std::sync::atomic::AtomicU64::new(0),
+            active_requests: Default::default(),
         })
     }
 
@@ -202,5 +205,55 @@ mod tests {
         assert_eq!(set.hosts_for_priority(0).len(), 1);
         assert_eq!(set.hosts_for_priority(1).len(), 1);
         assert!(set.hosts_for_priority(2).is_empty());
+    }
+
+    #[test]
+    fn carry_over_shares_the_in_flight_counter_with_the_old_snapshot() {
+        let old = HostSet::from_hosts(vec![host([10, 0, 0, 1], 80, 0), host([10, 0, 0, 2], 80, 0)]);
+        let guard = old.all_hosts()[0].begin_request();
+        let gone = old.all_hosts()[1].begin_request();
+
+        // A discovery refresh builds brand-new `Host`s (counter 0) for the
+        // same addresses; host 2 leaves, host 3 is new.
+        let fresh =
+            HostSet::from_hosts(vec![host([10, 0, 0, 1], 80, 0), host([10, 0, 0, 3], 80, 0)]);
+        let diff = diff_host_sets(&old, &fresh);
+        let merged = carry_over_health_flags(&old, fresh, &diff);
+        let by_addr = |ip: u8| {
+            merged
+                .all_hosts()
+                .into_iter()
+                .find(|h| h.address.ip() == IpAddr::V4(Ipv4Addr::new(10, 0, 0, ip)))
+                .unwrap()
+        };
+
+        assert_eq!(
+            by_addr(1).active_request_count(),
+            1,
+            "persisting host keeps its count"
+        );
+        assert_eq!(
+            by_addr(3).active_request_count(),
+            0,
+            "new endpoint starts at 0"
+        );
+        drop(guard);
+        assert_eq!(
+            by_addr(1).active_request_count(),
+            0,
+            "old guard decrements the shared counter"
+        );
+        drop(gone);
+    }
+
+    #[test]
+    fn guard_balances_the_counter() {
+        let h = host([10, 0, 0, 1], 80, 0);
+        let (a, b) = (h.begin_request(), h.begin_request());
+        assert_eq!(h.active_request_count(), 2);
+        drop(a);
+        assert_eq!(h.active_request_count(), 1);
+        drop(b);
+        assert_eq!(h.active_request_count(), 0);
     }
 }

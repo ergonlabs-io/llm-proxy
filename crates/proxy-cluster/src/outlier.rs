@@ -56,7 +56,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -768,7 +767,7 @@ impl OutlierDetector {
                             failed_active_hc: h.health_flags.failed_active_hc,
                             failed_outlier_check: ejected,
                         },
-                        active_requests: AtomicU64::new(h.active_request_count()),
+                        active_requests: Arc::clone(&h.active_requests),
                     })
                 })
                 .collect();
@@ -830,7 +829,6 @@ mod tests {
     use crate::load_balancer::{HostPicker, RoundRobinLb};
     use crate::LoadBalancerContext;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::atomic::AtomicU64;
 
     /// The IR duplicates every S6 default because `proxy-config` cannot
     /// depend on `proxy-cluster` (the dependency runs the other way). This
@@ -858,8 +856,25 @@ mod tests {
             weight: 1,
             priority: 0,
             health_flags: HealthFlags::default(),
-            active_requests: AtomicU64::new(0),
+            active_requests: Default::default(),
         })
+    }
+
+    #[test]
+    fn ejection_rebuild_shares_the_in_flight_counter() {
+        let host_set = ArcSwap::from_pointee(HostSet::from_hosts(vec![host(1)]));
+        let guard = host_set.load().all_hosts()[0].begin_request();
+
+        assert!(OutlierDetector::set_outlier_flag(&host_set, addr(1), true));
+        let rebuilt = host_set.load().all_hosts()[0].clone();
+        assert!(
+            !rebuilt.is_healthy(),
+            "the ejection really rebuilt the host"
+        );
+        assert_eq!(rebuilt.active_request_count(), 1);
+
+        drop(guard);
+        assert_eq!(rebuilt.active_request_count(), 0, "not stuck at 1");
     }
 
     /// Captures every event emitted, for assertion.
@@ -1338,7 +1353,7 @@ mod tests {
                                 failed_active_hc: true,
                                 failed_outlier_check: h.health_flags.failed_outlier_check,
                             },
-                            active_requests: AtomicU64::new(h.active_request_count()),
+                            active_requests: Arc::clone(&h.active_requests),
                         })
                     } else {
                         h

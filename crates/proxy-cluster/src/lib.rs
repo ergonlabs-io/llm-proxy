@@ -138,11 +138,16 @@ pub struct Host {
     /// independently -- see [`HealthFlags`].
     pub health_flags: HealthFlags,
     /// In-flight request count, read by `LEAST_REQUEST`'s power-of-two-choices
-    /// pick (S7). TODO: the connection pool and router
-    /// are what actually `fetch_add`/`fetch_sub` this as requests start and
-    /// finish; until those land it stays 0 for every host, which just makes
-    /// `LEAST_REQUEST` degrade to uniform random.
-    pub active_requests: AtomicU64,
+    /// pick (S7). The router takes an [`ActiveRequestGuard`] from
+    /// [`Host::begin_request`] for every upstream attempt and holds it until
+    /// the response body completes or is dropped.
+    ///
+    /// Rust note: an `Arc`, not a bare atomic, because `Host` is an immutable
+    /// snapshot that health checks, outlier detection and discovery rebuild.
+    /// Every rebuild of the same endpoint clones this `Arc`, so a guard
+    /// taken on an old snapshot still decrements the counter the new
+    /// snapshot reads. Only a genuinely new endpoint gets a fresh counter.
+    pub active_requests: Arc<AtomicU64>,
     // TODO: locality.
 }
 
@@ -164,13 +169,34 @@ impl Host {
         self.active_requests.load(Ordering::Relaxed)
     }
 
+    /// Count one in-flight request against this host until the returned
+    /// guard drops.
+    pub fn begin_request(&self) -> ActiveRequestGuard {
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        ActiveRequestGuard {
+            counter: Arc::clone(&self.active_requests),
+        }
+    }
+
     /// Test seam for [`crate::load_balancer`]'s `LEAST_REQUEST` tests: set
-    /// the counter directly instead of going through fetch_add/fetch_sub
-    /// (which real callers will use once the connection pool and router
-    /// increment it).
+    /// the counter directly for pick-algorithm unit tests.
     #[cfg(test)]
     pub(crate) fn set_active_requests_for_test(&self, n: u64) {
         self.active_requests.store(n, Ordering::Relaxed);
+    }
+}
+
+/// RAII handle for one in-flight request on a [`Host`]; dropping it
+/// decrements the host's counter, so every exit path (completion, error,
+/// downstream cancel) is balanced without explicit bookkeeping.
+#[derive(Debug)]
+pub struct ActiveRequestGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -323,6 +349,7 @@ impl BudgetHandle {
         Some(CbGuard {
             active: Arc::clone(&self.active),
             notify: self.notify.clone(),
+            _active_request: None,
         })
     }
 }
@@ -337,6 +364,27 @@ pub struct CbGuard {
     /// one parked waiter after this guard's `Drop` frees the slot. `None`
     /// for every other budget's guard.
     notify: Option<Arc<tokio::sync::Notify>>,
+    /// An in-flight-request count riding on this guard so it shares the
+    /// guard's lifetime. Only set for upgraded tunnels, whose
+    /// `UpgradeTunnel` carries a single `CbGuard` for the connection's whole
+    /// life; field order means it drops after the budget slot is released.
+    _active_request: Option<ActiveRequestGuard>,
+}
+
+impl CbGuard {
+    /// Attach `active` to `existing` (or to a stand-alone guard when the
+    /// dial had no budget slot) so both are released together.
+    pub fn with_active_request(existing: Option<CbGuard>, active: ActiveRequestGuard) -> CbGuard {
+        let mut guard = existing.unwrap_or_else(|| CbGuard {
+            // A private gauge no budget reads: starts at 1 so this guard's
+            // own `Drop` decrement balances it.
+            active: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            notify: None,
+            _active_request: None,
+        });
+        guard._active_request = Some(active);
+        guard
+    }
 }
 
 impl Drop for CbGuard {

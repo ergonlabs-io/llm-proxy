@@ -826,6 +826,14 @@ impl RouterHandler {
             }
         };
         let proxy_cluster::UpstreamStream { io, cb_guard } = upstream_stream;
+        // Count this upgraded connection against the host for the tunnel's
+        // whole life: the guard rides on `cb_guard`, which the declined
+        // path ties to the response body and the accepted path hands to
+        // `UpgradeTunnel` (held until the bridge ends).
+        let cb_guard = Some(proxy_cluster::CbGuard::with_active_request(
+            cb_guard,
+            host.begin_request(),
+        ));
 
         let body_bytes = self.captured_body.clone();
         dcb.stream_info().bytes_received = body_bytes.len() as u64;
@@ -1167,8 +1175,6 @@ impl RouterHandler {
                 };
                 // A hedge moves the original attempt's guard into its local
                 // task; ordinary response handling retains it here.
-                let mut rq_guard = Some(rq_guard);
-
                 let sel = match select_host_for_request(entry.as_ref(), &mut ctx) {
                     Ok(sel) => sel,
                     Err(NoHost::Ineligible(provider)) => {
@@ -1191,6 +1197,10 @@ impl RouterHandler {
                     }
                 };
                 let host = sel.host;
+                // `LEAST_REQUEST` reads this count. It lives and dies with
+                // `rq_guard` (response body, hedge task, or the end of this
+                // iteration on retry/error), so each attempt counts once.
+                let mut rq_guard = Some((rq_guard, host.begin_request()));
                 // `entry` is the *routed* cluster (a plain cluster,
                 // or an aggregate); `sel.member` is set only when `entry` is
                 // an aggregate and names the member that actually owns

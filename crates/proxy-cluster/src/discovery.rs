@@ -13,7 +13,6 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,7 +81,7 @@ pub(crate) fn static_hosts(endpoints: &[EndpointIR]) -> io::Result<Vec<Arc<Host>
                 weight: e.weight,
                 priority: e.priority,
                 health_flags: HealthFlags::default(),
-                active_requests: AtomicU64::new(0),
+                active_requests: Default::default(),
             }))
         })
         .collect()
@@ -105,7 +104,7 @@ async fn strict_dns_hosts(
                 weight: e.weight,
                 priority: e.priority,
                 health_flags: HealthFlags::default(),
-                active_requests: AtomicU64::new(0),
+                active_requests: Default::default(),
             })
         }));
     }
@@ -144,7 +143,7 @@ async fn logical_dns_hosts(
                 weight: e.weight,
                 priority: e.priority,
                 health_flags: HealthFlags::default(),
-                active_requests: AtomicU64::new(0),
+                active_requests: Default::default(),
             }));
         }
     }

@@ -2021,7 +2021,7 @@ mod tests {
                     failed_active_hc: true,
                     failed_outlier_check: false,
                 },
-                active_requests: std::sync::atomic::AtomicU64::new(0),
+                active_requests: Default::default(),
             })])));
 
         // Same DNS record set -- `addr` is `unchanged`, so its flipped flag
@@ -2843,7 +2843,7 @@ mod tests {
                     failed_active_hc: true,
                     failed_outlier_check: false,
                 },
-                active_requests: std::sync::atomic::AtomicU64::new(0),
+                active_requests: Default::default(),
             })])));
 
         // Reload with ONLY b's config changed.
@@ -3557,7 +3557,7 @@ mod tests {
                                 failed_active_hc: true,
                                 failed_outlier_check: false,
                             },
-                            active_requests: std::sync::atomic::AtomicU64::new(0),
+                            active_requests: Default::default(),
                         })
                     })
                     .collect();

@@ -235,10 +235,10 @@ const DEFAULT_CHOICE_COUNT: usize = 2;
 
 /// `LEAST_REQUEST` (S7): pick `choice_count` candidates uniformly at random
 /// and take whichever has fewer active requests ("power of two choices" when
-/// `choice_count` is 2, Envoy's default). Until the connection pool and
-/// the router start incrementing/decrementing `Host::active_requests`,
-/// every host reads 0 and this degrades to uniform random -- which is the
-/// correct behavior for "no signal yet", not a bug.
+/// `choice_count` is 2, Envoy's default). The router holds a
+/// `Host::begin_request` guard for each attempt's whole life, so
+/// `Host::active_requests` is the live in-flight count; with all hosts idle
+/// this is uniform random.
 pub struct LeastRequestLb {
     choice_count: usize,
     rng: Mutex<StdRng>,
@@ -448,7 +448,6 @@ mod tests {
     use crate::{HealthFlags, HealthStatus};
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::atomic::AtomicU64;
 
     fn addr(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), 80)
@@ -472,7 +471,7 @@ mod tests {
                 failed_active_hc: health == HealthStatus::Unhealthy,
                 failed_outlier_check: false,
             },
-            active_requests: AtomicU64::new(0),
+            active_requests: Default::default(),
         })
     }
 
