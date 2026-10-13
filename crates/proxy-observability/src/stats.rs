@@ -506,6 +506,18 @@ pub mod instruments {
         buckets: None,
     };
 
+    /// Downstream connections closed because the transport socket (TLS)
+    /// handshake did not finish within the filter chain's
+    /// `transport_socket_connect_timeout`. Envoy's own listener stat of the
+    /// same name.
+    pub const DOWNSTREAM_CX_TRANSPORT_SOCKET_CONNECT_TIMEOUT: Instrument = Instrument {
+        name: "downstream_cx_transport_socket_connect_timeout",
+        kind: InstrumentKind::Counter,
+        unit: "{connection}",
+        attribute_keys: &["listener"],
+        buckets: None,
+    };
+
     /// Tokens consumed by a GenAI request/response exchange. **Has no Envoy
     /// equivalent** — Envoy predates LLM gateways — so this renders to
     /// nothing in the `/stats` text output; it exists in

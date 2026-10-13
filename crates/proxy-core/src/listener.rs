@@ -947,6 +947,7 @@ fn spawn_accept_loop(
                 registry: registry.clone(),
                 shutdown: shutdown.clone(),
                 drain: drain.clone(),
+                downstream_stats: downstream_stats.clone(),
                 _connection_slot: connection_slot,
             }));
         }
@@ -1009,6 +1010,8 @@ struct ServeConnection {
     registry: ConnectionRegistry,
     shutdown: watch::Receiver<bool>,
     drain: watch::Receiver<DrainState>,
+    /// Counts a handshake that misses its deadline.
+    downstream_stats: Arc<DownstreamStats>,
     /// Held for the connection task's whole life; dropping it (on any exit
     /// path) frees the global connection-limit slot.
     _connection_slot: crate::admission::ConnectionSlot,
@@ -1037,6 +1040,7 @@ async fn serve_connection(conn: ServeConnection) {
         registry,
         shutdown,
         drain,
+        downstream_stats,
         _connection_slot,
     } = conn;
 
@@ -1158,6 +1162,7 @@ async fn serve_connection(conn: ServeConnection) {
                 // (`None`); the inner `Result` is the handshake's own outcome.
                 None => {
                     // Returning drops the stream and, with it, the admission slot.
+                    downstream_stats.record_transport_socket_connect_timeout(&name);
                     tracing::debug!(listener = %name, peer = %peer, "TLS handshake timed out; closing connection");
                 }
                 Some(Ok(tls_stream)) => {
@@ -2528,6 +2533,7 @@ mod tests {
         shutdown_tx: watch::Sender<bool>,
         registry: ConnectionRegistry,
         manager: tokio::task::JoinHandle<()>,
+        stats_control: proxy_observability::stats::StatsControl,
     }
 
     /// Builds a [`ClusterManager`] populated (and force-initialized, so
@@ -2681,10 +2687,24 @@ mod tests {
             shutdown_tx,
             registry,
             manager,
+            stats_control,
         }
     }
 
     impl Harness {
+        /// The Envoy `/stats` text for everything this harness's workers recorded.
+        fn stats(&self) -> String {
+            proxy_observability::stats::envoy_render::render(&self.stats_control.registry())
+        }
+
+        /// The value `stats()` renders for `name`, or `None` if absent.
+        fn counter(&self, name: &str) -> Option<u64> {
+            let prefix = format!("{name}: ");
+            self.stats()
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix.as_str())?.parse().ok())
+        }
+
         fn publish(&self, snapshot: Arc<ConfigSnapshot>) {
             self.config.store(snapshot.clone());
             let _ = self.config_tx.send(snapshot.version);
@@ -3681,6 +3701,9 @@ mod tests {
         }
     }
 
+    const HANDSHAKE_TIMEOUT_STAT: &str =
+        "listener.l1.downstream_cx_transport_socket_connect_timeout";
+
     #[test]
     fn stalled_tls_handshake_is_closed_at_the_deadline_and_frees_the_slot() {
         run_local(async {
@@ -3706,11 +3729,14 @@ mod tests {
                 "the second connection should be refused while the first holds the slot"
             );
 
-            // The proxy, not the client, ends the stalled handshake.
+            // The proxy, not the client, ends the stalled handshake, and
+            // counts it once. The overflow connection never reached a
+            // handshake, so it is not counted.
             assert!(
                 closed_within(&mut stalled, Duration::from_secs(5)).await,
                 "a stalled TLS handshake must be closed by the handshake deadline"
             );
+            assert_eq!(harness.counter(HANDSHAKE_TIMEOUT_STAT), Some(1));
 
             // The slot is free again: a real TLS client completes a handshake.
             let tcp = TcpStream::connect(addr).await.expect("connect");
@@ -3759,6 +3785,7 @@ mod tests {
                 held.is_err(),
                 "a completed handshake must outlive the handshake deadline, got {held:?}"
             );
+            assert_eq!(harness.counter(HANDSHAKE_TIMEOUT_STAT), Some(0));
 
             harness.shutdown().await;
         });

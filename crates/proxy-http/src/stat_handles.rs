@@ -315,12 +315,14 @@ impl RouterStats {
     }
 }
 
-/// One listener's pre-resolved `downstream_cx_total` and
-/// `downstream_global_cx_overflow` handles.
+/// One listener's pre-resolved `downstream_cx_total`,
+/// `downstream_global_cx_overflow` and
+/// `downstream_cx_transport_socket_connect_timeout` handles.
 #[derive(Debug, Clone, Copy)]
 pub struct ListenerStatHandles {
     pub cx_total: Handle,
     pub global_cx_overflow: Handle,
+    pub transport_socket_connect_timeout: Handle,
 }
 
 /// Listener name -> [`ListenerStatHandles`], mirroring [`StatHandles`]'s
@@ -375,11 +377,16 @@ impl DownstreamStatHandles {
                 &instruments::DOWNSTREAM_GLOBAL_CX_OVERFLOW,
                 &[("listener", name)],
             );
+            let transport_socket_connect_timeout = control.resolve(
+                &instruments::DOWNSTREAM_CX_TRANSPORT_SOCKET_CONNECT_TIMEOUT,
+                &[("listener", name)],
+            );
             next.insert(
                 name.to_string(),
                 ListenerStatHandles {
                     cx_total,
                     global_cx_overflow,
+                    transport_socket_connect_timeout,
                 },
             );
             changed = true;
@@ -443,6 +450,20 @@ impl DownstreamStats {
     pub fn record_global_cx_overflow(&self, listener: &str) {
         match self.handles.for_listener(listener) {
             Some(h) => self.registry.incr(self.worker, h.global_cx_overflow, 1),
+            None => self.warn_unknown_listener_once(listener),
+        }
+    }
+
+    /// Records one accepted connection closed because its transport socket
+    /// (TLS) handshake missed the filter chain's
+    /// `transport_socket_connect_timeout` (Envoy's
+    /// `downstream_cx_transport_socket_connect_timeout`). The connection was
+    /// already counted by [`Self::record_connection_accepted`].
+    pub fn record_transport_socket_connect_timeout(&self, listener: &str) {
+        match self.handles.for_listener(listener) {
+            Some(h) => self
+                .registry
+                .incr(self.worker, h.transport_socket_connect_timeout, 1),
             None => self.warn_unknown_listener_once(listener),
         }
     }

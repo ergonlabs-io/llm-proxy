@@ -240,6 +240,12 @@ fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Op
             let listener = attr(attrs, "listener")?;
             Some(format!("listener.{listener}.downstream_global_cx_overflow"))
         }
+        "downstream_cx_transport_socket_connect_timeout" => {
+            let listener = attr(attrs, "listener")?;
+            Some(format!(
+                "listener.{listener}.downstream_cx_transport_socket_connect_timeout"
+            ))
+        }
         // Everything else (llm.*, and any future counter this table
         // hasn't been taught about yet) has no Envoy /stats equivalent —
         // omitted, not invented. See the module doc's Rule 2.
@@ -365,6 +371,26 @@ mod tests {
 
         let output = render(&registry);
         assert_eq!(output, "listener.ingress_http.downstream_cx_total: 3\n");
+    }
+
+    /// Envoy's listener stat for a downstream TLS handshake that outlived
+    /// `transport_socket_connect_timeout`; the rendered key is the
+    /// operator-facing contract.
+    #[test]
+    fn transport_socket_connect_timeout_renders_under_the_listener_name() {
+        let control = StatsControl::new(1);
+        let h = control.resolve(
+            &instruments::DOWNSTREAM_CX_TRANSPORT_SOCKET_CONNECT_TIMEOUT,
+            &[("listener", "ingress_https")],
+        );
+        let registry = control.registry();
+        registry.incr(WorkerId(0), h, 2);
+
+        let output = render(&registry);
+        assert_eq!(
+            output,
+            "listener.ingress_https.downstream_cx_transport_socket_connect_timeout: 2\n"
+        );
     }
 
     // ---- 3: an instrument with no Envoy template is absent -----------------
